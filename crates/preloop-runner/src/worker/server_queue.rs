@@ -3,7 +3,7 @@
 //! Batches step status updates and log uploads to the server,
 //! flushing periodically and at step boundaries.
 //!
-//! F014: The WorkflowStepsUpdate Twirp body uses these fields (from golden flow 24):
+//! The WorkflowStepsUpdate Twirp body uses these fields (from golden flow 24):
 //! - `steps[{external_id, number, name, status, started_at, completed_at, conclusion}]`
 //! - `change_order` (monotonic counter)
 //! - `workflow_job_run_backend_id` (= jobId from the job message)
@@ -58,7 +58,7 @@ pub struct StepUpdate {
 /// The full WorkflowStepsUpdate request body.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkflowStepsUpdateBody {
-    /// Step updates  delta: includes only steps that changed since the last update.
+    /// Step updates delta: includes only steps that changed since the last update.
     pub steps: Vec<StepUpdate>,
     /// Monotonically increasing change counter.
     pub change_order: u64,

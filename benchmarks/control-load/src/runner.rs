@@ -133,13 +133,13 @@ impl Runner {
             &json!({"typ": "JWT", "alg": "PS256"}),
             &json!({
                 "sub": client_id, "iss": client_id,
-                "aud": "https://preloop.local/oauth",
+                "aud": self.base,
                 "jti": uuid::Uuid::new_v4().to_string(),
                 "nbf": now, "exp": now + 300,
             }),
             &params,
         )?;
-        let token: Value = self
+        let response = self
             .http
             .post(format!("{}/runner/server/_apis/v1/oauth2/token", self.base))
             .header("content-type", "application/x-www-form-urlencoded")
@@ -152,10 +152,13 @@ impl Runner {
                 ("grant_type", "client_credentials"),
             ])?)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("oauth2/token {status}: {body}");
+        }
+        let token: Value = response.json().await?;
         let listen_token = token["access_token"]
             .as_str()
             .context("access_token")?

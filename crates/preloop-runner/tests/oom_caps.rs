@@ -1,7 +1,4 @@
-//! R1-12 regression tests: runner OOM primitives must be bounded.
-//!
-//! Each test fails on the unfixed code (verified by stashing the fix) and
-//! passes with the caps in place.
+//! Regression tests: runner OOM primitives must be bounded.
 
 use preloop_runner::process;
 use preloop_runner::worker::contexts::JobContext;
@@ -18,7 +15,7 @@ fn make_job() -> JobContext {
     )
 }
 
-/// R1-12 (output lines): 2 MiB of newline-free output must not be retained
+/// Output lines: 2 MiB of newline-free output must not be retained
 /// 1:1 in the partial-line buffer.
 #[test]
 fn write_chunk_caps_newline_free_output() {
@@ -68,11 +65,11 @@ fn log_content_returns_whole_file_while_head_stays_bounded() {
     );
 }
 
-/// R1-12 (file commands): GITHUB_ENV-style files over 1 MiB are rejected
+/// File commands: GITHUB_ENV-style files over 1 MiB are rejected
 /// before being read whole.
 #[test]
 fn parse_kv_file_rejects_overlarge_input() {
-    let dir = std::env::temp_dir().join(format!("preloop-r112-kv-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("preloop-oom-caps-kv-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("env");
     let mut data = Vec::with_capacity(2 * 1024 * 1024);
@@ -88,11 +85,11 @@ fn parse_kv_file_rejects_overlarge_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// R1-12 (file commands): GITHUB_PATH-style files over 1 MiB are rejected
+/// File commands: GITHUB_PATH-style files over 1 MiB are rejected
 /// before being read whole.
 #[test]
 fn parse_path_file_rejects_overlarge_input() {
-    let dir = std::env::temp_dir().join(format!("preloop-r112-path-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("preloop-oom-caps-path-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("path");
     let mut data = Vec::with_capacity(2 * 1024 * 1024);
@@ -108,7 +105,7 @@ fn parse_path_file_rejects_overlarge_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// R1-12 (service logs / docker invocations): retained output lines are
+/// Service logs / docker invocations: retained output lines are
 /// capped even when the subprocess is chatty.
 #[tokio::test]
 async fn invoke_caps_retained_output_lines() {

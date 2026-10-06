@@ -349,7 +349,7 @@ pub async fn create_network(network: &str, label: &str, log: &mut Vec<String>) -
 /// When `credentials` is `Some`, logs into the registry using a temporary
 /// Docker config directory (so the user's global `~/.docker/config.json` is
 /// never touched), pulls with that config, then removes the credentials on
-/// drop.  Matches official runner `ContainerOperationProvider.cs:193-221`.
+/// drop. Matches official runner `ContainerOperationProvider.cs:193-221`.
 pub async fn pull_image(
     image: &str,
     credentials: Option<&RegistryCredentials>,
@@ -425,7 +425,7 @@ pub async fn start_job_container(
     args.push("-e".into());
     args.push("CI=true".into());
 
-    // F049: Inject proxy env vars from host into container
+    // Inject proxy env vars from host into container
     inject_proxy_env(&mut args, &spec.env);
 
     // Docker socket auto-mount (enables DinD)
@@ -569,7 +569,7 @@ pub async fn start_service_container(
     args.push("-e".into());
     args.push("CI=true".into());
 
-    // F049: Inject proxy env vars from host into container
+    // Inject proxy env vars from host into container
     inject_proxy_env(&mut args, &service.env);
 
     // Port mappings
@@ -631,7 +631,7 @@ pub async fn start_service_container(
 /// Wait for all service containers to be healthy.
 ///
 /// Polls each container until its health status is `healthy`, `none` (no
-/// health-check configured), or definitively `unhealthy`.  Backoff follows
+/// health-check configured), or definitively `unhealthy`. Backoff follows
 /// the official runner's `GetExponentialBackoff(attempt, min=2s, max=32s,
 /// delta=2s)`: delay = min(2 + (2^attempt - 1) * 2, 32) seconds.
 /// There is no hard retry cap — the outer job-level timeout or cancel channel
@@ -758,10 +758,10 @@ pub async fn cleanup_containers(state: &ContainerState, log: &mut Vec<String>) -
         let _ = docker_cmd(&["rm", "--force", id], log).await;
     }
 
-    // 2. Per-service: print logs, then remove
+    // Per-service: print logs, then remove
     for (alias, container_id, container_name) in &state.service_containers {
         log.push(format!("Print service container logs: {container_name}"));
-        // R1-12: bound the logs pulled into memory at teardown; a chatty
+        // Bound the logs pulled into memory at teardown; a chatty
         // service would otherwise have its whole log buffered by the runner.
         let _ = docker_cmd(&["logs", "--details", "--tail", "5000", container_id], log).await;
 
@@ -770,7 +770,7 @@ pub async fn cleanup_containers(state: &ContainerState, log: &mut Vec<String>) -
         debug!("Removed service container {alias} ({container_id})");
     }
 
-    // 3. Remove network
+    // Remove network
     log.push(format!("Remove container network: {}", state.network));
     let _ = docker_cmd(&["network", "rm", &state.network], log).await;
 
@@ -839,7 +839,7 @@ fn parse_registry_from_image(image: &str) -> &str {
 
 /// Authenticate to the registry that hosts `image`, placing credentials in a
 /// fresh temporary directory so the user's global `~/.docker/config.json` is
-/// never touched.  Returns the `TempDir`; dropping it deletes the config.
+/// never touched. Returns the `TempDir`; dropping it deletes the config.
 ///
 /// Retries up to 3 times with 5 s / 10 s exponential backoff, matching
 /// official runner `ContainerOperationProvider.cs:470-499`.
@@ -1050,7 +1050,7 @@ fn push_docker_inherited_env(args: &mut Vec<String>, key: &str) {
     args.push(key.to_string());
 }
 
-/// F049: Inject web proxy env vars into container if configured on the host.
+/// Inject web proxy env vars into container if configured on the host.
 ///
 /// Matches official runner `ContainerInfo.UpdateWebProxyEnv()`:
 /// - `HTTP_PROXY`/`http_proxy` from `$HTTP_PROXY` or `$http_proxy`
@@ -1083,7 +1083,7 @@ fn inject_proxy_env(args: &mut Vec<String>, user_env: &HashMap<String, String>) 
     }
 }
 
-/// F049: Public wrapper for docker action containers.
+/// Public wrapper for docker action containers.
 /// Same as `inject_proxy_env` but callable from handler modules.
 pub fn inject_proxy_env_for_docker(args: &mut Vec<String>, env: &HashMap<String, String>) {
     inject_proxy_env(args, env);
@@ -1329,7 +1329,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
     }
 
-    // --- P0 container/step host gap coverage ---
+    // --- container/step host gap coverage ---
 
     #[test]
     fn split_options_handles_quotes() {

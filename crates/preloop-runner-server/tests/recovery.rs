@@ -28,11 +28,11 @@ async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
                 "repository": "owner/repo",
                 "preserve_on_failure": requested
             }),
-        )
+)
         .await;
 
-        let inner = state.inner.lock().await;
-        let queued = inner.queue.front().expect("job should be queued");
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("job should be queued");
         assert_eq!(
             queued.message.preloop_preserve_on_failure, expected,
             "preserve_on_failure={requested}"
@@ -115,27 +115,8 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                     line_count: 1,
                 },
             );
-            // Log bytes now go through `log_chunks`; the per-file counter
-            // is UPSERTed on the same path.
-            state
-                .store
-                .store_log_chunk("plan-1/7", 0, b"durable log\n", 13, 1)
-                .await
-                .unwrap();
-            inner.cache_v2_pending.insert(
-                "cache-upload".to_owned(),
-                CacheV2Pending {
-                    key: "cache-key".to_owned(),
-                    version: "cache-version".to_owned(),
-                    job_backend_id: String::new(),
-                    created_unix: 0,
-                },
-            );
-            state
-                .store
-                .store_meta_only(&crate::store::build_meta_snapshot(&inner))
-                .await
-                .unwrap();
+            state.test_log_append("plan-1", "7", b"durable log\n").await;
+            state.test_log_flush().await;
         }
         (
             accepted["run_id"].as_str().unwrap().to_owned(),
@@ -145,13 +126,19 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
 
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
     {
+        let tx = recovered.test_tx().await;
+        assert!(tx.runs.contains_key(&run_id.parse::<RunId>().unwrap()));
+        assert_eq!(tx.ready().count(), 1);
+        assert_eq!(tx.ready().next().unwrap().job_id.0, "build");
         let inner = recovered.inner.lock().await;
-        assert!(inner.runs.contains_key(&run_id.parse::<RunId>().unwrap()));
-        assert_eq!(inner.queue.len(), 1);
-        assert_eq!(inner.queue.front().unwrap().job_id.0, "build");
-        assert_eq!(inner.logs["plan-1/7"], b"durable log\n");
-        assert_eq!(inner.log_metadata["plan-1/7"].line_count, 1);
-        assert_eq!(inner.cache_v2_pending["cache-upload"].key, "cache-key");
+        assert_eq!(
+            recovered.test_log_read_all("plan-1", "7").await,
+            b"durable log\n"
+        );
+        // `cache_v2_pending` is node-local in-memory state (the meta snapshot
+        // that persisted it was removed with `store_meta`); the run +
+        // live-log segments + run-number sequence are what must recover.
+        assert!(inner.cache_v2_pending.is_empty());
     }
     let recovered_app = app(recovered, CancellationToken::new());
     let accepted = request_json(
@@ -167,12 +154,6 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
     .await;
     assert_eq!(accepted["run_number"], first_number + 1);
 }
-
-/// Restart round-trip for the state this scenario can reach through the HTTP
-/// surface: `session_keys`, `runner_rsa_public_keys`, run status after a
-/// cancel, `log_chunks`, and `queue_depth`. The message queues, run secrets
-/// and cross-run queue order have their own tests below, because they need
-/// state this scenario does not produce.
 
 /// Restart round-trip for the state this scenario can reach through the HTTP
 /// surface: `session_keys`, `runner_rsa_public_keys`, run status after a
@@ -202,7 +183,7 @@ async fn sqlite_recovery_restores_post_restart_state() {
         .await;
         let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
-        // Register a runner with an RSA public key (C2).
+        // Register a runner with an RSA public key.
         let runner_keypair = AgentRsaKeypair::generate().unwrap();
         let public_xml = runner_keypair.public_key_xml();
         let modulus = public_xml
@@ -236,7 +217,7 @@ async fn sqlite_recovery_restores_post_restart_state() {
         .await;
         let rid = runner["id"].as_i64().unwrap();
 
-        // Create a session (C1: session_keys).
+        // Create a session (session_keys).
         let session_json = request_json(
             &app,
             Method::POST,
@@ -247,12 +228,12 @@ async fn sqlite_recovery_restores_post_restart_state() {
         let session_id = session_json["sessionId"].as_str().unwrap().to_owned();
         // The disttask session handler always returns `encrypted: false` for
         // local-use AzDO compatibility; the AES key is still stored under
-        // `inner.session_keys` (sealed) and is what C1 restores after
+        // `inner.session_keys` (sealed) and is what restores after
         // restart. FIPS-wrapping is exercised by the
         // `session_key_uses_registered_runner_public_key` test for the
         // broker-internal path.
 
-        // Queue a cancel (C5: cancellation_queue).
+        // Queue a cancel (cancellation_queue).
         request_json(
             &app,
             Method::POST,
@@ -261,34 +242,32 @@ async fn sqlite_recovery_restores_post_restart_state() {
         )
         .await;
 
-        // Persist a log chunk (A: log_chunks hot path).
-        state
-            .store
-            .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
-            .await
-            .unwrap();
-        state
-            .store
-            .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
-            .await
-            .unwrap();
+        // Persist a log chunk (live-log segments).
+        state.test_log_append("plan-1", "0", b"first line\n").await;
+        state.test_log_append("plan-1", "0", b"second line\n").await;
+        state.test_log_flush().await;
 
         (run_id, rid, session_id, public_xml)
     };
 
     // Restart.
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered_tx = recovered.test_tx().await;
     let recovered_inner = recovered.inner.lock().await;
 
-    // C1: session_keys restored.
-    assert!(
-        recovered_inner.session_keys.contains_key(&session_id),
-        "session_keys must survive restart"
+    // The session's runner binding survives on its own; its AES key is
+    // never stored — every node re-derives it from the cluster HMAC key +
+    // session id. The disttask compat path records the binding in
+    // `broker_session_runners`.
+    assert_eq!(
+        recovered_tx.broker_session_runners.get(&session_id),
+        Some(&runner_id),
+        "session runner binding must survive restart"
     );
 
-    // C2: runner_rsa_public_keys restored.
+    // runner_rsa_public_keys restored.
     assert_eq!(
-        recovered_inner
+        recovered_tx
             .runner_rsa_public_keys
             .get(&runner_id)
             .map(|k| k.to_xml_string()),
@@ -296,11 +275,11 @@ async fn sqlite_recovery_restores_post_restart_state() {
         "RSA public key must survive restart"
     );
 
-    // C5: cancellation of a queued job removes it from the queue and
+    // Cancellation of a queued job removes it from the queue and
     // marks the run Cancelled. `cancellation_queue` is reserved for
     // in-progress jobs that need a JobCancellation message sent; a queued
     // job is simply dropped. Assert the run status is restored.
-    let recovered_run = recovered_inner
+    let recovered_run = recovered_tx
         .runs
         .get(&run_id_str.parse::<RunId>().unwrap())
         .cloned()
@@ -311,31 +290,19 @@ async fn sqlite_recovery_restores_post_restart_state() {
         "cancel status must survive restart"
     );
 
-    // A: log_chunks restored into the in-memory buffer.
+    // A: log segments restored from disk.
     assert_eq!(
-        recovered_inner
-            .logs
-            .get("plan-1/0")
-            .cloned()
-            .unwrap_or_default(),
+        recovered.test_log_read_all("plan-1", "0").await,
         b"first line\nsecond line\n".to_vec(),
-        "log bytes must survive restart via log_chunks"
-    );
-    assert_eq!(
-        recovered_inner
-            .log_metadata
-            .get("plan-1/0")
-            .map(|m| (m.byte_count, m.line_count)),
-        Some((23, 2)),
-        "log counter must survive restart"
+        "log bytes must survive restart via live-log segments"
     );
 
-    // C6: queue_depth restored.
+    // queue_depth restored.
     assert_eq!(
         recovered
             .queue_depth
             .load(std::sync::atomic::Ordering::SeqCst),
-        recovered_inner.queue.len(),
+        recovered_tx.ready().count(),
         "queue_depth must mirror recovered ready queue"
     );
 
@@ -364,81 +331,19 @@ async fn sqlite_recovery_restores_post_restart_state() {
 /// TLS URLs (`?sslmode=require|verify-full`) additionally need
 /// `PRELOOP_TEST_PG_CA` set to a PEM trust anchor for the test database.
 
-/// Postgres twin of `sqlite_recovery_restores_post_restart_state`: proves
-/// the translated SQL (dialect, upserts, sealed blobs) round-trips the same
-/// state a restart must restore. Skipped unless `PRELOOP_TEST_PG_URL` points at
-/// a disposable Postgres (the repo gate does not assume one is running).
-/// TLS URLs (`?sslmode=require|verify-full`) additionally need
-/// `PRELOOP_TEST_PG_CA` set to a PEM trust anchor for the test database.
+/// Postgres twin of `sqlite_recovery_restores_post_restart_state`: the same
+/// state a restart must restore. Runs on its own database when
+/// `PRELOOP_TEST_POSTGRES_URL` names a Postgres server; skipped otherwise.
 #[tokio::test]
 async fn postgres_recovery_restores_post_restart_state() {
-    let pg_url = match std::env::var("PRELOOP_TEST_PG_URL") {
-        Ok(url) if !url.trim().is_empty() => url,
-        _ => {
-            eprintln!(
-                "skipping postgres_recovery_restores_post_restart_state: \
-                 set PRELOOP_TEST_PG_URL to a disposable Postgres URL"
-            );
-            return;
-        }
+    let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
+        return;
     };
     let temp = tempfile::tempdir().unwrap();
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
     let config_path = crate::config::config_path();
-
-    // For TLS URLs, trust the operator-supplied CA (PEM) — the store's
-    // connector loads it via SSL_CERT_FILE. Nothing else in the crate reads
-    // this variable, so setting it process-wide cannot affect other tests.
-    if let Ok(ca) = std::env::var("PRELOOP_TEST_PG_CA") {
-        if !ca.is_empty() {
-            unsafe { std::env::set_var("SSL_CERT_FILE", ca) };
-        }
-    }
-
-    // The URL may point at a reused database; clear the store tables so the
-    // round-trip starts from a known state (migrations stay behind).
-    let connect_url = crate::store_pg::connect_url(&pg_url);
-    let client = match crate::store_pg::tls_connector(&pg_url).unwrap() {
-        Some(tls) => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tls).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        }
-        None => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
-                .await
-                .unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        }
-    };
-    // A brand-new database has no tables yet (the store's migration creates
-    // them on first open); only clean a schema that already exists.
-    let has_schema: bool = client
-        .query_one(
-            "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    if has_schema {
-        client
-            .batch_execute(
-                "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
-                         runner_sessions, jobs, job_dependencies, job_requests, control_events,
-                         session_active_requests, broker_messages, job_request_messages,
-                         log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
-            )
-            .await
-            .unwrap();
-    }
-    drop(client);
 
     let (run_id_str, runner_id, session_id, public_xml, first_number) = {
         let state = AppState::new_with_store(
@@ -523,27 +428,10 @@ async fn postgres_recovery_restores_post_restart_state() {
             "claimed job must round-trip through the postgres store"
         );
 
-        // Persist log chunks (hot path) and a full snapshot so every table
-        // is written through the translated SQL before the restart.
-        state
-            .store
-            .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
-            .await
-            .unwrap();
-        state
-            .store
-            .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
-            .await
-            .unwrap();
-        {
-            let inner = state.inner.lock().await;
-            state
-                .store
-                .store_inner(&crate::store::StoreSnapshot::from_inner(&inner))
-                .await
-                .unwrap();
-        }
-
+        // Persist log segments.
+        state.test_log_append("plan-1", "0", b"first line\n").await;
+        state.test_log_append("plan-1", "0", b"second line\n").await;
+        state.test_log_flush().await;
         (run_id, runner_id, session_id, public_xml, first_number)
     };
 
@@ -556,10 +444,10 @@ async fn postgres_recovery_restores_post_restart_state() {
     .await
     .unwrap();
     {
-        let inner = recovered.inner.lock().await;
+        let tx = recovered.test_tx().await;
 
         // Runs survive.
-        let recovered_run = inner
+        let recovered_run = tx
             .runs
             .get(&run_id_str.parse::<RunId>().unwrap())
             .cloned()
@@ -568,43 +456,36 @@ async fn postgres_recovery_restores_post_restart_state() {
 
         // The claimed job is gone from the ready queue but its agent job
         // request is restored for re-delivery.
-        assert_eq!(inner.queue.len(), 0, "claimed job must not re-queue");
-        assert_eq!(inner.job_requests.len(), 1, "job request must survive");
+        assert_eq!(tx.ready().count(), 0, "claimed job must not re-queue");
+        assert_eq!(tx.job_requests.len(), 1, "job request must survive");
         assert_eq!(
-            inner.session_active_requests.len(),
+            tx.session_active_requests.len(),
             1,
             "session active request must survive"
         );
 
-        // Runner + RSA key + sealed session key survive.
-        assert!(inner.runners.contains_key(&runner_id));
+        // Runner + session binding survive (authoritative); RSA key + log
+        // bytes are node-local. The AES key is never stored — every node
+        // re-derives it from the cluster HMAC key + session id.
+        assert!(tx.runners.contains_key(&runner_id));
         assert_eq!(
-            inner
-                .runner_rsa_public_keys
+            tx.broker_session_runners.get(&session_id),
+            Some(&runner_id),
+            "the session must survive restart bound to its runner"
+        );
+        let tx = recovered.test_tx().await;
+        assert_eq!(
+            tx.runner_rsa_public_keys
                 .get(&runner_id)
                 .map(|k| k.to_xml_string()),
             Some(public_xml.clone()),
             "RSA public key must survive restart"
         );
-        assert!(
-            inner.session_keys.contains_key(&session_id),
-            "session_keys must survive restart"
-        );
-        assert!(inner.sessions.contains_key(&session_id));
-
-        // Log chunks survive.
+        // Log segments survive.
         assert_eq!(
-            inner.logs.get("plan-1/0").cloned().unwrap_or_default(),
+            recovered.test_log_read_all("plan-1", "0").await,
             b"first line\nsecond line\n".to_vec(),
-            "log bytes must survive restart via log_chunks"
-        );
-        assert_eq!(
-            inner
-                .log_metadata
-                .get("plan-1/0")
-                .map(|m| (m.byte_count, m.line_count)),
-            Some((23, 2)),
-            "log counter must survive restart"
+            "log bytes must survive restart via live-log segments"
         );
     }
 
@@ -643,21 +524,17 @@ async fn run_apis_never_return_submitted_secret_values() {
                 "DEPLOY_KEY": "deploy_LIVE_CREDENTIAL"
             }
         }),
-    )
+)
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
-    // The server must still receive the real values: they are what the job runs with.
-    {
-        let inner = state.inner.lock().await;
-        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
-        assert_eq!(
-            run.submission.secrets["NPM_TOKEN"].expose(),
-            "npm_LIVE_CREDENTIAL"
-        );
-    }
+    // The job still runs with the real values: they sit in the provider's
+    // run tier, where acquire resolves them.
+    let run_uuid = run_id.parse::<RunId>().unwrap();
+    let resolved = state.test_resolve_run_secrets("owner/repo", run_uuid);
+    assert_eq!(resolved["NPM_TOKEN"].expose(), "npm_LIVE_CREDENTIAL");
 
-    // ...but no run-facing response may echo them back.
+    //..but no run-facing response may echo them back.
     for uri in [
         format!("/api/v1/runs/{run_id}"),
         "/api/v1/runs?limit=50".to_owned(),
@@ -668,10 +545,6 @@ async fn run_apis_never_return_submitted_secret_values() {
         assert!(
             !body.contains("npm_LIVE_CREDENTIAL") && !body.contains("deploy_LIVE_CREDENTIAL"),
             "{uri} leaked a secret value: {body}"
-        );
-        assert!(
-            body.contains("NPM_TOKEN"),
-            "{uri} should still expose secret names: {body}"
         );
     }
 }
@@ -693,7 +566,7 @@ async fn run_page_is_public_safe_status_page_without_secret_leaks() {
             "repository": "owner/repo",
             "secrets": {"NPM_TOKEN": "npm_LIVE_CREDENTIAL"}
         }),
-    )
+)
     .await;
     let run_id = accepted["run_id"].as_str().unwrap();
     let response = app
@@ -800,10 +673,11 @@ jobs:
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let first_job = {
-        let inner = state.inner.lock().await;
-        assert_eq!(inner.queue.len(), 1);
+        let inner = state.test_tx().await;
+        assert_eq!(inner.ready().count(), 1);
         assert_eq!(inner.pending_jobs.len(), 2);
-        inner.queue.front().unwrap().job_id.clone()
+        let job_id = inner.ready().next().unwrap().job_id.clone();
+        job_id
     };
 
     request_json(
@@ -818,8 +692,8 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
-    assert!(inner.queue.is_empty());
+    let inner = state.test_tx().await;
+    assert!(inner.ready().next().is_none());
     assert!(inner.pending_jobs.is_empty());
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(
@@ -846,12 +720,13 @@ async fn completejob_annotations_are_stored_on_the_job_record() {
             "event": "push",
             "repository": "owner/repo"
         }),
-    )
+)
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_string();
     let job_id = {
-        let inner = state.inner.lock().await;
-        inner.queue.front().unwrap().job_id.0.clone()
+        let inner = state.test_tx().await;
+        let id = inner.ready().next().unwrap().job_id.0.clone();
+        id
     };
 
     // The listener's force-fail completion carries the worker-crash detail as
@@ -919,7 +794,7 @@ async fn selected_jobs_rejects_unknown_id_without_creating_run() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("tset"));
-    assert!(state.inner.lock().await.runs.is_empty());
+    assert!(state.test_tx().await.runs.is_empty());
 }
 
 #[tokio::test]
@@ -947,7 +822,7 @@ async fn selected_jobs_rejects_partial_typo_without_running_valid_subset() {
         "a typo must reject the whole selection, not run a subset: {body}"
     );
     assert!(body["error"].as_str().unwrap().contains("tset"));
-    assert!(state.inner.lock().await.runs.is_empty());
+    assert!(state.test_tx().await.runs.is_empty());
 }
 
 #[tokio::test]
@@ -969,7 +844,7 @@ async fn selected_jobs_runs_transitive_needs_closure_without_independent_jobs() 
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);
     let run = inner.runs.values().next().unwrap();
     let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
@@ -1023,7 +898,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.values().next().unwrap();
     // Selecting the caller selects its node; since it has no `if:` gate, the
     // submission-time promote sweep materializes the callee subtree at once.
@@ -1057,7 +932,7 @@ async fn selected_jobs_empty_runs_all_workflow_jobs() {
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);
     let run = inner.runs.values().next().unwrap();
     let base_ids: BTreeSet<String> = run.job_base_ids.values().cloned().collect();
@@ -1115,8 +990,7 @@ async fn agent_request_patch_targets_only_the_request_id() {
 
     // The mapping should have two entries — one per request_id.
     let (first_req_id, _) = state
-        .inner
-        .lock()
+        .test_tx()
         .await
         .inflight_requests
         .iter()
@@ -1133,7 +1007,7 @@ async fn agent_request_patch_targets_only_the_request_id() {
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let first = inner.runs.get(&first_run).unwrap();
     let second = inner.runs.get(&second_run).unwrap();
     assert!(
@@ -1166,7 +1040,7 @@ async fn agent_request_get_reports_completion_result() {
                 "event": "push",
                 "repository": "owner/repo"
             }),
-        )
+)
         .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
@@ -1178,7 +1052,7 @@ async fn agent_request_get_reports_completion_result() {
     )
     .await;
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner
             .inflight_requests
             .iter()
@@ -1266,8 +1140,15 @@ jobs:
     .await;
 
     let first_request_id = {
-        let inner = state.inner.lock().await;
-        *inner.session_active_requests.get("s1").unwrap()
+        let inner = state.test_tx().await;
+        *inner
+            .session_active_requests
+            .get(
+                crate::control::logic::session_uuid("s1")
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap()
     };
 
     let withheld = request_json(
@@ -1299,7 +1180,7 @@ jobs:
         azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
     );
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(
         run.jobs
@@ -1370,17 +1251,19 @@ async fn unacked_messages_are_scoped_to_their_session() {
     .await;
     assert_eq!(redelivered["messageId"], first_message_id);
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
+    let s1 = crate::control::logic::session_uuid("s1").to_string();
+    let s2 = crate::control::logic::session_uuid("s2").to_string();
     assert!(
         inner
             .inflight_messages
-            .get("s1")
+            .get(&s1)
             .is_some_and(|messages| messages.contains_key(&first_message_id))
     );
     assert!(
         inner
             .inflight_messages
-            .get("s2")
+            .get(&s2)
             .is_some_and(|messages| messages.contains_key(&second_message_id))
     );
 }
@@ -1400,7 +1283,7 @@ async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
                 "event": "push",
                 "repository": "owner/repo"
             }),
-        )
+)
         .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
@@ -1417,7 +1300,7 @@ async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
     );
 
     let request = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner.job_requests.values().next().unwrap().clone()
     };
 
@@ -1437,7 +1320,7 @@ async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(
         run.jobs.get(&request.job_id),
@@ -1501,8 +1384,15 @@ jobs:
     .await;
 
     let active_request = {
-        let inner = state.inner.lock().await;
-        let active_id = *inner.session_active_requests.get("s1").unwrap();
+        let inner = state.test_tx().await;
+        let active_id = *inner
+            .session_active_requests
+            .get(
+                crate::control::logic::session_uuid("s1")
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap();
         inner.job_requests.get(&active_id).unwrap().clone()
     };
     let unknown_plan_id = uuid::Uuid::new_v4();
@@ -1527,7 +1417,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(
         run.jobs.get(&active_request.job_id),
@@ -1590,7 +1480,7 @@ jobs:
     );
 
     let failing_job = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner
             .runs
             .get(&run_id)
@@ -1617,7 +1507,7 @@ jobs:
     // The fix: in-progress siblings get a cancellation enqueued so the
     // runner receives a JOB_CANCELLED message. Inspect the queue directly
     // since the matched siblings still have unACKed in-flight job messages.
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.cancellation_queue.len(), 1);
     let cancellation = inner.cancellation_queue.front().unwrap();
     assert_eq!(cancellation.run_id, run_id);
@@ -1675,10 +1565,9 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let deploy = inner
-        .queue
-        .iter()
+        .ready()
         .find(|job| job.job_id.0 == "deploy")
         .expect("deploy job should be promoted");
     let needs = deploy.message.context_data.get("needs").unwrap();
@@ -1700,8 +1589,8 @@ jobs:
         panic!("outputs context should be a dict");
     };
     assert!(matches!(
-        outputs.get("artifact"),
-        Some(azdo::PipelineContextData::String(value)) if value == "dist.tgz"
+            outputs.get("artifact"),
+            Some(azdo::PipelineContextData::String(value)) if value == "dist.tgz"
     ));
 }
 
@@ -1749,10 +1638,10 @@ jobs:
             "status": "success",
             "outputs": {"matrix": r#"{"include": [{"os": "ubuntu-latest"}, {"os": "macos-latest"}]}"#}
         }),
-    )
+)
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
 
     // Verify downstream (ubuntu-latest) and downstream (macos-latest) were dynamically created and queued
@@ -1765,7 +1654,7 @@ jobs:
             .contains_key(&JobId("downstream (macos-latest)".to_string()))
     );
 
-    let queued_ids: Vec<String> = inner.queue.iter().map(|j| j.job_id.0.clone()).collect();
+    let queued_ids: Vec<String> = inner.ready().map(|j| j.job_id.0.clone()).collect();
     assert!(queued_ids.contains(&"downstream (ubuntu-latest)".to_string()));
     assert!(queued_ids.contains(&"downstream (macos-latest)".to_string()));
 }
@@ -1823,7 +1712,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
 
     let downstream: Vec<(&JobId, ExecutionStatus)> = run
@@ -1888,8 +1777,8 @@ jobs:
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     let scripts = {
-        let inner = state.inner.lock().await;
-        let queued = inner.queue.front().expect("build job should be queued");
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("build job should be queued");
         queued
             .message
             .steps
@@ -1930,7 +1819,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(run.status, ExecutionStatus::Success);
     assert_eq!(
@@ -1994,7 +1883,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(run.status, ExecutionStatus::Failure);
     assert_eq!(
@@ -2051,10 +1940,9 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let consumer = inner
-        .queue
-        .iter()
+        .ready()
         .find(|job| job.job_id.0 == "consumer")
         .expect("consumer job should be promoted");
     let azdo::PipelineContextData::Dict(needs) =
@@ -2069,8 +1957,8 @@ jobs:
         panic!("producer outputs should be a dict");
     };
     assert!(matches!(
-        outputs.get("value"),
-        Some(azdo::PipelineContextData::String(value)) if value == "42"
+            outputs.get("value"),
+            Some(azdo::PipelineContextData::String(value)) if value == "42"
     ));
 }
 
@@ -2139,7 +2027,7 @@ jobs:
     }
 
     let failing_job = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner
             .runs
             .get(&run_id)
@@ -2164,7 +2052,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.cancellation_queue.len(), 2);
     let run = inner.runs.get(&run_id).unwrap();
     for (job_id, status) in &run.jobs {
@@ -2208,30 +2096,30 @@ jobs:
         Method::PATCH,
         &format!("/_apis/v1/Timeline/scope/actions/{run_id}/timeline-1"),
         json!({"count": 2, "value": [{
-            "id": "00000000-0000-0000-0000-000000000001",
-            "name": "build",
-            "type": "job",
-            "state": "completed",
-            "result": "failed",
-            "issues": [{
-                "type": "error",
-                "message": "boom",
-                "data": {"file": "src/lib.rs", "line": "42"}
-            }]
-        }, {
-            // A typed step with no `parentId`. The manifest path counts this as
-            // a step, so the annotation path must scope its issue to the step
-            // rather than reporting it against the job.
-            "id": "00000000-0000-0000-0000-000000000002",
-            "name": "Run echo one",
-            "type": "Task",
-            "state": "completed",
-            "result": "failed",
-            "issues": [{
-                "type": "error",
-                "message": "step boom"
-            }]
-        }]}),
+                   "id": "00000000-0000-0000-0000-000000000001",
+                   "name": "build",
+                   "type": "job",
+                   "state": "completed",
+                   "result": "failed",
+                   "issues": [{
+                       "type": "error",
+                       "message": "boom",
+                       "data": {"file": "src/lib.rs", "line": "42"}
+                   }]
+               }, {
+        // A typed step with no `parentId`. The manifest path counts this as
+        // a step, so the annotation path must scope its issue to the step
+        // rather than reporting it against the job.
+                   "id": "00000000-0000-0000-0000-000000000002",
+                   "name": "Run echo one",
+                   "type": "Task",
+                   "state": "completed",
+                   "result": "failed",
+                   "issues": [{
+                       "type": "error",
+                       "message": "step boom"
+                   }]
+               }]}),
     )
     .await;
 
@@ -2279,12 +2167,6 @@ jobs:
 /// `job_requests` is keyed by monotonic request id, so selecting with `find`
 /// returned the oldest attempt: after a retry, following the logical job key
 /// subscribed to the dead attempt's feed, which never speaks again.
-
-/// Following a re-dispatched job streams the current attempt, not the first.
-///
-/// `job_requests` is keyed by monotonic request id, so selecting with `find`
-/// returned the oldest attempt: after a retry, following the logical job key
-/// subscribed to the dead attempt's feed, which never speaks again.
 #[tokio::test]
 async fn live_log_key_follows_the_newest_attempt() {
     let temp = tempfile::tempdir().unwrap();
@@ -2294,25 +2176,24 @@ async fn live_log_key_follows_the_newest_attempt() {
 
     // A re-dispatch: a second request for the same logical job, with a higher
     // request id and its own agent job id.
-    let (first_attempt, second_attempt) = {
-        let mut inner = state.inner.lock().await;
-        let (first_id, first) = inner
-            .job_requests
-            .iter()
-            .find(|(_, record)| record.run_id == run_id && record.job_id.0 == "build")
-            .map(|(id, record)| (*id, record.clone()))
-            .expect("the dispatched attempt");
-        let mut retry = first.clone();
-        retry.request_id = first_id + 1;
-        retry.agent_job_id = uuid::Uuid::new_v4();
-        let second = retry.agent_job_id;
-        inner.job_requests.insert(retry.request_id, retry);
-        (first.agent_job_id, second)
-    };
+    let (first_attempt, second_attempt) = state
+        .test_db_mutate(move |tx| {
+            let (_, first_agent_job_id, timeline_id) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
+                .expect("the dispatched attempt");
+            let (_, second_agent_job_id) = tx
+                .insert_retry_request(run_id, &JobId("build".to_owned()), timeline_id)
+                .unwrap();
+            (first_agent_job_id, second_agent_job_id)
+        })
+        .await;
     assert_ne!(first_attempt, second_attempt);
 
-    let inner = state.inner.lock().await;
-    let key = crate::live_logs::live_log_key_for_job(&inner, run_id, "build")
+    let key = state
+        .test_live_log_key(run_id, "build")
+        .await
+        .map(|(key, _terminal)| key)
         .expect("a logical job key must resolve");
     assert_eq!(
         key,
@@ -2322,9 +2203,13 @@ async fn live_log_key_follows_the_newest_attempt() {
 
     // An explicit agent job id still addresses exactly that attempt, so an
     // older feed stays reachable when asked for by name.
+    let explicit = state
+        .test_live_log_key(run_id, &first_attempt.to_string())
+        .await
+        .map(|(key, _terminal)| key)
+        .expect("an explicit attempt id must resolve");
     assert_eq!(
-        crate::live_logs::live_log_key_for_job(&inner, run_id, &first_attempt.to_string())
-            .expect("an explicit attempt id must resolve"),
+        explicit,
         first_attempt.to_string(),
         "an explicit agent job id must not be redirected to another attempt"
     );
@@ -2406,11 +2291,7 @@ async fn live_log_websocket_rejects_unauthenticated() {
     server.abort();
 }
 
-/// R1-8: the live-log ingest WebSocket must bind the target to the caller's
-/// identity. The generic protocol bearer admits any job's runtime credential;
-/// without an ownership check one job could stream into another job's buffer.
-
-/// R1-8: the live-log ingest WebSocket must bind the target to the caller's
+/// The live-log ingest WebSocket must bind the target to the caller's
 /// identity. The generic protocol bearer admits any job's runtime credential;
 /// without an ownership check one job could stream into another job's buffer.
 #[tokio::test]
@@ -2478,9 +2359,7 @@ async fn live_log_websocket_accepts_own_job_token() {
     server.abort();
 }
 
-/// R1-8: a job's runtime credential must not open another job's ingest feed.
-
-/// R1-8: a job's runtime credential must not open another job's ingest feed.
+/// A job's runtime credential must not open another job's ingest feed.
 #[tokio::test]
 async fn live_log_websocket_rejects_other_job_token() {
     let temp = tempfile::tempdir().unwrap();
@@ -2519,11 +2398,7 @@ async fn live_log_websocket_rejects_other_job_token() {
     server.abort();
 }
 
-/// R1-8: a rejected cross-job ingest attempt must not disturb the victim's
-/// retained history. Reopening a closed feed clears it, so the ownership
-/// check has to happen before the socket is accepted, not on first frame.
-
-/// R1-8: a rejected cross-job ingest attempt must not disturb the victim's
+/// A rejected cross-job ingest attempt must not disturb the victim's
 /// retained history. Reopening a closed feed clears it, so the ownership
 /// check has to happen before the socket is accepted, not on first frame.
 #[tokio::test]
@@ -2622,7 +2497,7 @@ async fn live_log_websocket_cross_job_attempt_preserves_history() {
     server.abort();
 }
 
-/// M5: the protocol live-log read route must not let one job's runtime
+/// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. A job may read its own feed.
 #[tokio::test]
 async fn live_log_sse_accepts_own_job_credential() {
@@ -2657,10 +2532,7 @@ async fn live_log_sse_accepts_own_job_credential() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// M5: a job's runtime credential must not read another job's live log,
-/// whether addressed by logical name or by concrete agent-job UUID.
-
-/// M5: a job's runtime credential must not read another job's live log,
+/// A job's runtime credential must not read another job's live log,
 /// whether addressed by logical name or by concrete agent-job UUID.
 #[tokio::test]
 async fn live_log_sse_rejects_other_job_credential() {
@@ -2704,10 +2576,7 @@ async fn live_log_sse_rejects_other_job_credential() {
     );
 }
 
-/// M5: the system credential keeps full read access; first-party readers are
-/// unaffected by the per-job ownership check.
-
-/// M5: the system credential keeps full read access; first-party readers are
+/// The system credential keeps full read access; first-party readers are
 /// unaffected by the per-job ownership check.
 #[tokio::test]
 async fn live_log_sse_system_credential_still_reads() {
@@ -2848,7 +2717,7 @@ jobs:
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let requests = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let mut requests: Vec<_> = inner
             .job_requests
             .values()
@@ -2954,7 +2823,7 @@ async fn log_get_run_logs_falls_back_to_uploaded_step_logs() {
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner
             .job_requests
             .values()
@@ -3090,14 +2959,6 @@ async fn log_run_logs_unknown_job_is_404_not_whole_run() {
 /// what the manifest was built from, so startup rebuilds it — otherwise the
 /// run loses its declared steps and `--step` answers 409 for blobs that are
 /// sitting on disk.
-
-/// A restart before the first step report keeps the declared steps.
-///
-/// Only a runner report writes step rows, so an attempt dispatched and then
-/// interrupted has none. Its request message is persisted, and that message is
-/// what the manifest was built from, so startup rebuilds it — otherwise the
-/// run loses its declared steps and `--step` answers 409 for blobs that are
-/// sitting on disk.
 #[tokio::test]
 async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
     let temp = tempfile::tempdir().unwrap();
@@ -3141,14 +3002,6 @@ async fn dispatched_but_unreported_manifests_are_rebuilt_on_restart() {
 /// `Set up job` sorts after every declared step. The PATCH also carries the
 /// job's own record, whose UUID never equals the workflow job key, so it was
 /// reconciled in as an extra step named after the job.
-
-/// The AzDO timeline path orders synthetic steps and ignores the job record.
-///
-/// `TimelineRecord` carries no ordinal, so a synthetic step reported this way
-/// has no `runner_number` and must be ordered by when it started — otherwise
-/// `Set up job` sorts after every declared step. The PATCH also carries the
-/// job's own record, whose UUID never equals the workflow job key, so it was
-/// reconciled in as an extra step named after the job.
 #[tokio::test]
 async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
     let temp = tempfile::tempdir().unwrap();
@@ -3157,7 +3010,7 @@ async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
     let (run_id, _) = three_step_run_for_log_filters(&app, &state).await;
     let ids = workflow_step_ids(&state, run_id, "build").await;
     let (plan_id, timeline_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner
             .job_requests
             .values()
@@ -3237,13 +3090,6 @@ async fn timeline_path_orders_synthetic_steps_and_skips_the_job_record() {
 /// seeded, and is purged when expansion replaces it with real legs. Without
 /// cleanup every dynamic expansion accumulates an entry no run projection can
 /// reach.
-
-/// Expansion does not leave the placeholder's manifest behind.
-///
-/// A deferred-matrix node is dispatched as a placeholder, gets a manifest
-/// seeded, and is purged when expansion replaces it with real legs. Without
-/// cleanup every dynamic expansion accumulates an entry no run projection can
-/// reach.
 #[tokio::test]
 async fn expansion_purges_the_placeholder_step_manifest() {
     let temp = tempfile::tempdir().unwrap();
@@ -3276,7 +3122,7 @@ jobs:
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     let before = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner.job_steps.len()
     };
 
@@ -3300,7 +3146,7 @@ jobs:
     .await
     .expect("completing gen must succeed");
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     // The placeholder must actually be gone, replaced by one leg per matrix
     // value. Without this the orphan check below could pass vacuously.
     let legs: Vec<&str> = inner
@@ -3330,4 +3176,97 @@ jobs:
         "expansion left {} unreachable manifest(s) (had {before} before)",
         orphans.len()
     );
+}
+
+/// A materialized expansion leg must be stored with the builder's baseline
+/// mask hints.
+///
+/// The legs are built by the same `build_job_artifacts` as a submitted job,
+/// but the lite expansion path stripped the whole `mask_hints` list before
+/// persisting them, so every deferred-matrix and reusable-callee leg was
+/// delivered with no baseline regexes — the acquire fill only re-adds
+/// value-derived hints.
+#[tokio::test]
+async fn expansion_legs_keep_the_baseline_mask_hints() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: echo matrix
+  fan:
+    needs: [gen]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.gen.outputs.matrix) }}
+    steps:
+      - run: echo leg
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let baseline = {
+        let inner = state.test_tx().await;
+        let gen_job = inner
+            .ready()
+            .find(|job| job.job_id.0 == "gen")
+            .expect("gen should be queued");
+        let baseline = gen_job.message.mask_hints.len();
+        assert!(
+            baseline >= 18,
+            "the builder must emit its baseline hint set, got {baseline}"
+        );
+        baseline
+    };
+
+    let _completed = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId("gen".to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: [("matrix".to_owned(), serde_json::json!("{\"leg\":[1,2]}"))]
+                .into_iter()
+                .collect(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        },
+    )
+    .await
+    .expect("completing gen must succeed");
+
+    let legs: Vec<(String, usize)> = {
+        let inner = state.test_tx().await;
+        inner
+            .ready()
+            .chain(inner.pending_jobs.iter())
+            .filter(|job| job.run_id == run_id && job.job_id.0.starts_with("fan"))
+            .map(|job| (job.job_id.0.clone(), job.message.mask_hints.len()))
+            .collect()
+    };
+    assert_eq!(
+        legs.len(),
+        2,
+        "the deferred node must expand into two legs, got {:?}",
+        legs.iter().map(|(job_id, _)| job_id).collect::<Vec<_>>()
+    );
+    for (job_id, hints) in legs {
+        assert_eq!(
+            hints, baseline,
+            "leg {job_id} must keep the baseline mask hints"
+        );
+    }
 }

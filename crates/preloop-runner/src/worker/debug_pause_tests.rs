@@ -5,6 +5,7 @@
 //! round-trips, bearer auth, status handling, or the long-poll timeout path —
 //! and every bug this feature has hit so far lived in exactly those seams.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -25,6 +26,8 @@ struct Fake {
     verdict: Option<Verdict>,
     /// Snapshot credential the fake control plane mints for retry verdicts.
     snapshot_token: Option<String>,
+    /// Origin-rewrite auth header the fake control plane mints for retries.
+    snapshot_auth_header: Option<String>,
     /// Empty polls to serve before answering, simulating a human thinking.
     verdict_after: u32,
     polls: AtomicU32,
@@ -68,6 +71,7 @@ async fn spawn_fake(fake: Arc<Fake>) -> String {
                     "verdict": verdict,
                     "version": seen + 1,
                     "snapshot_token": fake.snapshot_token,
+                    "snapshot_auth_header": fake.snapshot_auth_header,
                 }))
             }),
         )
@@ -106,6 +110,18 @@ fn client(base_url: &str) -> DebugPauseClient {
     )
     .unwrap()
     .with_workspace(Some("/work".to_owned()), Some("deadbeef".to_owned()))
+}
+
+/// A debug client whose first verdict is Retry and carries a fresh snapshot
+/// origin-rewrite header. Used by the step-loop integration test.
+pub(crate) async fn retry_client_with_snapshot_header(auth_header: &str) -> DebugPauseClient {
+    let fake = Arc::new(Fake {
+        verdict: Some(Verdict::Retry),
+        snapshot_auth_header: Some(auth_header.to_owned()),
+        ..Default::default()
+    });
+    let base_url = spawn_fake(fake).await;
+    client(&base_url).with_snapshot_url(Some("http://snap.invalid/owner/repo".to_owned()))
 }
 
 /// A retry verdict must surface the fresh snapshot credential the server
@@ -189,6 +205,96 @@ fn refresh_snapshot_tokens_replaces_only_pinned_steps() {
         ),
         _ => panic!("unpinned step must be an action step"),
     }
+}
+
+/// The verdict must also carry the fresh origin-rewrite header, not just the
+/// step token — a replayed `git fetch` authenticates with the env entry the
+/// job extension wrote at start.
+#[tokio::test]
+async fn retry_verdict_carries_the_fresh_auth_header() {
+    let fake = Arc::new(Fake {
+        verdict: Some(Verdict::Retry),
+        verdict_after: 0,
+        snapshot_token: Some("fresh-snapshot-jwt".to_owned()),
+        snapshot_auth_header: Some("AUTHORIZATION: basic fresh".to_owned()),
+        ..Default::default()
+    });
+    let base_url = spawn_fake(fake).await;
+    let client = client(&base_url);
+
+    let decision = client
+        .pause(failed_step(), Vec::new(), Vec::new(), Vec::new())
+        .await
+        .expect("pause returns a decision");
+    assert_eq!(decision.verdict, Verdict::Retry);
+    assert_eq!(
+        decision.snapshot_auth_header.as_deref(),
+        Some("AUTHORIZATION: basic fresh"),
+        "the verdict must carry the re-minted origin-rewrite header"
+    );
+}
+
+/// The header refresh must find the injected `http.<snapshot>.extraheader`
+/// entry wherever it landed in the GIT_CONFIG_* range — a workflow that set
+/// its own GIT_CONFIG_* entries first shifts the indices, and a rewrite for
+/// a different URL must never be touched.
+#[test]
+fn refresh_snapshot_auth_header_rewrites_the_matching_entry() {
+    let client = client("http://127.0.0.1:1")
+        .with_snapshot_url(Some("http://snap.invalid/owner/repo".to_owned()));
+    let mut env = HashMap::from([
+        ("GIT_CONFIG_COUNT".to_owned(), "4".to_owned()),
+        // A workflow-owned entry that happened to land first.
+        ("GIT_CONFIG_KEY_0".to_owned(), "core.abbrev".to_owned()),
+        ("GIT_CONFIG_VALUE_0".to_owned(), "12".to_owned()),
+        (
+            "GIT_CONFIG_KEY_1".to_owned(),
+            "url.http://snap.invalid/owner/repo.insteadOf".to_owned(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_1".to_owned(),
+            "https://github.com/owner/repo.git".to_owned(),
+        ),
+        (
+            "GIT_CONFIG_KEY_2".to_owned(),
+            "url.http://snap.invalid/owner/repo.insteadOf".to_owned(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_2".to_owned(),
+            "https://github.com/owner/repo/".to_owned(),
+        ),
+        (
+            "GIT_CONFIG_KEY_3".to_owned(),
+            "http.http://snap.invalid/owner/repo.extraheader".to_owned(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_3".to_owned(),
+            "AUTHORIZATION: basic stale".to_owned(),
+        ),
+    ]);
+
+    assert!(
+        client.refresh_snapshot_auth_header(&mut env, "AUTHORIZATION: basic fresh"),
+        "the matching extraheader entry must be rewritten"
+    );
+    assert_eq!(
+        env.get("GIT_CONFIG_VALUE_3").map(String::as_str),
+        Some("AUTHORIZATION: basic fresh")
+    );
+    assert_eq!(
+        env.get("GIT_CONFIG_VALUE_1").map(String::as_str),
+        Some("https://github.com/owner/repo.git"),
+        "insteadOf entries are untouched"
+    );
+}
+
+/// No origin rewrite on the job (snapshot_url unset) means nothing to
+/// rewrite — the call must be a no-op, not an error.
+#[test]
+fn refresh_snapshot_auth_header_is_a_noop_without_a_rewrite() {
+    let client = client("http://127.0.0.1:1");
+    let mut env = HashMap::from([("GIT_CONFIG_COUNT".to_owned(), "0".to_owned())]);
+    assert!(!client.refresh_snapshot_auth_header(&mut env, "AUTHORIZATION: basic fresh"));
 }
 
 /// What the fake control plane recorded about the credential exchange.

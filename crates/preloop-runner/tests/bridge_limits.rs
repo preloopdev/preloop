@@ -1,12 +1,11 @@
-//! R1-13 regression tests: the control bridge must bound concurrent
+//! Regression tests: the control bridge must bound concurrent
 //! connections and reap truly-idle splices.
 //!
 //! Exercised through the public `spawn_from_env` entry point with
 //! `PRELOOP_BRIDGE_MAX_CONNECTIONS` / `PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS`
-//! overrides. On the unfixed code (verified by stashing the fix) the
-//! excess-connection scenario parks the third connection instead of closing
-//! it, and the idle scenario never closes the silent splice — both
-//! assertions fail.
+//! overrides. Without the bounds the excess-connection scenario parks the
+//! third connection instead of closing it, and the idle scenario never
+//! closes the silent splice — both assertions fail.
 
 use preloop_runner::control_bridge::{self, CONTROL_ORIGIN_ENV, CONTROL_UPSTREAM_ENV};
 use std::collections::BTreeMap;
@@ -14,9 +13,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-// R1-13 tuning knobs, as string literals (not the module constants) so this
-// test also compiles against the unfixed code — where the bridge ignores them
-// and the scenarios below fail at runtime.
+// Tuning knobs, as string literals (not the module constants): a bridge that
+// ignores them fails the scenarios below at runtime.
 const BRIDGE_MAX_CONNECTIONS_ENV: &str = "PRELOOP_BRIDGE_MAX_CONNECTIONS";
 const BRIDGE_IDLE_TIMEOUT_SECS_ENV: &str = "PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS";
 /// Env overrides are process-global and integration tests in one binary share

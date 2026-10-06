@@ -143,7 +143,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             .unwrap_or_else(|| "preloop-runner".to_string())
     });
 
-    // Step 5: Discover pool (F004)
+    // Step 5: Discover pool
     let pool_id =
         discover_pool(&http, &registration.service_url, &registration.oauth_token).await?;
     info!("Discovered pool ID: {pool_id}");
@@ -191,7 +191,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             .context("downloading Node.js externals")?;
     }
 
-    // Step 7: Register agent with the server (F003: correct endpoint)
+    // Step 7: Register agent with the server (correct endpoint)
     let agent_response = create_agent(
         &http,
         &registration,
@@ -207,7 +207,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         .and_then(|v| v.as_i64())
         .unwrap_or(1);
 
-    // Step 7: Persist configuration (F006: .credentials format, F007: .runner fields)
+    // Step 7: Persist configuration (.credentials format,.runner fields)
     // Extract OAuth URL and clientId from the agent creation RESPONSE (golden flow 6)
     // — the server generates these; we never fabricate them.
     let auth_block = agent_response.get("authorization");
@@ -222,14 +222,14 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         .map(String::from)
         .context("agent response missing authorization.clientId")?;
 
-    // F006: .credentials with data map (matching official format)
+    //credentials with data map (matching official format)
     let mut cred_data = serde_json::Map::new();
     cred_data.insert("clientId".to_string(), serde_json::json!(client_id));
     cred_data.insert("authorizationUrl".to_string(), serde_json::json!(auth_url));
     // Extract agent response properties (used for FIPS, auth migration, broker URL)
     let props = agent_response.get("properties");
 
-    // F056: Read requireFipsCryptography from agent response properties
+    // Read requireFipsCryptography from agent response properties
     // instead of hardcoding "True". Official reads properties.RequireFipsCryptography.
     // Default to "True" if not present (matches prior behavior).
     let require_fips = props
@@ -242,7 +242,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         serde_json::json!(require_fips),
     );
 
-    // F053: Extract auth migration fields from agent response properties
+    // Extract auth migration fields from agent response properties
     let enable_auth_migration = props
         .and_then(|p| p.get("EnableAuthMigrationByDefault"))
         .and_then(|v| v.get("$value").or(Some(v)))
@@ -265,7 +265,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     if let Some(url_v2) = auth_url_v2 {
         cred_data.insert("authorizationUrlV2".to_string(), serde_json::json!(url_v2));
     }
-    // P1.1: Extract broker URL from agent response properties.ServerUrlV2
+    // Extract broker URL from agent response properties.ServerUrlV2
     // GitHub returns `properties.ServerUrlV2.$value` = "https://broker.actions.githubusercontent.com/"
     // aksh returns it set to its own server URL. Fall back to registration service URL.
     let server_url_v2 = agent_response
@@ -289,11 +289,11 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             runner_group_id: None,
             runner_group_name: Some(args.runner_group.clone()),
             ephemeral: args.ephemeral,
-            // F007: new fields
+            // new fields
             is_hosted_server: false,
             use_v2_flow: true,
             server_url_v2: Some(server_url_v2),
-            // F052: settings fields (defaults matching official runner)
+            // settings fields (defaults matching official runner)
             disable_update: false,
             skip_session_recover: false,
             monitor_socket_address: None,
@@ -469,7 +469,7 @@ async fn check_existing_agent(
     Ok(None)
 }
 
-/// Create the agent on the server (F003: correct endpoint, F005: full field set).
+/// Create the agent on the server (correct endpoint, full field set).
 async fn create_agent(
     http: &HttpClient,
     reg: &RegistrationResult,
@@ -478,7 +478,7 @@ async fn create_agent(
     args: &ConfigureArgs,
     pool_id: i64,
 ) -> Result<serde_json::Value> {
-    // F003: Use _apis/distributedtask/ (not _apis/v1/)
+    // Use _apis/distributedtask/ (not _apis/v1/)
     let url = format!(
         "{}/_apis/distributedtask/pools/{pool_id}/agents",
         reg.service_url
@@ -507,7 +507,7 @@ async fn create_agent(
         }
     }
 
-    // F005: Full field set matching official runner (golden flow 6)
+    // Full field set matching official runner (golden flow 6)
     let os_description = crate::os_description();
     let agent = serde_json::json!({
         "labels": labels,
@@ -577,7 +577,7 @@ fn export_keypair(
 
 /// Download Node.js externals for running JS-based actions.
 ///
-/// Cache validation (R2): each `externals/nodeXX` must contain `preloop-node.json`
+/// Cache validation : each `externals/nodeXX` must contain `preloop-node.json`
 /// with matching version and a `bin/node --version` that prints `v<version>`.
 /// Stale/missing/mismatched entries are re-materialized (download into temp dir,
 /// verify SHA256 via pinned table + SHASUMS256.txt, atomic rename).

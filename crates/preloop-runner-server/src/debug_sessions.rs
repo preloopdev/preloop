@@ -24,13 +24,14 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use preloop_gha_protocol::debug_session::{
-    AgentAuditEntry, AgentEvent, AgentEventsResponse, AgentLeaseRequest, AgentLeaseResponse,
-    AgentOperation, AgentOperationRequest, AgentOperationResponse, DebugSession,
-    OpenSessionRequest, OpenSessionResponse, SessionState, Verdict, VerdictRequest,
-    VerdictResponse, WorkerTokenRequest, WorkerTokenResponse,
+    DebugSession, OpenSessionRequest, OpenSessionResponse, SessionAuditEntry, SessionEvent,
+    SessionEventsResponse, SessionLeaseRequest, SessionLeaseResponse, SessionOperation,
+    SessionOperationRequest, SessionOperationResponse, SessionState, Verdict, VerdictResponse,
+    WorkerTokenRequest, WorkerTokenResponse,
 };
 
 use crate::auth::{JobRuntimeIdentity, WorkerJob};
+use crate::control::backend::ControlBackend;
 use crate::errors::ApiError;
 use crate::state::SharedState;
 
@@ -73,10 +74,11 @@ const MAX_SESSION_AUDIT: usize = 512;
 /// Retained idempotency records per session.
 const MAX_COMPLETED_OPS: usize = 256;
 
-const AGENT_CONTROL_CAPABILITIES: &[&str] = &["step.retry", "job.retry_from", "job.abort"];
+const CONTROL_CAPABILITIES: &[&str] =
+    &["step.retry", "job.retry_from", "job.continue", "job.abort"];
 
 #[derive(Debug, Clone)]
-pub struct AgentLease {
+pub struct SessionLease {
     lease_id: String,
     controller: String,
     capabilities: Vec<String>,
@@ -106,13 +108,13 @@ pub struct SessionRecord {
     /// Last time the worker polled. Detects an abandoned session.
     pub worker_seen_at: SystemTime,
     /// Single mutating agent controller, if one has leased the session.
-    pub agent_lease: Option<AgentLease>,
+    pub controller_lease: Option<SessionLease>,
     /// Structured events retained for reconnecting agents.
-    pub agent_events: Vec<AgentEvent>,
+    pub session_events: Vec<SessionEvent>,
     /// Mutating agent operations, retained as an audit trail.
-    pub agent_audit: Vec<AgentAuditEntry>,
+    pub session_audit: Vec<SessionAuditEntry>,
     /// Completed requests, so a retry of the same request ID is harmless.
-    pub completed_agent_ops: BTreeMap<String, AgentOperationResponse>,
+    pub completed_ops: BTreeMap<String, SessionOperationResponse>,
 }
 
 impl SessionRecord {
@@ -145,7 +147,7 @@ impl SessionRecord {
         message: Option<String>,
     ) {
         let event_id = self
-            .agent_events
+            .session_events
             .last()
             .map(|entry| entry.event_id + 1)
             .unwrap_or(1);
@@ -159,16 +161,16 @@ impl SessionRecord {
             )
         });
         let capabilities = self
-            .agent_lease
+            .controller_lease
             .as_ref()
             .map(|lease| lease.capabilities.clone())
             .unwrap_or_else(|| {
-                AGENT_CONTROL_CAPABILITIES
+                CONTROL_CAPABILITIES
                     .iter()
                     .map(|capability| (*capability).to_owned())
                     .collect()
             });
-        self.agent_events.push(AgentEvent {
+        self.session_events.push(SessionEvent {
             event_id,
             event: event.to_owned(),
             session_id: self.session.session_id.clone(),
@@ -184,9 +186,9 @@ impl SessionRecord {
         // Oldest first: a reconnecting agent cares about recent history, and
         // `event_id` stays monotonic because it is derived from the last entry
         // rather than from the vector length.
-        if self.agent_events.len() > MAX_SESSION_EVENTS {
-            let excess = self.agent_events.len() - MAX_SESSION_EVENTS;
-            self.agent_events.drain(..excess);
+        if self.session_events.len() > MAX_SESSION_EVENTS {
+            let excess = self.session_events.len() - MAX_SESSION_EVENTS;
+            self.session_events.drain(..excess);
         }
     }
 }
@@ -196,8 +198,8 @@ impl SessionRecord {
 pub struct DebugSessionRegistry {
     sessions: BTreeMap<String, SessionRecord>,
     /// Retained structured history after a worker closes a session.
-    agent_event_archive: BTreeMap<String, Vec<AgentEvent>>,
-    agent_audit_archive: BTreeMap<String, Vec<AgentAuditEntry>>,
+    event_archive: BTreeMap<String, Vec<SessionEvent>>,
+    session_audit_archive: BTreeMap<String, Vec<SessionAuditEntry>>,
     /// Archive insertion order, so the oldest history is the first evicted.
     archive_order: std::collections::VecDeque<String>,
     /// Pause credit banked by sessions that have already left the registry,
@@ -243,10 +245,10 @@ impl DebugSessionRegistry {
             version,
             banked,
             source_revision,
-            agent_lease,
-            agent_events,
-            agent_audit,
-            completed_agent_ops,
+            controller_lease,
+            session_events,
+            session_audit,
+            completed_ops,
         ) = match existing {
             Some((id, old)) => {
                 self.sessions.remove(&id);
@@ -255,10 +257,10 @@ impl DebugSessionRegistry {
                     old.session.version + 1,
                     old.session.paused_seconds,
                     old.session.source_revision,
-                    old.agent_lease,
-                    old.agent_events,
-                    old.agent_audit,
-                    old.completed_agent_ops,
+                    old.controller_lease,
+                    old.session_events,
+                    old.session_audit,
+                    old.completed_ops,
                 )
             }
             None => (
@@ -309,10 +311,10 @@ impl DebugSessionRegistry {
             pending_retry_from_step: None,
             paused_since: Some(now),
             worker_seen_at: now,
-            agent_lease,
-            agent_events,
-            agent_audit,
-            completed_agent_ops,
+            controller_lease,
+            session_events,
+            session_audit,
+            completed_ops,
         };
         record.push_event("step_failed", Some(record.session.step.clone()), None);
         self.sessions.insert(session_id, record);
@@ -320,39 +322,18 @@ impl DebugSessionRegistry {
         session
     }
 
-    /// Record a controller's decision. Returns the updated session.
-    pub fn set_verdict(&mut self, session_id: &str, req: &VerdictRequest) -> Option<DebugSession> {
-        let record = self.sessions.get_mut(session_id)?;
-        record.pending_verdict = Some(req.verdict);
-        record.pending_revert = req.revert;
-        record.pending_revision = req.source_revision.clone();
-        record.pending_retry_from_step = req.retry_from_step;
-        if let Some(revision) = &req.source_revision {
-            record.session.source_revision = revision.clone();
-        }
-        record.session.controller = req.controller.clone();
-        record.session.version += 1;
-        record.session.state = match req.verdict {
-            Verdict::Retry => SessionState::Retrying,
-            Verdict::Continue => SessionState::Resumed,
-            Verdict::Abort => SessionState::Aborted,
-        };
-        self.notify.notify_waiters();
-        Some(record.session.clone())
-    }
-
-    pub fn acquire_agent_lease(
+    pub fn acquire_controller_lease(
         &mut self,
         session_id: &str,
-        req: &AgentLeaseRequest,
-    ) -> Result<AgentLeaseResponse, String> {
+        req: &SessionLeaseRequest,
+    ) -> Result<SessionLeaseResponse, String> {
         if req.controller.trim().is_empty() {
             return Err("controller must not be empty".to_owned());
         }
         // Agents always receive every supported capability.  The field
         // exists so a future sandboxed-agent mode can restrict it; for now
         // the full set is unconditional.
-        let requested: Vec<String> = AGENT_CONTROL_CAPABILITIES
+        let requested: Vec<String> = CONTROL_CAPABILITIES
             .iter()
             .map(|capability| (*capability).to_owned())
             .collect();
@@ -360,9 +341,9 @@ impl DebugSessionRegistry {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if let Some(existing) = &record.agent_lease {
+        if let Some(existing) = &record.controller_lease {
             if existing.controller == req.controller {
-                return Ok(AgentLeaseResponse {
+                return Ok(SessionLeaseResponse {
                     lease_id: existing.lease_id.clone(),
                     controller: existing.controller.clone(),
                     capabilities: existing.capabilities.clone(),
@@ -374,51 +355,55 @@ impl DebugSessionRegistry {
                 existing.controller
             ));
         }
-        let lease = AgentLease {
+        let lease = SessionLease {
             lease_id: format!("lease_{}", uuid::Uuid::new_v4().simple()),
             controller: req.controller.clone(),
             capabilities: requested,
         };
-        let response = AgentLeaseResponse {
+        let response = SessionLeaseResponse {
             lease_id: lease.lease_id.clone(),
             controller: lease.controller.clone(),
             capabilities: lease.capabilities.clone(),
             session_version: record.session.version,
         };
-        record.agent_lease = Some(lease);
+        record.controller_lease = Some(lease);
         record.push_event("agent_attached", None, Some(req.controller.clone()));
         self.notify.notify_waiters();
         Ok(response)
     }
 
-    pub fn release_agent_lease(&mut self, session_id: &str, lease_id: &str) -> Result<(), String> {
+    pub fn release_controller_lease(
+        &mut self,
+        session_id: &str,
+        lease_id: &str,
+    ) -> Result<(), String> {
         let record = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if record
-            .agent_lease
+            .controller_lease
             .as_ref()
             .is_none_or(|lease| lease.lease_id != lease_id)
         {
             return Err("invalid agent lease".to_owned());
         }
-        let controller = record.agent_lease.take().map(|lease| lease.controller);
+        let controller = record.controller_lease.take().map(|lease| lease.controller);
         record.push_event("agent_detached", None, controller);
         self.notify.notify_waiters();
         Ok(())
     }
 
-    pub fn agent_events(
+    pub fn session_events(
         &self,
         session_id: &str,
         after: u64,
-    ) -> Result<AgentEventsResponse, String> {
+    ) -> Result<SessionEventsResponse, String> {
         let all_events = self
             .sessions
             .get(session_id)
-            .map(|record| record.agent_events.clone())
-            .or_else(|| self.agent_event_archive.get(session_id).cloned())
+            .map(|record| record.session_events.clone())
+            .or_else(|| self.event_archive.get(session_id).cloned())
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         let next_event_id = all_events.last().map_or(after, |event| event.event_id);
         let events = all_events
@@ -426,25 +411,25 @@ impl DebugSessionRegistry {
             .filter(|event| event.event_id > after)
             .cloned()
             .collect::<Vec<_>>();
-        Ok(AgentEventsResponse {
+        Ok(SessionEventsResponse {
             events,
             next_event_id,
         })
     }
 
-    pub fn agent_audit(&self, session_id: &str) -> Result<Vec<AgentAuditEntry>, String> {
+    pub fn session_audit(&self, session_id: &str) -> Result<Vec<SessionAuditEntry>, String> {
         self.sessions
             .get(session_id)
-            .map(|record| record.agent_audit.clone())
-            .or_else(|| self.agent_audit_archive.get(session_id).cloned())
+            .map(|record| record.session_audit.clone())
+            .or_else(|| self.session_audit_archive.get(session_id).cloned())
             .ok_or_else(|| format!("no such session: {session_id}"))
     }
 
-    pub fn agent_operation(
+    pub fn session_operation(
         &mut self,
         session_id: &str,
-        req: AgentOperationRequest,
-    ) -> Result<AgentOperationResponse, String> {
+        req: SessionOperationRequest,
+    ) -> Result<SessionOperationResponse, String> {
         if req.request_id.trim().is_empty() {
             return Err("request_id must not be empty".to_owned());
         }
@@ -452,11 +437,11 @@ impl DebugSessionRegistry {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if let Some(previous) = record.completed_agent_ops.get(&req.request_id) {
+        if let Some(previous) = record.completed_ops.get(&req.request_id) {
             return Ok(previous.clone());
         }
         let (lease_id, controller, capabilities) = record
-            .agent_lease
+            .controller_lease
             .as_ref()
             .map(|lease| {
                 (
@@ -470,16 +455,17 @@ impl DebugSessionRegistry {
             return Err("invalid agent lease".to_owned());
         }
         let required_capability = match &req.operation {
-            AgentOperation::Retry { .. } => "step.retry",
-            AgentOperation::RetryFrom { .. } => "job.retry_from",
-            AgentOperation::Abort => "job.abort",
+            SessionOperation::Retry { .. } => "step.retry",
+            SessionOperation::RetryFrom { .. } => "job.retry_from",
+            SessionOperation::Continue => "job.continue",
+            SessionOperation::Abort => "job.abort",
         };
         if !capabilities
             .iter()
             .any(|capability| capability == required_capability)
         {
             return Err(format!(
-                "agent lease lacks capability `{required_capability}`"
+                "controller lease lacks capability `{required_capability}`"
             ));
         }
         if req.expected_version != record.session.version {
@@ -489,11 +475,24 @@ impl DebugSessionRegistry {
             ));
         }
 
-        let (verdict, retry_from_step, revert, event, status) = match req.operation {
-            AgentOperation::Retry { revert } => {
-                (Verdict::Retry, None, revert, "retry_requested", "retrying")
-            }
-            AgentOperation::RetryFrom { step_index, revert } => {
+        let (verdict, retry_from_step, revert, source_revision, event, status) = match req.operation
+        {
+            SessionOperation::Retry {
+                revert,
+                source_revision,
+            } => (
+                Verdict::Retry,
+                None,
+                revert,
+                source_revision,
+                "retry_requested",
+                "retrying",
+            ),
+            SessionOperation::RetryFrom {
+                step_index,
+                revert,
+                source_revision,
+            } => {
                 if step_index > record.session.step.index {
                     return Err(format!(
                         "step {step_index} is after failed step {}",
@@ -510,14 +509,24 @@ impl DebugSessionRegistry {
                     Verdict::Retry,
                     Some(step_index),
                     revert,
+                    source_revision,
                     "retry_from_requested",
                     "retrying",
                 )
             }
-            AgentOperation::Abort => (
+            SessionOperation::Continue => (
+                Verdict::Continue,
+                None,
+                Default::default(),
+                None,
+                "continue_requested",
+                "resuming",
+            ),
+            SessionOperation::Abort => (
                 Verdict::Abort,
                 None,
                 Default::default(),
+                None,
                 "abort_requested",
                 "aborting",
             ),
@@ -526,8 +535,11 @@ impl DebugSessionRegistry {
         let prev_version = record.session.version;
         record.pending_verdict = Some(verdict);
         record.pending_revert = revert;
-        record.pending_revision = None;
+        record.pending_revision = source_revision.clone();
         record.pending_retry_from_step = retry_from_step;
+        if let Some(revision) = &source_revision {
+            record.session.source_revision = revision.clone();
+        }
         record.session.controller = Some(controller.clone());
         record.session.version += 1;
         record.session.state = match verdict {
@@ -536,14 +548,14 @@ impl DebugSessionRegistry {
             Verdict::Continue => SessionState::Resumed,
         };
         record.push_event(event, None, Some(format!("request_id={}", req.request_id)));
-        let response = AgentOperationResponse {
+        let response = SessionOperationResponse {
             request_id: req.request_id.clone(),
             prev_version,
             new_version: record.session.version,
             status: status.to_owned(),
             session: record.session.clone(),
         };
-        record.agent_audit.push(AgentAuditEntry {
+        record.session_audit.push(SessionAuditEntry {
             request_id: req.request_id.clone(),
             controller,
             operation: event.to_owned(),
@@ -555,22 +567,22 @@ impl DebugSessionRegistry {
                 .unwrap_or_default()
                 .as_millis() as u64,
         });
-        if record.agent_audit.len() > MAX_SESSION_AUDIT {
-            let excess = record.agent_audit.len() - MAX_SESSION_AUDIT;
-            record.agent_audit.drain(..excess);
+        if record.session_audit.len() > MAX_SESSION_AUDIT {
+            let excess = record.session_audit.len() - MAX_SESSION_AUDIT;
+            record.session_audit.drain(..excess);
         }
         record
-            .completed_agent_ops
+            .completed_ops
             .insert(req.request_id, response.clone());
         // Idempotency only has to survive a client retry, not the whole
         // session. Evicting in key order is arbitrary but bounded, and a
         // replay past the bound re-executes rather than corrupting anything —
         // the `expected_version` check rejects it.
-        while record.completed_agent_ops.len() > MAX_COMPLETED_OPS {
-            let Some(oldest) = record.completed_agent_ops.keys().next().cloned() else {
+        while record.completed_ops.len() > MAX_COMPLETED_OPS {
+            let Some(oldest) = record.completed_ops.keys().next().cloned() else {
                 break;
             };
-            record.completed_agent_ops.remove(&oldest);
+            record.completed_ops.remove(&oldest);
         }
         self.notify.notify_waiters();
         Ok(response)
@@ -590,6 +602,7 @@ impl DebugSessionRegistry {
         Some(VerdictResponse {
             verdict,
             snapshot_token: None,
+            snapshot_auth_header: None,
             version: record.session.version,
             revert: record.pending_revert,
             source_revision: record.pending_revision.clone(),
@@ -603,7 +616,7 @@ impl DebugSessionRegistry {
             && self
                 .sessions
                 .get(session_id)
-                .and_then(|record| record.agent_lease.as_ref())
+                .and_then(|record| record.controller_lease.as_ref())
                 .is_some();
         if let Some(record) = self.sessions.get_mut(session_id) {
             record.bank_paused(now);
@@ -634,18 +647,18 @@ impl DebugSessionRegistry {
             Duration::from_secs(record.session.paused_seconds),
         );
         if self
-            .agent_event_archive
-            .insert(session_id.clone(), record.agent_events)
+            .event_archive
+            .insert(session_id.clone(), record.session_events)
             .is_none()
         {
             self.archive_order.push_back(session_id.clone());
         }
-        self.agent_audit_archive
-            .insert(session_id, record.agent_audit);
+        self.session_audit_archive
+            .insert(session_id, record.session_audit);
         while self.archive_order.len() > MAX_ARCHIVED_SESSIONS {
             if let Some(evicted) = self.archive_order.pop_front() {
-                self.agent_event_archive.remove(&evicted);
-                self.agent_audit_archive.remove(&evicted);
+                self.event_archive.remove(&evicted);
+                self.session_audit_archive.remove(&evicted);
             }
         }
     }
@@ -740,8 +753,8 @@ impl DebugSessionRegistry {
             .collect();
         for id in stale {
             self.sessions.remove(&id);
-            self.agent_event_archive.remove(&id);
-            self.agent_audit_archive.remove(&id);
+            self.event_archive.remove(&id);
+            self.session_audit_archive.remove(&id);
             self.archive_order.retain(|archived| archived != &id);
         }
     }
@@ -790,8 +803,7 @@ impl DebugSessionRegistry {
     /// Resolve a user-supplied reference: full session id, or a unique prefix
     /// of a session id or run id.
     pub fn resolve(&self, reference: &str) -> Option<String> {
-        if self.sessions.contains_key(reference) || self.agent_event_archive.contains_key(reference)
-        {
+        if self.sessions.contains_key(reference) || self.event_archive.contains_key(reference) {
             return Some(reference.to_owned());
         }
         let matches: Vec<&String> = self
@@ -868,65 +880,16 @@ pub async fn issue_worker_token(
             "a job may only acquire its own debug-worker token",
         ));
     }
-    let mut inner = shared.state.inner.lock().await;
-
     // Keyed on the agent job GUID for the same reason `open_session` is: it is
     // what the worker knows itself as, and it separates matrix legs sharing a
-    // workflow-level job id.
-    let request_id = inner
-        .agent_job_requests
-        .get(&req.agent_job_id)
-        .copied()
-        .filter(|id| {
-            inner
-                .job_requests
-                .get(id)
-                .is_some_and(|record| record.result.is_none())
-        })
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "no active job request for agent job {}",
-                req.agent_job_id
-            ))
-        })?;
-
-    let record = inner
-        .job_requests
-        .get(&request_id)
-        .expect("request id came from a liveness-filtered lookup");
-    let (run_id, plan_id, already_issued) = (
-        record.run_id,
-        record.plan_id.clone(),
-        record.debug_token_issued,
-    );
-
-    // The runner only builds a pause client under `preloopPreserveOnFailure`,
-    // so gating on the same flag issues the credential exactly when it is
-    // used, and never otherwise.
-    let preserve = inner
-        .runs
-        .get(&run_id)
-        .is_some_and(|run| run.submission.preserve_on_failure);
-    if !preserve {
-        return Err(ApiError::forbidden(
-            "this run did not enable pause-on-failure",
-        ));
-    }
-    if already_issued {
-        // Distinct from a 403 so a worker can tell "someone beat me to it"
-        // from "not allowed at all" in its log.
-        return Err(ApiError::conflict(format!(
-            "debug-worker token already issued for agent job {}",
-            req.agent_job_id
-        )));
-    }
-
-    inner
-        .job_requests
-        .get_mut(&request_id)
-        .expect("request id came from a liveness-filtered lookup")
-        .debug_token_issued = true;
-    drop(inner);
+    // workflow-level job id. The liveness check, the preserve-on-failure gate
+    // and the one-shot `debug_token_issued` mark commit as one transaction.
+    let (run_id, plan_id) = shared
+        .state
+        .backend
+        .issue_debug_token(req.agent_job_id)
+        .await
+        .map_err(ApiError::from)?;
 
     info!(
         %run_id,
@@ -956,26 +919,31 @@ pub async fn open_session(
         ));
     }
     let now = SystemTime::now();
-    let mut inner = shared.state.inner.lock().await;
+    let agent_job_id = req.agent_job_id;
 
     // Keyed on the agent job GUID: it is what the worker knows itself as, and
     // it disambiguates matrix legs that share a workflow-level job id.
-    let request_id = inner
-        .agent_job_requests
-        .get(&req.agent_job_id)
-        .copied()
-        .filter(|id| {
-            inner
-                .job_requests
-                .get(id)
-                .is_some_and(|record| record.result.is_none())
-        })
+    let active = match shared
+        .state
+        .backend
+        .request(crate::control::backend::RequestKey::AgentJobId(
+            agent_job_id,
+        ))
+        .await
+    {
+        Ok(record) => Some(record).filter(|record| record.result.is_none()),
+        Err(crate::control::ControlError::NotFound(_)) => None,
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    let request_id = active
         .ok_or_else(|| {
             ApiError::not_found(format!(
-                "no active job request for agent job {}",
-                req.agent_job_id
+                "no active job request for agent job {agent_job_id}"
             ))
-        })?;
+        })?
+        .request_id;
+
+    let mut inner = shared.state.inner.lock().await;
 
     let run_id = req.run_id;
     let job_name = req.job_name.clone();
@@ -1000,7 +968,7 @@ pub async fn open_session(
 pub struct VerdictPollQuery {
     /// Seconds to hold the request open. Clamped to [`VERDICT_POLL_MAX`].
     #[serde(default)]
-    wait: Option<u64>,
+    pub(crate) wait: Option<u64>,
 }
 
 /// Confirm the caller owns the session it named, and return its canonical id.
@@ -1061,16 +1029,42 @@ pub async fn poll_verdict(
                 // the time a human answers. Mint a replacement now so the
                 // replayed checkout authenticates. The worker only applies
                 // it to steps the message marks as pinned.
+                let record = inner
+                    .debug_sessions
+                    .get(&session_id)
+                    .map(|record| (record.request_id, record.agent_job_id));
+                // Drop the node-local lock before touching the backend: a
+                // Postgres reader checkout can wait on the pool, and every
+                // other `inner` user on this node would stall behind us.
+                drop(inner);
                 if response.verdict == Some(Verdict::Retry)
                     && response.snapshot_token.is_none()
-                    && let Some(record) = inner.debug_sessions.get(&session_id)
-                    && let Some(request) = inner.job_requests.get(&record.request_id)
+                    && let Some((request_id, agent_job_id)) = record
                 {
-                    response.snapshot_token = Some(
-                        shared
-                            .state
-                            .mint_runtime_token(&request.plan_id, &record.agent_job_id),
-                    );
+                    let plan_id = match shared
+                        .state
+                        .backend
+                        .request(crate::control::backend::RequestKey::Id(request_id))
+                        .await
+                    {
+                        Ok(request) => Some(request.plan_id),
+                        Err(crate::control::ControlError::NotFound(_)) => None,
+                        Err(error) => return Err(ApiError::from(error)),
+                    };
+                    if let Some(plan_id) = plan_id {
+                        let fresh = shared.state.mint_runtime_token(&plan_id, &agent_job_id);
+                        response.snapshot_token = Some(fresh.clone());
+                        // The origin-rewrite `authHeader` the job env
+                        // carries is the same runtime token in Basic
+                        // form (see runs::build_job_artifacts and
+                        // broker::re_mint_snapshot_credentials); send it
+                        // too so a replayed `git fetch` authenticates.
+                        use base64::Engine as _;
+                        let credentials = base64::engine::general_purpose::STANDARD
+                            .encode(format!("x-access-token:{fresh}"));
+                        response.snapshot_auth_header =
+                            Some(format!("AUTHORIZATION: basic {credentials}"));
+                    }
                 }
                 return Ok(Json(response));
             }
@@ -1134,46 +1128,12 @@ pub async fn get_session(
     Ok(Json(record.session.clone()))
 }
 
-/// Controller: issue a verdict.
-pub async fn post_verdict(
-    State(shared): State<Arc<SharedState>>,
-    Path(reference): Path<String>,
-    Json(req): Json<VerdictRequest>,
-) -> Result<Json<DebugSession>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    let id = inner
-        .debug_sessions
-        .resolve(&reference)
-        .ok_or_else(|| ApiError::not_found(format!("no session matching: {reference}")))?;
-    if inner
-        .debug_sessions
-        .get(&id)
-        .and_then(|record| record.agent_lease.as_ref())
-        .is_some()
-    {
-        return Err(ApiError::forbidden(
-            "session is controlled by an agent; release its lease before taking over",
-        ));
-    }
-    let session = inner
-        .debug_sessions
-        .set_verdict(&id, &req)
-        .ok_or_else(|| ApiError::not_found(format!("no such session: {id}")))?;
-    info!(
-        session = %id,
-        verdict = req.verdict.as_str(),
-        controller = req.controller.as_deref().unwrap_or("-"),
-        "debug verdict issued"
-    );
-    Ok(Json(session))
-}
-
-/// Agent: acquire the single mutating controller lease.
-pub async fn agent_acquire_lease(
+/// Controller: acquire the single mutating session lease.
+pub async fn acquire_lease(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
-    Json(req): Json<AgentLeaseRequest>,
-) -> Result<Json<AgentLeaseResponse>, ApiError> {
+    Json(req): Json<SessionLeaseRequest>,
+) -> Result<Json<SessionLeaseResponse>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
     let id = inner
         .debug_sessions
@@ -1181,13 +1141,13 @@ pub async fn agent_acquire_lease(
         .ok_or_else(|| ApiError::not_found(format!("no session matching: {session_id}")))?;
     inner
         .debug_sessions
-        .acquire_agent_lease(&id, &req)
+        .acquire_controller_lease(&id, &req)
         .map(Json)
         .map_err(ApiError::bad_request)
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AgentEventsQuery {
+pub struct SessionEventsQuery {
     #[serde(default)]
     after: u64,
     /// Seconds to wait for a new event when the cursor is current.
@@ -1196,11 +1156,11 @@ pub struct AgentEventsQuery {
 }
 
 /// Agent: fetch structured events after a sequence number.
-pub async fn agent_events(
+pub async fn session_events(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
-    Query(query): Query<AgentEventsQuery>,
-) -> Result<Json<AgentEventsResponse>, ApiError> {
+    Query(query): Query<SessionEventsQuery>,
+) -> Result<Json<SessionEventsResponse>, ApiError> {
     let wait = query
         .wait
         .map(Duration::from_secs)
@@ -1218,7 +1178,7 @@ pub async fn agent_events(
                 .ok_or_else(|| ApiError::not_found(format!("no session matching: {session_id}")))?;
             let response = inner
                 .debug_sessions
-                .agent_events(&id, query.after)
+                .session_events(&id, query.after)
                 .map_err(ApiError::not_found)?;
             if !response.events.is_empty() || tokio::time::Instant::now() >= deadline {
                 return Ok(Json(response));
@@ -1232,11 +1192,11 @@ pub async fn agent_events(
 }
 
 /// Agent: submit an idempotent, versioned operation.
-pub async fn agent_operation(
+pub async fn session_operation(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
-    Json(req): Json<AgentOperationRequest>,
-) -> Result<Json<AgentOperationResponse>, ApiError> {
+    Json(req): Json<SessionOperationRequest>,
+) -> Result<Json<SessionOperationResponse>, ApiError> {
     let mut inner = shared.state.inner.lock().await;
     let id = inner
         .debug_sessions
@@ -1244,13 +1204,13 @@ pub async fn agent_operation(
         .ok_or_else(|| ApiError::not_found(format!("no session matching: {session_id}")))?;
     inner
         .debug_sessions
-        .agent_operation(&id, req)
+        .session_operation(&id, req)
         .map(Json)
         .map_err(ApiError::bad_request)
 }
 
 /// Agent: release the controller lease without changing job state.
-pub async fn agent_release_lease(
+pub async fn release_lease(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
     Json(req): Json<serde_json::Value>,
@@ -1266,16 +1226,16 @@ pub async fn agent_release_lease(
         .ok_or_else(|| ApiError::not_found(format!("no session matching: {session_id}")))?;
     inner
         .debug_sessions
-        .release_agent_lease(&id, lease_id)
+        .release_controller_lease(&id, lease_id)
         .map_err(ApiError::bad_request)?;
     Ok(Json(json!({ "released": true })))
 }
 
 /// Agent: retrieve the mutation audit trail for an open session.
-pub async fn agent_audit(
+pub async fn session_audit(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
-) -> Result<Json<Vec<AgentAuditEntry>>, ApiError> {
+) -> Result<Json<Vec<SessionAuditEntry>>, ApiError> {
     let inner = shared.state.inner.lock().await;
     let id = inner
         .debug_sessions
@@ -1283,7 +1243,7 @@ pub async fn agent_audit(
         .ok_or_else(|| ApiError::not_found(format!("no session matching: {session_id}")))?;
     inner
         .debug_sessions
-        .agent_audit(&id)
+        .session_audit(&id)
         .map(Json)
         .map_err(ApiError::not_found)
 }
@@ -1352,6 +1312,48 @@ mod tests {
         let id = session.session_id.clone();
         (registry, id)
     }
+    /// Drive a session through the unified controller path: acquire the lease,
+    /// issue the operation, release the lease, return the response. Mirrors
+    /// what the CLI/agent do over HTTP, without the transport.
+    fn ctrl(
+        registry: &mut DebugSessionRegistry,
+        session_id: &str,
+        operation: SessionOperation,
+    ) -> SessionOperationResponse {
+        let lease = registry
+            .acquire_controller_lease(
+                session_id,
+                &SessionLeaseRequest {
+                    controller: "test".to_owned(),
+                    capabilities: Vec::new(),
+                },
+            )
+            .expect("lease");
+        let response = registry
+            .session_operation(
+                session_id,
+                SessionOperationRequest {
+                    request_id: format!("t-{}", operation_tag(&operation)),
+                    expected_version: lease.session_version,
+                    lease_id: lease.lease_id.clone(),
+                    operation,
+                },
+            )
+            .expect("operation");
+        registry
+            .release_controller_lease(session_id, &lease.lease_id)
+            .expect("release");
+        response
+    }
+
+    fn operation_tag(operation: &SessionOperation) -> &'static str {
+        match operation {
+            SessionOperation::Retry { .. } => "retry",
+            SessionOperation::RetryFrom { .. } => "retry_from",
+            SessionOperation::Continue => "continue",
+            SessionOperation::Abort => "abort",
+        }
+    }
 
     #[test]
     fn pause_accrues_until_the_verdict_is_delivered() {
@@ -1360,14 +1362,12 @@ mod tests {
         // Still paused 60s in: the whole interval is excluded from timeout.
         assert_eq!(registry.paused_for_request(7, at(60)).as_secs(), 60);
 
-        registry.set_verdict(
+        ctrl(
+            &mut registry,
             &id,
-            &VerdictRequest {
-                verdict: Verdict::Retry,
+            SessionOperation::Retry {
                 revert: Default::default(),
-                controller: Some("cli".to_owned()),
                 source_revision: None,
-                retry_from_step: None,
             },
         );
 
@@ -1397,14 +1397,12 @@ mod tests {
         let job_id = JobId("build".to_owned());
 
         let first = registry.open(7, test_open_request(run_id, job_id.clone()), at(0));
-        registry.set_verdict(
+        ctrl(
+            &mut registry,
             &first.session_id,
-            &VerdictRequest {
-                verdict: Verdict::Retry,
+            SessionOperation::Retry {
                 revert: Default::default(),
-                controller: None,
                 source_revision: Some("repair-1".to_owned()),
-                retry_from_step: None,
             },
         );
         registry.take_verdict(&first.session_id, at(50));
@@ -1451,16 +1449,7 @@ mod tests {
     #[test]
     fn credit_survives_the_close_that_resumes_the_job() {
         let (mut registry, id) = registry_with_session();
-        registry.set_verdict(
-            &id,
-            &VerdictRequest {
-                verdict: Verdict::Continue,
-                revert: Default::default(),
-                controller: Some("cli".to_owned()),
-                source_revision: None,
-                retry_from_step: None,
-            },
-        );
+        ctrl(&mut registry, &id, SessionOperation::Continue);
         registry.take_verdict(&id, at(100));
         registry.close(&id, SessionState::Resumed, at(100));
 
@@ -1478,12 +1467,9 @@ mod tests {
         let mut registry = DebugSessionRegistry::default();
         let run_id = RunId::new();
         let job_id = JobId("build".to_owned());
-        let retry = VerdictRequest {
-            verdict: Verdict::Retry,
+        let retry = SessionOperation::Retry {
             revert: Default::default(),
-            controller: None,
             source_revision: None,
-            retry_from_step: None,
         };
 
         // Three failures, each paused 100s and closed before the next attempt.
@@ -1491,7 +1477,7 @@ mod tests {
             let opened_at = attempt * 200;
             let session =
                 registry.open(7, test_open_request(run_id, job_id.clone()), at(opened_at));
-            registry.set_verdict(&session.session_id, &retry);
+            ctrl(&mut registry, &session.session_id, retry.clone());
             registry.take_verdict(&session.session_id, at(opened_at + 100));
             registry.close(
                 &session.session_id,
@@ -1521,14 +1507,12 @@ mod tests {
         // Three quarters of the ceiling, banked and retired.
         let long_pause = MAX_PAUSE_CREDIT.as_secs() * 3 / 4;
         let first = registry.open(7, test_open_request(run_id, job_id.clone()), at(0));
-        registry.set_verdict(
+        ctrl(
+            &mut registry,
             &first.session_id,
-            &VerdictRequest {
-                verdict: Verdict::Retry,
+            SessionOperation::Retry {
                 revert: Default::default(),
-                controller: None,
                 source_revision: None,
-                retry_from_step: None,
             },
         );
         registry.take_verdict(&first.session_id, at(long_pause));
@@ -1564,7 +1548,7 @@ mod tests {
         let (mut registry, id) = registry_with_session();
         registry.close(&id, SessionState::Aborted, at(100));
         // Archived, not merely dropped: an agent can still read the history.
-        assert!(registry.agent_events(&id, 0).is_ok());
+        assert!(registry.session_events(&id, 0).is_ok());
         assert_eq!(registry.paused_for_request(7, at(100)).as_secs(), 100);
 
         // Reaper ticks pass with the job still winding down.
@@ -1645,20 +1629,9 @@ mod tests {
     #[test]
     fn abort_verdict_closes_the_session() {
         let (mut registry, id) = registry_with_session();
-        let updated = registry
-            .set_verdict(
-                &id,
-                &VerdictRequest {
-                    verdict: Verdict::Abort,
-                    revert: Default::default(),
-                    controller: None,
-                    source_revision: None,
-                    retry_from_step: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(updated.state, SessionState::Aborted);
-        assert!(!updated.state.is_open());
+        let updated = ctrl(&mut registry, &id, SessionOperation::Abort);
+        assert_eq!(updated.session.state, SessionState::Aborted);
+        assert!(!updated.session.state.is_open());
         assert!(registry.list().is_empty());
     }
 
@@ -1686,14 +1659,13 @@ mod tests {
     #[test]
     fn verdict_records_the_source_revision_for_the_next_attempt() {
         let (mut registry, id) = registry_with_session();
-        registry.set_verdict(
+        ctrl(
+            &mut registry,
             &id,
-            &VerdictRequest {
-                verdict: Verdict::Retry,
+            SessionOperation::RetryFrom {
+                step_index: 0,
                 revert: Default::default(),
-                controller: Some("agent".to_owned()),
                 source_revision: Some("repair-1".to_owned()),
-                retry_from_step: Some(0),
             },
         );
         let delivered = registry.take_verdict(&id, at(10)).unwrap();
@@ -1735,19 +1707,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_lease_is_single_controller_and_idempotent() {
+    fn controller_lease_is_single_controller_and_idempotent() {
         let (mut registry, id) = registry_with_session();
-        let request = AgentLeaseRequest {
+        let request = SessionLeaseRequest {
             controller: "agent-1".to_owned(),
             capabilities: vec!["job.retry_from".to_owned()],
         };
-        let first = registry.acquire_agent_lease(&id, &request).unwrap();
-        let again = registry.acquire_agent_lease(&id, &request).unwrap();
+        let first = registry.acquire_controller_lease(&id, &request).unwrap();
+        let again = registry.acquire_controller_lease(&id, &request).unwrap();
         assert_eq!(first, again);
 
-        let other = registry.acquire_agent_lease(
+        let other = registry.acquire_controller_lease(
             &id,
-            &AgentLeaseRequest {
+            &SessionLeaseRequest {
                 controller: "agent-2".to_owned(),
                 capabilities: Vec::new(),
             },
@@ -1756,79 +1728,82 @@ mod tests {
     }
 
     #[test]
-    fn agent_events_and_operations_are_structured_and_idempotent() {
+    fn session_events_and_operations_are_structured_and_idempotent() {
         let (mut registry, id) = registry_with_session();
         let lease = registry
-            .acquire_agent_lease(
+            .acquire_controller_lease(
                 &id,
-                &AgentLeaseRequest {
+                &SessionLeaseRequest {
                     controller: "agent".to_owned(),
                     capabilities: vec!["job.retry_from".to_owned()],
                 },
             )
             .unwrap();
-        let events = registry.agent_events(&id, 0).unwrap();
+        let events = registry.session_events(&id, 0).unwrap();
         assert_eq!(events.events.len(), 2);
         assert_eq!(events.events[0].event, "step_failed");
         assert_eq!(events.events[1].event, "agent_attached");
 
-        let request = AgentOperationRequest {
+        let request = SessionOperationRequest {
             request_id: "retry-1".to_owned(),
             expected_version: 1,
             lease_id: lease.lease_id,
-            operation: AgentOperation::RetryFrom {
+            operation: SessionOperation::RetryFrom {
                 step_index: 0,
                 revert: Default::default(),
+                source_revision: None,
             },
         };
-        let response = registry.agent_operation(&id, request.clone()).unwrap();
+        let response = registry.session_operation(&id, request.clone()).unwrap();
         assert_eq!(response.prev_version, 1);
         assert_eq!(response.new_version, 2);
         assert_eq!(response.status, "retrying");
         assert_eq!(response.session.state, SessionState::Retrying);
 
-        let duplicate = registry.agent_operation(&id, request).unwrap();
+        let duplicate = registry.session_operation(&id, request).unwrap();
         assert_eq!(duplicate, response);
 
-        let audit = registry.agent_audit(&id).unwrap();
+        let audit = registry.session_audit(&id).unwrap();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].request_id, "retry-1");
     }
 
     #[test]
-    fn agent_operations_reject_stale_versions_and_future_steps() {
+    fn session_operations_reject_stale_versions_and_future_steps() {
         let (mut registry, id) = registry_with_session();
         let lease = registry
-            .acquire_agent_lease(
+            .acquire_controller_lease(
                 &id,
-                &AgentLeaseRequest {
+                &SessionLeaseRequest {
                     controller: "agent".to_owned(),
                     capabilities: Vec::new(),
                 },
             )
             .unwrap();
-        let stale = registry.agent_operation(
+        let stale = registry.session_operation(
             &id,
-            AgentOperationRequest {
+            SessionOperationRequest {
                 request_id: "stale".to_owned(),
                 expected_version: 0,
                 lease_id: lease.lease_id.clone(),
-                operation: AgentOperation::Retry {
+                operation: SessionOperation::Retry {
                     revert: Default::default(),
+                    source_revision: None,
                 },
             },
         );
         assert!(stale.unwrap_err().contains("stale session version"));
 
-        let future = registry.agent_operation(
+        let future = registry.session_operation(
             &id,
-            AgentOperationRequest {
+            SessionOperationRequest {
                 request_id: "future".to_owned(),
                 expected_version: 1,
                 lease_id: lease.lease_id,
-                operation: AgentOperation::RetryFrom {
+                operation: SessionOperation::RetryFrom {
                     step_index: 2,
                     revert: Default::default(),
+                    source_revision: None,
                 },
             },
         );
@@ -1839,56 +1814,57 @@ mod tests {
     fn agent_history_survives_session_close() {
         let (mut registry, id) = registry_with_session();
         let lease = registry
-            .acquire_agent_lease(
+            .acquire_controller_lease(
                 &id,
-                &AgentLeaseRequest {
+                &SessionLeaseRequest {
                     controller: "agent".to_owned(),
                     capabilities: Vec::new(),
                 },
             )
             .unwrap();
         registry
-            .agent_operation(
+            .session_operation(
                 &id,
-                AgentOperationRequest {
+                SessionOperationRequest {
                     request_id: "abort-1".to_owned(),
                     expected_version: 1,
                     lease_id: lease.lease_id,
-                    operation: AgentOperation::Abort,
+                    operation: SessionOperation::Abort,
                 },
             )
             .unwrap();
         registry.close(&id, SessionState::Aborted, at(1));
 
         assert!(!registry.sessions.contains_key(&id));
-        assert_eq!(registry.agent_events(&id, 0).unwrap().events.len(), 4);
-        assert_eq!(registry.agent_audit(&id).unwrap().len(), 1);
+        assert_eq!(registry.session_events(&id, 0).unwrap().events.len(), 4);
+        assert_eq!(registry.session_audit(&id).unwrap().len(), 1);
     }
 
     #[test]
-    fn agent_lease_survives_a_retry_transition_to_the_next_pause() {
+    fn controller_lease_survives_a_retry_transition_to_the_next_pause() {
         let run_id = RunId::new();
         let job_id = JobId("build".to_owned());
         let mut registry = DebugSessionRegistry::default();
         let first = registry.open(7, test_open_request(run_id, job_id.clone()), at(0));
         let lease = registry
-            .acquire_agent_lease(
+            .acquire_controller_lease(
                 &first.session_id,
-                &AgentLeaseRequest {
+                &SessionLeaseRequest {
                     controller: "agent".to_owned(),
                     capabilities: Vec::new(),
                 },
             )
             .unwrap();
         registry
-            .agent_operation(
+            .session_operation(
                 &first.session_id,
-                AgentOperationRequest {
+                SessionOperationRequest {
                     request_id: "retry-1".to_owned(),
                     expected_version: 1,
                     lease_id: lease.lease_id,
-                    operation: AgentOperation::Retry {
+                    operation: SessionOperation::Retry {
                         revert: Default::default(),
+                        source_revision: None,
                     },
                 },
             )
@@ -1900,7 +1876,7 @@ mod tests {
         assert_eq!(second.session_id, first.session_id);
         assert_eq!(
             registry
-                .agent_events(&second.session_id, 0)
+                .session_events(&second.session_id, 0)
                 .unwrap()
                 .events
                 .len(),
@@ -1910,7 +1886,7 @@ mod tests {
             registry
                 .get(&second.session_id)
                 .unwrap()
-                .agent_lease
+                .controller_lease
                 .is_some()
         );
     }

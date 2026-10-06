@@ -118,7 +118,7 @@ pub async fn live_logs_sse(
     live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
-/// M5: the protocol live-log read route must not let one job's runtime
+/// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. The caller's credential must identify
 /// the exact job being read; the system credential bypasses (first-party
 /// CLI/UI read through the separate native route).
@@ -137,11 +137,14 @@ async fn authorize_live_log_read(
     if bearer == shared.state.system_token {
         // The system credential bypasses ownership but still needs the
         // resolved key so the stream follows the same explicit-key contract.
-        let key = {
-            let inner = shared.state.inner.lock().await;
-            live_log_key_for_job(&inner, run_id, job_id)
-        }
-        .ok_or_else(|| ApiError::not_found("job not found"))?;
+        let key = shared
+            .state
+            .backend
+            .live_log_key(run_id, job_id)
+            .await
+            .map_err(ApiError::from)?
+            .map(|(key, _)| key)
+            .ok_or_else(|| ApiError::not_found("job not found"))?;
         return Ok((key, job_id.to_owned()));
     }
     let caller = shared
@@ -153,11 +156,14 @@ async fn authorize_live_log_read(
     // happens to be UUID-shaped — only resolution tells them apart. Missing
     // and foreign targets share one response so a mismatch never reveals
     // whether the target exists.
-    let key = {
-        let inner = shared.state.inner.lock().await;
-        live_log_key_for_job(&inner, run_id, job_id)
-    }
-    .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
+    let key = shared
+        .state
+        .backend
+        .live_log_key(run_id, job_id)
+        .await
+        .map_err(ApiError::from)?
+        .map(|(key, _)| key)
+        .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
     if key != caller.to_string() {
         return Err(ApiError::forbidden("live-log read job mismatch"));
     }
@@ -188,42 +194,43 @@ pub async fn live_run_logs_sse(
     Path(run_id): Path<RunId>,
     Query(query): Query<LiveLogsQuery>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    let job_id = match query.job {
-        Some(job) => job,
-        None => {
-            let inner = shared.state.inner.lock().await;
-            let run = inner
-                .runs
-                .get(&run_id)
-                .ok_or_else(|| ApiError::not_found("run not found"))?;
-            let mut jobs: Vec<String> = run.jobs.keys().map(|job_id| job_id.0.clone()).collect();
-            jobs.extend(
-                inner
-                    .job_requests
-                    .values()
-                    .filter(|request| request.run_id == run_id)
-                    .map(|request| request.job_id.0.clone()),
-            );
-            jobs.sort_unstable();
-            jobs.dedup();
-            match jobs.len() {
-                0 => return Err(ApiError::not_found("run has no jobs to follow")),
-                1 => jobs.pop().expect("one job was counted"),
-                _ => {
-                    return Err(ApiError::bad_request(format!(
-                        "`job` needs a value when a run has {} jobs: {}",
-                        jobs.len(),
-                        jobs.join(", ")
-                    )));
+    let job_id =
+        match query.job {
+            Some(job) => job,
+            None => {
+                // Indexed point read: `run.jobs` ∪ the run's request job ids.
+                let jobs =
+                    shared.state.backend.run_job_ids(run_id).await.map_err(
+                        |error| match error {
+                            crate::control::ControlError::NotFound(_) => {
+                                ApiError::not_found("run not found")
+                            }
+                            other => ApiError::from(other),
+                        },
+                    )?;
+                match jobs.len() {
+                    0 => return Err(ApiError::not_found("run has no jobs to follow")),
+                    1 => jobs.into_iter().next().expect("one job was counted"),
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "`job` needs a value when a run has {} jobs: {}",
+                            jobs.len(),
+                            jobs.join(", ")
+                        )));
+                    }
                 }
             }
-        }
-    };
-    let key = {
-        let inner = shared.state.inner.lock().await;
-        live_log_key_for_job(&inner, run_id, &job_id)
-    }
-    .ok_or_else(|| ApiError::not_found("job not found"))?;
+        };
+    // Backend: one indexed lookup for the run-scoped live-log key; the
+    // stream then follows that exact attempt rather than re-resolving it.
+    let key = shared
+        .state
+        .backend
+        .live_log_key(run_id, &job_id)
+        .await
+        .map_err(ApiError::from)?
+        .map(|(key, _)| key)
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
     live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
@@ -239,6 +246,20 @@ async fn live_log_stream(
     Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>>,
     ApiError,
 > {
+    // Backend: the run/job terminal flag for this selector. Only the flag is
+    // read — `key` is the caller's already-authorized concrete key and is not
+    // re-resolved, or a retry between the authorization check and here would
+    // redirect the stream to an attempt that never passed the check.
+    let (_, run_terminal) = shared
+        .state
+        .backend
+        .live_log_key(run_id, job_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+
+    // Node-local: snapshot the retained lines and subscribe unless the feed
+    // is closed (`live_log_*` are node-local).
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
         let lines_arc = inner
@@ -248,7 +269,8 @@ async fn live_log_stream(
             .clone();
         let lines = lines_arc.lock().await;
         let snapshot = lines.clone();
-        let subscription = if live_log_is_closed(&inner, run_id, job_id, key) {
+        let closed = inner.live_log_closed.contains(key) || run_terminal;
+        let subscription = if closed {
             None
         } else {
             Some(live_log_sender(&mut inner, key).subscribe())
@@ -287,49 +309,6 @@ pub fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
     Event::default().event("live-log").data(data)
 }
 
-pub fn live_log_key_for_job(inner: &InnerState, run_id: RunId, job_id: &str) -> Option<String> {
-    let run = inner.runs.get(&run_id)?;
-    // `job_requests` is keyed by monotonic request id, so `find` would return
-    // the oldest attempt and follow a dead feed after a re-dispatch. A logical
-    // job key means "the current attempt"; an explicit agent job id matches one
-    // record either way.
-    if let Some(record) = inner
-        .job_requests
-        .values()
-        .filter(|record| {
-            record.run_id == run_id
-                && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
-        })
-        .max_by_key(|record| record.request_id)
-    {
-        return Some(record.agent_job_id.to_string());
-    }
-    // A logical job key is valid without a request only when it belongs to
-    // this run. Never accept an arbitrary globally present live-log key:
-    // UUIDs are only scoped by their job request and otherwise could leak a
-    // different run's output.
-    run.jobs
-        .contains_key(&JobId(job_id.to_owned()))
-        .then(|| job_id.to_owned())
-}
-
-/// Whether a live stream for this run/job must end after its snapshot.
-fn live_log_is_closed(inner: &InnerState, run_id: RunId, job_id: &str, key: &str) -> bool {
-    if inner.live_log_closed.contains(key) {
-        return true;
-    }
-    let run_terminal = inner
-        .runs
-        .get(&run_id)
-        .is_some_and(|run| run.status.is_terminal());
-    let logical_job_terminal = inner
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.jobs.get(&JobId(job_id.to_owned())))
-        .is_some_and(|status| status.is_terminal());
-    run_terminal || logical_job_terminal
-}
-
 pub fn live_log_sender(
     inner: &mut InnerState,
     key: &str,
@@ -365,7 +344,7 @@ pub async fn ws_live_logs(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
-    // R1-8: bind the ingest target to the caller's identity. The generic
+    // Bind the ingest target to the caller's identity. The generic
     // protocol bearer admits any job's runtime credential, which would let one
     // job stream into another job's buffer — forging its live log, or wiping
     // its retained tail (reopening a feed clears the closed mark and history).
@@ -383,13 +362,19 @@ pub async fn ws_live_logs(
         let agent_job_id = job_id
             .parse::<uuid::Uuid>()
             .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
-        let request = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .agent_job_requests
-                .get(&agent_job_id)
-                .copied()
-                .and_then(|request_id| inner.job_requests.get(&request_id).cloned())
+        // Backend: resolve the agent job id to its request record so the
+        // credential can be checked against the job it names.
+        let request = match shared
+            .state
+            .backend
+            .request(crate::control::backend::RequestKey::AgentJobId(
+                agent_job_id,
+            ))
+            .await
+        {
+            Ok(record) => Some(record),
+            Err(crate::control::ControlError::NotFound(_)) => None,
+            Err(error) => return Err(ApiError::from(error)),
         };
         // Unresolved and foreign targets share one generic 403: distinct
         // messages would reveal whether the job UUID resolves.
@@ -484,10 +469,16 @@ pub async fn record_live_log_wrapper_for_run(
     job_id: &str,
     wrapper: LiveLogFeedLinesWrapper,
 ) {
-    let key = {
-        let inner = shared.state.inner.lock().await;
-        live_log_key_for_job(&inner, run_id, job_id).unwrap_or_else(|| job_id.to_owned())
-    };
+    // Backend: one indexed lookup for the run-scoped live-log key; falls
+    // back to the raw job key.
+    let key = shared
+        .state
+        .backend
+        .live_log_key(run_id, job_id)
+        .await
+        .unwrap_or(None)
+        .map(|(key, _)| key)
+        .unwrap_or_else(|| job_id.to_owned());
     record_live_log_wrapper(shared, &key, wrapper).await;
 }
 

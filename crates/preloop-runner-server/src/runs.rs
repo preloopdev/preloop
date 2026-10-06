@@ -265,26 +265,7 @@ fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
         .unwrap_or(true)
 }
 
-fn existing_webhook_run(
-    inner: &InnerState,
-    delivery_id: &str,
-    workflow_path: &str,
-) -> Option<RunAccepted> {
-    inner
-        .runs
-        .values()
-        .find(|run| {
-            run.webhook_delivery_id.as_deref() == Some(delivery_id)
-                && run.workflow_path_str == workflow_path
-        })
-        .map(|run| RunAccepted {
-            run_id: run.run_id,
-            run_number: run.run_number,
-            queued_jobs: run.jobs.len(),
-        })
-}
-
-/// Static-PAT permission enforcement (H3).
+/// Static-PAT permission enforcement.
 ///
 /// When no GitHub App is configured, the operator's static PAT
 /// (`PRELOOP_GITHUB_TOKEN` / `github.pat`) is embedded verbatim as every
@@ -297,7 +278,7 @@ fn existing_webhook_run(
 /// publishes the token's real authority in `system.github.token.pat_scopes`,
 /// which the runner prints alongside the declared permission set.
 ///
-/// What a job's `GITHUB_TOKEN` becomes in PAT mode (H3).
+/// What a job's `GITHUB_TOKEN` becomes in PAT mode.
 ///
 /// A static PAT cannot be narrowed per job, so it is embedded only when its
 /// classic OAuth scopes were introspected and do not exceed the job's declared
@@ -351,7 +332,43 @@ pub fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
         .map(|(_, scopes)| scopes)
 }
 
-/// Warm the process-wide PAT scope cache once at startup (H3).
+/// Drop every cached PAT scope entry, as if the TTL had elapsed (tests that
+/// exercise a job claimed after the cache expired).
+#[cfg(any(test, feature = "test-support"))]
+pub fn expire_pat_scope_cache() {
+    if let Ok(mut cache) = PAT_SCOPE_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+/// The PAT's classic OAuth scopes for a dispatch decision: the cached entry
+/// while it is fresh, otherwise a fresh introspection (which re-caches it).
+///
+/// Acquire paths must use this, not [`cached_pat_scopes`]: a job can wait in
+/// the queue far longer than the cache TTL, and only submits refresh the
+/// entry, so a job claimed more than five minutes after the last submit would
+/// otherwise find it expired, be handed the runtime token instead of the PAT,
+/// and fail every GitHub fetch the submit-time checkout routing assumed it
+/// could make. `None` when the scopes cannot be established (the PAT stays
+/// withheld, as before).
+pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
+    if let Some(scopes) = cached_pat_scopes(pat) {
+        return Some(scopes);
+    }
+    match pat_oauth_scopes(pat).await {
+        PatScopeOutcome::Known(scopes) => Some(scopes),
+        PatScopeOutcome::Unverifiable { reason } => {
+            tracing::warn!(%reason, "withholding PAT at dispatch: scopes unverifiable");
+            None
+        }
+        PatScopeOutcome::Invalid(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "withholding PAT at dispatch: rejected");
+            None
+        }
+    }
+}
+
+/// Warm the process-wide PAT scope cache once at startup.
 ///
 /// The job expansion pipeline is synchronous and reads [`cached_pat_scopes`],
 /// so without a warm entry the first expansions after a restart would find a
@@ -384,6 +401,60 @@ pub async fn warm_pat_scope_cache(pat: &str) {
                 "PRELOOP_GITHUB_TOKEN was rejected by the GitHub API at startup; jobs keep the \
                  job-scoped runtime token and any step that needs GitHub fails."
             );
+        }
+    }
+}
+
+fn secret_provider_error(shared: &SharedState, error: anyhow::Error) -> ApiError {
+    ApiError::internal(format!(
+        "secret provider `{}` failed: {error}",
+        shared.state.secret_provider.name()
+    ))
+}
+
+/// A submission's run-tier secrets, written before the run commits and
+/// deleted again on drop unless [`RunSecretsGuard::keep`] marks the run as
+/// committed (a failed build, a rejected submit, or a replayed webhook that
+/// resolved to an existing run all leave no values behind).
+struct RunSecretsGuard<'a> {
+    provider: &'a dyn crate::secret_provider::SecretProvider,
+    run_id: RunId,
+    armed: bool,
+}
+
+impl<'a> RunSecretsGuard<'a> {
+    fn put(
+        provider: &'a dyn crate::secret_provider::SecretProvider,
+        run_id: RunId,
+        secrets: &preloop_gha_protocol::SecretMap,
+    ) -> Result<Self, ApiError> {
+        let armed = !secrets.is_empty();
+        if armed {
+            provider.put_run(run_id, secrets).map_err(|error| {
+                ApiError::internal(format!(
+                    "secret provider `{}` failed to store run secrets: {error}",
+                    provider.name()
+                ))
+            })?;
+        }
+        Ok(Self {
+            provider,
+            run_id,
+            armed,
+        })
+    }
+
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunSecretsGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.provider.delete_run(self.run_id)
+        {
+            tracing::warn!(run_id = %self.run_id, %error, "failed to drop run secrets of an uncommitted run");
         }
     }
 }
@@ -551,7 +622,7 @@ pub fn enforce_pat_permissions(
 /// stated here. `system.github.token.permissions` keeps its documented
 /// `{"<Permission>": "<level>"}` map shape, so consumers that parse it are not
 /// surprised by a key that is not a permission and a value that is prose.
-fn pat_scopes_wire_value(scopes: &[String]) -> String {
+pub(crate) fn pat_scopes_wire_value(scopes: &[String]) -> String {
     if scopes.is_empty() {
         // The header was present but listed nothing: the token carries no
         // classic scopes, which is narrower than any declaration. Distinct from
@@ -561,6 +632,11 @@ fn pat_scopes_wire_value(scopes: &[String]) -> String {
         format!("static PAT OAuth scopes: {}", scopes.join(", "))
     }
 }
+
+/// Runner-visible explanation when a configured PAT is withheld because its
+/// authority could not be verified.
+pub(crate) const PAT_WITHHELD_WIRE_VALUE: &str =
+    "withheld: PAT authority unverifiable; NOT the declared `permissions:` set";
 
 pub async fn submit_run_inner(
     shared: &Arc<SharedState>,
@@ -628,11 +704,11 @@ pub async fn submit_run_inner_with_webhook_delivery(
     };
     let key = (delivery_id.to_owned(), workflow_path.to_owned());
     loop {
+        // In-transaction dedup inside `submit_run` (SubmitOutcome::existing)
+        // makes a committed run win over any in-flight reservation; the
+        // reservation only serializes concurrent builders for one delivery.
         let reservation_acquired = {
             let mut inner = shared.state.inner.lock().await;
-            if let Some(existing) = existing_webhook_run(&inner, delivery_id, workflow_path) {
-                return Ok(existing);
-            }
             inner.webhook_run_reservations.insert(key.clone())
         };
         if reservation_acquired {
@@ -702,35 +778,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     webhook_delivery_id: Option<&str>,
 ) -> Result<RunAccepted, ApiError> {
     let webhook_delivery_id = webhook_delivery_id.map(str::to_owned);
-    // Fork-PR workflow policy: runs from fork pull-request events wait for
-    // explicit operator approval before any job may start. The trust tier is
-    // stamped by the webhook path before submission; native submissions carry
-    // no tier and are never held.
-    let fork_approval_pending = crate::fork_policy::fork_approval_required(
-        &shared.state.fork_policy,
-        crate::events::trust_tier::tier_of(&submission),
-    );
-    let fork_approval_requested_at_unix_nanos =
-        fork_approval_pending.then(crate::models::now_unix_nanos);
-    if let (Some(delivery_id), Some(workflow_path)) = (
-        webhook_delivery_id.as_deref(),
-        submission.workflow_path.as_deref(),
-    ) {
-        let existing = {
-            let inner = shared.state.inner.lock().await;
-            existing_webhook_run(&inner, delivery_id, workflow_path)
-        };
-        if let Some(existing) = existing {
-            tracing::info!(
-                %delivery_id,
-                %workflow_path,
-                run_id = %existing.run_id,
-                "reusing run for replayed webhook delivery"
-            );
-            return Ok(existing);
-        }
-    }
+    // Dedup is now transactional: `submit_run` returns
+    // `SubmitOutcome::existing` for a replayed delivery, so no pre-check.
 
+    let t_parse = std::time::Instant::now();
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     // GitHub rejects workflows whose `on.schedule` cron cannot parse (save
     // time); aksh rejects them at submit so a bad schedule is a hard error
@@ -746,6 +797,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         shared.state.static_github_pat().as_deref(),
     )
     .await?;
+    let remote_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         // GitHub's webhook payload stringifies every workflow_dispatch input,
@@ -774,41 +826,22 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             object.insert("inputs".to_owned(), inputs_value);
         }
     }
-    // Native submissions carry no trust tier (the webhook path sets it) and
-    // pass secrets through unmodified — None is therefore trusted. Mirror
-    // GitHub org/repo/environment secrets: stored secrets are available to
-    // every trusted job, with submission-provided values winning per name.
-    let allow_secrets = submission_allows_secrets(&submission);
-    if !allow_secrets {
-        submission.secrets.clear();
+    // Native submissions carry no trust tier (the webhook path sets it) —
+    // None is therefore trusted. Caller-supplied secret values never ride
+    // on the run: they move into the SecretProvider's run tier once the run
+    // id exists (below), and untrusted tiers receive none at all.
+    let provided_secrets = std::mem::take(&mut submission.secrets);
+    let provided_secrets = if submission_allows_secrets(&submission) {
+        provided_secrets
     } else {
-        // Global secrets first, then per-repository secrets for the
-        // submitting repository. Precedence: submission-provided secrets
-        // (already in the map) > per-repo tier > global tier — mirroring
-        // GitHub, where repo secrets override org secrets of the same name.
-        let secret_store = shared.state.secrets.read();
-        let submission_names: BTreeSet<String> = submission.secrets.keys().cloned().collect();
-        // Remember the caller-provided names so per-job environment overlays
-        // (applied later, in `build_job_artifacts`) keep these values
-        // winning per name over the stored environment tier.
-        submission.submission_names = submission_names.clone();
-        for (name, value) in &secret_store.global {
-            submission
-                .secrets
-                .entry(name.clone())
-                .or_insert_with(|| preloop_gha_protocol::SecretString::new(value.clone()));
-        }
-        if let Some(repo_secrets) = secret_store.repo.get(&submission.repository) {
-            for (name, value) in repo_secrets {
-                if !submission_names.contains(name) {
-                    submission.secrets.insert(
-                        name.clone(),
-                        preloop_gha_protocol::SecretString::new(value.clone()),
-                    );
-                }
-            }
-        }
-    }
+        Default::default()
+    };
+    // The run-tier values are non-secret references once stored: record the
+    // names on the submission (they persist with the run, unlike the values)
+    // so a re-run can tell "no secrets were supplied" apart from "the tier is
+    // gone", and so every job template can name what the fill must resolve.
+    submission.run_secret_names = provided_secrets.keys().cloned().collect();
+    let secrets_ms = t_parse.elapsed().as_secs_f64() * 1000.0 - remote_ms;
     let (branch, tag) = {
         let (default_branch, default_tag) = git_ref_context(&submission.git_ref);
         let filter_branch = submission.filter_branch.clone().or_else(|| {
@@ -938,6 +971,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let t_expand = std::time::Instant::now();
     let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         &workflow,
         &submission.reusable_workflows,
@@ -945,6 +979,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
         Some(submission.event.as_str()),
     )?;
+    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
     let mut jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
     if !submission.dispatch_inputs.is_empty() {
@@ -1027,6 +1062,14 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     }
 
     let run_id = RunId::new();
+    // Durable before the run commits: any node may acquire its jobs later.
+    // Dropped again unless the submit commits a new run.
+    let run_secrets = RunSecretsGuard::put(
+        shared.state.secret_provider.as_ref(),
+        run_id,
+        &provided_secrets,
+    )?;
+    drop(provided_secrets);
     let repository_owner = submission
         .repository
         .split('/')
@@ -1287,21 +1330,34 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 .split_once('/')
                 .map(|(owner, name)| (owner.to_owned(), name.to_owned()))
                 .unwrap_or_else(|| ("local".to_owned(), submission.repository.clone()));
-            payload.insert(
-                "repository".to_owned(),
-                serde_json::json!({
-                    "name": name,
-                    "full_name": submission.repository,
-                    "owner": { "login": owner },
-                    "default_branch": snapshot.default_branch.clone().unwrap_or_else(|| {
-                        submission
-                            .git_ref
-                            .strip_prefix("refs/heads/")
-                            .unwrap_or("main")
-                            .to_owned()
-                    }),
-                }),
-            );
+            // Set the fields actions read, but keep the rest of a real
+            // payload's `repository` (e.g. GitHub's `pushed_at`, which orders
+            // late deliveries for concurrency).
+            let default_branch = snapshot.default_branch.clone().unwrap_or_else(|| {
+                submission
+                    .git_ref
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or("main")
+                    .to_owned()
+            });
+            let repository = payload
+                .entry("repository")
+                .or_insert_with(|| serde_json::json!({}));
+            if !repository.is_object() {
+                *repository = serde_json::json!({});
+            }
+            if let Some(repository) = repository.as_object_mut() {
+                repository.insert("name".to_owned(), serde_json::json!(name));
+                repository.insert(
+                    "full_name".to_owned(),
+                    serde_json::json!(submission.repository),
+                );
+                repository.insert("owner".to_owned(), serde_json::json!({ "login": owner }));
+                repository.insert(
+                    "default_branch".to_owned(),
+                    serde_json::json!(default_branch),
+                );
+            }
             if submission.event == "push" {
                 // `after` is the snapshot commit the runner checks out;
                 // `before` is the base its changes are measured against (the
@@ -1396,20 +1452,21 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         }
     }
 
-    // PATs are static and can be embedded now. GitHub App installation tokens
-    // are deliberately minted later, when the broker dispatches each job, so
-    // downstream jobs cannot sit in the queue until a short-lived token
-    // expires.
-    let mut github_tokens: BTreeMap<JobId, PatToken> = BTreeMap::new();
+    // PATs are static and the token is minted at acquire. GitHub App
+    // installation tokens are likewise minted later, when the broker
+    // dispatches each job, so downstream jobs cannot sit in the queue until a
+    // short-lived token expires. The scope check runs here, at submit,
+    // because a PAT broader than the declared `permissions:` refuses the run
+    // before it occupies queue slots.
     if shared.state.github_app.is_none()
         && let Some(pat) = shared.state.static_github_pat()
     {
-        // H3: a static PAT cannot be narrowed per job, so a PAT broader
+        // A static PAT cannot be narrowed per job, so a PAT broader
         // than a job's declared `permissions:` would silently hand every
         // non-fork job authority the workflow never claimed. Introspect
         // the PAT's classic OAuth scopes and refuse the run on mismatch;
         // an invalid PAT is refused outright, and a PAT whose bounds
-        // cannot be verified is withheld rather than embedded.
+        // cannot be verified is withheld rather than embedded at acquire.
         match pat_oauth_scopes(&pat).await {
             PatScopeOutcome::Known(scopes) => {
                 enforce_pat_permissions(&jobs, &submission, &scopes)?;
@@ -1420,12 +1477,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                      NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
                      GitHub App to mint least-privilege installation tokens."
                 );
-                github_tokens.extend(jobs.iter().map(|job| {
-                    (
-                        job.id.clone(),
-                        PatToken::with_scopes(pat.clone(), scopes.clone()),
-                    )
-                }));
             }
             PatScopeOutcome::Unverifiable { reason } => {
                 tracing::warn!(
@@ -1437,10 +1488,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                      needs GitHub fails. Configure a GitHub App to mint least-privilege installation \
                      tokens, or make the GitHub API reachable so the scopes can be verified."
                 );
-                github_tokens.extend(
-                    jobs.iter()
-                        .map(|job| (job.id.clone(), PatToken::withheld())),
-                );
             }
             PatScopeOutcome::Invalid(error) => {
                 return Err(ApiError::forbidden(format!(
@@ -1451,31 +1498,55 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         }
     }
-
     // Reserve the workflow run number only after rechecking the durable
     // delivery identity under the same state lock used for run insertion.
     // A competing replay therefore returns before advancing the counter.
-    let mut inner = shared.state.inner.lock().await;
+    // Recheck the durable delivery identity against the backend before
+    // reserving the run number — a competing replay that already committed
+    // returns here instead of advancing the counter. The reservation set
+    // (above) already serializes in-flight submits for this delivery, so the
+    // committed-run check and the counter increment need no shared lock.
+    // No pre-check needed: `submit_run` dedups the delivery inside its own
+    // transaction (`SubmitOutcome::existing`), so a replay that committed
+    // while messages were built still short-circuits there.
+    // Durable run-number allocation lives in the control backend so it is
+    // atomic with the committed state and survives restarts. It is its own
+    // transaction because the number is embedded in `github.run_number`
+    // before the job messages are built; a crash between here and
+    // `submit_run` burns a number, which is acceptable.
+    // A committed run for this delivery already exists (replay observed
+    // between reservation release and here): return it without burning a
+    // run number.
     if let Some(delivery_id) = webhook_delivery_id.as_deref()
-        && let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path)
+        && let Some(run_id) = shared
+            .state
+            .backend
+            .run_for_webhook_delivery(delivery_id, &workflow_path)
+            .await
+            .map_err(ApiError::from)?
     {
-        tracing::info!(
-            %delivery_id,
-            %workflow_path,
-            run_id = %existing.run_id,
-            "reusing run after webhook reservation race"
-        );
-        drop(inner);
-        return Ok(existing);
+        let existing = shared
+            .state
+            .backend
+            .run_record(run_id)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(RunAccepted {
+            run_id,
+            run_number: existing.run_number,
+            queued_jobs: existing.jobs.len(),
+        });
     }
-    let run_number = {
-        let counter = inner
-            .workflow_run_counters
-            .entry(workflow_path.clone())
-            .or_insert(0);
-        *counter += 1;
-        *counter
-    };
+    let run_number = shared
+        .state
+        .backend
+        .allocate_run_number(
+            crate::control::types::DEFAULT_NAMESPACE,
+            &submission.repository,
+            &workflow_path,
+        )
+        .await
+        .map_err(ApiError::from)?;
     if let Some(object) = github.as_object_mut() {
         object.insert(
             "run_number".to_owned(),
@@ -1483,20 +1554,32 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
     }
 
-    // Release the state lock while building messages, token material and OIDC
-    // contexts for all jobs in the matrix. Holding the global lock during
-    // serialization of a 100-job matrix blocks unrelated runners and polls;
-    // the lock is reacquired only for atomic insertion into `inner.runs`.
-    drop(inner);
+    // Messages, token material and OIDC contexts for the whole matrix are
+    // built without any lock — the durable insert happens in one
+    // `submit_run` transaction below.
     let base_url = runner_base_url();
     let normalized_github = preloop_gha_parser::job_builder::normalize_github_context(&github);
-    let secrets_exposed: BTreeMap<String, String> =
-        preloop_gha_protocol::masking::expose_all(&submission.secrets);
+    // Every value this run's jobs can see (run > repo > global), for the
+    // masker cache only; the builder below takes names.
+    let secrets_exposed: BTreeMap<String, String> = if submission_allows_secrets(&submission) {
+        preloop_gha_protocol::masking::expose_all(
+            &shared
+                .state
+                .secret_provider
+                .resolve(crate::secret_provider::SecretScope {
+                    repository: &submission.repository,
+                    environment: None,
+                    run_id: Some(run_id),
+                })
+                .map_err(|error| secret_provider_error(shared, error))?,
+        )
+    } else {
+        BTreeMap::new()
+    };
 
     struct PrebuiltJob {
         job: preloop_gha_protocol::JobPlan,
         agent_msg: Option<preloop_gha_protocol::azdo::AgentJobRequestMessage>,
-        request_id: i64,
         condition_context: preloop_gha_expressions::Context,
         skipped: bool,
         caller: bool,
@@ -1512,10 +1595,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let mut pre_job_needs: BTreeMap<JobId, Vec<JobId>> = BTreeMap::new();
     let mut pre_job_fail_fast: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
-    let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
     let mut pre_caller_plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan> = BTreeMap::new();
     let mut pre_job_names: BTreeMap<JobId, String> = BTreeMap::new();
 
+    let t_build = std::time::Instant::now();
     for job in jobs {
         pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
         pre_job_needs.insert(job.id.clone(), job.needs.clone());
@@ -1551,7 +1634,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 })?;
             if !should_run {
                 pre_statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
-                pre_initially_skipped.push((run_id, job.id.clone()));
                 skipped = true;
             }
         }
@@ -1562,7 +1644,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             prebuilt.push(PrebuiltJob {
                 job,
                 agent_msg: None,
-                request_id: 0,
                 condition_context,
                 skipped: true,
                 caller: false,
@@ -1586,18 +1667,15 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             &workflow_ref,
             &sha,
             &normalized_github,
-            &secrets_exposed,
             &base_url,
             workspace_snapshot.as_ref(),
             &job,
-            github_tokens.remove(&job.id),
         )?;
 
         prebuilt.push(PrebuiltJob {
             caller: job.reusable_call.is_some(),
             job,
             agent_msg: Some(artifacts.agent_msg),
-            request_id: artifacts.request_id,
             condition_context,
             skipped: false,
             id_token_granted: artifacts.id_token_granted,
@@ -1608,812 +1686,351 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     }
 
     {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(delivery_id) = webhook_delivery_id.as_deref()
-            && let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path)
-        {
-            tracing::info!(
-                %delivery_id,
-                %workflow_path,
-                run_id = %existing.run_id,
-                "reusing run after webhook race during message building"
-            );
-            return Ok(existing);
-        }
+        // The dedup recheck moved into `submit_run`'s transaction —
+        // `SubmitOutcome::existing` below short-circuits a replayed
+        // delivery that committed while messages were built.
+        // Build the run record and per-job submit inputs without any lock —
+        // the durable insert, concurrency gates, queue classification and
+        // correlation-record writes all happen inside one `submit_run`
+        // transaction on the control backend.
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
         let github = github;
-        let mut statuses = pre_statuses;
+        let statuses = pre_statuses;
         let caller_plans = pre_caller_plans;
         let job_names = pre_job_names;
-        let mut ready_jobs = 0usize;
         let job_base_ids = pre_job_base_ids;
         let job_needs = pre_job_needs;
         let job_fail_fast = pre_job_fail_fast;
         let job_continue_on_error = pre_job_continue_on_error;
-        let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
-        let initially_skipped = pre_initially_skipped;
-        // Jobs concluded at submit because no runner can host their platform,
-        // paired with the explanation emitted to watchers below.
-        let mut unhostable_reasons: Vec<(JobId, String)> = Vec::new();
-        let mut built_jobs: Vec<QueuedJob> = Vec::new();
-        if empty_workflow_concurrency_group {
-            let queued_jobs = 0;
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    webhook_delivery_id: webhook_delivery_id.clone(),
-                    run_name,
-                    submission: Arc::new(submission),
-                    jobs: BTreeMap::new(),
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids: BTreeMap::new(),
-                    job_needs: BTreeMap::new(),
-                    caller_plans: BTreeMap::new(),
-                    job_names: BTreeMap::new(),
-                    github: serde_json::Value::Null,
-                    head_sha: String::new(),
-                    workflow_ref: String::new(),
-                    workspace_snapshot: None,
-                    job_fail_fast: BTreeMap::new(),
-                    job_continue_on_error: BTreeMap::new(),
-                    status: ExecutionStatus::Failure,
-                    job_check_run_ids: BTreeMap::new(),
-                    reports_check_runs: false,
-                    reusable_calls,
-                    jobs_list: Vec::new(),
-                    created_at,
-                    started_at: None,
-                    completed_at: Some(created_at),
-                    run_number,
-                    run_attempt: 1,
-                    workflow_path_str: workflow_path.clone(),
-                    event: event.clone(),
-                    conclusion: Some("failure".to_owned()),
-                    push_state: None,
-                    snapshot_timing: None,
-                    fork_approval_pending,
-                    fork_approval_requested_at_unix_nanos,
-                    fork_approved_at_unix_nanos: None,
-                    fork_approval_note: None,
-                },
-            );
-            drop(inner);
-            shared
-                .state
-                .emit(NdjsonEvent::RunAccepted {
-                    run_id,
-                    queued_jobs,
-                })
-                .await;
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id,
-                    status: ExecutionStatus::Failure,
-                    reason: Some("concurrency group name must not be empty".to_owned()),
-                })
-                .await;
-            return Ok(RunAccepted {
-                run_id,
-                run_number,
-                queued_jobs,
-            });
-        }
-        // ── Install pre-built jobs under the lock (map inserts only) ────
+        let snapshot_timing = workspace_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.snapshot_timing);
+        // Fork-PR workflow policy: a run from the untrusted fork pull-request
+        // tier is stamped pending and held at scheduler admission until an
+        // operator approves it. The stamp starts the 24-hour fail-closed
+        // clock the reaper sweeps on.
+        let fork_approval_pending = crate::fork_policy::fork_approval_required(
+            &shared.state.fork_policy,
+            crate::events::trust_tier::tier_of(&submission),
+        );
+        let fork_approval_requested_at_unix_nanos =
+            fork_approval_pending.then(crate::models::now_unix_nanos);
+
+        let record = RunRecord {
+            run_id,
+            webhook_delivery_id: webhook_delivery_id.clone(),
+            run_name: run_name.clone(),
+            submission: Arc::new(submission.clone()),
+            jobs: statuses,
+            job_outputs: BTreeMap::new(),
+            job_base_ids,
+            job_needs,
+            caller_plans,
+            job_names,
+            github: github.clone(),
+            head_sha: sha.clone(),
+            workflow_ref: workflow_ref.clone(),
+            workspace_snapshot: workspace_snapshot.clone(),
+            job_fail_fast,
+            job_continue_on_error,
+            status: ExecutionStatus::Queued,
+            job_check_run_ids: BTreeMap::new(),
+            reusable_calls,
+            jobs_list: Vec::new(),
+            created_at,
+            started_at: None,
+            completed_at: None,
+            run_number,
+            run_attempt: 1,
+            workflow_path_str: workflow_path.clone(),
+            event: event.clone(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing,
+            reports_check_runs: false,
+            fork_approval_pending,
+            fork_approval_requested_at_unix_nanos,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
+        };
+
+        // Skipped jobs go to the backend as `SubmitJob`s with
+        // `initially_skipped` — they need `jobs`/`job_specs` rows for the run
+        // record (`run.jobs`, display order) but never mint a request or
+        // message. The handler emits their `JobStatus` events from
+        // `outcome.concluded` below.
+        let mut submit_jobs: Vec<crate::control::types::SubmitJob> =
+            Vec::with_capacity(prebuilt.len());
+        // plan_ids = each job's agent_job_id (string form): the log masker
+        // keys its provided-secret cache on them at accept below.
+        let mut submit_plan_ids: Vec<String> = Vec::with_capacity(prebuilt.len());
         for pb in prebuilt {
-            if pb.skipped {
-                continue;
-            }
-            let job = &pb.job;
-            let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
-
-            if !pb.caller {
-                // Caller placeholders are scheduling-only: no runner ever
-                // acquires them, so no request correlation records exist.
-                let job_request = pb
-                    .job_request
-                    .expect("non-skipped job must have job_request");
-
-                inner
-                    .id_token_grants
-                    .insert((run_id, job.id.clone()), pb.id_token_granted);
-                inner
-                    .oidc_job_contexts
-                    .insert((run_id, job.id.clone()), pb.oidc_ctx);
-
-                inner
-                    .inflight_requests
-                    .insert(job_request.request_id, (run_id, job.id.clone()));
-                inner
-                    .plan_requests
-                    .insert(job_request.plan_id.clone(), pb.request_id);
-                inner
-                    .agent_job_requests
-                    .insert(job_request.agent_job_id, pb.request_id);
-                inner
-                    .timeline_requests
-                    .insert(job_request.timeline_id, pb.request_id);
-                // Seed the attempt's step manifest before the runner can
-                // report anything, so step identity and order come from the
-                // message we just built rather than from whatever order the
-                // runner's log blobs happen to land in.
-                //
-                // Not persisted here. Rows are written by a runner report, a
-                // job completion, or a full snapshot that happens to flush
-                // them; none of those has necessarily run when a dispatched
-                // attempt is interrupted, so its manifest is rebuilt at startup
-                // from the persisted request message — the same source it was
-                // built from — and a restart in that window keeps its declared
-                // steps.
-                inner.job_steps.insert(
-                    job_request.agent_job_id,
-                    StepRecord::manifest(&agent_msg.steps),
-                );
-                inner.job_requests.insert(pb.request_id, job_request);
-                if let Some(request) = pb.github_token_request {
-                    inner.github_token_requests.insert(pb.request_id, request);
-                    tracing::debug!(
-                        request_id = pb.request_id,
-                        job = %job.id,
-                        "prebuild: dispatch token request inserted"
-                    );
-                } else {
-                    // Normal whenever no GitHub App is configured; one line per
-                    // job would drown the log on a wide matrix.
-                    tracing::debug!(
-                        request_id = pb.request_id,
-                        job = %job.id,
-                        "prebuild: job has no dispatch token request"
-                    );
-                }
-            }
-            let created_at_unix_nanos = crate::models::now_unix_nanos();
-            let queued_job = QueuedJob {
+            let agent_msg = pb.agent_msg.clone().unwrap_or_else(|| {
+                // Skipped jobs never reach the wire — a placeholder keeps
+                // `QueuedJob.message` satisfied without minting artifacts.
+                serde_json::from_value(serde_json::json!({
+                    "jobId": uuid::Uuid::nil(),
+                    "requestId": 0,
+                    "plan": {"planId": "", "planType": "", "version": 0, "artifactUri": "", "artifactLocation": ""},
+                    "timeline": {"id": uuid::Uuid::nil(), "changeId": 0},
+                    "jobName": pb.job.id.0,
+                    "lockedUntil": "",
+                    "resources": {"endpoints": []},
+                    "steps": []
+                }))
+                .expect("placeholder message shape is static")
+            });
+            let step_manifest = pb
+                .agent_msg
+                .as_ref()
+                .map(|msg| StepRecord::manifest(&msg.steps))
+                .unwrap_or_default();
+            let mut queued_job = QueuedJob {
                 run_id,
-                job_id: job.id.clone(),
-                base_id: job.base_id.clone(),
-                created_at_unix_nanos,
-                dependencies_ready_at_unix_nanos: job
+                job_id: pb.job.id.clone(),
+                base_id: pb.job.base_id.clone(),
+                created_at_unix_nanos: crate::models::now_unix_nanos(),
+                dependencies_ready_at_unix_nanos: pb
+                    .job
                     .needs
                     .is_empty()
-                    .then_some(created_at_unix_nanos),
+                    .then_some(crate::models::now_unix_nanos()),
                 concurrency_wait_started_at_unix_nanos: None,
                 concurrency_acquired_at_unix_nanos: None,
-                // Stamped when the job actually enters the ready queue (the
-                // promotion sites in runtime_scheduling), never at build
-                // time: dependency/concurrency delay is not queue wait.
                 enqueued_at_unix_nanos: 0,
-                needs: job.needs.clone(),
-                if_condition: job.if_condition.clone(),
+                needs: pb.job.needs.clone(),
+                if_condition: pb.job.if_condition.clone(),
                 condition_context: pb.condition_context,
-                max_parallel: job.max_parallel,
-                runs_on: job.runs_on.clone(),
-                runner_group: job.runner_group.clone(),
-                environment: job.environment.clone(),
+                max_parallel: pb.job.max_parallel,
+                runs_on: pb.job.runs_on.clone(),
+                runner_group: pb.job.runner_group.clone(),
+                environment: pb.job.environment.clone(),
                 message: agent_msg,
                 concurrency: concurrency::concurrency_from_plan_fields(
-                    job.concurrency_group.as_deref(),
-                    job.concurrency_cancel_in_progress.as_deref(),
-                    job.concurrency_queue.as_deref(),
+                    pb.job.concurrency_group.as_deref(),
+                    pb.job.concurrency_cancel_in_progress.as_deref(),
+                    pb.job.concurrency_queue.as_deref(),
                 ),
-                matrix: job
+                matrix: pb
+                    .job
                     .matrix
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                deferred_matrix: job.deferred_matrix.clone(),
-                reusable_call: job.reusable_call.clone(),
+                deferred_matrix: pb.job.deferred_matrix.clone(),
+                reusable_call: pb.job.reusable_call.clone(),
+                // Stamped just below, at the point the job first reaches
+                // scheduler admission.
                 environment_gate: None,
             };
-            built_jobs.push(queued_job);
-        }
-
-        let mut hold_entire_run = false;
-        // Workflow-level concurrency is isolated by the run's provenance.
-        // The display name remains the workflow's evaluated group; only the
-        // internal admission key gains the trust namespace.
-        //
-        // A submission with nothing runnable — every job gated off by its `if:`
-        // — takes no admission and never parks on a busy group. Taking one here
-        // would outlive the run: a workless run completes inside this function,
-        // never through the completion path that releases run-level holders,
-        // and the leaked `Holder::Run` then parks every later submission in
-        // that group forever. That is how a burst of `issue_comment` events
-        // whose job gate excluded them left a group permanently held and every
-        // later comment waiting behind it.
-        let has_runnable_jobs = statuses.values().any(|status| !status.is_terminal());
-        if has_runnable_jobs && let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
-            let tier = crate::events::trust_tier::tier_of(&submission);
-            let key = concurrency::concurrency_key_for_tier(&submission.repository, group, tier);
-            match try_acquire_concurrency(
-                &mut inner,
-                key,
-                group.clone(),
-                concurrency::Holder::Run(run_id),
-                *cancel,
-                *queue,
-            ) {
-                Ok(true) => {
-                    for job in &mut built_jobs {
-                        runtime_scheduling::stamp_concurrency_acquired(job);
-                    }
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "accept");
-                    inner.run_concurrency.insert(run_id, raw.clone());
-                }
-                Ok(false) => {
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "pending");
-                    hold_entire_run = true;
-                    for job in &mut built_jobs {
-                        runtime_scheduling::stamp_concurrency_wait_started(job);
-                    }
-                    inner.run_concurrency.insert(run_id, raw.clone());
-                }
-                Err(e) if e == "concurrency_queue_overflow" => {
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "reject");
-                    // Cancel this run immediately — all jobs Cancelled.
-                    for job in &built_jobs {
-                        statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
-                    }
-                    let queued_jobs = statuses
-                        .values()
-                        .filter(|status| !status.is_terminal())
-                        .count();
-                    inner.runs.insert(
-                        run_id,
-                        RunRecord {
-                            run_id,
-                            webhook_delivery_id: webhook_delivery_id.clone(),
-                            run_name,
-                            submission: Arc::new(submission),
-                            jobs: statuses,
-                            job_outputs: BTreeMap::new(),
-                            job_base_ids,
-                            job_needs,
-                            caller_plans: caller_plans.clone(),
-                            job_names: job_names.clone(),
-                            github: github.clone(),
-                            head_sha: sha.clone(),
-                            workflow_ref: workflow_ref.clone(),
-                            workspace_snapshot: workspace_snapshot.clone(),
-                            job_fail_fast,
-                            job_continue_on_error,
-                            status: ExecutionStatus::Cancelled,
-                            job_check_run_ids: BTreeMap::new(),
-                            reports_check_runs: false,
-                            reusable_calls,
-                            jobs_list: Vec::new(),
-                            created_at,
-                            started_at: None,
-                            completed_at: Some(created_at),
-                            run_number,
-                            run_attempt: 1,
-                            workflow_path_str: workflow_path.clone(),
-                            event: event.clone(),
-                            conclusion: Some("cancelled".to_owned()),
-                            push_state: None,
-                            snapshot_timing: None,
-                            fork_approval_pending,
-                            fork_approval_requested_at_unix_nanos,
-                            fork_approved_at_unix_nanos: None,
-                            fork_approval_note: None,
-                        },
-                    );
-                    // The run died on arrival: nothing will ever dispatch,
-                    // so the expandable nodes' minted request correlation has
-                    // to be settled here (MC-3), exactly like a cancellation.
-                    for job in &built_jobs {
-                        if job.deferred_matrix.is_some() || job.reusable_call.is_some() {
-                            runtime_scheduling::retire_node_requests(
-                                &mut inner,
-                                run_id,
-                                &job.job_id,
-                                runtime_scheduling::RequestRetirement::Settle(
-                                    ExecutionStatus::Cancelled,
-                                ),
-                            );
-                        }
-                    }
-                    drop(inner);
-                    shared
-                        .state
-                        .emit(NdjsonEvent::RunAccepted {
-                            run_id,
-                            queued_jobs,
-                        })
-                        .await;
-                    shared
-                        .state
-                        .emit(NdjsonEvent::RunStatus {
-                            run_id,
-                            status: ExecutionStatus::Cancelled,
-                            reason: concurrency::cancelled_reason(),
-                        })
-                        .await;
-                    return Ok(RunAccepted {
-                        run_id,
-                        run_number,
-                        queued_jobs,
-                    });
-                }
-                Err(e) => {
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "reject");
-                    return Err(ApiError::bad_request(e));
-                }
-            }
-        }
-
-        if hold_entire_run {
-            for job in &built_jobs {
-                statuses.insert(job.job_id.clone(), ExecutionStatus::Pending);
-            }
-            inner.held_runs.insert(run_id, built_jobs);
-            let queued_jobs = statuses
-                .values()
-                .filter(|status| !status.is_terminal())
-                .count();
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    webhook_delivery_id: webhook_delivery_id.clone(),
-                    run_name,
-                    submission: Arc::new(submission),
-                    jobs: statuses,
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids,
-                    job_needs,
-                    caller_plans: caller_plans.clone(),
-                    job_names: job_names.clone(),
-                    github: github.clone(),
-                    head_sha: sha.clone(),
-                    workflow_ref: workflow_ref.clone(),
-                    workspace_snapshot: workspace_snapshot.clone(),
-                    job_fail_fast,
-                    job_continue_on_error,
-                    status: ExecutionStatus::Pending,
-                    job_check_run_ids: BTreeMap::new(),
-                    reports_check_runs: false,
-                    reusable_calls,
-                    jobs_list: Vec::new(),
-                    created_at,
-                    started_at: None,
-                    completed_at: None,
-                    run_number,
-                    run_attempt: 1,
-                    workflow_path_str: workflow_path.clone(),
-                    event: event.clone(),
-                    conclusion: None,
-                    push_state: None,
-                    snapshot_timing: None,
-                    fork_approval_pending,
-                    fork_approval_requested_at_unix_nanos,
-                    fork_approved_at_unix_nanos: None,
-                    fork_approval_note: None,
-                },
-            );
-            drop(inner);
-            shared
-                .state
-                .emit(NdjsonEvent::RunAccepted {
-                    run_id,
-                    queued_jobs,
-                })
-                .await;
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id,
-                    status: ExecutionStatus::Pending,
-                    reason: concurrency::pending_reason(),
-                })
-                .await;
-            return Ok(RunAccepted {
-                run_id,
-                run_number,
-                queued_jobs,
-            });
-        }
-        // Install a provisional run before evaluating per-job and JobSet gates.
-        // Multiple holders from this same submission can cancel each other;
-        // cancellation helpers need the run to exist so they can persist the
-        // affected job conclusion instead of silently becoming no-ops.
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: webhook_delivery_id.clone(),
-                run_name: run_name.clone(),
-                submission: Arc::new(submission.clone()),
-                jobs: statuses.clone(),
-                job_outputs: BTreeMap::new(),
-                job_base_ids: job_base_ids.clone(),
-                job_needs: job_needs.clone(),
-                caller_plans: caller_plans.clone(),
-                job_names: job_names.clone(),
-                github: github.clone(),
-                head_sha: sha.clone(),
-                workflow_ref: workflow_ref.clone(),
-                workspace_snapshot: workspace_snapshot.clone(),
-                job_fail_fast: job_fail_fast.clone(),
-                job_continue_on_error: job_continue_on_error.clone(),
-                status: ExecutionStatus::Queued,
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls: reusable_calls.clone(),
-                jobs_list: Vec::new(),
-                created_at,
-                started_at: None,
-                completed_at: None,
-                run_number,
-                run_attempt: 1,
-                workflow_path_str: workflow_path.clone(),
-                event: event.clone(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing: workspace_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.snapshot_timing),
-                fork_approval_pending,
-                fork_approval_requested_at_unix_nanos,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
-            },
-        );
-
-        // Enqueue jobs (workflow concurrency free / acquired).
-        for mut queued_job in built_jobs {
-            let job_id = queued_job.job_id.clone();
-            let base_id = queued_job.base_id.clone();
-            let needs_empty = queued_job.needs.is_empty();
-
-            // Deferred reusable-caller nodes are scheduling-only: they wait in
-            // pending_jobs until their `if:` gate passes, when the scheduler
-            // acquires caller/embedded JobSet concurrency gates and expands
-            // the callee subtree (mirroring GitHub, which evaluates caller
-            // concurrency when the caller job starts).
-            if queued_job.reusable_call.is_some() {
-                statuses.insert(job_id, ExecutionStatus::Pending);
-                inner.pending_jobs.push_back(queued_job);
-                continue;
-            }
-
-            // No runner host for this platform: conclude the job rather than
-            // queue one nothing can ever claim. Checked here, before the job
-            // reaches either the ready queue or `pending_jobs`, so a
-            // needs-gated job on an unhostable platform concludes too and its
-            // dependents see a terminal status.
-            //
-            // The conclusion is `Failure`, never `Skipped`. A skipped job
-            // leaves the run reading `skipped`, which says "nothing to do
-            // here" rather than "this deployment cannot run your workflow":
-            // the operator would be told nothing by a run that never executed
-            // a step. Failing is loud, and the annotation below puts the
-            // reason where the user reads it rather than only in the server
-            // log.
-            // Defer label gates for needs-gated jobs: they park in
-            // pending_jobs anyway, and their `if:` — which can reference
-            // needs results — has not been evaluated yet. A job GitHub would
-            // skip must not fail here on labels it will never need; the
-            // promotion path re-runs both checks for every Run decision, so
-            // nothing escapes validation.
-            let platforms = runtime_scheduling::registered_runner_platforms(&inner);
-            if needs_empty
-                && let Some(platform) =
-                    runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
+            // A needs-less job never passes through promotion, so `runs-on`
+            // labels left raw at build time (they read `needs.*`, empty for a
+            // needs-less job) are finished here against the complete context,
+            // before the backend validates the true labels.
+            if queued_job.needs.is_empty()
+                && crate::control::logic::runs_on_deferred(&queued_job.runs_on)
             {
-                let reason = format!(
-                    "no {platform} runner is registered with this server, so `runs-on: {}` \
-                     cannot be scheduled",
-                    queued_job.runs_on.join(", ")
-                );
-                tracing::warn!(
-                    job = %job_id.0,
-                    labels = ?queued_job.runs_on,
-                    platform,
-                    "no {platform} runner is registered; failing the job"
-                );
-                unhostable_reasons.push((job_id.clone(), reason));
-                statuses.insert(job_id, ExecutionStatus::Failure);
-                continue;
-            }
-
-            if needs_empty && queued_job.runs_on.iter().any(|label| label.contains("${{")) {
-                // A job with no `needs` never passes through the promotion
-                // path, so `runs-on` labels left raw at build time (they read
-                // `needs.*`, which is empty for a needs-less job) are finished
-                // here against the complete context, before the pool check
-                // below validates the true labels. Needs-gated jobs keep
-                // their raw templates until promotion, when the needed jobs
-                // have completed.
                 let mut context = preloop_gha_expressions::Context::new();
                 for (key, value) in &queued_job.message.context_data {
                     context.insert(key, value.to_json());
                 }
                 crate::runtime_scheduling::resolve_deferred_runs_on(&mut queued_job, &context);
             }
-
-            // Full label validation against the co-hosted pool's advertised
-            // labels: when the pool has published them, a `runs-on` it can
-            // never satisfy fails at enqueue rather than starving in the
-            // queue. Skipped when the pool hasn't published (external-only
-            // deployments, or a pool that predates the field) — the
-            // starvation sweep remains the backstop there. Also skipped for
-            // jobs whose labels are still raw templates reading `needs.*`:
-            // their real labels only exist once the needed jobs complete, so
-            // there is nothing meaningful to validate yet. And deferred for
-            // `needs`-gated jobs entirely: they park in `pending_jobs` until
-            // their dependencies settle and `dependency_decision` evaluates
-            // `if:`; a job that will be skipped must not fail early on labels
-            // it was never going to run on. Promotion re-validates labels for
-            // every Run decision, so nothing escapes the gate.
-            let pool_labels = shared.state.pool_status.snapshot().labels;
-            let runs_on_deferred = queued_job
-                .runs_on
-                .iter()
-                .any(|label| preloop_gha_parser::eval::has_expressions(label));
-            if needs_empty
-                && !runs_on_deferred
-                && !pool_labels.is_empty()
-                && !crate::runtime_scheduling::job_matches_runner(&queued_job.runs_on, &pool_labels)
-            {
-                let reason = format!(
-                    "the runner pool's advertised labels ({}) can never satisfy \
-                     `runs-on: {}`, so the job cannot be scheduled",
-                    pool_labels.join(", "),
-                    queued_job.runs_on.join(", ")
-                );
-                tracing::warn!(
-                    job = %job_id.0,
-                    labels = ?queued_job.runs_on,
-                    pool_labels = ?pool_labels,
-                    "runs-on unsatisfiable by runner pool; failing the job at enqueue"
-                );
-                unhostable_reasons.push((job_id.clone(), reason));
-                statuses.insert(job_id, ExecutionStatus::Failure);
-                continue;
-            }
-
-            let max_parallel = queued_job.max_parallel;
-            let under_mp = max_parallel
-                .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
-
-            // Fork-PR workflow policy: a run awaiting fork approval holds
-            // every job in pending_jobs until the operator approves the run.
-            // The needs-empty fast path must not bypass that hold by
-            // enqueueing straight to inner.queue (or parking in
-            // concurrency_blocked): the fork gate in promote_ready_jobs only
-            // inspects pending_jobs.
-            let fork_held = inner
-                .runs
-                .get(&run_id)
-                .is_some_and(|run| run.fork_approval_pending);
-            if needs_empty && under_mp && !fork_held {
-                // Job-level concurrency gate (needs/max_parallel already satisfied).
-                match try_enqueue_with_job_concurrency(
-                    &mut inner,
-                    &github,
-                    &submission,
-                    queued_job,
-                    &mut statuses,
-                ) {
-                    JobEnqueueOutcome::Ready => {
-                        shared
-                            .state
-                            .observability
-                            .metrics()
-                            .lifecycle
-                            .record_concurrency_decision("job", "accept");
-                        *ready_by_base.entry(base_id).or_default() += 1;
-                        ready_jobs += 1;
-                    }
-                    JobEnqueueOutcome::Parked => {
-                        shared
-                            .state
-                            .observability
-                            .metrics()
-                            .lifecycle
-                            .record_concurrency_decision("job", "pending");
-                        // parked pending
-                    }
-                    JobEnqueueOutcome::Rejected => {
-                        shared
-                            .state
-                            .observability
-                            .metrics()
-                            .lifecycle
-                            .record_concurrency_decision("job", "reject");
-                        // cancelled by queue overflow or eval failure already marked
-                    }
+            // Skipped jobs are terminal at submit: no gate evaluation (a
+            // `Wait` verdict would park a node that never admits), no plan-id
+            // in the masker cache.
+            if !pb.skipped {
+                if crate::runtime_scheduling::check_environment_gates(
+                    &shared.state.environment_rules,
+                    &submission.repository,
+                    &submission.git_ref,
+                    &mut queued_job,
+                    crate::models::now_unix_nanos(),
+                ) == crate::runtime_scheduling::EnvironmentGateOutcome::Proceed
+                {
+                    queued_job.environment_gate = None;
                 }
-            } else {
-                // Fork-held jobs wait visibly in Pending until the operator
-                // approves the run; everything else queues normally for the
-                // scheduler.
-                let status = if fork_held {
-                    ExecutionStatus::Pending
-                } else {
-                    ExecutionStatus::Queued
-                };
-                statuses.insert(job_id, status);
-                inner.pending_jobs.push_back(queued_job);
+                submit_plan_ids.push(queued_job.message.plan.plan_id.clone());
             }
+            submit_jobs.push(crate::control::types::SubmitJob {
+                queued: queued_job,
+                request: pb.job_request,
+                token_request: pb.github_token_request,
+                id_token_granted: pb.id_token_granted,
+                oidc_context: Some(pb.oidc_ctx),
+                step_manifest,
+                initially_skipped: pb.skipped,
+            });
         }
 
-        // Preserve terminal conclusions written through cancel_job_inner while
-        // gates were evaluated. Non-terminal scheduling state remains owned by
-        // the local status map and is installed below with the final record.
-        if let Some(provisional) = inner.runs.get(&run_id) {
-            for (job_id, status) in &provisional.jobs {
-                if status.is_terminal() {
-                    statuses.insert(job_id.clone(), *status);
-                }
-            }
-        }
+        let workflow_concurrency =
+            workflow_concurrency_eval
+                .as_ref()
+                .map(
+                    |(group, cancel, queue, raw)| crate::control::types::WorkflowConcurrency {
+                        group: group.clone(),
+                        cancel_in_progress: *cancel,
+                        queue: *queue,
+                        raw: raw.clone(),
+                    },
+                );
 
-        // Only jobs with a runner left to wait for are queued. A job gated off
-        // by its `if:` is already terminal, and counting it told the submitter
-        // — and the `RunAccepted` event — that work was scheduled when none
-        // was.
-        let queued_jobs = statuses
-            .values()
-            .filter(|status| !status.is_terminal())
-            .count();
-        // C-05: derive the initial run status from job statuses so that eval
-        // failures (Failure) are reflected immediately rather than leaving the
-        // run permanently Queued. summarize_run returns InProgress for any mix
-        // of Queued/Pending jobs; map that to Queued since no job has started.
-        let initial_status = {
-            let s = summarize_run(statuses.values().copied());
-            if s == ExecutionStatus::InProgress {
-                ExecutionStatus::Queued
-            } else {
-                s
-            }
-        };
-        let snapshot_timing = workspace_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.snapshot_timing);
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: webhook_delivery_id.clone(),
-                run_name,
-                submission: Arc::new(submission),
-                jobs: statuses,
-                job_outputs: BTreeMap::new(),
-                job_base_ids,
-                job_needs,
-                caller_plans,
-                job_names,
-                github,
-                head_sha: sha,
-                workflow_ref,
-                workspace_snapshot,
-                job_fail_fast,
-                job_continue_on_error,
-                status: initial_status,
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls,
-                jobs_list: Vec::new(),
-                created_at,
-                started_at: None,
-                completed_at: None,
-                run_number,
-                run_attempt: 1,
-                workflow_path_str: workflow_path.clone(),
-                event: event.clone(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing,
-                fork_approval_pending,
-                fork_approval_requested_at_unix_nanos,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
-            },
-        );
-        // Deferred reusable-caller nodes whose needs are already satisfied
-        // (typically none) are reified by a first promote sweep: needs-free
-        // callers acquire their JobSet gates and materialize their callee
-        // subtree immediately.
-        promote_ready_jobs(
-            &mut inner,
-            &shared.state.environment_rules,
-            &shared.state.pool_status.snapshot().labels,
-        );
-        // A submission whose every job concluded before it reached the queue
-        // (all skipped by `if:`, or none hostable) never passes through the
-        // completion path, so nothing else would ever stamp `completed_at` and
-        // `conclusion`. Without this the run reports a terminal status while
-        // anything polling for completion waits forever.
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            runtime_scheduling::finalize_run_if_complete(run);
-        }
-        // The same run never reaches the completion path that releases
-        // run-level concurrency either: a holder taken for a run that concluded
-        // on arrival would park every later submission in its group.
-        if inner
-            .runs
-            .get(&run_id)
-            .is_some_and(|run| run.status.is_terminal())
-        {
-            runtime_scheduling::release_concurrency_for_run(&mut inner, run_id);
-        }
-        // The on-demand runner supervisor uses this atomic as its wake-up
-        // signal. Refresh it when submission makes work runnable; updating it
-        // only after a runner claims a job leaves a size-zero pool asleep
-        // forever on the first webhook-created run.
+        let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
+        let t_tx = std::time::Instant::now();
+
+        let outcome = shared
+            .state
+            .backend
+            .submit_run(crate::control::types::SubmitRun {
+                // Must match the namespace `allocate_run_number` just used:
+                // local runs live in DEFAULT_NAMESPACE, so the run row, its
+                // jobs and its concurrency keys all land there rather than
+                // under the repository slug.
+                namespace: crate::control::types::DEFAULT_NAMESPACE.to_owned(),
+                record,
+                jobs: submit_jobs,
+                workflow_concurrency,
+                empty_concurrency_group: empty_workflow_concurrency_group,
+                check_hostable: true,
+            })
+            .await
+            .map_err(ApiError::from)?;
+        let tx_ms = t_tx.elapsed().as_secs_f64() * 1000.0;
+        let t_tail = std::time::Instant::now();
+
+        // Post-commit: refresh the node-local gauges that wake the runner
+        // supervisor, then fan out the events the outcome carries.
         shared
             .state
             .queue_depth
-            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-        let cancel_count = inner.cancellation_queue.len();
-        drop(inner);
-        // The sweep above only recorded the intent to expand; the subtree build
-        // runs here with the lock released.
+            .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+        *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
+
+        if let Some(existing) = outcome.existing {
+            return Ok(RunAccepted {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: existing.jobs.len(),
+            });
+        }
+
+        run_secrets.keep();
+        // Masker cache: every value this run's jobs can see, keyed by run_id
+        // (log URI scope) and by every job's agent_job_id (the runner-facing
+        // plan id), so log appends need no provider round trip.
+        if !secrets_exposed.is_empty() {
+            let values = Arc::new(secrets_exposed.values().cloned().collect::<Vec<String>>());
+            let mut inner = shared.state.inner.lock().await;
+            inner
+                .plan_secret_masker
+                .insert(run_id.to_string(), Arc::clone(&values));
+            for plan_id in &submit_plan_ids {
+                inner
+                    .plan_secret_masker
+                    .insert(plan_id.clone(), Arc::clone(&values));
+            }
+        }
+
+        // The expansion sweep runs with the lock released; it materializes
+        // deferred caller/matrix subtrees the submit only recorded.
         let expansion = drain_expansions(shared).await;
-        if ready_jobs > 0 || cancel_count > 0 || expansion.promoted > 0 {
-            shared.state.message_notify.notify_waiters();
+        let drain_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
+        if outcome.queued_jobs > 0 || expansion.promoted > 0 {
+            crate::state::wake_waiters(
+                &shared.state.message_notify,
+                outcome.queued_jobs + expansion.promoted,
+                false,
+            );
         }
-        for (event_run_id, job_id) in initially_skipped {
+
+        // Skipped jobs land in `outcome.concluded` — when the submit
+        // transaction persisted the projected events (`outcome.events`),
+        // broadcasting is enough; `emit` would append the rows a second
+        // time. Early-return outcomes carry no events and emit normally.
+        let persisted = !outcome.events.is_empty();
+        for (job_id, status, reason) in &outcome.concluded {
+            // The empty-workflow-concurrency-group rejection names no real job:
+            // the backend marks it with a synthetic `*` id and the run-level
+            // `RunStatus` event below carries the reason. Emitting a
+            // `JobStatus` for `*` would describe a job that is not in the run.
+            if job_id.0 == "*" {
+                continue;
+            }
+            let event = NdjsonEvent::JobStatus {
+                run_id: outcome.run_id,
+                job_id: job_id.clone(),
+                status: *status,
+                reason: reason.clone(),
+            };
+            if persisted {
+                shared.state.emit_persisted(event).await;
+            } else {
+                shared.state.emit(event).await;
+            }
+        }
+
+        if persisted {
+            for event in outcome.events.iter().skip(outcome.concluded.len()) {
+                shared.state.emit_persisted(event.clone()).await;
+            }
+        } else {
             shared
                 .state
-                .emit(NdjsonEvent::JobStatus {
-                    run_id: event_run_id,
-                    job_id,
-                    status: ExecutionStatus::Skipped,
-                    reason: None,
+                .emit(NdjsonEvent::RunAccepted {
+                    run_id: outcome.run_id,
+                    queued_jobs: outcome.queued_jobs,
                 })
                 .await;
+
+            if let Some(rejected) = outcome.rejected {
+                let reason = match rejected {
+                    ExecutionStatus::Cancelled => crate::concurrency::cancelled_reason(),
+                    ExecutionStatus::Pending => crate::concurrency::pending_reason(),
+                    _ => Some("concurrency group name must not be empty".to_owned()),
+                };
+                shared
+                    .state
+                    .emit(NdjsonEvent::RunStatus {
+                        run_id: outcome.run_id,
+                        status: rejected,
+                        reason,
+                    })
+                    .await;
+            } else if outcome.held {
+                shared
+                    .state
+                    .emit(NdjsonEvent::RunStatus {
+                        run_id: outcome.run_id,
+                        status: ExecutionStatus::Pending,
+                        reason: crate::concurrency::pending_reason(),
+                    })
+                    .await;
+            }
         }
-        // Surface why a job could never be scheduled. Without this the only
-        // record is a server-side log line the workflow author never sees.
-        for (job_id, reason) in unhostable_reasons {
-            shared
-                .state
-                .emit(NdjsonEvent::JobStatus {
-                    run_id,
-                    job_id,
-                    status: ExecutionStatus::Failure,
-                    reason: Some(reason),
-                })
-                .await;
-        }
-        shared
-            .state
-            .emit(NdjsonEvent::RunAccepted {
-                run_id,
-                queued_jobs,
-            })
-            .await;
+
+        let tail_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
+        let parse_ms = total_ms - expand_ms - build_ms - tx_ms - tail_ms;
+        tracing::debug!(
+            run_id = %outcome.run_id,
+            queued_jobs = outcome.queued_jobs,
+            parse_ms = format_args!("{parse_ms:.1}"),
+            remote_ms = format_args!("{remote_ms:.1}"),
+            secrets_ms = format_args!("{secrets_ms:.1}"),
+            expand_ms = format_args!("{expand_ms:.1}"),
+            drain_ms = format_args!("{drain_ms:.1}"),
+            build_ms = format_args!("{build_ms:.1}"),
+            tx_ms = format_args!("{tx_ms:.1}"),
+            tail_ms = format_args!("{tail_ms:.1}"),
+            total_ms = format_args!("{total_ms:.1}"),
+            "submit_run timing"
+        );
+
         Ok(RunAccepted {
-            run_id,
-            run_number,
-            queued_jobs,
+            run_id: outcome.run_id,
+            run_number: outcome.run_number,
+            queued_jobs: outcome.queued_jobs,
         })
     }
 }
@@ -2470,76 +2087,83 @@ pub async fn submit_run(
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
         let run_id = accepted.run_id;
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.push_state = Some(PushState {
-                status: PushStatus::Pending,
-                error: None,
-                pr_number: None,
-                effective_sha: None,
-            });
-        }
-        drop(inner);
-
+        // The push state commits before any GitHub reporting is detached, so
+        // a client reading the run right after `preloop run --push` always
+        // sees `pending` rather than no push state at all.
+        shared
+            .state
+            .backend
+            .set_push_state(
+                run_id,
+                PushState {
+                    status: PushStatus::Pending,
+                    error: None,
+                    pr_number: None,
+                    effective_sha: None,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
         if clean_push_checks {
-            // Report queued check runs for every job in a detached task, so
-            // submitting a run with --push does not stall the CLI client on
-            // sequential GitHub Check API calls. Jobs resolved terminal at
-            // submission get their completion reported immediately.
-            let (repository, sha, jobs) = {
-                let mut inner = shared.state.inner.lock().await;
-                // Stamped before filtering: an all-expandable push reports
-                // nothing at intake yet still needs the flag for its
-                // materialized legs.
-                if let Some(run) = inner.runs.get_mut(&run_id) {
-                    run.reports_check_runs = true;
-                }
-                let Some(run) = inner.runs.get(&run_id) else {
-                    return Ok(Json(accepted));
-                };
-                (
-                    run.submission.repository.clone(),
-                    run.submission.sha.clone(),
-                    // Expandable nodes (deferred matrices, reusable callers)
-                    // mint no check at intake; their materialized legs do.
-                    run.jobs
-                        .keys()
-                        .filter(|job_id| {
-                            !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            };
-            let reporter = Arc::clone(&shared);
-            tokio::spawn(async move {
-                for job_id in &jobs {
-                    if let Err(error) = crate::github::report_check_run_queued(
-                        &reporter,
-                        &repository,
-                        &sha,
-                        job_id,
-                        run_id,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
-                    }
-                    let status = {
-                        let inner = reporter.state.inner.lock().await;
-                        inner
-                            .runs
-                            .get(&run_id)
-                            .and_then(|run| run.jobs.get(job_id).copied())
-                    };
-                    if let Some(status) = status.filter(|status| status.is_terminal()) {
-                        crate::github::report_check_run_completed(
-                            &reporter, run_id, job_id, status,
+            // Report queued check runs for every dispatchable job in a
+            // detached task, so submitting a run with `--push` does not stall
+            // the CLI client on sequential GitHub Check API calls. Jobs
+            // resolved terminal at submission get their completion reported
+            // right after their queued check.
+            //
+            // Stamped before filtering: an all-expandable submission reports
+            // nothing at intake yet still needs the flag for the legs
+            // materialized later, which mint their own checks.
+            if let Err(error) = shared
+                .state
+                .backend
+                .set_reports_check_runs(run_id, true)
+                .await
+            {
+                tracing::warn!(%run_id, ?error, "failed to stamp reports_check_runs for push run");
+            }
+            let info = shared
+                .state
+                .backend
+                .run_dispatch_info(run_id)
+                .await
+                .map_err(ApiError::from)?;
+            if let Some(info) = info {
+                let repository = info.repository;
+                let sha = info.sha;
+                // Expandable nodes (deferred matrices, reusable callers) are
+                // placeholders: expansion replaces them with the legs that
+                // mint their own checks, and a `queued` check for the
+                // placeholder would strand on GitHub (no delete API).
+                let jobs: Vec<(JobId, ExecutionStatus)> = info
+                    .jobs
+                    .into_iter()
+                    .filter(|job| !job.placeholder)
+                    .map(|job| (job.job_id, job.status))
+                    .collect();
+                let reporter = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    for (job_id, status) in jobs {
+                        if let Err(error) = crate::github::report_check_run_queued(
+                            &reporter,
+                            &repository,
+                            &sha,
+                            &job_id,
+                            run_id,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                        }
+                        if status.is_terminal() {
+                            crate::github::report_check_run_completed(
+                                &reporter, run_id, &job_id, status,
+                            )
+                            .await;
+                        }
                     }
-                }
-            });
+                });
+            }
         }
     }
     Ok(Json(accepted))
@@ -2608,13 +2232,12 @@ pub fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>)
 
 /// Per-job runner artifacts: agent message plus the correlation records the
 /// broker and results/timeline services use to track the delivered request.
-pub struct BuiltJobArtifacts {
-    pub agent_msg: azdo::AgentJobRequestMessage,
-    pub request_id: i64,
-    pub job_request: TaskAgentJobRequestRecord,
-    pub id_token_granted: bool,
-    pub oidc_ctx: OidcJobContext,
-    pub github_token_request: Option<GitHubTokenRequest>,
+pub(crate) struct BuiltJobArtifacts {
+    pub(crate) agent_msg: azdo::AgentJobRequestMessage,
+    pub(crate) job_request: TaskAgentJobRequestRecord,
+    pub(crate) id_token_granted: bool,
+    pub(crate) oidc_ctx: OidcJobContext,
+    pub(crate) github_token_request: Option<GitHubTokenRequest>,
 }
 
 /// The `fileTable` entry naming the reusable workflow a job was inlined from.
@@ -2710,8 +2333,10 @@ fn job_source_identity(
 /// Pure computation shared by the submission prebuild and the scheduler's
 /// runtime expansion of reusable-workflow callee subtrees (which cannot be
 /// built at submission: they exist only after the caller's `if:` gate passes).
+/// Names only — the built message is a secret-free template; values are
+/// resolved through the SecretProvider at acquire.
 #[allow(clippy::too_many_arguments)]
-pub fn build_job_artifacts(
+pub(crate) fn build_job_artifacts(
     shared: &SharedState,
     submission: &WorkflowSubmission,
     run_id: RunId,
@@ -2719,11 +2344,9 @@ pub fn build_job_artifacts(
     workflow_ref: &str,
     sha: &str,
     normalized_github: &serde_json::Value,
-    secrets_exposed: &BTreeMap<String, String>,
     base_url: &str,
     workspace_snapshot: Option<&WorkspaceSnapshot>,
     job: &preloop_gha_protocol::JobPlan,
-    github_token_override: Option<PatToken>,
 ) -> Result<BuiltJobArtifacts, ApiError> {
     // One policy drives every job-facing authority decision for this tier:
     // stored secrets, the runner-visible `system.github.token.permissions`
@@ -2738,7 +2361,7 @@ pub fn build_job_artifacts(
         job.oidc_id_token_granted,
     );
 
-    // M4: the environment registry. `environment:` names an
+    // The environment registry. `environment:` names an
     // operator-registered deployment tier; a workflow claiming an
     // unregistered name gets nothing — no environment secrets, no
     // environment OIDC subject — and the job fails closed rather than
@@ -2766,43 +2389,41 @@ pub fn build_job_artifacts(
     }
 
     // Environment secrets are per-job: a job's `environment:` selects the
-    // tier, so the overlay happens here, not in the submission-level merge.
-    // Precedence per name: submission-provided > environment > repo > global,
-    // mirroring GitHub's env-over-repo-over-org rule with the local
-    // `--secret` escape hatch kept on top.
-    // Overlay lazily: most jobs have no `environment:` tier, and the base
-    // map can be large — copying it per job would be pure allocation cost.
-    // The original map is borrowed directly in that case.
-    let mut env_overlay: Option<BTreeMap<String, String>> = None;
-    if policy.allows_secrets
-        && let Some(env_name) = job.oidc_environment.as_deref()
-    {
-        let env_secrets = shared
+    // tier. Precedence per name is run > environment > repo > global
+    // (resolved by the provider). Only the NAME SET matters here: the stored
+    // message is a secret-free template and the fill path re-resolves values
+    // at acquire.
+    let merged_names: BTreeSet<String> = if policy.allows_secrets {
+        shared
             .state
-            .secrets
-            .read()
-            .env
-            .get(&submission.repository)
-            .and_then(|envs| envs.get(env_name))
-            .cloned();
-        if let Some(env_secrets) = env_secrets {
-            let mut merged = secrets_exposed.clone();
-            for (name, value) in env_secrets {
-                if !submission.submission_names.contains(&name) {
-                    merged.insert(name, value);
-                }
-            }
-            env_overlay = Some(merged);
-        }
-    }
-    let merged_secrets = env_overlay.as_ref().unwrap_or(secrets_exposed);
+            .secret_provider
+            .resolve(crate::secret_provider::SecretScope {
+                repository: &submission.repository,
+                environment: job.oidc_environment.as_deref(),
+                run_id: Some(run_id),
+            })
+            .map_err(|error| secret_provider_error(shared, error))?
+            .into_keys()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+
+    // The builder needs secret *names* (for `secrets.*` contexts and
+    // `secrets: inherit` key sets) but never values — the stored message is
+    // a template: `build_context` masks values, and the only fields that
+    // would carry a real value (`variables`, `mask_hints`) are stripped
+    // below. Keys-only input makes a value leak structurally impossible.
+    let secret_names: BTreeMap<String, String> = merged_names
+        .iter()
+        .map(|name| (name.clone(), String::new()))
+        .collect();
 
     let mut agent_msg =
         preloop_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
             job,
             normalized_github,
-            &job.env,
-            merged_secrets,
+            &secret_names,
             &submission.vars,
         )
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
@@ -2826,11 +2447,13 @@ pub fn build_job_artifacts(
         );
     }
 
-    // Pre-allocate request ID atomically (no lock needed).
-    let request_id = shared
-        .state
-        .next_request_id
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The request id is the `job_requests` primary key; it is minted inside
+    // the writer transaction (`submit_run_tx`/`register_expanded_jobs`) under
+    // the cross-process writer lock, not here — a process-local atomic would
+    // let two engines sharing one database allocate the same id. Stamp the
+    // placeholder the transaction overwrites on both the message and the
+    // request record.
+    let request_id = 0;
     agent_msg.request_id = request_id;
 
     // Mint tokens outside the lock (HMAC computation).
@@ -2886,9 +2509,14 @@ pub fn build_job_artifacts(
     // fetch anonymously through the engine's forge relay when no GitHub
     // credential exists — otherwise actions/checkout writes a bogus
     // `x-access-token:` header and the fetch dies at github.com. With an App
-    // or an embeddable PAT the step keeps direct forge access.
+    // or an embeddable PAT (classic OAuth scopes verified at submit) the step
+    // keeps direct forge access.
     let has_forge_credential = shared.state.github_app.is_some()
-        || matches!(github_token_override.as_ref(), Some(PatToken::Embed { .. }));
+        || shared
+            .state
+            .static_github_pat()
+            .and_then(|pat| cached_pat_scopes(&pat))
+            .is_some();
     let rerouted = crate::snapshots::reroute_forge_checkouts(
         &mut agent_msg,
         base_url,
@@ -2922,67 +2550,10 @@ pub fn build_job_artifacts(
         }
     }
 
-    // The PAT override (used when no GitHub App is configured) is a static,
-    // repository-unscoped credential: embedding it in a fork-restricted job's
-    // message would hand hostile code authority GitHub would never grant the
-    // fork. Such jobs keep the local job-scoped runtime token, which
-    // authenticates only against this control plane.
-    let github_token = if policy.fork_restricted {
-        runtime_token.clone()
-    } else if let Some(pat) = github_token_override {
-        // PAT mode: the token carries the PAT's OAuth scopes, not the
-        // workflow's declared `permissions:`. `system.github.token.permissions`
-        // keeps its documented map shape (the declared set, as the message
-        // builder wrote it) so consumers that parse it are not surprised; the
-        // token's real authority goes in its own variable, which the runner
-        // prints inside the same `GITHUB_TOKEN Permissions` group.
-        let (token, authority) = match &pat {
-            PatToken::Embed { token, scopes } => {
-                // The github context predates PAT selection, so
-                // `${{ github.token }}` inputs (checkout's token, persist-
-                // credentials) resolve empty unless the PAT is patched in —
-                // same hole apply_minted_token_to_message fills for App mints.
-                if let Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) =
-                    agent_msg.context_data.get_mut("github")
-                {
-                    github.insert(
-                        "token".to_owned(),
-                        preloop_gha_protocol::azdo::PipelineContextData::String(token.clone()),
-                    );
-                }
-                (token.clone(), pat_scopes_wire_value(scopes))
-            }
-            // H3: unverifiable authority means no PAT is embedded. The job
-            // keeps the runtime token, which authenticates only against this
-            // control plane, so a step that needs GitHub fails at the point of
-            // use rather than running with authority nobody could bound.
-            PatToken::Withheld => (
-                runtime_token.clone(),
-                "withheld: PAT authority unverifiable; NOT the declared `permissions:` set"
-                    .to_owned(),
-            ),
-        };
-        agent_msg.variables.insert(
-            "system.github.token.pat_scopes".to_owned(),
-            preloop_gha_protocol::azdo::VariableValue::new(authority),
-        );
-        token
-    } else {
-        // No GitHub App and no PAT: `system.github.token` stays the
-        // job-scoped runtime JWT — engine endpoints (snapshots, forge relay,
-        // results) authenticate against it. It does NOT reach api.github.com:
-        // `${{ github.token }}` inputs resolve from the context (empty), and
-        // the runner no longer back-fills GITHUB_TOKEN from this variable.
-        runtime_token.clone()
-    };
-    agent_msg.variables.insert(
-        "system.github.token".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-    );
-    agent_msg.variables.insert(
-        "github_token".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-    );
+    // Token variables are minted at acquire: the stored template carries the
+    // `isSecret` slots empty and the acquire path fills them (runtime token
+    // by default; the PAT override or a minted App token where applicable —
+    // see `message_template::template_github_token` and `broker_acquire_job`).
     agent_msg.variables.insert(
         "actions_runner_allow_artifacts_file".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::new("false"),
@@ -3099,6 +2670,40 @@ pub fn build_job_artifacts(
             });
         }
     }
+    // Turn the built message into its stored template: strip every secret
+    // variable (the names-only build leaves values empty, and the token pair
+    // sits empty from `populate_runner_variables`), drop the value-derived
+    // mask hints (re-derived from live values at acquire), and blank the
+    // snapshot credentials (`redirect_primary_checkout` minted a pinned
+    // token so the template records WHERE it goes, not its value). The spec
+    // rides inside the template so the fill path is self-contained.
+    agent_msg.preloop_secret_spec = if policy.allows_secrets {
+        Some(crate::message_template::secret_spec_for(
+            job,
+            &merged_names,
+            &submission.run_secret_names,
+        ))
+    } else {
+        // A secrets-denied job still carries an explicit (empty) spec so the
+        // fill path injects only tokens — never treated as a legacy
+        // fully-formed message.
+        Some(preloop_gha_protocol::azdo::MessageSecretSpec {
+            environment: job.oidc_environment.clone(),
+            ..Default::default()
+        })
+    };
+    // The builder appends value-derived mask hints last, one per non-empty
+    // secret variable; counting them here reproduces that count without
+    // exporting the builder's internals.
+    let secret_hint_count = agent_msg
+        .variables
+        .values()
+        .filter(|value| {
+            value.is_secret == Some(true) && !value.value.as_deref().unwrap_or("").is_empty()
+        })
+        .count();
+    crate::message_template::strip_template(&mut agent_msg, secret_hint_count);
+
     let oidc_ctx = OidcJobContext {
         environment: job.oidc_environment.clone(),
         job_workflow_ref: job.oidc_job_workflow_ref.clone(),
@@ -3134,7 +2739,6 @@ pub fn build_job_artifacts(
 
     Ok(BuiltJobArtifacts {
         agent_msg,
-        request_id,
         job_request,
         id_token_granted,
         oidc_ctx,
@@ -3142,35 +2746,18 @@ pub fn build_job_artifacts(
     })
 }
 
-/// The step records of a job's most recent attempt.
-///
-/// Attempts are ordered by `request_id`, which is a monotonic allocation, so
-/// the highest one is the newest dispatch. `None` when the job was never
-/// dispatched (skipped or cancelled before a request was built).
-pub fn latest_attempt_steps(
-    inner: &crate::state::InnerState,
-    run_id: RunId,
-    job_id: &JobId,
-) -> Option<Vec<StepRecord>> {
-    let agent_job_id = inner
-        .job_requests
-        .values()
-        .filter(|request| request.run_id == run_id && request.job_id == *job_id)
-        .max_by_key(|request| request.request_id)
-        .map(|request| request.agent_job_id)?;
-    let mut steps = inner.job_steps.get(&agent_job_id).cloned()?;
-    // The stored vector is seeded-then-appended, so it is not execution order.
-    StepRecord::sort_execution_order(&mut steps);
-    Some(steps)
-}
-
 /// Project a stored run into its API shape.
 ///
 /// Shared by the single-run and list endpoints. Step records live in the
 /// attempt-scoped manifest rather than in the stored run, so a caller that
 /// clones `inner.runs` directly returns empty step arrays — which is exactly
-/// what the list endpoint did.
-pub fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunRecord {
+/// what the list endpoint did. `held` is whether the run sits on a
+/// concurrency slot; `steps_for` resolves a job's latest-attempt manifest.
+pub fn project_run_data(
+    mut run: RunRecord,
+    held: bool,
+    steps_for: &dyn Fn(RunId, &JobId) -> Option<Vec<StepRecord>>,
+) -> RunRecord {
     let run_id = run.run_id;
 
     // GitHub's run record shows a gate-passed reusable caller only as its
@@ -3217,12 +2804,30 @@ pub fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunR
             // Steps live in the attempt-scoped manifest, so the run record
             // shows the newest attempt: a retry supersedes what the previous
             // dispatch reported.
-            if let Some(manifest) = latest_attempt_steps(inner, run_id, job_id) {
+            if let Some(manifest) = steps_for(run_id, job_id) {
                 detail.steps = manifest;
             }
             detail
         })
         .collect();
+
+    // The stored status collapses `Queued`/`Pending`/`InProgress` into
+    // `InProgress` (summarize_run). The wire must distinguish a run still
+    // waiting for a runner (`queued`) from one held on a concurrency slot
+    // (`pending`) — neither has a started job. A run in `held_runs` is
+    // `pending`; a runnable run with no `InProgress` job is `queued`.
+    if run.status == ExecutionStatus::InProgress
+        && !run
+            .jobs
+            .values()
+            .any(|status| matches!(status, ExecutionStatus::InProgress))
+    {
+        run.status = if held {
+            ExecutionStatus::Pending
+        } else {
+            ExecutionStatus::Queued
+        };
+    }
 
     run
 }
@@ -3231,13 +2836,49 @@ pub async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    Ok(Json(project_run(&inner, run)))
+    // Indexed point reads — no working-set load. Steps resolve through the
+    // request↔manifest join; a held run is `pending`, never `queued`.
+    let backend = &shared.state.backend;
+    let run = backend
+        .run_record(run_id)
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
+    let (held, requests, manifests) = tokio::try_join!(
+        async { backend.run_held(run_id).await },
+        async { backend.run_requests(run_id).await },
+        async { backend.run_step_manifests(run_id).await },
+    )
+    .map_err(ApiError::from)?;
+    let latest_agent: std::collections::BTreeMap<&JobId, (i64, uuid::Uuid)> = requests
+        .iter()
+        .map(|request| (&request.job_id, (request.request_id, request.agent_job_id)))
+        .fold(
+            std::collections::BTreeMap::new(),
+            |mut map, (job_id, pair)| {
+                map.entry(job_id)
+                    .and_modify(|slot| {
+                        if pair.0 > slot.0 {
+                            *slot = pair;
+                        }
+                    })
+                    .or_insert(pair);
+                map
+            },
+        );
+    let projected = project_run_data(run, held, &|_run, job_id| {
+        latest_agent
+            .get(job_id)
+            .and_then(|(_, agent)| manifests.get(agent))
+            .map(|steps| {
+                let mut steps = steps.clone();
+                crate::models::StepRecord::sort_execution_order(&mut steps);
+                steps
+            })
+    });
+    Ok(Json(projected))
 }
 
 /// Browser-safe status page linked from GitHub Check Runs.
@@ -3249,11 +2890,15 @@ pub async fn get_public_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<axum::response::Html<String>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let run = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
 
     let jobs = run
         .jobs
@@ -3319,54 +2964,17 @@ pub async fn list_runs(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<RunRecord>>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let limit = query.limit.unwrap_or(50).min(200);
-
-    let mut runs: Vec<RunRecord> = inner
-        .runs
-        .values()
-        .filter(|run| {
-            if let Some(workflow) = &query.workflow
-                && !run.workflow_path_str.contains(workflow)
-            {
-                return false;
-            }
-            if let Some(status) = &query.status {
-                let run_status = serde_json::to_value(run.status)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                if run_status != *status {
-                    return false;
-                }
-            }
-            if let Some(event) = &query.event
-                && run.event != *event
-            {
-                return false;
-            }
-            true
+    let runs = shared
+        .state
+        .backend
+        .list_runs(crate::control::backend::RunListFilter {
+            workflow: query.workflow,
+            status: query.status,
+            event: query.event,
+            limit: query.limit.unwrap_or(50).min(200),
         })
-        .cloned()
-        .collect();
-    runs.sort_by(|a, b| {
-        a.status
-            .is_terminal()
-            .cmp(&b.status.is_terminal())
-            .then_with(|| {
-                let a_time = a.completed_at.or(a.started_at).unwrap_or(a.created_at);
-                let b_time = b.completed_at.or(b.started_at).unwrap_or(b.created_at);
-                b_time.cmp(&a_time)
-            })
-    });
-    runs.truncate(limit);
-    let runs = runs
-        .into_iter()
-        // Same projection as the single-run endpoint: steps live in the
-        // attempt manifest, so cloning the stored run alone returns empty
-        // step arrays.
-        .map(|run| project_run(&inner, run))
-        .collect();
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(runs))
 }
@@ -3620,105 +3228,122 @@ pub async fn get_run_logs(
     Path(run_id): Path<RunId>,
     Query(query): Query<RunLogsQuery>,
 ) -> Result<Response, ApiError> {
-    let (state_dir, sources) = {
-        let inner = shared.state.inner.lock().await;
-        if !inner.runs.contains_key(&run_id) {
-            return Err(ApiError::not_found("run not found"));
-        }
+    // Backend state: run existence, the run's job requests, and each request's
+    // step manifest. `inner.logs` (console blocks) is node-local and read
+    // separately below.
+    let job_filter = query.job.clone();
+    let step_requested = query.step.is_some();
+    // Backend: two indexed reads — the run's job requests and each attempt's
+    // step manifest. `inner.logs` (console blocks) is node-local and read
+    // below.
+    let backend = &shared.state.backend;
+    let mut requests = backend.run_requests(run_id).await.map_err(ApiError::from)?;
+    if requests.is_empty() {
+        // An existing run with no dispatched attempts still reads as having
+        // no requests, so confirm the run itself before reporting the job.
+        backend
+            .run_record(run_id)
+            .await
+            .map_err(|error| match error {
+                crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+                other => ApiError::from(other),
+            })?;
+    }
 
-        let mut requests: Vec<&TaskAgentJobRequestRecord> = inner
-            .job_requests
-            .values()
-            .filter(|request| request.run_id == run_id)
-            .collect();
-        requests.sort_by_key(|request| request.request_id);
-
-        if let Some(job) = &query.job {
-            // Same matching rule as the live-log feed: workflow job key or
-            // agent job UUID, so one value works across both surfaces.
-            requests.retain(|request| {
-                request.job_id.0 == *job || request.agent_job_id.to_string() == *job
-            });
-            if requests.is_empty() {
-                return Err(ApiError::not_found(format!(
-                    "job `{job}` not found in this run"
-                )));
-            }
-        } else if query.step.is_some() && requests.len() > 1 {
-            // Numbering restarts per job, so an unqualified step in a
-            // multi-job run names more than one thing.
-            let jobs: Vec<&str> = requests
-                .iter()
-                .map(|request| request.job_id.0.as_str())
-                .collect();
-            return Err(ApiError::bad_request(format!(
-                "`step` needs `job` when a run has {} jobs: {}",
-                jobs.len(),
-                jobs.join(", ")
+    if let Some(job) = &job_filter {
+        // Same matching rule as the live-log feed: workflow job key or agent
+        // job UUID, so one value works across both surfaces.
+        requests
+            .retain(|request| request.job_id.0 == *job || request.agent_job_id.to_string() == *job);
+        if requests.is_empty() {
+            return Err(ApiError::not_found(format!(
+                "job `{job}` not found in this run"
             )));
         }
+    } else if step_requested && requests.len() > 1 {
+        // Numbering restarts per job, so an unqualified step in a multi-job
+        // run names more than one thing.
+        let jobs: Vec<&str> = requests
+            .iter()
+            .map(|request| request.job_id.0.as_str())
+            .collect();
+        return Err(ApiError::bad_request(format!(
+            "`step` needs `job` when a run has {} jobs: {}",
+            jobs.len(),
+            jobs.join(", ")
+        )));
+    }
 
-        let sources = requests
-            .into_iter()
-            .map(|request| {
-                let prefix = format!("{}/", request.plan_id);
-                let mut blocks: Vec<(&str, &[u8])> = inner
-                    .logs
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        key.strip_prefix(&prefix)
-                            .map(|log_id| (log_id, value.as_slice()))
-                    })
-                    .collect();
-                blocks.sort_by(|(left, _), (right, _)| {
-                    match (left.parse::<u64>(), right.parse::<u64>()) {
-                        (Ok(left), Ok(right)) => left.cmp(&right),
-                        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                        (Err(_), Err(_)) => left.cmp(right),
-                    }
-                });
-                // The attempt's own manifest, keyed by the agent job id that
-                // also names this request's results directory. The broker
-                // message is deliberately not consulted — it is broker
-                // delivery state that a restart or a retirement can drop,
-                // while the manifest is run state.
-                //
-                // Two views: declared steps in workflow order decide `--step`,
-                // because a synthetic "Set up job" record must not occupy a
-                // slot; every id in execution order decides the whole-job
-                // concatenation, where synthetic output belongs in place.
-                let manifest = inner.job_steps.get(&request.agent_job_id);
-                let workflow_step_ids = manifest
-                    .map(|records| {
-                        StepRecord::workflow_steps(records)
-                            .into_iter()
-                            .map(|step| step.id.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|ids| !ids.is_empty());
-                let execution_step_ids = manifest
-                    .map(|records| {
-                        let mut ordered = records.clone();
-                        StepRecord::sort_execution_order(&mut ordered);
-                        ordered.into_iter().map(|step| step.id).collect::<Vec<_>>()
-                    })
-                    .filter(|ids| !ids.is_empty());
-                (
-                    request.plan_id.clone(),
-                    request.agent_job_id.to_string(),
-                    request.job_id.0.clone(),
-                    blocks
-                        .into_iter()
-                        .map(|(_, block)| block.to_vec())
-                        .collect::<Vec<_>>(),
-                    workflow_step_ids,
-                    execution_step_ids,
-                )
+    let manifests_map = backend
+        .run_step_manifests(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let manifests: Vec<Option<Vec<crate::models::StepRecord>>> = requests
+        .iter()
+        .map(|request| manifests_map.get(&request.agent_job_id).cloned())
+        .collect();
+
+    // Read published segments plus the unflushed tail. The node-local preview
+    // remains a fallback for logs created before the segment writer existed.
+    let mut sources = Vec::new();
+    for (request, manifest) in requests.iter().zip(manifests.iter()) {
+        let mut blocks = shared
+            .state
+            .log_segments
+            .read_blocks_for_plan(&request.plan_id)
+            .await
+            .map_err(|error| ApiError::internal(format!("failed to read live logs: {error}")))?;
+        if blocks.is_empty() {
+            let inner = shared.state.inner.lock().await;
+            let prefix = format!("{}/", request.plan_id);
+            let mut mem_blocks: Vec<(String, Vec<u8>)> = inner
+                .logs
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix(&prefix)
+                        .map(|log_id| (log_id.to_string(), value.clone()))
+                })
+                .collect();
+            mem_blocks.sort_by(|(left, _), (right, _)| {
+                match (left.parse::<u64>(), right.parse::<u64>()) {
+                    (Ok(left), Ok(right)) => left.cmp(&right),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => left.cmp(right),
+                }
+            });
+            blocks = mem_blocks;
+        }
+        let workflow_step_ids = manifest
+            .as_ref()
+            .map(|records| {
+                StepRecord::workflow_steps(records)
+                    .into_iter()
+                    .map(|step| step.id.clone())
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>();
-        (shared.state.state_dir.clone(), sources)
-    };
+            .filter(|ids| !ids.is_empty());
+        let execution_step_ids = manifest
+            .as_ref()
+            .map(|records| {
+                let mut ordered = records.clone();
+                StepRecord::sort_execution_order(&mut ordered);
+                ordered.into_iter().map(|step| step.id).collect::<Vec<_>>()
+            })
+            .filter(|ids| !ids.is_empty());
+        sources.push((
+            request.plan_id.clone(),
+            request.agent_job_id.to_string(),
+            request.job_id.0.clone(),
+            blocks
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect::<Vec<_>>(),
+            workflow_step_ids,
+            execution_step_ids,
+        ));
+    }
+    let state_dir = shared.state.state_dir.clone();
 
     let mut merged = Vec::new();
     for (
@@ -3759,35 +3384,29 @@ pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    if !inner.runs.contains_key(&run_id) {
-        return Err(ApiError::not_found("run not found"));
-    }
-    let cancellation_count =
-        cancel_run_inner(&mut inner, run_id, None /* no concurrency reason */);
-    let cancelled_jobs = {
-        let run = inner
-            .runs
-            .get_mut(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-        runtime_scheduling::finalize_run_if_complete(run);
-        run.jobs
-            .iter()
-            .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
-            .map(|(job_id, _)| job_id.clone())
-            .collect::<Vec<_>>()
-    };
-    let record = inner
-        .runs
-        .get(&run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let crate::control::types::CancelOutcome {
+        cancellations: cancellation_count,
+        record,
+        cancelled_jobs,
+        queue_depth,
+        next_runs_on,
+        ..
+    } = shared
+        .state
+        .backend
+        .cancel_run(run_id, None)
+        .await
+        .map_err(ApiError::from)?;
+    let record = record.ok_or_else(|| {
+        ApiError::from(crate::control::ControlError::NotFound(
+            "run not found".to_owned(),
+        ))
+    })?;
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    drop(inner);
+        .store(queue_depth, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
     }
@@ -3849,132 +3468,120 @@ pub async fn approve_job(
     Path((run_id, job_id)): Path<(RunId, JobId)>,
     Json(body): Json<ApproveJobRequest>,
 ) -> Result<Json<ApproveJobResponse>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    if run
-        .jobs
-        .get(&job_id)
-        .is_some_and(|status| status.is_terminal())
-    {
-        return Err(ApiError::conflict("job is already terminal"));
-    }
-    let repository = run.submission.repository.clone();
-    let job = inner
-        .pending_jobs
-        .iter_mut()
-        .find(|job| job.run_id == run_id && job.job_id == job_id)
-        .ok_or_else(|| ApiError::not_found("job is not waiting in the scheduler"))?;
-    let gate = job
-        .environment_gate
-        .as_mut()
-        .filter(|gate| gate.approval_requested_at_unix_nanos.is_some())
-        .ok_or_else(|| ApiError::conflict("job is not awaiting environment approval"))?;
-    let env_name = match job.environment.as_ref() {
-        Some(serde_json::Value::String(name)) => name.clone(),
-        Some(serde_json::Value::Object(map)) => map
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        _ => String::new(),
-    };
-    let required = shared
+    // One transaction records the approval — or fails the job closed when the
+    // window lapsed — and re-runs the run's promotion sweep, so a gate the
+    // approval satisfies releases its job before this returns.
+    let outcome = shared
         .state
-        .environment_rules
-        .get(&repository)
-        .and_then(|envs| envs.get(&env_name))
-        .map(|rule| rule.required_reviewers)
-        .unwrap_or(0);
-    // Fail closed on an expired window before recording anything.
-    if let Some(requested_at) = gate.approval_requested_at_unix_nanos
-        && crate::models::now_unix_nanos().saturating_sub(requested_at)
-            > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
-    {
-        crate::runtime_scheduling::promote_ready_jobs(
-            &mut inner,
-            &shared.state.environment_rules,
-            &shared.state.pool_status.snapshot().labels,
-        );
-        crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            crate::runtime_scheduling::finalize_run_if_complete(run);
-        }
-        return Err(ApiError::conflict(
-            "approval window expired; the job was failed closed",
-        ));
-    }
-    gate.approvals_unix_nanos
-        .push(crate::models::now_unix_nanos());
-    let approvals = gate.approvals_unix_nanos.len();
-    let satisfied = required > 0 && (approvals as u32) >= required;
-    tracing::info!(
-        run_id = %run_id.0,
-        job_id = %job_id.0,
-        environment = env_name,
-        approvals,
-        required,
-        note = body.note.as_deref().unwrap_or_default(),
-        "environment approval recorded"
-    );
-    let outcome = crate::runtime_scheduling::promote_ready_jobs(
-        &mut inner,
-        &shared.state.environment_rules,
-        &shared.state.pool_status.snapshot().labels,
-    );
+        .backend
+        .record_environment_approval(crate::control::types::EnvironmentApproval {
+            run_id,
+            job_id: job_id.clone(),
+            note: body.note.clone(),
+        })
+        .await
+        .map_err(ApiError::from)?;
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    let promoted = outcome.promoted;
-    drop(inner);
-    if promoted > 0 {
+        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
+    if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
     }
-    Ok(Json(ApproveJobResponse {
-        run_id: run_id.0.to_string(),
-        job_id: job_id.0.clone(),
-        approvals,
-        required,
-        satisfied,
-    }))
+    match outcome.result {
+        crate::control::types::EnvironmentApprovalResult::AlreadyTerminal => {
+            Err(ApiError::conflict("job is already terminal"))
+        }
+        crate::control::types::EnvironmentApprovalResult::NotAwaiting => Err(ApiError::conflict(
+            "job is not awaiting environment approval",
+        )),
+        crate::control::types::EnvironmentApprovalResult::Expired => {
+            shared.state.message_notify.notify_waiters();
+            Err(ApiError::conflict(
+                "approval window expired; the job was failed closed",
+            ))
+        }
+        crate::control::types::EnvironmentApprovalResult::Recorded {
+            approvals,
+            required,
+            satisfied,
+        } => {
+            tracing::info!(
+                run_id = %run_id.0,
+                job_id = %job_id.0,
+                approvals,
+                required,
+                note = body.note.as_deref().unwrap_or_default(),
+                "environment approval recorded"
+            );
+            Ok(Json(ApproveJobResponse {
+                run_id: run_id.0.to_string(),
+                job_id: job_id.0.clone(),
+                approvals,
+                required,
+                satisfied,
+            }))
+        }
+    }
 }
 pub async fn rerun_run_inner(
     shared: &Arc<SharedState>,
     run_id: RunId,
     reused_check_run: Option<(JobId, u64)>,
 ) -> Result<RunAccepted, ApiError> {
-    let submission = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .map(|run| (*run.submission).clone())
-            .ok_or_else(|| ApiError::not_found("run not found"))?
-    };
+    let mut submission = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map(|run| (*run.submission).clone())
+        .map_err(ApiError::from)?;
+    // A re-run sees the values the original submission supplied; they live
+    // in the provider's run tier while the run's history survives.
+    let run_tier = shared
+        .state
+        .secret_provider
+        .run_tier(run_id)
+        .map_err(|error| secret_provider_error(shared, error))?;
+    // The submission recorded the names it supplied. If any can no longer be
+    // resolved, fail loudly: submitting with them silently dropped would run
+    // the workflow without secrets.
+    let missing: Vec<&str> = submission
+        .run_secret_names
+        .iter()
+        .filter(|name| !run_tier.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "cannot rerun run {run_id}: its submission secrets ({}) can no longer be resolved",
+            missing.join(", ")
+        )));
+    }
+    submission.secrets = run_tier;
     let accepted = submit_run_inner(shared, submission).await?;
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
-        {
-            let mut inner = shared.state.inner.lock().await;
-            if let Some(run) = inner.runs.get_mut(&accepted.run_id)
-                && run.jobs.contains_key(job_id)
-            {
-                run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
-            }
-        }
+        let new_run = accepted.run_id;
+        // Guarded by the setter itself: a missing `jobs` row writes nothing.
+        let mapping_changed = shared
+            .state
+            .backend
+            .set_job_check_run(new_run, job_id, *check_run_id)
+            .await
+            .map_err(ApiError::from)?;
         // Same persistence obligation as `report_check_run_queued`: the
         // reused check id must survive a restart before the job's first
-        // status event.
-        shared
-            .state
-            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
-                run_id: accepted.run_id,
-            })
-            .await;
+        // status event. The setter wrote the event inside its transaction.
+        if mapping_changed {
+            shared
+                .state
+                .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
+                    run_id: accepted.run_id,
+                })
+                .await;
+        }
     }
     crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
     Ok(accepted)
@@ -4015,27 +3622,29 @@ pub async fn approve_fork(
     Path(run_id): Path<RunId>,
     Json(body): Json<ApproveForkRequest>,
 ) -> Result<Json<ApproveForkResponse>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get_mut(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    // The durable record is the guard: only a non-terminal run still awaiting
+    // fork approval may be approved.
+    let run = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?;
     if run.status.is_terminal() {
         return Err(ApiError::conflict("run is already terminal"));
     }
     if !run.fork_approval_pending {
         return Err(ApiError::conflict("run is not awaiting fork approval"));
     }
-    // Fail closed on an expired window before recording anything.
+    let now_unix_nanos = crate::models::now_unix_nanos();
+    // Fail closed on an expired window before recording anything: the sweep
+    // fails the run closed exactly as the reaper would.
     if let Some(requested_at) = run.fork_approval_requested_at_unix_nanos
-        && crate::models::now_unix_nanos().saturating_sub(requested_at)
+        && now_unix_nanos.saturating_sub(requested_at)
             > crate::fork_policy::FORK_APPROVAL_WINDOW_NANOS
     {
-        let expired = crate::fork_policy::sweep_expired_fork_approvals(
-            &mut inner,
-            crate::models::now_unix_nanos(),
-        );
-        drop(inner);
+        let expired =
+            crate::fork_policy::sweep_expired_fork_approvals(&shared, now_unix_nanos).await;
         if !expired.is_empty() {
             shared.state.message_notify.notify_waiters();
         }
@@ -4043,33 +3652,51 @@ pub async fn approve_fork(
             "approval window expired; the run was failed closed",
         ));
     }
-    let run = inner.runs.get_mut(&run_id).expect("run exists");
-    run.fork_approval_pending = false;
-    run.fork_approved_at_unix_nanos = Some(crate::models::now_unix_nanos());
-    run.fork_approval_note = body.note.clone();
+    // Release the hold, then hand the run's parked jobs back to admission.
+    shared
+        .state
+        .backend
+        .set_fork_approval(crate::control::types::ForkApprovalStamp {
+            run_id,
+            pending: false,
+            requested_at_unix_nanos: run.fork_approval_requested_at_unix_nanos,
+            approved_at_unix_nanos: Some(now_unix_nanos),
+            note: body.note.clone(),
+        })
+        .await
+        .map_err(ApiError::from)?;
     tracing::info!(
         run_id = %run_id.0,
         note = body.note.as_deref().unwrap_or_default(),
         "fork-PR approval recorded; run released"
     );
-    let outcome = crate::runtime_scheduling::promote_ready_jobs(
-        &mut inner,
-        &shared.state.environment_rules,
-        &shared.state.pool_status.snapshot().labels,
-    );
+    let outcome = shared
+        .state
+        .backend
+        .promote_ready_jobs(Some(run_id), &shared.state.environment_rules)
+        .await
+        .map_err(ApiError::from)?;
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    let promoted = outcome.promoted;
-    drop(inner);
-    if promoted > 0 {
+        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
+    if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
     }
+    // The expiry sweep may have won the run's terminal transition between the
+    // guard read and the write (it clears the hold in its own transaction).
+    // Report that honestly: the run is no longer awaiting this approval.
+    let approved = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map(|run| !run.status.is_terminal())
+        .unwrap_or(false);
     Ok(Json(ApproveForkResponse {
         run_id: run_id.0.to_string(),
-        approved: true,
+        approved,
     }))
 }
 
@@ -4094,32 +3721,38 @@ pub async fn run_events(
     // de-duplicate, and applying a status twice is idempotent.
     let receiver = shared.state.events.subscribe();
 
-    let (snapshot, settled) = {
-        let inner = shared.state.inner.lock().await;
-        let run = inner
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-        let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
-            run_id,
-            status: run.status,
-            reason: None,
+    // Backend: run status + job statuses. Node-local: the timeline-event
+    let run = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
         })?;
-        for (job_id, status) in &run.jobs {
-            out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
-                run_id,
-                job_id: job_id.clone(),
-                status: *status,
-                reason: None,
-            })?);
-        }
+    let mut snapshot = event_to_ndjson(&NdjsonEvent::RunStatus {
+        run_id,
+        status: run.status,
+        reason: None,
+    })?;
+    for (job_id, status) in &run.jobs {
+        snapshot.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
+            run_id,
+            job_id: job_id.clone(),
+            status: *status,
+            reason: None,
+        })?);
+    }
+    {
+        let inner = shared.state.inner.lock().await;
         if let Some(events) = inner.timeline_events.get(&run_id) {
             for event in events {
-                out.push_str(&event_to_ndjson(event)?);
+                snapshot.push_str(&event_to_ndjson(event)?);
             }
         }
-        (out, run.status.is_terminal())
-    };
+    }
+    let settled = run.status.is_terminal();
 
     let body = if settled {
         Body::from(snapshot)
@@ -4209,11 +3842,17 @@ mod tests {
         let result = submit_run_inner_with_webhook_delivery(&shared, submission, None)
             .await
             .unwrap();
-        let inner = state.inner.lock().await;
-        let run = inner.runs.get(&result.run_id).expect("run exists");
         // `sync` must not be failed at enqueue — its `if:` is pending until
         // `prep` finishes, then promotion evaluates it to Skip.
-        let sync_status = run.jobs.get(&JobId("sync".to_owned())).copied();
+        let sync_status = state
+            .backend
+            .run_job_statuses(result.run_id)
+            .await
+            .expect("backend read")
+            .expect("run exists")
+            .into_iter()
+            .find(|(job_id, _)| *job_id == JobId("sync".to_owned()))
+            .map(|(_, status)| status);
         assert_ne!(
             sync_status,
             Some(ExecutionStatus::Failure),
@@ -4222,7 +3861,7 @@ mod tests {
         assert!(
             matches!(
                 sync_status,
-                Some(ExecutionStatus::Queued | ExecutionStatus::Pending) | None
+                Some(ExecutionStatus::Queued | ExecutionStatus::Pending)
             ),
             "sync job must still be pending until needs settle, got {sync_status:?}"
         );
@@ -4278,12 +3917,15 @@ mod tests {
         assert_eq!(first.run_number, 1);
         assert_eq!(second.run_number, 1);
 
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
+        // The sqlite counter map is keyed `repository\x1fworkflow_path` (the
+        // new signature folds namespace/repository in; no stored column
+        // exists for them on the old backends).
         assert_eq!(
             inner
                 .workflow_run_counters
-                .get(".github/workflows/build.yml"),
+                .get("owner/repo\x1f.github/workflows/build.yml"),
             Some(&1),
             "a replay that reused the run must not advance the counter"
         );
@@ -4585,6 +4227,8 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .output()
             .expect("git runs in tests");
@@ -4643,7 +4287,7 @@ mod tests {
         };
         let accepted = submit_run_inner(&shared, submission).await.unwrap();
 
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
         let snapshot = run
             .workspace_snapshot
@@ -4838,7 +4482,7 @@ mod tests {
 
     const ENV_WORKFLOW: &str = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo hi\n";
 
-    /// M4: `environment:` is an unvalidated string. A workflow claiming an
+    /// `environment:` is an unvalidated string. A workflow claiming an
     /// environment the operator never registered must fail closed — even
     /// when that environment has secrets configured (the pentest shape: env
     /// secret injected + OIDC `sub` asserting the unregistered environment).
@@ -4861,7 +4505,7 @@ mod tests {
         );
     }
 
-    /// M4: an environment the operator registered in `[environments]` keeps
+    /// An environment the operator registered in `[environments]` keeps
     /// working — the registry gates existence, not legitimate use.
     #[tokio::test]
     async fn registered_environment_accepts_run_submission() {
@@ -4937,11 +4581,16 @@ mod tests {
             "unexpected error: {}",
             error.message()
         );
-        let inner = shared.state.inner.lock().await;
-        assert!(
-            inner.runs.is_empty(),
-            "denied submission must not create a run"
-        );
+        let runs = shared
+            .state
+            .backend
+            .list_runs(crate::control::backend::RunListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(runs.is_empty(), "denied submission must not create a run");
     }
 
     #[tokio::test]
@@ -4952,8 +4601,15 @@ mod tests {
         let accepted = submit_run_inner(&shared, push_submission())
             .await
             .expect("evaluate mode must not block submission");
-        let inner = shared.state.inner.lock().await;
-        assert!(inner.runs.contains_key(&accepted.run_id));
+        assert!(
+            shared
+                .state
+                .backend
+                .run_record(accepted.run_id)
+                .await
+                .is_ok(),
+            "evaluate mode must still create the run"
+        );
     }
 
     /// The shipped default — an unscoped `pull_request_target` event deny in
@@ -4985,9 +4641,13 @@ mod tests {
         let accepted = submit_run_inner(&shared, submission)
             .await
             .expect("the default pull_request_target rule is evaluate-only and must not block");
-        let inner = shared.state.inner.lock().await;
         assert!(
-            inner.runs.contains_key(&accepted.run_id),
+            shared
+                .state
+                .backend
+                .run_record(accepted.run_id)
+                .await
+                .is_ok(),
             "a logged-not-blocked submission must still create a run"
         );
     }
@@ -5018,8 +4678,12 @@ mod tests {
             ..Default::default()
         };
         let accepted = submit_run_inner(&shared, submission).await.unwrap();
-        let inner = state.inner.lock().await;
-        let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
         assert_eq!(run.jobs.len(), 1, "the gated job stays in the run");
         assert!(
             run.jobs.values().all(|status| status.is_terminal()),
@@ -5071,26 +4735,39 @@ mod tests {
 
         let first = submit_run_inner(&shared, submission.clone()).await.unwrap();
         let second = submit_run_inner(&shared, submission).await.unwrap();
-        let inner = state.inner.lock().await;
 
         for accepted in [&first, &second] {
-            let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+            let run = shared
+                .state
+                .backend
+                .run_record(accepted.run_id)
+                .await
+                .expect("run is recorded");
             assert!(
                 run.status.is_terminal(),
                 "run {} must not wait on a group: {:?}",
                 accepted.run_id,
                 run.status
             );
+            assert_eq!(
+                shared
+                    .state
+                    .backend
+                    .run_in_concurrency(accepted.run_id)
+                    .await
+                    .unwrap(),
+                crate::control::types::RunConcurrency::None,
+                "a workless run must not leave its group held"
+            );
+            assert!(
+                !shared
+                    .state
+                    .backend
+                    .run_held(accepted.run_id)
+                    .await
+                    .unwrap(),
+                "a workless run must not park on a busy group"
+            );
         }
-        assert!(
-            inner.concurrency_groups.is_empty(),
-            "a workless run must not leave its group held: {:?}",
-            inner.concurrency_groups.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            inner.held_runs.is_empty(),
-            "a workless run must not park on a busy group: {:?}",
-            inner.held_runs.keys().collect::<Vec<_>>()
-        );
     }
 }

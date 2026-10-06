@@ -274,6 +274,11 @@ impl PoolStatus {
         self.inner.write().labels = labels;
     }
 
+    /// The runner labels the pool advertises; empty until it publishes.
+    pub fn labels(&self) -> Vec<String> {
+        self.inner.read().labels.clone()
+    }
+
     pub fn insert_pending(&self, token: String, at: std::time::SystemTime) {
         self.pending_tokens.write().insert(token, at);
         // `snapshot()` derives `pending_registrations` from `pending_tokens`;

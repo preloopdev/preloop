@@ -450,7 +450,7 @@ mod tests {
         );
     }
 
-    // --- P0 container step host gap coverage ---
+    // --- container step host gap coverage ---
 
     #[test]
     fn resolve_sh_shell_default() {

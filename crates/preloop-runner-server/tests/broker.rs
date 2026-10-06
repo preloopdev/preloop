@@ -46,41 +46,41 @@ async fn hung_worker_reaped_while_session_still_polls() {
     )
     .await;
     let request_id = {
-        let inner = state.inner.lock().await;
-        *inner.job_requests.keys().next().unwrap()
+        let tx = state.test_tx().await;
+        *tx.job_requests.keys().next().unwrap()
     };
 
     // Worker stops renewing (lease stale past the hung threshold) but the
     // session stays fresh — the listener is alive, the worker is not.
-    {
-        let mut inner = state.inner.lock().await;
-        inner
-            .session_last_seen
-            .insert("default".to_owned(), std::time::Instant::now());
-        let request = inner.job_requests.get_mut(&request_id).unwrap();
-        request.last_renewed_at =
-            Some(SystemTime::now() - Duration::from_secs(HUNG_WORKER_LEASE_SECONDS + 1));
-    }
+    let now_micros = crate::store::now_us();
+    state
+        .test_db_mutate(|tx| {
+            tx.set_session_seen("default", now_micros).unwrap();
+            tx.set_lease_renewed(
+                request_id,
+                1,
+                now_micros - (HUNG_WORKER_LEASE_SECONDS as i64 + 1) * 1_000_000,
+                now_micros + JOB_LEASE_SECONDS as i64 * 1_000_000,
+            )
+            .unwrap();
+        })
+        .await;
 
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
-    let request = inner.job_requests.get(&request_id).unwrap();
+    let tx = state.test_tx().await;
+    let request = tx.job_requests.get(&request_id).unwrap();
     assert_eq!(
         request.result,
         Some(ExecutionStatus::Failure),
         "a hung worker must be reaped on its own cadence, not the full lease"
     );
-    assert!(inner.session_active_requests.is_empty());
+    assert!(tx.session_active_requests.is_empty());
     assert_eq!(
-        inner.runs.get(&run_id).unwrap().status,
+        tx.runs.get(&run_id).unwrap().status,
         ExecutionStatus::Failure
     );
 }
-
-/// The mirror image: a stale lease with a *dead* session is a disconnect, not
-/// a hung worker. It must wait out the full JOB_LEASE_SECONDS boundary — the
-/// guest may be partitioned and could still come back.
 
 /// The mirror image: a stale lease with a *dead* session is a disconnect, not
 /// a hung worker. It must wait out the full JOB_LEASE_SECONDS boundary — the
@@ -117,28 +117,35 @@ async fn dead_session_stale_lease_waits_for_full_lease() {
     )
     .await;
     let request_id = {
-        let inner = state.inner.lock().await;
-        *inner.job_requests.keys().next().unwrap()
+        let tx = state.test_tx().await;
+        *tx.job_requests.keys().next().unwrap()
     };
 
     // Lease stale past the hung threshold but the session is dead — this is a
     // disconnect, so the job must NOT be reaped at the hung-worker cadence.
-    {
-        let mut inner = state.inner.lock().await;
-        let stale_seen =
-            std::time::Instant::now() - inner.runner_liveness_timeout - Duration::from_secs(1);
-        inner
-            .session_last_seen
-            .insert("default".to_owned(), stale_seen);
-        let request = inner.job_requests.get_mut(&request_id).unwrap();
-        request.last_renewed_at =
-            Some(SystemTime::now() - Duration::from_secs(HUNG_WORKER_LEASE_SECONDS + 1));
-    }
+    let now_micros = crate::store::now_us();
+    let liveness = state.test_tx().await.runner_liveness_timeout;
+    state
+        .test_db_mutate(|tx| {
+            tx.set_session_seen(
+                "default",
+                now_micros - liveness.as_micros() as i64 - 1_000_000,
+            )
+            .unwrap();
+            tx.set_lease_renewed(
+                request_id,
+                1,
+                now_micros - (HUNG_WORKER_LEASE_SECONDS as i64 + 1) * 1_000_000,
+                now_micros + JOB_LEASE_SECONDS as i64 * 1_000_000,
+            )
+            .unwrap();
+        })
+        .await;
 
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
-    let request = inner.job_requests.get(&request_id).unwrap();
+    let tx = state.test_tx().await;
+    let request = tx.job_requests.get(&request_id).unwrap();
     assert_eq!(
         request.result, None,
         "a dead session is a disconnect; it must wait out the full lease"
@@ -156,7 +163,7 @@ async fn github_webhook_flows_with_signature_and_check_runs() {
 
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. Create a dummy workflow file in a local workspace
+    // Create a dummy workflow file in a local workspace
     let ws_dir = temp.path().join("workspace");
     tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
         .await
@@ -184,7 +191,7 @@ jobs:
 
     let app = app(state.clone(), CancellationToken::new());
 
-    // 2. Prepare mock webhook push payload
+    // Prepare mock webhook push payload
     let payload = serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
@@ -205,7 +212,7 @@ jobs:
 
     let payload_bytes = serde_json::to_vec(&payload).unwrap();
 
-    // 3. Compute correct signature
+    // Compute correct signature
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
@@ -218,7 +225,7 @@ jobs:
         .collect::<String>();
     let signature_header = format!("sha256={}", sig_hex);
 
-    // 4. Send request with WRONG signature -> should fail with 401
+    // Send request with WRONG signature -> should fail with 401
     let response_401 = app
         .clone()
         .oneshot(
@@ -235,7 +242,7 @@ jobs:
         .unwrap();
     assert_eq!(response_401.status(), StatusCode::UNAUTHORIZED);
 
-    // 5. Send request with CORRECT signature -> should succeed with 200
+    // Send request with CORRECT signature -> should succeed with 200
     let response_200 = app
         .clone()
         .oneshot(
@@ -256,7 +263,7 @@ jobs:
         shutdown: CancellationToken::new(),
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);
     assert_eq!(
         state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
@@ -309,6 +316,8 @@ jobs:
 
     let git = |args: &[&str]| -> String {
         let output = Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .current_dir(&ws_dir)
             .output()
@@ -383,7 +392,7 @@ jobs:
         shutdown: CancellationToken::new(),
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.values().next().expect("webhook created a run");
     assert_eq!(
         run.submission.resolved_sha.as_deref(),
@@ -475,7 +484,7 @@ jobs:
         shutdown: CancellationToken::new(),
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         inner.runs.is_empty(),
         "missing event SHA must not execute current-worktree YAML"
@@ -562,17 +571,12 @@ jobs:
         shutdown: CancellationToken::new(),
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         inner.runs.is_empty(),
         "pull_request_target must not execute head-controlled YAML"
     );
 }
-
-/// Check-run ids must survive a restart even when no job status event ever
-/// fired — a long queue can sit between check-run creation and the job's
-/// first status event, and a deploy in that window used to restore the run
-/// with an empty mapping, orphaning the GitHub check in "queued" forever.
 
 /// Check-run ids must survive a restart even when no job status event ever
 /// fired — a long queue can sit between check-run creation and the job's
@@ -662,7 +666,7 @@ jobs:
         });
         crate::github::drain_webhook_queue(&shared).await.unwrap();
 
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let (run_id, run) = inner.runs.iter().next().expect("webhook created a run");
         assert_eq!(
             run.job_check_run_ids.len(),
@@ -674,7 +678,7 @@ jobs:
 
     // Restart with no job event in between: the mapping must come back.
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let inner = recovered.inner.lock().await;
+    let inner = recovered.test_tx().await;
     let run = inner.runs.get(&run_id).expect("run must survive restart");
     assert_eq!(
         run.job_check_run_ids.len(),
@@ -704,16 +708,24 @@ async fn github_check_run_rerequest_resubmits_the_owning_run() {
     .await;
     let original_run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let original_check_run_id = 1234;
-    {
-        let mut inner = state.inner.lock().await;
-        let run = inner.runs.get_mut(&original_run_id).unwrap();
-        run.jobs
-            .insert(JobId("build".to_owned()), ExecutionStatus::Failure);
-        run.status = ExecutionStatus::Failure;
-        run.conclusion = Some("failure".to_owned());
-        run.job_check_run_ids
-            .insert(JobId("build".to_owned()), original_check_run_id);
-    }
+    state
+        .test_db_mutate(|tx| {
+            tx.set_run_status(original_run_id, "completed", Some("failure"))
+                .unwrap();
+            tx.0
+                .execute(
+                    "UPDATE jobs SET status = 'failure', queue_state = 'none'                      WHERE run_id = ?1 AND job_id = 'build'",
+                    [original_run_id.to_string()],
+                )
+                .unwrap();
+            tx.set_job_check_run(
+                original_run_id,
+                &JobId("build".to_owned()),
+                original_check_run_id as i64,
+            )
+            .unwrap();
+        })
+        .await;
 
     let payload = serde_json::json!({
         "action": "rerequested",
@@ -759,7 +771,7 @@ async fn github_check_run_rerequest_resubmits_the_owning_run() {
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 2);
     let rerun = inner
         .runs
@@ -797,7 +809,7 @@ async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() 
         StatusCode::ACCEPTED
     );
     fixture.drain().await;
-    let inner = fixture.state.inner.lock().await;
+    let inner = fixture.state.test_tx().await;
     assert_eq!(
         inner.runs.len(),
         2,
@@ -817,7 +829,7 @@ async fn github_webhook_missing_event_does_not_poison_delivery_id() {
         StatusCode::BAD_REQUEST
     );
     {
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(
             inner.runs.is_empty(),
             "a rejected request must not create a run"
@@ -831,11 +843,38 @@ async fn github_webhook_missing_event_does_not_poison_delivery_id() {
         StatusCode::ACCEPTED
     );
     fixture.drain().await;
-    let inner = fixture.state.inner.lock().await;
+    let inner = fixture.state.test_tx().await;
     assert_eq!(
         inner.runs.len(),
         1,
         "a retry after pre-enqueue rejection must create the run"
+    );
+}
+
+/// A failed dedup read must not fall through to submitting: that
+/// re-runs the workflow push-back already tested and published, which is
+/// exactly the duplicate this gate exists to prevent.
+#[tokio::test]
+async fn push_webhook_refuses_to_submit_when_the_dedup_read_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+    assert_eq!(
+        fixture.post("delivery-dedup-fail", Some("push")).await,
+        StatusCode::ACCEPTED
+    );
+    fixture
+        .state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE run_push_states", [])
+                .expect("drop run_push_states");
+        })
+        .await;
+
+    fixture.drain().await;
+    let inner = fixture.state.test_tx().await;
+    assert!(
+        inner.runs.is_empty(),
+        "a failed dedup read must not submit a possibly-duplicate run"
     );
 }
 
@@ -853,7 +892,7 @@ async fn github_webhook_concurrent_duplicate_delivery_creates_one_run() {
     assert_eq!(first, StatusCode::ACCEPTED);
     assert_eq!(second, StatusCode::ACCEPTED);
     fixture.drain().await;
-    let inner = fixture.state.inner.lock().await;
+    let inner = fixture.state.test_tx().await;
     assert_eq!(
         inner.runs.len(),
         1,
@@ -872,7 +911,7 @@ async fn github_webhook_dedup_survives_restart() {
     );
     fixture.drain().await;
     let original_run_id = {
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
         *inner.runs.keys().next().unwrap()
     };
@@ -914,18 +953,14 @@ async fn github_webhook_dedup_survives_restart() {
         state: restarted_state.clone(),
         shutdown: CancellationToken::new(),
     });
-    let claimed = restarted_state
-        .store
-        .claim_webhook_deliveries(1, 60)
-        .await
-        .unwrap();
-    assert!(
-        claimed.is_empty(),
+    let claimed = restarted_state.test_claim_webhook_deliveries(1, 60).await;
+    assert_eq!(
+        claimed, 0,
         "a completed delivery must not be claimed after restart"
     );
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
-    let inner = restarted_state.inner.lock().await;
+    let inner = restarted_state.test_tx().await;
     assert!(
         inner.runs.contains_key(&original_run_id),
         "restart redelivery must preserve the original run identity"
@@ -979,15 +1014,9 @@ async fn github_webhook_run_reservation_survives_restart() {
     .await
     .unwrap();
     let original_run_id = accepted.run_id;
-    let claimed = fixture
-        .state
-        .store
-        .claim_webhook_deliveries(1, 0)
-        .await
-        .unwrap();
+    let claimed = fixture.state.test_claim_webhook_deliveries(1, 0).await;
     assert_eq!(
-        claimed.len(),
-        1,
+        claimed, 1,
         "the simulated crash must leave the delivery in processing"
     );
     drop(shared);
@@ -1000,11 +1029,7 @@ async fn github_webhook_run_reservation_survives_restart() {
     restarted_state.webhook_secret = Some("super-secret".to_owned());
     restarted_state.local_workspace = Some(temp.path().join("ws"));
     assert_eq!(
-        restarted_state
-            .store
-            .recover_webhook_deliveries()
-            .await
-            .unwrap(),
+        restarted_state.test_recover_webhook_deliveries().await,
         1,
         "restart must release the uncompleted delivery lease"
     );
@@ -1036,7 +1061,7 @@ async fn github_webhook_run_reservation_survives_restart() {
     crate::github::drain_webhook_queue(&restarted_shared)
         .await
         .unwrap();
-    let inner = restarted_state.inner.lock().await;
+    let inner = restarted_state.test_tx().await;
     assert!(
         inner.runs.contains_key(&original_run_id),
         "replayed processing must reuse the run restored from the reservation"
@@ -1076,6 +1101,8 @@ jobs:
 
     let git = |args: &[&str]| -> String {
         let output = Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .current_dir(&ws_dir)
             .output()
@@ -1153,7 +1180,7 @@ jobs:
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
     // Verify triggered run
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);
     let (_, run_record) = inner.runs.iter().next().unwrap();
     assert_eq!(run_record.submission.event, "pull_request");
@@ -1255,35 +1282,29 @@ jobs:
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
-    let run_id = {
-        let inner = state.inner.lock().await;
-        assert_eq!(inner.runs.len(), 1, "fork PR must create a run");
-        let (run_id, run) = inner.runs.iter().next().unwrap();
-        assert!(
-            run.fork_approval_pending,
-            "fork PR run must wait for approval"
-        );
-        // The needs-empty job must be held in Pending, not dispatched.
-        assert_eq!(run.jobs.len(), 1);
-        let status = run.jobs.values().next().unwrap();
-        assert_eq!(
-            *status,
-            ExecutionStatus::Pending,
-            "needs-empty fork job must hold in Pending"
-        );
-        assert!(
-            inner.queue.iter().all(|j| j.run_id != *run_id),
-            "needs-empty fork job must not reach the ready queue"
-        );
-        assert!(
-            inner.pending_jobs.iter().any(|j| j.run_id == *run_id),
-            "needs-empty fork job must wait in pending_jobs"
-        );
-        *run_id
-    };
+    let runs = request_json(&app, Method::GET, "/api/v1/runs", Value::Null).await;
+    let runs = runs.as_array().expect("run list is an array");
+    assert_eq!(runs.len(), 1, "fork PR must create a run");
+    let run = &runs[0];
+    assert_eq!(
+        run["fork_approval_pending"],
+        Value::Bool(true),
+        "fork PR run must wait for approval"
+    );
+    let jobs = run["jobs"].as_object().expect("job statuses");
+    assert_eq!(jobs.len(), 1);
+    // The needs-empty job parks in `pending`: `queued` would mean it reached
+    // the ready queue and a runner could claim it before the approval.
+    assert_eq!(
+        jobs.values().next().unwrap(),
+        "pending",
+        "needs-empty fork job must hold in Pending"
+    );
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
 
     // Approving releases the hold; an empty JSON body must be accepted.
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -1296,10 +1317,21 @@ jobs:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let inner = state.inner.lock().await;
-    assert!(
-        !inner.runs[&run_id].fork_approval_pending,
+    let run = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runs/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        run["fork_approval_pending"],
+        Value::Bool(false),
         "approval must clear the hold"
+    );
+    assert_eq!(
+        run["jobs"]["build"], "queued",
+        "the released job reaches the ready queue"
     );
 }
 
@@ -1307,7 +1339,7 @@ jobs:
 async fn github_app_manifest_registration_flow() {
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. Setup a local mock GitHub API server for manifest conversion
+    // Setup a local mock GitHub API server for manifest conversion
     let mock_app = Router::new().route(
             "/app-manifests/:code/conversions",
             post(|Path(code): Path<String>| async move {
@@ -1326,7 +1358,7 @@ async fn github_app_manifest_registration_flow() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // 2. Configure mock API URL in environment
+    // Configure mock API URL in environment
     // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     unsafe {
@@ -1339,7 +1371,7 @@ async fn github_app_manifest_registration_flow() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 3. Request registration form (GET /api/v1/github/register)
+    // Request registration form (GET /api/v1/github/register)
     let response_reg = app
         .clone()
         .oneshot(
@@ -1359,7 +1391,7 @@ async fn github_app_manifest_registration_flow() {
     assert!(html.contains("https://github.com/settings/apps/new"));
     assert!(html.contains("preloop-local-app"));
 
-    // 4. Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
+    // Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
     let response_callback = app
         .clone()
         .oneshot(
@@ -1393,7 +1425,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 1. Generate RSA keypair for the runner using the protocol's library
+    // Generate RSA keypair for the runner using the protocol's library
     let keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
     let rsa_params = keypair.to_rsaparams();
 
@@ -1402,7 +1434,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
         rsa_params.modulus, rsa_params.exponent
     );
 
-    // 2. Register the runner
+    // Register the runner
     let reg_response = request_json(
         &app,
         Method::POST,
@@ -1426,7 +1458,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
         .unwrap()
         .to_owned();
 
-    // 3. Build a valid client assertion JWT signed with the runner's private RSA key
+    // Build a valid client assertion JWT signed with the runner's private RSA key
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1439,7 +1471,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let claims = json!({
         "sub": client_id,
         "iss": client_id,
-        // R1-9: aud must identify this server (the called token endpoint).
+        // aud must identify this server (the called token endpoint).
         "aud": "http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token",
         "jti": uuid::Uuid::new_v4().to_string(),
         "nbf": now,
@@ -1448,7 +1480,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
 
     let client_assertion = sign_jwt_ps256(&header, &claims, &rsa_params).unwrap();
 
-    // 4. Request OAuth token using urlencoded body
+    // Request OAuth token using urlencoded body
     let form_body = serde_urlencoded::to_string([
         (
             "client_assertion_type",
@@ -1515,7 +1547,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let rs256_token_resp: Value = serde_json::from_slice(&rs256_bytes).unwrap();
     assert!(rs256_token_resp["access_token"].is_string());
 
-    // 5. Test negative case: Invalid signature (wrong key)
+    // Test negative case: Invalid signature (wrong key)
     let wrong_keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
     let wrong_rsa_params = wrong_keypair.to_rsaparams();
     let bad_assertion = sign_jwt_ps256(&header, &claims, &wrong_rsa_params).unwrap();
@@ -1546,26 +1578,26 @@ async fn runner_oauth2_token_client_assertion_verification() {
     assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
 }
 
-// ─── R1-9: client_assertion expiry / audience validation ───
+// ─── client_assertion expiry / audience validation ───
 
 #[test]
-fn r1_9_accepts_valid_assertion_claims() {
+fn accepts_valid_assertion_claims() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let uri = r1_9_test_uri();
+    let uri = oauth2_token_uri();
     // Exact endpoint URL.
-    let claims = r1_9_claims(
+    let claims = assertion_claims(
         now,
         serde_json::json!("http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token"),
     );
     assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
     // Base URL alone is also accepted.
-    let claims = r1_9_claims(now, serde_json::json!("http://127.0.0.1:9090"));
+    let claims = assertion_claims(now, serde_json::json!("http://127.0.0.1:9090"));
     assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
     // Array form.
-    let claims = r1_9_claims(
+    let claims = assertion_claims(
         now,
         serde_json::json!(["https://other.example", "http://127.0.0.1:9090"]),
     );
@@ -1573,12 +1605,12 @@ fn r1_9_accepts_valid_assertion_claims() {
 }
 
 #[test]
-fn r1_9_rejects_expired_assertion() {
+fn rejects_expired_assertion() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let uri = r1_9_test_uri();
+    let uri = oauth2_token_uri();
     let claims = serde_json::json!({
         "sub": "test-client",
         "aud": "http://127.0.0.1:9090",
@@ -1589,14 +1621,14 @@ fn r1_9_rejects_expired_assertion() {
 }
 
 #[test]
-fn r1_9_rejects_wrong_audience() {
+fn rejects_wrong_audience() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let uri = r1_9_test_uri();
+    let uri = oauth2_token_uri();
     // Assertion addressed to a different server must not validate here.
-    let claims = r1_9_claims(now, serde_json::json!("https://preloop.local/oauth"));
+    let claims = assertion_claims(now, serde_json::json!("https://preloop.local/oauth"));
     assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
     // Missing aud is also rejected.
     let claims = serde_json::json!({"sub": "test-client", "nbf": now, "exp": now + 300});
@@ -1604,12 +1636,12 @@ fn r1_9_rejects_wrong_audience() {
 }
 
 #[test]
-fn r1_9_rejects_missing_exp_and_excessive_lifetime() {
+fn rejects_missing_exp_and_excessive_lifetime() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let uri = r1_9_test_uri();
+    let uri = oauth2_token_uri();
     // Missing exp.
     let claims = serde_json::json!({
         "sub": "test-client",
@@ -1678,11 +1710,6 @@ fn label_matching_rejects_missing_labels() {
 /// in for one it actually runs. A macOS host claiming `ubuntu-latest` fails
 /// the job deep inside a step (Linux-only crate features, `/home/runner`
 /// paths, apt) instead of waiting for a Linux runner.
-
-/// A hosted image label names an OS, and a self-hosted runner may only stand
-/// in for one it actually runs. A macOS host claiming `ubuntu-latest` fails
-/// the job deep inside a step (Linux-only crate features, `/home/runner`
-/// paths, apt) instead of waiting for a Linux runner.
 #[test]
 fn label_matching_never_crosses_operating_systems() {
     let mac = [
@@ -1709,9 +1736,6 @@ fn label_matching_never_crosses_operating_systems() {
 
 /// A runner that declares no OS label has told us nothing to contradict, so
 /// it stays eligible for every hosted label.
-
-/// A runner that declares no OS label has told us nothing to contradict, so
-/// it stays eligible for every hosted label.
 #[test]
 fn label_matching_os_less_runner_stays_eligible() {
     let unlabelled = ["self-hosted".to_owned(), "gpu".to_owned()];
@@ -1719,69 +1743,6 @@ fn label_matching_os_less_runner_stays_eligible() {
     assert!(job_matches_runner(&["windows-2022".into()], &unlabelled));
     assert!(!job_matches_runner(&["nvidia".into()], &unlabelled));
 }
-
-/// A 24.04 machine may stand in for an `ubuntu-22.04` job, but it must not
-/// take one while a job it exactly matches is claimable: the pool is usually
-/// already building the 22.04 machine that job asked for, and the stand-in
-/// would hand it a different base image for no reason.
-
-/// A 24.04 machine may stand in for an `ubuntu-22.04` job, but it must not
-/// take one while a job it exactly matches is claimable: the pool is usually
-/// already building the 22.04 machine that job asked for, and the stand-in
-/// would hand it a different base image for no reason.
-#[tokio::test]
-async fn claims_prefer_a_job_the_runner_exactly_matches() {
-    let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let app = app(state.clone(), CancellationToken::new());
-
-    // `pinned` is first in the queue, so only the preference can reorder it.
-    let accepted = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        json!({
-            "workflow_yaml": "on: push\njobs:\n  pinned:\n    runs-on: ubuntu-22.04\n    steps:\n      - run: echo pinned\n  wide:\n    runs-on: self-hosted\n    steps:\n      - run: echo wide\n",
-            "event": "push",
-            "repository": "owner/repo"
-        }),
-    )
-    .await;
-    assert!(
-        accepted["run_id"].is_string(),
-        "the run was accepted: {accepted}"
-    );
-
-    let machine = RunnerCapabilities {
-        known: true,
-        labels: vec![
-            "self-hosted".to_owned(),
-            "Linux".to_owned(),
-            "X64".to_owned(),
-            "ubuntu-24.04".to_owned(),
-            "ubuntu-latest".to_owned(),
-        ],
-        runner_group_id: None,
-        runner_group_name: None,
-    };
-
-    let mut inner = state.inner.lock().await;
-    let first = crate::runtime_scheduling::take_matching_job(&mut inner, &machine, Some(1))
-        .expect("a claimable job");
-    assert_eq!(
-        first.job_id.0, "wide",
-        "the exact `self-hosted` match must win over the 22.04 stand-in"
-    );
-
-    // And the stand-in still happens rather than starving the pinned job.
-    let second = crate::runtime_scheduling::take_matching_job(&mut inner, &machine, Some(1))
-        .expect("the pinned job is still claimable");
-    assert_eq!(second.job_id.0, "pinned");
-}
-
-/// A job for a platform with no runner host can never be claimed. Queuing it
-/// forever means a run that never finishes and a check that never reports, so
-/// it is skipped — but only when nothing is registered that could serve it.
 
 /// A job for a platform with no runner host can never be claimed. Queuing it
 /// forever means a run that never finishes and a check that never reports, so
@@ -1905,7 +1866,7 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(
         run.jobs.get(&JobId("build".to_owned())),
@@ -1918,13 +1879,11 @@ jobs:
     );
     // No new jobs should have been promoted to queue
     assert!(
-        !inner.queue.iter().any(|j| j.job_id.0 == "test"),
+        !inner.ready().any(|j| j.job_id.0 == "test"),
         "test must not be in queue"
     );
     assert!(inner.pending_jobs.is_empty(), "no jobs should be pending");
 }
-
-/// Production path: build fails → cleanup with `if: always()` runs.
 
 /// Production path: build fails → cleanup with `if: always()` runs.
 #[tokio::test]
@@ -1971,14 +1930,12 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
-        inner.queue.iter().any(|job| job.job_id.0 == "cleanup"),
+        inner.ready().any(|job| job.job_id.0 == "cleanup"),
         "cleanup with always() must be promoted after build failure"
     );
 }
-
-/// Production path: build fails → notify with `if: failure()` runs.
 
 /// Production path: build fails → notify with `if: failure()` runs.
 #[tokio::test]
@@ -2025,15 +1982,12 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
-        inner.queue.iter().any(|job| job.job_id.0 == "notify"),
+        inner.ready().any(|job| job.job_id.0 == "notify"),
         "notify with failure() must be promoted after build failure"
     );
 }
-
-/// Production path: diamond graph build → test-a/test-b → deploy.
-/// All succeed → deploy runs → run completes successfully.
 
 /// Production path: diamond graph build → test-a/test-b → deploy.
 /// All succeed → deploy runs → run completes successfully.
@@ -2080,9 +2034,9 @@ jobs:
 
     // Only build queued initially
     {
-        let inner = state.inner.lock().await;
-        assert_eq!(inner.queue.len(), 1);
-        assert_eq!(inner.queue[0].job_id.0, "build");
+        let inner = state.test_tx().await;
+        assert_eq!(inner.ready().count(), 1);
+        assert_eq!(inner.ready().next().unwrap().job_id.0, "build");
     }
 
     // Complete build
@@ -2096,9 +2050,9 @@ jobs:
 
     // test-a and test-b promoted (build QueuedJob remains until dispatched)
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let queued_ids: std::collections::BTreeSet<_> =
-            inner.queue.iter().map(|j| j.job_id.0.clone()).collect();
+            inner.ready().map(|j| j.job_id.0.clone()).collect();
         assert!(queued_ids.contains("test-a"), "test-a should be promoted");
         assert!(queued_ids.contains("test-b"), "test-b should be promoted");
     }
@@ -2121,9 +2075,9 @@ jobs:
 
     // deploy promoted (other completed jobs' QueuedJobs may linger)
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
-            inner.queue.iter().any(|j| j.job_id.0 == "deploy"),
+            inner.ready().any(|j| j.job_id.0 == "deploy"),
             "deploy should be promoted after test-a and test-b complete"
         );
     }
@@ -2137,13 +2091,11 @@ jobs:
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(run.status, ExecutionStatus::Success);
     assert!(inner.pending_jobs.is_empty());
 }
-
-/// Production path: cyclic graph rejected at submission time.
 
 /// Production path: cyclic graph rejected at submission time.
 #[tokio::test]
@@ -2206,41 +2158,228 @@ async fn stored_secrets_are_injected_into_native_submissions() {
         .insert("E2E_TEST_SECRET".to_owned(), "stored-value".to_owned());
     let app = app(state.clone(), CancellationToken::new());
 
-    let accepted = submit_yaml(
+    submit_yaml(
         &app,
         "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n        env:\n          SECRET: ${{ secrets.E2E_TEST_SECRET }}\n",
         "owner/repo",
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap();
 
-    // The job message must carry the stored secret as a secret variable so
-    // the worker republishes it into the `secrets.*` context.
-    let inner = state.inner.lock().await;
-    let run = inner
-        .runs
-        .values()
-        .find(|run| run.run_id.to_string() == run_id)
-        .unwrap();
-    let message = inner
-        .queue
-        .iter()
-        .find(|job| job.run_id == run.run_id)
-        .or_else(|| {
-            inner
-                .pending_jobs
-                .iter()
-                .find(|job| job.run_id == run.run_id)
+    // The stored message is a secret-free template; the secret arrives at
+    // acquire, resolved through the SecretProvider, as a secret variable —
+    // the runner's `secrets.*` context source.
+    let acquired = acquire_queued_job(&app, "stored-secret-runner").await;
+    let variables = &acquired["variables"];
+    let var = variables
+        .as_object()
+        .and_then(|map| map.get("E2E_TEST_SECRET"))
+        .expect("filled message carries the stored secret variable");
+    assert_eq!(var["value"].as_str(), Some("stored-value"));
+    assert_eq!(var["isSecret"].as_bool(), Some(true));
+}
+
+/// A submission's run-tier secrets must outlive the run finishing and being
+/// archived: a re-run of an archived run re-resolves them. Dropping the tier
+/// at archive silently ran the re-run without secrets.
+#[tokio::test]
+async fn archived_run_keeps_run_tier_secrets_for_rerun() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"MY_TOKEN": "s3cr3t-value"}
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    complete_via_api(&app, accepted["run_id"].as_str().unwrap(), "build").await;
+
+    // Push the settled run past the archive grace window, then archive it.
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(run_id, old).unwrap();
         })
-        .expect("queued job exists")
-        .message
-        .clone();
-    let secret_var = message
-        .variables
-        .values()
-        .find(|value| value.value.as_deref() == Some("stored-value"))
-        .expect("stored secret present in job message variables");
-    assert_eq!(secret_var.is_secret, Some(true));
+        .await;
+    let archived = state.test_archive_finished_runs_once().await;
+    assert!(archived >= 1, "the settled run must archive");
+    let resolved = state.test_resolve_run_secrets("owner/repo", run_id);
+    assert_eq!(
+        resolved.get("MY_TOKEN").map(|secret| secret.expose()),
+        Some("s3cr3t-value"),
+        "archiving a run must not drop its run tier"
+    );
+
+    // Re-run the archived run: the new run's jobs resolve the same value.
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/rerun"),
+        Value::Null,
+    )
+    .await;
+    let acquired = acquire_queued_job(&app, "rerun-secret-runner").await;
+    let var = acquired["variables"]
+        .as_object()
+        .and_then(|map| map.get("MY_TOKEN"))
+        .expect("re-run acquires the submission secret");
+    assert_eq!(var["value"].as_str(), Some("s3cr3t-value"));
+    assert_eq!(var["isSecret"].as_bool(), Some(true));
+}
+
+/// A reusable-workflow callee that declares no `secrets:` receives none of
+/// the caller's secrets — only `secrets: inherit` or an explicit map does.
+#[tokio::test]
+async fn reusable_callee_without_secrets_receives_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.secrets.write().repo.insert(
+        "owner/repo".to_owned(),
+        std::collections::BTreeMap::from([("OTHER".to_owned(), "leak".to_owned())]),
+    );
+    let app = app(state.clone(), CancellationToken::new());
+
+    let callee_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo inner\n";
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+
+    let acquired = acquire_queued_job(&app, "callee-no-secrets").await;
+    let variables = acquired["variables"].as_object().unwrap();
+    assert!(
+        !variables.contains_key("OTHER"),
+        "a callee without `secrets:` must not receive caller secrets: {variables:?}"
+    );
+}
+
+/// A reusable-call `secrets: {T: ${{ secrets.X }}}` mapping resolves against
+/// the caller scope and delivers only the mapped name.
+#[tokio::test]
+async fn reusable_callee_secrets_map_resolves_against_caller_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.secrets.write().repo.insert(
+        "owner/repo".to_owned(),
+        std::collections::BTreeMap::from([("OTHER".to_owned(), "leak".to_owned())]),
+    );
+    let app = app(state.clone(), CancellationToken::new());
+
+    let callee_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo inner\n";
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n    secrets:\n      T: ${{ secrets.OTHER }}\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+
+    let acquired = acquire_queued_job(&app, "callee-mapped").await;
+    let variables = acquired["variables"].as_object().unwrap();
+    assert_eq!(
+        variables.get("T").and_then(|var| var["value"].as_str()),
+        Some("leak"),
+        "the mapped name resolves against the caller scope: {variables:?}"
+    );
+    assert!(
+        !variables.contains_key("OTHER"),
+        "only the mapped name may reach the callee: {variables:?}"
+    );
+}
+
+/// Job-level `env: ${{ secrets.NAME }}` ships as an expression token in the
+/// stored template (values are absent by design). fill_template must resolve
+/// it into a literal on `environmentVariables` — the surface the runner
+/// materializes into the step environment — since the runner has no secrets
+/// context to evaluate the token itself.
+#[tokio::test]
+async fn job_level_env_secret_is_filled_into_environment_variables() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state
+        .secrets
+        .write()
+        .global
+        .insert("E2E_ENV_SECRET".to_owned(), "env-stored-value".to_owned());
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, runner_token) =
+        register_runner_with_token(&app, "env-secret-runner", &["self-hosted"], None).await;
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    env:\n      X: ${{ secrets.E2E_ENV_SECRET }}\n    steps:\n      - run: echo $X\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = body["runner_request_id"].as_str().unwrap();
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"}),
+        &runner_token,
+    )
+    .await;
+
+    let value = acquired["environmentVariables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["map"].as_array()?.first())
+        .find(|pair| pair["Key"]["lit"].as_str() == Some("X"))
+        .map(|pair| pair["Value"].clone())
+        .expect("X must reach the filled environmentVariables");
+    assert_eq!(
+        value["lit"].as_str(),
+        Some("env-stored-value"),
+        "the fill resolves secrets.* env tokens to literals: {value}"
+    );
 }
 
 /// Extract the queued job message for a run, wherever it currently sits.
@@ -2255,7 +2394,7 @@ async fn pat_only_config_supplies_job_github_token() {
     // it, and a leaked value would win env-then-config and break the assert.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    // H3: keep PAT scope introspection hermetic while still letting the PAT be
+    // Keep PAT scope introspection hermetic while still letting the PAT be
     // verified: the stub reports read-only scopes, so the configured PAT is
     // embedded rather than withheld.
     let _live_api = live_pat_scope_api("read:org, read:user").await;
@@ -2273,25 +2412,24 @@ async fn pat_only_config_supplies_job_github_token() {
     );
     let app = app(state.clone(), CancellationToken::new());
 
-    let accepted = submit_yaml(
+    submit_yaml(
         &app,
         "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
         "owner/repo",
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
-    let inner = state.inner.lock().await;
-    let message = queued_message_for(&inner, &run_id);
-    let token = message
-        .variables
-        .get("system.github.token")
-        .expect("job message carries a GitHub token variable");
-    assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
-    assert_eq!(token.is_secret, Some(true));
+    // The stored template carries no token; the broker path mints/selects it
+    // at claim — with no App the configured PAT fills `system.github.token`.
+    let acquired = acquire_queued_job(&app, "pat-runner").await;
+    assert_eq!(
+        wire_variable(&acquired, "system.github.token"),
+        Some("github_pat_testvalue"),
+        "the configured PAT reaches the job as GITHUB_TOKEN"
+    );
 }
 
-/// H3: a PAT whose OAuth scopes cannot be introspected must not be embedded.
+/// A PAT whose OAuth scopes cannot be introspected must not be embedded.
 /// The job keeps the job-scoped runtime token, so a step that needs GitHub
 /// fails at the point of use instead of running with authority nobody could
 /// bound, and the wire variable discloses the withholding.
@@ -2333,11 +2471,16 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     .expect("unverifiable scopes withhold the PAT, they do not refuse the run");
     let run_id = accepted.run_id.to_string();
 
-    let inner = state.inner.lock().await;
-    let message = queued_message_for(&inner, &run_id);
+    // The stored message is a secret-free template, so the token surface these
+    // assertions want is the *acquired* message: `acquirejob` mints the job's
+    // credential (runtime token when the PAT is withheld).
+    let tx = state.test_tx().await;
+    let message = queued_message_for(&tx, &run_id);
+    let app = app(state.clone(), CancellationToken::new());
+    let acquired = acquire_queued_job(&app, "unverifiable-pat-runner").await;
     // Minted tokens carry a random `jti`, so compare claims rather than bytes:
     // the wire variable must be a valid local JWT scoped to this job.
-    let wire_token = variable_value(&message, "system.github.token")
+    let wire_token = wire_variable(&acquired, "system.github.token")
         .expect("the job message carries a GitHub token variable");
     let claims = state
         .verify_local_jwt_claims(wire_token)
@@ -2357,11 +2500,11 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
         )
     );
     assert_ne!(
-        variable_value(&message, "system.github.token"),
+        wire_variable(&acquired, "system.github.token"),
         Some("github_pat_unverifiable_scopes"),
         "the PAT must never reach a job whose bounds could not be verified"
     );
-    let authority = variable_value(&message, "system.github.token.pat_scopes")
+    let authority = wire_variable(&acquired, "system.github.token.pat_scopes")
         .expect("the withheld state is published for the runner to print");
     assert!(
         authority.contains("withheld"),
@@ -2369,13 +2512,7 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     );
 }
 
-/// H3: scope-mismatch matrix for the static-PAT permission check. A classic
-/// PAT carrying write authority must never back a job whose effective
-/// `permissions:` are read-only (or empty); a PAT no broader than declared
-/// passes. Unknown classic scopes count as write-capable — the safe direction
-/// for a security check.
-
-/// H3: scope-mismatch matrix for the static-PAT permission check. A classic
+/// scope-mismatch matrix for the static-PAT permission check. A classic
 /// PAT carrying write authority must never back a job whose effective
 /// `permissions:` are read-only (or empty); a PAT no broader than declared
 /// passes. Unknown classic scopes count as write-capable — the safe direction
@@ -2449,11 +2586,7 @@ fn pat_exceeds_declared_scope_matrix() {
     ));
 }
 
-/// H3 end-to-end: a static PAT whose OAuth scopes exceed the workflow's
-/// declared `permissions:` refuses the run instead of silently embedding the
-/// broader PAT as the job's `GITHUB_TOKEN`.
-
-/// H3 end-to-end: a static PAT whose OAuth scopes exceed the workflow's
+/// a static PAT whose OAuth scopes exceed the workflow's
 /// declared `permissions:` refuses the run instead of silently embedding the
 /// broader PAT as the job's `GITHUB_TOKEN`.
 #[tokio::test]
@@ -2462,10 +2595,10 @@ async fn static_pat_broader_than_declared_permissions_rejects_run() {
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
-    // Distinct PAT string per H3 test: introspected scopes are cached by PAT
+    // Distinct PAT string per test: introspected scopes are cached by PAT
     // hash process-wide, so sharing one value across tests would leak cached
     // scopes between them.
-    std::fs::write(&config_path, "[github]\npat = \"h3-broad-pat\"\n").unwrap();
+    std::fs::write(&config_path, "[github]\npat = \"broad-pat\"\n").unwrap();
     let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
@@ -2515,12 +2648,7 @@ async fn static_pat_broader_than_declared_permissions_rejects_run() {
     );
 }
 
-/// H3: a static PAT whose OAuth scopes are no broader than the workflow's
-/// declared `permissions:` still reaches the job — but
-/// `system.github.token.permissions` must advertise the PAT's actual scopes,
-/// not the declared set the token does not honor.
-
-/// H3: a static PAT whose OAuth scopes are no broader than the workflow's
+/// a static PAT whose OAuth scopes are no broader than the workflow's
 /// declared `permissions:` still reaches the job — but
 /// `system.github.token.permissions` must advertise the PAT's actual scopes,
 /// not the declared set the token does not honor.
@@ -2530,7 +2658,7 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
-    std::fs::write(&config_path, "[github]\npat = \"h3-narrow-pat\"\n").unwrap();
+    std::fs::write(&config_path, "[github]\npat = \"narrow-pat\"\n").unwrap();
     let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
         .await
         .unwrap();
@@ -2563,7 +2691,7 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     // read-only PAT does not exceed.
     let yaml =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
-    let accepted = crate::submit_run_inner(
+    let _accepted = crate::submit_run_inner(
         &shared,
         preloop_gha_protocol::WorkflowSubmission {
             workflow_yaml: yaml.to_owned(),
@@ -2574,19 +2702,21 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     )
     .await
     .expect("a PAT no broader than declared permissions is accepted");
-    let run_id = accepted.run_id.to_string();
 
-    let inner = state.inner.lock().await;
-    let message = queued_message_for(&inner, &run_id);
+    // The stored message is a secret-free template, so the token surface these
+    // assertions want is the *acquired* message: `acquirejob` embeds the PAT
+    // once its scopes were verified at submit.
+    let app = app(state.clone(), CancellationToken::new());
+    let acquired = acquire_queued_job(&app, "narrow-pat-runner").await;
     assert_eq!(
-        variable_value(&message, "system.github.token"),
-        Some("h3-narrow-pat"),
+        wire_variable(&acquired, "system.github.token"),
+        Some("narrow-pat"),
         "the narrow PAT still reaches the job"
     );
     // `system.github.token.permissions` keeps its documented map shape: a
     // consumer parsing it as `{"<Permission>": "<level>"}` must not meet a
     // non-permission key whose value is prose.
-    let wire = variable_value(&message, "system.github.token.permissions")
+    let wire = wire_variable(&acquired, "system.github.token.permissions")
         .expect("PAT mode keeps the permissions wire variable");
     assert!(
         serde_json::from_str::<serde_json::Value>(wire).is_ok_and(|value| value.is_object()),
@@ -2594,7 +2724,7 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     );
     // The token's real authority is published separately, so the runner can
     // state that the declared set above is not enforced in PAT mode.
-    let pat_scopes = variable_value(&message, "system.github.token.pat_scopes")
+    let pat_scopes = wire_variable(&acquired, "system.github.token.pat_scopes")
         .expect("PAT mode publishes the token's real authority");
     assert!(
         pat_scopes.contains("static PAT OAuth scopes") && pat_scopes.contains("read:org"),
@@ -2602,10 +2732,50 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     );
 }
 
-/// The App-manifest setup flow receives the webhook secret from GitHub and
-/// stores it in the config file. Before that key existed the secret lived
-/// only in `PRELOOP_WEBHOOK_SECRET`, so a configured engine still rejected
-/// every signed delivery until the operator re-exported it by hand.
+/// A job claimed after the PAT scope cache expired must still receive the
+/// PAT. Only submits refresh the cache (TTL 300 s), so a job that queued
+/// longer used to be handed the runtime token instead — and the checkout the
+/// submit-time routing sent straight to github.com then failed with
+/// "could not read Username" (grafana's detect-changes, claimed 8.6 min after
+/// submit). Acquire re-verifies the scopes instead of withholding.
+#[tokio::test]
+async fn static_pat_reaches_a_job_claimed_after_the_scope_cache_expired() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "[github]\npat = \"queued-pat\"\n").unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    let _api_url = live_pat_scope_api("").await;
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let yaml =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a scope-less PAT is accepted");
+
+    crate::runs::expire_pat_scope_cache();
+    let app = app(state.clone(), CancellationToken::new());
+    let acquired = acquire_queued_job(&app, "queued-pat-runner").await;
+    assert_eq!(
+        wire_variable(&acquired, "system.github.token"),
+        Some("queued-pat"),
+        "a job claimed after the cache expired still gets the PAT"
+    );
+}
 
 /// The App-manifest setup flow receives the webhook secret from GitHub and
 /// stores it in the config file. Before that key existed the secret lived
@@ -2732,43 +2902,37 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
     let app = app(state.clone(), CancellationToken::new());
     let workflow = "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n";
 
-    // owner/repo: the per-repo tier overrides the global tier per name and
-    // contributes its own names.
-    let accepted = submit_yaml(&app, workflow, "owner/repo").await;
-    let run_id = accepted["run_id"].as_str().unwrap();
-    let inner = state.inner.lock().await;
-    let message = queued_message_for(&inner, run_id);
+    // Secrets resolve at acquire through the SecretProvider; the stored
+    // template only names them. Acquire each queued job in submit order.
+    submit_yaml(&app, workflow, "owner/repo").await;
+    let acquired = acquire_queued_job(&app, "scope-runner-a").await;
     assert_eq!(
-        variable_value(&message, "GLOBAL_TOKEN"),
+        wire_variable(&acquired, "GLOBAL_TOKEN"),
         Some("repo-wins"),
         "per-repo secret overrides the global tier"
     );
     assert_eq!(
-        variable_value(&message, "REPO_TOKEN"),
+        wire_variable(&acquired, "REPO_TOKEN"),
         Some("repo-value"),
         "per-repo secret is injected"
     );
-    drop(inner);
 
     // other/repo: only the global tier applies — repo secrets stay scoped.
-    let accepted = submit_yaml(&app, workflow, "other/repo").await;
-    let run_id = accepted["run_id"].as_str().unwrap();
-    let inner = state.inner.lock().await;
-    let message = queued_message_for(&inner, run_id);
+    submit_yaml(&app, workflow, "other/repo").await;
+    let acquired = acquire_queued_job(&app, "scope-runner-b").await;
     assert_eq!(
-        variable_value(&message, "GLOBAL_TOKEN"),
+        wire_variable(&acquired, "GLOBAL_TOKEN"),
         Some("global-value"),
         "unscoped repo still gets the global tier"
     );
     assert_eq!(
-        variable_value(&message, "REPO_TOKEN"),
+        wire_variable(&acquired, "REPO_TOKEN"),
         None,
         "repo-scoped secret must not leak into another repository"
     );
-    drop(inner);
 
     // Submission-provided secrets still win over both tiers.
-    let accepted = request_json(
+    request_json(
         &app,
         Method::POST,
         "/api/v1/runs",
@@ -2780,11 +2944,9 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
         }),
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap();
-    let inner = state.inner.lock().await;
-    let message = queued_message_for(&inner, run_id);
+    let acquired = acquire_queued_job(&app, "scope-runner-c").await;
     assert_eq!(
-        variable_value(&message, "GLOBAL_TOKEN"),
+        wire_variable(&acquired, "GLOBAL_TOKEN"),
         Some("submitted-value"),
         "submission-provided secrets outrank both stored tiers"
     );
@@ -3035,11 +3197,6 @@ async fn live_secrets_api_env_scope_round_trips() {
 /// the live API mutates the in-memory store only, so a restart loses the
 /// secret and the file never carries it. The in-memory store must still
 /// serve it for the current process lifetime.
-
-/// `secrets_store = "memory"` keeps values out of the config file entirely:
-/// the live API mutates the in-memory store only, so a restart loses the
-/// secret and the file never carries it. The in-memory store must still
-/// serve it for the current process lifetime.
 #[tokio::test]
 async fn memory_secrets_store_never_writes_the_config_file() {
     let temp = tempfile::tempdir().unwrap();
@@ -3103,12 +3260,6 @@ async fn memory_secrets_store_never_writes_the_config_file() {
     }
     .await;
 }
-
-/// Concurrent secret mutations must not lose writes. Each handler loads the
-/// whole config file, changes one entry and writes it back; without the
-/// `secret_mutation` lock the requests read the same base config and the
-/// last rename wins, so the file loses secrets the in-memory store still
-/// reports. Remove the lock and this test fails.
 
 /// Concurrent secret mutations must not lose writes. Each handler loads the
 /// whole config file, changes one entry and writes it back; without the
@@ -3206,9 +3357,6 @@ async fn concurrent_secret_mutations_keep_store_and_file_in_agreement() {
 
 /// The secret store holds plaintext values, so its `Debug` must never print
 /// them — one `debug!(?store)` would otherwise dump every stored secret.
-
-/// The secret store holds plaintext values, so its `Debug` must never print
-/// them — one `debug!(?store)` would otherwise dump every stored secret.
 #[test]
 fn secret_store_debug_redacts_values() {
     let mut store = crate::state::SecretStore::default();
@@ -3251,7 +3399,7 @@ async fn completion_step_results_are_authoritative_over_inference() {
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner
             .job_requests
             .values()
@@ -3329,7 +3477,7 @@ async fn workflow_steps_update_prefers_runner_reported_step_names() {
     // ("Run echo hi") in WorkflowStepsUpdate and that must win, not the
     // empty lookup result.
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner
             .job_requests
             .values()
@@ -3387,7 +3535,7 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     let (plan_id, agent_job_id, request_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner
             .job_requests
             .values()
@@ -3435,10 +3583,15 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
     .await;
     assert_eq!(response["ok"], true);
 
-    {
-        let mut inner = state.inner.lock().await;
-        inner.broker_messages.remove(&request_id);
-    }
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute(
+                "DELETE FROM session_messages WHERE request_id = ?1",
+                [request_id],
+            )
+            .unwrap();
+        })
+        .await;
     let run = get_run_json(&app, &run_id).await;
     let steps = run["jobs_list"][0]["steps"].as_array().unwrap();
     assert_eq!(

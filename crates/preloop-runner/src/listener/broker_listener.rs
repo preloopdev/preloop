@@ -128,8 +128,8 @@ async fn force_fail_job(http: &HttpClient, job: &RunningJob, conclusion: &str) {
 /// Ask the worker to cancel the running job and wrap up, waiting up to the
 /// official 60s grace; if the worker fails or ignores the message, force-fail
 /// the job request so the run concludes instead of dangling until the lease
-/// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths
-/// (CR-2 F-1); mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
+/// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths.
+/// Mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
 /// handling in `JobDispatcher`.
 async fn shutdown_job_gracefully(http: &HttpClient, job: &mut RunningJob) {
     match job
@@ -187,11 +187,11 @@ pub async fn run_broker_loop(
     runner_root: &std::path::Path,
 ) -> Result<()> {
     let mut config = config.clone();
-    // P1.1: Derive broker URL from settings.server_url_v2 (extracted from agent
+    // Derive broker URL from settings.server_url_v2 (extracted from agent
     // response properties.ServerUrlV2 at configure time). This is
     // "https://broker.actions.githubusercontent.com/" for github.com, and the
     // server's own URL for local aksh / self-hosted instances.
-    // Fall back to server_url if server_url_v2 is absent (pre-P1.1 configs).
+    // Fall back to server_url if server_url_v2 is absent (pre- configs).
     let broker_url = config
         .settings
         .server_url_v2
@@ -252,7 +252,7 @@ pub async fn run_broker_loop(
     let result = async {
     loop {
         // Proactive OAuth token refresh — renew 5 minutes before expiry so the
-        // next poll cycle always uses a live token (RLIS-02).
+        // next poll cycle always uses a live token.
         if let Some(exp) = token_expires_at
             && std::time::Instant::now() >= exp {
                 info!("OAuth token expiring soon, proactively refreshing...");
@@ -482,7 +482,7 @@ pub async fn run_broker_loop(
 
                         info!("Received broker message {message_id}: {message_type}");
 
-                        // Parse body — decrypt if key present, else plaintext (F011)
+                        // Parse body — decrypt if key present, else plaintext
                         let body = match parse_message_body(
                             &msg,
                             session_key.as_deref(),
@@ -672,7 +672,7 @@ pub async fn run_broker_loop(
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("unspecified");
                                 info!(%reason, "Service requested runner shutdown");
-                                // CR-2 F-1: this is the broker equivalent of
+                                // This is the broker equivalent of
                                 // the OS shutdown path — ask the worker to
                                 // cancel the running job and wrap up so the
                                 // run concludes instead of dangling until the
@@ -767,7 +767,7 @@ pub async fn run_broker_loop(
                                 }
                             }
                         } else if is_session_expired(&e) {
-                            // F052: Respect skip_session_recover setting
+                            // Respect skip_session_recover setting
                             if config.settings.skip_session_recover {
                                 warn!("Broker session expired. SkipSessionRecover is set — exiting.");
                                 return Err(e);
@@ -850,7 +850,7 @@ fn require_fips_cryptography(config: &RunnerConfig) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-/// F011: Extract session key only if present.
+/// Extract session key only if present.
 fn extract_session_key_if_present(
     session: &serde_json::Value,
     config: &RunnerConfig,
@@ -950,7 +950,7 @@ fn announce_busy() {
 /// Acquire a full job from a RunnerJobRequest reference via run-service.
 ///
 /// Golden flow 12: message body fields are snake_case:
-///   `runner_request_id`, `run_service_url`, `billing_owner_id`, `should_acknowledge`
+/// `runner_request_id`, `run_service_url`, `billing_owner_id`, `should_acknowledge`
 /// Golden flow 15: POST /{id}/acquirejob returns the full camelCase job payload.
 async fn acquire_job_from_ref(
     job_ref: &serde_json::Value,
@@ -1092,7 +1092,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    // --- P1 broker listener gap coverage ---
+    // --- broker listener gap coverage ---
 
     #[test]
     fn classify_message_maps_official_broker_types() {

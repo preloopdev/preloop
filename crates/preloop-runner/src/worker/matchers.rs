@@ -15,7 +15,7 @@ use tracing::debug;
 pub struct ProblemMatcher {
     pub owner: String,
     pub patterns: Vec<MatcherPattern>,
-    /// F051: Default base directory for resolving relative file paths in annotations.
+    /// Default base directory for resolving relative file paths in annotations.
     pub from_path: String,
     pub state: Vec<Option<PatternMatch>>,
     /// Regexes compiled from `patterns` at registration time; index-parallel to `patterns`.
@@ -147,7 +147,7 @@ pub struct MatcherPattern {
     pub message: Option<usize>,
     #[serde(default)]
     pub code: Option<usize>,
-    /// F051: Capture group index for the fromPath (base directory for relative file resolution).
+    /// Capture group index for the fromPath (base directory for relative file resolution).
     #[serde(default, rename = "fromPath")]
     pub from_path: Option<usize>,
     #[serde(rename = "loop", default)]
@@ -165,7 +165,7 @@ struct MatcherFile {
 struct MatcherDefinition {
     owner: String,
     pattern: Vec<MatcherPattern>,
-    /// F051: Default fromPath for the matcher (base directory for relative file paths).
+    /// Default fromPath for the matcher (base directory for relative file paths).
     #[serde(default, rename = "fromPath")]
     from_path: Option<String>,
 }
@@ -1128,7 +1128,7 @@ mod tests {
         assert!(err.to_string().contains("pattern is required"));
     }
 
-    // --- P0 matcher gap coverage ---
+    // --- matcher gap coverage ---
 
     #[test]
     fn matcher_owner_clobber_replaces_old() {

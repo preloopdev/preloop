@@ -9,6 +9,8 @@ defaults:
 jobs:
   summary:
     runs-on: self-hosted
+    env:
+      LAYER1: "base"
     steps:
       - run: |
           echo "### Edge Case Summary ${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"

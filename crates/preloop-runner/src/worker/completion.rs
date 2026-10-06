@@ -10,7 +10,7 @@ use super::steps_runner::{Step, StepType};
 use crate::cli::ProtocolPath;
 use crate::client::http::HttpClient;
 
-/// Build step results for the completejob body, including annotations (F025).
+/// Build step results for the completejob body, including annotations.
 ///
 /// Golden 06 flow 41: each stepResult has `{external_id, number, name,
 /// action_name, type, status, conclusion, started_at, completed_at, annotations}`.
@@ -43,7 +43,7 @@ pub(crate) fn build_completejob_step_results(
             .map(|result| runner_conclusion(&result.conclusion))
             .unwrap_or("skipped");
 
-        // F025: Include annotations for this step
+        // Include annotations for this step
         let step_number = (idx + 2) as u32;
         let annotations: Vec<serde_json::Value> = step_annotations
             .get(&step.context_name)
@@ -208,7 +208,7 @@ pub(crate) fn runner_conclusion(conclusion: &str) -> &'static str {
 }
 /// Report job completion to the server.
 ///
-/// F013: Full completejob body matching golden flow 25/41:
+/// Full completejob body matching golden flow 25/41:
 /// `{planId, jobId, conclusion, outputs, stepResults, annotations, telemetry, billingOwnerId}`
 pub(crate) async fn report_completion(
     job_message: &serde_json::Value,
@@ -312,9 +312,9 @@ pub(crate) async fn report_completion(
         map
     };
 
-    // F048: Collect job-level annotations for completejob body.
+    // Collect job-level annotations for completejob body.
     // These are infrastructure-level issues (container failures, action download errors)
-    // not tied to a specific step. Step annotations are already in stepResults (F025).
+    // not tied to a specific step. Step annotations are already in stepResults.
     let job_annotations: Vec<serde_json::Value> = job_ctx
         .job_annotations
         .iter()
@@ -370,7 +370,7 @@ pub(crate) async fn report_completion(
                 }
             }
             ProtocolPath::Azdo => {
-                // F030: mark the job timeline record as Completed before posting the event.
+                // mark the job timeline record as Completed before posting the event.
                 if let Some(azdo) = &rpt.azdo {
                     let azdo_result_str = match result.to_ascii_lowercase().as_str() {
                         "success" | "succeeded" => "succeeded",

@@ -756,7 +756,7 @@ async fn cron_loop(
             local_workspace: None,
             vars: Default::default(),
             secrets: Default::default(),
-            submission_names: Default::default(),
+            run_secret_names: Default::default(),
             reusable_workflows: Default::default(),
             reusable_workflow_shas: Default::default(),
             enable_debugger: false,

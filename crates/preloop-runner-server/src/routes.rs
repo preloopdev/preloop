@@ -161,7 +161,7 @@ pub fn build_app(
             "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
             get(live_logs_sse),
         )
-        // F030: standard AzDO API URL pattern used by the preloop-runner AzDO client.
+        // standard AzDO API URL pattern used by the preloop-runner AzDO client.
         // These alias the scope/hub-prefixed handlers above so both URL forms work.
         .route(
             "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
@@ -179,7 +179,7 @@ pub fn build_app(
             "/_apis/v1/plans/:plan_id/events",
             post(finish_job_plan_authenticated),
         )
-        // F030: /runner/server/ aliases — runner uses the SystemVssConnection URL
+        // /runner/server/ aliases — runner uses the SystemVssConnection URL
         // which is http://…/runner/server so all plan-level AzDO calls land here.
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
@@ -243,11 +243,11 @@ pub fn build_app(
     let protected_admin_apis = Router::new()
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
+            delete(delete_agent).put(update_agent),
         )
         .route(
             "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
+            delete(delete_agent).put(update_agent),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
@@ -294,7 +294,7 @@ pub fn build_app(
         .with_state(shared.clone());
 
     // GitHub-compatible dispatch API (surface 2): authenticated through the
-    // D2 chain (system bearer, PAT, own-App JWT, installation tokens) — see
+    // dispatch auth chain (system bearer, PAT, own-App JWT, installation tokens) — see
     // `dispatch_auth.rs`. Auth is mandatory; github.com returns 401 without a
     // token. One `route_layer` on the sub-router keeps the auth boundary in a
     // single place instead of repeating it on every route.
@@ -325,6 +325,10 @@ pub fn build_app(
         .route(
             "/api/v1/config/checkout-cache",
             get(crate::runs::checkout_cache_config),
+        )
+        .route(
+            "/api/v1/debug/txn-stats",
+            get(|| async { axum::Json(crate::control::txn_stats::snapshot()) }),
         )
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(
@@ -780,40 +784,34 @@ pub fn build_app(
                 require_native_bearer,
             )),
         )
+        // Unified controller surface: every controller (human CLI, agent, or
+        // DAP) drives a paused session through the same lease-gated,
+        // idempotent, version-checked operations.
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
-            post(crate::debug_sessions::post_verdict).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_native_bearer,
-            )),
-        )
-        // Structured agent debugging surface. It is deliberately separate
-        // from the human CLI verbs, but both mutate the same session state.
-        .route(
-            "/api/v1/agent/debug/sessions/:session_id/lease",
-            post(crate::debug_sessions::agent_acquire_lease)
-                .delete(crate::debug_sessions::agent_release_lease)
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/lease"),
+            post(crate::debug_sessions::acquire_lease)
+                .delete(crate::debug_sessions::release_lease)
                 .route_layer(middleware::from_fn_with_state(
                     shared.clone(),
                     require_native_bearer,
                 )),
         )
         .route(
-            "/api/v1/agent/debug/sessions/:session_id/events",
-            get(crate::debug_sessions::agent_events).route_layer(middleware::from_fn_with_state(
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/events"),
+            get(crate::debug_sessions::session_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/agent/debug/sessions/:session_id/operations",
-            post(crate::debug_sessions::agent_operation).route_layer(
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/operations"),
+            post(crate::debug_sessions::session_operation).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_native_bearer),
             ),
         )
         .route(
-            "/api/v1/agent/debug/sessions/:session_id/audit",
-            get(crate::debug_sessions::agent_audit).route_layer(middleware::from_fn_with_state(
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/audit"),
+            get(crate::debug_sessions::session_audit).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
@@ -1015,7 +1013,7 @@ pub fn build_app(
                     require_legacy_runner_bearer,
                 )),
         )
-        // P1.10: Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
+        // Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
         // The runner PUTs logs/summaries here; we store them in the state directory.
         .route("/replay/results/*path", put(replay_results_put))
         // Twirp APIs accept only the system token or a locally signed Actions.Results job token.
@@ -1076,7 +1074,7 @@ pub fn build_app(
         )
         // Azure Block Blob compat blob store — upload (PUT) and download (GET).
         // Cache: /twirp-blob/cache/{token}
-        // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
+        // Artifact: /twirp-blob/artifact/{token} (download URL appends.zip for content-type detection)
         .route(
             "/twirp-blob/:kind/:token",
             put(blob_put)

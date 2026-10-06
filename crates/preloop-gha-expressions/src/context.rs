@@ -28,7 +28,7 @@ impl Context {
         self
     }
 
-    /// Set workspace directory for hashFiles() evaluation (F027).
+    /// Set workspace directory for hashFiles() evaluation.
     pub fn with_workspace(mut self, dir: String) -> Self {
         self.workspace_dir = Some(dir);
         self

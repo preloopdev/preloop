@@ -21,7 +21,7 @@ const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
-/// M1: pinned release-signing public key (RSA-3072, PKCS#1 v1.5 / SHA-256).
+/// Pinned release-signing public key (RSA-3072, PKCS#1 v1.5 / SHA-256).
 ///
 /// The release workflow signs every published asset with the matching
 /// private key (`openssl dgst -sha256 -sign` over the asset bytes, raw
@@ -31,7 +31,7 @@ include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 /// channel as the asset it describes.
 const RELEASE_SIGNING_PUBLIC_KEY_DER_B64: &str = "MIIBigKCAYEAsSCF1NnqbOcV3itWi6rr4q62cE904AsWiUPu4lNR9Bpubpr0a9ucx1sQJE1ySpNxB7WLw3Vpm0vSOQWOg/s79EyJJ/Rv/8i4WK2KgOKCJ+8+pJeGW5hu6BCC8qeEmuMXAgTm7UE49q1/YtCtJqYESI9rbcSbho822UG7IiyfP+EDV1uqxuudQzjOdw0CQjnYx/bpeUEIymnunDtfyz1xWBV6lLXZNXSPgXlKiThCSoEkZwyGmvc+KkwZDe22VC9zdMcLfnk1os4kbvNw5ZFc+UF8XWVTSLYpG6EOwRb9p5W9vnJQCWHsi7J4B06dRd/tyj7LxFJamqnsZO9IClQezgE+fw74vjhMX0rURw9eoPTJaiUsMTEIpiS3ua0jXfHlsKbq2z8v59XHQIUxrD4a9gIkY8IarYA9uHnACzHd9nrywKK1OKoSjbFemavYFMpAnyTuYKStjcT+Tck7Exy1rS9P+f2srJ6MKXAfddUneoDD+lORWLW8FRABCxNS9qp1AgMBAAE=";
 
-/// M1: the updater replaces the running binary — it must never fetch
+/// The updater replaces the running binary — it must never fetch
 /// release metadata or assets over plaintext HTTP, where a network
 /// attacker could substitute the binary. Caller-controlled endpoints
 /// (`PRELOOP_RELEASES_API`, asset URLs) are rejected at entry, and the
@@ -153,7 +153,7 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     let api_url = args
         .api_url
         .unwrap_or_else(|| format!("https://api.github.com/repos/{repository}/releases"));
-    // M1: `PRELOOP_RELEASES_API` is caller-controlled — never poll it over HTTP.
+    // `PRELOOP_RELEASES_API` is caller-controlled — never poll it over HTTP.
     require_https_url(&api_url)?;
     let release = fetch_release(&client, &api_url, args.version.as_deref()).await?;
     if release.draft || release.prerelease {
@@ -739,7 +739,7 @@ async fn fetch_release(
 }
 
 async fn download(client: &Client, url: &str, destination: &Path) -> anyhow::Result<()> {
-    // M1: asset URLs come from release metadata — never fetch over HTTP.
+    // Asset URLs come from release metadata — never fetch over HTTP.
     require_https_url(url)?;
     let mut response = client
         .get(url)
@@ -830,7 +830,7 @@ struct StagedRelease {
     binary_path: PathBuf,
 }
 
-/// M1: verify the release asset's detached RSA signature against the
+/// Verify the release asset's detached RSA signature against the
 /// pinned release-signing public key.
 ///
 /// The signature is computed by the release workflow with
@@ -925,7 +925,7 @@ async fn stage_release(
         &archive_path,
     )
     .await?;
-    // M1: authenticate before trusting — signature first (proves the asset
+    // Authenticate before trusting — signature first (proves the asset
     // came from the release pipeline), then the checksum (proves the
     // download is intact).
     verify_release_signature(client, selected.archive, selected.signature, &archive_path).await?;
@@ -1114,7 +1114,7 @@ fn select_asset<'a>(
             || asset.name == "sha256sums.txt"
             || asset.name == "sha256.sum"
     });
-    // M1: the detached signature the release workflow publishes next to
+    // The detached signature the release workflow publishes next to
     // each asset (`<archive>.sig`, raw RSA signature bytes). Absence is a
     // hard failure in `stage_release`, never a silent skip.
     let signature = assets
@@ -1301,7 +1301,7 @@ mod tests {
     use super::*;
     use base64::Engine;
 
-    /// M1: caller-controlled release endpoints must never be fetched over
+    /// Caller-controlled release endpoints must never be fetched over
     /// plaintext HTTP — a network attacker could substitute the binary.
     #[test]
     fn release_urls_must_be_https() {
@@ -1320,7 +1320,7 @@ mod tests {
         assert!(require_https_url("not a url").is_err());
     }
 
-    /// M1: the redirect policy must refuse HTTPS-to-HTTP downgrades (a
+    /// The redirect policy must refuse HTTPS-to-HTTP downgrades (a
     /// compromised mirror could otherwise bounce the asset download to
     /// plaintext), while allowing HTTPS-to-HTTPS and HTTP-to-HTTP hops.
     #[test]
@@ -1340,7 +1340,7 @@ mod tests {
         ));
     }
 
-    /// M1: the pinned public key must verify a signature produced by the
+    /// The pinned public key must verify a signature produced by the
     /// release-signing private key (`openssl dgst -sha256 -sign`), proving
     /// the updater trusts the same key the release pipeline signs with.
     /// Test asset bytes and signature generated 2026-09-14; the signature
@@ -1354,7 +1354,7 @@ mod tests {
         assert!(verify_detached_signature(asset, &signature).is_ok());
     }
 
-    /// M1: tampered asset bytes or a tampered signature must fail closed.
+    /// Tampered asset bytes or a tampered signature must fail closed.
     #[test]
     fn tampered_asset_or_signature_fails_closed() {
         let asset = b"preloop-m1-release-signature-test-asset-v1";
@@ -1372,7 +1372,7 @@ mod tests {
         assert!(verify_detached_signature(asset, &signature[..signature.len() - 1]).is_err());
     }
 
-    /// M1: a release asset with no published `.sig` sidecar must be
+    /// A release asset with no published `.sig` sidecar must be
     /// refused, not installed on checksum alone.
     #[tokio::test]
     async fn missing_signature_sidecar_fails_closed() {
@@ -1394,7 +1394,7 @@ mod tests {
         );
     }
 
-    /// M1: `select_asset` must pick up the detached signature sidecar so
+    /// `select_asset` must pick up the detached signature sidecar so
     /// `stage_release` can authenticate the asset.
     #[test]
     fn selects_target_archive_checksum_and_signature() {

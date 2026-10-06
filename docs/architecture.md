@@ -37,12 +37,12 @@ TOML specs, and replays golden wire captures for protocol conformance.
 
 preloop is execution-agnostic. The only thing that differs between runner hosts
 is how a runner instance is created and destroyed. This is modeled as the
-`preloop_vm::VmProvider` trait (crates/preloop-vm/src/lib.rs:349); the `Store`
-trait (store.rs) covers durable state. (The `RunnerProvider`/`AuthProvider`
+`preloop_vm::VmProvider` trait (crates/preloop-vm/src/lib.rs:349); the
+`ControlBackend` trait (control/backend.rs) covers durable state. (The `RunnerProvider`/`AuthProvider`
 design in fidelity-gap §4 is aspirational.)
 
-- `**Store**` — durable control-plane state: SQLite (default) or Postgres.
-  See [State Model](#state-model).
+- `**ControlBackend**` — durable control-plane state behind one trait: SQLite
+  (default) or Postgres (shared nodes). See [State Model](#state-model).
 - `**AuthProvider**` — loopback-trust (local) or OAuth plus bearer tokens
   (system token or minted job JWTs).
 - `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
@@ -52,27 +52,40 @@ See [fidelity-gap.md §4](fidelity-gap.md) for the full design.
 
 ## State Model
 
-In-memory state is the source of truth. The HTTP layer reads and mutates
-`InnerState` behind `Arc<Mutex<…>>`; the database is a **restart source**, not
-a shared bus. Two servers pointed at one SQLite file or one Postgres database
-still diverge in memory.
+The control database is the source of truth. Every durable control mutation is
+one typed command on the `ControlBackend` trait
+(`preloop-runner-server/src/control/backend.rs`): a handler parses the request
+and maps the domain result onto the wire, and never holds a transaction, a SQL
+string, or a mutable record. A backend runs each command as **one short
+transaction of targeted statements** — conditional `UPDATE`s (zero rows means
+someone else won) and `FOR UPDATE SKIP LOCKED` queues — instead of loading a
+working set and writing it back, so there is no process-local control state to
+diverge between nodes. Scheduling decisions that need Rust evaluation live in
+`control/logic.rs` and both backends call them, so they answer identically.
 
-- `preloop-runner-server/src/store.rs` — the `Store` trait (async, object-safe:
-  the only surface the rest of the server sees), the SQLite backend, the
-  AEAD envelope, and the snapshot serialization shared by every backend.
-- `preloop-runner-server/src/store_pg.rs` — the Postgres backend.
+- `preloop-runner-server/src/control/lite/` — the SQLite backend (default).
+  One writer connection (`BEGIN IMMEDIATE`, WAL) serializes writers, so the row
+  locks Postgres needs are unnecessary; reads run on a pool of `query_only`
+  connections.
+- `preloop-runner-server/src/control/pg/` — the Postgres backend. Each node
+  opens its own pools (`PRELOOP_PG_WRITERS` / `PRELOOP_PG_READERS`), claims
+  leases with `FOR UPDATE SKIP LOCKED`, and uses `LISTEN`/`NOTIFY` so a job
+  submitted through one node wakes runners polling another. Several engine
+  nodes may share one database.
 
 Backends are selected by `--store` / `PRELOOP_STORE_URL` (`sqlite://<path>`, a
 bare path, or `postgres://…`), defaulting to SQLite at `<state_dir>/preloop.db`.
-Both are single-writer: one connection behind a mutex. Per-backend
-`MIGRATIONS` is the schema source of truth — SQLite tracks the version in
-`PRAGMA user_version`, Postgres in a `schema_migrations` table under an
-advisory lock.
+The control schema is greenfield **v1**: created on first use and stamped in
+`schema_meta`, with no migrations — a `control` schema at another version is
+refused.
+The in-memory state that remains (`state.rs::InnerState`) is node-local — live
+logs and log feeds, cache/artifact reservations, runner liveness, and debug
+sessions — and is never the authority for runs, jobs, runners, or sessions.
 
-Writes are **best-effort**: a store failure is logged and the affected event is
-still broadcast (`state.rs::emit`). Cache and artifact payloads stay in
-file-backed stores under `.preloop/`; only control-plane state goes to the
-database.
+Cache and artifact payloads stay in file-backed stores under `.preloop/`, and
+their reservation bookkeeping is node-local, so a multi-node deployment must
+route a job's cache/artifact requests to the node that reserved them (or run
+one node per job).
 
 Known gaps and their tradeoffs are tracked in the repository issue tracker.
 
@@ -163,7 +176,8 @@ Known limitations:
 | `webhook_health.rs`     | Periodic App subscription / delivery-URL drift checks                  |
 | `webhook_status.rs`     | Live repair-layer status behind one lock                               |
 | `webhook_api.rs`        | `/api/v1/webhooks` listing, replay, health                             |
-| `runtime_scheduling.rs` | Job dispatch/pairing, claim eligibility, binding ceiling & reaper       |
+| `control/`              | Database-authoritative control plane: the `ControlBackend` trait (`backend.rs`), backend-neutral domain types (`types.rs`), shared decision functions (`logic.rs`), wake-ups (`wake.rs`), transaction timings (`txn_stats.rs`), and the SQLite (`lite/`) and Postgres (`pg/`) implementations |
+| `runtime_scheduling.rs` | Pure dependency/need and runner-matching helpers reused by `control/logic.rs` |
 | `broker.rs`             | Broker protocol: session, message, acquire/renew/complete job           |
 | `distributed_task.rs`   | AzDO `/_apis/distributedtask/` handlers                                 |
 | `oidc.rs`               | OIDC token minting, JWKS, discovery, certificate management             |

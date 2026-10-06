@@ -45,11 +45,11 @@ const CHUNK_CHANNEL_CAPACITY: usize = 1024;
 /// Size of the read buffer for raw byte chunks from stdout/stderr.
 const READ_BUF_SIZE: usize = 65536; // 64 KB
 
-/// R1-12: maximum lines retained per invocation when `keep_lines` is set
+/// Maximum lines retained per invocation when `keep_lines` is set
 /// (docker invocations, e.g. `docker logs` at service teardown). Without a
 /// cap, a chatty subprocess grows the line vecs without bound.
 const MAX_KEPT_LINES: usize = 100_000;
-/// R1-12: maximum retained bytes across both line vecs per invocation. The
+/// Maximum retained bytes across both line vecs per invocation. The
 /// line-count cap alone still admits 100k × 64 KiB newline-free chunks, and
 /// stdout is mirrored into `lines`, doubling it again. Both vecs share one
 /// budget; retention stops (silently, like the line cap) once exhausted.

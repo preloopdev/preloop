@@ -490,6 +490,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 defaults: Vec::new(),
                 environment_variables: Vec::new(),
                 snapshot: None,
+                preloop_secret_spec: None,
                 condition,
                 variables,
                 mask_hints,

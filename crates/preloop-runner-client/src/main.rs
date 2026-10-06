@@ -24,7 +24,7 @@ fn resolve_native_api_token(server: &Url) -> anyhow::Result<String> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".preloop"));
         if let Some(token) =
-            preloop_runner_server::credential_store::load_engine_token(&storage_dir)
+            preloop_runner_server::credential_store::load_engine_token_from_env(&storage_dir)
                 .context("load local engine token")?
         {
             return Ok(token);

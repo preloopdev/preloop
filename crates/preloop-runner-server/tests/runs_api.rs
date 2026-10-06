@@ -74,12 +74,12 @@ async fn list_runs_puts_active_work_before_newer_terminal_runs() {
     } else {
         (second, first)
     };
-    {
-        let mut inner = state.inner.lock().await;
-        let completed = inner.runs.get_mut(&terminal).unwrap();
-        completed.status = ExecutionStatus::Success;
-        completed.completed_at = Some(chrono::Utc::now());
-    }
+    state
+        .test_db_mutate(|tx| {
+            tx.set_run_status(terminal, "completed", Some("success"))
+                .unwrap();
+        })
+        .await;
 
     let listed = request_json(&app, Method::GET, "/api/v1/runs?limit=2", json!(null)).await;
     let runs = listed.as_array().unwrap();
@@ -87,17 +87,6 @@ async fn list_runs_puts_active_work_before_newer_terminal_runs() {
     assert_eq!(runs[0]["status"], "queued");
     assert_eq!(runs[1]["run_id"], terminal.to_string());
 }
-
-/// A runner report persists the attempt, so a restart keeps step state.
-///
-/// Step records deliberately do not ride in `runs.record_blob` (which reseals
-/// the workflow YAML and event payload on every run event) nor in
-/// `MetaSnapshot` (every field of which is sealed on each `store_meta_only`),
-/// and the run-event projection no longer carries them at all. The only thing
-/// that persists them is `store_job_steps`, called from the reconciliation
-/// paths — so this drives a real `WorkflowStepsUpdate` rather than forcing a
-/// snapshot, which is what makes it a regression test for losing step
-/// conclusions across a restart.
 
 /// A runner report persists the attempt, so a restart keeps step state.
 ///
@@ -152,7 +141,7 @@ async fn step_manifests_survive_a_restart() {
 
     // The reported conclusion came back too, not just the identities.
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
         let reported = records
             .iter()
@@ -177,14 +166,6 @@ async fn step_manifests_survive_a_restart() {
         "`--step` must still resolve after a restart"
     );
 }
-
-/// A step report made after a restart is still persisted.
-///
-/// The out-of-order write guard compares an in-memory revision against the
-/// persisted one, so the counter has to resume above what is on disk. Left at
-/// zero it hands every post-restart write a revision the stored rows already
-/// exceed, and the upsert discards them — invisibly, because memory stays
-/// authoritative until the next restart drops the conclusion.
 
 /// A step report made after a restart is still persisted.
 ///
@@ -259,7 +240,7 @@ async fn step_reports_after_a_restart_are_persisted() {
 
     // Only a second restart can tell whether that write reached the store.
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let records = &inner.job_steps[&agent_job_id.parse::<uuid::Uuid>().unwrap()];
     let reported = records
         .iter()
@@ -271,13 +252,6 @@ async fn step_reports_after_a_restart_are_persisted() {
     );
     assert_eq!(reported.runner_number, Some(4));
 }
-
-/// Every surface showing a whole step list uses execution order.
-///
-/// The stored manifest is seeded with declared steps and then appends
-/// synthetic ones as the runner reports them, so its raw order puts
-/// `Set up job` last despite it running first. A step id is a v4 UUID, so it
-/// cannot supply the order either.
 
 /// Every surface showing a whole step list uses execution order.
 ///
@@ -379,14 +353,6 @@ async fn step_lists_and_job_logs_follow_execution_order() {
 /// then applied the new attempt's `external_id`s to the previous attempt's
 /// manifest — matching nothing — and terminalized that older attempt's steps
 /// while the run view still projected the newer one as in-flight.
-
-/// A completion reconciles the attempt that actually reported.
-///
-/// `job_requests` is keyed by monotonic request id, so picking the first match
-/// for `(run_id, job_id)` selects the *oldest* dispatch. A re-dispatched job
-/// then applied the new attempt's `external_id`s to the previous attempt's
-/// manifest — matching nothing — and terminalized that older attempt's steps
-/// while the run view still projected the newer one as in-flight.
 #[tokio::test]
 async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
     let temp = tempfile::tempdir().unwrap();
@@ -397,35 +363,31 @@ async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
     let first_step_id = first_ids[0].clone();
 
     // Re-dispatch: a newer request, its own agent job id, its own step ids.
-    let (first_agent_job_id, second_agent_job_id, second_step_id) = {
-        let mut inner = state.inner.lock().await;
-        let mut record = inner
-            .job_requests
-            .values()
-            .find(|request| request.run_id == run_id && request.job_id.0 == "build")
-            .cloned()
-            .expect("first attempt must exist");
-        let first_agent_job_id = record.agent_job_id;
-        let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
-        let agent_job_id = uuid::Uuid::new_v4();
-        record.request_id = request_id;
-        record.agent_job_id = agent_job_id;
-        record.plan_id = uuid::Uuid::new_v4().to_string();
-        record.result = None;
-        let step_id = uuid::Uuid::new_v4().to_string();
-        inner.job_steps.insert(
-            agent_job_id,
-            vec![crate::models::StepRecord::workflow(
-                step_id.clone(),
+    let (first_agent_job_id, second_agent_job_id, second_step_id) = state
+        .test_db_mutate(|tx| {
+            let (first_id, first_agent_job_id, timeline_id) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
+                .expect("first attempt must exist");
+            let _ = first_id;
+            let (request_id, agent_job_id) = tx
+                .insert_retry_request(run_id, &JobId("build".to_owned()), timeline_id)
+                .unwrap();
+            let _ = request_id;
+            let step_id = uuid::Uuid::new_v4().to_string();
+            tx.insert_step(
+                agent_job_id,
+                &step_id,
                 0,
-                "Run echo build".to_owned(),
-                Some("__run".to_owned()),
-            )],
-        );
-        inner.agent_job_requests.insert(agent_job_id, request_id);
-        inner.job_requests.insert(request_id, record);
-        (first_agent_job_id, agent_job_id, step_id)
-    };
+                Some(0),
+                Some("__run"),
+                "Run echo build",
+                "pending",
+            )
+            .unwrap();
+            (first_agent_job_id, agent_job_id, step_id)
+        })
+        .await;
 
     let _ = crate::distributed_task::complete_job_inner(
         state.shared(),
@@ -447,7 +409,7 @@ async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let reporting = &inner.job_steps[&second_agent_job_id];
     assert_eq!(
         reporting[0].conclusion, "skipped",
@@ -470,13 +432,6 @@ async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
 /// manifest would overwrite the mapping the first attempt's `step-<id>.txt`
 /// blobs are named after, and that attempt's logs would become unreachable.
 /// Keying by `agent_job_id` keeps both attempts resolvable.
-
-/// A second dispatch of the same job gets its own manifest.
-///
-/// `build_task_step` mints a fresh `TaskStep` id per build, so a job-scoped
-/// manifest would overwrite the mapping the first attempt's `step-<id>.txt`
-/// blobs are named after, and that attempt's logs would become unreachable.
-/// Keying by `agent_job_id` keeps both attempts resolvable.
 #[tokio::test]
 async fn step_manifests_are_scoped_per_job_attempt() {
     let temp = tempfile::tempdir().unwrap();
@@ -488,34 +443,31 @@ async fn step_manifests_are_scoped_per_job_attempt() {
 
     // Simulate a re-dispatch: a new attempt with a new agent job id and new
     // step ids, exactly as a fresh `build_job_artifacts` would produce.
-    let (second_plan_id, second_agent_job_id, second_step_id) = {
-        let mut inner = state.inner.lock().await;
-        let mut record = inner
-            .job_requests
-            .values()
-            .find(|request| request.run_id == run_id && request.job_id.0 == "build")
-            .cloned()
-            .expect("first attempt must exist");
-        let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
-        let agent_job_id = uuid::Uuid::new_v4();
-        record.request_id = request_id;
-        record.agent_job_id = agent_job_id;
-        record.plan_id = uuid::Uuid::new_v4().to_string();
-        let step_id = uuid::Uuid::new_v4().to_string();
-        inner.job_steps.insert(
-            agent_job_id,
-            vec![crate::models::StepRecord::workflow(
-                step_id.clone(),
+    let (second_plan_id, second_agent_job_id, second_step_id) = state
+        .test_db_mutate(|tx| {
+            let (_, _, timeline_id) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
+                .expect("first attempt must exist");
+            let (_, agent_job_id) = tx
+                .insert_retry_request(run_id, &JobId("build".to_owned()), timeline_id)
+                .unwrap();
+            let step_id = uuid::Uuid::new_v4().to_string();
+            tx.insert_step(
+                agent_job_id,
+                &step_id,
                 0,
-                "Run echo build".to_owned(),
-                Some("__run".to_owned()),
-            )],
-        );
-        let plan_id = record.plan_id.clone();
-        inner.agent_job_requests.insert(agent_job_id, request_id);
-        inner.job_requests.insert(request_id, record);
-        (plan_id, agent_job_id.to_string(), step_id)
-    };
+                Some(0),
+                Some("__run"),
+                "Run echo build",
+                "pending",
+            )
+            .unwrap();
+            // plan_id is derived from agent_job_id — never an independent id.
+            let plan_id = agent_job_id.to_string();
+            (plan_id, agent_job_id.to_string(), step_id)
+        })
+        .await;
 
     // The run API — not an internal helper — must show the newest attempt's
     // steps. Asserting through `workflow_step_ids` alone could not detect a
@@ -541,7 +493,7 @@ async fn step_manifests_are_scoped_per_job_attempt() {
     // The earlier attempt keeps its own mapping, which is what makes its
     // already-uploaded `step-<id>.txt` blobs still reachable.
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let first_agent_job_id: uuid::Uuid = jobs[0].2.parse().unwrap();
         let retained = inner
             .job_steps
@@ -1094,9 +1046,197 @@ async fn registration_persists_runner_public_key_material() {
     .await;
     let runner_id = runner["id"].as_i64().unwrap();
 
-    let inner = state.inner.lock().await;
-    assert_eq!(inner.runner_public_keys.get(&runner_id), Some(&public_key));
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.runner_public_keys.get(&runner_id), Some(&public_key));
+    }
+    let inner = state.test_tx().await;
     assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
+}
+
+/// Environment-tier secret values must mask on a node whose masker cache is
+/// cold (a restart, or a node that did not serve the acquire). The append
+/// path has to resolve the job's `environment:` itself — from the stored
+/// template's secret spec — instead of relying on the acquire-time cache
+/// merge, which only exists on the node that claimed the job.
+#[tokio::test]
+async fn log_append_masks_environment_secrets_on_a_cold_masker_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let mut secrets = state.secrets.write();
+        secrets
+            .env
+            .entry("owner/repo".to_owned())
+            .or_default()
+            .entry("prod".to_owned())
+            .or_default()
+            .insert("ENV_TOKEN".to_owned(), "env-tier-secret".to_owned());
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - run: echo env
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (plan_id, stored_environment) = {
+        let inner = state.test_tx().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("the submitted job must have a request");
+        let queued = inner.ready().next().expect("job should be queued");
+        (
+            request.plan_id.clone(),
+            queued
+                .message
+                .preloop_secret_spec
+                .as_ref()
+                .and_then(|spec| spec.environment.clone()),
+        )
+    };
+    assert_eq!(
+        stored_environment.as_deref(),
+        Some("prod"),
+        "the stored template must carry the job's environment tier"
+    );
+
+    // A cold node: nothing has resolved or acquired this plan yet.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.plan_secret_masker.clear();
+        inner.plan_secret_masker_pending.clear();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/scope/actions/{plan_id}/log-1"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from("token=env-tier-secret"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner
+            .logs
+            .get(&format!("{plan_id}/log-1"))
+            .map(Vec::as_slice),
+        Some(&b"token=***"[..]),
+        "environment-tier secrets must be masked from a cold masker cache"
+    );
+}
+
+/// A SecretProvider failure must fail the append closed: the raw body is
+/// neither stored nor streamed, and the failure is never cached as an empty
+/// masker (which would disable masking for the plan for the process's life).
+#[tokio::test]
+async fn log_append_fails_closed_when_the_secret_provider_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let failing = state.test_install_toggled_secret_provider();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo masked\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"TOKEN": "super-secret"}
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let plan_id = {
+        let inner = state.test_tx().await;
+        inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("the submitted job must have a request")
+            .plan_id
+            .clone()
+    };
+
+    let append = |body: &'static str| {
+        let app = app.clone();
+        let plan_id = plan_id.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{plan_id}/log-1"))
+                    .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A cold node: the submit-time seed is gone (restart, or a node that did
+    // not serve this run), so the append must resolve through the provider.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.plan_secret_masker.clear();
+        inner.plan_secret_masker_pending.clear();
+    }
+    let response = append("token=super-secret").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a provider failure must drop the append, not store it unmasked"
+    );
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            !inner.logs.contains_key(&format!("{plan_id}/log-1")),
+            "the failed append must not be buffered"
+        );
+    }
+
+    // The failure is not cached: once the provider recovers, the same plan
+    // masks against its real secrets instead of a permanently empty masker.
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let response = append("token=super-secret").await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner
+            .logs
+            .get(&format!("{plan_id}/log-1"))
+            .map(Vec::as_slice),
+        Some(&b"token=***"[..]),
+        "the provider error must not have been cached as an empty masker"
+    );
 }
 
 #[tokio::test]
@@ -1360,16 +1500,9 @@ async fn task_agent_registration_extracts_nested_public_key() {
     )
     .await;
     let runner_id = runner["id"].as_i64().unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(inner.runner_rsa_public_keys.contains_key(&runner_id));
 }
-
-/// The official `actions/runner` sends a stock label set that includes
-/// `self-hosted` as both a system label and a user label (the default
-/// `config.sh` prompt suggests it). The strict `(runner_id, label)` primary
-/// key on `runner_labels` must not reject this; the runner server collapses
-/// the duplicate at handler entry. The store layer dedupes again as a
-/// backstop, so the round-trip through the database preserves the collapse.
 
 /// The official `actions/runner` sends a stock label set that includes
 /// `self-hosted` as both a system label and a user label (the default
@@ -1406,7 +1539,7 @@ async fn register_runner_dedupes_official_label_set() {
         .to_owned();
 
     // Mirrors the label set captured in
-    // .runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl:
+    //runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl:
     // self-hosted appears as both system and user; Linux and linux coexist
     // (case-different today; collapsed under the same dedup rules).
     let body = json!({
@@ -1439,7 +1572,7 @@ async fn register_runner_dedupes_official_label_set() {
 
     // In-memory labels must be deduped case-insensitively while preserving
     // the first occurrence of each canonical form.
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let stored = &inner.runners.get(&runner_id).unwrap().labels;
     let lowered: std::collections::BTreeSet<String> =
         stored.iter().map(|l| l.to_lowercase()).collect();
@@ -1550,11 +1683,6 @@ async fn registration_and_oauth_return_runner_compatible_tokens() {
         3
     );
 }
-
-/// The registration mint hands out a RunnerManage JWT. Strict mode requires
-/// the system credential on both TCP and the mounted control socket; the
-/// conformance golden replays a real GitHub registration token that this
-/// control plane cannot verify, so those runs opt into `Permissive` explicitly.
 
 /// The registration mint hands out a RunnerManage JWT. Strict mode requires
 /// the system credential on both TCP and the mounted control socket; the
@@ -1933,11 +2061,6 @@ async fn current_runner_registration_to_broker_job_e2e() {
 /// `github_token` variable. The runner exposes that built-in value to
 /// `${{ secrets.GITHUB_TOKEN }}`; the wire must not add a second, non-official
 /// uppercase variable.
-
-/// GitHub's dispatcher injects the job token through the lower-case
-/// `github_token` variable. The runner exposes that built-in value to
-/// `${{ secrets.GITHUB_TOKEN }}`; the wire must not add a second, non-official
-/// uppercase variable.
 #[tokio::test]
 async fn job_message_carries_the_official_github_token_variable() {
     let temp = tempfile::tempdir().unwrap();
@@ -2027,11 +2150,6 @@ async fn job_message_carries_the_official_github_token_variable() {
         "uppercase GITHUB_TOKEN is not part of the official acquire schema"
     );
 }
-
-/// GitHub's environment-secret tier: a job whose `environment:` resolves to
-/// a stored environment sees that tier, with environment > repo > global
-/// precedence per name — and only that job does. Submission-provided values
-/// still win per name over every stored tier.
 
 /// GitHub's environment-secret tier: a job whose `environment:` resolves to
 /// a stored environment sees that tier, with environment > repo > global
@@ -3165,7 +3283,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
 
-    // 1. Successful cache hit, with the signed ticket the server mints
+    // Successful cache hit, with the signed ticket the server mints
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -3301,7 +3419,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         b"fetched-tar-content"
     );
 
-    // 2. Reject path traversal
+    // Reject path traversal
     let response = app
         .clone()
         .oneshot(
@@ -3394,7 +3512,7 @@ async fn runner_protocol_errors_use_official_envelopes_without_changing_native_a
     );
 
     // Auth middleware failures on _apis routes must be VSS/AzDO JSON, not the
-    // native {"error": ...} response used by local APIs.
+    // native {"error":...} response used by local APIs.
     let response = app
         .clone()
         .oneshot(
@@ -3528,8 +3646,8 @@ async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
     assert_eq!(accepted["queued_jobs"], 1);
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    let inner = state.inner.lock().await;
-    let run = inner.runs.get(&run_id).expect("the run must be recorded");
+    let tx = state.test_tx().await;
+    let run = tx.runs.get(&run_id).expect("the run must be recorded");
     let caller_plan = run
         .caller_plans
         .values()
