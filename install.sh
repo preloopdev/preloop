@@ -373,8 +373,7 @@ elif install_from_release; then
     cat <<EOF
 
 [preloop] next steps:
-    preloop serve                      # start the engine on 127.0.0.1:9090
-    preloop setup github               # GitHub App or fine-grained PAT
+    preloop init                       # step by step: credentials, VM image, run mode
     cd your-repo && preloop run -f .github/workflows/ci.yml
     preloop run --push --create-pr     # CI first, then a draft PR
 
@@ -470,8 +469,7 @@ esac
 cat <<EOF
 
 [preloop] next steps:
-    preloop serve                      # start the engine on 127.0.0.1:9090
-    preloop setup github               # GitHub App or fine-grained PAT
+    preloop init                       # step by step: credentials, VM image, run mode
     cd your-repo && preloop run -f .github/workflows/ci.yml
 
 [preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md

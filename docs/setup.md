@@ -162,10 +162,22 @@ preloop-runner remove --token <REMOVE_TOKEN>
 ## Quick start
 
 ```sh
+preloop init             # wizard: credentials, golden image, how to run
 preloop serve            # engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event push
 ```
+
+`preloop init` is the front door: it runs the credential step below, chooses
+the golden image every job forks from (the official GitHub runner image by
+default, or an OCI reference, a Dockerfile in your repo, or a local
+`.smolmachine`/rootfs), picks how to run (foreground, service, or configure
+only), and preflights the host (disk, architecture, hypervisor) before writing
+the config. In a terminal it is a step-by-step wizard; without one it takes the
+same answers as flags, and `preloop init --probe --json` reports host
+capabilities without changing anything. Re-running reconfigures in place.
+The sections below are the same steps in depth — `preloop setup github`
+remains the credentials command that `init` calls.
 
 `preloop run` snapshots the local workspace (dirty changes included) so a run
  will run your workflows locally. It doesnt depends on what is pushed to GitHub or require you to create a commit locally.
@@ -426,7 +438,9 @@ still stored inline are migrated on the next `preloop serve`, which rewrites
 the config to reference them instead. A missing or empty file is fine
 (everything defaults); a malformed one fails startup, so a typo is caught
 before a mint or a job hits it. `preloop setup github`
-writes the `[github]` section; `preloop secret` writes the secret tables.
+writes the `[github]` section; `preloop secret` writes the secret tables;
+`preloop init` writes the `[golden]` section and runs `setup` for the
+credentials.
 
 On a host with no reachable credential store — a headless Linux box without a
 Secret Service daemon, for example — startup logs a warning and falls back to
@@ -448,6 +462,11 @@ webhook_secret_ref = "github-app-webhook-123456"  # written by `setup github --v
 server_url = "https://github.com"          # GHES: point at your host
 api_url = "https://api.github.com"         # GHES: REST base
 graphql_url = "https://api.github.com/graphql"
+
+[golden]
+kind = "oci"                                # official | oci | dockerfile | file
+base_image = "ghcr.io/acme/base@sha256:…"   # what `serve` boots the golden from
+dockerfile = "ci/Dockerfile"                # only for kind = "dockerfile"
 
 [secrets]
 DOCKERHUB_TOKEN = "…"

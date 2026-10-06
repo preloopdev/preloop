@@ -231,6 +231,7 @@ fn submit_run_tx(
     let has_runnable = submit_jobs.iter().any(|job| {
         !logic::concludes_at_submit(
             job.initially_skipped,
+            !job.queued.needs.is_empty(),
             job.queued.reusable_call.is_some() || job.queued.deferred_matrix.is_some(),
             &job.queued.runs_on,
             check_hostable,
@@ -398,7 +399,11 @@ fn submit_run_tx(
         let spec = spec_extras(&record, &job, id_token_granted, oidc_context.as_ref());
 
         // Unhostable platform: no registered runner can ever take this job.
-        let unhostable = if check_hostable {
+        // Deferred for needs-gated jobs — they park until their `if:` can be
+        // evaluated, and a job GitHub would skip must not fail here on labels
+        // it will never need; promotion re-runs this check on every Run
+        // decision.
+        let unhostable = if check_hostable && job.needs.is_empty() {
             crate::control::logic::unhostable_platform(&job.runs_on, platforms.iter().copied())
         } else {
             None
@@ -452,8 +457,11 @@ fn submit_run_tx(
         // Labels the co-hosted pool can never satisfy and no registered
         // runner serves: conclude now instead of starving in the queue.
         // Placeholders are skipped — expansion materializes their real jobs.
+        // Needs-gated jobs defer too: they park until their `if:` can be
+        // evaluated, and the promotion path re-runs this check.
         if job.reusable_call.is_none()
             && job.deferred_matrix.is_none()
+            && job.needs.is_empty()
             && let Some(reason) = crate::control::logic::unschedulable_reason(
                 &job.runs_on,
                 &pool_labels,
