@@ -1442,7 +1442,6 @@ impl LiteBackend {
         let promote = self.promote_ready_jobs(Some(run_id), &rules).await?;
         Ok(EnvironmentApprovalOutcome {
             result,
-            queue_depth: promote.queue_depth,
             next_runs_on: promote.next_runs_on,
             promoted: promote.promoted,
         })

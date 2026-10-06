@@ -306,6 +306,17 @@ impl AppState {
         }
     }
 
+    /// Test hook: run one state-sampler tick inline. The harness never
+    /// spawns `run_state_sampler`, so pool/queue gauges stay at their seeded
+    /// values unless a test samples explicitly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_sample_state_once(&self) {
+        crate::bootstrap::sample_state_once(
+            &self.shared(),
+            &preloop_observability::status::StoreBackend::Sqlite,
+        )
+        .await;
+    }
     /// Mutate the control database directly. Escape hatch for seeds that no
     /// `ControlBackend` command expresses (forced-terminal runs, planted
     /// timestamps). SQLite only: production servers never see it, and the
@@ -702,6 +713,13 @@ pub struct AppState {
     /// ([`crate::event_feed`]).
     pub(crate) events_dirty: Arc<Notify>,
     pub message_notify: Arc<Notify>,
+    /// The state sampler's dedicated wake channel. Kept separate from
+    /// `message_notify`: runner waiters are woken with `notify_one` per
+    /// ready job (a permit), and a parked sampler would consume permits
+    /// meant for runners — a parked runner then misses work until its poll
+    /// window ends. Every producer that fires `message_notify` also fires
+    /// this (see [`wake_waiters`]); only the sampler listens on it.
+    pub sampler_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
     /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
     /// updates use a separate breaker so an ingress outage cannot suppress
@@ -734,9 +752,9 @@ pub struct AppState {
     pub pool_status: Arc<preloop_observability::status::PoolStatus>,
     /// When this AppState was created (for uptime).
     pub started_at: std::time::Instant,
-    /// Jobs accepted and still waiting for a runner, refreshed whenever one
-    /// is claimed. A supervising runner pool reads it to decide whether the
-    /// work already queued outruns the runners it has left.
+    /// Jobs accepted and still waiting for a runner, refreshed by the 5s
+    /// state sampler. A supervising runner pool reads it to decide whether
+    /// the work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     /// Plan 000 step 4 probe — broker job-lifecycle calls (`renewjob`,
     /// `completejob`) that authenticated with the bare runner *listen* token
@@ -1214,7 +1232,13 @@ impl AppState {
                 env::var("PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS")
                     .ok()
                     .and_then(|raw| raw.trim().parse().ok())
-                    .unwrap_or(1800),
+                    .unwrap_or(1800)
+                    // Floor: the liveness sweep must never outrun a
+                    // legitimate in-flight long-poll. A runner parked for
+                    // the full client window sends no traffic; a timeout
+                    // below ~3x the max poll window can reap a healthy,
+                    // still-polling runner.
+                    .max(3 * max_poll_window_secs()),
             ),
             ..Default::default()
         };
@@ -1401,21 +1425,25 @@ impl AppState {
             );
         }
         let message_notify = Arc::new(Notify::new());
+        let sampler_notify = Arc::new(Notify::new());
         // One pool status handle, shared with the backend: the pool's
         // advertised labels gate `runs-on` inside submit/promotion.
         let pool_status = Arc::new(preloop_observability::status::PoolStatus::default());
         backend.set_pool_status((*pool_status).clone());
         // Cross-node wake-ups (Postgres LISTEN): a job committed through any
-        // node wakes runners long-polling this one.
+        // node wakes runners long-polling this one — and nudges the local
+        // sampler so queue gauges track remote commits between ticks.
         if let Some(mut wakes) = backend.subscribe_wakes() {
             let notify = message_notify.clone();
+            let sampler = sampler_notify.clone();
             tokio::spawn(async move {
                 loop {
                     match wakes.recv().await {
-                        Ok(wake) => wake_waiters(&notify, wake.ready, wake.broadcast),
+                        Ok(wake) => wake_waiters(&notify, &sampler, wake.ready, wake.broadcast),
                         // Missed signals: wake everyone once; they re-check.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            notify.notify_waiters()
+                            notify.notify_waiters();
+                            sampler.notify_waiters();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -1439,6 +1467,7 @@ impl AppState {
             events,
             events_dirty,
             message_notify,
+            sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
@@ -2181,10 +2210,29 @@ mod cluster_key_tests {
     }
 }
 
+/// Upper bound on a runner long-poll `waitSeconds` (seconds).
+/// `PRELOOP_MAX_POLL_WINDOW_SECS` overrides; the default keeps polls short
+/// enough that a healthy runner always beats the liveness sweep (which is
+/// floored at `3 *` this value — see `runner_liveness_timeout` seeding).
+pub(crate) fn max_poll_window_secs() -> u64 {
+    env::var("PRELOOP_MAX_POLL_WINDOW_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60)
+}
+
 /// Wake long-polling runners: at most `ready` of them for newly claimable
 /// jobs (waking every waiter for one job is a thundering herd: all of them
 /// race one claim), or all of them for broadcasts such as cancellations.
-pub(crate) fn wake_waiters(notify: &Notify, ready: usize, broadcast: bool) {
+///
+/// The state sampler listens on a separate channel (`sampler`): the
+/// `notify_one` permits below belong to runner waiters, and a parked
+/// sampler parked on the same `Notify` would steal them. `notify_waiters`
+/// on the sampler channel is safe — it wakes a registered waiter without
+/// leaving a stale permit behind.
+pub(crate) fn wake_waiters(notify: &Notify, sampler: &Notify, ready: usize, broadcast: bool) {
+    sampler.notify_waiters();
     if broadcast {
         notify.notify_waiters();
         return;
@@ -2219,10 +2267,51 @@ mod wake_tests {
             }));
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        super::wake_waiters(&notify, 2, false);
+        let sampler = Arc::new(Notify::new());
+        super::wake_waiters(&notify, &sampler, 2, false);
         for waiter in waiters {
             waiter.await.unwrap();
         }
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
+    }
+
+    /// A parked sampler must never consume a `notify_one` permit meant for a
+    /// runner: regression cover for the pre-split bug where the sampler
+    /// shared `message_notify` and could park on the same `Notify`.
+    #[tokio::test]
+    async fn parked_sampler_never_steals_a_runner_permit() {
+        let notify = Arc::new(Notify::new());
+        let sampler = Arc::new(Notify::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+        // The sampler parks on its own channel.
+        let (sampler_handle, woken_s) = (sampler.clone(), woken.clone());
+        let sampler_task = tokio::spawn(async move {
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                sampler_handle.notified(),
+            )
+            .await
+            .is_ok()
+            {
+                woken_s.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // One runner parks on the runner channel.
+        let (notify_r, woken_r) = (notify.clone(), woken.clone());
+        let runner_task = tokio::spawn(async move {
+            if tokio::time::timeout(std::time::Duration::from_millis(300), notify_r.notified())
+                .await
+                .is_ok()
+            {
+                woken_r.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        super::wake_waiters(&notify, &sampler, 1, false);
+        sampler_task.await.unwrap();
+        runner_task.await.unwrap();
+        // Both wake: the sampler via notify_waiters on its channel, the
+        // runner via the single permit — the parked sampler can't take it.
         assert_eq!(woken.load(Ordering::SeqCst), 2);
     }
 }

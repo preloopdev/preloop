@@ -605,6 +605,92 @@ async fn submit_and_claim(
     (claimed.request, runner.runner.id)
 }
 
+/// The session's `last_seen_at` as text (microsecond precision), read through
+/// the reader pool.
+async fn session_last_seen_at(node: &PgBackend, session_id: &str) -> String {
+    let uuid = crate::control::logic::session_uuid(session_id).to_string();
+    let reader = node.reader().await.expect("reader pool");
+    reader
+        .query_one(
+            "SELECT last_seen_at::text FROM runner_sessions WHERE session_id = $1::text::uuid",
+            &[&uuid],
+        )
+        .await
+        .expect("last_seen_at read")
+        .get(0)
+}
+
+/// Idle polls must not take a writer: with no session message, no active
+/// request, no pending cancellation and no ready work, `poll_session`
+/// answers from the reader pool and leaves `last_seen_at` untouched.
+/// (Previously every poll opened a writer transaction and re-stamped
+/// liveness — about five statements per poll, per runner, every few
+/// seconds — which is what made thousands of idle long-pollers the
+/// dominant writer load.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_poll_leaves_last_seen_at_untouched() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        return skip_no_postgres();
+    };
+    let node = connect(&url).await;
+    let runner = node.register_runner(register_runner("r1")).await.unwrap();
+    let session = node
+        .create_session(create_session(runner.runner.id))
+        .await
+        .unwrap();
+    let seen_at = session_last_seen_at(&node, &session.session_id).await;
+    // A re-stamp would land on a later microsecond; sleep so the assertion
+    // below can actually observe one.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let outcome = node
+        .poll_session(poll(&session.session_id, runner.runner.id))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, PollOutcome::Empty),
+        "expected an idle poll, got {outcome:?}"
+    );
+    assert_eq!(
+        session_last_seen_at(&node, &session.session_id).await,
+        seen_at,
+        "an idle poll must not rewrite last_seen_at"
+    );
+}
+
+/// The probe must not swallow work: a poll right after a submit still
+/// claims through the writer path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_poll_still_claims_after_submit() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        return skip_no_postgres();
+    };
+    let node = connect(&url).await;
+    let runner = node.register_runner(register_runner("r1")).await.unwrap();
+    let session = node
+        .create_session(create_session(runner.runner.id))
+        .await
+        .unwrap();
+    // Sanity: idle first.
+    let outcome = node
+        .poll_session(poll(&session.session_id, runner.runner.id))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, PollOutcome::Empty));
+    // Then work arrives: the probe defers to the writer and the claim lands.
+    let run_id = RunId::new();
+    node.submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+        .await
+        .unwrap();
+    let outcome = node
+        .poll_session(poll(&session.session_id, runner.runner.id))
+        .await
+        .unwrap();
+    let PollOutcome::Claimed(claimed) = outcome else {
+        panic!("expected a claim after submit, got {outcome:?}");
+    };
+    assert_eq!(claimed.queued.job_id, JobId("build".to_owned()));
+}
+
 /// Far more concurrent acquires than pooled readers must all complete. An
 /// acquire that held one reader while checking out a second deadlocked the
 /// pool as soon as every reader was held by an acquire waiting for another —

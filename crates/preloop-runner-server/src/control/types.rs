@@ -322,9 +322,6 @@ pub(crate) struct SubmitOutcome {
     /// A replayed webhook delivery found an existing run — the handler
     /// returns that acceptance instead of a new run.
     pub(crate) existing: Option<Box<RunRecord>>,
-    /// Ready-queue depth after the transition — the handler stores it in
-    /// the node-local `queue_depth` gauge that wakes the runner supervisor.
-    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the next ready job, for `next_job_runs_on`.
     pub(crate) next_runs_on: Vec<String>,
     /// Events the submit transaction already wrote to the outbox — the
@@ -360,8 +357,6 @@ pub(crate) struct ClaimedJob {
     pub(crate) queued: QueuedJob,
     pub(crate) request: TaskAgentJobRequestRecord,
     pub(crate) runner_id: i64,
-    /// Queue depth after the claim (for the supervisor atomic).
-    pub(crate) queue_depth: usize,
     /// `runs-on` of the new queue front, for golden selection.
     pub(crate) next_runs_on: Vec<String>,
 }
@@ -412,8 +407,6 @@ pub(crate) struct CompleteOutcome {
     pub(crate) live_log_key: String,
     /// Whether the ready queue or cancellation queue is non-empty.
     pub(crate) queue_nonempty: bool,
-    /// Queue depth after the transition.
-    pub(crate) queue_depth: usize,
     /// Whether the completion was a replay of an already-terminal job.
     pub(crate) replayed: bool,
 }
@@ -431,8 +424,6 @@ pub(crate) struct CancelOutcome {
     pub(crate) record: Option<RunRecord>,
     /// Every job of the run whose status is now `Cancelled`, in job-id order.
     pub(crate) cancelled_jobs: Vec<JobId>,
-    /// Global ready-queue depth after the transition.
-    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the ready-queue front after the transition.
     pub(crate) next_runs_on: Vec<String>,
 }
@@ -1058,8 +1049,6 @@ pub(crate) enum EnvironmentApprovalResult {
 #[derive(Debug)]
 pub(crate) struct EnvironmentApprovalOutcome {
     pub(crate) result: EnvironmentApprovalResult,
-    /// Ready-queue depth after the command.
-    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the ready queue's front job after the command.
     pub(crate) next_runs_on: Vec<String>,
     /// Jobs released to ready by the post-approval promotion sweep.
@@ -1170,9 +1159,7 @@ pub(crate) struct JobSettled {
     pub(crate) newly_terminal_success: bool,
     /// Live-log key of the attempt (agent job id, else logical job id).
     pub(crate) live_log_key: String,
-    /// Ready-queue depth after the transition and the `runs-on` of its
-    /// front job.
-    pub(crate) queue_len: usize,
+    /// `runs-on` of the ready-queue front job after the transition.
     pub(crate) next_runs_on: Vec<String>,
 }
 
@@ -1234,16 +1221,13 @@ pub(crate) enum AzdoPollOutcome {
     /// a `JobCancellation` session message (HTTP 200).
     Cancel(SessionMessage),
     /// A job was claimed: the new `PipelineAgentJobRequest` session message
-    /// (HTTP 202) and the job it assigns, plus the ready-queue snapshot the
-    /// committed claim produced so the handler can refresh the supervisor
-    /// gauges (`queue_depth`/`next_job_runs_on`) the same way the broker
-    /// claim does.
+    /// (HTTP 202) and the job it assigns, plus the ready-queue front labels
+    /// the committed claim produced so the handler can refresh
+    /// `next_job_runs_on` the same way the broker claim does.
     Claimed {
         message: SessionMessage,
         run_id: RunId,
         job_id: JobId,
-        /// Queue depth after the claim (for the supervisor atomic).
-        queue_depth: usize,
         /// `runs-on` of the new queue front, for `next_job_runs_on`.
         next_runs_on: Vec<String>,
     },
