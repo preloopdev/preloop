@@ -913,8 +913,20 @@ impl SmolVmProvider {
     /// The directory is hash-derived, not name-derived, so it must be asked
     /// of smolvm rather than reconstructed from the platform cache layout.
     async fn machine_data_dir(&self, name: &MachineName) -> Result<PathBuf, VmError> {
+        let _guard = self.lifecycle_lock.read().await;
+        self.machine_data_dir_direct(name).await
+    }
+
+    /// [`Self::machine_data_dir`] without the lifecycle lock.
+    ///
+    /// The orphan sweep holds the read side across its whole
+    /// snapshot-and-scan to exclude `machine create` (see
+    /// [`VmProvider::sweep_orphaned_data_dirs`]), so it must not re-acquire
+    /// the lock per machine: a writer queued behind the sweep would block a
+    /// nested read forever.
+    async fn machine_data_dir_direct(&self, name: &MachineName) -> Result<PathBuf, VmError> {
         let output = self
-            .concurrent(
+            .checked(
                 "data-dir",
                 &[
                     "machine".into(),
@@ -1229,11 +1241,22 @@ impl VmProvider for SmolVmProvider {
     }
 
     async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        // Hold the lifecycle read lock across the registry snapshot *and* the
+        // filesystem scan. `machine create` and `machine pack` hold the write
+        // side for their whole run, so no create can be executing — or create
+        // its data dir before the registry row lands — while the scan decides
+        // what is an orphan; without that exclusion the sweep deleted a live
+        // create's unregistered dir out from under it, and the same tick's
+        // `RemovedDataDir` hypervisor purge then killed the create (issue
+        // #371). Forks run concurrently with other lifecycle operations by
+        // design; a fork clone's dir is created fresh, so the grace window
+        // covers it until its registry row lands.
+        let _lifecycle = self.lifecycle_lock.read().await;
         let registered = self.list().await?;
         let mut known_dirs = std::collections::BTreeSet::new();
         let mut roots = std::collections::BTreeSet::new();
         for name in &registered {
-            let dir = self.machine_data_dir(name).await?;
+            let dir = self.machine_data_dir_direct(name).await?;
             if let Some(parent) = dir.parent() {
                 roots.insert(parent.to_path_buf());
             }
@@ -1608,14 +1631,40 @@ impl VmProvider for SmolVmProvider {
     }
 }
 
-/// Grace window covering the create-before-register gap: smolvm writes the
-/// data dir before the registry row commits, so a brand-new dir is not yet
-/// provably orphaned.
+/// Grace window covering the fork-before-register gap: `machine fork` runs
+/// concurrently with the sweep by design, and smolvm writes the clone's data
+/// dir before the registry row commits, so a brand-new dir is not yet
+/// provably orphaned. It cannot cover a packed create (extraction runs for
+/// minutes longer than this); creates are excluded by the lifecycle lock
+/// instead, for the whole sweep.
 const ORPHAN_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Delete children of `roots` that are not in `known_dirs` and are older than
-/// `grace`. Synchronous: the sweep runs inside `spawn_blocking` because a
-/// leaked VM dir can be gigabytes of metadata.
+/// Whether `name` is a SmolVM machine data dir: the first 16 lowercase hex
+/// chars of the SHA-256 of the machine name (`vm_dir_hash`). SmolVM keeps its
+/// own node-wide state beside them under `_`-prefixed names — the shared
+/// content-addressed pack store (`_shared/`) every packed machine's
+/// `.pack-shared` lease points into, the restore base (`_restore-base/`) —
+/// precisely so they can never collide with a machine dir (#371).
+fn is_machine_data_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.len() == 16
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Delete machine data dirs under `roots` that are not in `known_dirs` and
+/// are older than `grace`. Only machine data dirs are candidates: anything
+/// else is SmolVM's own state, and deleting the shared pack store left every
+/// packed machine's lease dangling, so forks failed and the direct-create
+/// fallback re-extracted the whole pack per runner (#371).
+///
+/// The caller holds the lifecycle read lock, so no `machine create` or
+/// `machine pack` is running while this scans; `grace` covers `fork` clones
+/// and any other brand-new dir whose registry row has not landed yet.
+/// Synchronous: the sweep runs inside `spawn_blocking` because a leaked VM
+/// dir can be gigabytes of metadata.
 fn sweep_orphaned_dirs(
     roots: &[PathBuf],
     known_dirs: &std::collections::BTreeSet<PathBuf>,
@@ -1628,7 +1677,10 @@ fn sweep_orphaned_dirs(
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if known_dirs.contains(&path) || !path.is_dir() {
+            if !is_machine_data_dir_name(&entry.file_name())
+                || known_dirs.contains(&path)
+                || !path.is_dir()
+            {
                 continue;
             }
             let old_enough = std::fs::metadata(&path)
@@ -2126,6 +2178,10 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     Ok(killed)
 }
 
+/// Declared-size ceiling for SmolVM pack extraction (512 GiB): above the
+/// official golden's sparse disk sizes, still finite.
+const PACK_MAX_EXTRACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+
 fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
     let mut env = Vec::new();
@@ -2161,6 +2217,19 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
             .find(|path| path.is_dir())
     {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
+    }
+
+    // smolvm caps a pack extraction at 128 GiB of *header-declared* size, so
+    // the official golden's sparse disks (declared far beyond what they
+    // allocate) fail every unpack with "tar archive exceeds max total size"
+    // (#371). The packs Preloop extracts are digest- or checksum-verified
+    // before use, so the bomb guard only needs to stay finite. An operator
+    // value wins.
+    if std::env::var_os("SMOLVM_PACK_MAX_EXTRACT_BYTES").is_none() {
+        env.push((
+            "SMOLVM_PACK_MAX_EXTRACT_BYTES".to_owned(),
+            PACK_MAX_EXTRACT_BYTES.to_string().into(),
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -2731,17 +2800,21 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).ok();
     }
 
-    /// A data dir with no registry entry is unreachable garbage once the
-    /// create-before-register grace window passes; the sweep must take it
-    /// while sparing registered dirs and anything too young to be proven
-    /// orphaned.
+    /// A machine data dir with no registry entry is unreachable garbage once
+    /// the create-before-register grace window passes; the sweep must take it
+    /// while sparing registered dirs and SmolVM's own node-wide state, whose
+    /// loss dangles every packed machine's lease (#371).
     #[test]
-    fn sweep_orphaned_dirs_removes_unregistered_only() {
+    fn sweep_orphaned_dirs_removes_unregistered_machine_dirs_only() {
         let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
-        let known = root.join("registered");
-        let orphan = root.join("orphaned");
-        std::fs::create_dir_all(&known).unwrap();
-        std::fs::create_dir_all(&orphan).unwrap();
+        let known = root.join("0123456789abcdef");
+        let orphan = root.join("59cc3c416f4b6d5e");
+        let shared_store = root.join("_shared").join("a1b2c3d4");
+        let restore_base = root.join("_restore-base");
+        let not_a_hash = root.join("ABCDEF0123456789");
+        for dir in [&known, &orphan, &shared_store, &restore_base, &not_a_hash] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         let known_dirs = std::collections::BTreeSet::from([known.clone()]);
 
         // Zero grace: every unregistered dir is provably old enough.
@@ -2754,7 +2827,10 @@ mod tests {
 
         assert_eq!(swept, 1);
         assert!(known.is_dir(), "registered dir survives");
-        assert!(!orphan.exists(), "orphaned dir is removed");
+        assert!(!orphan.exists(), "orphaned machine dir is removed");
+        assert!(shared_store.is_dir(), "shared pack store survives");
+        assert!(restore_base.is_dir(), "restore base survives");
+        assert!(not_a_hash.is_dir(), "non-machine names are never swept");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2798,7 +2874,7 @@ mod tests {
     #[test]
     fn sweep_orphaned_dirs_spares_young_dirs() {
         let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
-        let young = root.join("young");
+        let young = root.join("fedcba9876543210");
         std::fs::create_dir_all(&young).unwrap();
 
         let swept = super::sweep_orphaned_dirs(
@@ -2930,6 +3006,170 @@ mod tests {
         assert!(!process_alive(live_pid), "only the scope spared it");
         assert!(!process_alive(unknown_pid), "only the scope spared it");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Make `path` older than [`super::ORPHAN_DIR_GRACE`], the way a dir
+    /// SmolVM created before its registry row landed is.
+    fn backdate(path: &std::path::Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(path)
+            .expect("open dir")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("backdate dir");
+    }
+
+    /// Write an executable stand-in for `smolvm` into `dir` and return it.
+    fn fake_smolvm(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("smolvm");
+        std::fs::write(&binary, script).expect("write fake smolvm");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake smolvm");
+        binary
+    }
+
+    /// Regression for issue #371: SmolVM creates a machine's data dir before
+    /// it publishes the registry row, and a packed create extracts for
+    /// minutes — longer than [`super::ORPHAN_DIR_GRACE`]. `machine create`
+    /// holds the lifecycle write lock for its whole run, so the sweep must
+    /// hold the read side and wait for it rather than delete the live,
+    /// unregistered dir; the same tick's `RemovedDataDir` purge then killed
+    /// the create's hypervisor. Without the lock the sweep reclaims the dir
+    /// while the create runs, which is exactly the reported failure.
+    #[test]
+    fn sweep_waits_for_a_create_in_flight_and_spares_its_data_dir() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let root = super::machine_data_root().expect("data root");
+        let dir = root.join("59cc3c416f4b6d5e");
+        let orphan = root.join("0000000000000000");
+        for path in [&dir, &orphan] {
+            std::fs::create_dir_all(path).expect("create machine dir");
+        }
+        // SmolVM's own plaintext name binding, written at dir creation.
+        std::fs::write(dir.join("name"), b"runner-0").expect("name file");
+        // Backdate last: creating child entries moves the dir's mtime.
+        for path in [&dir, &orphan] {
+            backdate(path);
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        let ready = scratch.path().join("create-started");
+        let release = scratch.path().join("create-release");
+        let registered = scratch.path().join("registered");
+        // The create stands in for a packed extraction: the dir already
+        // exists (older than the grace), the registry row does not.
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1 $2\" in\n\
+             \"machine ls\") if [ -f '{registered}' ]; then echo '[{{\"name\":\"runner-0\"}}]'; \
+             else echo '[]'; fi ;;\n\
+             \"machine data-dir\") echo '{dir}' ;;\n\
+             \"machine create\") : > '{ready}'; \
+             while [ ! -f '{release}' ]; do sleep 0.05; done; : > '{registered}' ;;\n\
+             esac\n",
+            registered = registered.display(),
+            dir = dir.display(),
+            ready = ready.display(),
+            release = release.display(),
+        );
+        let binary = fake_smolvm(scratch.path(), &script);
+        let provider = super::SmolVmProvider::new(&binary);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let spec = MachineSpec {
+            name: MachineName::new("runner-0").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        };
+        let create_provider = provider.clone();
+        let create = runtime.spawn(async move { create_provider.create(&spec).await });
+
+        // `machine create` is running, so the provider holds the write lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "create never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let sweep_provider = provider.clone();
+        let sweep = runtime.spawn(async move { sweep_provider.sweep_orphaned_data_dirs().await });
+        // A sweep that takes no lock completes here, deleting the in-flight
+        // create's dir; with the lock it is blocked behind the writer.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let waited_for_create = !sweep.is_finished();
+
+        std::fs::write(&release, b"").expect("release create");
+        runtime
+            .block_on(create)
+            .expect("create task")
+            .expect("create");
+        let swept = runtime.block_on(sweep).expect("sweep task").expect("sweep");
+
+        assert!(
+            dir.is_dir(),
+            "a create's unregistered data dir must survive the sweep"
+        );
+        assert_eq!(
+            swept, 1,
+            "only the dir with no create in flight is reclaimed"
+        );
+        assert!(
+            !orphan.exists(),
+            "a stale unregistered dir is still reclaimed"
+        );
+        assert!(
+            waited_for_create,
+            "the sweep must wait for the create in flight, not scan past it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The lock excludes only creates live in this engine: a dir left by a
+    /// create whose engine died mid-extraction (no registry row) is a real
+    /// orphan and must still be reclaimed, or a restart would leak it forever.
+    #[test]
+    fn sweep_reclaims_a_leftover_unregistered_dir() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let root = super::machine_data_root().expect("data root");
+        let dir = root.join("59cc3c416f4b6d5e");
+        std::fs::create_dir_all(&dir).expect("create leftover dir");
+        std::fs::write(dir.join("name"), b"runner-0").expect("name file");
+        backdate(&dir);
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        let binary = fake_smolvm(
+            scratch.path(),
+            "#!/bin/sh\n[ \"$1 $2\" = \"machine ls\" ] && echo '[]'\nexit 0\n",
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        // A synchronous runtime keeps the sync `PRELOOP_HOME` lock out of
+        // any await, where clippy's `await_holding_lock` would object.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let swept = runtime
+            .block_on(provider.sweep_orphaned_data_dirs())
+            .expect("sweep");
+        assert_eq!(swept, 1, "the leftover dir must be reclaimed");
+        assert!(!dir.exists(), "an unregistered leftover is a real orphan");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
