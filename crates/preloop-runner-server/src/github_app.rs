@@ -1269,7 +1269,7 @@ async fn verify_repo_access_at(
     repo: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let (owner, name) = split_repository(repo)?;
-    let client = reqwest::Client::builder()
+    let client = crate::shared_http::github_client_builder()
         .user_agent("preloop-doctor")
         .build()
         .context("building GitHub API client")?;
