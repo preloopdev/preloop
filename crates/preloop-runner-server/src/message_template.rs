@@ -27,22 +27,29 @@ use crate::secret_provider::{SecretProvider, SecretScope};
 ///
 /// `values` is the resolved `name -> value` map injected as secret
 /// `variables` (token fills are applied separately and are not listed here).
-/// `masked` is `values`' values exposed once for the caller's masking needs —
-/// the whole point of returning a summary rather than having the caller
-/// re-scan the message is that it never has to iterate `variables` for
-/// `is_secret` itself.
+/// `masked` is broader on purpose: it is every value the scope resolved —
+/// injected or not — plus resolved `secrets:` map literals, exposed once
+/// for the caller's masking needs. Unreferenced values can still reach a
+/// log (a literal echoed through `env`, a workflow file body, a map
+/// literal), so the node masker covers the whole scope even though the job
+/// message no longer does.
 #[derive(Debug, Default)]
 pub(crate) struct FillOutcome {
     /// Secret variable names now present on the message.
     pub(crate) names: Vec<String>,
-    /// Resolved plaintext values (for caller-side mask/log purposes).
+    /// Resolved plaintext values injected as `isSecret` variables.
     pub(crate) values: BTreeMap<String, String>,
+    /// Every resolved scoped value (injected or not) plus map literals —
+    /// the merge input for the node masker.
+    pub(crate) masked: Vec<String>,
 }
 
 /// Build the [`MessageSecretSpec`] for a job at submit.
 ///
-/// `names` is the caller-scope name set; `run_names` is the submission's
-/// run-tier name set (non-secret, recorded for every job of the run).
+/// `names` is the job's *referenced* subset of the caller-scope name set
+/// (`runs.rs::build_job_artifacts` computes it); `run_names` is the
+/// submission's run-tier name set (non-secret, recorded for every job of
+/// the run).
 ///
 /// A reusable callee never carries the caller's name set: it receives only
 /// the secrets its call mapped (`secrets: {...}`) or, with `secrets: inherit`,
@@ -276,9 +283,16 @@ pub(crate) fn fill_template(
     // serialized onto the wire.
     msg.preloop_secret_spec = None;
 
+    // Mask breadth stays wider than the injected set: unreferenced secrets
+    // are off the wire but can still reach a log through literals, so the
+    // node masker gets the whole resolved scope.
+    let mut masked: Vec<String> = scoped.values().cloned().collect();
+    masked.extend(resolved.values().cloned());
+
     Ok(FillOutcome {
         names: resolved.keys().cloned().collect(),
         values: resolved,
+        masked,
     })
 }
 
