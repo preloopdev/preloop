@@ -265,6 +265,9 @@ jobs:
     crate::github::drain_webhook_queue(&shared).await.unwrap();
     let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);
+    // Queue depth is sampled by the 5s sampler, not updated per operation;
+    // run one tick inline (the test harness spawns no sampler task).
+    state.test_sample_state_once().await;
     assert_eq!(
         state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
         1
