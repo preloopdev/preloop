@@ -23,6 +23,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Comment- and payload-triggered workflows no longer run without stored
+  secrets**: every event whose workflow file comes from the default branch
+  (`issue_comment`, `issues`, `discussion`, `discussion_comment`, `label`,
+  `milestone`, `watch`, `fork`, `member`, `public`, `gollum`, `page_build`,
+  `repository_dispatch`, `check_run`, `check_suite`, `delete`) was stamped
+  with the `Untrusted` trust tier — the fail-closed default for events with
+  no classification of their own. That tier withholds every stored secret,
+  read-clamps `GITHUB_TOKEN` regardless of the declared `permissions:`, and
+  drops the OIDC grant, so a comment-triggered bot workflow (the canonical
+  `@bot review` chatops pattern) started with an empty `secrets.*` and died
+  on its first API-key check even though the engine held the secret. These
+  events only ever execute the repository's own default-branch workflow —
+  the payload is data, never code — which is the same posture as a push to
+  the default branch, and it is what github.com grants them: repository
+  secrets, the declared permission set, and OIDC. Only fork pull-request
+  workflows keep the withheld-secret profile. Runs persisted before this
+  change keep their recorded tier.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the

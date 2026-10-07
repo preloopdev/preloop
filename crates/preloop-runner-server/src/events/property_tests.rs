@@ -299,6 +299,63 @@ mod tests {
                 prop_assert_eq!(&events[0].event, expected_event);
                 prop_assert_eq!(&events[0].git_ref, &format!("refs/heads/{}", default_branch));
                 prop_assert_eq!(&events[0].activity_type, &Some(action.clone()));
+                // The workflow file comes from the default branch, so the
+                // run keeps default-branch authority: repo secrets, declared
+                // permissions, OIDC. Stamping `Untrusted` here withheld every
+                // stored secret from comment-triggered workflows.
+                prop_assert_eq!(&events[0].trust_tier, &Some(TrustTier::Trusted));
+            }
+        }
+    }
+
+    /// Every event whose workflow file is read from the default branch must
+    /// keep default-branch authority. A regression to `Untrusted` silently
+    /// strips stored secrets, read-clamps the token, and drops the OIDC grant
+    /// — the failure mode #424's `@pullfrog review` run hit.
+    #[test]
+    fn default_branch_events_keep_default_branch_authority() {
+        let payload = serde_json::json!({
+            "action": "completed",
+            "repository": { "full_name": "o/r", "default_branch": "main" },
+            "check_run": { "head_sha": "a".repeat(40) },
+            "check_suite": { "head_sha": "a".repeat(40) },
+            "ref_type": "branch",
+        });
+        let adapters: &[(&dyn EventAdapter, &str)] = &[
+            (&crate::events::issues::Adapter, "issues"),
+            (&crate::events::issue_comment::Adapter, "issue_comment"),
+            (&crate::events::discussion::Adapter, "discussion"),
+            (&crate::events::discussion_comment::Adapter, "discussion_comment"),
+            (&crate::events::label::Adapter, "label"),
+            (&crate::events::milestone::Adapter, "milestone"),
+            (&crate::events::watch::Adapter, "watch"),
+            (&crate::events::fork::Adapter, "fork"),
+            (&crate::events::member::Adapter, "member"),
+            (&crate::events::public::Adapter, "public"),
+            (&crate::events::gollum::Adapter, "gollum"),
+            (&crate::events::page_build::Adapter, "page_build"),
+            (&crate::events::repository_dispatch::Adapter, "repository_dispatch"),
+            (&crate::events::check_run::Adapter, "check_run"),
+            (&crate::events::check_suite::Adapter, "check_suite"),
+            (&crate::events::delete::Adapter, "delete"),
+        ];
+        for (adapter, expected_event) in adapters {
+            let events = adapter.project(&payload);
+            assert!(
+                !events.is_empty(),
+                "adapter for {expected_event} produced no event for a valid payload"
+            );
+            for event in &events {
+                assert_eq!(
+                    event.trust_tier,
+                    Some(TrustTier::Trusted),
+                    "{expected_event} runs the default-branch workflow file and must keep \
+                     default-branch authority"
+                );
+                assert!(
+                    event.trust_tier.is_some_and(|tier| tier.allows_secrets()),
+                    "{expected_event} must receive stored secrets, like github.com"
+                );
             }
         }
     }
