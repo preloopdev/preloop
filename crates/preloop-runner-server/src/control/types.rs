@@ -216,14 +216,15 @@ pub(crate) fn status_parse(s: &str) -> ExecutionStatus {
     }
 }
 
-/// A position in the outbox. Rows are read in `(txid, event_id)` order.
+/// A position in the transactional outbox. PostgreSQL uses `(txid,event_id)`;
+/// SQLite leaves `txid` at zero and orders by `event_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct OutboxBookmark {
     pub(crate) txid: u64,
     pub(crate) event_id: i64,
 }
 
-/// One `outbox_events` row, as the stream consumer reads it.
+/// One `outbox_events` row, as a stream consumer reads it.
 #[derive(Debug, Clone)]
 pub(crate) struct OutboxRow {
     pub(crate) bookmark: OutboxBookmark,
@@ -235,6 +236,29 @@ pub(crate) struct OutboxRow {
     /// The writing node process.
     pub(crate) origin: String,
     pub(crate) topic: String,
+    pub(crate) payload: serde_json::Value,
+}
+
+/// A coalesced desired check-run state leased by the background sender.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckRunUpdate {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) installation_id: i64,
+    pub(crate) check_run_id: Option<u64>,
+    pub(crate) version: i64,
+    pub(crate) payload: serde_json::Value,
+    pub(crate) attempts: i32,
+}
+
+/// Backend-neutral durable update for one desired check-run state.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckRunUpdateInput {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) installation_id: i64,
+    pub(crate) check_run_id: Option<u64>,
+    pub(crate) version: i64,
     pub(crate) payload: serde_json::Value,
 }
 

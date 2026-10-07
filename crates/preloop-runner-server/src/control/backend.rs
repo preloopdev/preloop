@@ -491,6 +491,96 @@ pub(crate) trait ControlBackend: Send + Sync {
         limit: usize,
     ) -> Result<u64, ControlError>;
 
+    /// Consume one durable outbox batch for the check-run projector. The
+    /// bookmark and all desired-state upserts commit atomically while the
+    /// named consumer lease is held by `owner`.
+    async fn consume_check_run_outbox(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<usize, ControlError>;
+
+    /// Lease due desired check-run rows for the single background sender.
+    async fn lease_check_run_updates(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<Vec<CheckRunUpdate>, ControlError>;
+
+    /// Save a GitHub check-run id obtained by the sender. A newer desired
+    /// version may have arrived meanwhile; the conditional update preserves
+    /// that newer row while still recording the id.
+    async fn set_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+        check_run_id: u64,
+    ) -> Result<(), ControlError>;
+
+    /// Complete a leased row only when no newer desired version arrived.
+    async fn finish_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+    ) -> Result<(), ControlError>;
+
+    /// Release a failed sender lease with exponential-backoff metadata.
+    async fn retry_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+        permanent: bool,
+    ) -> Result<(), ControlError>;
+
+    /// Clear a stale GitHub id so the next attempt recreates/reconciles it.
+    async fn clear_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError>;
+
+    async fn enqueue_check_run_update(
+        &self,
+        update: CheckRunUpdateInput,
+    ) -> Result<(), ControlError>;
+
+    /// Release a rate-limited lease without counting a delivery attempt.
+    async fn defer_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+    ) -> Result<(), ControlError>;
+
+    /// Append a durable projection wake after a reporter stamped
+    /// `reports_check_runs`.
+    async fn append_check_run_projection(
+        &self,
+        run_id: RunId,
+        job_id: Option<&JobId>,
+    ) -> Result<(), ControlError>;
+
+    /// Current end of the outbox stream (backend safe point).
+    async fn outbox_head(&self) -> Result<Option<OutboxBookmark>, ControlError>;
+
+    /// Up to `limit` outbox rows after `after`, in backend commit order.
+    async fn outbox_read(
+        &self,
+        after: OutboxBookmark,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, ControlError>;
+
     /// One reaper tick's inputs, read directly (no working-set load, no lock).
     async fn reap_inputs(&self) -> Result<ReapInputs, ControlError>;
 
@@ -1297,24 +1387,23 @@ impl Backend {
         }
     }
 
-    /// The outbox position a consumer that starts now reads from. `None`
-    /// on SQLite.
+    /// The current end of the outbox stream. SQLite returns event-id order;
+    /// PostgreSQL returns its `(txid,event_id)` safe point.
     pub(crate) async fn outbox_head(&self) -> Result<Option<OutboxBookmark>, ControlError> {
         match self {
-            Self::Sqlite(_) => Ok(None),
+            Self::Sqlite(b) => b.outbox_head().await.map(Some),
             Self::Postgres(b) => b.outbox_head().await.map(Some),
         }
     }
 
-    /// Up to `limit` outbox rows after `after`, from finished transactions,
-    /// in `(txid, event_id)` order. Empty on SQLite.
+    /// Up to `limit` rows after `after`, ordered by the backend safe point.
     pub(crate) async fn outbox_read(
         &self,
         after: OutboxBookmark,
         limit: usize,
     ) -> Result<Vec<OutboxRow>, ControlError> {
         match self {
-            Self::Sqlite(_) => Ok(Vec::new()),
+            Self::Sqlite(b) => b.outbox_read(after, limit).await,
             Self::Postgres(b) => b.outbox_read(after, limit).await,
         }
     }
@@ -1324,6 +1413,144 @@ impl Backend {
         match self {
             Self::Sqlite(_) => Ok(()),
             Self::Postgres(b) => b.notify_events().await,
+        }
+    }
+
+    pub(crate) async fn consume_check_run_outbox(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<usize, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.consume_check_run_outbox(owner, lease_for, limit).await,
+            Self::Postgres(b) => b.consume_check_run_outbox(owner, lease_for, limit).await,
+        }
+    }
+
+    pub(crate) async fn lease_check_run_updates(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<Vec<CheckRunUpdate>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.lease_check_run_updates(owner, lease_for, limit).await,
+            Self::Postgres(b) => b.lease_check_run_updates(owner, lease_for, limit).await,
+        }
+    }
+
+    pub(crate) async fn set_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+        check_run_id: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.set_check_run_update_id(owner, run_id, job_id, version, check_run_id)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.set_check_run_update_id(owner, run_id, job_id, version, check_run_id)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn finish_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.finish_check_run_update(owner, run_id, job_id, version)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.finish_check_run_update(owner, run_id, job_id, version)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn retry_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+        permanent: bool,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retry_check_run_update(owner, run_id, job_id, delay, permanent)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retry_check_run_update(owner, run_id, job_id, delay, permanent)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn clear_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.clear_check_run_update_id(owner, run_id, job_id, expected)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.clear_check_run_update_id(owner, run_id, job_id, expected)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn defer_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.defer_check_run_update(owner, run_id, job_id, delay).await,
+            Self::Postgres(b) => b.defer_check_run_update(owner, run_id, job_id, delay).await,
+        }
+    }
+
+    /// Append a durable projection wake after a reporter stamped
+    /// `reports_check_runs`; see `append_check_run_projection` on the
+    /// backends.
+    pub(crate) async fn append_check_run_projection(
+        &self,
+        run_id: RunId,
+        job_id: Option<&JobId>,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.append_check_run_projection(run_id, job_id).await,
+            Self::Postgres(b) => b.append_check_run_projection(run_id, job_id).await,
+        }
+    }
+    pub(crate) async fn enqueue_check_run_update(
+        &self,
+        update: CheckRunUpdateInput,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.enqueue_check_run_update(update).await,
+            Self::Postgres(b) => b.enqueue_check_run_update(update).await,
         }
     }
 
@@ -1810,6 +2037,149 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.prune_outbox(older_than, limit).await,
             Self::Postgres(b) => b.prune_outbox(older_than, limit).await,
+        }
+    }
+    async fn consume_check_run_outbox(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<usize, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.consume_check_run_outbox(owner, lease_for, limit).await,
+            Self::Postgres(b) => b.consume_check_run_outbox(owner, lease_for, limit).await,
+        }
+    }
+    async fn lease_check_run_updates(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<Vec<CheckRunUpdate>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.lease_check_run_updates(owner, lease_for, limit).await,
+            Self::Postgres(b) => b.lease_check_run_updates(owner, lease_for, limit).await,
+        }
+    }
+    async fn set_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+        check_run_id: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.set_check_run_update_id(owner, run_id, job_id, version, check_run_id)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.set_check_run_update_id(owner, run_id, job_id, version, check_run_id)
+                    .await
+            }
+        }
+    }
+    async fn finish_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.finish_check_run_update(owner, run_id, job_id, version)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.finish_check_run_update(owner, run_id, job_id, version)
+                    .await
+            }
+        }
+    }
+    async fn retry_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+        permanent: bool,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retry_check_run_update(owner, run_id, job_id, delay, permanent)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retry_check_run_update(owner, run_id, job_id, delay, permanent)
+                    .await
+            }
+        }
+    }
+    async fn clear_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.clear_check_run_update_id(owner, run_id, job_id, expected)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.clear_check_run_update_id(owner, run_id, job_id, expected)
+                    .await
+            }
+        }
+    }
+    async fn enqueue_check_run_update(
+        &self,
+        update: CheckRunUpdateInput,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.enqueue_check_run_update(update).await,
+            Self::Postgres(b) => b.enqueue_check_run_update(update).await,
+        }
+    }
+    async fn defer_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.defer_check_run_update(owner, run_id, job_id, delay).await,
+            Self::Postgres(b) => b.defer_check_run_update(owner, run_id, job_id, delay).await,
+        }
+    }
+    async fn append_check_run_projection(
+        &self,
+        run_id: RunId,
+        job_id: Option<&JobId>,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.append_check_run_projection(run_id, job_id).await,
+            Self::Postgres(b) => b.append_check_run_projection(run_id, job_id).await,
+        }
+    }
+    async fn outbox_head(&self) -> Result<Option<OutboxBookmark>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.outbox_head().await.map(Some),
+            Self::Postgres(b) => b.outbox_head().await.map(Some),
+        }
+    }
+    async fn outbox_read(
+        &self,
+        after: OutboxBookmark,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.outbox_read(after, limit).await,
+            Self::Postgres(b) => b.outbox_read(after, limit).await,
         }
     }
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {

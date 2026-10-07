@@ -2663,6 +2663,370 @@ pub(crate) mod suite {
         );
     }
 
+    /// Drain the projector until a short batch, returning rows consumed.
+    async fn project_all_check_run_events(backend: &dyn ControlBackend, owner: &str) -> usize {
+        let mut total = 0;
+        for _ in 0..64 {
+            let n = backend
+                .consume_check_run_outbox(owner, std::time::Duration::from_secs(30), 256)
+                .await
+                .unwrap();
+            total += n;
+            if n < 256 {
+                break;
+            }
+        }
+        total
+    }
+
+    async fn lease_check_runs(
+        backend: &dyn ControlBackend,
+        owner: &str,
+    ) -> Vec<crate::control::types::CheckRunUpdate> {
+        backend
+            .lease_check_run_updates(owner, std::time::Duration::from_secs(30), 32)
+            .await
+            .unwrap()
+    }
+
+    async fn outbox_len(backend: &dyn ControlBackend) -> usize {
+        backend
+            .outbox_read(
+                OutboxBookmark {
+                    txid: 0,
+                    event_id: 0,
+                },
+                10_000,
+            )
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Consume until the projector has nothing left to read.
+    ///
+    /// On a shared Postgres server a concurrent transaction (another test's
+    /// database, same cluster) holds `pg_snapshot_xmin` back, hiding freshly
+    /// committed rows for a moment; retry instead of assuming instant
+    /// visibility.
+    async fn consume_until_quiescent(backend: &dyn ControlBackend, owner: &str) -> usize {
+        let mut total = 0;
+        for _ in 0..600 {
+            let n = backend
+                .consume_check_run_outbox(owner, std::time::Duration::from_secs(30), 256)
+                .await
+                .unwrap();
+            total += n;
+            if n == 0 && total > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        total
+    }
+
+    /// Read the outbox length once two consecutive reads agree, so a delayed
+    /// commit cannot make an assertion count a half-visible stream.
+    async fn stable_outbox_len(backend: &dyn ControlBackend) -> usize {
+        let mut last = outbox_len(backend).await;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let now = outbox_len(backend).await;
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+        last
+    }
+
+    /// Wait until the projector has materialized `status` for the job.
+    async fn wait_for_projected_status(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &JobId,
+        status: &str,
+    ) -> crate::control::types::CheckRunUpdate {
+        for _ in 0..600 {
+            let _ = consume_until_quiescent(backend, "suite-projector").await;
+            let rows = lease_check_runs(backend, "suite-probe").await;
+            if let Some(row) = rows
+                .iter()
+                .find(|row| row.run_id == run_id && row.job_id == *job_id)
+                && row.payload["status"] == status
+            {
+                return row.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("check-run row for {run_id}/{job_id} never reached {status}");
+    }
+
+    /// The desired-state row is latest-version-wins: an older projected event
+    /// (or a direct insert) never overwrites a newer row, so a late `queued`
+    /// cannot regress a `success` already in the queue.
+    pub(crate) async fn check_run_projection_never_regresses_a_newer_row(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let build = JobId("build".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        backend.set_reports_check_runs(run_id, true).await.unwrap();
+
+        // A newer desired state than any event this run can produce.
+        backend
+            .enqueue_check_run_update(CheckRunUpdateInput {
+                run_id,
+                job_id: build.clone(),
+                installation_id: 0,
+                check_run_id: None,
+                version: 9_999,
+                payload: serde_json::json!({
+                    "repository": "owner/repo",
+                    "sha": "abc123",
+                    "job_id": "build",
+                    "status": "success",
+                    "name": "build",
+                }),
+            })
+            .await
+            .unwrap();
+        // Direct insert of an older version is a no-op too.
+        backend
+            .enqueue_check_run_update(CheckRunUpdateInput {
+                run_id,
+                job_id: build.clone(),
+                installation_id: 0,
+                check_run_id: None,
+                version: 3,
+                payload: serde_json::json!({
+                    "repository": "owner/repo",
+                    "sha": "abc123",
+                    "job_id": "build",
+                    "status": "queued",
+                    "name": "build",
+                }),
+            })
+            .await
+            .unwrap();
+
+        // A real projection wake for the same job must not regress the row.
+        backend
+            .append_check_run_projection(run_id, Some(&build))
+            .await
+            .unwrap();
+        project_all_check_run_events(backend, "suite-projector").await;
+
+        let rows = lease_check_runs(backend, "suite-probe").await;
+        let row = rows
+            .iter()
+            .find(|row| row.run_id == run_id && row.job_id == build)
+            .expect("the queue holds a row for build");
+        assert_eq!(
+            row.version, 9_999,
+            "an older projected version must not overwrite a newer row"
+        );
+        assert_eq!(row.payload["status"], "success");
+    }
+
+    /// The acquire transition must reach GitHub: claiming a job writes
+    /// `job.started.v1` and moves the row to in_progress, the projector
+    /// coalesces that into an in_progress queue row, and the sender then
+    /// PATCHes it (exercised end-to-end by the github.rs sender tests).
+    pub(crate) async fn acquire_projects_in_progress_check_run(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let build = JobId("build".to_owned());
+        let runner = backend
+            .register_runner(register_runner("check-run-r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        backend.set_reports_check_runs(run_id, true).await.unwrap();
+        backend
+            .append_check_run_projection(run_id, Some(&build))
+            .await
+            .unwrap();
+        let queued = wait_for_projected_status(backend, run_id, &build, "queued").await;
+        let queued_version = queued.version;
+
+        let poll = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(poll, PollOutcome::Claimed(_)),
+            "expected a claim, got {poll:?}"
+        );
+        let row = wait_for_projected_status(backend, run_id, &build, "in_progress").await;
+        assert!(
+            row.version > queued_version,
+            "the acquire transition bumps the row version ({} vs {queued_version})",
+            row.version
+        );
+    }
+
+    /// The consumer bookmark is durable state, not process memory: a second
+    /// consumer owner (a restarted process) resumes exactly where the first
+    /// stopped, so events committed while it was down are delivered once.
+    pub(crate) async fn check_run_bookmark_survives_consumer_restart(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let total = backend
+            .outbox_read(
+                OutboxBookmark {
+                    txid: 0,
+                    event_id: 0,
+                },
+                10_000,
+            )
+            .await
+            .unwrap()
+            .len();
+        assert!(total > 1, "a submit emits several outbox rows");
+
+        // First consumer reads exactly one event and commits the bookmark.
+        // Its lease is left expired so the restarted consumer can take over
+        // without waiting out the production lease window. Retry: on a shared
+        // Postgres cluster a concurrent transaction can hide the row briefly.
+        let mut first = 0;
+        for _ in 0..600 {
+            first = backend
+                .consume_check_run_outbox(
+                    "suite-consumer-1",
+                    std::time::Duration::from_millis(1),
+                    1,
+                )
+                .await
+                .unwrap();
+            if first == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(first, 1, "the first consumer reads one event");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Events committed while it was "down" (the second submit) plus the
+        // remainder are delivered after the restart. Retry until the counts
+        // settle: a concurrent transaction on a shared Postgres cluster can
+        // delay visibility of freshly committed rows.
+        let run_id2 = RunId::new();
+        backend
+            .submit_run(submit_run(run_id2, vec![submit_job(run_id2, "build", 1)]))
+            .await
+            .unwrap();
+        let mut delivered = 0;
+        for _ in 0..600 {
+            delivered += backend
+                .consume_check_run_outbox(
+                    "suite-consumer-2",
+                    std::time::Duration::from_secs(30),
+                    256,
+                )
+                .await
+                .unwrap();
+            if delivered > 0 && first + delivered == stable_outbox_len(backend).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            delivered > 0,
+            "events committed while the consumer was down are delivered after restart"
+        );
+        assert_eq!(
+            first + delivered,
+            stable_outbox_len(backend).await,
+            "a restarted consumer must resume at the persisted bookmark, not replay the stream"
+        );
+    }
+
+    /// Outbox prune never passes the durable consumer bookmark, and still
+    /// bounds growth by age when no consumer has registered.
+    pub(crate) async fn prune_outbox_respects_slowest_consumer(backend: &dyn ControlBackend) {
+        // No consumer: age alone bounds the stream.
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut before = 0;
+        for _ in 0..600 {
+            before = stable_outbox_len(backend).await;
+            if before > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(before > 0, "committed outbox rows become visible");
+        let pruned = backend
+            .prune_outbox(std::time::Duration::ZERO, 10_000)
+            .await
+            .unwrap();
+        assert!(
+            pruned >= 1,
+            "with no durable consumer, age prunes the stream"
+        );
+        assert_eq!(
+            outbox_len(backend).await,
+            before - pruned as usize,
+            "prune removes exactly the rows it counted"
+        );
+
+        // A consumer's bookmark: rows at/below it are prunable, rows past it
+        // are retained however old they are.
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let fast = consume_until_quiescent(backend, "prune-consumer-fast").await;
+        assert!(fast > 0);
+        let run_id2 = RunId::new();
+        backend
+            .submit_run(submit_run(run_id2, vec![submit_job(run_id2, "build", 1)]))
+            .await
+            .unwrap();
+        let mut total = 0;
+        for _ in 0..600 {
+            total = stable_outbox_len(backend).await;
+            if total > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(total > 0);
+        let pruned = backend
+            .prune_outbox(std::time::Duration::ZERO, 10_000)
+            .await
+            .unwrap();
+        assert!(pruned >= 1, "rows at or below the bookmark are prunable");
+        let remaining = outbox_len(backend).await;
+        assert_eq!(
+            remaining,
+            total - pruned as usize,
+            "prune removes exactly the rows it counted"
+        );
+        assert!(
+            remaining >= 1,
+            "rows past the consumer bookmark must survive an age prune"
+        );
+    }
+
     /// `run_dispatch_info` flags the expandable placeholder nodes — a
     /// deferred-matrix parent and a reusable caller. They never dispatch:
     /// expansion replaces them with the legs that mint their own checks, so
@@ -5052,6 +5416,113 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn check_run_projection_never_regresses_a_newer_row() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::check_run_projection_never_regresses_a_newer_row(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn acquire_projects_in_progress_check_run() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::acquire_projects_in_progress_check_run(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn check_run_bookmark_survives_consumer_restart() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::check_run_bookmark_survives_consumer_restart(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn prune_outbox_respects_slowest_consumer() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::prune_outbox_respects_slowest_consumer(&backend).await;
+    }
+
+    /// The consumer bookmark is row state in `consumer_offsets`, so a second
+    /// connection (another node, or the process after a restart) resumes at
+    /// it instead of replaying the stream.
+    #[tokio::test]
+    async fn check_run_bookmark_survives_a_second_connection() {
+        let Some((_pg, first, second)) = backend_pair().await else {
+            return skip_no_postgres();
+        };
+        let run_id = RunId::new();
+        first
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let mut consumed = 0;
+        for _ in 0..600 {
+            consumed = first
+                .consume_check_run_outbox("pg-consumer-1", std::time::Duration::from_millis(1), 256)
+                .await
+                .unwrap();
+            if consumed > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(consumed > 0, "the first connection reads the run's events");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let run_id2 = RunId::new();
+        second
+            .submit_run(submit_run(run_id2, vec![submit_job(run_id2, "build", 1)]))
+            .await
+            .unwrap();
+        // Retry until the counts settle: a concurrent transaction on the
+        // shared test cluster can hold `pg_snapshot_xmin` back.
+        let mut delivered = 0;
+        for _ in 0..600 {
+            delivered += second
+                .consume_check_run_outbox("pg-consumer-2", std::time::Duration::from_secs(30), 256)
+                .await
+                .unwrap();
+            let total = second
+                .outbox_read(
+                    OutboxBookmark {
+                        txid: 0,
+                        event_id: 0,
+                    },
+                    10_000,
+                )
+                .await
+                .unwrap()
+                .len();
+            if delivered > 0 && consumed + delivered == total {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(delivered > 0, "the down-window events are delivered");
+        let total = second
+            .outbox_read(
+                OutboxBookmark {
+                    txid: 0,
+                    event_id: 0,
+                },
+                10_000,
+            )
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            consumed + delivered,
+            total,
+            "a second connection must resume at the persisted bookmark (no replay, no skip)"
+        );
+    }
+
+    #[tokio::test]
     async fn sessionless_runner_is_not_idle_capacity() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -6097,6 +6568,85 @@ mod lite {
     async fn prune_outbox_keeps_fresh_rows_and_bounds_a_batch() {
         suite::prune_outbox_keeps_fresh_rows_and_bounds_a_batch(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn check_run_projection_never_regresses_a_newer_row() {
+        suite::check_run_projection_never_regresses_a_newer_row(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn acquire_projects_in_progress_check_run() {
+        suite::acquire_projects_in_progress_check_run(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn check_run_bookmark_survives_consumer_restart() {
+        suite::check_run_bookmark_survives_consumer_restart(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn prune_outbox_respects_slowest_consumer() {
+        suite::prune_outbox_respects_slowest_consumer(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    /// The bookmark lives in the SQLite file: reopen the database and only the
+    /// events committed while the consumer was down are delivered.
+    #[tokio::test]
+    async fn check_run_bookmark_survives_a_file_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("preloop.db");
+        let run_id = RunId::new();
+        let consumed = {
+            let backend =
+                LiteBackend::open(&path, false, false, std::time::Duration::from_secs(300))
+                    .unwrap();
+            backend
+                .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+                .await
+                .unwrap();
+            backend
+                .consume_check_run_outbox(
+                    "reopen-consumer",
+                    std::time::Duration::from_millis(1),
+                    256,
+                )
+                .await
+                .unwrap()
+        };
+        assert!(consumed > 0);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Down window: a fresh handle appends without consuming.
+        let reopened =
+            LiteBackend::open(&path, false, false, std::time::Duration::from_secs(300)).unwrap();
+        let run_id2 = RunId::new();
+        reopened
+            .submit_run(submit_run(run_id2, vec![submit_job(run_id2, "build", 1)]))
+            .await
+            .unwrap();
+        let total = reopened
+            .outbox_read(
+                crate::control::types::OutboxBookmark {
+                    txid: 0,
+                    event_id: 0,
+                },
+                10_000,
+            )
+            .await
+            .unwrap()
+            .len();
+        let delivered = reopened
+            .consume_check_run_outbox("reopen-consumer-2", std::time::Duration::from_secs(30), 256)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered,
+            total - consumed,
+            "a reopened consumer must resume at the persisted bookmark"
+        );
     }
 
     #[tokio::test]

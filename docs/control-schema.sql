@@ -657,12 +657,13 @@ CREATE TABLE check_run_updates (
     job_id                  text NOT NULL,
     installation_id         bigint NOT NULL,
     check_run_id            bigint,
+    version                 bigint NOT NULL DEFAULT 0,
     payload                 jsonb NOT NULL,
     not_before              timestamptz NOT NULL DEFAULT now(),
     attempts                integer NOT NULL DEFAULT 0,
     leased_until            timestamptz,
-    PRIMARY KEY (run_id, job_id),
-    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+    lease_owner             text,
+    PRIMARY KEY (run_id, job_id)
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 

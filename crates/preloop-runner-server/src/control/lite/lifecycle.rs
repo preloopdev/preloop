@@ -1148,12 +1148,73 @@ impl LiteBackend {
         self.write(|tx| {
             tx.execute(
                 "DELETE FROM outbox_events WHERE event_id IN ( \
-                     SELECT event_id FROM outbox_events WHERE created_at < ?1 \
-                     ORDER BY created_at LIMIT ?2)",
+                     SELECT e.event_id FROM outbox_events e \
+                     WHERE e.created_at < ?1 AND \
+                       e.event_id <= COALESCE((SELECT MIN(last_event_id) FROM consumer_offsets), \
+                                              e.event_id) \
+                     ORDER BY e.created_at LIMIT ?2)",
                 params![cutoff, limit as i64],
             )
             .map(|n| n as u64)
             .map_err(db)
+        })
+    }
+
+    /// The SQLite outbox position at the current end of the single-writer
+    /// stream. SQLite event ids are commit order, so no txid safe point is
+    /// needed.
+    pub(crate) async fn outbox_head(&self) -> Result<OutboxBookmark, ControlError> {
+        self.read(|tx| {
+            let event_id: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(event_id),0) FROM outbox_events",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(db)?;
+            Ok(OutboxBookmark { txid: 0, event_id })
+        })
+    }
+
+    pub(crate) async fn outbox_read(
+        &self,
+        after: OutboxBookmark,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, ControlError> {
+        self.read(|tx| {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT event_id,run_id,job_id,version,'' AS origin,topic,payload \
+                 FROM outbox_events WHERE event_id > ?1 ORDER BY event_id LIMIT ?2",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![after.event_id, limit as i64], |row| {
+                    let run_id = match row.get::<_, Option<String>>(1)? {
+                        Some(value) => Some(
+                            value
+                                .parse()
+                                .map(RunId)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        ),
+                        None => None,
+                    };
+                    Ok(OutboxRow {
+                        bookmark: OutboxBookmark {
+                            txid: 0,
+                            event_id: row.get(0)?,
+                        },
+                        run_id,
+                        job_id: row.get(2)?,
+                        version: row.get(3)?,
+                        origin: row.get(4)?,
+                        topic: row.get(5)?,
+                        payload: serde_json::from_str(&row.get::<_, String>(6)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    })
+                })
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)
         })
     }
 

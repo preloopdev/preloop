@@ -89,6 +89,37 @@ one node per job).
 
 Known gaps and their tradeoffs are tracked in the repository issue tracker.
 
+## Transactional event flow
+
+Every state transition writes its versioned event to `outbox_events` in the
+same database transaction as the run/job mutation. The durable `check-runs`
+consumer holds a persisted `consumer_offsets` lease, reads from its bookmark
+(`(txid,event_id)` on Postgres and `event_id` on SQLite), and atomically
+projects the newest desired state for each `(run_id,job_id)` into
+`check_run_updates`. Older versions are ignored.
+
+```text
+run/job transaction -> outbox_events
+                           |
+                 check-runs projector
+                           v
+              check_run_updates (coalesced)
+                           |
+                  one leased sender
+                           v
+                    GitHub Checks API
+```
+
+The sender is the only check-run HTTP writer. It leases due rows, renders
+the existing check name/summary/details/output at send time, chunks
+annotations at GitHub's 50-item limit, and owns token caching, circuit
+breaking, rate-limit handling, retries and exponential backoff. A webhook
+therefore commits durable state and returns without waiting for GitHub.
+Postgres `NOTIFY preloop_events`, the local dirty signal, and a short polling
+fallback wake the projector. Outbox pruning is bounded by age only when no
+durable consumer exists; otherwise rows at or beyond the slowest consumer
+bookmark are retained.
+
 ## Secrets
 
 Secrets use `SecretString` in `preloop-gha-protocol`. It redacts `Debug`,

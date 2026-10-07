@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod check_run_outbox;
 pub mod concurrency;
 pub mod config;
 pub mod credential_store;

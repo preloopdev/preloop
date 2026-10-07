@@ -731,6 +731,21 @@ pub async fn select_app_for_repo(
         .next()
 }
 
+/// The installation id `app` mints tokens for on `repository`'s owner.
+///
+/// Exposed so the check-run sender can key per-installation rate budgets on
+/// the *real* installation rather than whatever id a queue row happened to
+/// carry: `0` is never a valid GitHub installation, and discovery is cached
+/// per App+owner, so steady state costs no extra API call.
+pub async fn installation_for_repo(
+    app: &GitHubAppCredentials,
+    repository: &str,
+) -> anyhow::Result<u64> {
+    let (owner, _) = split_repository(repository)?;
+    let app_jwt = sign_app_jwt(&app.app_id, &app.private_key)?;
+    installation_id_for(&api_base(), app, &app_jwt, owner).await
+}
+
 /// Mint an installation token for `repository`, scoped to `permissions`.
 ///
 /// `repository` is an `owner/repo` slug: the owner selects the installation and

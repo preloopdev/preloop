@@ -554,12 +554,13 @@ CREATE TABLE check_run_updates (
     job_id                  TEXT NOT NULL,
     installation_id         INTEGER NOT NULL,
     check_run_id            INTEGER,
+    version                 INTEGER NOT NULL DEFAULT 0,
     payload                 TEXT NOT NULL,
     not_before              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     attempts                INTEGER NOT NULL DEFAULT 0,
     leased_until            INTEGER,
-    PRIMARY KEY (run_id, job_id),
-    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+    lease_owner             TEXT,
+    PRIMARY KEY (run_id, job_id)
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 

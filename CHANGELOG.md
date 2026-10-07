@@ -160,6 +160,10 @@ Releases before v0.27.0 predate the changelog.
   limit or a suspension — GitHub does not redeliver, so they are recorded and
   wait at claim; only a `deleted` namespace refuses them. Namespaces with no
   limit rows behave as before.
+- Check-run updates now use a durable, coalescing transactional-outbox
+  projector and one leased background sender. GitHub API retries, rate-limit
+  backoff, stale-id reconciliation and restart recovery happen outside
+  webhook/request paths on both SQLite and PostgreSQL.
 
 ### Changed
 

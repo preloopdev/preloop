@@ -263,6 +263,7 @@ jobs:
         shutdown: CancellationToken::new(),
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
+    crate::github::drain_check_run_sender(&shared).await;
     let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);
     // Queue depth is sampled by the 5s sampler, not updated per operation;
@@ -668,6 +669,7 @@ jobs:
             shutdown: CancellationToken::new(),
         });
         crate::github::drain_webhook_queue(&shared).await.unwrap();
+        crate::github::drain_check_run_sender(&shared).await;
 
         let inner = state.test_tx().await;
         let (run_id, run) = inner.runs.iter().next().expect("webhook created a run");
@@ -1182,6 +1184,7 @@ jobs:
         shutdown: CancellationToken::new(),
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
+    crate::github::drain_check_run_sender(&shared).await;
     // Verify triggered run
     let inner = state.test_tx().await;
     assert_eq!(inner.runs.len(), 1);

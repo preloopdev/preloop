@@ -235,6 +235,97 @@ impl ControlBackend for PgBackend {
     ) -> Result<u64, ControlError> {
         self.prune_outbox(older_than, limit).await
     }
+    async fn consume_check_run_outbox(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<usize, ControlError> {
+        self.consume_check_run_outbox(owner, lease_for, limit).await
+    }
+    async fn lease_check_run_updates(
+        &self,
+        owner: &str,
+        lease_for: std::time::Duration,
+        limit: usize,
+    ) -> Result<Vec<CheckRunUpdate>, ControlError> {
+        self.lease_check_run_updates(owner, lease_for, limit).await
+    }
+    async fn set_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+        check_run_id: u64,
+    ) -> Result<(), ControlError> {
+        self.set_check_run_update_id(owner, run_id, job_id, version, check_run_id)
+            .await
+    }
+    async fn finish_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+    ) -> Result<(), ControlError> {
+        self.finish_check_run_update(owner, run_id, job_id, version)
+            .await
+    }
+    async fn retry_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+        permanent: bool,
+    ) -> Result<(), ControlError> {
+        self.retry_check_run_update(owner, run_id, job_id, delay, permanent)
+            .await
+    }
+    async fn clear_check_run_update_id(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError> {
+        self.clear_check_run_update_id(owner, run_id, job_id, expected)
+            .await
+    }
+    async fn enqueue_check_run_update(
+        &self,
+        update: CheckRunUpdateInput,
+    ) -> Result<(), ControlError> {
+        self.enqueue_check_run_update(update).await
+    }
+    async fn defer_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        delay: std::time::Duration,
+    ) -> Result<(), ControlError> {
+        self.defer_check_run_update(owner, run_id, job_id, delay)
+            .await
+    }
+    async fn append_check_run_projection(
+        &self,
+        run_id: RunId,
+        job_id: Option<&JobId>,
+    ) -> Result<(), ControlError> {
+        self.append_check_run_projection(run_id, job_id).await
+    }
+    async fn outbox_head(&self) -> Result<Option<OutboxBookmark>, ControlError> {
+        self.outbox_head().await.map(Some)
+    }
+    async fn outbox_read(
+        &self,
+        after: OutboxBookmark,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, ControlError> {
+        self.outbox_read(after, limit).await
+    }
     async fn reap_inputs(&self) -> Result<ReapInputs, ControlError> {
         self.reap_inputs().await
     }

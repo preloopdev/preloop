@@ -250,6 +250,34 @@ impl GithubBreaker {
         }
     }
 
+    /// Honour a *primary* rate limit advertised on an otherwise successful
+    /// response.
+    ///
+    /// GitHub sends `x-ratelimit-remaining: 0` plus `x-ratelimit-reset` on the
+    /// last allowed response. Recording the advertised window here means the
+    /// caller parks itself until the reset instead of spending the next
+    /// request on a guaranteed 403. A response without rate headers, or one
+    /// that still has budget, changes nothing.
+    pub fn observe_rate_budget(&self, headers: &HeaderMap) {
+        let remaining = header_str(headers, "x-ratelimit-remaining")
+            .and_then(|value| value.trim().parse::<i64>().ok());
+        if !remaining.is_some_and(|remaining| remaining <= 0) {
+            return;
+        }
+        let Some(wait) = retry_after_from_headers(headers) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        inner.rate_limited = true;
+        inner.last_error = Some("GitHub primary rate limit exhausted".to_owned());
+        Self::open_for(
+            &mut inner,
+            now,
+            wait.clamp(Duration::from_secs(1), Duration::from_secs(3600)),
+        );
+    }
+
     /// Observe a transport-level failure (DNS, TLS, connect, timeout).
     pub fn observe_transport_error(&self, error: &reqwest::Error) -> GithubFailureKind {
         let kind = GithubFailureKind::Unavailable;
