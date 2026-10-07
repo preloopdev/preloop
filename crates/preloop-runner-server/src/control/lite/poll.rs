@@ -170,10 +170,12 @@ fn pending_cancellation(
 }
 
 /// `claim_one` (pg dispatch.rs): the ready job this runner should take,
-/// chosen by the shared four-tier preference over the ready queue in
-/// dispatch order. The queue is read in pages until a candidate matches —
-/// a 64-row window must not hide a job a runner can serve. The conditional
-/// UPDATE is the claim fence.
+/// chosen by the shared four-tier preference over the ready queue in the
+/// shared global queue order (`priority DESC, run_order, job_order`, the
+/// `run_id, job_id` tie-breakers last — never the pool key's text order).
+/// The queue is read in pages until a candidate matches — a 64-row window
+/// must not hide a job a runner can serve. The conditional UPDATE is the
+/// claim fence.
 fn claim_one(
     tx: &Transaction<'_>,
     runner_id: Option<i64>,
@@ -199,11 +201,16 @@ fn claim_one(
         group_id: caps.runner_group_id,
         group_name: caps.runner_group_name.clone(),
     };
-    // Page the ready queue in dispatch order until a candidate matches or the
-    // ready set is exhausted: a runner whose own pool sorts past the first
-    // batch must still see the jobs it can serve. Jobs whose namespace admits
-    // no new claim (state or running caps) are never candidates; the single
-    // writer makes the read-then-claim exact without a lock.
+    // Page the ready queue in the shared global dispatch order until a
+    // candidate matches or the ready set is exhausted: a 64-row window must
+    // not hide a job a runner can serve. The order is `priority DESC,
+    // run_order, job_order` plus the `run_id, job_id` tie-breakers — the same
+    // queue order pg `claim_one` reads, and the one `ready_jobs`/`queue_stats`
+    // report — never the pool key's text order: the key groups equal label
+    // sets for pruning, it does not rank them, and ranking by it starves
+    // every label set whose key sorts after another's. Jobs whose namespace
+    // admits no new claim (state or running caps) are never candidates; the
+    // single writer makes the read-then-claim exact without a lock.
     let batch_sql = format!(
         "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
          j.enqueued_at, \
@@ -220,7 +227,7 @@ fn claim_one(
          LEFT JOIN provision_requests p ON p.run_id = j.run_id \
             AND p.job_id = j.job_id \
          WHERE j.queue_state = 'ready' AND ({}) \
-         ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+         ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
          LIMIT 64 OFFSET ?2",
         crate::control::types::NAMESPACE_ADMITS_CLAIM
     );
@@ -308,7 +315,9 @@ fn claim_one(
                 runner_group,
                 assigned_runner_id,
                 assignment_fresh,
-                queue_position: position as u64,
+                // Position in the GLOBAL queue: the batch is a window of it,
+                // so the page offset counts (pg `claim_one` reports the same).
+                queue_position: offset as u64 + position as u64,
                 claimable,
             });
         }

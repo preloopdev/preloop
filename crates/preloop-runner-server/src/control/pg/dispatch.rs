@@ -4716,13 +4716,19 @@ impl PgBackend {
     }
 
     /// [`Self::ready_front_labels`] on a caller's connection or open transaction.
+    ///
+    /// The front is the queue head in the shared global dispatch order
+    /// (`priority DESC, run_order, job_order` — the `jobs_ready_global`
+    /// index), never the lexically first pool key: the pool key groups equal
+    /// label sets for pruning, it does not rank them, so ordering by it would
+    /// report a different job than the claim takes.
     pub(super) async fn ready_front_labels_on(
         client: &impl GenericClient,
     ) -> Result<Vec<String>, ControlError> {
         let row = client
             .query_opt(
                 "SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
-                 ORDER BY pool_key, priority DESC, run_order, job_order LIMIT 1",
+                 ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
                 &[],
             )
             .await
@@ -4925,8 +4931,16 @@ impl PgBackend {
     /// conditional `UPDATE` would queue on that row until the winner's whole
     /// transaction commits, then match nothing. No lock is taken on the rest
     /// of the batch. The batch is paged until a candidate matches or the
-    /// ready set is exhausted: a runner whose pool sorts past the first batch
-    /// must still see the jobs it can serve.
+    /// ready set is exhausted, so a runner whose labels match only jobs deep
+    /// in the queue still finds them.
+    ///
+    /// The batch is the queue in ONE global order — `priority DESC,
+    /// run_order, job_order`, then the `run_id, job_id` tie-breakers that make
+    /// the order total and keep `OFFSET` paging stable — never the pool key's
+    /// text order: the key groups equal label sets for pruning, it does not
+    /// rank them, and ranking by it starves every label set whose key sorts
+    /// after another's (a runner matching both takes the lexically earlier
+    /// key's job even when the other is older).
     async fn claim_one(
         &self,
         tx: &Transaction<'_>,
@@ -4965,7 +4979,7 @@ impl PgBackend {
              LEFT JOIN provision_requests p ON p.run_id = j.run_id \
                 AND p.job_id = j.job_id \
              WHERE j.queue_state = 'ready' AND ({admits}) \
-             ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+             ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
              LIMIT 64 OFFSET $1",
             capped = crate::control::types::NAMESPACE_CLAIM_CAPPED,
             admits = crate::control::types::NAMESPACE_ADMITS_CLAIM,
@@ -4973,8 +4987,8 @@ impl PgBackend {
         for _attempt in 0..CLAIM_ATTEMPTS {
             let mut offset: i64 = 0;
             loop {
-                // The pool key prunes by label set; the shared eligibility
-                // ladder and matcher still decide.
+                // The batch is the ready queue in global dispatch order; the
+                // shared eligibility ladder and matcher decide.
                 let rows = tx.query(batch_sql.as_str(), &[&offset]).await.map_err(db)?;
                 let exhausted = rows.len() < 64;
                 let mut candidates = Vec::with_capacity(rows.len());
@@ -5044,7 +5058,10 @@ impl PgBackend {
                         runner_group: row.get(3),
                         assigned_runner_id: assigned,
                         assignment_fresh,
-                        queue_position: position as u64,
+                        // Position in the GLOBAL queue: the batch is a window
+                        // of it, so the page offset counts (lite `claim_one`
+                        // reports the same position).
+                        queue_position: offset as u64 + position as u64,
                         claimable,
                     });
                     namespaces.push((row.get(11), row.get(12), row.get(13)));
