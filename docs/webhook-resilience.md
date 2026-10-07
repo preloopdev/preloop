@@ -41,6 +41,11 @@ Invariants worth keeping:
 
 - The watermark **never advances on a failed poll** and never past the grace
   boundary, so no range of history is silently skipped.
+- A store's **first poll adopts the history before it**: with no watermark
+  yet, the watermark starts at the grace boundary. A new store (cutover,
+  deleted state dir) has no rows for deliveries another store already
+  handled, and repairing them would replay three days of closed PRs and
+  superseded pushes. Recover a known gap by redelivering it from GitHub.
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.

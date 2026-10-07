@@ -12,16 +12,21 @@
 //! * **Edge failure** — GitHub recorded a failure. Funnel was stale, the host
 //!   was rebooting, TLS was broken. Obvious once you look at the history.
 //! * **Phantom ack** — GitHub recorded *success* and preloop has no row. A
-//!   restore from an old snapshot, a deleted state dir, corruption. Both
-//!   sides look healthy; only a join between GitHub's GUIDs and the local
-//!   `webhook_deliveries` table reveals it. This is the dangerous one,
-//!   because nothing anywhere is alarming.
+//!   restore from an old snapshot, corruption. Both sides look healthy; only
+//!   a join between GitHub's GUIDs and the local `webhook_deliveries` table
+//!   reveals it. This is the dangerous one, because nothing anywhere is
+//!   alarming.
 //!
 //! Everything here is deliberately conservative:
 //!
 //! * A **grace window** keeps a merely-late delivery from being declared
 //!   lost. GitHub deliveries are not immediate, and "missing after 30s"
 //!   would manufacture duplicate work every day.
+//! * A store's **first poll adopts the history** before it. A new store
+//!   (cutover, deleted state dir) has no rows for deliveries another store
+//!   already handled; repairing them would replay three days of closed PRs
+//!   and superseded pushes. Recover a known gap by asking GitHub to redeliver
+//!   it (`POST /app/hook/deliveries/{id}/attempts`).
 //! * The watermark **never advances on a failed poll**, so an error cannot
 //!   silently skip a range of history.
 //! * Nothing is redelivered while the local store is unhealthy — replaying a
@@ -309,13 +314,19 @@ async fn poll_app(
         .backend
         .load_webhook_watchdog_cursor(&app.app_id)
         .await?;
+    let grace_boundary = now_us() - grace_us();
+    // A store with no watermark has never judged this App's history, so
+    // everything GitHub logged before its first poll was acked (or failed)
+    // by some other store. Replaying that history re-runs closed PRs and
+    // superseded pushes, so the first poll adopts it: the watermark starts
+    // at the grace boundary, and only later deliveries are judged.
     let watermark = previous
         .as_ref()
-        .and_then(|cursor| cursor.cursor_delivered_at_us);
+        .and_then(|cursor| cursor.cursor_delivered_at_us)
+        .unwrap_or(grace_boundary);
     let watermark_guid = previous
         .as_ref()
         .and_then(|cursor| cursor.cursor_delivered_at_guid.clone());
-    let grace_boundary = now_us() - grace_us();
 
     let mut outcome = WatchdogPollOutcome::default();
     let mut newest_examined: Option<(i64, String)> = None;
@@ -338,9 +349,12 @@ async fn poll_app(
                 // delivery on every poll forever.
                 continue;
             };
-            if watermark.is_some_and(|mark| {
-                item_is_at_or_before(delivered_at_us, &item.guid, mark, watermark_guid.as_deref())
-            }) {
+            if item_is_at_or_before(
+                delivered_at_us,
+                &item.guid,
+                watermark,
+                watermark_guid.as_deref(),
+            ) {
                 reached_watermark = true;
                 continue;
             }
@@ -406,21 +420,17 @@ async fn poll_app(
 
     let now = now_us();
     let (advanced, advanced_guid) = if reached_watermark || !has_more_pages {
-        match (watermark, newest_examined) {
-            (Some(mark), Some((newest, guid))) => {
-                if newest > mark
-                    || (newest == mark
+        match newest_examined {
+            Some((newest, guid))
+                if newest > watermark
+                    || (newest == watermark
                         && watermark_guid
                             .as_ref()
-                            .is_none_or(|previous_guid| guid > *previous_guid))
-                {
-                    (Some(newest), Some(guid))
-                } else {
-                    (Some(mark), watermark_guid)
-                }
+                            .is_none_or(|previous_guid| guid > *previous_guid)) =>
+            {
+                (newest, Some(guid))
             }
-            (None, Some((newest, guid))) => (Some(newest), Some(guid)),
-            (mark, None) => (mark, watermark_guid),
+            _ => (watermark, watermark_guid),
         }
     } else {
         // Truncated at max_pages(): do not advance the watermark across an
@@ -437,7 +447,7 @@ async fn poll_app(
         .backend
         .store_webhook_watchdog_cursor(&WebhookWatchdogCursor {
             scope: app.app_id.clone(),
-            cursor_delivered_at_us: advanced,
+            cursor_delivered_at_us: Some(advanced),
             cursor_delivered_at_guid: advanced_guid,
             scan_cursor,
             last_poll_at_us: Some(now),
@@ -711,6 +721,23 @@ mod tests {
         })
     }
 
+    /// The store already judged GitHub's history up to `age_secs` ago.
+    async fn seed_watermark(shared: &Arc<SharedState>, age_secs: i64) {
+        shared
+            .state
+            .backend
+            .store_webhook_watchdog_cursor(&WebhookWatchdogCursor {
+                scope: "424".to_owned(),
+                cursor_delivered_at_us: Some(now_us() - age_secs * 1_000_000),
+                cursor_delivered_at_guid: None,
+                scan_cursor: None,
+                last_poll_at_us: None,
+                last_success_at_us: None,
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn redelivers_a_failed_delivery_that_never_landed() {
         let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -721,6 +748,7 @@ mod tests {
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
+        seed_watermark(&shared, 3600).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
 
@@ -749,6 +777,7 @@ mod tests {
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
+        seed_watermark(&shared, 3600).await;
 
         let outcome = watchdog_poll_once(&shared).await.unwrap();
 
@@ -780,6 +809,7 @@ mod tests {
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let (_temp, shared) = shared_with_app(&api_base).await;
+        seed_watermark(&shared, 3600).await;
         shared
             .state
             .backend
@@ -805,8 +835,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_poll_adopts_history_from_before_the_store() {
+        // A new store (cutover, deleted state dir) finds GitHub's whole
+        // history without local rows; another store already handled it.
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api_base, attempts) = stub_github(
+            vec![
+                delivery(21, "guid-old-ack", 202, 600),
+                delivery(22, "guid-old-fail", 502, 900),
+            ],
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let (_temp, shared) = shared_with_app(&api_base).await;
+
+        let outcome = watchdog_poll_once(&shared).await.unwrap();
+
+        assert_eq!(outcome.redelivered, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        for guid in ["guid-old-ack", "guid-old-fail"] {
+            assert!(
+                shared
+                    .state
+                    .backend
+                    .load_webhook_redelivery(guid)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{guid} predates the store and must not become a repair"
+            );
+        }
+        let watermark = shared
+            .state
+            .backend
+            .load_webhook_watchdog_cursor("424")
+            .await
+            .unwrap()
+            .and_then(|cursor| cursor.cursor_delivered_at_us)
+            .expect("the adopted range is persisted");
+        assert!(
+            watermark > now_us() - 600 * 1_000_000,
+            "the watermark covers the adopted history"
+        );
+    }
+
+    #[tokio::test]
     async fn delivery_inside_the_grace_window_is_left_alone() {
         let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let delivered_before = now_us() - 5_000_000;
         let (api_base, attempts) = stub_github(
             vec![delivery(13, "guid-fresh", 500, 5)],
             axum::http::StatusCode::OK,
@@ -828,7 +905,9 @@ mod tests {
             .unwrap()
             .expect("cursor persisted");
         assert!(
-            cursor.cursor_delivered_at_us.is_none(),
+            cursor
+                .cursor_delivered_at_us
+                .is_some_and(|watermark| watermark < delivered_before),
             "the watermark must not skip past a delivery that was never judged"
         );
     }

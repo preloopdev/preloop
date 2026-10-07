@@ -43,6 +43,23 @@ Releases before v0.27.0 predate the changelog.
   the runner itself, and the official runner's Docker command shape are
   unchanged.
 
+- **A new store no longer replays three days of webhook history**: the
+  delivery watchdog treated every delivery in GitHub's history as a phantom
+  ack when the store had no watchdog cursor, and asked GitHub to redeliver
+  all of them. After a store cutover this re-ran CI for merged PRs and
+  superseded pushes — 2,435 redeliveries and hundreds of runs on one host —
+  and the replays queued ahead of live webhooks in the inbox. A store's
+  first poll now adopts the history before it (the watermark starts at the
+  grace boundary); later passes repair phantom acks and edge failures as
+  before, and a restored snapshot keeps its cursor and still repairs
+  everything since. Recover a known gap by redelivering it from GitHub.
+
+- **The conformance campaign survives a second run against the same
+  Postgres database**: `conformance-5repos.sh` wiped the campaign home,
+  including the node key, on every run while requiring a persistent
+  Postgres store, so the next run died on the store's key-fingerprint
+  guard. The node key now survives the wipe.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
