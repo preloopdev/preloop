@@ -43,7 +43,10 @@ Releases before v0.27.0 predate the changelog.
   remote cache entries only from protected-branch pushes, which left its
   remote cache unwritten and every later lookup a miss. Non-branch refs
   (tags, `refs/pull/*`) stay `false` and are never looked up; an unresolved
-  lookup falls back to `false`, the unprivileged answer.
+  lookup falls back to `false`, the unprivileged answer. The value is
+  engine-resolved only — a native submission cannot assert it — and a branch
+  is looked up under its exact, URL-encoded name, so `release#test` never
+  answers with `release`'s protection.
 
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
