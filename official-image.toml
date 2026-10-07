@@ -47,3 +47,13 @@ golden_hostname_resolves_locally = "true"
 # Environment keys a hosted step's environment does not carry: the terminal
 # identity, which the guest's exec channel would otherwise leak into steps.
 golden_step_env_unset = "TERM,COLORTERM"
+# The composed forms the code and the launch scripts use, so no shell text and
+# no prlimit value is a literal in the init: each line must agree with the
+# primitive keys above (the unit test `guest_runtime_values_come_from_official_image_toml`
+# fails if they drift).
+golden_stack_ulimit_raise = "ulimit -Hs unlimited; ulimit -Ss 16384"
+golden_nofile_ulimit_raise = "ulimit -Hn 65536; ulimit -Sn 65536"
+golden_nofile_ulimit_raise_best_effort = "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true"
+golden_stack_soft_bytes = "16777216"
+golden_stack_prlimit = "16777216:unlimited"
+golden_nofile_prlimit = "65536:65536"

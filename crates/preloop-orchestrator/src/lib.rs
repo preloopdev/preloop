@@ -1792,6 +1792,10 @@ const RUNNER_ROOT: &str = "/home/runner";
 /// with a stack-overflow `SIGSEGV` (exit 139) under 8192 KiB, where the same
 /// commit passes on GitHub under 16384 KiB.
 ///
+/// The shell text is `golden_stack_ulimit_raise` in `official-image.toml` —
+/// the same file that carries the values it composes — compiled in by
+/// `build.rs`, so the init carries no literal.
+///
 /// Soft is the hosted value; hard stays `unlimited` as the image sets it, so a
 /// step that raises its own soft limit keeps working. Raising a hard limit
 /// needs root (CAP_SYS_RESOURCE), and every launch site that applies this
@@ -1800,7 +1804,7 @@ const RUNNER_ROOT: &str = "/home/runner";
 /// A chain already running keeps the limits it was born with, so
 /// [`docker_start_command`] re-raises an inherited one rather than trusting
 /// it.
-const GUEST_STACK_ULIMIT: &str = "ulimit -Hs unlimited; ulimit -Ss 16384";
+const GUEST_STACK_ULIMIT: &str = GOLDEN_STACK_ULIMIT_RAISE;
 
 /// The file-descriptor limit GitHub's hosted images give every runner.
 ///
@@ -1821,7 +1825,7 @@ const GUEST_STACK_ULIMIT: &str = "ulimit -Hs unlimited; ulimit -Ss 16384";
 /// root), and the container engine raises so its containers inherit the pair.
 /// A site that may run unprivileged gets
 /// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`] instead.
-const GUEST_NOFILE_ULIMIT: &str = "ulimit -Hn 65536; ulimit -Sn 65536";
+const GUEST_NOFILE_ULIMIT: &str = GOLDEN_NOFILE_ULIMIT_RAISE;
 
 /// [`GUEST_NOFILE_ULIMIT`] for the launches that keep the exec channel's
 /// identity and therefore cannot assume root: a process may lower its hard
@@ -1829,8 +1833,7 @@ const GUEST_NOFILE_ULIMIT: &str = "ulimit -Hn 65536; ulimit -Sn 65536";
 /// inherited hard limit is below the hosted 65536 keeps what it has instead of
 /// failing the launch with `EPERM` noise. The privileged launch sites use the
 /// strict form above and fail loudly.
-const GUEST_NOFILE_ULIMIT_BEST_EFFORT: &str =
-    "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true";
+const GUEST_NOFILE_ULIMIT_BEST_EFFORT: &str = GOLDEN_NOFILE_ULIMIT_RAISE_BEST_EFFORT;
 
 /// Standard loopback entries for `/etc/hosts`.
 ///
@@ -2661,11 +2664,11 @@ fn docker_start_command() -> Vec<String> {
                  done 2>/dev/null < \"/proc/$pid/limits\"; \
                  case \"$stack\" in ''|*[!0-9]*) stack= ;; esac; \
                  case \"$nofile\" in ''|*[!0-9]*) nofile= ;; esac; \
-                 if [ -n \"$stack\" ] && [ \"$stack\" -lt 16777216 ]; then \
-                   prlimit --pid \"$pid\" --stack=16777216:unlimited 2>/dev/null; \
+                 if [ -n \"$stack\" ] && [ \"$stack\" -lt {GOLDEN_STACK_SOFT_BYTES} ]; then \
+                   prlimit --pid \"$pid\" --stack={GOLDEN_STACK_PRLIMIT} 2>/dev/null; \
                  fi; \
-                 if [ -n \"$nofile\" ] && [ \"$nofile\" -lt 65536 ]; then \
-                   prlimit --pid \"$pid\" --nofile=65536:65536 2>/dev/null; \
+                 if [ -n \"$nofile\" ] && [ \"$nofile\" -lt {GOLDEN_RLIMIT_NOFILE_SOFT} ]; then \
+                   prlimit --pid \"$pid\" --nofile={GOLDEN_NOFILE_PRLIMIT} 2>/dev/null; \
                  fi; \
                done; \
                return 0; \
@@ -8616,6 +8619,117 @@ done
         assert!(script.contains("root='/proc/sys'"), "{script}");
     }
 
+    /// The expected golden runtime lives in `official-image.toml`, and
+    /// `build.rs` compiles every flat key into a constant. This fails if the
+    /// code and the config drift apart: a hand-edited literal, a key renamed
+    /// in the file, a codegen that stops emitting one of them, or a composed
+    /// raise that no longer agrees with the primitive values it is built from.
+    #[test]
+    fn guest_runtime_values_come_from_official_image_toml() {
+        let config = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../official-image.toml"
+        ))
+        .expect("official-image.toml must be readable");
+        let cfg = |key: &str| {
+            config
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.trim().split_once('=')?;
+                    if name.trim() != key {
+                        return None;
+                    }
+                    Some(value.trim().trim_matches('"').to_owned())
+                })
+                .next()
+                .unwrap_or_else(|| panic!("official-image.toml is missing {key}"))
+        };
+
+        // The compiled constants are the file's values.
+        assert_eq!(
+            GOLDEN_RLIMIT_STACK_SOFT_KIB,
+            cfg("golden_rlimit_stack_soft_kib")
+        );
+        assert_eq!(GOLDEN_RLIMIT_STACK_HARD, cfg("golden_rlimit_stack_hard"));
+        assert_eq!(GOLDEN_RLIMIT_NOFILE_SOFT, cfg("golden_rlimit_nofile_soft"));
+        assert_eq!(GOLDEN_RLIMIT_NOFILE_HARD, cfg("golden_rlimit_nofile_hard"));
+
+        // The raises are the composed keys, and those agree with the values.
+        assert_eq!(GUEST_STACK_ULIMIT, cfg("golden_stack_ulimit_raise"));
+        assert_eq!(GUEST_NOFILE_ULIMIT, cfg("golden_nofile_ulimit_raise"));
+        assert_eq!(
+            GUEST_NOFILE_ULIMIT_BEST_EFFORT,
+            cfg("golden_nofile_ulimit_raise_best_effort")
+        );
+        assert_eq!(
+            GUEST_STACK_ULIMIT,
+            format!(
+                "ulimit -Hs {}; ulimit -Ss {}",
+                cfg("golden_rlimit_stack_hard"),
+                cfg("golden_rlimit_stack_soft_kib")
+            ),
+            "golden_stack_ulimit_raise must compose golden_rlimit_stack_*"
+        );
+        assert_eq!(
+            GUEST_NOFILE_ULIMIT,
+            format!(
+                "ulimit -Hn {}; ulimit -Sn {}",
+                cfg("golden_rlimit_nofile_hard"),
+                cfg("golden_rlimit_nofile_soft")
+            ),
+            "golden_nofile_ulimit_raise must compose golden_rlimit_nofile_*"
+        );
+        assert!(
+            !GUEST_NOFILE_ULIMIT.contains("|| true"),
+            "{GUEST_NOFILE_ULIMIT}"
+        );
+        assert!(
+            GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("|| true"),
+            "the fallback must stay a fallback"
+        );
+
+        // The live-chain prlimit forms agree with the same values.
+        assert_eq!(GOLDEN_STACK_SOFT_BYTES, cfg("golden_stack_soft_bytes"));
+        assert_eq!(
+            GOLDEN_STACK_SOFT_BYTES.parse::<u64>().unwrap(),
+            cfg("golden_rlimit_stack_soft_kib").parse::<u64>().unwrap() * 1024,
+            "golden_stack_soft_bytes must be the soft stack in bytes"
+        );
+        assert_eq!(
+            GOLDEN_STACK_PRLIMIT,
+            format!(
+                "{}:{}",
+                cfg("golden_stack_soft_bytes"),
+                cfg("golden_rlimit_stack_hard")
+            ),
+            "golden_stack_prlimit must compose the stack pair"
+        );
+        assert_eq!(
+            GOLDEN_NOFILE_PRLIMIT,
+            format!(
+                "{}:{}",
+                cfg("golden_rlimit_nofile_soft"),
+                cfg("golden_rlimit_nofile_hard")
+            ),
+            "golden_nofile_prlimit must compose the descriptor pair"
+        );
+
+        // The sysctls are the file's golden_sysctl_* values.
+        for (key, value) in GITHUB_GUEST_SYSCTLS {
+            let config_key = format!("golden_sysctl_{}", key.replace('.', "_"));
+            assert_eq!(
+                *value,
+                cfg(&config_key),
+                "{key} must come from {config_key} in official-image.toml"
+            );
+        }
+        assert_eq!(
+            GITHUB_GUEST_SYSCTLS.len(),
+            3,
+            "the hosted sysctl set changed — update official-image.toml and this test together"
+        );
+    }
+
     /// The composed init run end to end against scratch roots: the fork's own
     /// name resolves and the sysctls reach the hosted values in one exec, and
     /// a second run changes nothing. Textual order alone would not catch a
@@ -8836,7 +8950,7 @@ done
         // prlimit speaks raw bytes; 16777216 is the hosted 16384 KiB soft
         // limit, with the hard limit left unlimited as the image sets it.
         assert!(
-            script.contains("--stack=16777216:unlimited"),
+            script.contains(&format!("--stack={GOLDEN_STACK_PRLIMIT}")),
             "the live chain must be raised to the hosted stack: {script}"
         );
         assert!(
@@ -8850,7 +8964,7 @@ done
         // engine's nofile, and a golden baked before that raise would keep
         // handing containers the exec channel's.
         assert!(
-            script.contains("--nofile=65536:65536"),
+            script.contains(&format!("--nofile={GOLDEN_NOFILE_PRLIMIT}")),
             "the live chain must be raised to the hosted descriptor limit too: {script}"
         );
         assert!(
