@@ -2351,7 +2351,7 @@ fn guest_hostname_script_at(hosts: &str) -> String {
          [ -n \"$host\" ] || exit 0; \
          # The name reaches /etc/hosts and the matching below, so treat it as \
          # untrusted input: a hostname carrying shell or regex syntax must \
-         # fail provisioning rather than be interpolated into a program. \
+         # fail provisioning rather than be interpolated into a program.\n \
          case \"$host\" in \
            ''|*[!A-Za-z0-9._-]*) echo \"guest hostname is not a valid hostname\" >&2; exit 1 ;; \
          esac; \
@@ -2375,7 +2375,7 @@ fn guest_hostname_script_at(hosts: &str) -> String {
            [ -n \"$resolved\" ] || return 1; \
            # Every answer must be local. A resolver hands out the first \
            # answer, and a foreign answer left anywhere in the list still \
-           # lets a consumer pick it. \
+           # lets a consumer pick it.\n \
            for addr in $resolved; do is_local \"$addr\" || return 1; done; \
            return 0; \
          }}; \
@@ -2383,7 +2383,7 @@ fn guest_hostname_script_at(hosts: &str) -> String {
          tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts.$$; \
          # Drop every occurrence of the machine's own name from every \
          # mapping, and drop a line left with no name at all. awk compares \
-         # fields as strings, so no hostname byte is ever part of a program. \
+         # fields as strings, so no hostname byte is ever part of a program.\n \
          awk -v host=\"$host\" ' \
            /^[[:space:]]*#/ {{ print; next }} \
            {{ \
@@ -8965,7 +8965,7 @@ done
         // descriptor pair GitHub-hosted containers carry (65536/65536) has to
         // be raised here too, in the same launch.
         let nofile = script
-            .find("ulimit -Hn 65536; ulimit -Sn 65536")
+            .find("ulimit -Sn 65536; ulimit -Hn 65536")
             .unwrap_or_else(|| {
                 panic!("the container engine must start on the hosted descriptor limit: {script}")
             });
@@ -8993,7 +8993,7 @@ done
         // Reached before the inherited daemon short-circuits the launch, or a
         // pre-fix golden keeps its container steps at half the hosted stack.
         let inherited_exit = script
-            .find("docker info >/dev/null 2>&1 && { raise_engine_chain; exit 0; }")
+            .find("docker info >/dev/null 2>&1 && { raise_engine_chain || exit 1; exit 0; }")
             .unwrap_or_else(|| {
                 panic!("the inherited daemon must be re-raised, not trusted: {script}")
             });
@@ -9047,7 +9047,7 @@ done
             .find("ulimit -Hs unlimited; ulimit -Ss 16384")
             .unwrap_or_else(|| panic!("the preloaded engine must be raised: {script}"));
         let nofile = script
-            .find("ulimit -Hn 65536; ulimit -Sn 65536")
+            .find("ulimit -Sn 65536; ulimit -Hn 65536")
             .unwrap_or_else(|| {
                 panic!("the preloaded engine must carry the hosted descriptor limit: {script}")
             });
@@ -9147,7 +9147,7 @@ done
         // status is the raise's, which is what makes a failed raise on a root
         // launch observable instead of silent.
         assert_eq!(
-            GUEST_NOFILE_ULIMIT, "ulimit -Hn 65536; ulimit -Sn 65536",
+            GUEST_NOFILE_ULIMIT, "ulimit -Sn 65536; ulimit -Hn 65536",
             "the privileged form must stay strict"
         );
         assert!(
