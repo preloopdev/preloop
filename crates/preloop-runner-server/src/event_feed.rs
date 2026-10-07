@@ -51,6 +51,7 @@ pub(crate) fn spawn(
     events: broadcast::Sender<NdjsonEvent>,
     dirty: Arc<Notify>,
 ) {
+    crate::check_run_outbox::spawn_consumer(backend, Arc::clone(&dirty));
     let Some(origin) = backend.event_origin().map(str::to_owned) else {
         return;
     };

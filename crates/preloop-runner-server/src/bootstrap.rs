@@ -511,13 +511,6 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                     reason: Some("fork-PR approval window expired".to_owned()),
                 })
                 .await;
-            crate::github::report_check_run_completed(
-                shared,
-                *run_id,
-                &job_id,
-                ExecutionStatus::Failure,
-            )
-            .await;
         }
         shared
             .state
@@ -541,13 +534,6 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 reason: Some(job.reason.clone()),
             })
             .await;
-        crate::github::report_check_run_completed(
-            shared,
-            job.run_id,
-            &job.job_id,
-            ExecutionStatus::Failure,
-        )
-        .await;
     }
 
     // Publish each affected run's updated status. A run the sweep just
@@ -679,8 +665,9 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
     }
 }
 
-/// Outbox rows are only needed for the live fan-out window (no durable
-/// consumer reads them yet): older rows are deleted. Env:
+/// Outbox rows are pruned once older than the retention window *and* at or
+/// below the slowest durable consumer bookmark (the `check-runs` projector);
+/// rows a consumer has not read yet are retained however old they are. Env:
 /// `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600).
 fn outbox_retention() -> Duration {
     Duration::from_secs(
@@ -1693,6 +1680,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: shutdown.clone(),
+    });
+    let check_run_sender_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::github::run_check_run_sender(check_run_sender_shared).await;
     });
 
     // 5s sampler — clone needed state under lock, release, then publish.

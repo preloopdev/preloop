@@ -18,6 +18,7 @@
 //! - [`lookups`]: request/callback/check-run/run lookups, push state,
 //!   run numbers, key fingerprint, archival and queue statistics.
 
+mod check_runs;
 mod codec;
 mod dispatch;
 mod graph;
@@ -39,7 +40,7 @@ use tokio_postgres::{Client, NoTls};
 
 /// The schema this build creates and accepts. Greenfield v1: there are no
 /// migrations, a database at any other version is refused.
-pub(crate) const SCHEMA_VERSION: &str = "4";
+pub(crate) const SCHEMA_VERSION: &str = "5";
 
 /// The agreed schema plus `schema_meta`.
 const SCHEMA_SQL: &str = include_str!("schema.sql");

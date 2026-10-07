@@ -226,12 +226,29 @@ async fn send_github_check_request(
     )
     .await?;
 
+    // Honour the primary budget advertised on the response: once remaining
+    // hits zero, wait for the reset instead of spending the next call on a
+    // guaranteed 403.
+    breaker.observe_rate_budget(res.headers());
+
     if !res.status().is_success() {
         let status = res.status();
+        let retry_after = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let reset = res
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         let err_text = res.text().await.unwrap_or_default();
         record_check_reporting(shared, false);
         return Err(anyhow::anyhow!(
-            "GitHub Check API failed with status {}: {}",
+            "GitHub Check API failed with status {}: {}; retry_after={retry_after}; rate_reset={reset}",
             status,
             err_text
         ));
@@ -306,77 +323,35 @@ pub fn run_details_url(run_id: RunId) -> Option<String> {
 /// check runs too".
 pub async fn report_check_run_queued(
     shared: &Arc<SharedState>,
-    repo: &str,
-    sha: &str,
+    _repo: &str,
+    _sha: &str,
     job_id: &JobId,
     run_id: RunId,
 ) -> anyhow::Result<Option<u64>> {
-    // Every intake path that reports checks funnels through here; persist the
-    // flag so a job materialized later (runtime-expanded leg, reusable callee)
-    // still mints checks, including after a control-plane restart.
     shared
         .state
         .backend
         .set_reports_check_runs(run_id, true)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let existing_check_run_id = shared
+    // The state transition already normally emitted a durable event. Intake
+    // paths such as rerun/push can report a queued check without changing the
+    // scheduler row, and a job already terminal when the flag lands would
+    // stamp a `JobStatus` event `Stale`; append an unconditional projection
+    // wake instead.
+    shared
+        .state
+        .backend
+        .append_check_run_projection(run_id, Some(job_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    shared.state.events_dirty.notify_one();
+    shared
         .state
         .backend
         .job_check_run_id(run_id, job_id)
         .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    // The per-run mint lock is still node-local metadata: it only serializes
-    // concurrent reporters on this node so two of them cannot both observe
-    // "no mapping" and POST. Fetched before the (slow) token resolution so a
-    // caller that blocks on it does not re-resolve the token afterwards.
-    let mint_lock = {
-        let mut inner = shared.state.inner.lock().await;
-        inner
-            .check_run_mint_locks
-            .entry(run_id)
-            .or_default()
-            .clone()
-    };
-    let token = resolve_check_run_token(shared, repo).await;
-
-    if let Some(check_run_id) = existing_check_run_id {
-        match report_existing_check_run_queued(shared, repo, job_id, run_id, check_run_id).await {
-            Ok(()) => return Ok(Some(check_run_id)),
-            Err(error) if !is_check_run_not_found(&error) => return Err(error),
-            Err(error) => {
-                warn!(
-                    %run_id,
-                    %job_id,
-                    check_run_id,
-                    %error,
-                    "persisted GitHub check run is stale; reconciling it"
-                );
-                shared
-                    .state
-                    .backend
-                    .clear_job_check_run(run_id, job_id, check_run_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            }
-        }
-    }
-
-    // Mint under the per-run lock and re-check the mapping inside it: two
-    // reporters (e.g. an expansion mint and a claim-time in-progress report)
-    // can both see "no mapping" and POST, and GitHub accepts duplicate check
-    // runs for the same name+SHA — the loser would strand a `queued` check.
-    let _guard = mint_lock.lock().await;
-    let existing = shared
-        .state
-        .backend
-        .job_check_run_id(run_id, job_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    if let Some(check_run_id) = existing {
-        return Ok(Some(check_run_id));
-    }
-    mint_check_run(shared, repo, sha, job_id, run_id, token.as_deref()).await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 
 /// The repository + SHA check runs for this run attach to, when the run
@@ -396,198 +371,69 @@ fn check_run_report_coords(run: &crate::models::RunRecord) -> Option<(String, St
     Some((run.submission.repository.clone(), sha))
 }
 
-/// Return the job's check run id, minting a `queued` check when the job was
-/// materialized after intake reported (runtime-expanded matrix legs,
-/// reusable callee jobs). `None` when the run does not report checks or the
-/// mint fails — callers then behave as before this fix: skip the report.
+/// Return an already persisted job→check-run mapping, if any.
+///
+/// The sender is solely responsible for creating a missing GitHub check run;
+/// request handlers never mint one. Callers that need a check for a
+/// late-materialized job call [`report_check_run_queued`], which stamps
+/// `reports_check_runs` and appends a durable projection wake.
 pub async fn ensure_check_run_mapped(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &JobId,
 ) -> Option<u64> {
-    let run = shared.state.backend.run_record(run_id).await.ok()?;
-    if let Some(id) = run.job_check_run_ids.get(job_id).copied() {
-        return Some(id);
-    }
-    let coords = check_run_report_coords(&run)?;
-    let mint_lock = {
-        let mut inner = shared.state.inner.lock().await;
-        inner
-            .check_run_mint_locks
-            .entry(run_id)
-            .or_default()
-            .clone()
-    };
-    let _guard = mint_lock.lock().await;
-    let existing = shared
+    shared
         .state
         .backend
         .job_check_run_id(run_id, job_id)
         .await
         .ok()
-        .flatten();
-    if let Some(id) = existing {
-        return Some(id);
-    }
-    let (repo, sha) = coords;
-    let token = resolve_check_run_token(shared, &repo).await;
-    match mint_check_run(shared, &repo, &sha, job_id, run_id, token.as_deref()).await {
-        Ok(id) => id,
-        Err(error) => {
-            warn!(%run_id, %job_id, ?error, "failed to mint check run for materialized job");
-            None
-        }
-    }
-}
-
-/// POST a `queued` check run (or mint a mock id when no token resolves) and
-/// record the job→check-run mapping. Caller holds the per-run mint lock.
-async fn mint_check_run(
-    shared: &Arc<SharedState>,
-    repo: &str,
-    sha: &str,
-    job_id: &JobId,
-    run_id: RunId,
-    token: Option<&str>,
-) -> anyhow::Result<Option<u64>> {
-    let check_run_id = if let Some(token) = token {
-        let details_url = run_details_url(run_id);
-
-        let job_name = shared
-            .state
-            .backend
-            .job_display_name(run_id, job_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?
-            .unwrap_or_else(|| job_id.0.clone());
-        let mut body = serde_json::json!({
-            "name": job_name,
-            "head_sha": sha,
-            "status": "queued",
-            "output": {
-                "title": job_name,
-                "summary": format!("Waiting for a preloop runner.\n\njob_id: `{}`", job_id.0)
-            }
-        });
-        if let Some(url) = details_url {
-            body["details_url"] = serde_json::json!(url);
-        }
-
-        match send_github_check_request(
-            shared,
-            &shared.state.github_breaker,
-            token,
-            repo,
-            reqwest::Method::POST,
-            "check-runs",
-            &body,
-        )
-        .await
-        {
-            Ok(response) => match response.get("id").and_then(Value::as_u64) {
-                Some(id) => {
-                    info!(
-                        %run_id,
-                        %job_id,
-                        check_run_id = id,
-                        "GitHub check run created successfully"
-                    );
-                    id
-                }
-                None => find_existing_check_run(shared, token, repo, sha, &job_id.to_string())
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?,
-            },
-            Err(error) => {
-                // A transport error is ambiguous: GitHub may have
-                // committed the POST before the connection failed.
-                match find_existing_check_run(shared, token, repo, sha, &job_id.to_string()).await {
-                    Ok(Some(id)) => id,
-                    Ok(None) => return Err(error),
-                    Err(reconcile_error) => {
-                        return Err(anyhow::anyhow!(
-                            "{error}; check-run reconciliation failed: {reconcile_error}"
-                        ));
-                    }
-                }
-            }
-        }
-    } else {
-        info!(%run_id, %job_id, "GitHub token not configured, using mock check run");
-        rand::random::<u32>() as u64
-    };
-
-    let mapping_changed = shared
-        .state
-        .backend
-        .set_job_check_run(run_id, job_id, check_run_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    if mapping_changed {
-        // The mapping is meaningful while the run lives, and the next status
-        // event may be hours away. `set_job_check_run` persisted the event
-        // inside its own transaction; only the broadcast remains.
-        shared
-            .state
-            .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
-            .await;
-    }
-    Ok(Some(check_run_id))
+        .flatten()
 }
 
 fn is_check_run_not_found(error: &anyhow::Error) -> bool {
     error.to_string().contains("status 404")
 }
 
-/// Move an existing GitHub check run back to the queue after a rerequest.
+/// Record a rerequest's desired queued state; the sender performs the PATCH.
 pub async fn report_existing_check_run_queued(
     shared: &Arc<SharedState>,
-    repo: &str,
+    _repo: &str,
     job_id: &JobId,
     run_id: RunId,
     check_run_id: u64,
 ) -> anyhow::Result<()> {
-    let token = resolve_check_run_token(shared, repo).await;
-    if let Some(token) = &token {
-        let mut body = serde_json::json!({
-            "status": "queued",
-        });
-        if let Some(url) = run_details_url(run_id) {
-            body["details_url"] = serde_json::json!(url);
-        }
-        let path = format!("check-runs/{check_run_id}");
-        if let Err(error) = send_github_check_request(
-            shared,
-            &shared.state.github_breaker,
-            token,
-            repo,
-            reqwest::Method::PATCH,
-            &path,
-            &body,
-        )
+    shared
+        .state
+        .backend
+        .set_job_check_run(run_id, job_id, check_run_id)
         .await
-        {
-            warn!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                %error,
-                "Failed to requeue GitHub check run"
-            );
-            return Err(error);
-        }
-    } else {
-        info!(
-            %run_id,
-            %job_id,
-            check_run_id,
-            "Mock requeued GitHub check run"
-        );
-    }
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    shared
+        .state
+        .backend
+        .append_event(&NdjsonEvent::JobStatus {
+            run_id,
+            job_id: job_id.clone(),
+            status: ExecutionStatus::Queued,
+            reason: None,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // The status event above is dropped when the job row settled differently;
+    // the wake still delivers whatever state the row holds.
+    shared
+        .state
+        .backend
+        .append_check_run_projection(run_id, Some(job_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    shared.state.events_dirty.notify_one();
     Ok(())
 }
 async fn find_existing_check_run(
     shared: &Arc<SharedState>,
+    breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     sha: &str,
@@ -595,7 +441,7 @@ async fn find_existing_check_run(
 ) -> anyhow::Result<Option<u64>> {
     let payload = match send_github_check_request(
         shared,
-        &shared.state.github_breaker,
+        breaker,
         token,
         repo,
         reqwest::Method::GET,
@@ -621,6 +467,614 @@ async fn find_existing_check_run(
         }))
 }
 
+/// Per-installation rate budget key.
+///
+/// Installation ids come from [`crate::github_app::installation_for_repo`];
+/// the PAT fallback shares one bucket because it is one token. `0` is never a
+/// valid GitHub installation id, so it is never used as a key.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum CheckRunRateKey {
+    Installation(u64),
+    Pat,
+}
+
+/// Ceiling on how long a rate limit may park a row; a bogus header must not
+/// strand a check run for a day.
+const MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// The single background sender for the durable check-run queue.
+///
+/// The serve bootstrap spawns one per node; tests build their own and drive
+/// [`CheckRunSender::drain_once`]. Rate budgets are per installation, so a
+/// throttled installation parks only its own rows and the rest keep flowing.
+pub(crate) struct CheckRunSender {
+    owner: String,
+    budget: parking_lot::Mutex<
+        std::collections::HashMap<CheckRunRateKey, Arc<crate::github_breaker::GithubBreaker>>,
+    >,
+}
+
+impl Default for CheckRunSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CheckRunSender {
+    pub(crate) fn new() -> Self {
+        Self {
+            owner: uuid::Uuid::new_v4().to_string(),
+            budget: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn breaker(&self, key: &CheckRunRateKey) -> Arc<crate::github_breaker::GithubBreaker> {
+        let mut budget = self.budget.lock();
+        budget
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(crate::github_breaker::GithubBreaker::default()))
+            .clone()
+    }
+
+    /// Lease and process one batch. Returns how many rows were leased; the
+    /// caller keeps looping while batches arrive and sleeps when none do.
+    pub(crate) async fn drain_once(&self, shared: &Arc<SharedState>) -> usize {
+        const BATCH: usize = 32;
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(30);
+        let updates = match shared
+            .state
+            .backend
+            .lease_check_run_updates(&self.owner, LEASE, BATCH)
+            .await
+        {
+            Ok(updates) => updates,
+            Err(error) => {
+                warn!(?error, "check-run sender lease failed");
+                return 0;
+            }
+        };
+        let leased = updates.len();
+        for update in updates {
+            self.send_one(shared, &update).await;
+        }
+        leased
+    }
+
+    async fn send_one(
+        &self,
+        shared: &Arc<SharedState>,
+        update: &crate::control::types::CheckRunUpdate,
+    ) {
+        let repo = update
+            .payload
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // Resolve the real installation before budgeting or sending: the
+        // queue row's `installation_id` is projection metadata (0 = unknown),
+        // never an authority.
+        let key = resolve_check_run_rate_key(shared, &repo).await;
+        let breaker = self.breaker(&key);
+        if let Some(remaining) = breaker.retry_after() {
+            // Waiting out a rate limit is not a delivery failure: release the
+            // row due at GitHub's advertised resume time without burning an
+            // attempt, so a long throttle cannot exhaust the permanent-drop
+            // budget.
+            if let Err(error) = shared
+                .state
+                .backend
+                .defer_check_run_update(
+                    &self.owner,
+                    update.run_id,
+                    &update.job_id,
+                    remaining.min(MAX_DEFER),
+                )
+                .await
+            {
+                warn!(run_id=%update.run_id, job_id=%update.job_id, ?error, "failed to defer rate-limited check-run row");
+            }
+            return;
+        }
+        let token = resolve_check_run_token(shared, &repo).await;
+        match send_queued_check_run(shared, &self.owner, &breaker, token.as_deref(), update).await {
+            Ok(()) => {}
+            Err(error) if error.to_string().contains("circuit breaker is open") => {
+                // A breaker that opened between the budget check and the call
+                // is still a deferral, not a failure.
+                let remaining = breaker
+                    .retry_after()
+                    .unwrap_or(std::time::Duration::from_secs(30));
+                let _ = shared
+                    .state
+                    .backend
+                    .defer_check_run_update(
+                        &self.owner,
+                        update.run_id,
+                        &update.job_id,
+                        remaining.min(MAX_DEFER),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                let permanent = update.attempts >= 7 || error.to_string().contains("status 422");
+                let delay = check_retry_delay(&error, update.attempts);
+                warn!(run_id=%update.run_id, job_id=%update.job_id, attempts=update.attempts, permanent, ?error, "check-run sender attempt failed");
+                if let Err(store_error) = shared
+                    .state
+                    .backend
+                    .retry_check_run_update(
+                        &self.owner,
+                        update.run_id,
+                        &update.job_id,
+                        delay,
+                        permanent,
+                    )
+                    .await
+                {
+                    warn!(run_id=%update.run_id, job_id=%update.job_id, ?store_error, "failed to persist check-run retry state");
+                }
+            }
+        }
+    }
+}
+
+/// The installation (or PAT) whose budget governs this repository's check
+/// runs. Resolution failure falls back to the PAT bucket; it never invents an
+/// installation id.
+async fn resolve_check_run_rate_key(shared: &Arc<SharedState>, repo: &str) -> CheckRunRateKey {
+    match crate::github_app::select_app_for_repo(shared, repo).await {
+        Some(app) => match crate::github_app::installation_for_repo(&app, repo).await {
+            Ok(installation) if installation != 0 => CheckRunRateKey::Installation(installation),
+            _ => CheckRunRateKey::Pat,
+        },
+        None => CheckRunRateKey::Pat,
+    }
+}
+
+/// Drain the durable check-run queue. This is the only path that invokes the
+/// GitHub Checks API; request handlers only append desired-state events.
+pub(crate) async fn run_check_run_sender(shared: Arc<SharedState>) {
+    let sender = CheckRunSender::new();
+    while !shared.shutdown.is_cancelled() {
+        let leased = sender.drain_once(&shared).await;
+        if leased == 0 {
+            tokio::select! {
+                _ = shared.shutdown.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
+            }
+        }
+    }
+}
+
+/// Test-only single pass of the check-run sender, mirroring the bootstrap
+/// loop. Tests that assert a check-run mapping was recorded must drain the
+/// sender: the sender is the only path that writes one, so a webhook alone
+/// leaves `job_check_run_ids` empty.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn drain_check_run_sender(shared: &Arc<SharedState>) -> usize {
+    CheckRunSender::new().drain_once(shared).await
+}
+
+fn check_retry_delay(error: &anyhow::Error, attempts: i32) -> std::time::Duration {
+    let text = error.to_string();
+    if let Some(value) = text
+        .split("retry_after=")
+        .nth(1)
+        .and_then(|v| v.split(';').next())
+        && let Ok(seconds) = value.trim().parse::<u64>()
+        && seconds > 0
+    {
+        return std::time::Duration::from_secs(seconds.min(86_400));
+    }
+    // `rate_reset` is `x-ratelimit-reset`: an absolute unix timestamp.
+    if let Some(value) = text
+        .split("rate_reset=")
+        .nth(1)
+        .and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next())
+        && let Ok(reset) = value.parse::<u64>()
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        if reset > now {
+            return std::time::Duration::from_secs((reset - now).min(86_400));
+        }
+    }
+    if text.contains("secondary rate limit") || text.contains("abuse detection") {
+        return std::time::Duration::from_secs(60);
+    }
+    let base = 250_u64.saturating_mul(1_u64 << (attempts.clamp(0, 8) as u32));
+    std::time::Duration::from_millis(base + rand::random::<u64>() % 250)
+}
+
+/// Render and deliver one queued update. `breaker` is the resolved
+/// installation's rate budget; every request this function makes goes
+/// through it.
+async fn send_queued_check_run(
+    shared: &Arc<SharedState>,
+    owner: &str,
+    breaker: &crate::github_breaker::GithubBreaker,
+    token: Option<&str>,
+    update: &crate::control::types::CheckRunUpdate,
+) -> anyhow::Result<()> {
+    let repo = update
+        .payload
+        .get("repository")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("check-run queue row has no repository"))?;
+    let sha = update
+        .payload
+        .get("sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("check-run queue row has no head sha"))?;
+    let name = update
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(update.job_id.0.as_str());
+    let status = update
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("queued");
+    let Some(token) = token else {
+        info!(run_id=%update.run_id, job_id=%update.job_id, status, "GitHub token not configured; check-run update simulated locally");
+        // A token-less engine still records a local check-run id. The base
+        // minted exactly this mock at submit, before the sender took over
+        // minting; the mapping is what `job_check_run_ids` serves and what
+        // must survive a restart, so dropping it would silently erase the
+        // mock path (`check_run_ids_survive_a_restart_before_any_job_event`).
+        let existing = shared
+            .state
+            .backend
+            .job_check_run_id(update.run_id, &update.job_id)
+            .await
+            .ok()
+            .flatten();
+        if existing.is_none() {
+            let mock = rand::random::<u32>() as u64;
+            let mapping_changed = shared
+                .state
+                .backend
+                .set_job_check_run(update.run_id, &update.job_id, mock)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            if mapping_changed {
+                shared
+                    .state
+                    .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
+                        run_id: update.run_id,
+                    })
+                    .await;
+            }
+        }
+        shared
+            .state
+            .backend
+            .finish_check_run_update(owner, update.run_id, &update.job_id, update.version)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        return Ok(());
+    };
+    let mut check_run_id = update.check_run_id;
+    if check_run_id.is_none() {
+        // The persisted job mapping is the first dedup source: a previous
+        // attempt may have POSTed and saved the mapping while failing to save
+        // the queue row.
+        check_run_id = shared
+            .state
+            .backend
+            .job_check_run_id(update.run_id, &update.job_id)
+            .await
+            .ok()
+            .flatten();
+        if let Some(id) = check_run_id {
+            persist_check_run_id(shared, owner, update, id).await?;
+        }
+    }
+    if check_run_id.is_none() {
+        // Crash-after-POST reconciliation: never POST a second check run for
+        // the same commit + name.
+        check_run_id = find_existing_check_run(shared, breaker, token, repo, sha, name).await?;
+        if let Some(id) = check_run_id {
+            persist_check_run_id(shared, owner, update, id).await?;
+        }
+    }
+
+    if update.payload.get("kind").and_then(Value::as_str) == Some("workflow_failure") {
+        // Synthetic workflow-evaluation failures have no run row; keep the
+        // body byte-identical to the pre-queue reporter.
+        let body = serde_json::json!({
+            "name": name,
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "failure",
+            "completed_at": chrono::Utc::now().to_rfc3339(),
+            "output": {
+                "title": "Workflow evaluation failed",
+                "summary": update.payload.get("summary").and_then(Value::as_str).unwrap_or(""),
+            }
+        });
+        send_check_run_body(
+            shared,
+            owner,
+            breaker,
+            token,
+            repo,
+            sha,
+            name,
+            update,
+            check_run_id,
+            body,
+        )
+        .await?;
+        finish_check_run_update(shared, owner, update).await?;
+        return Ok(());
+    }
+
+    match status {
+        // `pending` is a held job (needs/approval); it reports as a queued
+        // check exactly as intake did. Only terminal statuses conclude one.
+        "queued" | "pending" | "in_progress" => {
+            let mut body = if status == "in_progress" {
+                serde_json::json!({"status":"in_progress","started_at":chrono::Utc::now().to_rfc3339(),"output":{"title":name,"summary":"Running in preloop."}})
+            } else {
+                serde_json::json!({"name":name,"head_sha":sha,"status":"queued","output":{"title":name,"summary":format!("Waiting for a preloop runner.\n\njob_id: `{}`",update.job_id.0)}})
+            };
+            if let Some(url) = run_details_url(update.run_id) {
+                body["details_url"] = Value::String(url);
+            }
+            send_check_run_body(
+                shared,
+                owner,
+                breaker,
+                token,
+                repo,
+                sha,
+                name,
+                update,
+                check_run_id,
+                body,
+            )
+            .await?;
+        }
+        _ => {
+            let info = shared
+                .state
+                .backend
+                .run_dispatch_info(update.run_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let conclusion = match status {
+                "success" => "success",
+                "failure" => "failure",
+                "cancelled" => "cancelled",
+                "skipped" => "skipped",
+                _ => "failure",
+            };
+            let (title, summary, started_at, completed_at, annotations) = if let Some(info) = info {
+                let job = info.jobs.iter().find(|job| job.job_id == update.job_id);
+                let steps = job.map(|j| j.steps.clone()).unwrap_or_default();
+                let (annotations, mut global_issues) =
+                    timeline_annotations(shared, update.run_id, &update.job_id).await;
+                if let Some(detail) = job.and_then(|j| j.detail.as_ref()) {
+                    for annotation in &detail.annotations {
+                        let message = annotation
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| annotation.to_string());
+                        global_issues.push(format!("- {}", markdown_cell(&message)));
+                    }
+                }
+                let summary = check_summary(conclusion, &steps, &global_issues, &update.job_id);
+                let title = job
+                    .and_then(|j| j.display_name.as_deref())
+                    .unwrap_or(name)
+                    .to_owned();
+                let started_at = steps
+                    .iter()
+                    .filter_map(|step| step.started_at)
+                    .min()
+                    .or_else(|| info.started_at.map(chrono::DateTime::<chrono::Utc>::from));
+                let completed_at = steps
+                    .iter()
+                    .filter_map(|step| step.finished_at)
+                    .max()
+                    .or_else(|| info.completed_at.map(chrono::DateTime::<chrono::Utc>::from))
+                    .unwrap_or_else(chrono::Utc::now);
+                (title, summary, started_at, completed_at, annotations)
+            } else {
+                (
+                    name.to_owned(),
+                    update
+                        .payload
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    None,
+                    chrono::Utc::now(),
+                    Vec::new(),
+                )
+            };
+            // Annotations travel 50 per request, exactly as before; only the
+            // final request concludes the check run.
+            let chunks: Vec<&[Value]> = if annotations.is_empty() {
+                vec![&[]]
+            } else {
+                annotations.chunks(50).collect()
+            };
+            let mut id = check_run_id;
+            for (index, chunk) in chunks.iter().enumerate() {
+                let last = index + 1 == chunks.len();
+                let mut body = serde_json::json!({
+                    "output": {"title": title, "summary": summary, "annotations": chunk}
+                });
+                if last {
+                    body["status"] = Value::String("completed".to_owned());
+                    body["conclusion"] = Value::String(conclusion.to_owned());
+                    body["completed_at"] = Value::String(completed_at.to_rfc3339());
+                    if let Some(started_at) = started_at {
+                        body["started_at"] = Value::String(started_at.to_rfc3339());
+                    }
+                    if let Some(url) = run_details_url(update.run_id) {
+                        body["details_url"] = Value::String(url);
+                    }
+                } else if id.is_none() {
+                    // Creating a check run requires a status; annotations
+                    // arrive over the follow-up PATCHes.
+                    body["status"] = Value::String("queued".to_owned());
+                }
+                id = send_check_run_body(
+                    shared, owner, breaker, token, repo, sha, &title, update, id, body,
+                )
+                .await?;
+            }
+        }
+    }
+    finish_check_run_update(shared, owner, update).await?;
+    Ok(())
+}
+
+/// The in-memory annotation stream for one job, split into GitHub annotation
+/// payloads and free-text failure details (annotations without a file).
+async fn timeline_annotations(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> (Vec<Value>, Vec<String>) {
+    let inner = shared.state.inner.lock().await;
+    let mut annotations = Vec::new();
+    let mut global_issues = Vec::new();
+    if let Some(events) = inner.timeline_events.get(&run_id) {
+        for event in events {
+            if let NdjsonEvent::Annotation {
+                job_id: event_job_id,
+                level,
+                message,
+                file,
+                line,
+                ..
+            } = event
+                && event_job_id == job_id
+            {
+                let level_str = match level {
+                    AnnotationLevel::Notice => "notice",
+                    AnnotationLevel::Warning => "warning",
+                    AnnotationLevel::Error => "failure",
+                };
+                if let Some(file_path) = file {
+                    let line_num = line.unwrap_or(1);
+                    annotations.push(serde_json::json!({
+                        "path": file_path,
+                        "start_line": line_num,
+                        "end_line": line_num,
+                        "annotation_level": level_str,
+                        "message": message,
+                    }));
+                } else {
+                    global_issues.push(format!("**{}**: {}", level_str.to_uppercase(), message));
+                }
+            }
+        }
+    }
+    (annotations, global_issues)
+}
+
+/// Send one Checks API request for `update`, creating the check run on POST.
+/// Returns the check-run id (persisted alongside the queue row).
+#[allow(clippy::too_many_arguments)]
+async fn send_check_run_body(
+    shared: &Arc<SharedState>,
+    owner: &str,
+    breaker: &crate::github_breaker::GithubBreaker,
+    token: &str,
+    repo: &str,
+    sha: &str,
+    name: &str,
+    update: &crate::control::types::CheckRunUpdate,
+    check_run_id: Option<u64>,
+    mut body: Value,
+) -> anyhow::Result<Option<u64>> {
+    let (method, path) = match check_run_id {
+        Some(id) => (reqwest::Method::PATCH, format!("check-runs/{id}")),
+        None => {
+            // Creation requires the check name and commit.
+            body["name"] = Value::String(name.to_owned());
+            body["head_sha"] = Value::String(sha.to_owned());
+            (reqwest::Method::POST, "check-runs".to_owned())
+        }
+    };
+    let response =
+        match send_github_check_request(shared, breaker, token, repo, method, &path, &body).await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(stale) = check_run_id.filter(|_| is_check_run_not_found(&error)) {
+                    let _ = shared
+                        .state
+                        .backend
+                        .clear_check_run_update_id(owner, update.run_id, &update.job_id, stale)
+                        .await;
+                    let _ = shared
+                        .state
+                        .backend
+                        .clear_job_check_run(update.run_id, &update.job_id, stale)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+    let Some(id) = check_run_id else {
+        let id = response
+            .get("id")
+            .and_then(Value::as_u64)
+            .or(find_existing_check_run(shared, breaker, token, repo, sha, name).await?)
+            .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?;
+        persist_check_run_id(shared, owner, update, id).await?;
+        return Ok(Some(id));
+    };
+    Ok(Some(id))
+}
+
+/// Record a GitHub check-run id on both the queue row (version-guarded) and
+/// the job mapping.
+async fn persist_check_run_id(
+    shared: &Arc<SharedState>,
+    owner: &str,
+    update: &crate::control::types::CheckRunUpdate,
+    id: u64,
+) -> anyhow::Result<()> {
+    shared
+        .state
+        .backend
+        .set_check_run_update_id(owner, update.run_id, &update.job_id, update.version, id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    shared
+        .state
+        .backend
+        .set_job_check_run(update.run_id, &update.job_id, id)
+        .await
+        .map_err(|e| anyhow::anyhow!("saved check-run id {id} but job mapping failed: {e:?}"))?;
+    Ok(())
+}
+
+async fn finish_check_run_update(
+    shared: &Arc<SharedState>,
+    owner: &str,
+    update: &crate::control::types::CheckRunUpdate,
+) -> anyhow::Result<()> {
+    shared
+        .state
+        .backend
+        .finish_check_run_update(owner, update.run_id, &update.job_id, update.version)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
 /// Report a permanent failure check run to GitHub (e.g. invalid workflow YAML, expression failure).
 ///
 /// The check name and head SHA are the idempotency key. A retry after a crash
@@ -633,37 +1087,29 @@ pub async fn report_check_run_permanent_failure(
     name: &str,
     summary: &str,
 ) -> anyhow::Result<()> {
-    let token = resolve_check_run_token(shared, repo).await;
-    if let Some(token) = &token {
-        let body = serde_json::json!({
+    let run_id = RunId::new();
+    let update = crate::control::types::CheckRunUpdateInput {
+        run_id,
+        job_id: JobId(format!("__workflow_failure__:{name}")),
+        installation_id: 0,
+        check_run_id: None,
+        version: 0,
+        payload: serde_json::json!({
+            "kind": "workflow_failure",
+            "repository": repo,
+            "sha": sha,
             "name": name,
-            "head_sha": sha,
             "status": "completed",
-            "conclusion": "failure",
-            "completed_at": chrono::Utc::now().to_rfc3339(),
-            "output": {
-                "title": "Workflow evaluation failed",
-                "summary": summary,
-            }
-        });
-        let existing = find_existing_check_run(shared, token, repo, sha, name).await?;
-        let (method, path) = match existing {
-            Some(check_run_id) => (reqwest::Method::PATCH, format!("check-runs/{check_run_id}")),
-            None => (reqwest::Method::POST, "check-runs".to_owned()),
-        };
-        send_github_check_request(
-            shared,
-            &shared.state.github_breaker,
-            token,
-            repo,
-            method,
-            &path,
-            &body,
-        )
-        .await?;
-    } else {
-        info!(%repo, %name, "GitHub token not configured, mock failure check run recorded");
-    }
+            "summary": summary,
+        }),
+    };
+    shared
+        .state
+        .backend
+        .enqueue_check_run_update(update)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    shared.state.events_dirty.notify_one();
     Ok(())
 }
 
@@ -673,148 +1119,58 @@ pub async fn report_check_runs_for_run(
     run_id: RunId,
     reused_check_run: Option<(JobId, u64)>,
 ) {
-    let (repository, sha, jobs) = {
-        // The rerun reports checks even when every job is an expandable
-        // placeholder — those mint nothing here, but their materialized legs
-        // report later and need the flag.
-        if let Err(error) = shared
+    if let Err(error) = shared
+        .state
+        .backend
+        .set_reports_check_runs(run_id, true)
+        .await
+    {
+        warn!(%run_id, ?error, "failed to stamp reports_check_runs for rerun");
+        return;
+    }
+    if let Some((job_id, check_run_id)) = reused_check_run
+        && let Err(error) = shared
             .state
             .backend
-            .set_reports_check_runs(run_id, true)
+            .set_job_check_run(run_id, &job_id, check_run_id)
             .await
-        {
-            warn!(%run_id, ?error, "failed to stamp reports_check_runs for rerun");
-        }
-        let outcome = shared
-            .state
-            .backend
-            .run_dispatch_info(run_id)
-            .await
-            .map_err(crate::ApiError::from)
-            .ok()
-            .flatten();
-        match outcome {
-            Some(info) => (
-                info.repository,
-                info.sha,
-                // Expandable nodes (deferred matrices, reusable callers) are
-                // placeholders: expansion replaces them, and their
-                // materialized legs mint their own checks. A `queued` check
-                // minted here would strand on GitHub (no delete API).
-                info.jobs
-                    .into_iter()
-                    .filter(|job| !job.placeholder)
-                    .map(|job| (job.job_id, job.status))
-                    .collect::<Vec<_>>(),
-            ),
-            None => return,
-        }
-    };
-
-    for (job_id, status) in jobs {
-        if let Some((reused_job_id, check_run_id)) = &reused_check_run {
-            if reused_job_id == &job_id {
-                if let Err(error) = report_existing_check_run_queued(
-                    shared,
-                    &repository,
-                    &job_id,
-                    run_id,
-                    *check_run_id,
-                )
+    {
+        warn!(%run_id, %job_id, ?error, "failed to persist reused check-run id");
+    }
+    if let Ok(Some(info)) = shared.state.backend.run_dispatch_info(run_id).await {
+        for job in info.jobs.into_iter().filter(|job| !job.placeholder) {
+            if let Err(error) = shared
+                .state
+                .backend
+                .append_check_run_projection(run_id, Some(&job.job_id))
                 .await
-                {
-                    warn!(%run_id, %job_id, ?error, "failed to requeue GitHub check run");
-                }
-            } else if let Err(error) =
-                report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await
             {
-                warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                warn!(%run_id, job_id=%job.job_id, ?error, "failed to append rerun check projection wake");
             }
-        } else if let Err(error) =
-            report_check_run_queued(shared, &repository, &sha, &job_id, run_id).await
-        {
-            warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
         }
-
-        if status.is_terminal() {
-            report_check_run_completed(shared, run_id, &job_id, status).await;
-        }
+        shared.state.events_dirty.notify_one();
     }
 }
 
 /// Report check run status to in_progress on GitHub or simulate it locally.
+/// The acquire transition writes `job.started.v1` in its own transaction; the
+/// durable projector observes it and the sender performs the PATCH
+/// asynchronously. This wake covers a projector that consumed that event
+/// before the run's `reports_check_runs` flag landed.
 pub async fn report_check_run_in_progress(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &JobId,
 ) {
-    let (repo, check_run_id, job_name) = {
-        let backend = &shared.state.backend;
-        let Some(check_run_id) = backend
-            .job_check_run_id(run_id, job_id)
-            .await
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
-        let repo = backend
-            .submission_fields(run_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|fields| fields.repository);
-        let Some(repo) = repo else {
-            return;
-        };
-        let job_name = backend
-            .job_display_name(run_id, job_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| job_id.0.clone());
-        (repo, check_run_id, job_name)
-    };
-
-    let token = resolve_check_run_token(shared, &repo).await;
-    if let Some(token) = &token {
-        let details_url = run_details_url(run_id);
-
-        let started_at = chrono::Utc::now().to_rfc3339();
-        let mut body = serde_json::json!({
-            "status": "in_progress",
-            "started_at": started_at,
-            "output": {
-                "title": job_name,
-                "summary": "Running in preloop."
-            }
-        });
-        if let Some(url) = details_url {
-            body["details_url"] = serde_json::json!(url);
-        }
-
-        let path = format!("check-runs/{}", check_run_id);
-        if let Err(e) = send_github_check_request(
-            shared,
-            &shared.state.github_lifecycle_breaker,
-            token,
-            &repo,
-            reqwest::Method::PATCH,
-            &path,
-            &body,
-        )
+    if let Err(error) = shared
+        .state
+        .backend
+        .append_check_run_projection(run_id, Some(job_id))
         .await
-        {
-            warn!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                error = %e,
-                "Failed to update GitHub check run to in_progress"
-            );
-        }
+    {
+        warn!(%run_id, %job_id, ?error, "failed to append in-progress check projection wake");
     } else {
-        info!(%run_id, %job_id, check_run_id, "Mock updated check run to in_progress");
+        shared.state.events_dirty.notify_one();
     }
 }
 
@@ -875,207 +1231,26 @@ fn check_summary(
     summary
 }
 /// Report check run status to completed on GitHub or simulate it locally.
+///
+/// The terminal transition already wrote a durable event; this wake covers a
+/// projector that consumed it before the run's `reports_check_runs` flag
+/// landed (a job concluded during submit) — the sender renders the row's
+/// final state.
 pub async fn report_check_run_completed(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &JobId,
-    status: ExecutionStatus,
+    _status: ExecutionStatus,
 ) {
-    // Backend: one indexed dispatch read. Node-local: `timeline_events` for
-    // annotations. Read each under its own owner.
-    let (repo, _check_run_id, job_name, steps, started_at, completed_at, detail) = {
-        let outcome = shared
-            .state
-            .backend
-            .run_dispatch_info(run_id)
-            .await
-            .map_err(crate::ApiError::from)
-            .ok()
-            .flatten();
-        let Some(info) = outcome else {
-            return;
-        };
-        // A job minted on demand (deferred-matrix leg, reusable callee) may
-        // have no dispatch row at all — proceed with run-level defaults so
-        // `ensure_check_run_mapped` below can mint for it.
-        let job = info.jobs.iter().find(|job| job.job_id == *job_id);
-        let check_run_id = job.and_then(|job| job.check_run_id);
-        // `project_run`'s per-job projection, minus the pieces it derived
-        // from a second pass over the whole run: name, status conclusion and
-        // the latest attempt's step manifest.
-        let mut detail =
-            job.and_then(|job| job.detail.clone())
-                .unwrap_or(crate::models::JobDetail {
-                    job_id: job_id.0.clone(),
-                    name: job
-                        .and_then(|job| job.display_name.clone())
-                        .unwrap_or_else(|| job_id.0.clone()),
-                    conclusion: crate::runtime_scheduling::status_string(
-                        job.map(|job| job.status)
-                            .unwrap_or(ExecutionStatus::Pending),
-                    ),
-                    steps: Vec::new(),
-                    annotations: Vec::new(),
-                });
-        detail.job_id = job_id.0.clone();
-        detail.name = job
-            .and_then(|job| job.display_name.clone())
-            .unwrap_or_else(|| job_id.0.clone());
-        detail.conclusion = crate::runtime_scheduling::status_string(
-            job.map(|job| job.status)
-                .unwrap_or(ExecutionStatus::Pending),
-        );
-        let job_steps: Vec<crate::models::StepRecord> =
-            job.map(|job| job.steps.clone()).unwrap_or_default();
-        if !job_steps.is_empty() {
-            detail.steps = job_steps.clone();
-        }
-        let job_name = detail.name.clone();
-        let started_at = job_steps
-            .iter()
-            .filter_map(|step| step.started_at)
-            .min()
-            .or_else(|| info.started_at.map(chrono::DateTime::from));
-        let completed_at = job_steps
-            .iter()
-            .filter_map(|step| step.finished_at)
-            .max()
-            .or_else(|| info.completed_at.map(chrono::DateTime::from))
-            .unwrap_or_else(chrono::Utc::now);
-        (
-            info.repository,
-            check_run_id,
-            job_name,
-            job_steps,
-            started_at,
-            completed_at,
-            Some(detail),
-        )
-    };
-
-    let (annotations, global_issues) = {
-        let inner = shared.state.inner.lock().await;
-        let mut annotations = Vec::new();
-        let mut global_issues = Vec::new();
-        if let Some(events) = inner.timeline_events.get(&run_id) {
-            for event in events {
-                if let NdjsonEvent::Annotation {
-                    job_id: event_job_id,
-                    level,
-                    message,
-                    file,
-                    line,
-                    ..
-                } = event
-                    && event_job_id == job_id
-                {
-                    let level_str = match level {
-                        AnnotationLevel::Notice => "notice",
-                        AnnotationLevel::Warning => "warning",
-                        AnnotationLevel::Error => "failure",
-                    };
-                    if let Some(file_path) = file {
-                        let line_num = line.unwrap_or(1);
-                        annotations.push(serde_json::json!({
-                            "path": file_path,
-                            "start_line": line_num,
-                            "end_line": line_num,
-                            "annotation_level": level_str,
-                            "message": message,
-                        }));
-                    } else {
-                        global_issues.push(format!(
-                            "**{}**: {}",
-                            level_str.to_uppercase(),
-                            message
-                        ));
-                    }
-                }
-            }
-        }
-        if let Some(detail) = &detail {
-            for annotation in &detail.annotations {
-                let message = annotation
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| annotation.to_string());
-                global_issues.push(format!("- {}", markdown_cell(&message)));
-            }
-        }
-        (annotations, global_issues)
-    };
-
-    // Jobs materialized after intake (runtime matrix fan-out, reusable callee
-    // jobs) have no check run yet; mint one instead of dropping the report.
-    // A cancelled expandable placeholder mints a `cancelled` check — GitHub
-    // has no delete API, so concluding it is better than leaving it queued.
-    let Some(check_run_id) = ensure_check_run_mapped(shared, run_id, job_id).await else {
-        return;
-    };
-
-    let conclusion = match status {
-        ExecutionStatus::Success => "success",
-        ExecutionStatus::Failure => "failure",
-        ExecutionStatus::Cancelled => "cancelled",
-        ExecutionStatus::Skipped => "skipped",
-        _ => "failure",
-    };
-    let summary = check_summary(conclusion, &steps, &global_issues, job_id);
-
-    let token = resolve_check_run_token(shared, &repo).await;
-    if let Some(token) = &token {
-        let path = format!("check-runs/{check_run_id}");
-        let chunks: Vec<&[Value]> = if annotations.is_empty() {
-            vec![&[]]
-        } else {
-            annotations.chunks(50).collect()
-        };
-        for (index, chunk) in chunks.iter().enumerate() {
-            let last = index + 1 == chunks.len();
-            let mut body = serde_json::json!({
-                "output": {
-                    "title": job_name,
-                    "summary": summary,
-                    "annotations": chunk,
-                }
-            });
-            if last {
-                body["status"] = serde_json::json!("completed");
-                body["conclusion"] = serde_json::json!(conclusion);
-                body["completed_at"] = serde_json::json!(completed_at.to_rfc3339());
-                if let Some(started_at) = started_at {
-                    body["started_at"] = serde_json::json!(started_at.to_rfc3339());
-                }
-                if let Some(url) = run_details_url(run_id) {
-                    body["details_url"] = serde_json::json!(url);
-                }
-            }
-            if let Err(error) =
-                send_github_check_completion(shared, token, &repo, &path, &body).await
-            {
-                warn!(
-                    %run_id,
-                    %job_id,
-                    check_run_id,
-                    annotation_batch = index + 1,
-                    annotation_batches = chunks.len(),
-                    %error,
-                    "Failed to update GitHub check run"
-                );
-                return;
-            }
-        }
+    if let Err(error) = shared
+        .state
+        .backend
+        .append_check_run_projection(run_id, Some(job_id))
+        .await
+    {
+        warn!(%run_id, %job_id, ?error, "failed to append completed check projection wake");
     } else {
-        info!(
-            %run_id,
-            %job_id,
-            check_run_id,
-            conclusion,
-            annotations_count = annotations.len(),
-            global_issues_count = global_issues.len(),
-            "Mock updated check run to completed"
-        );
+        shared.state.events_dirty.notify_one();
     }
 }
 
@@ -3873,6 +4048,9 @@ jobs:
 
     #[tokio::test]
     async fn malformed_pull_request_workflow_reports_head_sha() {
+        // See `malformed_pull_request_workflow_failure_is_deduplicated`: the
+        // PR-files lookup must not hit another test's GitHub stub.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
@@ -3929,6 +4107,10 @@ jobs:
 
     #[tokio::test]
     async fn malformed_pull_request_workflow_failure_is_deduplicated() {
+        // `PRELOOP_GITHUB_API_URL` is process-global; this scenario expects no
+        // stub to answer the PR-files lookup, so it must not race a test that
+        // installs one.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
@@ -4667,20 +4849,40 @@ jobs:
     #[tokio::test]
     async fn materialized_job_mints_check_run_when_intake_reported() {
         let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let job = JobId("build".to_owned());
 
-        // A leg materialized by a deferred matrix has a check run minted
-        // on demand — no GitHub token resolves in tests, so the mock id is
-        // fine; the assertion is that the mapping exists at all.
-        let leg = JobId("build (linux)".to_owned());
-        let id = ensure_check_run_mapped(&shared, run_id, &leg).await;
-        assert!(id.is_some(), "reported runs mint checks for late jobs");
+        // Handlers never mint inline any more: there is no GitHub call and no
+        // persisted id before the sender runs.
+        assert_eq!(
+            ensure_check_run_mapped(&shared, run_id, &job).await,
+            None,
+            "a request handler must not mint a check run"
+        );
+
+        // The durable queued report stamps the run and appends a projection
+        // wake; the projector materializes the desired row, and the sender
+        // (exercised by the sender tests) creates the GitHub check from it.
+        report_check_run_queued(
+            &shared,
+            "owner/repo",
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            &job,
+            run_id,
+        )
+        .await
+        .unwrap();
+        let row = wait_for_check_run_row(&shared, run_id, &job).await;
+        assert_eq!(row.payload["status"], "queued");
+        assert_eq!(row.payload["name"], "build");
+        assert_eq!(row.payload["repository"], "owner/repo");
+        assert_eq!(
+            row.payload["sha"], "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "the projected row carries the run's check sha"
+        );
         let runs = shared.state.test_tx().await.runs;
         assert!(
-            runs.get(&run_id)
-                .unwrap()
-                .job_check_run_ids
-                .contains_key(&leg),
-            "the minted id must be recorded for lifecycle PATCHes"
+            runs.get(&run_id).unwrap().reports_check_runs,
+            "the queued report must stamp the run so later jobs report too"
         );
     }
 
@@ -4701,20 +4903,587 @@ jobs:
     #[tokio::test]
     async fn terminal_report_mints_missing_check_run_for_late_job() {
         let (_temp, shared, run_id) = mint_fixture(true, None).await;
-        let leg = JobId("build (linux)".to_owned());
+        let job = JobId("build".to_owned());
 
-        // A matrix leg that skips at promotion never dispatches, so the only
-        // report it ever gets is the completion one — which must mint the
-        // check rather than drop the report.
-        report_check_run_completed(&shared, run_id, &leg, ExecutionStatus::Skipped).await;
+        // A matrix leg that skips at promotion never dispatches; the only
+        // report it ever gets is the completion one. It must reach the queue
+        // even though the job settled before the reporting flag landed (a
+        // `JobStatus` event would be stamped stale; the projection wake is
+        // not).
+        shared
+            .state
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE jobs SET status = 'skipped' WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run_id.to_string(), "build"],
+                )
+            })
+            .await
+            .unwrap();
+        report_check_run_completed(&shared, run_id, &job, ExecutionStatus::Skipped).await;
 
-        let runs = shared.state.test_tx().await.runs;
+        let row = wait_for_check_run_row(&shared, run_id, &job).await;
+        assert_eq!(
+            row.payload["status"], "skipped",
+            "a terminal report must queue its final state for the sender"
+        );
+    }
+
+    /// Wait for the durable projector (which owns the consumer lease in the
+    /// background) to materialize a queue row for `run_id`/`job_id`.
+    async fn wait_for_check_run_row(
+        shared: &std::sync::Arc<crate::SharedState>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> crate::control::types::CheckRunUpdate {
+        for _ in 0..120 {
+            if let Ok(rows) = shared
+                .state
+                .backend
+                .lease_check_run_updates("test-probe", std::time::Duration::from_millis(1), 100)
+                .await
+                && let Some(row) = rows
+                    .into_iter()
+                    .find(|row| row.run_id == run_id && row.job_id == *job_id)
+            {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("check-run row for {run_id}/{job_id} was never projected");
+    }
+
+    // ── Sender acceptance tests ────────────────────────────────────────
+
+    type StubRequests = std::sync::Arc<parking_lot::Mutex<Vec<(String, String, Value)>>>;
+
+    /// Fake GitHub API: records every request and answers from
+    /// `handler(method, path, body)`. Returns the base URL to install as
+    /// `PRELOOP_GITHUB_API_URL`.
+    async fn start_github_stub(
+        handler: impl Fn(&str, &str, &Value) -> (u16, Vec<(&'static str, String)>, Value)
+        + Send
+        + Sync
+        + 'static,
+    ) -> (String, StubRequests) {
+        let requests: StubRequests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let handler = std::sync::Arc::new(handler);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorded = recorded.clone();
+            let handler = handler.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_owned();
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap_or_default();
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                recorded
+                    .lock()
+                    .push((method.clone(), path.clone(), body.clone()));
+                let (status, headers, response_body) = handler(&method, &path, &body);
+                let mut response = axum::response::Response::new(axum::body::Body::from(
+                    response_body.to_string(),
+                ));
+                *response.status_mut() = axum::http::StatusCode::from_u16(status).unwrap();
+                for (name, value) in headers {
+                    response.headers_mut().insert(
+                        axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        axum::http::HeaderValue::from_str(&value).unwrap(),
+                    );
+                }
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn check_run_writes(requests: &StubRequests) -> Vec<(String, String, Value)> {
+        requests
+            .lock()
+            .iter()
+            .filter(|(method, _, _)| method == "POST" || method == "PATCH")
+            .cloned()
+            .collect()
+    }
+
+    async fn seed_check_run_update(
+        shared: &std::sync::Arc<crate::SharedState>,
+        run_id: RunId,
+        job_id: &JobId,
+        version: i64,
+        status: &str,
+        check_run_id: Option<u64>,
+    ) {
+        shared
+            .state
+            .backend
+            .enqueue_check_run_update(crate::control::types::CheckRunUpdateInput {
+                run_id,
+                job_id: job_id.clone(),
+                installation_id: 0,
+                check_run_id,
+                version,
+                payload: serde_json::json!({
+                    "repository": "owner/repo",
+                    "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "job_id": job_id.0,
+                    "status": status,
+                    "name": "build",
+                }),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn drain_sender(shared: &std::sync::Arc<crate::SharedState>) -> usize {
+        CheckRunSender::new().drain_once(shared).await
+    }
+
+    /// (b) queued → in_progress → completed committed before the sender runs
+    /// coalesces to ONE Checks API write carrying the final state.
+    #[tokio::test]
+    async fn sender_coalesces_versions_into_one_final_request() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api, requests) = start_github_stub(|method, _path, _body| match method {
+            "GET" => (200, vec![], serde_json::json!({"check_runs": []})),
+            _ => (201, vec![], serde_json::json!({"id": 4242})),
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let job = JobId("build".to_owned());
+        for (version, status) in [(1, "queued"), (2, "in_progress"), (3, "success")] {
+            seed_check_run_update(&shared, run_id, &job, version, status, None).await;
+        }
+
+        assert_eq!(drain_sender(&shared).await, 1);
+        let writes = check_run_writes(&requests);
+        assert_eq!(writes.len(), 1, "coalesced to one write: {writes:?}");
+        assert_eq!(writes[0].0, "POST");
+        assert_eq!(writes[0].2["status"], "completed");
+        assert_eq!(writes[0].2["conclusion"], "success");
         assert!(
-            runs.get(&run_id)
+            shared
+                .state
+                .backend
+                .lease_check_run_updates("probe", std::time::Duration::from_millis(1), 10)
+                .await
                 .unwrap()
-                .job_check_run_ids
-                .contains_key(&leg),
-            "a terminal report must mint the check it reports to"
+                .is_empty(),
+            "the sent row is deleted"
+        );
+    }
+
+    /// (d) a 429 with Retry-After parks the row for the advertised delay and
+    /// the next attempt succeeds.
+    #[tokio::test]
+    async fn sender_retries_after_retry_after_then_succeeds() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_stub = attempts.clone();
+        let (api, requests) = start_github_stub(move |method, _path, _body| {
+            if method == "GET" {
+                return (200, vec![], serde_json::json!({"check_runs": []}));
+            }
+            if attempts_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (
+                    429,
+                    vec![("retry-after", "1".to_owned())],
+                    serde_json::json!({"message": "You have exceeded a secondary rate limit"}),
+                )
+            } else {
+                (201, vec![], serde_json::json!({"id": 777}))
+            }
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let job = JobId("build".to_owned());
+        seed_check_run_update(&shared, run_id, &job, 1, "queued", None).await;
+
+        assert_eq!(drain_sender(&shared).await, 1);
+        assert_eq!(
+            check_run_writes(&requests).len(),
+            1,
+            "first attempt is throttled"
+        );
+        assert_eq!(
+            drain_sender(&shared).await,
+            0,
+            "the row is not due until Retry-After elapses"
+        );
+        assert_eq!(check_run_writes(&requests).len(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(1_150)).await;
+        assert_eq!(drain_sender(&shared).await, 1);
+        assert_eq!(
+            check_run_writes(&requests).len(),
+            2,
+            "retried and succeeded"
+        );
+        assert!(
+            shared
+                .state
+                .backend
+                .lease_check_run_updates("probe", std::time::Duration::from_millis(1), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the successful retry deletes the row"
+        );
+    }
+
+    /// (e) crash after POST before the id was saved: the next attempt finds
+    /// the existing check run (or the persisted job mapping) and PATCHes it;
+    /// it never POSTs a duplicate.
+    #[tokio::test]
+    async fn sender_reconciles_instead_of_second_post() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api, requests) = start_github_stub(|method, path, _body| {
+            if method == "GET" {
+                let existing = if path.contains("commits/") {
+                    serde_json::json!({"check_runs": [{
+                        "id": 7001,
+                        "name": "build",
+                        "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    }]})
+                } else {
+                    serde_json::json!({})
+                };
+                return (200, vec![], existing);
+            }
+            (200, vec![], serde_json::json!({"id": 7001}))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let job = JobId("build".to_owned());
+
+        // The check run already exists on GitHub but the row has no id.
+        seed_check_run_update(&shared, run_id, &job, 1, "queued", None).await;
+        assert_eq!(drain_sender(&shared).await, 1);
+        let writes = check_run_writes(&requests);
+        assert_eq!(writes.len(), 1, "one write only: {writes:?}");
+        assert_eq!(writes[0].0, "PATCH");
+        assert!(writes[0].1.ends_with("/check-runs/7001"));
+        assert_eq!(
+            shared
+                .state
+                .backend
+                .job_check_run_id(run_id, &job)
+                .await
+                .unwrap(),
+            Some(7001),
+            "the reconciled id is persisted"
+        );
+
+        // A persisted job mapping alone (no GitHub lookup) also PATCHes.
+        let (_temp2, shared2, run_id2) = mint_fixture(true, None).await;
+        shared2
+            .state
+            .backend
+            .set_job_check_run(run_id2, &job, 7002)
+            .await
+            .unwrap();
+        seed_check_run_update(&shared2, run_id2, &job, 1, "queued", None).await;
+        let before = requests.lock().len();
+        assert_eq!(drain_sender(&shared2).await, 1);
+        let writes: Vec<_> = requests
+            .lock()
+            .iter()
+            .skip(before)
+            .filter(|(method, _, _)| method == "POST" || method == "PATCH")
+            .cloned()
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "PATCH");
+        assert!(writes[0].1.ends_with("/check-runs/7002"));
+        assert!(
+            !requests
+                .lock()
+                .iter()
+                .skip(before)
+                .any(|(method, _, _)| method == "POST"),
+            "no duplicate POST"
+        );
+    }
+
+    /// (h) a throttled installation parks only its own rows: the other
+    /// installation's check run succeeds in the same batch.
+    #[tokio::test]
+    async fn throttled_installation_does_not_block_another() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api, requests) = start_github_stub(|method, path, _body| {
+            if path.contains("/access_tokens") {
+                let token = if path.contains("/101/") {
+                    "ghs-a"
+                } else {
+                    "ghs-b"
+                };
+                return (
+                    201,
+                    vec![],
+                    serde_json::json!({"token": token, "expires_at": "2099-01-01T00:00:00Z"}),
+                );
+            }
+            if method == "GET" && path.starts_with("/app/installations/") {
+                let login = if path.ends_with("/101") {
+                    "owner-a"
+                } else {
+                    "owner-b"
+                };
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"account": {"login": login}}),
+                );
+            }
+            if method == "GET" {
+                return (200, vec![], serde_json::json!({"check_runs": []}));
+            }
+            if path.starts_with("/repos/owner-a/") {
+                let reset = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60)
+                    .to_string();
+                return (
+                    403,
+                    vec![
+                        ("x-ratelimit-remaining", "0".to_owned()),
+                        ("x-ratelimit-reset", reset),
+                    ],
+                    serde_json::json!({"message": "API rate limit exceeded"}),
+                );
+            }
+            (201, vec![], serde_json::json!({"id": 900}))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let mut app_a = crate::github_app::GitHubAppCredentials::for_tests(
+            "424",
+            key.clone(),
+            crate::github_app::MintFailurePolicy::LocalJwt,
+        );
+        app_a.installation_id = Some(101);
+        let mut app_b = crate::github_app::GitHubAppCredentials::for_tests(
+            "425",
+            key,
+            crate::github_app::MintFailurePolicy::LocalJwt,
+        );
+        app_b.installation_id = Some(202);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![app_a.clone(), app_b],
+            default_index: 0,
+        });
+        state.github_app = Some(app_a);
+        let shared = state.shared();
+        let job = JobId("build".to_owned());
+        let mut run_ids = Vec::new();
+        for repo in ["owner-a/repo", "owner-b/repo"] {
+            let submission = WorkflowSubmission {
+                workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n".to_owned(),
+                event: "push".to_owned(),
+                repository: repo.to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                resolved_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
+                ..Default::default()
+            };
+            let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
+            shared
+                .state
+                .backend
+                .set_reports_check_runs(accepted.run_id, true)
+                .await
+                .unwrap();
+            let payload = serde_json::json!({
+                "repository": repo,
+                "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "job_id": "build",
+                "status": "queued",
+                "name": "build",
+            });
+            shared
+                .state
+                .backend
+                .enqueue_check_run_update(crate::control::types::CheckRunUpdateInput {
+                    run_id: accepted.run_id,
+                    job_id: job.clone(),
+                    installation_id: 0,
+                    check_run_id: None,
+                    version: 1,
+                    payload,
+                })
+                .await
+                .unwrap();
+            run_ids.push(accepted.run_id);
+        }
+
+        assert_eq!(drain_sender(&shared).await, 2, "both rows are leased");
+        let writes: Vec<_> = check_run_writes(&requests)
+            .into_iter()
+            .filter(|(_, path, _)| path.contains("/check-runs"))
+            .collect();
+        assert_eq!(
+            writes.len(),
+            2,
+            "one write per installation: all={:?}",
+            check_run_writes(&requests)
+        );
+        let a_writes = writes
+            .iter()
+            .filter(|(_, path, _)| path.starts_with("/repos/owner-a/"))
+            .count();
+        let b_writes = writes
+            .iter()
+            .filter(|(_, path, _)| path.starts_with("/repos/owner-b/"))
+            .count();
+        assert_eq!((a_writes, b_writes), (1, 1));
+        let writes_before = writes.len();
+        assert_eq!(
+            drain_sender(&shared).await,
+            0,
+            "the throttled installation's row is deferred, not retried immediately"
+        );
+        assert_eq!(
+            check_run_writes(&requests)
+                .iter()
+                .filter(|(_, path, _)| path.contains("/check-runs"))
+                .count(),
+            writes_before
+        );
+        // B's row is gone; A's is parked until the reset (not due).
+        assert!(
+            shared
+                .state
+                .backend
+                .lease_check_run_updates("probe", std::time::Duration::from_millis(1), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the successful installation's row is deleted and the throttled one is not due"
+        );
+    }
+
+    /// (j) a run that vanished before the sender ran still delivers its final
+    /// state from the payload; permanent errors drop the row.
+    #[tokio::test]
+    async fn sender_delivers_vanished_run_and_drops_permanent_failures() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let statuses = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u16>::new()));
+        let statuses_for_stub = statuses.clone();
+        let (api, requests) = start_github_stub(move |method, _path, _body| {
+            if method == "GET" {
+                return (200, vec![], serde_json::json!({"check_runs": []}));
+            }
+            let status = statuses_for_stub.lock().pop().unwrap_or(201);
+            (status, vec![], serde_json::json!({"id": 555}))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+        let job = JobId("build".to_owned());
+
+        // No `runs` row at all: an archived/deleted run, or the synthetic
+        // workflow-failure shape.
+        seed_check_run_update(&shared, RunId::new(), &job, 1, "success", None).await;
+        assert_eq!(drain_sender(&shared).await, 1);
+        let writes = check_run_writes(&requests);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].2["status"], "completed");
+        assert_eq!(writes[0].2["conclusion"], "success");
+
+        // A permanent 422 drops the row after one attempt.
+        statuses.lock().push(422);
+        seed_check_run_update(&shared, RunId::new(), &job, 1, "queued", None).await;
+        assert_eq!(drain_sender(&shared).await, 1);
+        assert!(
+            shared
+                .state
+                .backend
+                .lease_check_run_updates("probe", std::time::Duration::from_millis(1), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a 422 must drop the row instead of retrying forever"
+        );
+    }
+
+    /// (a) a webhook push fanning out to many jobs returns without any inline
+    /// GitHub Checks API call; the durable queue carries the reports instead.
+    #[tokio::test]
+    async fn webhook_fanout_makes_zero_inline_check_calls() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api, requests) =
+            start_github_stub(|_method, _path, _body| (200, vec![], serde_json::json!({}))).await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        let mut workflow = "on: push\njobs:\n".to_owned();
+        for index in 0..8 {
+            workflow.push_str(&format!(
+                "  job{index}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo {index}\n"
+            ));
+        }
+        std::fs::write(ws_dir.join(".github/workflows/build.yml"), workflow).unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        assert_eq!(
+            fixture.post("delivery-check-fanout", Some("push")).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .all(|(_, path, _)| !path.contains("check-runs")),
+            "the webhook handler must not call the Checks API inline: {:?}",
+            requests.lock()
+        );
+        fixture.drain().await;
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-check-fanout")
+            .await
+            .unwrap()
+            .expect("delivery row");
+        assert_eq!(record.state, WebhookDeliveryStatus::Done);
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        assert_eq!(
+            inner.runs.values().next().unwrap().jobs.len(),
+            8,
+            "all eight jobs fan out"
+        );
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .all(|(_, path, _)| !path.contains("check-runs")),
+            "delivery must not call the Checks API inline either"
         );
     }
 

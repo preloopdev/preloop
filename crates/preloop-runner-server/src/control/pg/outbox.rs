@@ -119,10 +119,14 @@ impl PgBackend {
         let client = self.writer().await?;
         client
             .execute(
-                "DELETE FROM outbox_events WHERE (event_id, created_at) IN \
-                 (SELECT event_id, created_at FROM outbox_events \
-                  WHERE created_at < now() - make_interval(secs => $1) \
-                  ORDER BY created_at LIMIT $2)",
+                "DELETE FROM outbox_events o WHERE (o.event_id,o.created_at) IN \
+                 (SELECT e.event_id,e.created_at FROM outbox_events e \
+                  WHERE e.created_at < now() - make_interval(secs => $1) \
+                    AND (NOT EXISTS (SELECT 1 FROM consumer_offsets) OR \
+                         (e.txid,e.event_id) <= \
+                         (SELECT last_txid,last_event_id FROM consumer_offsets \
+                          ORDER BY last_txid,last_event_id LIMIT 1)) \
+                  ORDER BY e.created_at LIMIT $2)",
                 &[&older_than.as_secs_f64(), &(limit as i64)],
             )
             .await
