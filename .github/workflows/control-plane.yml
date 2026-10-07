@@ -114,3 +114,10 @@ jobs:
           leaked=$(docker exec postgres psql "$PRELOOP_TEST_POSTGRES_URL" -Atc \
             "select count(*) from pg_database where datname like 'preloop_t_%'")
           test "$leaked" -eq 0 || { echo "leaked $leaked test databases" >&2; exit 1; }
+      - name: Remove PostgreSQL container
+        # The self-hosted runner host is reused across jobs, and the container
+        # is detached: leave it behind and the next job's
+        # `docker run --name postgres` fails with "name is already in use".
+        # `always()` so a failing test or schema step still cleans up.
+        if: always()
+        run: docker rm -f postgres || true
