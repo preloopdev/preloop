@@ -1,4 +1,17 @@
-//! Toolchain and base-image resolution for disposable job environments.
+//! Base-image selection for disposable job environments.
+//!
+//! A job VM is forked from a golden. There are exactly two golden sources:
+//!
+//! * the **official** packed golden ([`OFFICIAL_GOLDEN`]) — the published
+//!   preloop runner image, downloaded and verified per architecture, and
+//!   mandatory: nothing is baked locally when it cannot be fetched;
+//! * a **configured image** — whatever `PRELOOP_RUNNER_BASE_IMAGE` or
+//!   `[golden] base_image` names, baked into a golden as-is plus the
+//!   GitHub-runner machinery (see `golden_contract_script`).
+//!
+//! There is no third source: the stock Ubuntu bake (apt baseline, language
+//! toolchains, package pins) is gone, and with it the "curated" classification
+//! that used to decide between it and a custom image.
 
 use preloop_gha_protocol::oci_image_ref;
 use serde::{Deserialize, Serialize};
@@ -68,407 +81,100 @@ pub fn scan_workflow_images(workspace: &Path) -> Vec<String> {
     images.into_iter().collect()
 }
 
-/// A toolchain that must be available in a job VM.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum ToolchainLayer {
-    /// Node.js release (for example, `22`, `20.11.0`, or `lts/*`).
-    Node(String),
-    /// Rust channel or release (for example, `stable`, `nightly`, or `1.85.1`).
-    Rust(String),
-    /// Python release (for example, `3.12` or `3.11.8`).
-    Python(String),
-    /// Go release (for example, `1.24` or `1.23.4`).
-    Go(String),
-}
-
-impl std::fmt::Display for ToolchainLayer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Node(version) => write!(f, "node {version}"),
-            Self::Rust(channel) => write!(f, "rust {channel}"),
-            Self::Python(version) => write!(f, "python {version}"),
-            Self::Go(version) => write!(f, "go {version}"),
-        }
-    }
-}
-
-impl ToolchainLayer {
-    /// Return shell commands to install this toolchain in a SmolVM.
-    ///
-    /// Commands are represented as argv vectors, as expected by
-    /// [`preloop_vm::VmProvider::exec`]. Commands requiring a pipe are run
-    /// through `sh -c` so that the returned vectors remain valid argv.
-    pub fn install_commands(&self) -> Vec<Vec<String>> {
-        match self {
-            Self::Node(version) => {
-                // Exact-version tarball install, not the apt series: a workflow
-                // pinning `22.23.1` gets exactly that, and a major (`22`) or
-                // `lts/*` request resolves against the nodejs.org release
-                // index at bake time (GitHub's setup-node resolves the same
-                // way, so this matches hosted behavior instead of floating
-                // with the apt archive).
-                // The version is interpolated into a `sh -c` script, so it
-                // must be allowlisted (same `safe_component` the Rust and Go
-                // layers use): a workflow-controlled value carrying shell
-                // metacharacters would execute arbitrary commands in the
-                // provisioning VM.
-                let version = safe_component(version.trim().trim_start_matches('v'));
-                vec![
-                    vec![
-                        "sh".into(),
-                        "-c".into(),
-                        format!(
-                            "set -e\n\
-                             WANT=v{version}\n\
-                             case '{version}' in lts/*) WANT='lts/*' ;; esac\n\
-                             VERSION=$(curl -fsSL https://nodejs.org/dist/index.json | python3 -c '\n\
-                             import json, sys\n\
-                             want = sys.argv[1]\n\
-                             idx = json.load(sys.stdin)\n\
-                             print(next((e[\"version\"] for e in idx if (want == \"lts/*\" and e[\"lts\"]) or e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
-                             ' \"$WANT\")\n\
-                             [ -n \"$VERSION\" ] || {{ echo \"no node release matching {version}\" >&2; exit 1; }}\n\
-                             arch=$(uname -m)\n\
-                             case \"$arch\" in\n\
-                               x86_64) NODE_ARCH=x64 ;;\n\
-                               aarch64|arm64) NODE_ARCH=arm64 ;;\n\
-                               *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
-                             esac\n\
-                             curl -fsSL \"https://nodejs.org/dist/$VERSION/node-$VERSION-linux-$NODE_ARCH.tar.gz\" \\\n\
-                               | tar -xz --strip-components=1 -C /usr/local\n\
-                             node --version"
-                        ),
-                    ],
-                ]
-            }
-            Self::Rust(channel) => vec![
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        // Pin the rustup installer itself (the `sh.rustup.rs`
-                        // wrapper floats with every rustup release). The
-                        // channel stays workflow-driven — `stable` resolves
-                        // at bake time exactly as GitHub resolves it at job
-                        // time — and the resolved version is recorded in the
-                        // golden's bake manifest.
-                        "set -e\n\
-                         arch=$(uname -m)\n\
-                         case \"$arch\" in\n\
-                           x86_64) RUST_ARCH=x86_64 ;;\n\
-                           aarch64|arm64) RUST_ARCH=aarch64 ;;\n\
-                           *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
-                         esac\n\
-                         export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo\n\
-                         curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
-                         chmod +x /tmp/rustup-init\n\
-                         /tmp/rustup-init -y --profile minimal --default-toolchain {} --component rustfmt,clippy\n\
-                         rm -f /tmp/rustup-init",
-                        crate::RUSTUP_VERSION,
-                        safe_component(channel)
-                    ),
-                ],
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    // Run steps execute with `bash --noprofile --norc`, so
-                    // profile.d PATH exports are never sourced. The toolchain
-                    // lives at the fixed system addresses exported by
-                    // `guest_env_prefix` (RUSTUP_HOME / CARGO_HOME above):
-                    // the bake runs as root while job steps run as the
-                    // unprivileged runner user, and rustup obeys those
-                    // variables verbatim, so a $HOME-derived location is
-                    // simply unreachable across that boundary (/root is
-                    // 0700). Symlink the shims into /usr/local/bin so they
-                    // resolve on the default system PATH for every step.
-                    "ln -sf /usr/local/cargo/bin/cargo /usr/local/bin/cargo; ln -sf /usr/local/cargo/bin/cargo-fmt /usr/local/bin/cargo-fmt; ln -sf /usr/local/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy; ln -sf /usr/local/cargo/bin/rustc /usr/local/bin/rustc; ln -sf /usr/local/cargo/bin/rustdoc /usr/local/bin/rustdoc; ln -sf /usr/local/cargo/bin/rustup /usr/local/bin/rustup".into(),
-                ],
-            ],
-            Self::Python(version) => {
-                let package = format!("python{}", version.trim());
-                vec![vec![
-                    "apt-get".into(),
-                    "install".into(),
-                    "-y".into(),
-                    package,
-                    "python3-pip".into(),
-                ]]
-            }
-            Self::Go(version) => vec![
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        // `go.mod` carries a minimum (`go 1.24`), not a tarball
-                        // version — resolve it against the go.dev release index
-                        // so `go1.24` becomes the newest 1.24.x and the install
-                        // is exact and reproducible.
-                        "set -e\n\
-                         WANT='{}'\n\
-                         VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | python3 -c '\n\
-                         import json, sys\n\
-                         want = sys.argv[1]\n\
-                         if not want.startswith(\"go\"):\n    \
-                             want = \"go\" + want\n\
-                         idx = json.load(sys.stdin)\n\
-                         print(next((e[\"version\"] for e in idx if e[\"version\"] == want or e[\"version\"].startswith(want + \".\")), \"\"))\n\
-                         ' \"$WANT\")\n\
-                         [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
-                         arch=$(uname -m)\n\
-                         case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
-                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
-                        safe_component(version)
-                    ),
-                ],
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    // The Go tarball extracts to /usr/local/go/bin, which is
-                    // not on the default system PATH. Step shells run with
-                    // `bash --noprofile --norc`, so profile.d exports never
-                    // apply; symlink the binaries like the Rust layer does.
-                    "ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt".into(),
-                ],
-            ],
-        }
-    }
-
-    /// Binary that must exist on the default PATH once this layer is
-    /// installed. Verified after install so a provision interrupted mid-way
-    /// (or a toolchain that silently failed) fails the machine instead of
-    /// running the job without the tool it asked for.
-    pub fn verify_binary(&self) -> &'static str {
-        match self {
-            Self::Node(_) => "node",
-            Self::Rust(_) => "cargo",
-            Self::Python(_) => "python3",
-            Self::Go(_) => "go",
-        }
-    }
-
-    /// Shell predicate proving this exact layer is usable.
-    pub fn verify_command(&self) -> String {
-        match self {
-            Self::Rust(channel) => {
-                let channel = safe_component(channel);
-                format!(
-                    "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && \
-                     command -v cargo >/dev/null && \
-                     rustup run {channel} rustc --version >/dev/null && \
-                     rustup run {channel} cargo-fmt --version >/dev/null && \
-                     rustup run {channel} cargo-clippy --version >/dev/null"
-                )
-            }
-            Self::Go(_) => {
-                "export PATH=/usr/local/go/bin:$PATH && command -v go >/dev/null".to_owned()
-            }
-            _ => format!("command -v {} >/dev/null", self.verify_binary()),
-        }
-    }
-}
-
-/// Toolchains missing from the stock Ubuntu base and therefore baked once
-/// into the reusable golden instead of installed in every ephemeral job VM.
-pub fn curated_toolchains() -> Vec<ToolchainLayer> {
-    vec![
-        ToolchainLayer::Rust(crate::RUST_TOOLCHAIN_VERSION.into()),
-        ToolchainLayer::Go("1.26".into()),
-    ]
-}
-
-/// Digest-pinned Ubuntu base images.
+/// The sentinel naming the official packed golden.
 ///
-/// The floating tags (`ubuntu:24.04`) move whenever Canonical publishes a
-/// point release, so two goldens baked a month apart would differ for no
-/// reason anyone recorded. These pins are the provenance: bumping one is a
-/// deliberate, reviewable change. Digests are the registry manifest-list
-/// digests, valid for both x86_64 and arm64 guests.
-pub const UBUNTU_24_04_PIN: &str = crate::UBUNTU_24_04_BASE;
-pub const UBUNTU_22_04_PIN: &str = crate::UBUNTU_22_04_BASE;
-pub const OFFICIAL_RUNNER_IMAGE_AMD64_PIN: &str = crate::OFFICIAL_RUNNER_IMAGE_BASE_AMD64;
-pub const OFFICIAL_RUNNER_IMAGE_ARM64_PIN: &str = crate::OFFICIAL_RUNNER_IMAGE_BASE_ARM64;
+/// `runs-on: ubuntu-latest`/`ubuntu-24.04` resolve to this, and so does a pool
+/// with no image configured. It is deliberately not an OCI reference: the
+/// official golden is fetched as a packed `.smolmachine` (per architecture,
+/// digest-pinned), never built from a base image, and the sentinel keeps that
+/// distinct from "an operator pointed us at an image".
+pub const OFFICIAL_GOLDEN: &str = "preloop-official-golden";
 
-/// The default base image for GitHub-runner-labelled jobs.
-pub const DEFAULT_BASE_IMAGE: &str = UBUNTU_24_04_PIN;
-
-/// Guest path of the apt-index freshness marker baked into golden images.
-/// Written by `prepare_artifact` after the baseline install; forks inherit
-/// it through the packed rootfs (unlike post-create exec writes, which
-/// snapshots do not carry).
-pub const APT_INDICES_MARKER_PATH: &str = "/etc/preloop/apt-indices-baked-at";
-/// Fallback freshness policy when a marker lacks its policy line.
-pub const APT_INDICES_DEFAULT_MAX_AGE_DAYS: u64 = 7;
-
-/// Parse an apt-index marker into `(age_days, max_age_days)`.
-///
-/// The marker is `YYYY-MM-DD` on line one with an optional policy age on
-/// line two. `today_days` is days since the Unix epoch. Returns `None` when
-/// the marker is absent or malformed — the caller then behaves exactly as
-/// before markers existed (full refresh, no warning).
-pub fn apt_marker_age_days(marker: &str, today_days: u64) -> Option<(u64, u64)> {
-    let mut lines = marker.lines().map(str::trim);
-    let baked = days_from_civil_date(lines.next()?)?;
-    let max_age = lines
-        .next()
-        .map_or(APT_INDICES_DEFAULT_MAX_AGE_DAYS, |line| {
-            line.parse::<u64>()
-                .ok()
-                .filter(|days| *days > 0)
-                .unwrap_or(APT_INDICES_DEFAULT_MAX_AGE_DAYS)
-        });
-    Some((today_days.saturating_sub(baked), max_age))
+/// Whether a resolved base image names the official packed golden.
+pub fn is_official_golden(base: &str) -> bool {
+    base == OFFICIAL_GOLDEN
 }
 
-/// Days since the Unix epoch for a civil date, or `None` if invalid.
-/// (Howard Hinnant's days_from_civil; std has no civil-date type and this
-/// crate has no chrono dependency for three lines of math.)
-fn days_from_civil_date(text: &str) -> Option<u64> {
-    let mut parts = text.split('-');
-    let (year, month, day) = (
-        parts.next()?.parse::<i64>().ok()?,
-        parts.next()?.parse::<u64>().ok()?,
-        parts.next()?.parse::<u64>().ok()?,
-    );
-    if parts.next().is_some() || !(1..=12).contains(&month) {
-        return None;
-    }
-    let leap = month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-    let max_day = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if day == 0 || day > max_day {
-        return None;
-    }
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let yoe = (year - era * 400) as u64;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era as u64)
-        .checked_mul(146097)?
-        .checked_add(doe)?
-        .checked_sub(719468)
-}
-
-/// The plain repository:tag of an image reference, ignoring any `@digest`.
-pub fn base_name(image_ref: &str) -> &str {
-    image_ref.split('@').next().unwrap_or(image_ref)
-}
-
-/// Whether an image reference is one of Preloop's stock Ubuntu bases.
-pub fn is_stock_base_image(image_ref: &str) -> bool {
-    matches!(
-        base_name(image_ref),
-        "ubuntu:24.04"
-            | "ubuntu:22.04"
-            | "mirror.gcr.io/library/ubuntu:24.04"
-            | "mirror.gcr.io/library/ubuntu:22.04"
-    )
-}
-
-/// Resolved base image and toolchains for one job.
+/// Resolved base image for one job: a golden source plus its fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
-    /// Base OCI image or VM image identifier.
+    /// [`OFFICIAL_GOLDEN`] or the configured image reference.
     pub base: String,
-    /// Sorted, deduplicated toolchain layers.
-    pub toolchains: Vec<ToolchainLayer>,
-    /// Whether Preloop's complete package bake applies to this base.
-    pub curated: bool,
-    /// SHA-256 hex digest of the normalized base and toolchain list.
+    /// SHA-256 hex digest of everything the golden for this base depends on.
     pub fingerprint: String,
 }
 
 impl EnvironmentSpec {
-    /// Build a normalized environment specification and compute its fingerprint.
-    pub fn new(base: String, toolchains: Vec<ToolchainLayer>) -> Self {
-        Self::from_parts(base, toolchains, true)
-    }
-
     /// Resolve the environment for a base image.
     ///
-    /// Stock Ubuntu bases receive the complete Preloop package bake. Official
-    /// runner snapshots and other custom images are used as-is; workflow
-    /// `setup-*` actions select exact language-tool versions at job time.
+    /// The image is used exactly as it is: no packages, toolchains, PATH or
+    /// environment overrides. Workflow `setup-*` actions select exact language
+    /// versions at job time, as they do on GitHub-hosted runners.
     pub fn for_base(base: String) -> Self {
-        let curated = is_stock_base_image(&base);
-        let toolchains = if curated {
-            curated_toolchains()
-        } else {
-            Vec::new()
-        };
-        Self::from_parts(base, toolchains, curated)
-    }
-
-    /// Replace the base image, recomputing the fingerprint.
-    pub fn with_base(mut self, base: String) -> Self {
-        self.base = base;
-        Self::from_parts(self.base.clone(), self.toolchains.clone(), self.curated)
+        Self::from_base(base)
     }
 
     /// Resolve a queued job's base image from its `runs-on` labels.
     ///
-    /// Only a label that *names* a hosted Ubuntu image selects a stock pin.
-    /// Everything else — `[self-hosted, preloop-cpane]`, `[self-hosted,
+    /// Only a label that *names* a hosted Ubuntu image selects the official
+    /// golden. Everything else — `[self-hosted, preloop-cpane]`, `[self-hosted,
     /// runner-sync]`, any private label set — keeps `configured`, the image
     /// this pool was built around.
     ///
-    /// Falling back to the stock pin instead is what wedged production: a
-    /// self-hosted-only label set resolved to stock Ubuntu, which is
-    /// `curated`, so every slot tried to bake the full hosted apt baseline
-    /// against the live Ubuntu archive. That bake fails whenever the archive
-    /// has moved past the pinned versions (observed: `libatk1.0-0t64`,
-    /// clang-16/17/18, gcc-13/14 all unlocatable), so slots burned on
-    /// doomed bakes and the pool served one runner instead of three while
-    /// the configured golden sat ready and forkable.
+    /// The label set used to resolve to the stock `mirror.gcr.io/library/ubuntu`
+    /// pin, which was "curated" and therefore sent every slot into the hosted
+    /// apt baseline against the live Ubuntu archive. That bake fails whenever
+    /// the archive has moved past the pinned versions (observed:
+    /// `libatk1.0-0t64`, clang-16/17/18, gcc-13/14 all unlocatable), so slots
+    /// burned on doomed bakes and the pool served one runner instead of three
+    /// while the configured golden sat ready and forkable. The official golden
+    /// is the hosted image, so the mapping is now direct and cannot fail that
+    /// way.
+    ///
+    /// `ubuntu-22.04` maps nowhere: the archive baseline that used to back it
+    /// was part of the deleted stock bake, so the label keeps `configured`
+    /// instead of silently selecting a 24.04 image.
     pub fn base_for_labels(runs_on: &[String], configured: &str) -> String {
         if runs_on.iter().any(|label| {
             let label = label.to_ascii_lowercase();
             label.contains("ubuntu-24.04") || label.contains("ubuntu-latest")
         }) {
-            return UBUNTU_24_04_PIN.into();
-        }
-        if runs_on
-            .iter()
-            .any(|label| label.to_ascii_lowercase().contains("ubuntu-22.04"))
-        {
-            return UBUNTU_22_04_PIN.into();
+            return OFFICIAL_GOLDEN.into();
         }
         configured.to_owned()
     }
 
-    fn from_parts(base: String, mut toolchains: Vec<ToolchainLayer>, curated: bool) -> Self {
-        toolchains.sort();
-        toolchains.dedup();
+    fn from_base(base: String) -> Self {
         let normalized = serde_json::json!({
             "base": &base,
-            "toolchains": &toolchains,
-            "curated": curated,
             // The pool only rebuilds when the fingerprint-suffixed artifact
             // file is missing, so bake-content changes MUST invalidate the
-            // fingerprint or the pool silently keeps the old golden forever
-            // (packages, resolv.conf, nvm, tool pins all live in the bake
-            // script, which interpolates the versions.toml pins). Custom
-            // bases skip the bake entirely, so the fingerprint records that
-            // too.
-            "bake": if curated { crate::base_install_script() } else { String::new() },
+            // fingerprint or the pool silently keeps the old golden forever.
+            //
+            // The official golden is built by the release pipeline from a
+            // published runner image, not here: its identity is the digest
+            // pinned in `official_golden_reference`, so a freshly published
+            // golden is picked up (and an unchanged one is not re-downloaded).
+            // A configured image is baked locally, so its fingerprint is the
+            // bake contract itself — bump a step of `golden_contract_script`
+            // and every golden is rebuilt.
+            "golden": if is_official_golden(&base) {
+                crate::official_golden_reference()
+            } else {
+                crate::golden_contract_script(crate::DEFAULT_RUNNER_USER, crate::DEFAULT_RUNNER_UID)
+            },
             // Rosetta x86_64 translation exists only on Apple Silicon hosts.
-            // The packed-golden prep installs the amd64 loader + libc into
-            // arm64 goldens so dynamically linked x86_64 binaries run under
-            // it; the fingerprint records whether that shim is present so a
-            // host-class change re-preps the golden once instead of adopting
-            // a base built for the other class.
+            // The golden prep installs the amd64 loader + libc so dynamically
+            // linked x86_64 binaries run under it; the fingerprint records
+            // whether that shim is present so a host-class change re-preps the
+            // golden once instead of adopting a base built for the other class.
             "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-            // The packed artifact's baked runner resolves node through the
-            // bundle mount at the pins it was built against. A pin bump that
-            // left the fingerprint untouched would keep an artifact whose
-            // runner demands the previous version, so every JS action step
-            // fails with `bundled nodeXX is missing` against a bundle that is
-            // itself perfectly valid at the new pin.
+            // The golden's runner resolves node through the bundle mount at
+            // the pins it was built against. A pin bump that left the
+            // fingerprint untouched would keep a golden whose runner demands
+            // the previous version, so every JS action step fails with
+            // `bundled nodeXX is missing` against a bundle that is itself
+            // perfectly valid at the new pin.
             "node_externals": crate::node_externals::expected_runtimes()
                 .iter()
                 .map(|(runtime, version)| format!("{runtime}={version}"))
@@ -477,22 +183,8 @@ impl EnvironmentSpec {
         let bytes =
             serde_json::to_vec(&normalized).expect("normalized environment is serializable");
         let fingerprint = hex_digest(&bytes);
-        Self {
-            base,
-            toolchains,
-            curated,
-            fingerprint,
-        }
+        Self { base, fingerprint }
     }
-}
-
-fn safe_component(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/' | '*')
-        })
-        .collect()
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -505,227 +197,67 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
 
-    /// Hosted labels select a stock pin; a self-hosted label set keeps the
-    /// pool's own image. The last case is the production wedge: resolving
-    /// `[self-hosted, …]` to stock Ubuntu sent every slot into a curated
-    /// apt bake that the rolling archive can no longer satisfy.
+    /// Hosted labels select the official golden; a self-hosted label set keeps
+    /// the pool's own image. The last case is the production wedge described
+    /// on `base_for_labels`: resolving `[self-hosted, …]` to a stock Ubuntu pin
+    /// sent every slot into a curated apt bake that the rolling archive can no
+    /// longer satisfy.
     #[test]
-    fn labels_select_hosted_pins_and_otherwise_keep_the_configured_image() {
-        const CONFIGURED: &str = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795";
+    fn labels_select_the_official_golden_and_otherwise_keep_the_configured_image() {
+        const CONFIGURED: &str = "ghcr.io/acme/runner-image:ubuntu24";
         assert_eq!(
             EnvironmentSpec::base_for_labels(&["ubuntu-latest".into()], CONFIGURED),
-            UBUNTU_24_04_PIN
+            OFFICIAL_GOLDEN
         );
         assert_eq!(
             EnvironmentSpec::base_for_labels(&["ubuntu-24.04".into()], CONFIGURED),
-            UBUNTU_24_04_PIN
+            OFFICIAL_GOLDEN
         );
+        // No image configured: every label resolves to the official golden.
         assert_eq!(
-            EnvironmentSpec::base_for_labels(&["ubuntu-22.04".into()], CONFIGURED),
-            UBUNTU_22_04_PIN
+            EnvironmentSpec::base_for_labels(&["self-hosted".into()], OFFICIAL_GOLDEN),
+            OFFICIAL_GOLDEN
         );
         for labels in [
             vec!["self-hosted".to_owned()],
             vec!["self-hosted".to_owned(), "preloop-cpane".to_owned()],
             vec!["self-hosted".to_owned(), "runner-sync".to_owned()],
+            // The 22.04 archive baseline went with the stock bake: the label
+            // must keep the configured image rather than select a 24.04 one.
+            vec!["ubuntu-22.04".to_owned()],
         ] {
             assert_eq!(
                 EnvironmentSpec::base_for_labels(&labels, CONFIGURED),
                 CONFIGURED,
-                "{labels:?} must not be rebased onto a stock pin"
+                "{labels:?} must not be rebased onto another image"
             );
         }
     }
 
     #[test]
-    fn stock_base_pins_use_explicit_mirror_and_digest() {
-        for pin in [UBUNTU_24_04_PIN, UBUNTU_22_04_PIN] {
-            let digest = pin
-                .strip_prefix("mirror.gcr.io/library/ubuntu:")
-                .and_then(|reference| reference.split_once("@sha256:"))
-                .map(|(_, digest)| digest)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "stock image must use the explicit mirror.gcr.io registry and a sha256 digest: {pin}"
-                    )
-                });
-            assert_eq!(digest.len(), 64, "sha256 digest has the wrong length");
-            assert!(
-                digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "sha256 digest is not hexadecimal: {digest}"
-            );
-        }
-    }
-
-    #[test]
-    fn base_name_strips_digest() {
-        assert_eq!(base_name("ubuntu:24.04@sha256:abc"), "ubuntu:24.04");
-        assert_eq!(base_name("ubuntu:24.04"), "ubuntu:24.04");
-        assert_eq!(base_name(""), "");
-    }
-
-    #[test]
-    fn stock_base_detection_ignores_digest_but_rejects_custom_images() {
+    fn official_golden_is_the_only_sentinel() {
+        assert!(is_official_golden(OFFICIAL_GOLDEN));
         for image in [
+            "official",
+            "preloop-official-golden@sha256:abc",
+            "ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:abc",
             "ubuntu:24.04",
-            "ubuntu:24.04@sha256:abc",
-            "mirror.gcr.io/library/ubuntu:22.04@sha256:def",
         ] {
-            assert!(is_stock_base_image(image), "{image}");
-        }
-        for image in [
-            "ghcr.io/acme/runner-image:ubuntu24",
-            "ghcr.io/christopherhx/runner-images:ubuntu24-runner-large-latest-arm64",
-            "/tmp/custom.smolmachine",
-        ] {
-            assert!(!is_stock_base_image(image), "{image}");
+            assert!(!is_official_golden(image), "{image}");
         }
     }
 
+    /// Two configured images must not share a fingerprint, and the same image
+    /// must resolve to the same fingerprint on every call.
     #[test]
-    fn node_layer_install_uses_pinned_tarball() {
-        // The Node layer must never resolve through apt: exact versions are
-        // installed verbatim and major/lts requests resolve via the nodejs.org
-        // index, never the floating apt series.
-        let commands = ToolchainLayer::Node("20.11.0".into()).install_commands();
-        let script = commands[0].join(" ");
-        assert!(script.contains("nodejs.org/dist/index.json"));
-        assert!(script.contains("node-$VERSION-linux-$NODE_ARCH.tar.gz"));
-        assert!(!script.contains("nodesource"));
-        assert!(!script.contains("apt-get"));
-    }
-
-    #[test]
-    fn apt_marker_reports_age_against_baked_policy() {
-        // 2026-09-16 is day 20712; keep the arithmetic anchored to fixed
-        // values rather than the wall clock so the test never rots.
-        const TODAY: u64 = 20712;
-        assert_eq!(
-            apt_marker_age_days("2026-09-09\n7\n", TODAY),
-            Some((7, 7)),
-            "exactly at policy reads fresh-or-stale by strict greater-than"
-        );
-        assert_eq!(apt_marker_age_days("2026-09-08\n7\n", TODAY), Some((8, 7)));
-        assert_eq!(
-            apt_marker_age_days("2026-09-16\n", TODAY),
-            Some((0, APT_INDICES_DEFAULT_MAX_AGE_DAYS)),
-            "missing policy line falls back to the default"
-        );
-        assert_eq!(
-            apt_marker_age_days("2026-09-16\n0\n", TODAY),
-            Some((0, APT_INDICES_DEFAULT_MAX_AGE_DAYS)),
-            "zero policy is garbage, not instant-stale"
-        );
-    }
-
-    #[test]
-    fn apt_marker_rejects_impossible_dates() {
-        const TODAY: u64 = 20712;
-        for bad in [
-            "",
-            "yesterday\n7\n",
-            "2026-13-01\n7\n",
-            "2026-02-30\n7\n",
-            "2023-02-29\n7\n",
-        ] {
-            assert_eq!(apt_marker_age_days(bad, TODAY), None, "{bad:?}");
-        }
-        // Leap day parses; future bakes saturate at age zero.
-        assert_eq!(
-            apt_marker_age_days("2024-02-29\n7\n", TODAY),
-            Some((TODAY - 19782, 7))
-        );
-        assert_eq!(apt_marker_age_days("2026-09-20\n7\n", TODAY), Some((0, 7)));
-    }
-
-    #[test]
-    fn node_layer_version_rejects_shell_metacharacters() {
-        // A workflow-controlled `node-version` is interpolated into the
-        // `sh -c` provisioning script (`WANT=v{version}`, the case pattern,
-        // and the error message), so shell metacharacters would execute
-        // arbitrary commands inside the bake VM. The version must be
-        // allowlisted through the same `safe_component` used by the Rust and
-        // Go layers.
-        let payload = "22; touch /tmp/pwned; #";
-        let commands = ToolchainLayer::Node(payload.into()).install_commands();
-        let script = commands[0].join(" ");
-        // The raw payload must not survive into the script...
-        assert!(!script.contains("touch /tmp/pwned"));
-        assert!(!script.contains("22;"));
-        // ...and the sanitized version is still interpolated everywhere the
-        // original was (WANT, case, error message), never silently dropped.
-        assert!(script.contains("WANT=v22touch/tmp/pwned"));
-        assert!(script.contains("no node release matching 22touch/tmp/pwned"));
-    }
-
-    #[test]
-    fn rust_layer_install_uses_pinned_rustup() {
-        let commands = ToolchainLayer::Rust("stable".into()).install_commands();
-        let script = commands[0].join(" ");
-        assert!(script.contains(&format!(
-            "static.rust-lang.org/rustup/archive/{}",
-            crate::RUSTUP_VERSION
-        )));
-        assert!(script.contains("--profile minimal"));
-        assert!(script.contains("--default-toolchain stable"));
-        assert!(!script.contains("sh.rustup.rs"));
-    }
-
-    /// `cargo test --workspace` spawns `rustdoc` by bare name for doctests, so
-    /// the interpreter must be on the default PATH of a `bash --noprofile
-    /// --norc` step shell. Without the symlink the workspace test step fails
-    /// with `could not execute process rustdoc` after every real test passed.
-    #[test]
-    fn rust_layer_puts_rustdoc_on_default_path() {
-        let commands = ToolchainLayer::Rust("stable".into()).install_commands();
-        let script = commands[1].join(" ");
-        for binary in [
-            "cargo",
-            "cargo-fmt",
-            "cargo-clippy",
-            "rustc",
-            "rustdoc",
-            "rustup",
-        ] {
-            assert!(
-                script.contains(&format!("/usr/local/bin/{binary}")),
-                "{binary} must be linked onto the default PATH: {script}"
-            );
-        }
-    }
-
-    #[test]
-    fn go_layer_install_resolves_minimum_version() {
-        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
-        let script = commands[0].join(" ");
-        assert!(script.contains("go.dev/dl/?mode=json"));
-        assert!(script.contains("$VERSION.linux"));
-        assert!(script.contains("tar -C /usr/local -xzf -"));
-        assert!(!script.contains("go1.24.linux")); // never a raw minimum
-    }
-
-    #[test]
-    fn go_layer_puts_binary_on_default_path() {
-        // The Go tarball extracts to /usr/local/go/bin, which is not on the
-        // default PATH of `bash --noprofile --norc` step shells, so `go` and
-        // `gofmt` would be unresolvable in job steps without the symlinks.
-        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
-        assert_eq!(commands.len(), 2);
-        let script = commands[1].join(" ");
-        assert!(script.contains("ln -sf /usr/local/go/bin/go /usr/local/bin/go"));
-        assert!(script.contains("ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"));
-    }
-
-    #[test]
-    fn with_base_recomputes_fingerprint() {
-        let spec = EnvironmentSpec::new("ubuntu:24.04".into(), curated_toolchains());
-        let original_fingerprint = spec.fingerprint.clone();
-        let rebased = spec.clone().with_base("ubuntu:22.04".into());
-        assert_eq!(rebased.base, "ubuntu:22.04");
-        assert_eq!(rebased.toolchains, spec.toolchains);
-        assert_ne!(rebased.fingerprint, original_fingerprint);
+    fn configured_images_fingerprint_deterministically_per_image() {
+        let first = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".into());
+        let second = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".into());
+        let other = EnvironmentSpec::for_base("ghcr.io/acme/runner:2".into());
+        assert_eq!(first, second);
+        assert_ne!(first.fingerprint, other.fingerprint);
+        assert_eq!(first.base, "ghcr.io/acme/runner:latest");
     }
 
     /// The artifact filename is keyed by this fingerprint, and the artifact's
@@ -734,7 +266,7 @@ mod tests {
     /// serving an artifact whose runner demands a version no longer shipped.
     #[test]
     fn fingerprint_covers_the_node_externals_pins() {
-        let spec = EnvironmentSpec::for_base("ubuntu:24.04".into());
+        let spec = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".into());
         let pins: Vec<String> = crate::node_externals::expected_runtimes()
             .iter()
             .map(|(runtime, version)| format!("{runtime}={version}"))
@@ -744,10 +276,11 @@ mod tests {
         // Recompute the digest with a bumped pin: it must not collide.
         let bumped: Vec<String> = pins.iter().map(|pin| format!("{pin}-bumped")).collect();
         let normalized = serde_json::json!({
-            "base": "ubuntu:24.04",
-            "toolchains": &spec.toolchains,
-            "curated": spec.curated,
-            "bake": if spec.curated { crate::base_install_script() } else { String::new() },
+            "base": "ghcr.io/acme/runner:latest",
+            "golden": crate::golden_contract_script(
+                crate::DEFAULT_RUNNER_USER,
+                crate::DEFAULT_RUNNER_UID
+            ),
             "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
             "node_externals": bumped,
         });
@@ -758,141 +291,60 @@ mod tests {
         );
     }
 
-    /// Stock bases get Preloop's complete bake, while official runner
-    /// snapshots and arbitrary custom images stay untouched.
+    /// The fingerprint of a configured image is the bake contract: changing a
+    /// contract step must rebuild the golden, and the official golden must not
+    /// be keyed on that contract (it is baked by the release pipeline, so a
+    /// contract change must not re-download an unchanged artifact).
     #[test]
-    fn for_base_selects_only_required_layers() {
-        let stock = EnvironmentSpec::for_base(UBUNTU_24_04_PIN.to_owned());
-        assert!(stock.curated, "stock bases must carry the curated bake");
-        assert!(!stock.toolchains.is_empty());
-
-        let official = EnvironmentSpec::for_base(OFFICIAL_RUNNER_IMAGE_AMD64_PIN.to_owned());
-        assert!(
-            !official.curated,
-            "official images already contain packages"
-        );
-        assert!(
-            official.toolchains.is_empty(),
-            "official runner images must resolve workflow toolchains through setup actions"
-        );
-
-        let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
-        assert!(!custom.curated, "custom bases must not be curated");
-        assert!(
-            custom.toolchains.is_empty(),
-            "custom bases must run without the curated toolchain layer"
-        );
+    fn fingerprint_tracks_the_bake_contract_for_configured_images_only() {
+        let contract =
+            crate::golden_contract_script(crate::DEFAULT_RUNNER_USER, crate::DEFAULT_RUNNER_UID);
+        let spec = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".into());
+        let normalized = serde_json::json!({
+            "base": "ghcr.io/acme/runner:latest",
+            "golden": format!("{contract}\ntrue\n"),
+            "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            "node_externals": crate::node_externals::expected_runtimes()
+                .iter()
+                .map(|(runtime, version)| format!("{runtime}={version}"))
+                .collect::<Vec<_>>(),
+        });
         assert_ne!(
-            stock.fingerprint, custom.fingerprint,
-            "the bake decision must invalidate the golden fingerprint"
+            spec.fingerprint,
+            hex_digest(&serde_json::to_vec(&normalized).unwrap()),
+            "a contract change must invalidate a configured image's golden"
         );
 
-        assert!(EnvironmentSpec::for_base(UBUNTU_22_04_PIN.to_owned()).curated);
-    }
-
-    #[test]
-    fn curated_toolchains_is_fixed_and_deduped() {
-        let first = curated_toolchains();
-        let second = curated_toolchains();
-        assert_eq!(first, second, "the curated set must be deterministic");
+        let official = EnvironmentSpec::for_base(OFFICIAL_GOLDEN.into());
+        let normalized = serde_json::json!({
+            "base": OFFICIAL_GOLDEN,
+            "golden": crate::official_golden_reference(),
+            "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+            "node_externals": crate::node_externals::expected_runtimes()
+                .iter()
+                .map(|(runtime, version)| format!("{runtime}={version}"))
+                .collect::<Vec<_>>(),
+        });
         assert_eq!(
-            first.iter().collect::<BTreeSet<_>>().len(),
-            first.len(),
-            "no duplicate toolchains"
+            official.fingerprint,
+            hex_digest(&serde_json::to_vec(&normalized).unwrap()),
+            "the official golden is keyed by its published reference"
         );
-        // The repository CI pin is compiled from versions.toml and baked into
-        // stock goldens; changing it therefore changes the environment
-        // fingerprint and forces a rebuild.
-        assert!(first.contains(&ToolchainLayer::Rust(crate::RUST_TOOLCHAIN_VERSION.into())));
-        assert!(first.contains(&ToolchainLayer::Go("1.26".into())));
     }
 
     #[test]
-    fn install_commands_are_non_empty() {
-        for layer in [
-            ToolchainLayer::Node("22".into()),
-            ToolchainLayer::Rust("stable".into()),
-            ToolchainLayer::Python("3.12".into()),
-            ToolchainLayer::Go("1.24".into()),
-        ] {
-            assert!(!layer.install_commands().is_empty());
-        }
-    }
-
-    /// Rust is baked into fixed system homes, while bare provider `exec`
-    /// commands run as root with HOME=/root. Verification must select the same
-    /// homes as installation and job execution or it falsely reports the
-    /// installed toolchain missing, reinstalls it, then fails the same probe.
-    #[test]
-    fn rust_verification_uses_the_baked_system_homes() {
-        let command = ToolchainLayer::Rust("1.97".into()).verify_command();
-        assert!(
-            command.starts_with(
-                "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && "
-            ),
-            "verification must resolve the baked system homes, not $HOME: {command}"
-        );
-        assert!(command.contains("rustup run 1.97 rustc --version"));
-    }
-
-    /// The Go layer emits an inline Python resolver whose body must survive
-    /// the Rust line-continuation string. A `\n\` continuation strips the
-    /// leading whitespace of the following source line, which used to flatten
-    /// the `if` body to column zero — the emitted script then died with
-    /// `IndentationError` on every provisioning run and no runner ever
-    /// registered. Run the actual emitted Python against a sample release
-    /// index so a regression fails the suite instead of the pool.
-    #[test]
-    fn go_toolchain_python_resolver_is_valid_and_resolves() {
-        let commands = ToolchainLayer::Go("1.24".into()).install_commands();
-        let shell = &commands[0][2];
-        assert!(
-            shell.contains("python3 -c"),
-            "resolver must be inline python"
-        );
-
-        // Extract the python -c program: everything between the single-quoted
-        // `python3 -c '` and the closing `' "$WANT"`.
-        let start = shell.find("python3 -c '").expect("inline python") + "python3 -c '".len();
-        let end = shell[start..]
-            .find("' \"$WANT\"")
-            .map(|offset| start + offset)
-            .expect("closing quote");
-        let program = &shell[start..end];
-
-        // The emitted shell wraps the python in its own quoting; decode the
-        // `\\n` -> `\n` and `\"` -> `"` escapes the Rust string introduced.
-        let program = program.replace("\\n", "\n").replace("\\\"", "\"");
-
-        // The program reads JSON from stdin and prints the matching version.
-        // go.dev serves the index newest-first, which is what makes `next`
-        // resolve a `1.24` minimum to the newest 1.24.x.
-        let index = r#"[{"version":"go1.25.0"},{"version":"go1.24.2"},{"version":"go1.24.1"},{"version":"go1.24.0"}]"#;
-        let mut child = std::process::Command::new("python3")
-            .arg("-c")
-            .arg(&program)
-            .arg("1.24")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("python3 available for the test");
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(index.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "emitted python must parse and run: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        assert_eq!(
-            resolved, "go1.24.2",
-            "a `go 1.24` minimum must resolve to the newest 1.24.x"
-        );
+    fn workflow_scan_reads_container_images_from_yaml() {
+        let root = std::env::temp_dir().join(format!("env-scan-{}", std::process::id()));
+        let workflows = root.join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("ci.yml"),
+            "jobs:\n  test:\n    runs-on: ubuntu-latest\n    container:\n      image: node:22\n    services:\n      db:\n        image: postgres:16\n",
+        )
+        .unwrap();
+        std::fs::write(workflows.join("broken.yml"), "jobs: [: not yaml").unwrap();
+        let images = scan_workflow_images(&root);
+        assert_eq!(images, vec!["node:22".to_owned(), "postgres:16".to_owned()]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

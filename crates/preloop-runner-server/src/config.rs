@@ -47,8 +47,9 @@ pub struct GoldenConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Base image `serve` boots its golden from: an OCI reference, a
-    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent means the
-    /// engine's stock base — the packed official GitHub runner golden.
+    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent selects the
+    /// packed official GitHub runner golden — the image `runs-on:
+    /// ubuntu-latest` means, downloaded and verified, never baked locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
     /// Dockerfile a `kind = "dockerfile"` tar was built from, so a re-run can
@@ -58,7 +59,7 @@ pub struct GoldenConfig {
 }
 
 /// Effective golden base image: [`BASE_IMAGE_ENV`] when set to a non-blank
-/// value, else the `[golden]` section. `None` means the engine's stock base.
+/// value, else the `[golden]` section. `None` means the packed official golden.
 ///
 /// An exported-but-blank variable behaves like an unset one — the same rule
 /// `PRELOOP_GOLDEN_URL` follows — so a shell that exports an empty value

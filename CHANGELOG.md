@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **One golden source: the official packed golden, or the image you
+  configured.** `runs-on: ubuntu-latest`/`ubuntu-24.04` — and any pooled
+  environment with no image configured — now resolve to the published packed
+  golden, downloaded per architecture from a digest-pinned OCI reference
+  (`PRELOOP_GOLDEN_OCI_REF` overrides it; `PRELOOP_GOLDEN_URL` still selects a
+  release-asset mirror) and installed only after its checksum (release asset)
+  or layer digest (OCI) matches. The transfer resumes from a `.partial` file
+  across retries and engine restarts, and a download that cannot complete
+  fails the job: there is no local bake and no stock-Ubuntu fallback behind it.
+  `ubuntu-22.04` now maps nowhere and keeps the configured image instead of
+  silently selecting a 24.04 base.
+
+  The curated stock bake is deleted with it: no toolchain layers
+  (Rust/Go/Python/Node), no `base_install_script`, no apt package pins or
+  index-freshness marker (and no weekly `apt-indices-refresh` workflow), no
+  goldens baked per `runs-on` environment, no local bake from stock Ubuntu and
+  no direct-create fallback when the packed artifact is unavailable.
+  `PRELOOP_USE_PACKED_GOLDEN` is gone — a file-pack backend always uses a
+  packed golden — and the pool holds one golden per pool environment and forks
+  it per job.
+
+  A configured image (`PRELOOP_RUNNER_BASE_IMAGE`, or the `[golden]
+  base_image` that `preloop init` records) is now used exactly as it is.
+  Preloop adds only the GitHub-runner machinery at golden build: a `runner`
+  account (uid 1001) with its home, `_work` and passwordless sudo unless the
+  image already has them; an owner-only ownership walk over the runner home
+  (`find … ! -user 1001 -exec chown -h 1001:1001 {} +`, which leaves a
+  runner-owned file's group alone); a writable `/opt/hostedtoolcache` with
+  `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`; and the
+  `/etc/preloop-bake.json` build record. The only checked requirement is a
+  glibc dynamic loader — a missing `bash`, `git` or `docker` fails the step
+  that needs it, exactly as on GitHub-hosted runners. `preloop build-golden`
+  takes the image it bakes (`--base-image <ref>`, or the configured image when
+  the flag is absent); the official golden is published packed and cannot be
+  built locally.
+
+  Guest `PATH`, `RUSTUP_HOME` and `CARGO_HOME` overrides are gone: the guest
+  runner's PATH is the system PATH, and tool versions come from the workflow's
+  `setup-*` actions, as they do on GitHub.
 
 ### Security
 

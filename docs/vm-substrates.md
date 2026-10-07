@@ -95,9 +95,10 @@ orchestrator branches on it instead of assuming SmolVM's semantics.
   snapshot and writes a small JSON descriptor naming it (at both `<output>` and
   the `<output>.smolmachine` sidecar the orchestrator looks for). The
   descriptor is portable only within that AgentENV server. The pool therefore
-  skips artifact build/download entirely on this backend and prepares its
-  golden straight from the base image, then forks per job:
-  `use_packed_artifact` is forced off and `use_fork` on.
+  skips the packed-artifact path — download or local bake — entirely on this
+  backend: the golden is booted from its base image, the runner contract is
+  applied in the guest, and `start --forkable` captures the result, which this
+  backend's snapshots carry into every fork. `use_fork` stays on.
 
 ## Identity, TTL, and the registry
 

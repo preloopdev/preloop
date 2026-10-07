@@ -111,10 +111,17 @@ export PRELOOP_GOLDEN_NAME_PREFIX=preloop-official-golden-x86-64
 
 ./target/release/preloop build-golden \
   --runner-bundle target/x86_64-unknown-linux-gnu/release \
+  --base-image "$PRELOOP_RUNNER_BASE_IMAGE" \
   --output dist/preloop-ubuntu-24.04-x86_64
 sha256sum dist/preloop-ubuntu-24.04-x86_64 \
   > dist/preloop-ubuntu-24.04-x86_64.sha256
 ```
+
+`build-golden` bakes the image it is given: `--base-image <ref>` (or the
+configured `PRELOOP_RUNNER_BASE_IMAGE` / `[golden] base_image` when the flag is
+absent). There is no default — the official golden is published packed and
+cannot be built locally. The bake adds the runner contract only; see
+[vm-images.md](vm-images.md#what-the-golden-contains).
 
 `build-golden` renames the `.smolmachine` sidecar to the requested output
 path. The launcher stub is discarded; the output file itself is the packed
