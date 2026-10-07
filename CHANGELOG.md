@@ -32,9 +32,13 @@ Releases before v0.27.0 predate the changelog.
   hosted values per machine on the same post-boot exec path as the
   runner-ownership reconciliation: idempotent, escalating through the runner
   account's passwordless sudo, and failing provisioning if a write the kernel
-  exposes does not take. No golden rebake is required; keys a guest kernel
-  does not expose are skipped, as the hosted image's own sysctl lines for
-  unknown keys are. `vm.overcommit_memory` is deliberately left at `0` —
+  exposes does not take. The write list is built from the keys the guest
+  kernel actually exposes and that differ from the hosted values, so a kernel
+  missing one key still gets every other key instead of aborting the apply (a
+  missing key makes both `sysctl -w` and a direct `/proc/sys` write fail). No
+  golden rebake is required; keys a guest kernel does not expose are skipped,
+  as the hosted image's own sysctl lines for unknown keys are.
+  `vm.overcommit_memory` is deliberately left at `0` —
   a probe job on a real GitHub-hosted runner (image `20261004.327.1`, kernel
   `6.17.0-1022-azure`) reads back `0` there too, so Valkey's overcommit
   warning is parity, not a fidelity gap.

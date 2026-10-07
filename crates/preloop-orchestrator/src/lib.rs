@@ -2175,41 +2175,59 @@ pub const GITHUB_GUEST_SYSCTLS: &[(&str, &str)] = &[
 /// without writing when the machine already matches. A needed write escalates
 /// the way the ownership reconciliation does (directly when the exec landed on
 /// root, else through passwordless sudo, which the runner account has), then
-/// re-reads every key, so a write the kernel rejected fails provisioning
-/// instead of silently handing jobs a different environment than GitHub's.
-/// Keys the guest kernel does not expose are skipped rather than fatal:
-/// GitHub's `/etc/sysctl.conf` lines for unknown keys are equally inert.
+/// re-reads every key it wrote, so a write the kernel rejected fails
+/// provisioning instead of silently handing jobs a different environment than
+/// GitHub's.
+///
+/// Only keys the guest kernel exposes *and* that differ are written. A kernel
+/// that lacks one hosted key (say `fs.inotify.max_user_instances`) still gets
+/// the others: both `sysctl -w` and a direct `/proc/sys` write fail on an
+/// absent key, so handing the whole configured list to the privileged half
+/// would discard an otherwise usable guest. Skipping is what GitHub does with
+/// its own `/etc/sysctl.conf` lines for keys the kernel does not know.
 /// Writes use `sysctl` when the image ships procps, else `/proc/sys` directly.
 pub fn guest_sysctl_script() -> String {
+    guest_sysctl_script_at("/proc/sys")
+}
+
+/// `root` is the sysctl tree the script reads and writes. Production passes
+/// `/proc/sys`; the shell tests pass a scratch tree so the real script runs
+/// end to end without touching the host kernel, the way
+/// [`scope_rosetta_apt_sources`] stands in for `/etc/apt`.
+fn guest_sysctl_script_at(root: &str) -> String {
     let pairs = GITHUB_GUEST_SYSCTLS
         .iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join(" ");
+    let root = shell_quote(root);
     // The privileged half, base64'd so quoting survives both exec branches.
+    // It only ever sees the pairs the pre-check selected: an absent key would
+    // fail the write and, under `set -e`, take the whole apply with it.
     let apply = format!(
-        "set -e; \
-         if command -v sysctl >/dev/null 2>&1; then sysctl -w {pairs}; \
+        "set -e; root={root}; \
+         if command -v sysctl >/dev/null 2>&1; then \
+           for pair in \"$@\"; do sysctl -w \"$pair\"; done; \
          else \
-           for pair in {pairs}; do \
-             printf '%s' \"${{pair#*=}}\" > \"/proc/sys/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           for pair in \"$@\"; do \
+             printf '%s' \"${{pair#*=}}\" > \"$root/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
            done; \
          fi"
     );
     use base64::Engine as _;
     let apply_b64 = base64::engine::general_purpose::STANDARD.encode(&apply);
     format!(
-        "needs=0; \
+        "root={root}; plan=''; \
          for pair in {pairs}; do \
-           path=\"/proc/sys/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
-           if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then needs=1; fi; \
+           path=\"$root/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then plan=\"$plan $pair\"; fi; \
          done; \
-         if [ \"$needs\" -eq 0 ]; then echo 'guest sysctls already match the hosted image'; exit 0; fi; \
-         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh; \
-         else printf %s '{apply_b64}' | base64 -d | sudo -n sh; fi; \
+         if [ -z \"$plan\" ]; then echo 'guest sysctls already match the hosted image'; exit 0; fi; \
+         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh -s -- $plan; \
+         else printf %s '{apply_b64}' | base64 -d | sudo -n sh -s -- $plan; fi; \
          failed=''; \
-         for pair in {pairs}; do \
-           path=\"/proc/sys/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+         for pair in $plan; do \
+           path=\"$root/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
            if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then \
              failed=\"$failed $pair(got:$(cat \"$path\"))\"; \
            fi; \
@@ -7694,9 +7712,13 @@ chmod +x "$dest/bin/node"
     /// hosted image bakes into `/etc/sysctl.conf` must be written per machine
     /// or every job runs against kernel defaults. Pin the hosted values and
     /// the shape of the script: a comparison-only pre-check (an already-correct
-    /// machine writes nothing), escalation through passwordless sudo when the
-    /// exec lands on the image user, and a post-write re-read so a rejected
-    /// write fails provisioning instead of silently diverging.
+    /// machine writes nothing), a privileged half that writes only the pairs
+    /// the pre-check selected (a key the kernel does not expose must never
+    /// reach the write), escalation through passwordless sudo when the exec
+    /// lands on the image user, and a post-write re-read so a rejected write
+    /// fails provisioning instead of silently diverging. The behavior itself
+    /// is executed by `guest_sysctl_script_writes_only_exposed_keys` and
+    /// `guest_sysctl_script_falls_back_to_proc_sys_without_procps` below.
     #[test]
     fn guest_sysctl_script_pins_hosted_values() {
         let script = guest_sysctl_script();
@@ -7711,7 +7733,7 @@ chmod +x "$dest/bin/node"
             );
         }
         assert!(
-            script.contains("needs=0"),
+            script.contains("[ -z \"$plan\" ]"),
             "an already-correct machine must skip the writes: {script}"
         );
         assert!(
@@ -7725,6 +7747,10 @@ chmod +x "$dest/bin/node"
         assert!(
             !script.contains("|| true"),
             "a rejected write must stay observable: {script}"
+        );
+        assert!(
+            script.contains("root='/proc/sys'"),
+            "the guest tree must be the kernel's: {script}"
         );
         // The privileged half travels base64-encoded; decode every blob and
         // assert the writes it carries.
@@ -7744,17 +7770,201 @@ chmod +x "$dest/bin/node"
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            decoded.contains("sysctl -w vm.max_map_count=262144 fs.inotify.max_user_watches=655360 fs.inotify.max_user_instances=1280"),
-            "the privileged half must write every hosted value: {decoded}"
+            decoded.contains("for pair in \"$@\""),
+            "the privileged half must write the pairs the pre-check selected, not the \
+             whole configured list: {decoded}"
         );
         assert!(
-            decoded.contains("/proc/sys/"),
+            decoded.contains("sysctl -w \"$pair\""),
+            "the procps branch must write one selected pair at a time: {decoded}"
+        );
+        assert!(
+            decoded.contains("root='/proc/sys'"),
             "images without procps need the direct /proc/sys fallback: {decoded}"
         );
         // GitHub-hosted runners run with vm.overcommit_memory=0 (probe of
         // image 20261004.327.1): Valkey's overcommit warning is expected on
         // both sides, and forcing it to 1 here would *diverge* from GitHub.
         assert!(!script.contains("overcommit"), "{script}");
+    }
+
+    /// A stub executable in a scratch `bin`, the shape the curl/tar stubs
+    /// above use.
+    #[cfg(unix)]
+    fn scratch_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The runner account's passwordless sudo, for harnesses whose test runner
+    /// is not root (CI guests usually are, a developer machine is not).
+    #[cfg(unix)]
+    const SUDO_STUB: &str = "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n";
+
+    /// Link one real tool into a scratch `bin` that must offer no others; the
+    /// direct-write test uses it to remove `sysctl` from the guest's PATH.
+    #[cfg(unix)]
+    fn symlink_tool(bin: &std::path::Path, tool: &str) {
+        let source = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| std::path::Path::new(dir).join(tool))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| panic!("no {tool} on this machine for the harness PATH"));
+        std::os::unix::fs::symlink(source, bin.join(tool)).unwrap();
+    }
+
+    /// Devin's case: a guest kernel with `vm.max_map_count` at the kernel
+    /// default that does not expose `fs.inotify.max_user_instances` at all.
+    /// The pre-check skipped absent keys, but the privileged half used to hand
+    /// every configured pair to `sysctl -w`; the absent key made procps exit
+    /// non-zero and `set -e` aborted the apply, so an otherwise usable guest
+    /// could never be provisioned. The scratch tree stands in for `/proc/sys`
+    /// and the stub for procps, so the real script runs end to end — a `-w`
+    /// for a leaf the tree does not have fails exactly as on a real kernel.
+    #[cfg(unix)]
+    #[test]
+    fn guest_sysctl_script_writes_only_exposed_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sys");
+        let bin = temp.path().join("bin");
+        let log = temp.path().join("sysctl.log");
+        std::fs::create_dir_all(root.join("vm")).unwrap();
+        std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        // Present at the kernel default: the hosted value must land.
+        std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
+        // Present and already correct: no write is needed for it.
+        std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
+        // Absent on this kernel: procps fails on it, so the privileged half
+        // must never see it.
+        scratch_executable(
+            &bin.join("sysctl"),
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -w) shift;;
+    -*) shift;;
+    *) break;;
+  esac
+done
+for pair in "$@"; do
+  key=${pair%%=*}
+  path="$PRELOOP_TEST_SYSCTL_ROOT/$(printf '%s' "$key" | tr '.' '/')"
+  printf '%s\n' "$pair" >> "$PRELOOP_TEST_SYSCTL_LOG"
+  if [ ! -e "$path" ]; then
+    printf 'sysctl: cannot stat %s: No such file or directory\n' "$path" >&2
+    exit 1
+  fi
+  [ "$PRELOOP_TEST_SYSCTL_STALL" = "$key" ] && continue
+  printf '%s' "${pair#*=}" > "$path"
+done
+"#,
+        );
+        scratch_executable(&bin.join("sudo"), SUDO_STUB);
+
+        let script = guest_sysctl_script_at(root.to_str().unwrap());
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PRELOOP_TEST_SYSCTL_ROOT", &root)
+                .env("PRELOOP_TEST_SYSCTL_LOG", &log)
+                .output()
+                .unwrap()
+        };
+        let first = run();
+        assert!(
+            first.status.success(),
+            "a guest missing one hosted key must still be provisioned: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("vm/max_map_count")).unwrap(),
+            "262144",
+            "the exposed key that differed must reach the hosted value"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "vm.max_map_count=262144\n",
+            "only exposed, differing keys may reach a write"
+        );
+        // A second exec against the same machine compares clean: one exec
+        // round trip, no writes.
+        let second = run();
+        assert!(second.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "vm.max_map_count=262144\n"
+        );
+        // A write the kernel did not take must still fail provisioning: the
+        // post-check re-reads every pair the apply carried and names it.
+        std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
+        let stalled = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PRELOOP_TEST_SYSCTL_ROOT", &root)
+            .env("PRELOOP_TEST_SYSCTL_LOG", &log)
+            .env("PRELOOP_TEST_SYSCTL_STALL", "vm.max_map_count")
+            .output()
+            .unwrap();
+        assert!(
+            !stalled.status.success(),
+            "a write the kernel did not take must fail provisioning"
+        );
+        assert!(
+            String::from_utf8_lossy(&stalled.stderr).contains("vm.max_map_count=262144(got:65530)"),
+            "the failure must name the pair and the value read back: {}",
+            String::from_utf8_lossy(&stalled.stderr)
+        );
+    }
+
+    /// Images without procps write `/proc/sys` directly, and that branch had
+    /// the same absent-key failure. A real procfs refuses to create a leaf for
+    /// a key the kernel does not expose; a scratch tree cannot, so the
+    /// harness instead pins that the absent key is never written (the pre-fix
+    /// script created it here, and fails outright on a kernel that has no such
+    /// leaf).
+    #[cfg(unix)]
+    #[test]
+    fn guest_sysctl_script_falls_back_to_proc_sys_without_procps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sys");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(root.join("fs/inotify/max_user_watches"), "64372").unwrap();
+        // Only the tools the script genuinely needs, so `command -v sysctl`
+        // comes up empty as it does on an image without procps.
+        for tool in ["cat", "tr", "id", "base64", "sh"] {
+            symlink_tool(&bin, tool);
+        }
+        // A test runner that is not root takes the escalated branch; the
+        // runner account's passwordless sudo is a `sudo` that runs its argv.
+        scratch_executable(&bin.join("sudo"), SUDO_STUB);
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &guest_sysctl_script_at(root.to_str().unwrap())])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the direct-write branch must provision too: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("fs/inotify/max_user_watches")).unwrap(),
+            "655360"
+        );
+        assert!(
+            !root.join("fs/inotify/max_user_instances").exists(),
+            "a key the kernel does not expose must never be written"
+        );
+        assert!(
+            !root.join("vm").exists(),
+            "keys the tree does not have must be left alone entirely"
+        );
     }
 
     #[test]
