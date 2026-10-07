@@ -10,6 +10,20 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **The warm pool forks on completion instead of replacing mid-job**: a slot
+  now serves exactly one job per VM — fork from the golden, run the job,
+  delete the VM, fork the next one — so a slot holds one VM instead of a
+  running runner plus a pre-provisioned successor, and no successor boot
+  competes with the running job for host CPU. The fork → ready window
+  (~5 s measured, against an average job time of ~400 s) now sits in front
+  of the job a slot picks up next, which costs roughly 1% throughput for
+  half the VMs per slot. The memory-derived warm pool cap therefore sizes
+  one runner ceiling per slot instead of two, and the queued-job backpressure
+  that decided whether a successor was worth building is gone. On-demand
+  (size=0) slots kept their shape: they already served one job per VM.
+  `preloop status`'s `building` counter now reports the fork/boot in flight
+  (the only "build" the pool still performs) rather than successor builds,
+  which no longer exist.
 - **One golden source: the official packed golden, or the image you
   configured.** `runs-on: ubuntu-latest`/`ubuntu-24.04` — and any pooled
   environment with no image configured — now resolve to the published packed

@@ -108,11 +108,12 @@ Sizing on-demand fork concurrency **by CPU only** is not safe:
 (available_parallelism / cpus_per_runner) - 1   // floor 1
 ```
 
-With `PRELOOP_RUNNER_MEMORY_MIB=8192` on a modest host, that allows enough
-8 GiB forks to exhaust RAM and OOM the control plane —
-the golden alone commits 8 GiB, every fork inherits that footprint and grows
-toward the ceiling while its job runs, and warm mode provisions a successor
-mid-job (so `size + 1` VMs are live).
+On the 6-core / 22 GiB production host with `PRELOOP_RUNNER_MEMORY_MIB=8192`,
+that allowed enough 8 GiB forks to exhaust RAM and OOM the control plane —
+the golden alone commits 8 GiB, and every fork inherits that footprint and
+grows toward the ceiling while its job runs. (Warm slots used to add to that
+by provisioning a successor mid-job; a slot now deletes its VM when the job
+ends and forks the next one, so only `size` VMs are live.)
 
 The guard, `on_demand_memory_cap`:
 
@@ -127,7 +128,7 @@ max_concurrent = min(cpu_term, by_memory)
   without it the host OOMs *after* the forks are up.
 - Applied in **both** pool modes:
   - size=0 on-demand: `max_concurrent = min(by_cpu, by_memory)`
-  - warm mode: `warm_size = min(configured size, max(by_memory / 2, 1))`
+  - warm mode: `warm_size = min(configured size, max(by_memory, 1))`
     (logged when reduced). `PRELOOP_RUNNER_POOL_SIZE` still wins as an explicit
     override
     only up to the memory cap — the cap is a safety floor, not a knob.
