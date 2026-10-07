@@ -894,7 +894,13 @@ mod tests {
             crate::control::migrations::postgres_ledger(&old).await.unwrap(),
             Ledger::Unledgered
         );
-        let applied = run_postgres(&mut old).await.unwrap();
+        // A populated pre-ledger baseline upgrades through the same probe →
+        // adopt → apply sequence `preloop store migrate --adopt-baseline`
+        // uses (the SQLite twin of this gate); applying the migration set
+        // directly would re-create the baseline and fail on its own tables.
+        let probe = probe_shape_postgres(&mut old).await.unwrap();
+        assert_eq!(probe.version, MIGRATIONS[0]);
+        let applied = adopt_postgres(&mut old, probe.version).await.unwrap();
         assert_eq!(applied, MIGRATIONS[1..].to_vec());
         crate::control::migrations::verify_postgres(&old).await.unwrap();
         let index: i64 = old
