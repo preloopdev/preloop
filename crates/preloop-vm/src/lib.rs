@@ -2043,42 +2043,73 @@ enum MachineDataState {
     Unknown,
 }
 
-/// Machine data directories a `ps` line's argv names, one per token that
-/// carries a boot config under one of `markers`.
+/// The [`machine_data_root`] in both the configured and the canonical form.
+///
+/// Everything that identifies this home's machines — `_boot-vm` argv, the
+/// mount table — is matched against a *complete path prefix* of one of these
+/// roots, never as a substring: `/tmp` and `/private/tmp` name the same
+/// directory on macOS, an argv carries whichever the caller passed, and
+/// `mount` prints the canonical one, while a neighboring home whose name
+/// merely shares a prefix (`/homes/smolvm` vs `/homes/smolvm-vm-other`) must
+/// never be claimed as ours.
+fn machine_data_roots() -> Vec<PathBuf> {
+    let Some(root) = machine_data_root() else {
+        return Vec::new();
+    };
+    let mut roots = vec![root.clone()];
+    if let Ok(canonical) = root.canonicalize()
+        && canonical != root
+    {
+        roots.push(canonical);
+    }
+    roots
+}
+
+/// Machine data directory one token's argv names, when it names the boot
+/// config of a machine under one of `roots`.
 ///
 /// The boot config is handed to `_boot-vm` as a path, either bare or behind a
-/// flag (`--boot-config=<path>`), so the path starts at the data-root marker
-/// inside whichever token carries it. The marker may be the shorter `smolvm`
-/// prefix of the macOS `smolvm-home` root, so the earliest occurrence bounds
-/// the path. Only a token that names `boot-config.json` decides anything; an
-/// argv shape this cannot parse yields nothing.
-fn boot_config_dirs(line: &str, markers: &[String]) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for token in line.split_whitespace() {
-        let Some(start) = markers
-            .iter()
-            .filter_map(|marker| token.find(marker.as_str()))
-            .min()
-        else {
+/// flag (`--boot-config=<path>`), optionally quoted. Only a token whose path
+/// is a `boot-config.json` beneath this home's data root decides anything — a
+/// path under any other home (even one whose name this root is a string
+/// prefix of) is not ours to reap.
+fn token_boot_config_dir(token: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = vec![token];
+    if let Some((_, value)) = token.split_once('=') {
+        candidates.push(value);
+    }
+    for candidate in candidates {
+        let path = Path::new(candidate.trim_matches(['"', '\'']));
+        if !path.is_absolute()
+            || path.file_name().and_then(|name| name.to_str()) != Some(BOOT_CONFIG_FILE)
+        {
+            continue;
+        }
+        let Some(dir) = path.parent() else {
             continue;
         };
-        let path = token[start..].trim_matches(['"', '\'']);
-        if !path.starts_with('/') || !path.ends_with(BOOT_CONFIG_FILE) {
-            continue;
-        }
-        if let Some(dir) = Path::new(path).parent() {
-            dirs.push(dir.to_path_buf());
+        if roots.iter().any(|root| dir.starts_with(root)) {
+            return Some(dir.to_path_buf());
         }
     }
-    dirs
+    None
+}
+
+/// Machine data directories a `ps` line's argv names, one per token that
+/// carries a boot config under one of `roots`. An argv shape this cannot
+/// parse yields nothing.
+fn boot_config_dirs(line: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
+    line.split_whitespace()
+        .filter_map(|token| token_boot_config_dir(token, roots))
+        .collect()
 }
 
 /// Classify a `ps` line by the machine state its argv names.
 ///
 /// The boot config itself is gone once the machine booted, so the directory
 /// is what proves the machine exists.
-fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
-    let dirs = boot_config_dirs(line, markers);
+fn machine_data_state(line: &str, roots: &[PathBuf]) -> MachineDataState {
+    let dirs = boot_config_dirs(line, roots);
     if dirs.iter().any(|dir| dir.exists()) {
         return MachineDataState::Present;
     }
@@ -2087,32 +2118,6 @@ fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
     } else {
         MachineDataState::Removed
     }
-}
-
-/// Data-root markers bounding this Preloop home's machine state in process
-/// command lines and in the mount table: the macOS layout (`smolvm-home`)
-/// and the Linux one (`smolvm`).
-///
-/// Both the home as configured and its canonical form are included: `/tmp`
-/// and `/private/tmp` name the same directory on macOS, a process argv
-/// carries whichever the caller passed, and `mount` prints the canonical one.
-fn home_markers() -> Option<Vec<String>> {
-    let home = effective_preloop_home()?;
-    let mut homes = vec![home.clone()];
-    if let Ok(canonical) = home.canonicalize()
-        && canonical != home
-    {
-        homes.push(canonical);
-    }
-    let mut markers = Vec::new();
-    for home in homes {
-        for suffix in ["smolvm", "smolvm-home"] {
-            if let Some(marker) = home.join(suffix).to_str() {
-                markers.push(marker.to_owned());
-            }
-        }
-    }
-    (!markers.is_empty()).then_some(markers)
 }
 
 /// Filesystem form of a path for cross-checking argv against the mount
@@ -2129,16 +2134,17 @@ fn canonical_path(path: &Path) -> PathBuf {
 #[cfg(any(target_os = "macos", test))]
 const LAYER_STORE_MOUNT_SUFFIX: &str = "/pack/layers-cs";
 
-/// Layer-store mounts under this Preloop home, each with the machine data
-/// directory it belongs to.
+/// Layer-store mounts under one of this home's machine data roots, each with
+/// the machine data directory it belongs to.
 ///
 /// macOS mounts a packed machine's `pack/layers-cs` APFS sparseimage inside
 /// the machine's data directory while the machine runs (`machine start`) and
 /// detaches it on `stop`/`delete`. `mount` prints
-/// `<device> on <mount point> (<options>)`; anything else mounted under the
-/// home is not ours to touch.
+/// `<device> on <mount point> (<options>)`; a mount point that is not a layer
+/// store beneath one of the roots (a nested home, a neighboring home whose
+/// name overlaps at a path component) is not ours to touch.
 #[cfg(any(target_os = "macos", test))]
-fn layer_store_mounts(markers: &[String], mount_table: &str) -> Vec<(PathBuf, PathBuf)> {
+fn layer_store_mounts(roots: &[PathBuf], mount_table: &str) -> Vec<(PathBuf, PathBuf)> {
     let mut mounts = Vec::new();
     for line in mount_table.lines() {
         let Some((_, rest)) = line.split_once(" on ") else {
@@ -2148,13 +2154,17 @@ fn layer_store_mounts(markers: &[String], mount_table: &str) -> Vec<(PathBuf, Pa
             continue;
         };
         let path = path.trim();
-        if !path.starts_with('/') || !markers.iter().any(|marker| path.contains(marker.as_str())) {
+        if !path.starts_with('/') {
             continue;
         }
         let Some(dir) = path.strip_suffix(LAYER_STORE_MOUNT_SUFFIX) else {
             continue;
         };
-        mounts.push((PathBuf::from(path), PathBuf::from(dir)));
+        let dir = Path::new(dir);
+        if !roots.iter().any(|root| dir.starts_with(root)) {
+            continue;
+        }
+        mounts.push((PathBuf::from(path), dir.to_path_buf()));
     }
     mounts
 }
@@ -2167,17 +2177,17 @@ fn layer_store_mounts(markers: &[String], mount_table: &str) -> Vec<(PathBuf, Pa
 /// directory still has a `_boot-vm` process is live and must be left alone.
 #[cfg(any(target_os = "macos", test))]
 fn orphan_layer_store_mounts(
-    markers: &[String],
+    roots: &[PathBuf],
     ps_output: &str,
     mount_table: &str,
 ) -> Vec<PathBuf> {
     let live: std::collections::BTreeSet<PathBuf> = ps_output
         .lines()
         .filter(|line| line.contains(BOOT_VM_PROCESS))
-        .flat_map(|line| boot_config_dirs(line, markers))
+        .flat_map(|line| boot_config_dirs(line, roots))
         .map(|dir| canonical_path(&dir))
         .collect();
-    layer_store_mounts(markers, mount_table)
+    layer_store_mounts(roots, mount_table)
         .into_iter()
         .filter(|(_, dir)| !live.contains(&canonical_path(dir)))
         .map(|(mount, _)| mount)
@@ -2207,9 +2217,10 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
     }
     #[cfg(target_os = "macos")]
     {
-        let Some(markers) = home_markers() else {
+        let roots = machine_data_roots();
+        if roots.is_empty() {
             return Ok(0);
-        };
+        }
         let ps = std::process::Command::new("ps")
             .args(["ax", "-o", "pid=,command="])
             .output()
@@ -2225,7 +2236,7 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
             })?;
         let mut detached = 0usize;
         for mount in orphan_layer_store_mounts(
-            &markers,
+            &roots,
             &String::from_utf8_lossy(&ps.stdout),
             &String::from_utf8_lossy(&mounts.stdout),
         ) {
@@ -2276,7 +2287,7 @@ pub enum OrphanPurge {
 }
 
 /// Kill any lingering SmolVM `_boot-vm` hypervisor processes whose machine
-/// state lives under this Preloop home.
+/// state lives under this Preloop home's machine data root.
 ///
 /// A server death (crash, OOM, SIGKILL) orphans the detached `_boot-vm`
 /// processes: the CLI flow detaches them (the parent-death watchdog is
@@ -2287,16 +2298,19 @@ pub enum OrphanPurge {
 /// keeps the storage file descriptors open and the unlinked blocks leak
 /// until the process exits. The `_boot-vm` argv names its
 /// `boot-config.json` under the data dir, so orphaned processes are
-/// identifiable by path.
+/// identifiable by path: only a token naming a boot config under one of
+/// [`machine_data_roots`] makes a process ours — a neighboring home whose
+/// path merely shares a prefix is never matched.
 ///
 /// `scope` decides which of those processes may be killed; see
 /// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
 /// interval while the pool serves (`RemovedDataDir`). Returns the number of
 /// processes killed.
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
-    let Some(markers) = home_markers() else {
+    let roots = machine_data_roots();
+    if roots.is_empty() {
         return Ok(0);
-    };
+    }
     let output = std::process::Command::new("ps")
         .args(["ax", "-o", "pid=,command="])
         .output()
@@ -2310,16 +2324,13 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
         if !line.contains(BOOT_VM_PROCESS) {
             continue;
         }
-        if !markers.iter().any(|marker| line.contains(marker.as_str())) {
-            continue;
-        }
         // Anything whose machine data directory still exists may be live:
         // spare it rather than kill a machine that is registered, running a
         // job, or still being created. See `OrphanPurge::RemovedDataDir`.
-        if scope == OrphanPurge::RemovedDataDir
-            && machine_data_state(line, &markers) != MachineDataState::Removed
-        {
-            continue;
+        match machine_data_state(line, &roots) {
+            MachineDataState::Unknown => continue,
+            MachineDataState::Present if scope == OrphanPurge::RemovedDataDir => continue,
+            MachineDataState::Present | MachineDataState::Removed => {}
         }
         let Some(pid) = line
             .split_whitespace()
@@ -3097,12 +3108,15 @@ mod tests {
     fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
         let _guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
-        let marker = home.join("smolvm-home/Library/Caches/smolvm/vms/deadbeef/boot-config.json");
-        // A process that looks like an orphaned _boot-vm for this home: the
-        // argv carries the marker path, so `ps` shows it in the command line.
-        let mut child = spawn_fake_boot_vm(&[marker.to_str().unwrap()]);
-        let pid = child.id() as i32;
         let _home = PreloopHomeGuard::set(&home);
+        let boot_config = super::machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("deadbeef/boot-config.json");
+        // A process that looks like an orphaned _boot-vm for this home: the
+        // argv carries the boot-config path, so `ps` shows it in the command
+        // line.
+        let mut child = spawn_fake_boot_vm(&[boot_config.to_str().unwrap()]);
+        let pid = child.id() as i32;
         let killed = purge_orphaned_vms(OrphanPurge::All).expect("purge");
         assert!(killed >= 1, "purge should have killed the matching process");
         // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
@@ -3111,18 +3125,56 @@ mod tests {
         assert!(!process_alive(pid), "matching _boot-vm must be dead");
     }
 
+    /// A hypervisor is ours only when its argv names a boot config under one
+    /// of this home's machine data roots. A neighboring home whose path the
+    /// data root is a *string prefix* of (`…/smolvm` vs `…/smolvm-vm-other`)
+    /// shares no path component with it; killing that home's VM would take
+    /// down a different engine's running job.
+    #[test]
+    fn purge_never_touches_a_neighboring_homes_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home =
+            std::env::temp_dir().join(format!("preloop-purge-neighbor-{}", uuid::Uuid::new_v4()));
+        // The neighbor's home is spelled so that this home's data root prefix
+        // is a string prefix of its machine paths, but not a path-component
+        // prefix: exactly the shape old substring matches claimed as ours.
+        let neighbor_boot_config = {
+            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
+            super::machine_data_root()
+                .expect("the neighbor home resolves to a data root")
+                .join("deadbeef/boot-config.json")
+        };
+        let mut neighbor_child = spawn_fake_boot_vm(&[neighbor_boot_config.to_str().unwrap()]);
+        let neighbor_pid = neighbor_child.id() as i32;
+        let _home = PreloopHomeGuard::set(&home);
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            0,
+            "a neighboring home's hypervisor is not ours to kill"
+        );
+        assert!(
+            process_alive(neighbor_pid),
+            "the neighboring home's VM must survive this home's purge"
+        );
+        let _ = neighbor_child.kill();
+        let _ = neighbor_child.wait();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// The mid-flight scope must spare every hypervisor whose machine data
     /// directory still exists — a registered machine, a running job VM, a
-    /// golden, or a create in flight all keep theirs — spare an argv shape it
-    /// cannot classify, and still reclaim one whose data directory was
-    /// removed from under it. `All` kills every survivor, which is what makes
-    /// the scope, not the process match, the protection.
+    /// golden, or a create in flight all keep theirs — and still reclaim one
+    /// whose data directory was removed from under it. `All` kills every
+    /// hypervisor this home owns, which is what makes the scope, not the
+    /// process match, the protection for live machines.
     #[test]
-    fn removed_data_dir_purge_spares_live_and_unknown_data_dirs() {
+    fn removed_data_dir_purge_spares_live_data_dirs_and_unowned_argvs() {
         let _guard = PRELOOP_HOME_LOCK.lock();
         let home =
             std::env::temp_dir().join(format!("preloop-purge-live-{}", uuid::Uuid::new_v4()));
-        let vms = home.join("smolvm-home/Library/Caches/smolvm/vms");
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
         // A live machine's directory, in the shape a running machine leaves on
         // disk: smolvm consumes `boot-config.json` at boot, so only the
         // directory — not that file — is durable evidence of the machine.
@@ -3132,8 +3184,9 @@ mod tests {
         let live = live_dir.join("boot-config.json");
         // Same home, no data directory: the failed-delete leak.
         let gone = vms.join("gone/boot-config.json");
-        // The data root itself, in an argv shape that names no boot config:
-        // nothing can be concluded about that process, so it must be spared.
+        // A `_boot-vm` whose argv names no boot config under this home: no
+        // machine can be concluded from it, so neither scope may kill it —
+        // ownership is a parsed path, never a mention of the home.
         let unclassified = home.join("smolvm-home");
         let mut live_child = spawn_fake_boot_vm(&[live.to_str().unwrap()]);
         let mut gone_child = spawn_fake_boot_vm(&[gone.to_str().unwrap()]);
@@ -3141,7 +3194,6 @@ mod tests {
         let live_pid = live_child.id() as i32;
         let gone_pid = gone_child.id() as i32;
         let unknown_pid = unknown_child.id() as i32;
-        let _home = PreloopHomeGuard::set(&home);
 
         assert_eq!(
             purge_orphaned_vms(OrphanPurge::RemovedDataDir).expect("purge"),
@@ -3154,7 +3206,7 @@ mod tests {
         );
         assert!(
             process_alive(unknown_pid),
-            "an unclassifiable argv must survive the mid-flight purge"
+            "an argv that names no boot config must survive the mid-flight purge"
         );
         let _ = gone_child.wait();
         assert!(
@@ -3164,13 +3216,17 @@ mod tests {
 
         assert_eq!(
             purge_orphaned_vms(OrphanPurge::All).expect("purge"),
-            2,
-            "the startup scope kills the hypervisors the mid-flight scope spared"
+            1,
+            "the startup scope kills the hypervisor the mid-flight scope spared"
         );
         let _ = live_child.wait();
-        let _ = unknown_child.wait();
         assert!(!process_alive(live_pid), "only the scope spared it");
-        assert!(!process_alive(unknown_pid), "only the scope spared it");
+        assert!(
+            process_alive(unknown_pid),
+            "an argv that names no boot config is not ours under any scope"
+        );
+        let _ = unknown_child.kill();
+        let _ = unknown_child.wait();
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -3212,10 +3268,12 @@ mod tests {
         }
     }
 
-    /// A layer-store mount belongs to a home when it hangs off that home's
-    /// machine directory — in either the raw or the canonical form of the
-    /// path (`mount` prints `/private/tmp/...` for a `/tmp/...` home) — and
-    /// only the mounts no live hypervisor claims may be detached.
+    /// A layer-store mount belongs to this home when it hangs off this home's
+    /// machine data root — in either the raw or the canonical form of the path
+    /// (`mount` prints `/private/tmp/...` for a `/tmp/...` home) — and only
+    /// the mounts no live hypervisor claims may be detached. A neighboring
+    /// home's mount that this home's root is a string prefix of, and any
+    /// mount that is not a layer store, must never be selected.
     #[test]
     fn orphan_layer_store_mounts_spare_machines_with_a_live_hypervisor() {
         let _guard = PRELOOP_HOME_LOCK.lock();
@@ -3224,30 +3282,37 @@ mod tests {
         // the scan canonicalizes both sides.
         let home = std::path::PathBuf::from("/tmp")
             .join(format!("preloop-layer-mounts-{}", uuid::Uuid::new_v4()));
-        let vms = home.join("smolvm-home/Library/Caches/smolvm/vms");
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
         let live = vms.join("aaaaaaaaaaaaaaaa");
         let orphan = vms.join("bbbbbbbbbbbbbbbb");
         for dir in [&live, &orphan] {
             std::fs::create_dir_all(dir.join("pack/layers-cs")).unwrap();
         }
-        let _home = PreloopHomeGuard::set(&home);
-        let markers = home_markers().expect("this home resolves to markers");
-        let canonical = std::fs::canonicalize(&home).unwrap();
+        let roots = super::machine_data_roots();
+        let canonical_vms = std::fs::canonicalize(&vms).unwrap();
+        // A neighboring home whose path shares this home's data-root prefix
+        // as a *string* but not as a path component (`…/smolvm` vs
+        // `…/smolvm-vm-other`): its mount is not ours to detach.
+        let neighbor_mount = {
+            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
+            super::machine_data_root()
+                .expect("the neighbor home resolves to a data root")
+                .join("cccccccccccccccc/pack/layers-cs")
+        };
         let mount_table = format!(
             "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
              /dev/disk11s1 on {live}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
              /dev/disk9s1 on {orphan}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
-             /dev/disk10s1 on /tmp/other-home/smolvm-home/Library/Caches/smolvm/vms/cccccccccccccccc/pack/layers-cs (apfs, local)\n\
+             /dev/disk10s1 on {neighbor} (apfs, local)\n\
              /dev/disk12s1 on {orphan}/storage (apfs, local)\n",
-            live = canonical
-                .join("smolvm-home/Library/Caches/smolvm/vms/aaaaaaaaaaaaaaaa")
-                .display(),
-            orphan = canonical
-                .join("smolvm-home/Library/Caches/smolvm/vms/bbbbbbbbbbbbbbbb")
-                .display(),
+            live = canonical_vms.join("aaaaaaaaaaaaaaaa").display(),
+            orphan = canonical_vms.join("bbbbbbbbbbbbbbbb").display(),
+            neighbor = neighbor_mount.display(),
         );
-        // The live _boot-vm's argv names its machine's boot config (the file
-        // itself is consumed at boot; only the directory is durable).
+        // The live _boot-vm's argv names its machine's boot config in the raw
+        // form of the path (the file itself is consumed at boot; only the
+        // directory is durable).
         let ps_output = format!(
             "  501 /Users/x/.smolvm/smolvm-bin _boot-vm {}/boot-config.json\n\
              502 /usr/bin/unrelated\n",
@@ -3255,12 +3320,8 @@ mod tests {
         );
 
         assert_eq!(
-            orphan_layer_store_mounts(&markers, &ps_output, &mount_table),
-            vec![
-                canonical
-                    .join("smolvm-home/Library/Caches/smolvm/vms/bbbbbbbbbbbbbbbb")
-                    .join("pack/layers-cs")
-            ],
+            orphan_layer_store_mounts(&roots, &ps_output, &mount_table),
+            vec![canonical_vms.join("bbbbbbbbbbbbbbbb/pack/layers-cs")],
             "only the mount whose hypervisor is gone may be detached"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -3275,7 +3336,10 @@ mod tests {
         let _path_guard = PATH_LOCK.lock();
         let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-detach-{}", uuid::Uuid::new_v4()));
-        let orphan = home.join("smolvm-home/Library/Caches/smolvm/vms/bbbbbbbbbbbbbbbb");
+        let _home = PreloopHomeGuard::set(&home);
+        let orphan = super::machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("bbbbbbbbbbbbbbbb");
         std::fs::create_dir_all(orphan.join("pack/layers-cs")).unwrap();
         let log = home.join("hdiutil.log");
         let bin = home.join("fake-bin");
@@ -3301,7 +3365,6 @@ mod tests {
             std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let _path = PathPrependGuard::prepend(&bin);
-        let _home = PreloopHomeGuard::set(&home);
 
         // The real `ps` runs: no `_boot-vm` names this fixture home, so the
         // mount is provably orphaned.
