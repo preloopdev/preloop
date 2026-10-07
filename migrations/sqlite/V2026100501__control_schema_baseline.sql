@@ -1,7 +1,9 @@
 -- Control schema v1 baseline (SQLite).
 --
 -- Frozen copy of `crates/preloop-runner-server/src/control/lite/schema.sql`
--- as of base commit 05126635 (the schema the pre-migration runtime created).
+-- as of base commit 992e3b81 — the schema the pre-migration runtime creates
+-- (SQLite v4: `check_run_updates` carries the outbox `version`/`lease_owner`
+-- columns and no foreign key, per #365).
 -- Migration files are immutable: refinery stores a checksum per version and
 -- refuses a changed file (abort_divergent), so never edit an applied
 -- migration — add a new V<version>__<name>.sql instead. An executable parity
@@ -572,12 +574,13 @@ CREATE TABLE check_run_updates (
     job_id                  TEXT NOT NULL,
     installation_id         INTEGER NOT NULL,
     check_run_id            INTEGER,
+    version                 INTEGER NOT NULL DEFAULT 0,
     payload                 TEXT NOT NULL,
     not_before              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     attempts                INTEGER NOT NULL DEFAULT 0,
     leased_until            INTEGER,
-    PRIMARY KEY (run_id, job_id),
-    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+    lease_owner             TEXT,
+    PRIMARY KEY (run_id, job_id)
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 
