@@ -2319,8 +2319,11 @@ fn guest_sysctl_script_at(root: &str) -> String {
 /// curated bake maps the golden's name to loopback. So the check is "does the
 /// name resolve to loopback or a local-interface address"; a name mapped
 /// anywhere else is rewritten to the bake's `127.0.0.1 <host>` convention,
-/// with the stale mapping removed (a resolver answers a name with its *first*
-/// match, so appending a second line would leave the stale one winning).
+/// with the stale mapping removed — a resolver answers a name with its *first*
+/// match, so appending a second line would leave the stale one winning. Only
+/// the machine's own name is removed from a mapping, never the whole line: an
+/// entry that also carries `localhost` keeps it, and a line left with no name
+/// at all is dropped.
 ///
 /// Idempotent: a machine whose name already resolves locally — the baked
 /// golden itself, a fork that ran this once, or a GitHub-shaped
@@ -2360,7 +2363,7 @@ fn guest_hostname_script_at(hosts: &str) -> String {
          }}; \
          name_resolves_locally && exit 0; \
          tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts.$$; \
-         grep -v -E \"^[^#]*[[:space:]]$host([[:space:]]|$)\" {hosts} > \"$tmp\" 2>/dev/null || : > \"$tmp\"; \
+         sed -E -n \"/^[[:space:]]*#/{{\np\nb\n}}\ns/(^|[[:space:]])$host([[:space:]]|\\$)/\\1/g\ns/[[:space:]]+$//\n/^[[:space:]]*[0-9A-Fa-f:.]+[[:space:]]*$/!p\" {hosts} > \"$tmp\" 2>/dev/null || : > \"$tmp\"; \
          printf '127.0.0.1 %s\\n' \"$host\" >> \"$tmp\"; \
          if [ \"$(id -u)\" -eq 0 ]; then cat \"$tmp\" > {hosts}; \
          else cat \"$tmp\" | sudo -n tee {hosts} >/dev/null; fi; \
@@ -8409,12 +8412,13 @@ done
     /// carry `169.254.0.21`). `getent hosts <name>` answers, so a check that
     /// only asks whether the name resolves passes — while every consumer of
     /// the name, `sudo` included, gets an address that is not this machine.
-    /// The script must notice, drop the foreign mapping (a resolver answers
-    /// with the *first* match, so appending a second line would leave the
-    /// stale one winning) and leave the machine's own name pointing at
-    /// loopback. A machine whose name maps to one of its own interface
-    /// addresses — GitHub's own `/etc/hosts` shape — is already correct and
-    /// must be left alone.
+    /// The script must notice and remove the machine's own name from the
+    /// foreign mapping (a resolver answers with the *first* match, so
+    /// appending a second line would leave the stale one winning), leaving the
+    /// machine's name on loopback; only the name goes, so a mapping that also
+    /// carries another name (`localhost`) keeps it. A machine whose name maps
+    /// to one of its own interface addresses — GitHub's own `/etc/hosts`
+    /// shape — is already correct and must be left alone.
     #[cfg(unix)]
     #[test]
     fn guest_hostname_script_rewrites_a_stale_foreign_mapping() {
@@ -8426,6 +8430,7 @@ done
             &hosts,
             "127.0.0.1 localhost\n\
              10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net runnervmvrwv9\n\
+             10.1.0.60 localhost runnervmvrwv9\n\
              # a comment that mentions runnervmvrwv9\n",
         )
         .unwrap();
@@ -8481,9 +8486,12 @@ done
         assert_eq!(
             std::fs::read_to_string(&hosts).unwrap(),
             "127.0.0.1 localhost\n\
+             10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net\n\
+             10.1.0.60 localhost\n\
              # a comment that mentions runnervmvrwv9\n\
              127.0.0.1 runnervmvrwv9\n",
-            "the foreign mapping must be replaced, comments untouched"
+            "the machine's name must leave the foreign mapping, other names and \
+             comments untouched"
         );
         let after = std::process::Command::new("/bin/sh")
             .args(["-c", "getent hosts \"$(hostname)\""])
