@@ -821,6 +821,82 @@ mod tests {
         );
     }
 
+    /// The preparation never writes through a symlinked database path: a
+    /// dangling link (or one onto an empty file) would otherwise have the
+    /// migration create the store at the link's target — the move a
+    /// service-owned state tree uses to aim a privileged write anywhere.
+    #[tokio::test]
+    async fn brand_new_preparation_refuses_a_symlinked_store_path() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let outside = dir.path().join("outside.db");
+        let link = state_dir.join("preloop.db");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let error = crate::store_admin::prepare_brand_new_local(&state_dir).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(
+            !outside.exists(),
+            "the link's target is never created through it"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is left as it was"
+        );
+    }
+
+    /// A link that resolves to an existing store is nothing to prepare, and
+    /// anything that is not a regular file at the path is refused rather
+    /// than migrated into.
+    #[tokio::test]
+    async fn brand_new_preparation_never_migrates_through_a_link_or_a_non_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        assert!(
+            crate::store_admin::prepare_brand_new_local(&state_dir).unwrap(),
+            "a fresh store is initialized"
+        );
+        let store = dir.path().join("store.db");
+        std::fs::rename(state_dir.join("preloop.db"), &store).unwrap();
+        let before = std::fs::metadata(&store).unwrap();
+        std::os::unix::fs::symlink(&store, state_dir.join("preloop.db")).unwrap();
+        assert!(
+            !crate::store_admin::prepare_brand_new_local(&state_dir).unwrap(),
+            "an existing store behind a link is left alone"
+        );
+        let after = std::fs::metadata(&store).unwrap();
+        assert_eq!(before.len(), after.len(), "nothing is written through it");
+        assert_eq!(
+            before.permissions().mode() & 0o7777,
+            after.permissions().mode() & 0o7777,
+            "nothing is chmodded through it"
+        );
+
+        // A directory (a FIFO, a device) is never a store to migrate into.
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir_all(occupied.join("preloop.db")).unwrap();
+        let error = crate::store_admin::prepare_brand_new_local(&occupied).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+
+        // A link onto a non-file cannot become the store either.
+        let linked = dir.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&occupied, linked.join("preloop.db")).unwrap();
+        let error = crate::store_admin::prepare_brand_new_local(&linked).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
     // ── PostgreSQL ──────────────────────────────────────────────────────
 
     async fn pg_client(url: &str) -> tokio_postgres::Client {

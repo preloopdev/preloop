@@ -368,13 +368,16 @@ fn install_systemd(
         bootstrap_smolvm_data(home, dry)?;
         migrate_legacy_env_file(home, dry)?;
         // Brand-new installs: initialize the control database so the
-        // service's first start works with no extra step. Ownership is fixed
-        // by the recursive chown below; an existing database is never
+        // service's first start works with no extra step. The recursive
+        // chown runs first and the preparation runs *as the service
+        // account*: root must not create or chmod inside the tree that
+        // account owns, because a symlink planted there would aim the write
+        // at a target of its choosing. An existing database is never
         // upgraded here (`preloop store migrate` is the explicit path).
-        prepare_control_store(home, dry)?;
         chown_state_dir(home, dry)?;
+        prepare_control_store(home, exe, args.user, dry)?;
     } else {
-        prepare_control_store(home, dry)?;
+        prepare_control_store(home, exe, args.user, dry)?;
     }
     // Written after chown_state_dir, and deliberately outside it for a system
     // install: the env file lives in the root-owned config dir, so the
@@ -1706,20 +1709,76 @@ fn prepare_home(home: &Path, dry_run: bool) -> Result<()> {
 /// first start works with no extra step (zero-config first use). An existing
 /// database is never touched: upgrading is `preloop store migrate`, never
 /// implicit, and a Postgres store is the operator's explicit migrate call.
+///
+/// Runs the internal `store init-local` in a child process rather than the
+/// helper in-process, because the database lives in the state tree that
+/// belongs to the service account: a root-owned create, write or chmod there
+/// can be aimed anywhere the account can place a symlink. A system install
+/// therefore drops the child to the service account, which can only write
+/// where the service itself can — the identity that owns the store from the
+/// first start on.
 #[cfg(target_os = "linux")]
-fn prepare_control_store(home: &Path, dry_run: bool) -> Result<()> {
+fn prepare_control_store(home: &Path, exe: &Path, user: bool, dry_run: bool) -> Result<()> {
     if dry_run {
         eprintln!("[preloop] would initialize a brand-new control database");
         return Ok(());
     }
-    let state_dir = home.join("state");
-    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
-        eprintln!(
-            "[preloop] initialized the control database at {}",
-            state_dir.join("preloop.db").display()
+    let store_url = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+    let status = match control_store_init_command(exe, home, user, store_url.as_deref()).status() {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !user => bail!(
+            "`setpriv` (util-linux) is required to initialize the control database \
+             as {SERVICE_USER}; install util-linux, or run `sudo -u {SERVICE_USER} \
+             env PRELOOP_HOME={} preloop store migrate` yourself",
+            home.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| format!("run {} store init-local", exe.display()));
+        }
+    };
+    if !status.success() {
+        bail!(
+            "initializing the control database at {} failed ({status}); run \
+             `preloop store migrate` as the account that owns the state directory",
+            home.join("state").join("preloop.db").display()
         );
     }
     Ok(())
+}
+
+/// The `store init-local` command that prepares the control database: the
+/// installed executable, run as the service account for a system install
+/// (`setpriv` drops to it) and as the invoker for a user-scope one. The
+/// environment is explicitly emptied — the child gets only the home it must
+/// prepare and the operator's store override — so root's environment never
+/// reaches a process running as the service's account.
+#[cfg(any(target_os = "linux", test))]
+fn control_store_init_command(
+    exe: &Path,
+    home: &Path,
+    user: bool,
+    store_url: Option<&std::ffi::OsStr>,
+) -> Command {
+    let mut command = if user {
+        Command::new(exe)
+    } else {
+        let mut command = Command::new("setpriv");
+        // Least privilege: the store lives in the state tree
+        // `chown -R preloop:preloop` handed over, so the child needs the
+        // service's identity and nothing else — no supplementary groups.
+        command
+            .arg(format!("--reuid={SERVICE_USER}"))
+            .arg(format!("--regid={SERVICE_USER}"))
+            .args(["--clear-groups", "--"])
+            .arg(exe);
+        command
+    };
+    command.args(["store", "init-local"]);
+    command.env_clear().env("PRELOOP_HOME", home);
+    if let Some(url) = store_url {
+        command.env(preloop_runner_server::store::STORE_URL_ENV, url);
+    }
+    command
 }
 
 #[cfg(target_os = "linux")]
@@ -1864,6 +1923,7 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
 
     fn env_lines() -> Vec<String> {
@@ -2292,6 +2352,98 @@ WantedBy=multi-user.target
             systemctl_args(true, &["daemon-reload"]),
             vec!["--user".to_owned(), "daemon-reload".to_owned()]
         );
+    }
+
+    /// A system install prepares the control database as the service account
+    /// (`setpriv`), never as root: the state tree belongs to that account, so
+    /// a root-owned create there could be aimed at any target with a symlink.
+    #[test]
+    fn system_install_prepares_the_store_as_the_service_account() {
+        let command = control_store_init_command(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/var/lib/preloop"),
+            false,
+            None,
+        );
+        assert_eq!(command.get_program(), OsStr::new("setpriv"));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--reuid=preloop",
+                "--regid=preloop",
+                "--clear-groups",
+                "--",
+                "/usr/local/bin/preloop",
+                "store",
+                "init-local",
+            ]
+        );
+        assert_eq!(
+            environment(&command),
+            [(
+                "PRELOOP_HOME".to_owned(),
+                Some("/var/lib/preloop".to_owned())
+            )]
+        );
+    }
+
+    /// A user-scope install has no privilege boundary to cross: the same
+    /// preparation runs directly, with the invoker's own identity.
+    #[test]
+    fn user_install_prepares_the_store_directly() {
+        let command = control_store_init_command(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/home/alice/.preloop"),
+            true,
+            None,
+        );
+        assert_eq!(command.get_program(), OsStr::new("/usr/local/bin/preloop"));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["store", "init-local"]);
+    }
+
+    /// The child's environment is only what it needs: the home to prepare and
+    /// the operator's store override when one is set — never root's.
+    #[test]
+    fn the_preparation_environment_is_exactly_the_home_and_store_override() {
+        let command = control_store_init_command(
+            Path::new("/usr/local/bin/preloop"),
+            Path::new("/var/lib/preloop"),
+            false,
+            Some(OsStr::new("postgres://db.example/preloop")),
+        );
+        assert_eq!(
+            environment(&command),
+            [
+                (
+                    "PRELOOP_HOME".to_owned(),
+                    Some("/var/lib/preloop".to_owned())
+                ),
+                (
+                    "PRELOOP_STORE_URL".to_owned(),
+                    Some("postgres://db.example/preloop".to_owned())
+                ),
+            ]
+        );
+    }
+
+    fn environment(command: &Command) -> Vec<(String, Option<String>)> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
     }
 
     #[test]

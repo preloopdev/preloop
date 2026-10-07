@@ -23,6 +23,13 @@ enum StoreCommand {
     /// Show the control database's applied, pending and unknown migrations.
     /// Read-only: never creates or changes the database.
     Status(StatusArgs),
+    /// Internal: initialize only a brand-new local store, as the account
+    /// that will own it. `preloop server install` runs this as the service
+    /// account so root never creates, writes or chmods inside the
+    /// service-owned state tree; an existing store is never touched
+    /// (upgrading is `migrate`).
+    #[command(hide = true)]
+    InitLocal,
 }
 
 #[derive(Debug, Args)]
@@ -60,7 +67,22 @@ pub(crate) async fn run(args: StoreArgs) -> anyhow::Result<()> {
     match args.command {
         StoreCommand::Migrate(args) => migrate(args).await,
         StoreCommand::Status(args) => status(args).await,
+        StoreCommand::InitLocal => init_local(),
     }
+}
+
+/// Initialize only a brand-new local store (see `prepare_brand_new_local`).
+/// A no-op when the store already exists, so it is safe as the installer's
+/// preparation step for both a fresh and a repeated install.
+fn init_local() -> anyhow::Result<()> {
+    let state_dir = crate::preloop_home().join("state");
+    if store_admin::prepare_brand_new_local(&state_dir)? {
+        eprintln!(
+            "[preloop] initialized the control database at {}",
+            state_dir.join("preloop.db").display()
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the target exactly like `preloop serve` resolves its store.
