@@ -2097,12 +2097,19 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
     );
     // The privileged half, applied only after `needs=1`. `set -e` makes every
     // required operation fail the script: this is the ownership jobs depend
-    // on, so a partial apply must not report success.
+    // on, so a partial apply must not report success. Like the per-exec
+    // provisioning, the walk matches on the owner alone and touches only the
+    // inodes that need it; a recursive chown would copy the whole tree into
+    // the VM's overlay upper, and a group predicate would re-group files the
+    // official images deliberately leave in another group (the runner home's
+    // `runner:docker`).
     let apply = format!(
         "set -e; \
          {adopt_homes}; \
          for d in /usr/local/rustup /usr/local/cargo; do \
-           if [ -e \"$d\" ]; then chown -R {uid}:{uid} \"$d\"; fi; \
+           if [ -e \"$d\" ]; then \
+             find \"$d\" -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} +; \
+           fi; \
          done; \
          if [ -d /opt/hostedtoolcache ]; then \
            [ \"$(stat -c %a /opt/hostedtoolcache)\" = \"777\" ] || chmod -R 777 /opt/hostedtoolcache; \
@@ -6469,6 +6476,23 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // `name_to_handle_at`, so fanotify FID watchers (TypeScript's fswatch,
     // 126 tests) failed with "operation not supported". GitHub-hosted
     // runners keep `/tmp` on ext4; the bind mount matches that.
+    // Ownership is reconciled by walking to the inodes whose *owner* is
+    // actually wrong, never by a recursive `chown`. The guest root is
+    // overlayfs: a recursive chown copies every file it visits out of the
+    // packed lower layer into the per-VM upper, even when the owner already
+    // matches — measured on a throwaway VM booted from the campaign golden,
+    // one `chown -R /home/runner` spent 304 s and copied 1.22 GB (12,631
+    // overlay entries) into the per-VM upper to re-group two inodes. The
+    // predicate is the owner alone: GitHub's own images ship
+    // `/home/runner/.docker` and its `config.json` as `runner:docker`
+    // (verified on hosted `ubuntu-24.04-arm` and `ubuntu-24.04`, both
+    // `mismatch-count=2` under a uid-or-gid predicate), and the official
+    // runner leaves that group in place, so a file the runner already owns
+    // must keep whatever group it has.
+    // `chown -h` on the matched paths preserves `chown -R`'s default
+    // no-symlink-traversal semantics. `-xdev` keeps the walk out of the
+    // read-only externals mount some bases carry under the runner home; on the
+    // packed-golden shape it visits the same entries as an unfiltered walk.
     let provisioning = format!(
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
@@ -6477,10 +6501,10 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
            || true; \
          chmod 0440 /etc/sudoers.d/preloop-{user} 2>/dev/null || true; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         chown -R {uid}:{uid} /home/runner 2>/dev/null || true; \
+         find /home/runner -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null || true; \
          chown {uid}:{uid} /run/user/{uid} 2>/dev/null || true; \
-         if [ -d /usr/local/rustup ]; then chown -R {uid}:{uid} /usr/local/rustup; fi; \
-         if [ -d /usr/local/cargo ]; then chown -R {uid}:{uid} /usr/local/cargo; fi; \
+         if [ -d /usr/local/rustup ]; then find /usr/local/rustup -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null; fi; \
+         if [ -d /usr/local/cargo ]; then find /usr/local/cargo -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null; fi; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -7565,10 +7589,33 @@ chmod +x "$dest/bin/node"
             "adoption must be gated on a usable rustup home: {script}"
         );
         // A runner-owned root with root-owned descendants passes a top-level
-        // `stat` and then skips the recursive chown; the probe must descend.
+        // `stat` and then skips the ownership fix; the probe must descend.
         assert!(
             script.contains("find \"$d/.\" ! -uid 1001 -print -quit"),
             "the ownership probe must be recursive: {script}"
+        );
+        // ...but the apply itself must not be: a recursive chown copies every
+        // file of the tree out of the golden's lower layer into the VM's
+        // overlay upper.
+        assert!(
+            decoded.contains("-exec chown -h 1001:1001 {} +"),
+            "the reconcile apply must chown only the mismatched inodes: {decoded}"
+        );
+        assert!(
+            !decoded.contains("chown -R"),
+            "the reconcile apply must not recurse: {decoded}"
+        );
+        // A file the runner already owns keeps whatever group it has. GitHub's
+        // own images ship `/home/runner/.docker` as `runner:docker`, and the
+        // official runner leaves it alone — only the owner identifies an inode
+        // the guest has to adopt.
+        assert!(
+            decoded.contains("find \"$d\" -xdev ! -user 1001 -exec chown -h 1001:1001 {} +"),
+            "the reconcile apply must match on the owner alone: {decoded}"
+        );
+        assert!(
+            !decoded.contains("! -group 1001"),
+            "a runner-owned file in another group must be left alone: {decoded}"
         );
         assert!(
             script.contains("stat -L -c %u"),
@@ -7604,6 +7651,30 @@ chmod +x "$dest/bin/node"
         assert!(
             script.contains("| base64 -d | sudo -n sh 2>/dev/null || true"),
             "{script}"
+        );
+        // Ownership is reconciled by walking to the inodes whose owner is
+        // wrong. The guest root is overlayfs, where a recursive chown copies
+        // every visited file into the per-VM upper layer even when the owner
+        // is unchanged (1.22 GB per provision on the production golden's
+        // runner home, to fix two inodes).
+        assert!(
+            script.contains("-exec chown -h 1001:1001 {} +"),
+            "provisioning must chown only the mismatched inodes: {script}"
+        );
+        assert!(
+            !script.contains("chown -R"),
+            "no recursive chown may stay in the per-exec provisioning: {script}"
+        );
+        // Owner-only, like the reconcile apply: hosted `ubuntu-24.04-arm` and
+        // `ubuntu-24.04` both ship `/home/runner/.docker` as `runner:docker`,
+        // and a runner-owned file must keep its group.
+        assert!(
+            script.contains("find /home/runner -xdev ! -user 1001 -exec chown -h 1001:1001 {} +"),
+            "the home walk must match on the owner alone: {script}"
+        );
+        assert!(
+            !script.contains("! -group 1001"),
+            "a runner-owned file in another group must be left alone: {script}"
         );
         // Both branches run the launch (limit raise + setpriv drop) from a
         // base64'd script; the image-user branch pipes it through sudo so the

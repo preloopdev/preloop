@@ -23,6 +23,23 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Runner provisioning no longer copies the runner home into every VM's
+  overlay**: the per-exec ownership fix ran `chown -R` over `/home/runner`,
+  `/usr/local/rustup`, and `/usr/local/cargo`. The guest root is overlayfs —
+  the packed golden is the lower layer, the per-VM disk the upper — and chown
+  copies every file it visits out of the lower layer before it can change the
+  metadata, matching owner or not. Measured on a throwaway VM booted from the
+  campaign golden (12,643 entries, 1.2 GiB under `/home/runner`): one
+  `chown -R /home/runner` spent 304 s and copied 1.22 GB (12,631 overlay
+  entries) to touch two inodes, while parallel provisions queue behind it.
+  The walk now chowns only the inodes the runner account does not own — the
+  owner is the whole predicate — in 1.7 s, copying no file content and leaving
+  the ownership map byte-identical, so a runner-owned file keeps its group
+  exactly as GitHub's images ship it (`/home/runner/.docker` is
+  `runner:docker`, verified on hosted `ubuntu-24.04-arm` and `ubuntu-24.04`).
+  The always-run ownership reconciliation's `/usr/local/rustup` and
+  `/usr/local/cargo` trees get the same treatment.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the
