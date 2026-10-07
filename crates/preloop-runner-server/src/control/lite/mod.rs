@@ -130,14 +130,13 @@ fn ensure_usable(conn: &mut Connection) -> Result<(), ControlError> {
     if let super::migrations::Ledger::Empty = ledger {
         #[cfg(any(test, feature = "test-support"))]
         {
-            super::migrate_runner::initialize_empty_sqlite(conn)
-                .map_err(ControlError::backend)?;
+            super::migrate_runner::initialize_empty_sqlite(conn).map_err(ControlError::backend)?;
             return Ok(());
         }
         #[cfg(not(any(test, feature = "test-support")))]
-        return Err(super::migrations::backend_error(super::migrations::refusal(
-            super::migrations::Ledger::Empty,
-        )));
+        return Err(super::migrations::backend_error(
+            super::migrations::refusal(super::migrations::Ledger::Empty),
+        ));
     }
     super::migrations::check_ledger(ledger).map_err(super::migrations::backend_error)
 }
