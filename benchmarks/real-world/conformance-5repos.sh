@@ -149,8 +149,19 @@ file_size() {
 prepare_golden_home() {
   # Dedicated temp home: a crashed run leaves VM disks (tens of GiB) that
   # crowd out the next golden unpack. The golden artifact itself lives
-  # outside this home (~/.config/preloop/vms), so a clean slate is safe.
+  # outside this home (~/.config/preloop/vms), so a clean slate is safe —
+  # except for the node key: the required Postgres store outlives this wipe
+  # and the engine refuses a database created under a different key.
+  local saved_key=""
+  if [ -f "$CAMPAIGN_HOME/state/hmac-key.bin" ]; then
+    saved_key="$(mktemp)"
+    cp -p "$CAMPAIGN_HOME/state/hmac-key.bin" "$saved_key"
+  fi
   rm -rf "$CAMPAIGN_HOME"
+  if [ -n "$saved_key" ]; then
+    mkdir -p "$CAMPAIGN_HOME/state"
+    mv "$saved_key" "$CAMPAIGN_HOME/state/hmac-key.bin"
+  fi
   if [ "${PRELOOP_GOLDEN_SOURCE:-}" = ghcr ]; then
     # Fresh pull of the digest-pinned golden (GOLDEN_OCI_REF_* in
     # preloop-orchestrator): no local artifact is linked, so the engine
