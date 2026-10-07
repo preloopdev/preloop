@@ -76,6 +76,13 @@ docker_compose_version = "2.38.2"
 # GitHub release asset is statically linked, so it carries no glibc coupling
 # to the Ubuntu base.
 crun_version = "1.23.1"
+# SHA-256 of the `crun-{version}-linux-{amd64,arm64}` release assets above.
+# crun is root-executed by every container the golden creates, so the bake
+# verifies the download against these pins before installing it as dockerd's
+# default runtime (the version string alone would accept a truncated body).
+# The asset names embed the version: re-pin both hashes when bumping it.
+crun_sha256_amd64 = "9ca2edc15f366b385eaae29a97ee06a390cb9baccf07a07fb48bb60e168e6056"
+crun_sha256_arm64 = "a06911e40b52722e1aa462c61bcab085e09901de9565ba611f3de9a5b7122631"
 clang_versions = "16 17 18"
 clang_default_version = "18"
 clang_16_version = "16.0.6"

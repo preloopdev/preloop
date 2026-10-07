@@ -1963,6 +1963,16 @@ pub fn crun_rosetta_shim() -> &'static str {
     CRUN_ROSETTA_SHIM
 }
 
+/// The `daemon.json` keys that wire the shim in as docker's `default-runtime`.
+///
+/// Two writers own `/etc/docker/daemon.json`: the bake ([`base_install_script`],
+/// which creates it) and the runtime storage-driver fallback
+/// ([`docker_start_command`], which rewrites it when the kernel forces `vfs`).
+/// Both must carry these keys — a rewrite that drops them silently downgrades
+/// every container back to runc and loses the Rosetta mount injection
+/// (`rosetta-wrapper: unexpected initial stop: 32512` on Apple Silicon).
+const DOCKER_RUNTIME_JSON: &str = "\"runtimes\":{\"crun-rosetta\":{\"path\":\"/usr/local/bin/crun-rosetta\"}},\"default-runtime\":\"crun-rosetta\"";
+
 /// Loopback `/etc/hosts` contents. Exposed for the fidelity tests.
 pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
@@ -2308,14 +2318,23 @@ pub fn base_install_script() -> String {
           docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
           docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-         printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"runtimes\":{{\"crun-rosetta\":{{\"path\":\"/usr/local/bin/crun-rosetta\"}}}},\"default-runtime\":\"crun-rosetta\"}}\\n' > /etc/docker/daemon.json && \
-         echo \"### install crun v{CRUN_VERSION} + rosetta runtime shim\" >&2 && \
-         curl -fsSL \"https://github.com/containers/crun/releases/download/{CRUN_VERSION}/crun-{CRUN_VERSION}-linux-$LFS_ARCH\" -o /usr/bin/crun && \
-         chmod 0755 /usr/bin/crun && \
-         /usr/bin/crun --version | grep -F '{CRUN_VERSION}' && \
-         printf '%s' {crun_rosetta_shim_quoted} > /usr/local/bin/crun-rosetta && \
-         chmod 0755 /usr/local/bin/crun-rosetta && \
-         ln -sf crun-rosetta /usr/local/bin/runc) && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",{DOCKER_RUNTIME_JSON}}}\\n' > /etc/docker/daemon.json)) && \
+         (echo \"### install crun v{CRUN_VERSION} + rosetta runtime shim\" >&2 && \
+          case \"$LFS_ARCH\" in \
+            amd64) crun_sha256={CRUN_SHA256_AMD64} ;; \
+            arm64) crun_sha256={CRUN_SHA256_ARM64} ;; \
+            *) echo \"no crun sha256 pin for arch $LFS_ARCH\" >&2; exit 1 ;; \
+          esac; \
+          curl -fsSL \"https://github.com/containers/crun/releases/download/{CRUN_VERSION}/crun-{CRUN_VERSION}-linux-$LFS_ARCH\" -o /tmp/crun && \
+          crun_actual=$(shasum -a 256 /tmp/crun 2>/dev/null | awk '{{print $1}}'); \
+          if [ -z \"$crun_actual\" ]; then crun_actual=$(sha256sum /tmp/crun 2>/dev/null | awk '{{print $1}}'); fi; \
+          if [ \"$crun_actual\" != \"$crun_sha256\" ]; then echo \"ERROR: crun {CRUN_VERSION} sha256 mismatch for $LFS_ARCH (got $crun_actual expected $crun_sha256)\" >&2; exit 1; fi; \
+          chmod 0755 /tmp/crun && \
+          mv /tmp/crun /usr/bin/crun && \
+          /usr/bin/crun --version | grep -F '{CRUN_VERSION}' && \
+          printf '%s' {crun_rosetta_shim_quoted} > /usr/local/bin/crun-rosetta && \
+          chmod 0755 /usr/local/bin/crun-rosetta && \
+          ln -sf crun-rosetta /usr/local/bin/runc) && \
          (echo \"### fetch cargo-shear\" >&2 && \
           curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
          (echo \"### bake git v{GIT_VERSION}\" >&2 && \
@@ -2379,19 +2398,21 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// and is only removed once `docker info` has failed so it is stale by
 /// definition.
 ///
-/// The storage driver is probed, never assumed: the golden's daemon auto-selects
-/// `fuse-overlayfs`, which cannot mount inside the smolvm kernel (no `/dev/fuse`,
-/// and the bundled fuse-overlayfs rejects the `lazytime` option), so every
-/// `docker run` in a container job dies with "fuse: device not found". We try a
-/// real overlay mount first and fall back to `vfs`; if the daemon then refuses
-/// the previous driver's data, the docker data-root is reset and dockerd is
-/// retried once (images re-pull from the registry).
-fn docker_start_command() -> Vec<String> {
-    vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        run_as_root_or_sudo(&format!(
-            "command -v dockerd >/dev/null 2>&1 || exit 0; \
+/// A guest's container-engine start script (see [`docker_start_command`] for
+/// the wrapper). The storage driver is probed, never assumed: the golden's
+/// daemon auto-selects `fuse-overlayfs`, which cannot mount inside the smolvm
+/// kernel (no `/dev/fuse`, and the bundled fuse-overlayfs rejects the
+/// `lazytime` option), so every `docker run` in a container job dies with
+/// "fuse: device not found". We try a real overlay mount first and fall back
+/// to `vfs`; if the daemon then refuses the previous driver's data, the docker
+/// data-root is reset and dockerd is retried once (images re-pull from the
+/// registry).
+///
+/// Extracted from the wrapper so tests can assert the `daemon.json` rewrite
+/// directly; the wrapper embeds the script base64.
+fn docker_start_script() -> String {
+    format!(
+        "command -v dockerd >/dev/null 2>&1 || exit 0; \
              docker info >/dev/null 2>&1 && exit 0; \
              rm -f /var/run/docker.pid; \
              mkdir -p {DOCKER_DATA_ROOT}; \
@@ -2419,7 +2440,11 @@ fn docker_start_command() -> Vec<String> {
              fi; \
              rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
              if [ -n \"$DRIVER\" ]; then \
-               printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+               if [ -x /usr/local/bin/crun-rosetta ]; then \
+                 printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\",{DOCKER_RUNTIME_JSON}}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+               else \
+                 printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+               fi; \
              fi; \
              start_dockerd() {{ \
                rm -f /var/run/docker.pid; \
@@ -2445,8 +2470,83 @@ fn docker_start_command() -> Vec<String> {
              if start_dockerd; then exit 0; fi; \
              echo 'dockerd failed to start after data-root reset' >&2; \
              exit 1"
-        )),
+    )
+}
+
+/// Start the container engine, if one is installed.
+///
+/// Runs per machine rather than in the golden: a daemon captured mid-flight by
+/// a fork would wake up with stale state and a socket it does not own. It runs
+/// as a background task from provisioning (overlapping runner registration),
+/// never gating readiness: the 5-15 s cold boot sits off the starting path,
+/// and the worker waits for the daemon before container setup, so neither
+/// declared (`container:`/`services:`) nor ad-hoc (`docker run` steps)
+/// container use can observe a half-started engine.
+///
+/// Never fatal. A pool without a working container engine still runs every job
+/// that does not use `container:` or `services:`.
+///
+/// Readiness is `docker info` rather than `pgrep dockerd`, because a forked VM
+/// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
+/// the zombie, concludes Docker is up, and leaves the runner with no daemon.
+/// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
+/// and is only removed once `docker info` has failed so it is stale by
+/// definition.
+fn docker_start_command() -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        run_as_root_or_sudo(&docker_start_script()),
     ]
+}
+
+#[cfg(test)]
+mod docker_daemon_tests {
+    use super::*;
+
+    fn start_script() -> String {
+        docker_start_script()
+    }
+
+    /// The vfs fallback rewrites `/etc/docker/daemon.json`. It must keep the
+    /// crun-rosetta wiring the bake wrote — a plain rewrite silently drops
+    /// `default-runtime` and every container falls back to runc, losing the
+    /// Rosetta mount injection (`unexpected initial stop: 32512` on Apple
+    /// Silicon) — while still forcing the storage driver.
+    #[test]
+    fn vfs_fallback_keeps_the_crun_rosetta_runtime_wiring() {
+        let script = start_script();
+        let wired = format!(
+            "printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\",{DOCKER_RUNTIME_JSON}}}\\n' \"$DRIVER\" > /etc/docker/daemon.json"
+        );
+        assert!(
+            script.contains(&wired),
+            "the vfs rewrite must keep the runtime keys; got: {script}"
+        );
+        // Goldens that predate the shim keep the plain rewrite: pointing
+        // `default-runtime` at a binary the image lacks would fail every
+        // container create instead of merely losing the mount injection.
+        let plain = format!(
+            "printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json"
+        );
+        assert!(
+            script.contains(&plain),
+            "shim-less goldens must keep the plain rewrite; got: {script}"
+        );
+        assert!(
+            script.contains("[ -x /usr/local/bin/crun-rosetta ]"),
+            "the runtime wiring is gated on the shim actually being installed"
+        );
+    }
+
+    #[test]
+    fn docker_start_script_parses_as_posix_shell() {
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", &start_script()])
+            .status()
+            .expect("run the shell parser");
+        assert!(status.success(), "docker start script must parse");
+    }
 }
 
 /// How long to wait for a freshly started guest to accept commands.

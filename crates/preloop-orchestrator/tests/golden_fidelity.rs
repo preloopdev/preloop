@@ -10,8 +10,9 @@
 //! come to roughly 90 GB and are the job of setup actions and containers.
 
 use preloop_orchestrator::{
-    BASE_NODE_VERSION, CRUN_VERSION, base_install_script, base_packages, compiler_packages,
-    crun_rosetta_shim, docker_data_root, docker_packages, loopback_hosts,
+    BASE_NODE_VERSION, CRUN_SHA256_AMD64, CRUN_SHA256_ARM64, CRUN_VERSION, base_install_script,
+    base_packages, compiler_packages, crun_rosetta_shim, docker_data_root, docker_packages,
+    loopback_hosts,
 };
 
 /// Commands a workflow may reasonably assume exist, because `ubuntu-latest`
@@ -462,18 +463,36 @@ fn golden_wires_crun_rosetta_as_docker_default_runtime() {
          clobbering the container data-root; missing: {daemon_json}"
     );
 
-    // The shim and its pinned static backend both land in the image. crun must
-    // be >= 1.14: buildx's embedded executor invokes `runc run --keep`.
+    // The shim and its checksummed static backend both land in the image. crun
+    // must be >= 1.14: buildx's embedded executor invokes `runc run --keep`.
     for fragment in [
         format!("crun-{CRUN_VERSION}-linux-$LFS_ARCH"),
         "https://github.com/containers/crun/releases/download/".to_owned(),
-        "chmod 0755 /usr/bin/crun".to_owned(),
+        format!("crun_sha256={CRUN_SHA256_AMD64}"),
+        format!("crun_sha256={CRUN_SHA256_ARM64}"),
+        "chmod 0755 /tmp/crun".to_owned(),
+        "mv /tmp/crun /usr/bin/crun".to_owned(),
         format!("/usr/bin/crun --version | grep -F '{CRUN_VERSION}'"),
         "chmod 0755 /usr/local/bin/crun-rosetta".to_owned(),
         "ln -sf crun-rosetta /usr/local/bin/runc".to_owned(),
     ] {
         assert!(script.contains(&fragment), "bake lost {fragment:?}");
     }
+
+    // crun is root-executed by every container the golden creates, so the
+    // download is verified against the reviewed per-arch sha256 pin BEFORE it
+    // is moved into /usr/bin; the version string alone would accept a
+    // truncated or swapped body.
+    let verify_at = script
+        .find("if [ \"$crun_actual\" != \"$crun_sha256\" ]")
+        .expect("the bake must compare the crun download against a sha256 pin");
+    let install_at = script
+        .find("mv /tmp/crun /usr/bin/crun")
+        .expect("the verified download must be installed as /usr/bin/crun");
+    assert!(
+        verify_at < install_at,
+        "the sha256 check must gate the crun install, not follow it"
+    );
 
     // The shim rides into the image as one shell word; without it dockerd has
     // a default-runtime pointing at nothing and every container create fails.
