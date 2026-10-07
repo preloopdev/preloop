@@ -2060,7 +2060,9 @@ async fn current_runner_registration_to_broker_job_e2e() {
 /// GitHub's dispatcher injects the job token through the lower-case
 /// `github_token` variable. The runner exposes that built-in value to
 /// `${{ secrets.GITHUB_TOKEN }}`; the wire must not add a second, non-official
-/// uppercase variable.
+/// uppercase variable — and with no GitHub credential configured (no App, no
+/// PAT) there is no token to inject at all: the surface stays empty instead of
+/// carrying the engine's runtime token.
 #[tokio::test]
 async fn job_message_carries_the_official_github_token_variable() {
     let temp = tempfile::tempdir().unwrap();
@@ -2137,13 +2139,21 @@ async fn job_message_carries_the_official_github_token_variable() {
     );
 
     let token_secret = &acquired["variables"]["github_token"];
-    assert_eq!(
-        token_secret["isSecret"], true,
-        "github_token must be marked secret so the runner masks it: {acquired}"
+    assert!(
+        token_secret.is_null() || token_secret["value"].as_str().is_some_and(str::is_empty),
+        "a tokenless engine must not invent a github_token: {token_secret}"
     );
     assert_eq!(
-        token_secret["value"], acquired["variables"]["system.github.token"]["value"],
-        "github_token must be the job token the engine minted"
+        acquired["variables"]["system.github.token"], *token_secret,
+        "system.github.token and github_token describe the same (absent) token"
+    );
+    assert!(
+        github_context_token(&acquired).is_none_or(|token| token.is_empty()),
+        "`${{ github.token }}` must resolve empty so consumers go anonymous"
+    );
+    assert!(
+        service_endpoint_token(&acquired).is_some(),
+        "the engine's runtime token still reaches the job through the service endpoint"
     );
     assert!(
         acquired["variables"].get("GITHUB_TOKEN").is_none(),
@@ -2458,7 +2468,10 @@ jobs:
         acquired["variables"]["system.github.launch_endpoint"]["value"],
         public_base_url()
     );
-    assert!(acquired["variables"]["system.github.token"]["value"].is_string());
+    assert!(
+        wire_variable(&acquired, "system.github.token").is_none_or(str::is_empty),
+        "a tokenless engine leaves the GitHub token surface empty"
+    );
     assert_eq!(
         acquired["variables"]["actions_runner_allow_artifacts_file"]["value"],
         "false"

@@ -1016,17 +1016,29 @@ pub async fn broker_acquire_job(
     }
     if !token_applied {
         // The build wrote empty `isSecret` slots for `github_token` /
-        // `system.github.token`; with no App mint (untrusted fork, no App,
-        // or a mint that legitimately answered None) the job keeps its
-        // job-scoped runtime token — the credential a fork job may hold is
-        // this control-plane JWT, never the repository-unscoped PAT.
-        let runtime = shared
-            .state
-            .mint_runtime_token(&message.plan.plan_id, &message.job_id);
-        // Fork-restricted tiers get the runtime token even when no request
+        // `system.github.token`; no App installation token was minted for this
+        // job (untrusted fork, no App, or a mint that legitimately answered
+        // None), so the only GitHub credential it can still receive is the
+        // operator's static PAT, and only when its OAuth scopes are verified.
+        //
+        // Everything else leaves the token surface *empty*, exactly like the
+        // official runner when its message carries no `system.github.token`
+        // variable (`ExecutionContext.cs` builds `github.token` from that
+        // variable, so an absent one yields ""). The job-scoped runtime token
+        // is not a GitHub credential — it authenticates to this engine
+        // (snapshot fetches, the anonymous forge relay, run-service calls) and
+        // reaches the job through the pinned snapshot steps and the
+        // `SystemVssConnection` endpoint — so presenting it as
+        // `github.token`/`GITHUB_TOKEN` only sends a dead credential to
+        // github.com ("Bad credentials") from every step that reads it, and
+        // hands a control-plane credential to whatever third party the
+        // workflow points at.
+        //
+        // Fork-restricted tiers are resolved here too even when no request
         // exists to say so (no App): `job_authorization` answers
         // `fork_restricted` for untrusted tiers regardless of declared
-        // permissions.
+        // permissions, and such a job never receives the repository-unscoped
+        // PAT.
         let fork_restricted = token_untrusted
             || crate::events::trust_tier::job_authorization(
                 tier,
@@ -1034,45 +1046,40 @@ pub async fn broker_acquire_job(
                 ctx.id_token_granted.unwrap_or(false),
             )
             .fork_restricted;
-        let default_token = if fork_restricted {
-            runtime
-        } else {
+        if !fork_restricted
+            && let Some(pat) = shared.state.static_github_pat()
+        {
             // A static PAT is embedded only when its OAuth scopes are
             // verified (fresh cache, or re-introspected here: the job may have
             // queued past the cache TTL); unverifiable authority stays
-            // withheld and the job keeps the runtime token.
-            match shared.state.static_github_pat() {
-                Some(pat) => match crate::runs::verified_pat_scopes(&pat).await {
-                    Some(scopes) => {
-                        message.variables.insert(
-                            "system.github.token.pat_scopes".to_owned(),
-                            preloop_gha_protocol::azdo::VariableValue::new(
-                                crate::runs::pat_scopes_wire_value(&scopes),
-                            ),
-                        );
-                        pat
-                    }
-                    None => {
-                        message.variables.insert(
-                            "system.github.token.pat_scopes".to_owned(),
-                            preloop_gha_protocol::azdo::VariableValue::new(
-                                crate::runs::PAT_WITHHELD_WIRE_VALUE,
-                            ),
-                        );
-                        runtime
-                    }
-                },
-                None => runtime,
+            // withheld and the job keeps an empty token surface.
+            match crate::runs::verified_pat_scopes(&pat).await {
+                Some(scopes) => {
+                    message.variables.insert(
+                        "system.github.token.pat_scopes".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            crate::runs::pat_scopes_wire_value(&scopes),
+                        ),
+                    );
+                    apply_minted_token_to_message(
+                        &mut message,
+                        &MintedGitHubToken {
+                            token: pat,
+                            effective_permissions: None,
+                        },
+                        false,
+                    );
+                }
+                None => {
+                    message.variables.insert(
+                        "system.github.token.pat_scopes".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            crate::runs::PAT_WITHHELD_WIRE_VALUE,
+                        ),
+                    );
+                }
             }
-        };
-        apply_minted_token_to_message(
-            &mut message,
-            &MintedGitHubToken {
-                token: default_token,
-                effective_permissions: None,
-            },
-            false,
-        );
+        }
     }
     // The snapshot checkout token is pinned onto the step at submission,
     // but a job can sit queued well past its ~50-minute lifetime. The
@@ -1232,6 +1239,12 @@ pub struct MintedGitHubToken {
 /// and the re-derived-request fallback, which had already diverged (the
 /// fallback lost the success log). `re_derived` only tailors the log wording:
 /// the derived path historically logged no success line.
+///
+/// `minted.token` must be a *GitHub* credential — an App installation token or
+/// a PAT whose OAuth scopes were verified. The job-scoped runtime token is not
+/// one: it authenticates to this engine and travels on the pinned snapshot
+/// steps and the `SystemVssConnection` endpoint, never as the job's
+/// `GITHUB_TOKEN`.
 pub(crate) fn apply_minted_token_to_message(
     message: &mut azdo::AgentJobRequestMessage,
     minted: &MintedGitHubToken,

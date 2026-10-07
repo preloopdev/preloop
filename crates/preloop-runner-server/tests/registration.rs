@@ -922,38 +922,46 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     let _ = trusted.run_id;
 
     // The stored template carries no token; the broker fills it at claim.
-    // A fork-restricted job receives the job-scoped runtime token — never
-    // the repository-unscoped PAT.
+    // A fork-restricted job never receives the repository-unscoped PAT, and
+    // with no App there is no GitHub credential left for it at all: the token
+    // surface stays empty (the official runner's value when the message has no
+    // `system.github.token`) instead of carrying the engine's runtime token
+    // into a third-party API call.
     let fork_acquired = acquire_queued_job(&app, "fork-runner").await;
     let fork_job_id = fork_acquired["jobId"].as_str().expect("acquired job id");
     let fork_plan = fork_acquired["plan"]["planId"]
         .as_str()
         .expect("acquired plan id");
-    let runtime_token =
-        state.mint_runtime_token(fork_plan, &uuid::Uuid::parse_str(fork_job_id).unwrap());
-    // Compare token identity (`sub`), not token strings: JWT timestamps are
-    // second-granularity, so a comparison token minted across a clock tick
-    // differs textually from the identical token minted at acquire.
-    let expected_sub = jwt_sub(runtime_token.as_str());
-    assert!(
-        expected_sub.is_some(),
-        "the runtime token carries a subject"
-    );
     for name in ["system.github.token", "github_token"] {
-        assert_eq!(
-            wire_variable(&fork_acquired, name).and_then(jwt_sub),
-            expected_sub.clone(),
-            "fork job must carry the local runtime token, not the PAT ({name})"
-        );
+        let wire = wire_variable(&fork_acquired, name);
         assert_ne!(
-            wire_variable(&fork_acquired, name),
+            wire,
             Some(pat.as_str()),
             "the static PAT must not reach a fork-restricted job ({name})"
+        );
+        assert!(
+            wire.is_none_or(str::is_empty),
+            "a fork-restricted job must carry no GitHub token at all ({name}={wire:?})"
         );
     }
     assert!(
         wire_variable(&fork_acquired, "GITHUB_TOKEN").is_none(),
         "uppercase GITHUB_TOKEN is not part of the official acquire schema"
+    );
+    // Compare token identity (`sub`), not token strings: JWT timestamps are
+    // second-granularity, so a comparison token minted across a clock tick
+    // differs textually from the identical token minted at acquire.
+    let endpoint_token = service_endpoint_token(&fork_acquired)
+        .expect("the fork job still authenticates to this engine");
+    let expected_sub = jwt_sub(
+        state
+            .mint_runtime_token(fork_plan, &uuid::Uuid::parse_str(fork_job_id).unwrap())
+            .as_str(),
+    );
+    assert_eq!(
+        jwt_sub(&endpoint_token),
+        expected_sub,
+        "the engine credential travels on the service endpoint, not as GITHUB_TOKEN"
     );
 
     let trusted_acquired = acquire_queued_job(&app, "trusted-runner").await;

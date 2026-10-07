@@ -11,6 +11,23 @@ Releases before v0.27.0 predate the changelog.
 
 ### Security
 
+- **A job never receives the control-plane runtime token as its
+  `GITHUB_TOKEN`**: with no GitHub App and no embeddable static PAT (the
+  tokenless conformance configuration, `PRELOOP_SKIP_GH_TOKEN=1`), the broker
+  filled `system.github.token`, `github_token` and the `github` context's
+  `token` with the job-scoped runtime JWT. Every step that reads
+  `${{ github.token }}`, `secrets.GITHUB_TOKEN` or `GITHUB_TOKEN` — such as
+  `maturin-action`'s `getInput('token') || process.env.GITHUB_TOKEN` and
+  zizmor's online audits — then presented that engine credential to
+  github.com and failed with `Bad credentials`, and the credential itself
+  could be exfiltrated to any third party a workflow pointed at. The token
+  surface now stays empty unless a real GitHub credential exists (an App
+  installation token, or a PAT whose OAuth scopes were verified), matching
+  the official runner's value when its message carries no
+  `system.github.token` variable: API clients go anonymous. The runtime token
+  keeps travelling where the engine needs it — the pinned snapshot checkout
+  steps, the forge-relay reroutes and the `SystemVssConnection` endpoint.
+
 - **The static GitHub PAT no longer crosses the network over plain HTTP**:
   action resolution and action tarball downloads attached the PAT to any
   request for a configured GitHub origin regardless of scheme, so a
