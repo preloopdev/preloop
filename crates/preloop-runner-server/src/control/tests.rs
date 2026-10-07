@@ -5278,7 +5278,7 @@ pub(crate) mod suite {
         );
     }
 
-    /// The command-outcome gauges report the global ready depth and the
+    /// The command-outcome gauges report the global ready set and the
     /// `runs-on` labels of the front job in the shared global dispatch order
     /// (`priority DESC, run_order, job_order`) — no pool filter.
     pub(crate) async fn queue_gauges_report_the_global_front(backend: &dyn ControlBackend) {
@@ -5289,14 +5289,14 @@ pub(crate) mod suite {
             .submit_run(submit_run(run_id, vec![alpha, beta]))
             .await
             .unwrap();
-        assert_eq!(outcome.queue_depth, 2);
+        assert_eq!(outcome.queued_jobs, 2);
 
         // Cancelling the second job leaves the first as the queue front.
         let cancel = backend
             .cancel_job(run_id, &JobId("beta".to_owned()))
             .await
             .unwrap();
-        assert_eq!(cancel.queue_depth, 1);
+        assert!(cancel.queue_nonempty);
         assert_eq!(
             cancel.next_runs_on,
             vec!["self-hosted".to_owned(), "alpha".to_owned()],
@@ -5304,7 +5304,7 @@ pub(crate) mod suite {
         );
 
         let drained = backend.cancel_run(run_id, None).await.unwrap();
-        assert_eq!(drained.queue_depth, 0);
+        assert!(!drained.queue_nonempty);
         assert!(drained.next_runs_on.is_empty());
     }
 }
@@ -7698,8 +7698,8 @@ mod lite {
     }
 
     /// A malformed `runs_on` (lite stores it as free-form TEXT) must not
-    /// abort the gauges: the command still reports the depth, with no front
-    /// labels.
+    /// abort the gauges: the command still reports the ready set, with no
+    /// front labels.
     #[tokio::test]
     async fn malformed_runs_on_does_not_abort_gauges() {
         let backend = LiteBackend::in_memory().unwrap();
@@ -7726,7 +7726,7 @@ mod lite {
             .cancel_job(run_id, &JobId("beta".to_owned()))
             .await
             .unwrap();
-        assert_eq!(cancel.queue_depth, 1);
+        assert!(cancel.queue_nonempty);
         assert!(
             cancel.next_runs_on.is_empty(),
             "a malformed runs_on yields no labels, not an error: {:?}",
