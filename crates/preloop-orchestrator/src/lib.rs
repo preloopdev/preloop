@@ -2351,8 +2351,13 @@ fn guest_hostname_script_at(hosts: &str) -> String {
               ip -o addr show 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1; }} \
              | sed '/^$/d' | sort -u; \
          }}; \
+         name_addrs() {{ \
+           addrs=$(getent ahosts \"$host\" 2>/dev/null | awk '{{print $1}}'); \
+           [ -n \"$addrs\" ] || addrs=$(getent hosts \"$host\" 2>/dev/null | awk '{{print $1}}'); \
+           printf '%s\\n' \"$addrs\"; \
+         }}; \
          name_resolves_locally() {{ \
-           resolved=$(getent ahosts \"$host\" 2>/dev/null | awk '{{print $1}}'); \
+           resolved=$(name_addrs); \
            [ -n \"$resolved\" ] || return 1; \
            for addr in $resolved; do \
              for local in $(local_addrs); do \
