@@ -6256,12 +6256,12 @@ impl PgBackend {
         // through `release_concurrency_for_job`: that path promotes the
         // group's oldest waiter, which re-parks under a max-parallel cohort
         // and leaves the finished holder's row behind (the pinned case in
-        // `max_parallel_repark_keeps_fifo_slot_and_releases_group`). A
-        // released group with no holder admits the next arrival; the parked
-        // waiter keeps its FIFO position in `concurrency_waits`.
+        // `max_parallel_repark_keeps_fifo_slot_and_releases_group`). Only the
+        // job's own rows are dropped — a run-level (workflow) hold belongs to
+        // `release_concurrency_for_run`, which promotes the parked run.
         tx.execute(
             "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
-             AND (holder_job_id=$2 OR holder_job_id IS NULL)",
+             AND holder_job_id=$2",
             &[&run, &job_id.0],
         )
         .await
