@@ -4,8 +4,8 @@ use preloop_orchestrator::{
     artifact_payload, node_externals,
 };
 use preloop_vm::{
-    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
-    SocketMount, VmError, VmProvider, VolumeMount,
+    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
+    ProviderCapabilities, SecretSource, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -51,6 +51,10 @@ struct RecordingVmProvider {
     state: Mutex<ProviderState>,
     run_actions: Mutex<Vec<RunAction>>,
     changed: Notify,
+    /// Whether packs are host files (SmolVM) or live server-side (AgentENV).
+    /// A backend without host-side packs has no artifact to unpack, so its
+    /// golden is baked in the guest instead.
+    file_packs: bool,
 }
 
 impl RecordingVmProvider {
@@ -66,7 +70,15 @@ impl RecordingVmProvider {
             }),
             run_actions: Mutex::new(run_actions),
             changed: Notify::new(),
+            file_packs: true,
         }
+    }
+
+    /// Model a backend whose packs are not host files (AgentENV): there is no
+    /// artifact to unpack, so the pool prepares its golden in the guest.
+    fn no_packs(mut self) -> Self {
+        self.file_packs = false;
+        self
     }
 
     async fn wait_until<F>(&self, predicate: F)
@@ -128,6 +140,13 @@ fn provider_error(message: &'static str) -> VmError {
 
 #[async_trait]
 impl VmProvider for RecordingVmProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            file_packs: self.file_packs,
+            ..ProviderCapabilities::default()
+        }
+    }
+
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
         let mut state = self.state.lock().await;
         state
@@ -305,11 +324,12 @@ struct Fixture {
 /// restores the previous values on drop. The pool reads all of these from the
 /// process environment, so without the pins the tests depend on the host:
 ///
-/// - `PRELOOP_GOLDEN_URL` -> unreachable. The pool downloads a prebaked golden
-///   before building when one is reachable (`prepare_artifact` ->
-///   `download_prebaked_golden`); a host with egress to the release asset
-///   would skip the local build+pack these tests assert and hang
-///   `wait_until(Event::Pack)` forever.
+/// - `PRELOOP_GOLDEN_URL` -> unreachable. Configured-image fixtures bake
+///   their golden locally and never download; only the official sentinel does
+///   (`prepare_artifact` -> `download_prebaked_golden`), so the pin keeps
+///   that download off the network and failing fast in
+///   `official_golden_download_failure_is_a_startup_error` instead of
+///   fetching a real pack from GHCR or GitHub on a host with egress.
 /// - `PRELOOP_SKIP_DISK_PREFLIGHT` -> on. The golden build refuses when the
 ///   host volume lacks builder disk + pack staging (60 GiB for this fixture);
 ///   the provider here is a recording mock that writes nothing, so a host
@@ -356,6 +376,9 @@ impl Drop for HermeticEnvGuard {
 
 impl Fixture {
     fn new(label: &str, payload_exists: bool) -> Self {
+        // A configured custom image, not the official sentinel: the pool bakes
+        // it locally (as-is plus the runner contract), so no fixture here
+        // depends on the released official golden.
         const BASE_IMAGE: &str = "ghcr.io/preloop/base:latest";
         let env_guard = TEST_ENV_LOCK
             .lock()
@@ -388,11 +411,9 @@ impl Fixture {
         let config = RunnerPoolConfig {
             size: 1,
             use_fork: false,
-            use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
             pool_status: None,
             base_image: BASE_IMAGE.to_owned(),
-            workspace: None,
             artifact_stem,
             release_version: "9.9.9".to_owned(),
             runner_bundle: bundle,
@@ -571,8 +592,9 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
         vec![RunAction::Wait, RunAction::Wait],
     ));
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
-    // The builder machine's install steps count as `exec` calls, so a
-    // `run_calls` wait can cancel the pool between the builder's install and
+    // The builder machine's bake steps (guest readiness, the runner
+    // contract, the externals symlink) count as `exec` calls, so a
+    // `run_calls` wait can cancel the pool between the builder's start and
     // its pack on a loaded host — the pack never runs and the assertion
     // below fails with `pack_calls == 0`. Wait on the pack itself, which
     // only happens after the artifact is fully built, then cancel.
@@ -618,21 +640,64 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
     );
 }
 
+/// The official golden is downloaded packed and is never baked locally.
+///
+/// The deleted stock-Ubuntu bake used to stand in when the official golden
+/// could not be fetched, which silently ran jobs on a different image than the
+/// one `runs-on: ubuntu-latest` names. There is no substitute now: an
+/// unreachable pack fails the pool at startup, and the error names the
+/// official golden so an operator knows to point
+/// `PRELOOP_GOLDEN_OCI_REF`/`PRELOOP_GOLDEN_URL` at a reachable one.
+#[tokio::test]
+async fn official_golden_download_failure_is_a_startup_error() {
+    let fixture = Fixture::new("official-fatal", false);
+    let mut config = fixture.config.clone();
+    config.base_image = preloop_orchestrator::environment::OFFICIAL_GOLDEN.to_owned();
+    let provider = Arc::new(RecordingVmProvider::with_machines(&[], vec![]));
+    let pool = RunnerPool::new(provider.clone(), config).unwrap();
+
+    let error = pool
+        .run(CancellationToken::new())
+        .await
+        .expect_err("an unreachable official golden must fail the pool, not bake a substitute");
+    let message = error.to_string();
+    assert!(
+        message.contains("official golden"),
+        "the error must name the official golden: {message}"
+    );
+    assert!(
+        provider.snapshot().await.events.is_empty(),
+        "no substitute golden may be created for the official sentinel"
+    );
+}
+
+/// A backend without host-side packs has no artifact to unpack: its golden is
+/// booted from the configured image, the runner contract is applied in the
+/// guest, and the result is frozen with `start_forkable`. The contract is
+/// applied once, on the golden — forks inherit it — so no runner pays for it.
 #[tokio::test]
 async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
-    let fixture = Fixture::new("fork-golden", true);
+    let fixture = Fixture::new("fork-golden", false);
     let mut config = fixture.config.clone();
     config.use_fork = true;
     config.control_socket = Some(fixture.root.join("engine.sock"));
-    let provider = Arc::new(RecordingVmProvider::with_machines(
-        &[],
-        vec![RunAction::Wait],
-    ));
+    let provider =
+        Arc::new(RecordingVmProvider::with_machines(&[], vec![RunAction::Wait]).no_packs());
     let pool = RunnerPool::new(provider.clone(), config).unwrap();
     run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
 
-    let events = provider.snapshot().await.events;
+    let snapshot = provider.snapshot().await;
     let golden = format!("{}-golden", fixture.config.name_prefix);
+    // The golden boots the configured image itself: there is no packed
+    // artifact on this backend to unpack, and none may be built.
+    let spec = snapshot
+        .created_specs
+        .iter()
+        .find(|spec| spec.name.as_str() == golden)
+        .expect("golden machine specification");
+    assert_eq!(spec.image, fixture.config.base_image);
+
+    let events = &snapshot.events;
     let golden_starts = events
         .iter()
         .enumerate()
@@ -650,7 +715,8 @@ async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
     assert!(
         events[first_start + 1..stop]
             .iter()
-            .any(|event| matches!(event, Event::Exec(name, _) if name == &golden))
+            .any(|event| matches!(event, Event::Exec(name, _) if name == &golden)),
+        "the guest contract must be applied to the golden before it freezes: {events:?}"
     );
     assert!(stop < golden_starts[1]);
 }
@@ -717,19 +783,17 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
         .find(|spec| spec.name.as_str() == runner)
         .expect("runner machine specification");
     assert_eq!(spec.network, NetworkPolicy::PublicOnly);
+    // A packed machine reaches node through the artifact's baked symlink
+    // (`<root>/externals -> /opt/preloop/bin/externals`): the externals ride
+    // the bundle mount instead of a third virtiofs mount, which the packed
+    // launcher has no IRQ budget for. Only a machine booted from a raw image
+    // carries the separate externals mount.
     assert_eq!(
         &spec.volumes,
         &vec![
             VolumeMount {
                 host: fixture.root.join("runner-bundle"),
                 guest: PathBuf::from("/opt/preloop/bin"),
-                read_only: true,
-            },
-            VolumeMount {
-                // Node externals are mounted host-side, never baked into the
-                // machine image or downloaded per runner.
-                host: fixture.root.join("host-externals").join("externals"),
-                guest: PathBuf::from("/home/runner/externals"),
                 read_only: true,
             },
             VolumeMount {
@@ -842,18 +906,27 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
-        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
-        let want_base = vec!["/usr/bin/env", path.as_str(), machine_name.as_str()];
-        // Unconditional toolchain homes come last in the prefix (fixed
-        // system addresses shared by root and switched runners).
-        let want_tail = [
-            "RUSTUP_HOME=/usr/local/rustup",
-            "CARGO_HOME=/usr/local/cargo",
+        // The runner's PATH is exactly the system directories a hosted step
+        // shell sees: the deleted Rust/Go language installs (and their
+        // `/usr/local/cargo/bin` and `/usr/local/go/bin` entries) are gone.
+        let want_base = vec![
+            "/usr/bin/env",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            machine_name.as_str(),
         ];
         let mut want = want_base;
         want.extend(expected);
-        want.extend(want_tail);
-        assert_eq!(prefix, want,);
+        assert_eq!(prefix, want);
+        // Nor may anything export the deleted Rust/Go install homes: a runner
+        // told RUSTUP_HOME/CARGO_HOME would point rustup at paths the golden
+        // no longer carries.
+        assert!(
+            configure
+                .iter()
+                .all(|argument| !argument.starts_with("RUSTUP_HOME=")
+                    && !argument.starts_with("CARGO_HOME=")),
+            "the deleted Rust/Go install homes must not be exported: {configure:?}"
+        );
     }
 }
 

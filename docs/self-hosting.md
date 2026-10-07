@@ -261,23 +261,23 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | — | Proceed past the golden disk check with a warning. Without it, a golden download that cannot fit is refused before it starts, and a golden build is refused below builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB pack staging |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
-| `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
-| `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
-| `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
+| `PRELOOP_USE_FORK` | `true` | Run the pool as forks of the golden rather than one boot per job |
+| `PRELOOP_GOLDEN_URL` | release asset | Mirror of the official packed golden; the optional checksum is fetched from the same URL plus `.sha256`. When set it replaces the OCI reference |
 | `PRELOOP_GOLDEN_OCI_REF` | per-architecture official GHCR artifacts | OCI packed golden reference downloaded automatically on the matching host architecture |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` | Host-side Node externals directory |
-| `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
+| `PRELOOP_RUNNER_BASE_IMAGE` | — (official golden) | Image a custom golden is baked from, used as-is plus the GitHub-runner machinery. `runs-on: ubuntu-latest`/`ubuntu-24.04` and an unconfigured pool use the official packed golden instead. Wins over the `[golden] base_image` that `preloop init` records |
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
 | `PRELOOP_RUNNER_DNS` | `8.8.8.8` | Resolver used inside guests; override when a different public resolver is preferred |
 | `PRELOOP_RUNNER_PACK_PROXY` / `_NO_PROXY` | — | Proxy and no-proxy values used while downloading and packing golden artifacts |
-| `PRELOOP_WORKSPACE` | — | Workspace context for daemon deployments; not a package or toolchain installation input |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
 
-To add organization-wide software, derive an OCI image from one of Preloop's
-digest-pinned Ubuntu bases and build a custom packed golden. For the complete
-build, checksum, publishing, and runtime configuration flow, see
+To add organization-wide software, publish an OCI image that carries it and
+point `PRELOOP_RUNNER_BASE_IMAGE` (or `[golden] base_image`, which
+`preloop init` records) at it: the image is used exactly as it is, plus the
+GitHub-runner machinery a bake adds. For the complete build, pre-bake, and
+runtime configuration flow, see
 [VM images and version tracking](vm-images.md#adding-organization-wide-software).
 Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Run the five-repository conformance campaign against the pinned official
+# Run the five-repository conformance campaign against the official packed
 # GitHub-hosted runner golden.
 #
-# The golden is the 9GB packed artifact produced from the official
-# ubuntu24-arm64 runner image.  It is selected by its immutable base-image
-# reference and exposed to Preloop through a temporary PRELOOP_HOME symlink;
-# no second 9GB copy is made.
+# The golden is the ~9GB packed artifact produced from the official
+# ubuntu24-arm64 runner image.  A pool with no image configured resolves to the
+# official sentinel, so hosted labels (ubuntu-latest, ubuntu-24.04) and the
+# pool's own labels both run on it; the artifact is exposed to Preloop through
+# a temporary PRELOOP_HOME symlink, so no second 9GB copy is made.
 #
 # Usage:
 #   benchmarks/real-world/conformance-5repos.sh [all|grafana|deno|pydantic|valkey|cli]
@@ -36,12 +37,17 @@ SERVER_BIN="${PRELOOP_BIN:-$ROOT/target/debug/preloop}"
 CLIENT_BIN="${PRELOOP_CLIENT_BIN:-$ROOT/target/debug/preloop-runner-client}"
 GUEST_RUNNER_BUNDLE="${PRELOOP_RUNNER_BUNDLE:-$ROOT/target/aarch64-unknown-linux-gnu/debug}"
 
-# This is the official ubuntu24 arm64 hosted-image snapshot whose local packed
-# artifact is approximately 9GB.  Keep the digest and artifact name together:
-# changing either silently selects a different image and invalidates results.
-OFFICIAL_GOLDEN_BASE="ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:a58990d6b6f8ca5861f33d77e1d3f0732d7d14261caacd6fba8c8f707c05b40e"
-OFFICIAL_GOLDEN_NAME="preloop-ghcr.io-preloopdev-runner-images-ubuntu24-arm64-runner-large-latest-sha256-a58990d6b6f8ca5861f33d77e1d3f0732d7d14261caacd6fba8c8f707c05b40e-aarch64"
-OFFICIAL_GOLDEN_ARTIFACT="${PRELOOP_GOLDEN_ARTIFACT:-$HOME/.config/preloop/vms/${OFFICIAL_GOLDEN_NAME}.smolmachine}"
+# The official sentinel: what a pool with no image configured resolves to, and
+# what `runs-on: ubuntu-latest`/`ubuntu-24.04` resolve to.  The engine fetches
+# the packed golden from the per-architecture OCI reference (GOLDEN_OCI_REF_*
+# in preloop-orchestrator, overridable with PRELOOP_GOLDEN_OCI_REF) and keys the
+# payload by this sentinel plus the environment fingerprint — ask
+# `preloop golden-path` for that path, never spell it here.
+OFFICIAL_GOLDEN_SENTINEL="preloop-official-golden"
+# Operator cache of the same ~9GB payload, symlinked into the campaign home so a
+# harness restart does not re-download it.  Point PRELOOP_GOLDEN_ARTIFACT at a
+# copy that lives elsewhere.
+OFFICIAL_GOLDEN_ARTIFACT="${PRELOOP_GOLDEN_ARTIFACT:-$HOME/.config/preloop/vms/preloop-official-golden-aarch64.smolmachine}"
 
 SERVER_PID=""
 FAILED_TARGETS=""
@@ -152,27 +158,16 @@ prepare_golden_home() {
   # outside this home (~/.config/preloop/vms), so a clean slate is safe.
   rm -rf "$CAMPAIGN_HOME"
   if [ "${PRELOOP_GOLDEN_SOURCE:-}" = ghcr ]; then
-    # Fresh pull of the digest-pinned golden (GOLDEN_OCI_REF_* in
-    # preloop-orchestrator): no local artifact is linked, so the engine
-    # downloads the packed golden from ghcr into the empty campaign home.
-    echo "=== golden: downloading digest-pinned image from ghcr.io (no local artifact) ==="
-    # Only the stock ubuntu bases trigger the prebaked-golden download
-    # (should_download_prebaked_golden); the runner-images ref is "custom".
-    # It must be the exact digest pin (the engine default): the packed golden
-    # is registered under this base's fingerprint, and hosted labels
-    # (ubuntu-24.04*, ubuntu-latest) resolve to the pin. Any other spelling
-    # (e.g. bare `ubuntu:24.04`) misses that golden, and the pool bakes a
-    # second, stock-Ubuntu golden for those jobs — no cmake, no hostedtoolcache.
-    GOLDEN_BASE_OVERRIDE="$(sed -n 's/^ubuntu_24_04_base = "\(.*\)"$/\1/p' "$ROOT/versions.toml")"
-    [ -n "$GOLDEN_BASE_OVERRIDE" ] || fail "ubuntu_24_04_base pin missing from versions.toml"
-    # A verified ghcr download is kept in $PRELOOP_GOLDEN_CACHE (APFS clone, so
-    # reuse is instant) to avoid re-pulling 9.6 GB on every harness restart.
-    # The downloaded bytes are the same official golden for any stock base, so
-    # clone the cached file to the path the engine computes for this base.
+    # Fresh download into the empty campaign home: nothing is linked, so the
+    # engine fetches the packed golden from the per-arch OCI reference.
+    echo "=== golden: downloading the official packed golden from ghcr.io (no local artifact) ==="
+    # A verified download is kept in $PRELOOP_GOLDEN_CACHE (APFS clone, so reuse
+    # is instant) to avoid re-pulling 9.6 GB on every harness restart.  Clone it
+    # to the payload path the engine computes for the official sentinel.
     local cache="${PRELOOP_GOLDEN_CACHE:-$HOME/golden-cache}" cached target
     cached="$(compgen -G "$cache/preloop-*" | head -1 || true)"
     if [ -n "$cached" ]; then
-      target="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$GOLDEN_BASE_OVERRIDE")"
+      target="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$OFFICIAL_GOLDEN_SENTINEL")"
       mkdir -p "$(dirname "$target")"
       cp -c "$cached" "$target"
       echo "=== golden: reusing verified ghcr download $cached as $target ==="
@@ -185,10 +180,10 @@ prepare_golden_home() {
   # Reject the small launcher stub or a partial download.  The packed payload
   # used by this campaign is the ~9GB .smolmachine sidecar.
   [ "$bytes" -ge 8589934592 ] || fail "golden is ${bytes} bytes, not the required ~9GB .smolmachine payload"
-  # Ask the engine for its own payload path — the fingerprint folds in
-  # base/toolchains/bake AND the node-external pins, so duplicating the hash
+  # Ask the engine for its own payload path — the fingerprint folds in the
+  # official OCI reference and the node-external pins, so duplicating the hash
   # here drifts. `preloop golden-path` keeps the harness in lockstep.
-  expected="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$OFFICIAL_GOLDEN_BASE")"
+  expected="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$OFFICIAL_GOLDEN_SENTINEL")"
   mkdir -p "$(dirname "$expected")"
   ln -sfn "$OFFICIAL_GOLDEN_ARTIFACT" "$expected"
   [ -f "$expected" ] || fail "failed to expose official golden at $expected"
@@ -226,9 +221,9 @@ start_server() {
   local log="$OUTPUT_ROOT/server.log"
   mkdir -p "$OUTPUT_ROOT" "$CAMPAIGN_HOME" "$SMOLVM_PROCESS_HOME"
   rm -f "$log"
-  # The base reference is intentionally the same string encoded in the local
-  # cache filename.  The CLI then consumes the symlinked 9GB artifact instead
-  # of downloading or rebuilding a different golden.
+  # No image is configured: every job resolves to the official sentinel, so the
+  # pool consumes the symlinked 9GB artifact instead of downloading another
+  # golden.  Configure PRELOOP_RUNNER_BASE_IMAGE only to run a different image.
   # A broad `gh auth token` PAT is refused by the engine whenever a job's
   # declared `permissions:` are narrower; PRELOOP_SKIP_GH_TOKEN=1 runs tokenless.
   if [ -z "${PRELOOP_SKIP_GH_TOKEN:-}" ] && [ -z "${PRELOOP_GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
@@ -249,10 +244,9 @@ start_server() {
   SMOLVM_DATA_DIR="${SMOLVM_DATA_DIR:-$CAMPAIGN_HOME/smolvm}" \
   SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$HOST_HOME/.smolvm/agent-rootfs}" \
   SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$HOST_HOME/.smolvm/lib}" \
-  PRELOOP_RUNNER_BASE_IMAGE="${GOLDEN_BASE_OVERRIDE:-$OFFICIAL_GOLDEN_BASE}" \
+  PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_SENTINEL" \
   PRELOOP_RUNNER_BUNDLE="$GUEST_RUNNER_BUNDLE" \
   PRELOOP_RUNNER_NAME_PREFIX="conformance-5repos" \
-  PRELOOP_USE_PACKED_GOLDEN=1 \
   PRELOOP_RUNNER_POOL_ENABLED=1 \
   PRELOOP_RUNNER_POOL_SIZE="$POOL_SIZE" \
   PRELOOP_USE_FORK=1 \

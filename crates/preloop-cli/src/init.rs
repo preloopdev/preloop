@@ -361,8 +361,8 @@ struct GoldenAnswer {
 /// Dockerfile built and saved).
 struct GoldenDecision {
     kind: GoldenChoice,
-    /// Persisted base image; `None` = the engine's stock base, i.e. the packed
-    /// official golden the engine downloads itself.
+    /// Persisted base image; `None` = nothing configured, i.e. the packed
+    /// official golden the engine downloads and verifies itself.
     base_image: Option<String>,
     dockerfile: Option<PathBuf>,
     label: String,
@@ -980,7 +980,8 @@ impl Session {
                 arch_ok: None,
                 warnings: Vec::new(),
                 detail: json!({
-                    "note": "the engine downloads the packed official golden on the first serve",
+                    "note": "the engine downloads the pinned packed official golden on the first \
+                             serve; a failed download fails the job (no local fallback)",
                     "download_bytes": OFFICIAL_GOLDEN_DOWNLOAD_BYTES,
                     "working_set_bytes": OFFICIAL_GOLDEN_WORKING_SET_BYTES,
                 }),
@@ -1008,6 +1009,10 @@ impl Session {
                 self.record_local_path(&path)
             }
         }?;
+        // A configured image is baked by the pool on the next serve. The
+        // official golden takes the opposite path — downloaded packed by the
+        // engine, never baked — so this line must not be shown for it (and
+        // cannot be: an official decision carries no base image).
         if decision.base_image.is_some() {
             self.note(
                 "serve builds this golden locally on the first run (a builder VM, then a \
@@ -1878,8 +1883,8 @@ async fn print_probe() -> anyhow::Result<()> {
         "golden": {
             "kind": configured_kind(&config).map(GoldenChoice::as_str),
             // The base image `serve` would use right now: the environment
-            // variable when set, else the persisted choice, else the engine's
-            // stock base (null).
+            // variable when set, else the persisted choice; null means
+            // nothing is configured, i.e. the packed official golden.
             "base_image": base_image,
             "env_override": std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
                 .ok()
@@ -2445,6 +2450,34 @@ mod tests {
         assert_eq!(
             preloop_runner_server::config::golden_base_image(&config).as_deref(),
             Some("ghcr.io/x/y:1")
+        );
+    }
+
+    /// The official choice is `kind` alone — no base image — and that is a
+    /// complete answer: a re-run keeps it without re-asking, and nothing
+    /// pretends a local bake is in its future (the engine downloads the
+    /// pinned packed golden; a failed download fails the job).
+    #[test]
+    fn the_stored_official_golden_is_a_complete_answer() {
+        let config = ConfigFile {
+            golden: GoldenConfig {
+                kind: Some(GoldenChoice::Official.as_str().to_owned()),
+                base_image: None,
+                dockerfile: None,
+            },
+            ..ConfigFile::default()
+        };
+        let (kind, label) = golden_prior(&config).expect("the stored golden must be offered");
+        assert_eq!(kind, GoldenChoice::Official);
+        assert!(label.contains("official"), "{label}");
+
+        let decision = decision_from_config(&config, &GoldenAnswer::of(GoldenChoice::Official))
+            .expect("the stored golden must be a complete answer");
+        assert_eq!(decision.kind, GoldenChoice::Official);
+        assert_eq!(decision.base_image, None);
+        assert_eq!(
+            decision.artifact_bytes, None,
+            "the official golden is downloaded, not staged from a local artifact"
         );
     }
 
