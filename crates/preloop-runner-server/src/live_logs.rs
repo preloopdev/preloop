@@ -380,6 +380,18 @@ pub async fn ws_live_logs(
         // messages would reveal whether the job UUID resolves.
         crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())
             .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
+        // A settled attempt's credential is spent. Reads of its retained feed
+        // stay available (`live_log_stream`), but a *frame* from it must not
+        // be accepted: `record_live_log_wrapper` reopens a closed key by
+        // clearing its retained tail, so a replayed credential could wipe a
+        // completed job's history and forge lines into it. Same rule the
+        // Results writes apply (`auth::require_live_results_job`); a retry
+        // streams under its own, live attempt's credential.
+        if let Some(record) = request.as_ref()
+            && matches!(record.result, Some(status) if status.is_terminal())
+        {
+            return Err(ApiError::forbidden("live-log ingest job is not live"));
+        }
     }
     Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
 }

@@ -4102,6 +4102,19 @@ async fn authorize_snapshot_token(
             "snapshot Git token does not belong to this run",
         ));
     }
+    // The credential is spent with its attempt. This token is exported to
+    // workflow code as `ACTIONS_RUNTIME_TOKEN` and pinned into checkout steps,
+    // and the snapshot is otherwise reachable only by the jobs that hold one —
+    // so a completed (or purged) job's token must not keep fetching the run's
+    // snapshot for the rest of its lifetime. Liveness follows the request
+    // record, exactly like the Results writes (`auth::job_is_live`): an
+    // attempt stays live through a debug session, whose retry replays the
+    // checkout with a freshly minted token from `debug_sessions::poll_verdict`.
+    if !crate::auth::job_is_live(state, identity.job_id).await? {
+        return Err(ApiError::forbidden(
+            "snapshot Git token belongs to a completed job",
+        ));
+    }
     let run = state
         .backend
         .run_record(run_id)

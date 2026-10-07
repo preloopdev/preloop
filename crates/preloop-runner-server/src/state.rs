@@ -44,11 +44,17 @@ pub const RUNTIME_TOKEN_LIFETIME: Duration = JOB_CREDENTIAL_LIFETIME;
 /// 360 minutes, and the same six hours plus the four-hour pause credit is what
 /// a job that declares nothing may spend. A workflow can declare more —
 /// `timeout-minutes` is validated to 1..=360 for a *step*, but any value is
-/// accepted for a *job* and the reaper honours it — so the token grows with
-/// the declared timeout instead of expiring inside a job the server is still
-/// willing to run.
+/// accepted for a *job* — so the token grows with the declared timeout instead
+/// of expiring inside a job the server is still willing to run, up to the same
+/// server ceiling the reaper and the delivered message are clamped to
+/// ([`preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS`], GitHub's own
+/// five-day maximum). A fork cannot mint an arbitrarily long credential: a
+/// `timeout-minutes` past the ceiling is worth exactly the ceiling here, and
+/// the job it would have retained runner capacity for is clamped to the same
+/// point.
 pub fn runtime_token_lifetime(job_timeout_seconds: Option<i64>) -> Duration {
     let declared = job_timeout_seconds
+        .map(preloop_gha_parser::job_builder::clamp_job_timeout_seconds)
         .and_then(|seconds| u64::try_from(seconds).ok())
         .map(Duration::from_secs)
         .unwrap_or_default();
@@ -2226,6 +2232,48 @@ mod tests {
         let exp = claims["exp"].as_u64().expect("exp is minted");
         let iat = claims["iat"].as_u64().expect("iat is minted");
         assert_eq!(exp - iat, lifetime.as_secs());
+    }
+
+    /// The runtime token grows with the declared job timeout *up to a server
+    /// ceiling*: a fork's `timeout-minutes` is untrusted input (the parser
+    /// accepts any number for a job), and an unbounded token is an unbounded
+    /// credential for runner capacity. The ceiling is GitHub's own five-day
+    /// maximum, the same value the delivered `jobTimeout` and the reaper's
+    /// deadline are clamped to, so a declaration past it buys nothing.
+    #[tokio::test]
+    async fn runtime_token_lifetime_is_capped_at_the_github_maximum() {
+        use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+        let ceiling = Duration::from_secs(MAX_JOB_TIMEOUT_SECONDS as u64)
+            + crate::debug_sessions::MAX_PAUSE_CREDIT
+            + JOB_CREDENTIAL_SLACK;
+        // Exactly the maximum is honoured in full.
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS)),
+            ceiling
+        );
+        // One second past it, an hour past it, and an absurd declaration all
+        // stop at the same ceiling.
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS + 1)),
+            ceiling
+        );
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS * 24)),
+            ceiling
+        );
+        assert_eq!(runtime_token_lifetime(Some(i64::MAX)), ceiling);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let token = state.mint_runtime_token_for_job("plan-fork", &job, Some(i64::MAX));
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a capped runtime token must still verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, ceiling.as_secs());
     }
 }
 

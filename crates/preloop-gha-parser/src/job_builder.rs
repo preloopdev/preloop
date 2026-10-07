@@ -16,6 +16,37 @@ use crate::eval::{build_context, resolve_string};
 use preloop_gha_expressions::Context;
 use serde_json::{Value, json};
 
+/// GitHub's default job timeout: 360 minutes, the value the official runner
+/// applies when a message carries no `jobTimeout`.
+pub const DEFAULT_JOB_TIMEOUT_SECONDS: i64 = 360 * 60;
+
+/// The longest a job may run, in seconds: GitHub's own maximum of five days,
+/// which the service enforces regardless of the workflow's declared
+/// `timeout-minutes` (GitHub-hosted runners are cut off after six hours).
+///
+/// The server consumes a job timeout in three places — the `jobTimeout` the
+/// message carries (clamped here, at build), the job runtime token's lifetime,
+/// and the reaper's cancellation deadline — and this is the one ceiling all
+/// three apply. Without it a workflow's `timeout-minutes` is an
+/// unauthenticated lever on both runner capacity and credential lifetime: a
+/// step's `timeout-minutes` is validated to 1..=360, but a *job's* is accepted
+/// as-is, so `timeout-minutes: 1000000` would keep a leased runner alive for
+/// two years and mint a token to match.
+pub const MAX_JOB_TIMEOUT_SECONDS: i64 = 5 * 24 * 60 * 60;
+
+/// Clamp a job timeout in seconds into the range a job may actually occupy.
+pub fn clamp_job_timeout_seconds(seconds: i64) -> i64 {
+    seconds.clamp(0, MAX_JOB_TIMEOUT_SECONDS)
+}
+
+/// The timeout an attempt is bounded by: the message's declared `jobTimeout`,
+/// defaulted to [`DEFAULT_JOB_TIMEOUT_SECONDS`] when absent and clamped to
+/// [`MAX_JOB_TIMEOUT_SECONDS`]. The reaper, the token mint, and the runner's
+/// own timer must all read this same value.
+pub fn effective_job_timeout_seconds(declared: Option<i64>) -> i64 {
+    clamp_job_timeout_seconds(declared.unwrap_or(DEFAULT_JOB_TIMEOUT_SECONDS))
+}
+
 fn runner_condition(condition: &str) -> String {
     let trimmed = condition.trim();
     trimmed
@@ -679,9 +710,13 @@ pub fn build_agent_job_message_with_normalized_context(
         retry_count: None,
         pre_job_timeout: None,
         // `jobTimeout` is seconds on the wire (see azdo::job). The workflow's
-        // `timeout-minutes` is minutes, so it is scaled here; `None` leaves the
+        // `timeout-minutes` is minutes, so it is scaled here and clamped to
+        // GitHub's maximum (`MAX_JOB_TIMEOUT_SECONDS`); `None` leaves the
         // runner/server default (360 min) in effect.
-        job_timeout: plan.timeout_minutes.map(|minutes| (minutes * 60) as i64),
+        job_timeout: plan.timeout_minutes.map(|minutes| {
+            let seconds = i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX);
+            clamp_job_timeout_seconds(seconds)
+        }),
         job_container: plan
             .container
             .as_ref()
@@ -1125,6 +1160,60 @@ jobs:
         )
         .unwrap();
         assert_eq!(msg.job_timeout, None);
+    }
+
+    /// A *job's* `timeout-minutes` is accepted as any number (unlike a step's
+    /// 1..=360), so the message the runner and the reaper time the job by must
+    /// be clamped to GitHub's own maximum: the service cancels a job at five
+    /// days regardless of what the workflow declared, and an unclamped value
+    /// would hold a leased runner for as long as the fork asked while the
+    /// server sized its credential to match.
+    #[test]
+    fn job_timeout_above_github_maximum_is_clamped() {
+        let build = |timeout: u64| {
+            let workflow = parse_workflow(&format!(
+                r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: {timeout}
+    steps:
+      - run: echo ok
+"#
+            ))
+            .unwrap();
+            let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+            build_agent_job_message(
+                plan,
+                &serde_json::json!({}),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .unwrap()
+            .job_timeout
+        };
+
+        assert_eq!(MAX_JOB_TIMEOUT_SECONDS, 5 * 24 * 60 * 60);
+        // Exactly the maximum is honoured in full.
+        assert_eq!(
+            build(MAX_JOB_TIMEOUT_SECONDS as u64 / 60),
+            Some(MAX_JOB_TIMEOUT_SECONDS)
+        );
+        // One minute past it clamps to the maximum, not to the declared value.
+        assert_eq!(
+            build(MAX_JOB_TIMEOUT_SECONDS as u64 / 60 + 1),
+            Some(MAX_JOB_TIMEOUT_SECONDS)
+        );
+        assert_eq!(build(1_000_000), Some(MAX_JOB_TIMEOUT_SECONDS));
+        // A timespan no `u64` minutes could hold without wrapping must land on
+        // the maximum, not on a wrapped negative value.
+        assert_eq!(build(u64::MAX), Some(MAX_JOB_TIMEOUT_SECONDS));
+        assert_eq!(
+            effective_job_timeout_seconds(None),
+            DEFAULT_JOB_TIMEOUT_SECONDS
+        );
+        assert_eq!(effective_job_timeout_seconds(Some(-1)), 0);
     }
 
     #[test]

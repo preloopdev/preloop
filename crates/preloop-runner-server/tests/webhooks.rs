@@ -737,6 +737,94 @@ jobs:
     );
 }
 
+/// The snapshot Git endpoint is authenticated by the job runtime credential —
+/// the value pinned into a redirected checkout step and exported to workflow
+/// code as `ACTIONS_RUNTIME_TOKEN`. That credential is spent with its attempt:
+/// once the job has completed (or been reaped), its token must not keep
+/// fetching the run's snapshot for the rest of its lifetime.
+#[tokio::test]
+async fn snapshot_git_rejects_a_completed_jobs_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let acquired = acquire_queued_job(&app, "snapshot-settled").await;
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    let runtime_token = delivered_step_input(checkout, "token")
+        .expect("the claimed checkout carries the runtime token");
+
+    let advertisement = |app: axum::Router, token: String| async move {
+        app.oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{run_id}/info/refs?service=git-upload-pack"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+    // While the attempt is live, its checkout credential fetches the snapshot.
+    let live = advertisement(app.clone(), runtime_token.to_owned()).await;
+    assert_eq!(live.status(), StatusCode::OK);
+    // Settle the attempt — what `completejob` (or the reaper) does.
+    let request_id = {
+        let job_id = JobId("build".to_owned());
+        state
+            .test_db_mutate(move |tx| {
+                tx.request_key_for(run_id, &job_id)
+                    .unwrap()
+                    .expect("the claimed attempt")
+                    .0
+            })
+            .await
+    };
+    state
+        .test_db_mutate(move |tx| {
+            tx.update_request(request_id, None, None, Some("success"), None)
+                .unwrap();
+        })
+        .await;
+
+    let settled = advertisement(app.clone(), runtime_token.to_owned()).await;
+    assert_eq!(
+        settled.status(),
+        StatusCode::FORBIDDEN,
+        "a completed job's token must not keep fetching the run's snapshot"
+    );
+    let bytes = to_bytes(settled.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["error"],
+        "snapshot Git token belongs to a completed job"
+    );
+}
+
 /// A job that declares a `timeout-minutes` above the six-hour default must
 /// still get a runtime token that outlives it: the attempt presents that one
 /// credential on every job-scoped route — lease renewal, completion, the step
@@ -824,6 +912,112 @@ jobs:
         exp - iat >= 1200 * 60 + 4 * 60 * 60,
         "a claimed runtime token must outlive the job's declared timeout plus the pause credit, \
          got {}s",
+        exp - iat
+    );
+}
+
+/// A fork's `timeout-minutes` is untrusted input, and a job's value is not
+/// range-checked the way a step's 1..=360 is. Both the timeout the runner is
+/// given and the credential sizing it are clamped to GitHub's own maximum
+/// (five days): the service cancels a job at that point regardless of what the
+/// workflow declared, so a longer declaration must not buy a longer lease nor
+/// an arbitrarily long-lived token on this server.
+#[tokio::test]
+async fn claimed_job_timeout_and_token_are_clamped_to_the_github_maximum() {
+    use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 100000
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "over-max-runner"},
+            "ownerName": "clamped timeout test",
+            "sessionId": "00000000-0000-0000-0000-000000000002",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "over-max-runner", &["self-hosted"], None).await;
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+    assert_eq!(
+        acquired["jobTimeout"].as_i64(),
+        Some(MAX_JOB_TIMEOUT_SECONDS),
+        "the delivered jobTimeout must be clamped to GitHub's maximum, got {}",
+        acquired["jobTimeout"]
+    );
+
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    let claimed_token = delivered_step_input(checkout, "token").expect("claimed pinned token");
+    let claims = state
+        .verify_local_jwt_claims(claimed_token)
+        .expect("the claimed token must verify as a local JWT");
+    let iat = claims["iat"].as_u64().expect("iat is minted");
+    let exp = claims["exp"].as_u64().expect("exp is minted");
+    let max_seconds = MAX_JOB_TIMEOUT_SECONDS as u64;
+    let pause_credit = MAX_PAUSE_CREDIT.as_secs();
+    assert!(
+        exp - iat >= max_seconds + pause_credit,
+        "the token must cover the clamped timeout plus the pause credit, got {}s",
+        exp - iat
+    );
+    assert!(
+        exp - iat <= max_seconds + pause_credit + 10 * 60,
+        "an over-max declaration must not stretch the token past the clamped ceiling, got {}s",
         exp - iat
     );
 }

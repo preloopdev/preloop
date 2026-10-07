@@ -253,7 +253,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         let timed_out = request.started_at.is_some()
             && !request.timeout_triggered
             && elapsed(request.started_at)
-                >= Duration::from_secs(request.job_timeout_s.unwrap_or(21600).max(0) as u64);
+                >= Duration::from_secs(
+                    preloop_gha_parser::job_builder::effective_job_timeout_seconds(
+                        request.job_timeout_s,
+                    ) as u64,
+                );
         let lease_expired = request.last_renewed_at.is_some()
             && elapsed(request.last_renewed_at)
                 >= Duration::from_secs(if request.session_live {
