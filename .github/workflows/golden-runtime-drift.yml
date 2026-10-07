@@ -1,0 +1,137 @@
+name: golden runtime drift
+
+# The expected golden runtime values (process limits, sysctls, the hostname
+# contract, the keys a step environment must not carry) live in
+# official-image.toml and are compiled into the orchestrator by build.rs. This
+# weekly check re-probes real GitHub-hosted runners and opens a bump PR when
+# one of them moves, so a GitHub-side change arrives as a reviewable diff
+# instead of a silent divergence between preloop guests and hosted runners.
+#
+# Shaped like `check-upstream-drift` in official-golden.yml: schedule-only,
+# compares the file, rewrites it, and opens one dated branch/PR.
+#
+# Manual run: `gh workflow run golden-runtime-drift.yml`.
+
+on:
+  schedule:
+    - cron: "20 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Read the golden runtime off this hosted runner
+        run: |
+          set -euo pipefail
+          {
+            echo "golden_rlimit_stack_soft_kib=$(ulimit -Ss)"
+            echo "golden_rlimit_stack_hard=$(ulimit -Hs)"
+            echo "golden_rlimit_nofile_soft=$(ulimit -Sn)"
+            echo "golden_rlimit_nofile_hard=$(ulimit -Hn)"
+            for key in vm.max_map_count fs.inotify.max_user_watches fs.inotify.max_user_instances; do
+              echo "golden_sysctl_${key//./_}=$(cat "/proc/sys/${key//./\/}")"
+            done
+            host=$(hostname)
+            addr=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}')
+            [ -n "$addr" ] || addr=$(getent hosts "$host" 2>/dev/null | awk 'NR==1{print $1}')
+            local_ok=false
+            for local in 127.0.0.1 ::1 $(hostname -I 2>/dev/null) $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
+              [ "$addr" = "$local" ] && local_ok=true
+            done
+            echo "golden_hostname_resolves_locally=${local_ok}"
+            # `golden_step_env_unset` lists the keys a hosted step does NOT
+            # carry. Report the subset that is genuinely absent: reporting the
+            # present ones would rewrite the contract to "" every week.
+            unset_keys=""
+            for key in $(awk -F'"' '/^golden_step_env_unset = / { print $2; exit }' official-image.toml | tr ',' ' '); do
+              if ! printenv "$key" >/dev/null 2>&1; then
+                unset_keys="${unset_keys:+$unset_keys,}$key"
+              fi
+            done
+            echo "golden_step_env_unset=${unset_keys}"
+          } > "golden-runtime-${{ matrix.runner }}.txt"
+          cat "golden-runtime-${{ matrix.runner }}.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: golden-runtime-${{ matrix.runner }}
+          path: golden-runtime-*.txt
+          if-no-files-found: error
+
+  bump:
+    name: Open bump PR when a value moved
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          merge-multiple: true
+      - name: Compare with official-image.toml and open a bump PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cfg() {
+            awk -F'"' -v k="^$1 = " '$0 ~ k { print $2; exit }' official-image.toml
+          }
+          changed=0
+          for artifact in golden-runtime-*.txt; do
+            while IFS='=' read -r key value; do
+              [ -n "$key" ] || continue
+              pinned="$(cfg "$key")"
+              if [ -z "$pinned" ]; then
+                echo "::warning::$key is probed but not in official-image.toml ($value)"
+                continue
+              fi
+              if [ "$pinned" != "$value" ]; then
+                echo "$key drifted: $pinned -> $value (from $artifact)"
+                sed -i "s|^${key} = \".*\"$|${key} = \"${value}\"|" official-image.toml
+                changed=1
+              fi
+            done < "$artifact"
+          done
+          if [ "$changed" -eq 0 ]; then
+            echo "the golden runtime matches the hosted runners; nothing to do"
+            exit 0
+          fi
+          # The composed keys the init uses must follow the primitive ones, or
+          # guest_runtime_values_come_from_official_image_toml fails in CI.
+          sed -i "s|^golden_stack_ulimit_raise = \".*\"$|golden_stack_ulimit_raise = \"ulimit -Hs $(cfg golden_rlimit_stack_hard); ulimit -Ss $(cfg golden_rlimit_stack_soft_kib)\"|" official-image.toml
+          sed -i "s|^golden_nofile_ulimit_raise = \".*\"$|golden_nofile_ulimit_raise = \"ulimit -Sn $(cfg golden_rlimit_nofile_soft); ulimit -Hn $(cfg golden_rlimit_nofile_hard)\"|" official-image.toml
+          sed -i "s|^golden_nofile_ulimit_raise_best_effort = \".*\"$|golden_nofile_ulimit_raise_best_effort = \"ulimit -Sn $(cfg golden_rlimit_nofile_soft) 2>/dev/null \\|\\| true; ulimit -Hn $(cfg golden_rlimit_nofile_hard) 2>/dev/null \\|\\| echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2\"|" official-image.toml
+          sed -i "s|^golden_stack_soft_bytes = \".*\"$|golden_stack_soft_bytes = \"$(( $(cfg golden_rlimit_stack_soft_kib) * 1024 ))\"|" official-image.toml
+          sed -i "s|^golden_stack_prlimit = \".*\"$|golden_stack_prlimit = \"$(cfg golden_stack_soft_bytes):$(cfg golden_rlimit_stack_hard)\"|" official-image.toml
+          sed -i "s|^golden_nofile_prlimit = \".*\"$|golden_nofile_prlimit = \"$(cfg golden_rlimit_nofile_soft):$(cfg golden_rlimit_nofile_hard)\"|" official-image.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # The checkout keeps `persist-credentials: false`; authenticate the
+          # push with the workflow token explicitly.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          BRANCH="chore/golden-runtime-drift-$(date -u +%F)"
+          git checkout -b "$BRANCH"
+          git add official-image.toml
+          git diff --cached --stat
+          git commit -m "chore(golden): update the golden runtime values from a hosted-runner probe"
+          git push -u origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore(golden): update the golden runtime values from a hosted-runner probe" \
+            --body "The weekly probe of real GitHub-hosted \`ubuntu-24.04\` and \`ubuntu-24.04-arm\` runners found a golden runtime value that no longer matches \`official-image.toml\`. Merging updates the file the guest init, the parity fixture and the CI job all derive from; the diff above is the reviewable record of what GitHub changed."

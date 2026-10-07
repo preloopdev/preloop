@@ -831,8 +831,11 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
             _ => None,
         })
         .expect("runner configure command");
+    // `runner_user: None`, so the launch is the pass-through wrapper
+    // (`sh -c '<stack raise>; exec "$@"' sh`): the env prefix follows the
+    // wrapper, untouched.
     assert_eq!(
-        &configure[..expected_prefix.len()],
+        &configure[4..4 + expected_prefix.len()],
         expected_prefix.as_slice()
     );
 
@@ -846,7 +849,25 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
             _ => None,
         })
         .expect("runner run command");
-    assert_eq!(&run[..expected_prefix.len()], expected_prefix.as_slice());
+    // This pool runs `runner_user: None`, so the launch is the pass-through
+    // wrapper: `sh -c '<stack raise>; exec "$@"' sh <argv…>`. The original
+    // argv follows the four wrapper elements untouched — that is the point of
+    // the `$@` form, so nothing here is re-quoted.
+    assert_eq!(run[0], "sh");
+    assert_eq!(run[1], "-c");
+    assert_eq!(
+        run[2],
+        "ulimit -Hs unlimited; ulimit -Ss 16384; \
+          ulimit -Sn 65536 2>/dev/null || true; \
+          ulimit -Hn 65536 2>/dev/null || \
+          echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2; \
+          exec \"$@\""
+    );
+    assert_eq!(run[3], "sh");
+    assert_eq!(
+        &run[4..4 + expected_prefix.len()],
+        expected_prefix.as_slice()
+    );
 }
 
 /// Control-socket routing and failure-marker debugging are independent knobs.
@@ -900,7 +921,23 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .clone();
 
         // The prefix is everything before the runner executable itself.
-        let prefix: Vec<&str> = configure
+        // `runner_user: None`, so the launch is the pass-through wrapper
+        // (`sh -c '<stack raise>; exec "$@"' sh`) and the original argv — env
+        // entries included — follows it untouched.
+        assert_eq!(
+            &configure[..4],
+            [
+                "sh",
+                "-c",
+                "ulimit -Hs unlimited; ulimit -Ss 16384; \
+                  ulimit -Sn 65536 2>/dev/null || true; \
+                  ulimit -Hn 65536 2>/dev/null || \
+                  echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2; \
+                  exec \"$@\"",
+                "sh"
+            ]
+        );
+        let prefix: Vec<&str> = configure[4..]
             .iter()
             .take_while(|arg| !arg.ends_with(&config.runner_binary_name))
             .map(String::as_str)
