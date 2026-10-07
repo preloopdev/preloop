@@ -88,6 +88,19 @@ Releases before v0.27.0 predate the changelog.
   hard limit can only be raised by root. The earlier 524288 hard limit here was
   a guess at what GitHub's runner service inherits — the probe shows 65536.
 
+- **A guest step's environment no longer carries the terminal the exec channel
+  booted with**: a hosted step has no `TERM` (or `COLORTERM`) in its
+  environment — a probe of a real hosted runner shows `printenv TERM` unset,
+  no `TERM` in `env` or `/proc/self/environ`, and the `dumb` a bash step
+  prints for `$TERM` is bash's own default for an *unset* `TERM`
+  (`bash/variables.c`: `set_if_not ("TERM", "dumb")`), not an exported
+  variable. A preloop runner is started through the VM's exec channel, which
+  carries the terminal the guest booted with (`TERM=linux` from the smolvm
+  init, and from `envd` on AgentENV), and every step process inherits the
+  runner's machine environment: the runner now drops an inherited
+  `TERM`/`COLORTERM` from the step environment, so a step's environment
+  matches a hosted runner's. A workflow that declares either still wins.
+
 - **Guest job workloads run on GitHub's stack size again**: the hosted
   `ubuntu-24.04` image doubles the kernel's 8192 KiB process stack
   (`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
