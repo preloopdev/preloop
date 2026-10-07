@@ -16,9 +16,9 @@
 //!    the source changed underneath it.
 //!
 //! The target schema is initialized through
-//! [`target::initialize_fresh_target`] — the swap point the migrations work
-//! replaces with the embedded-migration initializer (`preloop store migrate`)
-//! once the two land together.
+//! [`target::initialize_fresh_target`], which runs the embedded migrations
+//! (`preloop store migrate`'s initializer) and their ledger, so the imported
+//! database is verified and served like any other control store.
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixture;

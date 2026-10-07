@@ -1,18 +1,16 @@
 //! Target-database preparation for the importer.
 //!
-//! **Swap point.** The migrations branch owns schema initialization and the
-//! version ledger; when the two land together this module's body is replaced
-//! by `control::migrations::{initialize_empty_sqlite, verify_sqlite_ledger}`
-//! (embedded migrations, `preloop store migrate`), and the importer keeps
-//! calling [`initialize_fresh_target`] / [`verify_target_ledger`]. Until
-//! then the body mirrors the lite backend's `ensure_schema` exactly: apply
-//! `lite/schema.sql`, seed `sqlite_sequence`, stamp `schema_meta`.
+//! The target is created through the embedded migrations and their ledger —
+//! `control::migrate_runner::initialize_empty_sqlite`, the same initializer
+//! `preloop store migrate` and the test-support backends use — so an
+//! imported store is an ordinary ledgered control database and the migration
+//! ledger, not `schema_meta`, is its version authority.
 //!
-//! The importer never migrates a non-fresh database: an existing
-//! `schema_meta` (or any foreign table) is a refusal, not an upgrade.
+//! The importer never migrates a non-fresh database: an existing control
+//! schema (or any foreign table) is a refusal, not an upgrade.
 
 use anyhow::{Context, bail};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 
 /// Connection settings the importer's own connection needs (the import is a
 /// sequence of raw statements, not a `LiteBackend`).
@@ -26,61 +24,20 @@ pub(crate) fn configure(conn: &mut Connection) -> anyhow::Result<()> {
 
 /// Create the control schema in a brand-new database file.
 pub(crate) fn initialize_fresh_target(conn: &mut Connection) -> anyhow::Result<()> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .context("begin target initialization")?;
-    let has_meta: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
-         WHERE type = 'table' AND name = 'schema_meta')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_meta {
-        bail!("staging database already carries a control schema; refusing to re-initialize it");
-    }
-    let foreign: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM sqlite_master \
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?;
-    if foreign != 0 {
-        bail!("staging database holds {foreign} tables but no schema_meta; refusing to adopt it");
-    }
-    tx.execute_batch(include_str!("../schema.sql"))
-        .context("apply control schema to staging database")?;
-    tx.execute(
-        "INSERT INTO sqlite_sequence (name, seq) VALUES ('session_messages', 1000000)",
-        [],
-    )?;
-    tx.execute(
-        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
-        [crate::control::lite::SCHEMA_VERSION.as_bytes()],
-    )?;
-    tx.commit().context("commit target initialization")
+    crate::control::migrate_runner::initialize_empty_sqlite(conn)
+        .context("initialize the staging database")
 }
 
-/// Verify the target carries the control schema this build reads.
+/// Verify the target carries exactly the control schema this build ships.
 ///
-/// The standalone-branch check mirrors the lite backend's `ensure_schema`:
-/// the recorded schema version must match exactly. The migrations branch
-/// replaces this with its ledger verification, which is the schema-version
-/// authority there.
+/// The migration ledger is the version authority, exactly as at serve time
+/// (a stale pre-ledger `schema_meta.schema_version` row is ignored there
+/// too), and every table the importer writes into must exist.
 pub(crate) fn verify_target_ledger(conn: &Connection) -> anyhow::Result<()> {
-    let version: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let version = version.map(|value| String::from_utf8_lossy(&value).into_owned());
-    if version.as_deref() != Some(crate::control::lite::SCHEMA_VERSION) {
-        bail!(
-            "imported database schema version {:?} does not match this build's {}",
-            version.as_deref().unwrap_or("<none>"),
-            crate::control::lite::SCHEMA_VERSION
-        );
+    let ledger = crate::control::migrations::sqlite_ledger(conn)
+        .context("read the staging database's migration ledger")?;
+    if let Err(error) = crate::control::migrations::check_ledger(ledger) {
+        anyhow::bail!("imported database is not a control schema this build serves: {error}");
     }
     for table in [
         "runs",
