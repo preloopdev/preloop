@@ -32,6 +32,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Pushes to the same pull request must not pile up golden bakes: a newer run
+  # cancels the older one. Manual (`workflow_dispatch`) and scheduled runs are
+  # never cancelled — a bake that has been running for hours must not be lost
+  # to an unrelated trigger.
+  group: official-golden-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check-upstream-drift:
     name: Open bump PR on upstream rebuild

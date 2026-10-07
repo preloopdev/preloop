@@ -22,6 +22,14 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Fixed
+- **A push to a pull request no longer piles up golden bakes**:
+  `official-golden.yml` now runs under a per-PR concurrency group with
+  `cancel-in-progress` for `pull_request` runs only, so a superseded push
+  cancels the bake it replaces while a `workflow_dispatch` or scheduled bake
+  that has been running for hours is never cancelled. The workflow also bakes
+  only when the `official_runner_image_base_*` pins move: the `golden_*`
+  launch-time runtime keys in the same file no longer start a ~60 GiB rebuild.
+
 
 - **A guest job's runtime now matches a GitHub-hosted runner's**: the hosted
   VM boots with systemd/cloud-init and runs the runner as a systemd service, so
