@@ -121,6 +121,20 @@ Releases before v0.27.0 predate the changelog.
   `null` body was treated as a message with id 0 and type `unknown`. It is
   now an empty poll, as in the official listener.
 
+### Added
+
+- The runner now implements the official background-step coordinator
+  (v2.336.0, `actions/runner` #4476/#4482): background steps execute off-loop
+  with bounded concurrency (`system.runner.maxbackgroundsteps`, default 10),
+  `wait` / `wait-all` / `cancel` control-flow steps coordinate them, job and
+  explicit cancellation propagate through a linked token with the official
+  7.5 s grace period, deferred outputs / environment / path / state flush at
+  wait time, and a post-job safety net joins anything an explicit control did
+  not cover. Canceled results from explicitly cancelled steps no longer
+  influence the job result, and background updates carry the official
+  `isBackground` / `backgroundControlType` / `backgroundControlStepIds` /
+  `parallelGroupId` timeline metadata.
+
 ## [0.33.9] - 2026-10-02
 
 ### Changed

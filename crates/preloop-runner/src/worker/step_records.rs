@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use super::server_queue::{StepUpdate, step_conclusion, step_status};
 
 /// Partial step update — omitted fields preserve existing values on merge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartialStepUpdate {
     /// Identity key (UUID / wire external_id). Required.
     pub external_id: String,
@@ -36,6 +36,17 @@ pub struct PartialStepUpdate {
     /// Conclusion enum. Omitted → keep previous; never erase a non-zero
     /// conclusion with zero/absent unless status is still non-terminal.
     pub conclusion: Option<u32>,
+    /// Official `TimelineRecord.IsBackground` (v2.336.0). Static per step:
+    /// once set it is never cleared by a later partial.
+    pub is_background: Option<bool>,
+    /// Official `TimelineRecord.BackgroundControlType` (`wait` / `waitAll` /
+    /// `cancel`). Static per step.
+    pub background_control_type: Option<String>,
+    /// Official `TimelineRecord.BackgroundControlStepIds` (external ids of the
+    /// targeted background steps). Empty never erases a non-empty list.
+    pub background_control_step_ids: Vec<String>,
+    /// Official `TimelineRecord.ParallelGroupId`. Static per step.
+    pub parallel_group_id: Option<String>,
 }
 
 impl PartialStepUpdate {
@@ -51,6 +62,10 @@ impl PartialStepUpdate {
             completed_at: update.completed_at.clone(),
             has_completed_at: true,
             conclusion: Some(update.conclusion),
+            is_background: update.is_background,
+            background_control_type: update.background_control_type.clone(),
+            background_control_step_ids: update.background_control_step_ids.clone(),
+            parallel_group_id: update.parallel_group_id.clone(),
         }
     }
 }
@@ -84,9 +99,26 @@ pub fn merge_step_update(
         started_at: None,
         completed_at: None,
         conclusion: 0,
+        ..Default::default()
     });
 
     let mut merged = base;
+
+    // Official background-step metadata is static per step: a later partial
+    // never clears a value an earlier update carried (upstream
+    // `JobServerQueue` merges the record fields with `?? timelineRecord.X`).
+    if incoming.is_background.is_some() {
+        merged.is_background = incoming.is_background;
+    }
+    if incoming.background_control_type.is_some() {
+        merged.background_control_type = incoming.background_control_type.clone();
+    }
+    if !incoming.background_control_step_ids.is_empty() {
+        merged.background_control_step_ids = incoming.background_control_step_ids.clone();
+    }
+    if incoming.parallel_group_id.is_some() {
+        merged.parallel_group_id = incoming.parallel_group_id.clone();
+    }
 
     if let Some(number) = incoming.number {
         merged.number = number;
@@ -216,6 +248,7 @@ pub fn reconcile_cancelled_steps(
                     started_at: None,
                     completed_at: Some(completed_at.to_owned()),
                     conclusion: step_conclusion::FAILED,
+                    ..Default::default()
                 },
             );
         }
@@ -270,7 +303,53 @@ mod tests {
                 None
             },
             conclusion,
+            ..Default::default()
         }
+    }
+
+    /// Official background-step metadata is static per step: a later
+    /// status-only partial must not clear the fields a first update carried
+    /// (upstream merges them with `?? record.X`), and an empty control-target
+    /// list must not erase a non-empty one.
+    #[test]
+    fn background_step_metadata_survives_partial_updates() {
+        let first = StepUpdate {
+            external_id: "s".into(),
+            number: 1,
+            name: "bg".into(),
+            status: step_status::IN_PROGRESS,
+            is_background: Some(true),
+            background_control_type: Some("waitAll".into()),
+            background_control_step_ids: vec!["target".into()],
+            parallel_group_id: Some("group-1".into()),
+            ..Default::default()
+        };
+        let merged = merge_step_update(None, &PartialStepUpdate::from_full(&first));
+        assert_eq!(merged.is_background, Some(true));
+        assert_eq!(merged.background_control_type.as_deref(), Some("waitAll"));
+        assert_eq!(
+            merged.background_control_step_ids,
+            vec!["target".to_string()]
+        );
+        assert_eq!(merged.parallel_group_id.as_deref(), Some("group-1"));
+
+        let later = merge_step_update(
+            Some(&merged),
+            &PartialStepUpdate {
+                external_id: "s".into(),
+                status: Some(step_status::COMPLETED),
+                conclusion: Some(step_conclusion::SUCCEEDED),
+                ..Default::default()
+            },
+        );
+        assert_eq!(later.status, step_status::COMPLETED);
+        assert_eq!(later.is_background, Some(true));
+        assert_eq!(later.background_control_type.as_deref(), Some("waitAll"));
+        assert_eq!(
+            later.background_control_step_ids,
+            vec!["target".to_string()]
+        );
+        assert_eq!(later.parallel_group_id.as_deref(), Some("group-1"));
     }
 
     #[test]
@@ -292,6 +371,7 @@ mod tests {
             completed_at: None,
             has_completed_at: true,
             conclusion: Some(0),
+            ..Default::default()
         };
         let merged = merge_step_update(Some(&existing), &incoming);
         assert_eq!(merged.status, step_status::COMPLETED);
@@ -311,6 +391,7 @@ mod tests {
             completed_at: Some("t9".into()),
             has_completed_at: true,
             conclusion: Some(step_conclusion::FAILED),
+            ..Default::default()
         };
         let merged = merge_step_update(Some(&existing), &incoming);
         assert_eq!(merged.number, 2);
@@ -443,6 +524,7 @@ mod tests {
                         completed_at: has_completed.then(|| "t".into()),
                         has_completed_at: has_completed,
                         conclusion,
+                        ..Default::default()
                     }
                 },
             )
@@ -503,6 +585,7 @@ mod tests {
                 completed_at: None,
                 has_completed_at: false,
                 conclusion: Some(0),
+                ..Default::default()
             };
             let merged = merge_step_update(Some(&existing), &incoming);
             prop_assert_eq!(merged.conclusion, c);
@@ -631,6 +714,7 @@ mod tests {
             completed_at: None,
             has_completed_at: false,
             conclusion: None,
+            ..Default::default()
         };
         let merged = merge_step_update(Some(&existing), &incoming);
         assert_eq!(

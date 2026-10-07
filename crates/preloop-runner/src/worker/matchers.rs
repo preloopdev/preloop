@@ -121,15 +121,16 @@ impl PatternMatch {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+/// Severity level of a problem matcher.
 pub enum SeveritySpec {
     Capture(usize),
     Literal(String),
 }
 
 /// A single matcher pattern.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct MatcherPattern {
     pub regexp: String,
     #[serde(default)]
@@ -180,6 +181,44 @@ impl MatcherRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fold a background step's matcher delta into `self`: install owners the
+    /// step added or re-registered with a changed definition, and remove
+    /// owners it deleted via `::remove-matcher::`. Mirrors the official
+    /// coordinator's deferred matcher flush — the diff against the
+    /// dispatch-time snapshot (`base`) recovers additions, removals, and
+    /// re-registrations alike.
+    pub(crate) fn merge_delta(&mut self, base: &Self, current: &Self) {
+        for (owner, matcher) in &current.matchers {
+            let changed = match base.matchers.get(owner) {
+                // Compare the definition, not the runtime state: `state` and
+                // `compiled_regexes` are derived from the pattern set and are
+                // not comparable.
+                Some(base_matcher) => {
+                    base_matcher.from_path != matcher.from_path
+                        || base_matcher.patterns != matcher.patterns
+                }
+                None => true,
+            };
+            if changed {
+                // Install a *reset* copy: the incoming matcher carries the
+                // background step's own partial multi-pattern state, and a
+                // later foreground line matching its final pattern would
+                // otherwise assemble an annotation from the background
+                // output. Official registration starts from a clean state.
+                let mut installed = matcher.clone();
+                installed.reset();
+                self.matchers.insert(owner.clone(), installed);
+            }
+        }
+        // Owners present at dispatch but gone from the step's registry were
+        // removed by `::remove-matcher::`; they must not stay active.
+        for owner in base.matchers.keys() {
+            if !current.matchers.contains_key(owner) {
+                self.matchers.remove(owner);
+            }
+        }
     }
 
     /// Add a matcher from a JSON file.
@@ -712,6 +751,56 @@ mod tests {
         assert_eq!(annotations[0].line, Some(12));
         assert_eq!(annotations[0].col, Some(34));
         assert_eq!(annotations[0].message, "boom");
+    }
+
+    fn registry_with(matcher_json: &str) -> (MatcherRegistry, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("matcher.json");
+        std::fs::write(&path, matcher_json).unwrap();
+        let mut registry = MatcherRegistry::new();
+        registry.add_from_file(&path).unwrap();
+        (registry, dir)
+    }
+
+    #[test]
+    fn merge_delta_applies_additions_removals_and_replacements() {
+        let (base, _base_dir) = registry_with(
+            r#"{
+              "problemMatcher": [
+                { "owner": "keep", "pattern": [{ "regexp": "^KEEP_OLD (.*)$", "message": 1 }] },
+                { "owner": "remove", "pattern": [{ "regexp": "^REMOVE (.*)$", "message": 1 }] }
+              ]
+            }"#,
+        );
+        let (current, _current_dir) = registry_with(
+            r#"{
+              "problemMatcher": [
+                { "owner": "keep", "pattern": [{ "regexp": "^KEEP_NEW (.*)$", "message": 1 }] },
+                { "owner": "add", "pattern": [{ "regexp": "^ADD (.*)$", "message": 1 }] }
+              ]
+            }"#,
+        );
+
+        // `self` starts as the dispatch-time snapshot, then folds the step's
+        // delta — exactly what flush_step does.
+        let mut self_registry = base.clone();
+        self_registry.merge_delta(&base, &current);
+
+        // Addition.
+        assert!(
+            self_registry.matchers.contains_key("add"),
+            "added owner must be installed"
+        );
+        // Removal (`::remove-matcher::`).
+        assert!(
+            !self_registry.matchers.contains_key("remove"),
+            "removed owner must no longer be active"
+        );
+        // Replacement (re-registration with new patterns).
+        assert_eq!(
+            self_registry.matchers["keep"].patterns[0].regexp, "^KEEP_NEW (.*)$",
+            "re-registered owner must use the new definition"
+        );
     }
 
     #[test]
@@ -1252,5 +1341,47 @@ mod tests {
         assert_eq!(anns[0].end_column, Some(20));
         assert_eq!(anns[0].message, "unused variable");
         assert_eq!(anns[0].level, AnnotationLevel::Warning);
+    }
+
+    /// The delta merge must install a *reset* matcher: the incoming matcher
+    /// carries the background step's own partial multi-pattern state, and a
+    /// later foreground line matching its final pattern would otherwise
+    /// assemble an annotation from the background output.
+    #[test]
+    fn merge_delta_resets_installed_matcher_state() {
+        let (base, _base_dir) = registry_with(
+            r#"{
+              "problemMatcher": [
+                { "owner": "multi", "pattern": [
+                    { "regexp": "^FIRST (.*)$" },
+                    { "regexp": "^SECOND (.*)$", "message": 1 }
+                ] }
+              ]
+            }"#,
+        );
+        let (mut current, _current_dir) = registry_with(
+            r#"{
+              "problemMatcher": [
+                { "owner": "multi", "pattern": [
+                    { "regexp": "^FIRST (.*)$" },
+                    { "regexp": "^SECOND (.*)$", "message": 1 }
+                ] }
+              ]
+            }"#,
+        );
+        // The background step matched the first pattern before it was waited
+        // on, leaving partial state behind.
+        current.match_line("FIRST background noise", "", "", "", false);
+
+        let mut registry = base.clone();
+        registry.merge_delta(&base, &current);
+
+        // A foreground line matching only the second pattern must not complete
+        // an annotation from the background step's first line.
+        let annotations = registry.match_line("SECOND foreground line", "", "", "", false);
+        assert!(
+            annotations.is_empty(),
+            "partial state from the background step must not leak: {annotations:?}"
+        );
     }
 }

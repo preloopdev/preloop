@@ -719,6 +719,56 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 
         let env = extract_step_env(step);
 
+        // Background control-flow steps (official DTPipelines
+        // BackgroundStepControl): wait / wait-all / cancel. The official
+        // JobExtension validates the control type and hardcodes the
+        // condition to always(). An unknown type is not parseable into a
+        // process step, so it surfaces as a failed control step at runtime
+        // (the official worker fails the job at extension time).
+        let control_type = step.get("controlType").and_then(|v| v.as_str());
+        if control_type.is_some() || step.get("stepIds").is_some() {
+            // Official `Pipelines.BackgroundControlTypes`: `wait`, `waitAll`,
+            // `cancel` (the timeline carries the same spelling). The
+            // hyphenated `wait-all` is tolerated for preloop-generated
+            // payloads; everything else is an unknown control type and fails
+            // the control step at runtime.
+            let raw_control_type = control_type.unwrap_or("");
+            let control_type =
+                super::background_steps::canonical_control_type(raw_control_type).to_string();
+            if !matches!(control_type.as_str(), "wait" | "waitAll" | "cancel") {
+                tracing::warn!(
+                    "Unknown background step control type '{raw_control_type}' for step '{}'",
+                    step.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+            }
+            let step_ids = step
+                .get("stepIds")
+                .and_then(|v| v.as_array())
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let display_name = display_name_override.unwrap_or_else(|| control_type.clone());
+            result.push(Step {
+                id,
+                context_name,
+                display_name,
+                step_type: StepType::ControlFlow {
+                    control_type,
+                    step_ids,
+                },
+                condition: Some("always()".to_string()),
+                continue_on_error,
+                timeout_minutes,
+                env,
+                raw: step.clone(),
+                is_background: false,
+            });
+            continue;
+        }
+
         // Determine step type (reuse `reference` from above)
         let step_type = if let Some(ref_val) = reference {
             let ref_type = ref_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -842,7 +892,35 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
         });
     }
 
+    resolve_control_targets(&mut result);
+
     result
+}
+
+/// Translate each control step's `stepIds` into the coordinator's key space.
+///
+/// The coordinator keys background entries by `context_name` — matching the
+/// official `BackgroundStepCoordinator._backgroundSteps[step.ExecutionContext
+/// .ContextName]` — and a control step's `stepIds` name those targets. A
+/// payload that instead lists each target's wire `id` (the GUID used as
+/// `external_id`) is translated here so a `wait` / `cancel` always resolves
+/// its target; an unresolved id is left untouched and reported as unknown by
+/// the coordinator.
+fn resolve_control_targets(steps: &mut [Step]) {
+    let mut canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for step in steps.iter() {
+        canonical.insert(step.id.clone(), step.context_name.clone());
+        canonical.insert(step.context_name.clone(), step.context_name.clone());
+    }
+    for step in steps.iter_mut() {
+        if let StepType::ControlFlow { step_ids, .. } = &mut step.step_type {
+            for id in step_ids.iter_mut() {
+                if let Some(context_name) = canonical.get(id) {
+                    *id = context_name.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Discover pre/post steps from action manifests and return the full ordered list.
@@ -859,10 +937,65 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 /// Remote actions must be downloaded before this runs; `action_paths` maps the
 /// original `uses:` ref to the resolved manifest directory.
 pub fn build_step_list_with_lifecycle(
-    main_steps: Vec<Step>,
+    mut main_steps: Vec<Step>,
     workspace: &str,
     action_paths: &std::collections::HashMap<String, String>,
 ) -> Vec<Step> {
+    // Official JobExtension: when background steps exist and some are not
+    // covered by an explicit wait/wait-all/cancel control step, append an
+    // implicit wait-all ("Wait for all background steps") at the end of the
+    // main steps, so the job never ends with a still-running background
+    // step. The coordinator's safety net at the post-job boundary is the
+    // backstop for whatever this misses.
+    let background_ids: Vec<String> = main_steps
+        .iter()
+        .filter(|step| step.is_background)
+        .map(|step| step.context_name.clone())
+        .collect();
+    if !background_ids.is_empty() {
+        let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for step in &main_steps {
+            if let StepType::ControlFlow {
+                control_type,
+                step_ids,
+            } = &step.step_type
+            {
+                for id in step_ids {
+                    covered.insert(id.as_str());
+                }
+                if control_type == "wait-all" {
+                    // A wait-all covers every background step, whatever the
+                    // wire listed.
+                    for id in &background_ids {
+                        covered.insert(id.as_str());
+                    }
+                }
+            }
+        }
+        let uncovered: Vec<String> = background_ids
+            .iter()
+            .filter(|id| !covered.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if !uncovered.is_empty() {
+            main_steps.push(Step {
+                id: uuid::Uuid::new_v4().to_string(),
+                context_name: "__implicit_wait_all".to_string(),
+                display_name: "Wait for all background steps".to_string(),
+                step_type: StepType::ControlFlow {
+                    control_type: "waitAll".to_string(),
+                    step_ids: uncovered,
+                },
+                condition: Some("always()".to_string()),
+                continue_on_error: false,
+                timeout_minutes: None,
+                env: std::collections::HashMap::new(),
+                raw: serde_json::json!({ "backgroundControlType": "waitAll" }),
+                is_background: false,
+            });
+        }
+    }
+
     let mut pre_steps: Vec<Step> = Vec::new();
     let mut post_steps: Vec<Step> = Vec::new();
 
@@ -1112,6 +1245,8 @@ pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
             }
         }
         StepType::Action { uses, .. } if !uses.is_empty() => format!("Run {uses}"),
+        // Official fallback for control steps is the control type itself.
+        StepType::ControlFlow { control_type, .. } => control_type.clone(),
         _ => id.to_string(),
     }
 }

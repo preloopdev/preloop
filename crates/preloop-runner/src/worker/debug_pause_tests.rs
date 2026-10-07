@@ -24,6 +24,8 @@ use super::steps_runner::{Step, StepType};
 struct Fake {
     /// Verdict handed out once `polls` reaches `verdict_after`.
     verdict: Option<Verdict>,
+    /// Range the retry verdict asks to replay from (0-based step index).
+    retry_from_step: Option<usize>,
     /// Snapshot credential the fake control plane mints for retry verdicts.
     snapshot_token: Option<String>,
     /// Origin-rewrite auth header the fake control plane mints for retries.
@@ -72,6 +74,7 @@ async fn spawn_fake(fake: Arc<Fake>) -> String {
                     "version": seen + 1,
                     "snapshot_token": fake.snapshot_token,
                     "snapshot_auth_header": fake.snapshot_auth_header,
+                    "retry_from_step": fake.retry_from_step,
                 }))
             }),
         )
@@ -122,6 +125,18 @@ pub(crate) async fn retry_client_with_snapshot_header(auth_header: &str) -> Debu
     });
     let base_url = spawn_fake(fake).await;
     client(&base_url).with_snapshot_url(Some("http://snap.invalid/owner/repo".to_owned()))
+}
+
+/// A debug client whose first verdict is a Retry that asks to replay from
+/// `retry_from_step`, used by the step-loop range-replay regression tests.
+pub(crate) async fn retry_from_step_client(retry_from_step: usize) -> DebugPauseClient {
+    let fake = Arc::new(Fake {
+        verdict: Some(Verdict::Retry),
+        retry_from_step: Some(retry_from_step),
+        ..Default::default()
+    });
+    let base_url = spawn_fake(fake).await;
+    client(&base_url)
 }
 
 /// A retry verdict must surface the fresh snapshot credential the server

@@ -1560,3 +1560,160 @@ async fn post_step_executes_for_node_action_with_post_entrypoint() {
         "expected Post steps in queue updates, got {post_updates}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Debug-retry range replay: the barrier rule itself, and the behaviour it
+// guarantees when a requested range cannot be replayed.
+// ---------------------------------------------------------------------
+
+/// A range is replayable only when it lies at or behind the current step and
+/// contains neither a background nor a control-flow step.
+#[test]
+fn replay_range_rejects_background_and_control_steps() {
+    let plain = [false, false, false, false];
+    // The current step itself, and any plain range behind it.
+    assert!(replay_range_is_safe(&plain, 3, 3, 4));
+    assert!(replay_range_is_safe(&plain, 0, 3, 4));
+    assert!(replay_range_is_safe(&plain, 2, 2, 4));
+
+    // A background step inside the range.
+    let with_background = [false, true, false, false];
+    assert!(!replay_range_is_safe(&with_background, 0, 3, 4));
+    assert!(!replay_range_is_safe(&with_background, 1, 1, 4));
+    // ... but a range that stops before it is fine.
+    assert!(replay_range_is_safe(&with_background, 2, 3, 4));
+
+    // A control-flow step inside the range (its wait already merged state the
+    // replay's snapshot restore would drop).
+    let with_control = [false, false, true, false];
+    assert!(!replay_range_is_safe(&with_control, 0, 3, 4));
+    assert!(!replay_range_is_safe(&with_control, 2, 3, 4));
+
+    // Forward ranges and targets past the step list are never replayable.
+    assert!(!replay_range_is_safe(&plain, 3, 1, 4));
+    assert!(!replay_range_is_safe(&plain, 4, 3, 4));
+}
+
+/// The regression: a `retry_from_step` range that spans a background step must
+/// fall through to the current-step retry — the pre-fix code broke out of the
+/// retry loop first and only *then* refused the range, leaving the failed
+/// attempt terminal.
+#[tokio::test]
+async fn retry_range_spanning_a_background_step_retries_the_current_step() {
+    let dir = TempDir::new().unwrap();
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some(dir.path().to_string_lossy().into_owned());
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+
+    let mut first = test_step("first", None);
+    first.step_type = StepType::Script {
+        script: "echo run >> first_ran".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+    let mut background = test_step("background", None);
+    background.is_background = true;
+    background.step_type = StepType::Script {
+        script: "sleep 0.2".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+    let mut last = test_step("last", None);
+    last.step_type = StepType::Script {
+        script: "echo run >> last_ran; exit 1".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+
+    // The verdict always asks to replay from step 0, which would span the
+    // background step while the current step is the last one.
+    let debug = crate::worker::debug_pause_tests::retry_from_step_client(0).await;
+
+    let result = run_steps(
+        &[first, background, last],
+        &mut job,
+        dir.path().to_str().unwrap(),
+        cancel_rx,
+        queue,
+        None,
+        None,
+        &[],
+        Some(&debug),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, "Failed");
+    let runs = |name: &str| {
+        std::fs::read_to_string(dir.path().join(name))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    assert_eq!(
+        runs("first_ran"),
+        1,
+        "the requested range must not be replayed over the background step"
+    );
+    assert!(
+        runs("last_ran") >= 2,
+        "the failed step must still be retried, not left terminal"
+    );
+}
+
+/// A replayable range still replays: a request from a plain earlier step is
+/// honoured (the barrier must not disable range replay wholesale).
+#[tokio::test]
+async fn retry_range_without_background_steps_still_replays() {
+    let dir = TempDir::new().unwrap();
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some(dir.path().to_string_lossy().into_owned());
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+
+    let mut first = test_step("first", None);
+    first.step_type = StepType::Script {
+        script: "echo run >> first_ran; exit 1".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+
+    let debug = crate::worker::debug_pause_tests::retry_from_step_client(0).await;
+
+    let result = run_steps(
+        &[first],
+        &mut job,
+        dir.path().to_str().unwrap(),
+        cancel_rx,
+        queue,
+        None,
+        None,
+        &[],
+        Some(&debug),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, "Failed");
+    assert!(
+        std::fs::read_to_string(dir.path().join("first_ran"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            >= 2,
+        "a replayable range must be replayed"
+    );
+}

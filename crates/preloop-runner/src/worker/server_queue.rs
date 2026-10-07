@@ -35,7 +35,7 @@ pub mod step_conclusion {
 }
 
 /// A step update matching the WorkflowStepsUpdate Twirp schema.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StepUpdate {
     /// Step external ID (UUID from the job message step).
     pub external_id: String,
@@ -53,6 +53,24 @@ pub struct StepUpdate {
     pub completed_at: Option<String>,
     /// Step conclusion (see `step_conclusion` constants).
     pub conclusion: u32,
+    /// Official `TimelineRecord.IsBackground` (v2.336.0): true for a
+    /// concurrent background step. Omitted for ordinary steps. Named after
+    /// the sibling wire fields (this body is snake_case); the AzDO timeline
+    /// record emits the official `isBackground` spelling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_background: Option<bool>,
+    /// Official `TimelineRecord.BackgroundControlType`: `wait`, `waitAll`, or
+    /// `cancel` for a control-flow step. Omitted for ordinary steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_control_type: Option<String>,
+    /// Official `TimelineRecord.BackgroundControlStepIds`: the external ids of
+    /// the background steps a control-flow step targets. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub background_control_step_ids: Vec<String>,
+    /// Official `TimelineRecord.ParallelGroupId`, when the job message
+    /// supplies one for the action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_group_id: Option<String>,
 }
 
 /// The full WorkflowStepsUpdate request body.
@@ -280,6 +298,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:00Z".into()),
             completed_at: Some("2024-01-01T00:00:01Z".into()),
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
         assert!(q.has_pending());
 
@@ -317,6 +336,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:00Z".into()),
             completed_at: Some("2024-01-01T00:00:01Z".into()),
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
 
         let (body, generation) = q.take_steps_update_body().unwrap();
@@ -351,6 +371,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:00Z".into()),
             completed_at: Some("2024-01-01T00:00:01Z".into()),
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
         // Step 2 starts
         q.queue_update(StepUpdate {
@@ -361,6 +382,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:02Z".into()),
             completed_at: None,
             conclusion: 0,
+            ..Default::default()
         });
 
         let (body, generation) = q.take_steps_update_body().unwrap();
@@ -379,6 +401,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:02Z".into()),
             completed_at: Some("2024-01-01T00:00:03Z".into()),
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
         q.queue_update(StepUpdate {
             external_id: "step-3".into(),
@@ -388,6 +411,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:04Z".into()),
             completed_at: Some("2024-01-01T00:00:05Z".into()),
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
 
         let (body2, _) = q.take_steps_update_body().unwrap();
@@ -432,6 +456,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
         let (b1, generation) = q.take_steps_update_body().unwrap();
         assert_eq!(b1.change_order, 1);
@@ -445,6 +470,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             conclusion: step_conclusion::FAILED,
+            ..Default::default()
         });
         let (b2, _) = q.take_steps_update_body().unwrap();
         assert_eq!(b2.change_order, 2);
@@ -461,6 +487,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             conclusion: 0,
+            ..Default::default()
         });
         let (_, in_flight_generation) = q.take_steps_update_body().unwrap();
         q.queue_update(StepUpdate {
@@ -471,6 +498,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
         });
 
         q.mark_steps_published(in_flight_generation);

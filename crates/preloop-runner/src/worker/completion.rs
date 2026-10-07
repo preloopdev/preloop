@@ -190,6 +190,7 @@ pub(crate) fn completejob_type_and_action(step: &Step) -> (&'static str, String)
                 .to_string(),
         ),
         StepType::Action { uses, .. } => ("action", uses.clone()),
+        StepType::ControlFlow { control_type, .. } => ("background-control", control_type.clone()),
     }
 }
 
