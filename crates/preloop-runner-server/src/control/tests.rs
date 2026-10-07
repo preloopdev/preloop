@@ -2884,17 +2884,18 @@ pub(crate) mod suite {
             .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
             .await
             .unwrap();
-        let total = backend
-            .outbox_read(
-                OutboxBookmark {
-                    txid: 0,
-                    event_id: 0,
-                },
-                10_000,
-            )
-            .await
-            .unwrap()
-            .len();
+        // Postgres reads only below the cluster-wide snapshot `xmin`, so an
+        // open transaction in another test's database on the shared server
+        // hides these freshly committed rows for a moment. Retry like the
+        // consumer loops below instead of counting once.
+        let mut total = 0;
+        for _ in 0..600 {
+            total = outbox_len(backend).await;
+            if total > 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(total > 1, "a submit emits several outbox rows");
 
         // First consumer reads exactly one event and commits the bookmark.
@@ -2954,6 +2955,74 @@ pub(crate) mod suite {
         );
     }
 
+    /// Renewal keeps only the current owner's lease: a sender whose lease
+    /// expired and was re-leased by another sender is told so (and so must
+    /// not POST), and its renewal attempt does not steal the row back.
+    pub(crate) async fn check_run_lease_renewal_respects_takeover(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let build = JobId("build".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        backend
+            .enqueue_check_run_update(CheckRunUpdateInput {
+                run_id,
+                job_id: build.clone(),
+                installation_id: 0,
+                check_run_id: None,
+                version: 1,
+                payload: serde_json::json!({
+                    "repository": "owner/repo",
+                    "sha": "abc123",
+                    "status": "queued",
+                    "name": "build",
+                }),
+            })
+            .await
+            .unwrap();
+        let holds = |rows: &[crate::control::types::CheckRunUpdate]| {
+            rows.iter()
+                .any(|row| row.run_id == run_id && row.job_id == build)
+        };
+
+        let first = backend
+            .lease_check_run_updates("sender-a", std::time::Duration::from_millis(1), 100)
+            .await
+            .unwrap();
+        assert!(holds(&first), "sender-a leases the row");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = backend
+            .lease_check_run_updates("sender-b", std::time::Duration::from_secs(30), 100)
+            .await
+            .unwrap();
+        assert!(holds(&second), "sender-b re-leases the expired row");
+
+        let lease = std::time::Duration::from_secs(60);
+        assert!(
+            !backend
+                .renew_check_run_update("sender-a", run_id, &build, lease)
+                .await
+                .unwrap(),
+            "the superseded sender must learn it lost the row"
+        );
+        assert!(
+            backend
+                .renew_check_run_update("sender-b", run_id, &build, lease)
+                .await
+                .unwrap(),
+            "the current owner renews"
+        );
+        let third = backend
+            .lease_check_run_updates("sender-c", std::time::Duration::from_secs(30), 100)
+            .await
+            .unwrap();
+        assert!(
+            !holds(&third),
+            "a renewed lease is not up for grabs, and the failed renewal took nothing"
+        );
+    }
+
     /// Outbox prune never passes the durable consumer bookmark, and still
     /// bounds growth by age when no consumer has registered.
     pub(crate) async fn prune_outbox_respects_slowest_consumer(backend: &dyn ControlBackend) {
@@ -2981,10 +3050,13 @@ pub(crate) mod suite {
             pruned >= 1,
             "with no durable consumer, age prunes the stream"
         );
-        assert_eq!(
-            outbox_len(backend).await,
-            before - pruned as usize,
-            "prune removes exactly the rows it counted"
+        // Postgres hides rows above the cluster-wide snapshot `xmin`, so a
+        // row the count missed can surface after the prune; rows never
+        // vanish except by pruning. Hence `>=`: prune removed no more than it
+        // reported.
+        assert!(
+            outbox_len(backend).await >= before - pruned as usize,
+            "prune removes no more rows than it counted"
         );
 
         // A consumer's bookmark: rows at/below it are prunable, rows past it
@@ -2996,6 +3068,10 @@ pub(crate) mod suite {
             .unwrap();
         let fast = consume_until_quiescent(backend, "prune-consumer-fast").await;
         assert!(fast > 0);
+        // Rows past the bookmark must be visible before the prune, or the
+        // "they survive" assertion below is vacuous: wait until the second
+        // submit's rows are counted, not just the first run's.
+        let before_second = stable_outbox_len(backend).await;
         let run_id2 = RunId::new();
         backend
             .submit_run(submit_run(run_id2, vec![submit_job(run_id2, "build", 1)]))
@@ -3004,22 +3080,24 @@ pub(crate) mod suite {
         let mut total = 0;
         for _ in 0..600 {
             total = stable_outbox_len(backend).await;
-            if total > 0 {
+            if total > before_second {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(total > 0);
+        assert!(
+            total > before_second,
+            "the second submit's rows become visible"
+        );
         let pruned = backend
             .prune_outbox(std::time::Duration::ZERO, 10_000)
             .await
             .unwrap();
         assert!(pruned >= 1, "rows at or below the bookmark are prunable");
         let remaining = outbox_len(backend).await;
-        assert_eq!(
-            remaining,
-            total - pruned as usize,
-            "prune removes exactly the rows it counted"
+        assert!(
+            remaining >= total - pruned as usize,
+            "prune removes no more rows than it counted"
         );
         assert!(
             remaining >= 1,
@@ -5440,6 +5518,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn check_run_lease_renewal_respects_takeover() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::check_run_lease_renewal_respects_takeover(&backend).await;
+    }
+
+    #[tokio::test]
     async fn prune_outbox_respects_slowest_consumer() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -6590,6 +6676,11 @@ mod lite {
     #[tokio::test]
     async fn prune_outbox_respects_slowest_consumer() {
         suite::prune_outbox_respects_slowest_consumer(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn check_run_lease_renewal_respects_takeover() {
+        suite::check_run_lease_renewal_respects_takeover(&LiteBackend::in_memory().unwrap()).await;
     }
 
     /// The bookmark lives in the SQLite file: reopen the database and only the
