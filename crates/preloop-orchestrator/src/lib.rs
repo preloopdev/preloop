@@ -2608,8 +2608,9 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// A daemon the fork inherited from its golden instead — preload leaves the
 /// chain running so forks never restart it — carries whatever limits it was
 /// started with, so the command re-raises that live chain (dockerd and
-/// containerd) before exiting, covering goldens baked before the raise
-/// existed.
+/// containerd) in place before exiting, covering goldens baked before either
+/// raise existed: both the stack pair and the descriptor pair, since a
+/// container's processes inherit whichever the chain still carries.
 ///
 /// Readiness is `docker info` rather than `pgrep dockerd`, because a forked VM
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
@@ -2648,12 +2649,19 @@ fn docker_start_command() -> Vec<String> {
              # branches run as.
              raise_engine_chain() {{ \
                for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
-                 soft=; \
+                 stack=; nofile=; \
                  while read -r word1 word2 word3 value _rest; do \
-                   [ \"$word1/$word2/$word3\" = \"Max/stack/size\" ] && {{ soft=$value; break; }}; \
+                   [ \"$word1/$word2/$word3\" = \"Max/stack/size\" ] && stack=$value; \
+                   [ \"$word1/$word2/$word3\" = \"Max/open/files\" ] && nofile=$value; \
                  done 2>/dev/null < \"/proc/$pid/limits\"; \
-                 case \"$soft\" in ''|*[!0-9]*) continue ;; esac; \
-                 [ \"$soft\" -lt 16777216 ] && prlimit --pid \"$pid\" --stack=16777216:unlimited 2>/dev/null; \
+                 case \"$stack\" in ''|*[!0-9]*) stack= ;; esac; \
+                 case \"$nofile\" in ''|*[!0-9]*) nofile= ;; esac; \
+                 if [ -n \"$stack\" ] && [ \"$stack\" -lt 16777216 ]; then \
+                   prlimit --pid \"$pid\" --stack=16777216:unlimited 2>/dev/null; \
+                 fi; \
+                 if [ -n \"$nofile\" ] && [ \"$nofile\" -lt 65536 ]; then \
+                   prlimit --pid \"$pid\" --nofile=65536:65536 2>/dev/null; \
+                 fi; \
                done; \
                return 0; \
              }}; \
@@ -8833,6 +8841,17 @@ done
         // Containerd spawns every container shim, so its limits — not only
         // dockerd's — are what a container process inherits.
         assert!(script.contains("pgrep -x containerd"), "{script}");
+        // The descriptor pair is re-raised too: a container inherits the
+        // engine's nofile, and a golden baked before that raise would keep
+        // handing containers the exec channel's.
+        assert!(
+            script.contains("--nofile=65536:65536"),
+            "the live chain must be raised to the hosted descriptor limit too: {script}"
+        );
+        assert!(
+            script.contains("\"Max/open/files\""),
+            "the nofile raise must only touch a chain still below the hosted limit: {script}"
+        );
         // A fresh daemon can still adopt a surviving containerd from the
         // golden, so both start retries raise the chain too.
         assert_eq!(
