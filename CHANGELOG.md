@@ -163,7 +163,15 @@ Releases before v0.27.0 predate the changelog.
 - Check-run updates now use a durable, coalescing transactional-outbox
   projector and one leased background sender. GitHub API retries, rate-limit
   backoff, stale-id reconciliation and restart recovery happen outside
-  webhook/request paths on both SQLite and PostgreSQL.
+  webhook/request paths on both SQLite and PostgreSQL. Each check run carries
+  an `external_id` of `{run_id}:{job_id}`, and crash-after-POST
+  reconciliation adopts only a check with that id — never another workflow's
+  or app's same-named check. The control schema moves to **SQLite v4 /
+  Postgres v5** in place: an existing control database at the old version is
+  refused and must be recreated. The Postgres backend must **connect
+  directly, not through a transaction pooler** (e.g. PgBouncer in transaction
+  mode): it relies on per-connection `search_path` and on a dedicated
+  `LISTEN` connection, which transaction pooling breaks.
 
 ### Changed
 

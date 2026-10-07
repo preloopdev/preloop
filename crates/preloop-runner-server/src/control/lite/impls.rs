@@ -307,6 +307,16 @@ impl ControlBackend for LiteBackend {
         self.defer_check_run_update(owner, run_id, job_id, delay)
             .await
     }
+    async fn renew_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        lease_for: std::time::Duration,
+    ) -> Result<bool, ControlError> {
+        self.renew_check_run_update(owner, run_id, job_id, lease_for)
+            .await
+    }
     async fn append_check_run_projection(
         &self,
         run_id: RunId,
