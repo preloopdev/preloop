@@ -8263,7 +8263,7 @@ done
             "an already-resolving machine must skip the write: {script}"
         );
         assert!(
-            script.contains("127.0.0.1 $host"),
+            script.contains("printf '127.0.0.1 %s"),
             "the entry must follow the bake's 127.0.0.1 convention: {script}"
         );
         assert!(
@@ -8580,9 +8580,16 @@ done
             script.contains("); ( "),
             "the two halves must be separate subshells: {script}"
         );
-        // Both early exits live inside the subshells, so neither can end the
-        // other's half.
-        assert_eq!(script.matches("exit 0").count(), 2, "{script}");
+        // Each half's early exit lives inside its own subshell, so neither
+        // can end the other's half.
+        assert!(
+            script.contains("name_resolves_locally && exit 0"),
+            "the hostname half's already-correct exit must stay in its subshell: {script}"
+        );
+        assert!(
+            script.contains("guest sysctls already match the hosted image"),
+            "the sysctl half's already-correct exit must stay in its subshell: {script}"
+        );
         // The production roots, not a scratch path.
         assert!(script.contains("'/etc/hosts'"), "{script}");
         assert!(script.contains("root='/proc/sys'"), "{script}");
@@ -8608,8 +8615,12 @@ done
         std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
         // The sysctl half's procps is absent here, so the apply writes the
-        // scratch tree directly — the same branch a guest without procps takes.
-        for tool in ["cat", "tr", "id", "base64", "sh"] {
+        // scratch tree directly — the same branch a guest without procps
+        // takes. Every other tool both halves call is linked in, so the test
+        // exercises the real scripts rather than the harness PATH.
+        for tool in [
+            "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp", "tee",
+        ] {
             symlink_tool(&bin, tool);
         }
         hostname_harness_stub(
@@ -8919,18 +8930,31 @@ done
             "",
             "the fallback must not print EPERM noise into the job log"
         );
-        assert_eq!(
-            String::from_utf8_lossy(&best_effort.stdout),
-            if root { "65536 65536" } else { "1024 1024" },
-            "a root exec must reach the hosted pair; a non-root exec keeps what it has"
+        // Either the raise took (root, or a platform that permits raising the
+        // hard limit) or the launch kept what it inherited — never a third
+        // state, and never a failure.
+        let pair = String::from_utf8_lossy(&best_effort.stdout).to_string();
+        assert!(
+            pair == "65536 65536" || pair == "1024 1024",
+            "the best-effort pair must be the hosted one or the inherited one, got {pair:?}"
         );
-        if !root {
-            let strict = run(GUEST_NOFILE_ULIMIT);
-            assert!(
-                !strict.status.success(),
-                "the privileged sites must fail loudly when the raise does not take"
+        if root {
+            assert_eq!(
+                pair, "65536 65536",
+                "a root exec must reach the hosted pair"
             );
         }
+        // The strict form the privileged sites use has no fallback: its exit
+        // status is the raise's, which is what makes a failed raise on a root
+        // launch observable instead of silent.
+        assert_eq!(
+            GUEST_NOFILE_ULIMIT, "ulimit -Hn 65536; ulimit -Sn 65536",
+            "the privileged form must stay strict"
+        );
+        assert!(
+            GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("|| true"),
+            "the fallback must swallow only the raise's failure"
+        );
     }
 
     /// A base that is not the official runner image may lack `sudo`
@@ -8977,9 +9001,10 @@ done
     /// Unset and root still skip the account switch, but not the limits: the
     /// launch is wrapped around the same argv, so the exec channel's identity
     /// is untouched while the runner and every step it spawns inherit the
-    /// hosted stack.
+    /// hosted stack, and the descriptor pair best-effort (a hard limit can
+    /// only be raised by root, and this path cannot assume it).
     #[test]
-    fn runner_user_wrapper_passes_root_and_unset_through_with_the_stack_limit() {
+    fn runner_user_wrapper_passes_root_and_unset_through_with_the_hosted_limits() {
         let mut config = test_config(false);
         let argv = vec![
             "/usr/bin/env".to_owned(),
@@ -8993,8 +9018,9 @@ done
             assert_eq!(wrapped[0], "sh", "{user:?}");
             assert_eq!(wrapped[1], "-c", "{user:?}");
             assert_eq!(
-                wrapped[2], "ulimit -Hs unlimited; ulimit -Ss 16384; exec \"$@\"",
-                "the pass-through launch must run on the hosted stack: {user:?}"
+                wrapped[2],
+                format!("{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
+                "the pass-through launch must run on the hosted limits: {user:?}"
             );
             // The original argv travels as the shell's positional parameters,
             // so nothing is re-quoted and the launch is untouched.
