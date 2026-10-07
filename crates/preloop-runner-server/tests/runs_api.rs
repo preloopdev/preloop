@@ -3044,12 +3044,12 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
     );
 }
 
-/// The static PAT follows the engine to the *configured* GitHub origin, and
-/// the URL scheme is not part of that boundary: an engine pointed at a
-/// plain-http emulator (`gh-simulate` local mode) needs the credential too,
-/// or the anonymous API budget (60/hr) runs out in minutes. The other half of
-/// the contract — an origin the operator did *not* configure never receives
-/// the PAT — is pinned by `pat_targets_configured_github_regardless_of_scheme`
+/// The static PAT follows the engine to the *configured* GitHub origin, plain
+/// http included when that origin is loopback: an engine pointed at a local
+/// emulator (`gh-simulate` local mode) needs the credential too, or the
+/// anonymous API budget (60/hr) runs out in minutes. The rest of the contract
+/// — an unconfigured origin never receives the PAT, and a remote origin only
+/// over https — is pinned by `pat_targets_configured_github_over_a_safe_transport`
 /// in `actions.rs`, where the request URL is neither derived from nor compared
 /// against the same value.
 #[tokio::test]

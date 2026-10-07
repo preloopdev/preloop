@@ -9,6 +9,18 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
 
+### Security
+
+- **The static GitHub PAT no longer crosses the network over plain HTTP**:
+  action resolution and action tarball downloads attached the PAT to any
+  request for a configured GitHub origin regardless of scheme, so a
+  configured *remote* `http://` API URL received the token in cleartext. Plain
+  HTTP now qualifies only for a loopback origin (`localhost`, `127.0.0.0/8`,
+  `::1`) — local emulators such as gh-simulate keep authenticating — and
+  every other origin requires HTTPS. Point a remote emulator or GHES at an
+  `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
+  authenticated.
+
 ### Fixed
 
 - **Server integration tests no longer fail on a leaked static PAT**:
@@ -20,9 +32,8 @@ Releases before v0.27.0 predate the changelog.
   network: the PAT is withheld and the run proceeds on the job-scoped runtime
   token, while a test that wants a verdict points `PRELOOP_GITHUB_API_URL` at
   its own stub. The action-resolution test now pins the behavior
-  `#351` introduced: the PAT follows the *configured* GitHub origin regardless
-  of scheme (plain-http emulators included), and never follows a request to an
-  unconfigured origin.
+  `#351` introduced: the PAT follows the *configured* GitHub origin, and never
+  follows a request to an unconfigured origin.
 
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
