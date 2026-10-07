@@ -523,6 +523,13 @@ pub(crate) trait ControlBackend: Send + Sync {
         run_id: Option<RunId>,
     ) -> Result<Vec<ArtifactCatalogRow>, ControlError>;
 
+    /// One finalized v1 artifact row by its public id: the indexed lookup the
+    /// GET path uses. An id lookup must not read the whole catalog.
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError>;
+
     /// Upsert a finalized v1 artifact row (native uploads and imports).
     async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError>;
 
@@ -3214,6 +3221,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.artifact_catalog(run_id).await,
             Self::Postgres(b) => b.artifact_catalog(run_id).await,
+        }
+    }
+
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.artifact_by_public_id(public_id).await,
+            Self::Postgres(b) => b.artifact_by_public_id(public_id).await,
         }
     }
 

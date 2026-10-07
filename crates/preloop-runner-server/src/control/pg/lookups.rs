@@ -1928,6 +1928,35 @@ impl PgBackend {
         Ok(artifacts)
     }
 
+    /// One finalized v1 artifact row by its public id, served by the unique
+    /// `artifacts_public_id` index (the catalog-wide scan is never needed to
+    /// answer a single id).
+    pub(super) async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT public_id, run_id::text, name, storage_key, COALESCE(size_bytes, 0) \
+                 FROM artifacts \
+                 WHERE state = 'finalized' AND public_id = $1",
+                &[&public_id],
+            )
+            .await
+            .map_err(db)?;
+        row.map(|row| {
+            Ok(ArtifactCatalogRow {
+                public_id: row.get(0),
+                run_id: codec::run_id(row.get::<_, &str>(1))?,
+                name: row.get(2),
+                storage_key: row.get(3),
+                size_bytes: row.get(4),
+            })
+        })
+        .transpose()
+    }
+
     /// Upsert a finalized v1 artifact row (native uploads and imports).
     pub(super) async fn put_artifact_catalog(
         &self,

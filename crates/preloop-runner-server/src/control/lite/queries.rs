@@ -1189,6 +1189,44 @@ impl LiteBackend {
         Ok(artifacts)
     }
 
+    /// One finalized v1 artifact row by its public id, served by the unique
+    /// `artifacts_public_id` index (the catalog-wide scan is never needed to
+    /// answer a single id).
+    pub(crate) async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        let id = public_id.to_owned();
+        let row = self.read(move |tx| {
+            tx.prepare_cached(
+                "SELECT public_id, run_id, name, storage_key, COALESCE(size_bytes, 0) \
+                 FROM artifacts \
+                 WHERE state = 'finalized' AND public_id = ?1",
+            )
+            .map_err(db)?
+            .query_row([&id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .optional()
+            .map_err(db)
+        })?;
+        Ok(row.map(
+            |(public_id, run, name, storage_key, size_bytes)| ArtifactCatalogRow {
+                public_id,
+                run_id: codec::run_id(&run),
+                name,
+                storage_key,
+                size_bytes,
+            },
+        ))
+    }
+
     /// Upsert a finalized v1 artifact row (native uploads and imports).
     pub(crate) async fn put_artifact_catalog(
         &self,

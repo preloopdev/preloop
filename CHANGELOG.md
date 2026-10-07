@@ -351,6 +351,11 @@ Releases before v0.27.0 predate the changelog.
   templates (reconstructing them for terminal jobs), the finalized artifact
   registry — legacy v1 `artifact_records` and `artifact_v2_registry.json` —
   moves into `artifacts`, and buffered timeline events move into the outbox.
+  Both uploads and imports land in that durable catalog, and the v1 artifact
+  GET/list endpoints serve from it: a restart (or a process that never saw
+  the upload) keeps serving, an imported artifact is served instead of
+  vanishing with the legacy process, and one id is one row by the unique
+  `artifacts_public_id` index — never a scan of the whole catalog.
   Anything not carried into a table is written to
   `<state-dir>/legacy-import-archive.json`; only node-local state that
   cannot be carried (queued broker frames, in-flight artifact/cache uploads,

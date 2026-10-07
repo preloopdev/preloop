@@ -526,14 +526,15 @@ pub async fn read_artifact(
     // The control catalog is the durable home: imported artifacts and
     // uploads from a previous process live there. The in-memory map serves
     // only rows this process has not catalogued (test hooks, a backend
-    // hiccup).
-    let catalog = shared
+    // hiccup). One artifact id is one indexed row — never a catalog scan.
+    let catalog_row = shared
         .state
         .backend
-        .artifact_catalog(None)
+        .artifact_by_public_id(&artifact_id)
         .await
-        .unwrap_or_default();
-    let bytes = if let Some(row) = catalog.into_iter().find(|row| row.public_id == artifact_id) {
+        .ok()
+        .flatten();
+    let bytes = if let Some(row) = catalog_row {
         tokio::fs::read(&row.storage_key).await?
     } else {
         let record = {
