@@ -2139,6 +2139,39 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Make a machine's own hostname resolve, the way a hosted runner's does.
+///
+/// The curated bake writes the *golden's* name into `/etc/hosts`
+/// (`base_install_script`), but every fork boots under a new name, so the
+/// guest's own hostname resolves nowhere. `sudo` resolves its hostname on
+/// every invocation and prints `sudo: unable to resolve host <name>` before
+/// each command — a line no hosted-runner log contains (the hosted image
+/// carries its own name in `/etc/hosts`) — and anything else that looks the
+/// machine's name up fails the same way. The fork cannot inherit the bake's
+/// entry because the name is decided at fork time, so the mapping is applied
+/// per machine on the same post-boot path as the ownership reconciliation.
+///
+/// Idempotent: a machine whose hostname already resolves (the baked golden
+/// itself, or a fork that ran this once) exits without touching `/etc/hosts`.
+/// Appends through `tee` under passwordless sudo when the exec lands on the
+/// image user, then re-checks resolution so a machine that still cannot
+/// resolve its name fails provisioning instead of emitting the warning on
+/// every step forever. The address matches the bake's convention
+/// (`127.0.0.1 <host>`).
+pub fn guest_hostname_script() -> String {
+    "host=$(hostname 2>/dev/null || uname -n); \
+     [ -n \"$host\" ] || exit 0; \
+     getent hosts \"$host\" >/dev/null 2>&1 && exit 0; \
+     line=\"127.0.0.1 $host\"; \
+     if [ \"$(id -u)\" -eq 0 ]; then printf '%s\\n' \"$line\" >> /etc/hosts; \
+     else printf '%s\\n' \"$line\" | sudo -n tee -a /etc/hosts >/dev/null; fi; \
+     getent hosts \"$host\" >/dev/null 2>&1 || { \
+       echo \"guest hostname $host still does not resolve after /etc/hosts update\" >&2; \
+       exit 1; \
+     }"
+        .to_owned()
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -6248,6 +6281,32 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
 
+    // Make the machine's own hostname resolve before anything runs in it.
+    // Every fork boots under a new name that the bake could not have written
+    // into `/etc/hosts`, so without this `sudo` prints
+    // `sudo: unable to resolve host <name>` on every invocation — a line no
+    // hosted-runner log contains. Same always-run, idempotent path as the
+    // ownership reconciliation above.
+    {
+        let script = guest_hostname_script();
+        let output = provider
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OrchestratorError::Config(format!(
+                "guest hostname reconciliation failed on {} (exit {}): {} — the machine's \
+                 own hostname must resolve (hosted runners resolve theirs; sudo prints \
+                 `unable to resolve host` on every command otherwise)",
+                name.as_str(),
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown")
+            )));
+        }
+    }
+
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
     for label in runner_environment_labels(&environment.base) {
@@ -7573,6 +7632,48 @@ chmod +x "$dest/bin/node"
         assert!(
             script.contains("stat -L -c %u"),
             "the probe must dereference an adopted symlink home: {script}"
+        );
+    }
+
+    /// Every fork boots under a name the bake could not write into
+    /// `/etc/hosts`, so `sudo` printed `sudo: unable to resolve host <name>`
+    /// on every invocation — 25 lines in one valkey job, and no hosted-runner
+    /// log has one. Pin the shape: resolve-check first (an already-resolving
+    /// machine writes nothing), append the machine's own name under the
+    /// bake's `127.0.0.1 <host>` convention, escalate through passwordless
+    /// sudo when the exec lands on the image user, and re-check so a machine
+    /// that still cannot resolve fails provisioning instead of warning
+    /// forever.
+    #[test]
+    fn guest_hostname_script_is_idempotent_and_verifies() {
+        let script = guest_hostname_script();
+        assert!(
+            script.contains("getent hosts \"$host\""),
+            "the check must resolve the machine's own name: {script}"
+        );
+        assert!(
+            script.contains("exit 0"),
+            "an already-resolving machine must skip the write: {script}"
+        );
+        assert!(
+            script.contains("127.0.0.1 $host"),
+            "the entry must follow the bake's 127.0.0.1 convention: {script}"
+        );
+        assert!(
+            script.contains("tee -a /etc/hosts"),
+            "the image-user branch must append through sudo: {script}"
+        );
+        assert!(
+            script.contains("sudo -n"),
+            "escalation must be non-interactive: {script}"
+        );
+        assert!(
+            script.contains(">> /etc/hosts"),
+            "the root branch must append directly: {script}"
+        );
+        assert!(
+            !script.contains("|| true"),
+            "a failed append or resolution must stay observable: {script}"
         );
     }
 

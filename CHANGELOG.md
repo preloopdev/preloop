@@ -43,6 +43,17 @@ Releases before v0.27.0 predate the changelog.
   the runner itself, and the official runner's Docker command shape are
   unchanged.
 
+- **Guest forks resolve their own hostname**: the curated bake writes the
+  *golden's* name into `/etc/hosts`, but every fork boots under a new name, so
+  `sudo` printed `sudo: unable to resolve host <name>` before each of its
+  invocations — 25 such lines in a single Valkey job, where a hosted-runner
+  log has none. The engine now appends the machine's own
+  `127.0.0.1 <host>` entry per machine on the same post-boot exec path as the
+  runner-ownership reconciliation: idempotent (a machine whose name already
+  resolves writes nothing), escalating through the runner account's
+  passwordless sudo, and failing provisioning if the name still does not
+  resolve.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
