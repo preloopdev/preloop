@@ -374,6 +374,32 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         };
         match shared.state.backend.reap_sweep(sweep).await {
             Ok(outcome) => {
+                // A lease that stopped being renewed is the one failure with
+                // no runner-side report behind it: the step is still running,
+                // its output only ever went to the live feed, and the job is
+                // failed from here. Without this line the only trace is a job
+                // that went from running to failed, with nothing in the log to
+                // say why — say why, with the numbers.
+                for lease in &outcome.expired {
+                    let stale = inputs
+                        .active
+                        .iter()
+                        .find(|request| request.request_id == lease.request_id);
+                    warn!(
+                        run_id = %lease.run_id,
+                        job_id = %lease.job_id,
+                        request_id = lease.request_id,
+                        last_renewed_at = ?stale.and_then(|request| request.last_renewed_at),
+                        session_live = stale.map(|request| request.session_live),
+                        lease_seconds = stale.map(|request| if request.session_live {
+                            crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
+                        } else {
+                            crate::distributed_task::DEAD_SESSION_LEASE_SECONDS
+                        }),
+                        "failing an attempt whose lease stopped being renewed: the worker is \
+                         dead, wedged, or no longer able to authenticate its `renewjob`"
+                    );
+                }
                 let completions: Vec<JobCompletion> = outcome
                     .expired
                     .into_iter()

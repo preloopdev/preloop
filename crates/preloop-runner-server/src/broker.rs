@@ -1020,9 +1020,11 @@ pub async fn broker_acquire_job(
         // or a mint that legitimately answered None) the job keeps its
         // job-scoped runtime token — the credential a fork job may hold is
         // this control-plane JWT, never the repository-unscoped PAT.
-        let runtime = shared
-            .state
-            .mint_runtime_token(&message.plan.plan_id, &message.job_id);
+        let runtime = shared.state.mint_runtime_token_for_job(
+            &message.plan.plan_id,
+            &message.job_id,
+            message.job_timeout,
+        );
         // Fork-restricted tiers get the runtime token even when no request
         // exists to say so (no App): `job_authorization` answers
         // `fork_restricted` for untrusted tiers regardless of declared
@@ -1075,11 +1077,11 @@ pub async fn broker_acquire_job(
         );
     }
     // The snapshot checkout token is pinned onto the step at submission,
-    // but a job can sit queued well past its ~50-minute lifetime. The
-    // checkout would then be answered with a git 401 that the step can
-    // never recover from — it replays whatever the message carries. Re-mint
-    // the pinned inputs at claim so the token is fresh exactly when the job
-    // first runs.
+    // but a job can sit queued past the lifetime of the credential minted
+    // then. The checkout would then be answered with a git 401 that the step
+    // can never recover from — it replays whatever the message carries.
+    // Re-mint the pinned inputs at claim so the token is fresh exactly when
+    // the job first runs.
     let re_minted = re_mint_snapshot_credentials(&mut message, &shared.state);
     if re_minted > 0 {
         tracing::info!(
@@ -1095,9 +1097,11 @@ pub async fn broker_acquire_job(
             endpoint.url = Some(run_service_url.clone());
             endpoint.authorization.parameters.insert(
                 "AccessToken".to_owned(),
-                shared
-                    .state
-                    .mint_runtime_token(&message.plan.plan_id, &message.job_id),
+                shared.state.mint_runtime_token_for_job(
+                    &message.plan.plan_id,
+                    &message.job_id,
+                    message.job_timeout,
+                ),
             );
             endpoint.data.insert(
                 "ResultsServiceUrl".to_owned(),
@@ -1176,10 +1180,10 @@ pub async fn broker_acquire_job(
 /// snapshot.
 ///
 /// Every delivery path must call this when it renders the stored template: a
-/// job can sit queued (or paused in a debug session) well past the runtime
-/// token's ~50-minute lifetime, and a checkout or redirected git fetch
-/// replaying the stored credential would be answered with a 401 it can never
-/// recover from.
+/// job can sit queued (or paused in a debug session) past the lifetime of the
+/// credential minted when the template was stored, and a checkout or
+/// redirected git fetch replaying that stored credential would be answered
+/// with a 401 it can never recover from.
 pub fn re_mint_snapshot_credentials(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     state: &AppState,
@@ -1196,7 +1200,11 @@ pub fn re_mint_snapshot_credentials(
         return 0;
     }
 
-    let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    let fresh = state.mint_runtime_token_for_job(
+        &message.plan.plan_id,
+        &message.job_id,
+        message.job_timeout,
+    );
     if let Some(rewrite) = message.preloop_snapshot_origin_rewrite.as_mut() {
         // Same credential shape `runs::build_job_artifacts` pinned at
         // submission: the snapshot endpoint authenticates the job-scoped

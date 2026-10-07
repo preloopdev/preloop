@@ -3598,8 +3598,8 @@ pub fn redirect_primary_checkout(
 /// already-redirected steps are untouched.
 ///
 /// Rewritten ids are appended to `preloop_snapshot_token_steps` — the list
-/// the broker re-mints at claim — because the pinned credential is a
-/// ~50-minute JWT and a queued job outlives it; an expired token turns the
+/// the broker re-mints at claim — because the pinned credential is minted at
+/// submission and a queued job can outlive it; an expired token turns the
 /// relay into a 401 the step can never recover from.
 pub fn reroute_forge_checkouts(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,

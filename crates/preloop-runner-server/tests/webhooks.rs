@@ -737,6 +737,97 @@ jobs:
     );
 }
 
+/// A job that declares a `timeout-minutes` above the six-hour default must
+/// still get a runtime token that outlives it: the attempt presents that one
+/// credential on every job-scoped route — lease renewal, completion, the step
+/// and job log uploads — and can never be issued another, so a token that
+/// expired before the job's own timeout would hand the lease to the reaper
+/// while the job was still running.
+#[tokio::test]
+async fn claimed_runtime_token_covers_a_declared_longer_job_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 1200
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "long-timeout-runner"},
+            "ownerName": "long timeout test",
+            "sessionId": "00000000-0000-0000-0000-000000000001",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "long-timeout-runner", &["self-hosted"], None).await;
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    let claimed_token = delivered_step_input(checkout, "token").expect("claimed pinned token");
+    let claims = state
+        .verify_local_jwt_claims(claimed_token)
+        .expect("the claimed token must verify as a local JWT");
+    let iat = claims["iat"].as_u64().expect("iat is minted");
+    let exp = claims["exp"].as_u64().expect("exp is minted");
+    assert!(
+        exp - iat >= 1200 * 60 + 4 * 60 * 60,
+        "a claimed runtime token must outlive the job's declared timeout plus the pause credit, \
+         got {}s",
+        exp - iat
+    );
+}
+
 /// A retry verdict must carry a freshly minted snapshot credential: the
 /// worker replays the failed step from the message it already holds, whose
 /// pinned token may be long expired.
