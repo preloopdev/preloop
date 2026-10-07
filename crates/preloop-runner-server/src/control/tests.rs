@@ -7603,14 +7603,18 @@ mod lite {
         let jobs = (0..64)
             .map(|i| submit_job_on(ready, &format!("job-{i:03}"), i, &["self-hosted"]))
             .collect();
-        backend
-            .submit_run(submit_run(ready, jobs))
-            .await
-            .unwrap();
+        backend.submit_run(submit_run(ready, jobs)).await.unwrap();
         // A realistic mix: a cancelled run's jobs stay in `jobs`, not ready.
         let cancelled = RunId::new();
         let jobs = (0..16)
-            .map(|i| submit_job_on(cancelled, &format!("gone-{i:03}"), 100 + i, &["self-hosted"]))
+            .map(|i| {
+                submit_job_on(
+                    cancelled,
+                    &format!("gone-{i:03}"),
+                    100 + i,
+                    &["self-hosted"],
+                )
+            })
             .collect();
         backend
             .submit_run(submit_run(cancelled, jobs))
@@ -7628,10 +7632,7 @@ mod lite {
                 ]
                 .iter()
                 .map(|sql| {
-                    let mut statement = db
-                        .0
-                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                        .unwrap();
+                    let mut statement = db.0.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
                     statement
                         .query_map([], |row| row.get::<_, String>(3))
                         .unwrap()
@@ -7687,9 +7688,7 @@ mod lite {
                 .unwrap()
         };
         assert_eq!(
-            index_sql(&backend)
-                .split_whitespace()
-                .collect::<Vec<_>>(),
+            index_sql(&backend).split_whitespace().collect::<Vec<_>>(),
             index_sql(&LiteBackend::in_memory().unwrap())
                 .split_whitespace()
                 .collect::<Vec<_>>(),

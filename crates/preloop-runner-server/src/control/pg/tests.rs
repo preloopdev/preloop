@@ -1545,7 +1545,13 @@ async fn queue_gauge_plans_are_index_fed() {
     for batch in 0..4u64 {
         let run_id = RunId::new();
         let jobs = (0..64)
-            .map(|i| submit_job(run_id, &format!("job-{batch}-{i:03}"), (batch * 64 + i) as i64))
+            .map(|i| {
+                submit_job(
+                    run_id,
+                    &format!("job-{batch}-{i:03}"),
+                    (batch * 64 + i) as i64,
+                )
+            })
             .collect();
         let mut submit = submit_run(run_id, jobs);
         submit.record.run_number = batch + 1;
@@ -1572,7 +1578,10 @@ async fn queue_gauge_plans_are_index_fed() {
             plan.contains("Index Scan using jobs_ready_global"),
             "the gauge plan must use the global index:\n{plan}"
         );
-        assert!(!plan.contains("Sort"), "the gauge plan must not sort:\n{plan}");
+        assert!(
+            !plan.contains("Sort"),
+            "the gauge plan must not sort:\n{plan}"
+        );
     }
     let plan: String = client
         .query(
@@ -1604,7 +1613,10 @@ async fn non_list_runs_on_does_not_abort_gauges() {
     let run_id = RunId::new();
     node.submit_run(submit_run(
         run_id,
-        vec![submit_job(run_id, "alpha", 1), submit_job(run_id, "beta", 2)],
+        vec![
+            submit_job(run_id, "alpha", 1),
+            submit_job(run_id, "beta", 2),
+        ],
     ))
     .await
     .unwrap();
