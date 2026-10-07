@@ -239,16 +239,22 @@ async fn send_github_check_request(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        let reset = res
-            .headers()
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
+        let header = |name: &str| {
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned()
+        };
+        // GitHub sends `x-ratelimit-reset` on every response, so the reset is
+        // only meaningful together with `remaining`: `check_retry_delay`
+        // waits for the reset only when the budget is actually spent.
+        let reset = header("x-ratelimit-reset");
+        let remaining = header("x-ratelimit-remaining");
         let err_text = res.text().await.unwrap_or_default();
         record_check_reporting(shared, false);
         return Err(anyhow::anyhow!(
-            "GitHub Check API failed with status {}: {}; retry_after={retry_after}; rate_reset={reset}",
+            "GitHub Check API failed with status {}: {}; retry_after={retry_after}; rate_remaining={remaining}; rate_reset={reset}",
             status,
             err_text
         ));
@@ -257,56 +263,6 @@ async fn send_github_check_request(
     record_check_reporting(shared, true);
     let val = res.json().await.unwrap_or(Value::Null);
     Ok(val)
-}
-
-/// GitHub can briefly return 404 when a PATCH races replication of a newly
-/// created check run. Retry only that response; every other error is final.
-async fn send_github_check_completion(
-    shared: &Arc<SharedState>,
-    token: &str,
-    repo: &str,
-    path: &str,
-    body: &Value,
-) -> anyhow::Result<Value> {
-    const RETRY_DELAYS: [Duration; 3] = [
-        Duration::from_millis(250),
-        Duration::from_millis(750),
-        Duration::from_millis(1_500),
-    ];
-    for (attempt, delay) in RETRY_DELAYS.into_iter().enumerate() {
-        match send_github_check_request(
-            shared,
-            &shared.state.github_lifecycle_breaker,
-            token,
-            repo,
-            reqwest::Method::PATCH,
-            path,
-            body,
-        )
-        .await
-        {
-            Err(error) if is_check_run_not_found(&error) => {
-                warn!(
-                    attempt = attempt + 1,
-                    delay_ms = delay.as_millis(),
-                    %error,
-                    "new GitHub check run is not visible to PATCH yet; retrying"
-                );
-                tokio::time::sleep(delay).await;
-            }
-            result => return result,
-        }
-    }
-    send_github_check_request(
-        shared,
-        &shared.state.github_lifecycle_breaker,
-        token,
-        repo,
-        reqwest::Method::PATCH,
-        path,
-        body,
-    )
-    .await
 }
 
 pub fn run_details_url(run_id: RunId) -> Option<String> {
@@ -431,40 +387,74 @@ pub async fn report_existing_check_run_queued(
     shared.state.events_dirty.notify_one();
     Ok(())
 }
+/// The `external_id` this engine stamps on every check run it creates. It
+/// identifies the queue row's own check, so crash-after-POST reconciliation
+/// never adopts another workflow's (or another app's) same-named check.
+///
+/// Job checks key on `{run_id}:{job_id}`. A workflow-evaluation failure gets a
+/// fresh `RunId` on every redelivery but a stable
+/// `__workflow_failure__:{name}` job id, so the job id alone is its key.
+fn check_run_external_id(update: &crate::control::types::CheckRunUpdate) -> String {
+    if update.payload.get("kind").and_then(Value::as_str) == Some("workflow_failure") {
+        update.job_id.0.clone()
+    } else {
+        format!("{}:{}", update.run_id, update.job_id)
+    }
+}
+
+/// Find the check run this queue row already created on `sha`, by its
+/// `external_id`. Pages through every check run on the commit (100 per page,
+/// bounded) rather than trusting GitHub's default first page of 30, and asks
+/// for `filter=all` so a newer same-named check cannot hide ours.
 async fn find_existing_check_run(
     shared: &Arc<SharedState>,
     breaker: &crate::github_breaker::GithubBreaker,
     token: &str,
     repo: &str,
     sha: &str,
-    name: &str,
+    external_id: &str,
 ) -> anyhow::Result<Option<u64>> {
-    let payload = match send_github_check_request(
-        shared,
-        breaker,
-        token,
-        repo,
-        reqwest::Method::GET,
-        &format!("commits/{sha}/check-runs"),
-        &Value::Null,
-    )
-    .await
-    {
-        Ok(payload) => payload,
-        Err(error) if is_check_run_not_found(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(payload
-        .get("check_runs")
-        .and_then(Value::as_array)
-        .and_then(|check_runs| {
-            check_runs.iter().find_map(|check_run| {
-                (check_run.get("name").and_then(Value::as_str) == Some(name)
-                    && check_run.get("head_sha").and_then(Value::as_str) == Some(sha))
-                .then(|| check_run.get("id").and_then(Value::as_u64))
-                .flatten()
-            })
-        }))
+    const PER_PAGE: u64 = 100;
+    const MAX_PAGES: u64 = 10;
+    for page in 1..=MAX_PAGES {
+        let payload = match send_github_check_request(
+            shared,
+            breaker,
+            token,
+            repo,
+            reqwest::Method::GET,
+            &format!("commits/{sha}/check-runs?filter=all&per_page={PER_PAGE}&page={page}"),
+            &Value::Null,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) if is_check_run_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let check_runs = payload
+            .get("check_runs")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let found = check_runs.iter().find_map(|check_run| {
+            (check_run.get("external_id").and_then(Value::as_str) == Some(external_id)
+                && check_run.get("head_sha").and_then(Value::as_str) == Some(sha))
+            .then(|| check_run.get("id").and_then(Value::as_u64))
+            .flatten()
+        });
+        if found.is_some() {
+            return Ok(found);
+        }
+        let total = payload
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if (check_runs.len() as u64) < PER_PAGE || page * PER_PAGE >= total {
+            return Ok(None);
+        }
+    }
+    Ok(None)
 }
 
 /// Per-installation rate budget key.
@@ -481,6 +471,21 @@ pub(crate) enum CheckRunRateKey {
 /// Ceiling on how long a rate limit may park a row; a bogus header must not
 /// strand a check run for a day.
 const MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(3_600);
+
+/// How far each renewal extends a row's lease. Every write to GitHub renews
+/// first, and this covers one request at the shared client's 30 s timeout
+/// with margin, so a row cannot expire under an in-flight POST and be
+/// re-leased by another sender that would POST a second check run.
+const CHECK_RUN_LEASE_RENEWAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Error marker for a row another sender re-leased mid-delivery.
+const LOST_CHECK_RUN_LEASE: &str = "check-run lease lost to another sender";
+
+/// Attempts during which a PATCH 404 keeps the stored check-run id. GitHub
+/// can answer 404 while a just-created check run replicates; only a 404 that
+/// outlives these backoff retries means the check is really gone, and only
+/// then is the id dropped so the next attempt reconciles or re-creates it.
+const CHECK_RUN_NOT_FOUND_RETRIES: i32 = 3;
 
 /// The single background sender for the durable check-run queue.
 ///
@@ -579,6 +584,11 @@ impl CheckRunSender {
         let token = resolve_check_run_token(shared, &repo).await;
         match send_queued_check_run(shared, &self.owner, &breaker, token.as_deref(), update).await {
             Ok(()) => {}
+            Err(error) if error.to_string().contains(LOST_CHECK_RUN_LEASE) => {
+                // Another sender owns the row now; it delivers the update.
+                // Touching the row here would overwrite its lease state.
+                debug!(run_id=%update.run_id, job_id=%update.job_id, "check-run lease taken over by another sender; skipping");
+            }
             Err(error) if error.to_string().contains("circuit breaker is open") => {
                 // A breaker that opened between the budget check and the call
                 // is still a deferral, not a failure.
@@ -667,11 +677,21 @@ fn check_retry_delay(error: &anyhow::Error, attempts: i32) -> std::time::Duratio
     {
         return std::time::Duration::from_secs(seconds.min(86_400));
     }
-    // `rate_reset` is `x-ratelimit-reset`: an absolute unix timestamp.
-    if let Some(value) = text
-        .split("rate_reset=")
+    // `rate_reset` is `x-ratelimit-reset`: an absolute unix timestamp. GitHub
+    // sends it on every response (404, 422, 5xx included), so it only governs
+    // the retry when the primary budget is actually spent; otherwise a
+    // transient failure would wait out the rest of the rate window.
+    let budget_spent = text
+        .split("rate_remaining=")
         .nth(1)
         .and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|v| v.parse::<u64>().ok())
+        == Some(0);
+    if budget_spent
+        && let Some(value) = text
+            .split("rate_reset=")
+            .nth(1)
+            .and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next())
         && let Ok(reset) = value.parse::<u64>()
     {
         let now = std::time::SystemTime::now()
@@ -775,9 +795,12 @@ async fn send_queued_check_run(
         }
     }
     if check_run_id.is_none() {
-        // Crash-after-POST reconciliation: never POST a second check run for
-        // the same commit + name.
-        check_run_id = find_existing_check_run(shared, breaker, token, repo, sha, name).await?;
+        // Crash-after-POST reconciliation: adopt the check run this row
+        // already created (matched by its `external_id`), never a same-named
+        // check from another workflow or app.
+        let external_id = check_run_external_id(update);
+        check_run_id =
+            find_existing_check_run(shared, breaker, token, repo, sha, &external_id).await?;
         if let Some(id) = check_run_id {
             persist_check_run_id(shared, owner, update, id).await?;
         }
@@ -1002,17 +1025,41 @@ async fn send_check_run_body(
     let (method, path) = match check_run_id {
         Some(id) => (reqwest::Method::PATCH, format!("check-runs/{id}")),
         None => {
-            // Creation requires the check name and commit.
+            // Creation requires the check name and commit; `external_id` is
+            // what reconciliation matches on after a crash.
             body["name"] = Value::String(name.to_owned());
             body["head_sha"] = Value::String(sha.to_owned());
+            body["external_id"] = Value::String(check_run_external_id(update));
             (reqwest::Method::POST, "check-runs".to_owned())
         }
     };
+    // Hold the row through the request: if it expired and another sender
+    // re-leased it, that sender owns delivery, and a POST from here would
+    // create a second check run.
+    let renewed = shared
+        .state
+        .backend
+        .renew_check_run_update(
+            owner,
+            update.run_id,
+            &update.job_id,
+            CHECK_RUN_LEASE_RENEWAL,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    if !renewed {
+        anyhow::bail!(LOST_CHECK_RUN_LEASE);
+    }
     let response =
         match send_github_check_request(shared, breaker, token, repo, method, &path, &body).await {
             Ok(response) => response,
             Err(error) => {
-                if let Some(stale) = check_run_id.filter(|_| is_check_run_not_found(&error)) {
+                // An early 404 is usually a just-created check still
+                // replicating: keep the id and let the backoff retry the
+                // PATCH. Only a persistent 404 drops it.
+                if let Some(stale) = check_run_id.filter(|_| {
+                    is_check_run_not_found(&error) && update.attempts >= CHECK_RUN_NOT_FOUND_RETRIES
+                }) {
                     let _ = shared
                         .state
                         .backend
@@ -1028,11 +1075,15 @@ async fn send_check_run_body(
             }
         };
     let Some(id) = check_run_id else {
-        let id = response
-            .get("id")
-            .and_then(Value::as_u64)
-            .or(find_existing_check_run(shared, breaker, token, repo, sha, name).await?)
-            .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?;
+        let id = match response.get("id").and_then(Value::as_u64) {
+            Some(id) => id,
+            None => {
+                let external_id = check_run_external_id(update);
+                find_existing_check_run(shared, breaker, token, repo, sha, &external_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?
+            }
+        };
         persist_check_run_id(shared, owner, update, id).await?;
         return Ok(Some(id));
     };
@@ -5147,14 +5198,28 @@ jobs:
     #[tokio::test]
     async fn sender_reconciles_instead_of_second_post() {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let (api, requests) = start_github_stub(|method, path, _body| {
+        // The row's own check is listed after a same-named check another
+        // workflow created on the same commit; only the `external_id` match
+        // may be adopted. The id is filled in once the fixture exists.
+        let own_external_id = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let stub_external_id = own_external_id.clone();
+        let (api, requests) = start_github_stub(move |method, path, _body| {
             if method == "GET" {
                 let existing = if path.contains("commits/") {
-                    serde_json::json!({"check_runs": [{
-                        "id": 7001,
-                        "name": "build",
-                        "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-                    }]})
+                    serde_json::json!({"total_count": 2, "check_runs": [
+                        {
+                            "id": 6001,
+                            "name": "build",
+                            "external_id": "another-workflow-run:build",
+                            "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                        },
+                        {
+                            "id": 7001,
+                            "name": "build",
+                            "external_id": *stub_external_id.lock(),
+                            "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                        },
+                    ]})
                 } else {
                     serde_json::json!({})
                 };
@@ -5167,6 +5232,7 @@ jobs:
         let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
         let (_temp, shared, run_id) = mint_fixture(true, None).await;
         let job = JobId("build".to_owned());
+        *own_external_id.lock() = format!("{run_id}:{}", job.0);
 
         // The check run already exists on GitHub but the row has no id.
         seed_check_run_update(&shared, run_id, &job, 1, "queued", None).await;
@@ -5491,27 +5557,43 @@ jobs:
     async fn terminal_check_retries_not_found_after_creation() {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mock_app = axum::Router::new().route(
-            "/repos/owner/repo/check-runs/:id",
-            axum::routing::patch({
-                let attempts = attempts.clone();
-                move || {
+        let creates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock_app = axum::Router::new()
+            .route(
+                "/repos/owner/repo/check-runs/:id",
+                axum::routing::patch({
                     let attempts = attempts.clone();
-                    async move {
-                        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if attempt == 0 {
-                            (
-                                StatusCode::NOT_FOUND,
-                                Json(serde_json::json!({"message": "Not Found"})),
-                            )
-                                .into_response()
-                        } else {
-                            Json(serde_json::json!({"id": 7})).into_response()
+                    move || {
+                        let attempts = attempts.clone();
+                        async move {
+                            let attempt =
+                                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if attempt == 0 {
+                                (
+                                    StatusCode::NOT_FOUND,
+                                    Json(serde_json::json!({"message": "Not Found"})),
+                                )
+                                    .into_response()
+                            } else {
+                                Json(serde_json::json!({"id": 7})).into_response()
+                            }
                         }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route(
+                "/repos/owner/repo/check-runs",
+                axum::routing::post({
+                    let creates = creates.clone();
+                    move || {
+                        let creates = creates.clone();
+                        async move {
+                            creates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Json(serde_json::json!({"id": 99}))
+                        }
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -5538,13 +5620,70 @@ jobs:
         let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "check-retry-token");
 
         report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Skipped).await;
+        // The projector queues the update in the background; drain the
+        // sender until the PATCH is retried past its first 404.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                drain_sender(&shared).await;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the PATCH is retried after an immediate 404");
 
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "an immediate 404 must be retried instead of stranding the check"
         );
+        assert_eq!(
+            creates.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an immediate 404 must not abandon the check and POST a duplicate"
+        );
+        assert_eq!(
+            shared
+                .state
+                .backend
+                .job_check_run_id(run_id, &job_id)
+                .await
+                .unwrap(),
+            Some(7),
+            "the check-run mapping survives the replication-race 404"
+        );
         server.abort();
+    }
+
+    /// GitHub sends `x-ratelimit-reset` on every response, so a failure with
+    /// budget left keeps the short exponential backoff; only a spent budget
+    /// waits for the reset.
+    #[test]
+    fn check_retry_delay_waits_for_reset_only_when_budget_is_spent() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1_800;
+        let failure = |status: u16, remaining: &str| {
+            anyhow::anyhow!(
+                "GitHub Check API failed with status {status} Internal Server Error: {{}}; \
+                 retry_after=; rate_remaining={remaining}; rate_reset={reset}"
+            )
+        };
+
+        for (status, remaining) in [(500, "4321"), (404, "4999"), (422, "12"), (502, "")] {
+            let delay = check_retry_delay(&failure(status, remaining), 0);
+            assert!(
+                delay < std::time::Duration::from_secs(1),
+                "status {status} with remaining={remaining:?} must back off briefly, got {delay:?}"
+            );
+        }
+
+        let delay = check_retry_delay(&failure(403, "0"), 0);
+        assert!(
+            delay > std::time::Duration::from_secs(1_700),
+            "a spent budget waits for the advertised reset, got {delay:?}"
+        );
     }
 
     #[test]

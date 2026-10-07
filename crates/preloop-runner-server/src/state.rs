@@ -721,11 +721,11 @@ pub struct AppState {
     /// this (see [`wake_waiters`]); only the sampler listens on it.
     pub sampler_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
-    /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
-    /// updates use a separate breaker so an ingress outage cannot suppress
-    /// status transitions for runs already in progress.
+    /// Circuit breaker for durable webhook delivery work. Check-run updates
+    /// go through the sender's per-installation budgets instead, so an
+    /// ingress outage cannot suppress status transitions for runs already in
+    /// progress.
     pub github_breaker: Arc<crate::github_breaker::GithubBreaker>,
-    pub github_lifecycle_breaker: Arc<crate::github_breaker::GithubBreaker>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
     pub webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
@@ -1470,7 +1470,6 @@ impl AppState {
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
-            github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             observability: preloop_observability::Observability::noop(),

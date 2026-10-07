@@ -169,6 +169,33 @@ impl PgBackend {
         client.execute("UPDATE check_run_updates SET not_before=now()+make_interval(secs=>$4),leased_until=NULL,lease_owner=NULL WHERE lease_owner=$1 AND run_id=$2::text::uuid AND job_id=$3", &[&owner,&run_text(run_id),&job_id.0,&delay.as_secs_f64()]).await.map(|_|()).map_err(db)
     }
 
+    /// Extend `owner`'s lease on one row. A row another sender re-leased has
+    /// a different `lease_owner`, so ownership alone decides: `false` means
+    /// the caller lost the row and must not call GitHub for it.
+    pub(crate) async fn renew_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        lease_for: std::time::Duration,
+    ) -> Result<bool, ControlError> {
+        let client = self.writer().await?;
+        let renewed = client
+            .execute(
+                "UPDATE check_run_updates SET leased_until=now()+make_interval(secs=>$4) \
+                 WHERE lease_owner=$1 AND run_id=$2::text::uuid AND job_id=$3",
+                &[
+                    &owner,
+                    &run_text(run_id),
+                    &job_id.0,
+                    &lease_for.as_secs_f64(),
+                ],
+            )
+            .await
+            .map_err(db)?;
+        Ok(renewed == 1)
+    }
+
     /// Append a durable projection wake for one run (or one job) *after* a
     /// reporter stamped `reports_check_runs`.
     ///

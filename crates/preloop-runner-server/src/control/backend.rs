@@ -563,6 +563,17 @@ pub(crate) trait ControlBackend: Send + Sync {
         delay: std::time::Duration,
     ) -> Result<(), ControlError>;
 
+    /// Extend this sender's lease on one row to `now + lease_for`. `false`
+    /// when the row is no longer leased by `owner` (another sender took it
+    /// over, or it was settled): the caller must not call GitHub for it.
+    async fn renew_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        lease_for: std::time::Duration,
+    ) -> Result<bool, ControlError>;
+
     /// Append a durable projection wake after a reporter stamped
     /// `reports_check_runs`.
     async fn append_check_run_projection(
@@ -1531,6 +1542,25 @@ impl Backend {
         }
     }
 
+    pub(crate) async fn renew_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        lease_for: std::time::Duration,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.renew_check_run_update(owner, run_id, job_id, lease_for)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.renew_check_run_update(owner, run_id, job_id, lease_for)
+                    .await
+            }
+        }
+    }
+
     /// Append a durable projection wake after a reporter stamped
     /// `reports_check_runs`; see `append_check_run_projection` on the
     /// backends.
@@ -2154,6 +2184,24 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.defer_check_run_update(owner, run_id, job_id, delay).await,
             Self::Postgres(b) => b.defer_check_run_update(owner, run_id, job_id, delay).await,
+        }
+    }
+    async fn renew_check_run_update(
+        &self,
+        owner: &str,
+        run_id: RunId,
+        job_id: &JobId,
+        lease_for: std::time::Duration,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.renew_check_run_update(owner, run_id, job_id, lease_for)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.renew_check_run_update(owner, run_id, job_id, lease_for)
+                    .await
+            }
         }
     }
     async fn append_check_run_projection(
