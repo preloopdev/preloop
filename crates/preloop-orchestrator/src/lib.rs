@@ -1802,6 +1802,36 @@ const RUNNER_ROOT: &str = "/home/runner";
 /// it.
 const GUEST_STACK_ULIMIT: &str = "ulimit -Hs unlimited; ulimit -Ss 16384";
 
+/// The file-descriptor limit GitHub's hosted images give every runner.
+///
+/// The same `actions/runner-images`
+/// `images/ubuntu/scripts/build/configure-limits.sh` writes
+/// `DefaultLimitNOFILE=65536` into `/etc/systemd/system.conf` and
+/// `* soft nofile 65536` / `* hard nofile 65536` into
+/// `/etc/security/limits.conf`; a probe job on a hosted runner reads back
+/// `Max open files 65536 / 65536` in a step, in a `container:` job and in an
+/// ad-hoc `docker run` alike. A preloop job inherits the exec channel's
+/// defaults instead — 1024 soft / 4096 hard on AgentENV, where jobs arrive
+/// through `aenv exec` off `envd` — which is below what suites that raise
+/// their own soft limit ask for (valkey's test suite requests 10032) and
+/// makes the runner die with `EPERM` on `setrlimit`.
+///
+/// Applied next to [`GUEST_STACK_ULIMIT`] on the same launch sites: the runner
+/// wrapper raises before it drops privileges (raising a hard limit needs
+/// root), and the container engine raises so its containers inherit the pair.
+/// A site that may run unprivileged gets
+/// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`] instead.
+const GUEST_NOFILE_ULIMIT: &str = "ulimit -Hn 65536; ulimit -Sn 65536";
+
+/// [`GUEST_NOFILE_ULIMIT`] for the launches that keep the exec channel's
+/// identity and therefore cannot assume root: a process may lower its hard
+/// limit and raise its soft limit only up to the hard one, so a guest whose
+/// inherited hard limit is below the hosted 65536 keeps what it has instead of
+/// failing the launch with `EPERM` noise. The privileged launch sites use the
+/// strict form above and fail loudly.
+const GUEST_NOFILE_ULIMIT_BEST_EFFORT: &str =
+    "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true";
+
 /// Standard loopback entries for `/etc/hosts`.
 ///
 /// The base image ships an **empty** `/etc/hosts`, and `nsswitch.conf` is
@@ -2167,6 +2197,221 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Sysctls GitHub's hosted `ubuntu-24.04` image applies, with their values.
+///
+/// Provenance: `actions/runner-images` appends these to `/etc/sysctl.conf`
+/// when the image is built —
+/// `images/ubuntu/scripts/build/configure-environment.sh`
+/// (<https://github.com/actions/runner-images/blob/5f7588b285eccc2edbeb1cd79d65ee0b577e4b4a/images/ubuntu/scripts/build/configure-environment.sh#L48-L55>)
+/// — and a probe job on a hosted runner reads them back from `/proc/sys` as
+/// the effective values (image `20260927.320.1` x64 / `20260927.135.1` arm64,
+/// kernel `6.17.0-1022-azure`). `vm.max_map_count` matters to any mmap-heavy
+/// workload (Redis and Valkey suites, Elasticsearch-style tooling); the
+/// inotify limits are what the image raises for file watchers (`kind` scale,
+/// bundlers, test runners).
+///
+/// Deliberately absent: `vm.mmap_rnd_bits` (kernel hardening the image also
+/// writes, with no workflow-visible effect) and `vm.overcommit_memory`, which
+/// the probe proves is `0` on GitHub-hosted runners too — the kernel default
+/// the guest already has. Valkey's overcommit warning is therefore fidelity,
+/// not a gap: it appears on both sides.
+pub const GITHUB_GUEST_SYSCTLS: &[(&str, &str)] = &[
+    ("vm.max_map_count", "262144"),
+    ("fs.inotify.max_user_watches", "655360"),
+    ("fs.inotify.max_user_instances", "1280"),
+];
+
+/// Bring a machine's sysctls in line with GitHub's hosted image.
+///
+/// The guest boots straight into the job workload — no init runs
+/// `/etc/sysctl.d` or `/etc/sysctl.conf` — so an image-level sysctl file would
+/// never take effect and every job saw raw kernel defaults (`vm.max_map_count`
+/// 65530, inotify watches and instances a fraction of the hosted values).
+/// Applied per machine by [`guest_hosted_runtime_init_script`], from the same
+/// post-boot exec path as [`runner_ownership_reconcile_script`], so no golden
+/// rebake is needed.
+///
+/// Idempotent: the first loop only compares `/proc/sys` values and exits
+/// without writing when the machine already matches. A needed write escalates
+/// the way the ownership reconciliation does (directly when the exec landed on
+/// root, else through passwordless sudo, which the runner account has), then
+/// re-reads every key it wrote, so a write the kernel rejected fails
+/// provisioning instead of silently handing jobs a different environment than
+/// GitHub's.
+///
+/// Only keys the guest kernel exposes *and* that differ are written. A kernel
+/// that lacks one hosted key (say `fs.inotify.max_user_instances`) still gets
+/// the others: both `sysctl -w` and a direct `/proc/sys` write fail on an
+/// absent key, so handing the whole configured list to the privileged half
+/// would discard an otherwise usable guest. Skipping is what GitHub does with
+/// its own `/etc/sysctl.conf` lines for keys the kernel does not know.
+/// Writes use `sysctl` when the image ships procps, else `/proc/sys` directly.
+pub fn guest_sysctl_script() -> String {
+    guest_sysctl_script_at("/proc/sys")
+}
+
+/// `root` is the sysctl tree the script reads and writes. Production passes
+/// `/proc/sys`; the shell tests pass a scratch tree so the real script runs
+/// end to end without touching the host kernel, the way
+/// [`scope_rosetta_apt_sources`] stands in for `/etc/apt`.
+fn guest_sysctl_script_at(root: &str) -> String {
+    let pairs = GITHUB_GUEST_SYSCTLS
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let root = shell_quote(root);
+    // The privileged half, base64'd so quoting survives both exec branches.
+    // It only ever sees the pairs the pre-check selected: an absent key would
+    // fail the write and, under `set -e`, take the whole apply with it.
+    let apply = format!(
+        "set -e; root={root}; \
+         if command -v sysctl >/dev/null 2>&1; then \
+           for pair in \"$@\"; do sysctl -w \"$pair\"; done; \
+         else \
+           for pair in \"$@\"; do \
+             printf '%s' \"${{pair#*=}}\" > \"$root/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           done; \
+         fi"
+    );
+    use base64::Engine as _;
+    let apply_b64 = base64::engine::general_purpose::STANDARD.encode(&apply);
+    format!(
+        "root={root}; plan=''; \
+         for pair in {pairs}; do \
+           path=\"$root/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then plan=\"$plan $pair\"; fi; \
+         done; \
+         if [ -z \"$plan\" ]; then echo 'guest sysctls already match the hosted image'; exit 0; fi; \
+         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh -s -- $plan; \
+         else printf %s '{apply_b64}' | base64 -d | sudo -n sh -s -- $plan; fi; \
+         failed=''; \
+         for pair in $plan; do \
+           path=\"$root/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then \
+             failed=\"$failed $pair(got:$(cat \"$path\"))\"; \
+           fi; \
+         done; \
+         if [ -n \"$failed\" ]; then \
+           echo \"guest sysctls did not reach the hosted values:$failed (wanted: {pairs})\" >&2; \
+           exit 1; \
+         fi"
+    )
+}
+
+/// Make a machine's own hostname resolve to an address of the machine.
+///
+/// The curated bake writes the *golden's* name into `/etc/hosts`
+/// (`base_install_script`), but every fork boots under a new name, so the
+/// guest's own hostname resolved nowhere and `sudo` printed
+/// `sudo: unable to resolve host <name>` before every invocation — a line no
+/// hosted-runner log contains. The fork cannot inherit the bake's entry
+/// because the name is decided at fork time, so the mapping is applied per
+/// machine by [`guest_hosted_runtime_init_script`].
+///
+/// Resolving is not enough. A guest can boot with a hosts file that maps its
+/// name to an address the machine does **not** own — an AgentENV guest carried
+/// `10.1.0.59 runnervm… runnervmvrwv9` while its interfaces held
+/// `169.254.0.21` — and a check that only asks `getent hosts <name>` passes
+/// there while every consumer of the name gets an unreachable address. A
+/// hosted runner's own name resolves to an address of the VM itself: GitHub's
+/// `/etc/hosts` maps `runnervm…` to the VM's interface address, and the
+/// curated bake maps the golden's name to loopback. So the check is "does the
+/// name resolve to loopback or a local-interface address"; a name mapped
+/// anywhere else is rewritten to the bake's `127.0.0.1 <host>` convention,
+/// with the stale mapping removed (a resolver answers a name with its *first*
+/// match, so appending a second line would leave the stale one winning).
+///
+/// Idempotent: a machine whose name already resolves locally — the baked
+/// golden itself, a fork that ran this once, or a GitHub-shaped
+/// interface-address mapping — exits without touching `/etc/hosts`. The
+/// rewrite escalates through passwordless sudo when the exec lands on the
+/// image user, and the resolution is re-checked, so a machine whose name still
+/// does not resolve locally fails provisioning instead of handing every later
+/// command a name that points somewhere else.
+pub fn guest_hostname_script() -> String {
+    guest_hostname_script_at("/etc/hosts")
+}
+
+/// `hosts` is the file the machine's own name is mapped in. Production passes
+/// `/etc/hosts`; the shell test below passes a scratch file so the real script
+/// runs end to end without touching the host's resolver, the way
+/// [`scope_rosetta_apt_sources`] stands in for `/etc/apt`.
+fn guest_hostname_script_at(hosts: &str) -> String {
+    let hosts = shell_quote(hosts);
+    format!(
+        "command -v getent >/dev/null 2>&1 || exit 0; \
+         host=$(hostname 2>/dev/null || uname -n); \
+         [ -n \"$host\" ] || exit 0; \
+         local_addrs() {{ \
+           {{ printf '127.0.0.1\\n::1\\n'; hostname -I 2>/dev/null | tr ' ' '\\n'; \
+              ip -o addr show 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1; }} \
+             | sed '/^$/d' | sort -u; \
+         }}; \
+         name_resolves_locally() {{ \
+           resolved=$(getent ahosts \"$host\" 2>/dev/null | awk '{{print $1}}'); \
+           [ -n \"$resolved\" ] || return 1; \
+           for addr in $resolved; do \
+             for local in $(local_addrs); do \
+               [ \"$addr\" = \"$local\" ] && return 0; \
+             done; \
+           done; \
+           return 1; \
+         }}; \
+         name_resolves_locally && exit 0; \
+         tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts.$$; \
+         grep -v -E \"^[^#]*[[:space:]]$host([[:space:]]|$)\" {hosts} > \"$tmp\" 2>/dev/null || : > \"$tmp\"; \
+         printf '127.0.0.1 %s\\n' \"$host\" >> \"$tmp\"; \
+         if [ \"$(id -u)\" -eq 0 ]; then cat \"$tmp\" > {hosts}; \
+         else cat \"$tmp\" | sudo -n tee {hosts} >/dev/null; fi; \
+         rm -f \"$tmp\"; \
+         name_resolves_locally || {{ \
+           echo \"guest hostname $host does not resolve to an address of this machine after the hosts-file update\" >&2; \
+           exit 1; \
+         }}"
+    )
+}
+
+/// The per-guest **hosted runtime init**: what the hosted image's own init
+/// applies to a job's environment, applied by preloop instead.
+///
+/// On GitHub the VM boots with systemd/cloud-init and the runner is a systemd
+/// service, so the image's `/etc/sysctl.d`, `/etc/security/limits.conf` and
+/// hostname setup all apply before a step runs. A preloop guest enters the job
+/// workload through the VM's exec channel instead: the smolvm guest's PID 1 is
+/// `/run/smolvm/init`, with no systemd at all, and an AgentENV job arrives via
+/// `aenv exec` off `envd`, outside systemd and PAM. The golden carries
+/// GitHub's files, but nothing ever applies them. This is the per-guest half
+/// of that gap — the kernel values and the machine's own name, applied once on
+/// the post-boot exec path, before the runner registers.
+///
+/// The other half cannot live here: process limits are per process, so the
+/// pair a step and a container inherit is applied where the workload is
+/// launched ([`GUEST_STACK_ULIMIT`], [`GUEST_NOFILE_ULIMIT`], and the
+/// re-raise of an engine chain inherited from a golden).
+///
+/// Each half runs in its own subshell so its early `exit 0` ("already at the
+/// hosted values") cannot skip the other, and `set -e` turns either half's
+/// failure into a provisioning failure rather than leaving the machine half
+/// converted. Hostname resolution runs first because the sysctl half escalates
+/// through passwordless sudo, and sudo resolves its hostname on every
+/// invocation: with a stale mapping it would print
+/// `sudo: unable to resolve host` into the apply's stderr before the name is
+/// fixed.
+pub fn guest_hosted_runtime_init_script() -> String {
+    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys")
+}
+
+/// `hosts` and `sysctl_root` are the scratch paths the shell tests substitute
+/// for `/etc/hosts` and `/proc/sys`; production passes those.
+fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
+    format!(
+        "set -e; ( {} ); ( {} )",
+        guest_hostname_script_at(hosts),
+        guest_sysctl_script_at(sysctl_root)
+    )
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -2351,10 +2596,12 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// Never fatal. A pool without a working container engine still runs every job
 /// that does not use `container:` or `services:`.
 ///
-/// The daemon is started with the hosted stack limit ([`GUEST_STACK_ULIMIT`],
-/// the same raise the runner wrapper applies): a container's processes inherit
-/// the daemon's limits, so without it every container step would run on the
-/// VM init's half-sized stack while the same step on GitHub runs on 16 MiB.
+/// The daemon is started with the hosted process limits ([`GUEST_STACK_ULIMIT`]
+/// and [`GUEST_NOFILE_ULIMIT`], the same raise the runner wrapper applies): a
+/// container's processes inherit the daemon's limits, so without it every
+/// container step would run on the VM init's half-sized stack and a
+/// descriptor limit below the hosted 65536 while the same step on GitHub runs
+/// on 16 MiB and 65536 open files.
 /// A daemon the fork inherited from its golden instead — preload leaves the
 /// chain running so forks never restart it — carries whatever limits it was
 /// started with, so the command re-raises that live chain (dockerd and
@@ -2380,7 +2627,7 @@ fn docker_start_command() -> Vec<String> {
         "sh".to_owned(),
         "-c".to_owned(),
         run_as_root_or_sudo(&format!(
-            "{GUEST_STACK_ULIMIT}; \
+            "{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT}; \
              command -v dockerd >/dev/null 2>&1 || exit 0; \
              # A fork inherits its golden's live daemon chain — dockerd, and
              # the containerd that spawns each container's shim. A container
@@ -3116,13 +3363,14 @@ async fn preload_images<P: VmProvider>(
 /// The golden-side command that brings up a container engine and pulls
 /// `images` into it.
 ///
-/// The engine is started with the hosted stack limit ([`GUEST_STACK_ULIMIT`]):
-/// the daemon lives on in the golden's process table, forks inherit it as the
-/// engine that serves their container steps, and a container's processes
-/// inherit the limits of the chain that spawned them. Started without the
-/// raise, every forked runner would hand its containers the VM init's 8192 KiB
-/// — half of GitHub's — even though its own runner wrapper had raised the
-/// stack for step processes.
+/// The engine is started with the hosted process limits ([`GUEST_STACK_ULIMIT`]
+/// and [`GUEST_NOFILE_ULIMIT`]): the daemon lives on in the golden's process
+/// table, forks inherit it as the engine that serves their container steps,
+/// and a container's processes inherit the limits of the chain that spawned
+/// them. Started without the raise, every forked runner would hand its
+/// containers the VM init's 8192 KiB and its own descriptor limit — half of
+/// GitHub's stack, and a nofile pair no hosted container has — even though its
+/// own runner wrapper had raised both for step processes.
 fn preload_images_command(images: &[String]) -> Vec<String> {
     let refs = images
         .iter()
@@ -3133,7 +3381,7 @@ fn preload_images_command(images: &[String]) -> Vec<String> {
         "sh".to_owned(),
         "-c".to_owned(),
         run_as_root_or_sudo(&format!(
-            "{GUEST_STACK_ULIMIT}; \
+            "{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT}; \
              command -v dockerd >/dev/null 2>&1 || {{ echo 'no dockerd' >&2; exit 1; }}; \
              mkdir -p {DOCKER_DATA_ROOT}; \
              docker info >/dev/null 2>&1 || (dockerd >/var/log/dockerd-preload.log 2>&1 &); \
@@ -6330,6 +6578,41 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
 
+    // Apply the hosted runtime init — the per-guest half of what the hosted
+    // image's own init does for a GitHub-hosted runner. Same always-run,
+    // idempotent path as the ownership reconciliation above, and for the same
+    // reason: the guest enters the job workload through the exec channel, so
+    // the image's `/etc/sysctl.*` (no init reads them) and its hostname setup
+    // (the fork's name is decided after the bake) never applied, and jobs ran
+    // against kernel defaults and a hostname that resolved nowhere. See
+    // [`guest_hosted_runtime_init_script`] for what each half covers; a
+    // machine that already matches pays one exec round trip and no writes.
+    {
+        let script = guest_hosted_runtime_init_script();
+        let output = provider
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OrchestratorError::Config(format!(
+                "hosted runtime init failed on {} (exit {}): {} — the machine must \
+                 reach GitHub's hosted sysctls ({}) and resolve its own hostname to \
+                 an address of this machine, or jobs run against a different \
+                 environment than a hosted runner's",
+                name.as_str(),
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown"),
+                GITHUB_GUEST_SYSCTLS
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
     for label in runner_environment_labels(&environment.base) {
@@ -6524,24 +6807,28 @@ fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
     )
 }
 
-/// Wrap a guest argv so it launches on the hosted stack limit without
+/// Wrap a guest argv so it launches on the hosted process limits without
 /// switching accounts.
 ///
 /// The `runner_user`-less and `runner_user: root` launches keep their identity
 /// (the exec channel's user — root, or the image's own `USER`); only the
-/// limit is added. The wrapped argv travels as the shell's positional
+/// limits are added. The wrapped argv travels as the shell's positional
 /// parameters (`sh -c '<raise>; exec "$@"' sh <argv…>`), so nothing is
 /// re-quoted and the launch stays byte-identical after the wrapper: a
 /// mis-quoted argument cannot corrupt a step command, and the exec records
 /// the pool's tests read still carry the original argv.
 ///
-/// Raising a soft limit towards the existing hard limit needs no privileges,
-/// so this works whether the exec landed on root or on the image user.
-fn with_guest_stack_limit(argv: &[String]) -> Vec<String> {
+/// The stack pair only needs the soft limit raised towards the existing hard
+/// one, which needs no privileges, so it works whether the exec landed on root
+/// or on the image user. The descriptor pair cannot promise that — raising a
+/// hard limit needs root — so it uses [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]: a
+/// root exec reaches the hosted 65536, and an image-user exec keeps whatever
+/// hard limit it inherited rather than failing the launch.
+fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
     let mut wrapped = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!("{GUEST_STACK_ULIMIT}; exec \"$@\""),
+        format!("{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
         "sh".to_owned(),
     ];
     wrapped.extend_from_slice(argv);
@@ -6551,14 +6838,15 @@ fn with_guest_stack_limit(argv: &[String]) -> Vec<String> {
 fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // Unset or root means no account switch, not no limits: the guest applies
     // neither the image's systemd nor its PAM limits on this path either, so
-    // the runner would keep the VM init's 8192 KiB stack and every step it
-    // spawns would too. The launch is wrapped instead of replaced — the exec
-    // channel's identity (root, or the image user) stays exactly as it was.
+    // the runner would keep the VM init's 8192 KiB stack — and the exec
+    // channel's descriptor limit — and every step it spawns would too. The
+    // launch is wrapped instead of replaced — the exec channel's identity
+    // (root, or the image user) stays exactly as it was.
     let Some(user) = &config.runner_user else {
-        return with_guest_stack_limit(argv);
+        return with_guest_hosted_limits(argv);
     };
     if user == "root" {
-        return with_guest_stack_limit(argv);
+        return with_guest_hosted_limits(argv);
     }
     let uid = config.runner_uid.unwrap_or(1001);
     let home = format!("/home/{user}");
@@ -6615,21 +6903,23 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // permitted without privileges. The root branch keeps --init-groups.
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&provisioning);
-    // Raise RLIMIT_NOFILE before dropping privileges. GitHub-hosted runners
-    // allow many open files (valkey's test suite raises the soft limit to
-    // 10032), but the exec channel's defaults leave the hard limit below
-    // that, so the runner user gets EPERM on setrlimit. 524288 mirrors
-    // systemd's built-in hard default, which is what GitHub's runner service
-    // (no explicit LimitNOFILE) inherits. Raising the hard limit needs root
-    // (CAP_SYS_RESOURCE), hence the sudo in the exec-as-image-user branch;
-    // setpriv then runs as root there too, so --init-groups is correct in
-    // both branches (setgroups needs root — the --keep-groups variant was
-    // only a workaround for the self-drop). [`GUEST_STACK_ULIMIT`] mirrors the
-    // hosted stack limit in the same wrapper, because the guest applies
-    // neither the image's systemd nor its PAM limits; without it the runner
-    // and every step it spawns keep the VM init's half-sized stack.
+    // Raise the process limits before dropping privileges: the runner and
+    // every step it spawns inherit them from here. [`GUEST_STACK_ULIMIT`] and
+    // [`GUEST_NOFILE_ULIMIT`] mirror the hosted pair, because the guest
+    // applies neither the image's systemd units nor its PAM limits; without
+    // them the runner chain keeps the VM init's half-sized stack and the exec
+    // channel's descriptor limit (1024 soft / 4096 hard on AgentENV), and
+    // suites that raise their own soft limit — valkey's test suite asks for
+    // 10032 — die with EPERM on setrlimit. The earlier 524288 hard limit here
+    // was a guess at what GitHub's runner service inherits; a probe of a
+    // hosted runner reads back `Max open files 65536 / 65536`, which is what
+    // `configure-limits.sh` (`DefaultLimitNOFILE=65536`) actually grants.
+    // Raising a hard limit needs root (CAP_SYS_RESOURCE), hence the sudo in
+    // the exec-as-image-user branch; setpriv then runs as root there too, so
+    // --init-groups is correct in both branches (setgroups needs root — the
+    // --keep-groups variant was only a workaround for the self-drop).
     let inner = format!(
-        "ulimit -Hn 524288; ulimit -Sn 524288; {GUEST_STACK_ULIMIT}; \
+        "{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT}; \
          exec setpriv --reuid {uid} --regid {uid} --init-groups env \
            PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
     );
@@ -7690,6 +7980,696 @@ chmod +x "$dest/bin/node"
         );
     }
 
+    /// The guest has no init applying `/etc/sysctl.*`, so the values GitHub's
+    /// hosted image bakes into `/etc/sysctl.conf` must be written per machine
+    /// or every job runs against kernel defaults. Pin the hosted values and
+    /// the shape of the script: a comparison-only pre-check (an already-correct
+    /// machine writes nothing), a privileged half that writes only the pairs
+    /// the pre-check selected (a key the kernel does not expose must never
+    /// reach the write), escalation through passwordless sudo when the exec
+    /// lands on the image user, and a post-write re-read so a rejected write
+    /// fails provisioning instead of silently diverging. The behavior itself
+    /// is executed by `guest_sysctl_script_writes_only_exposed_keys` and
+    /// `guest_sysctl_script_falls_back_to_proc_sys_without_procps` below.
+    #[test]
+    fn guest_sysctl_script_pins_hosted_values() {
+        let script = guest_sysctl_script();
+        for pair in [
+            "vm.max_map_count=262144",
+            "fs.inotify.max_user_watches=655360",
+            "fs.inotify.max_user_instances=1280",
+        ] {
+            assert!(
+                script.contains(pair),
+                "hosted value {pair} must be applied: {script}"
+            );
+        }
+        assert!(
+            script.contains("[ -z \"$plan\" ]"),
+            "an already-correct machine must skip the writes: {script}"
+        );
+        assert!(
+            script.contains("exit 0"),
+            "the matching case must exit before escalating: {script}"
+        );
+        assert!(
+            script.contains("sudo -n sh"),
+            "the image-user case must escalate: {script}"
+        );
+        assert!(
+            !script.contains("|| true"),
+            "a rejected write must stay observable: {script}"
+        );
+        assert!(
+            script.contains("root='/proc/sys'"),
+            "the guest tree must be the kernel's: {script}"
+        );
+        // The privileged half travels base64-encoded; decode every blob and
+        // assert the writes it carries.
+        let decoded = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .filter_map(|blob| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(blob)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            decoded.contains("for pair in \"$@\""),
+            "the privileged half must write the pairs the pre-check selected, not the \
+             whole configured list: {decoded}"
+        );
+        assert!(
+            decoded.contains("sysctl -w \"$pair\""),
+            "the procps branch must write one selected pair at a time: {decoded}"
+        );
+        assert!(
+            decoded.contains("root='/proc/sys'"),
+            "images without procps need the direct /proc/sys fallback: {decoded}"
+        );
+        // GitHub-hosted runners run with vm.overcommit_memory=0 (probe of
+        // image 20260927.320.1): Valkey's overcommit warning is expected on
+        // both sides, and forcing it to 1 here would *diverge* from GitHub.
+        assert!(!script.contains("overcommit"), "{script}");
+    }
+
+    /// A stub executable in a scratch `bin`, the shape the curl/tar stubs
+    /// above use.
+    #[cfg(unix)]
+    fn scratch_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The runner account's passwordless sudo, for harnesses whose test runner
+    /// is not root (CI guests usually are, a developer machine is not).
+    #[cfg(unix)]
+    const SUDO_STUB: &str = "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n";
+
+    /// Link one real tool into a scratch `bin` that must offer no others; the
+    /// direct-write test uses it to remove `sysctl` from the guest's PATH.
+    #[cfg(unix)]
+    fn symlink_tool(bin: &std::path::Path, tool: &str) {
+        let source = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| std::path::Path::new(dir).join(tool))
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| panic!("no {tool} on this machine for the harness PATH"));
+        std::os::unix::fs::symlink(source, bin.join(tool)).unwrap();
+    }
+
+    /// Devin's case: a guest kernel with `vm.max_map_count` at the kernel
+    /// default that does not expose `fs.inotify.max_user_instances` at all.
+    /// The pre-check skipped absent keys, but the privileged half used to hand
+    /// every configured pair to `sysctl -w`; the absent key made procps exit
+    /// non-zero and `set -e` aborted the apply, so an otherwise usable guest
+    /// could never be provisioned. The scratch tree stands in for `/proc/sys`
+    /// and the stub for procps, so the real script runs end to end — a `-w`
+    /// for a leaf the tree does not have fails exactly as on a real kernel.
+    #[cfg(unix)]
+    #[test]
+    fn guest_sysctl_script_writes_only_exposed_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sys");
+        let bin = temp.path().join("bin");
+        let log = temp.path().join("sysctl.log");
+        std::fs::create_dir_all(root.join("vm")).unwrap();
+        std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        // Present at the kernel default: the hosted value must land.
+        std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
+        // Present and already correct: no write is needed for it.
+        std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
+        // Absent on this kernel: procps fails on it, so the privileged half
+        // must never see it.
+        scratch_executable(
+            &bin.join("sysctl"),
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -w) shift;;
+    -*) shift;;
+    *) break;;
+  esac
+done
+for pair in "$@"; do
+  key=${pair%%=*}
+  path="$PRELOOP_TEST_SYSCTL_ROOT/$(printf '%s' "$key" | tr '.' '/')"
+  printf '%s\n' "$pair" >> "$PRELOOP_TEST_SYSCTL_LOG"
+  if [ ! -e "$path" ]; then
+    printf 'sysctl: cannot stat %s: No such file or directory\n' "$path" >&2
+    exit 1
+  fi
+  [ "$PRELOOP_TEST_SYSCTL_STALL" = "$key" ] && continue
+  printf '%s' "${pair#*=}" > "$path"
+done
+"#,
+        );
+        scratch_executable(&bin.join("sudo"), SUDO_STUB);
+
+        let script = guest_sysctl_script_at(root.to_str().unwrap());
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("PRELOOP_TEST_SYSCTL_ROOT", &root)
+                .env("PRELOOP_TEST_SYSCTL_LOG", &log)
+                .output()
+                .unwrap()
+        };
+        let first = run();
+        assert!(
+            first.status.success(),
+            "a guest missing one hosted key must still be provisioned: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("vm/max_map_count")).unwrap(),
+            "262144",
+            "the exposed key that differed must reach the hosted value"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "vm.max_map_count=262144\n",
+            "only exposed, differing keys may reach a write"
+        );
+        // A second exec against the same machine compares clean: one exec
+        // round trip, no writes.
+        let second = run();
+        assert!(second.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "vm.max_map_count=262144\n"
+        );
+        // A write the kernel did not take must still fail provisioning: the
+        // post-check re-reads every pair the apply carried and names it.
+        std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
+        let stalled = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PRELOOP_TEST_SYSCTL_ROOT", &root)
+            .env("PRELOOP_TEST_SYSCTL_LOG", &log)
+            .env("PRELOOP_TEST_SYSCTL_STALL", "vm.max_map_count")
+            .output()
+            .unwrap();
+        assert!(
+            !stalled.status.success(),
+            "a write the kernel did not take must fail provisioning"
+        );
+        assert!(
+            String::from_utf8_lossy(&stalled.stderr).contains("vm.max_map_count=262144(got:65530)"),
+            "the failure must name the pair and the value read back: {}",
+            String::from_utf8_lossy(&stalled.stderr)
+        );
+    }
+
+    /// Images without procps write `/proc/sys` directly, and that branch had
+    /// the same absent-key failure. A real procfs refuses to create a leaf for
+    /// a key the kernel does not expose; a scratch tree cannot, so the
+    /// harness instead pins that the absent key is never written (the pre-fix
+    /// script created it here, and fails outright on a kernel that has no such
+    /// leaf).
+    #[cfg(unix)]
+    #[test]
+    fn guest_sysctl_script_falls_back_to_proc_sys_without_procps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sys");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(root.join("fs/inotify/max_user_watches"), "64372").unwrap();
+        // Only the tools the script genuinely needs, so `command -v sysctl`
+        // comes up empty as it does on an image without procps.
+        for tool in ["cat", "tr", "id", "base64", "sh"] {
+            symlink_tool(&bin, tool);
+        }
+        // A test runner that is not root takes the escalated branch; the
+        // runner account's passwordless sudo is a `sudo` that runs its argv.
+        scratch_executable(&bin.join("sudo"), SUDO_STUB);
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &guest_sysctl_script_at(root.to_str().unwrap())])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the direct-write branch must provision too: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("fs/inotify/max_user_watches")).unwrap(),
+            "655360"
+        );
+        assert!(
+            !root.join("fs/inotify/max_user_instances").exists(),
+            "a key the kernel does not expose must never be written"
+        );
+        assert!(
+            !root.join("vm").exists(),
+            "keys the tree does not have must be left alone entirely"
+        );
+    }
+
+    /// Every fork boots under a name the bake could not write into
+    /// `/etc/hosts`, so `sudo` printed `sudo: unable to resolve host <name>`
+    /// on every invocation — 25 lines in one valkey job, and no hosted-runner
+    /// log has one. Pin the shape: a resolve-to-a-local-address check first
+    /// (an already-correct machine writes nothing), the bake's
+    /// `127.0.0.1 <host>` convention, escalation through passwordless sudo
+    /// when the exec lands on the image user, and a re-check so a machine
+    /// whose name still does not resolve locally fails provisioning instead of
+    /// pointing at an address it does not own. The behavior itself is executed
+    /// by `guest_hostname_script_makes_the_fork_name_resolve`,
+    /// `guest_hostname_script_rewrites_a_stale_foreign_mapping` and
+    /// `guest_hostname_script_fails_when_the_name_still_does_not_resolve`.
+    #[test]
+    fn guest_hostname_script_is_idempotent_and_verifies() {
+        let script = guest_hostname_script();
+        assert!(
+            script.contains("getent ahosts \"$host\""),
+            "the check must resolve the machine's own name: {script}"
+        );
+        assert!(
+            script.contains("name_resolves_locally && exit 0"),
+            "an already-resolving machine must skip the write: {script}"
+        );
+        assert!(
+            script.contains("127.0.0.1 $host"),
+            "the entry must follow the bake's 127.0.0.1 convention: {script}"
+        );
+        assert!(
+            script.contains("sudo -n tee '/etc/hosts'"),
+            "the image-user branch must rewrite through sudo: {script}"
+        );
+        assert!(
+            script.contains("sudo -n"),
+            "escalation must be non-interactive: {script}"
+        );
+        assert!(
+            script.contains("> '/etc/hosts'"),
+            "the root branch must rewrite directly: {script}"
+        );
+        assert!(
+            script.contains("hostname -I"),
+            "local addresses must include the interfaces': {script}"
+        );
+        assert!(
+            !script.contains("|| true"),
+            "a failed rewrite or resolution must stay observable: {script}"
+        );
+    }
+
+    /// A stub executable in a scratch `bin` for the hostname harness below.
+    #[cfg(unix)]
+    fn hostname_harness_stub(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The fork's `/etc/hosts` carries the bake's entries but never the name
+    /// the fork booted under (`base_install_script` writes the *golden's*
+    /// name; the fork's is decided at fork time), so `sudo` resolved its
+    /// hostname to nothing and printed `sudo: unable to resolve host <name>`
+    /// before every command — 25 lines in one valkey job, where a
+    /// hosted-runner log has none. Run the real script against a scratch hosts
+    /// file with `hostname`, the resolver and the escalator stubbed, and show
+    /// the trigger before and the resolution after: the same before/after
+    /// REVIEW.md §1a asks for, since on `main` nothing ever wrote the mapping.
+    #[cfg(unix)]
+    #[test]
+    fn guest_hostname_script_makes_the_fork_name_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &hosts,
+            "127.0.0.1 localhost\n127.0.0.1 preloop-golden-bake\n",
+        )
+        .unwrap();
+
+        // The name is decided at fork time.
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\nprintf '%s\\n' fork-7c1f\n",
+        );
+        // `getent hosts <name>` answered from the scratch file the way nss
+        // `files` answers it: the first match and exit 0, else exit 2.
+        hostname_harness_stub(
+            &bin.join("getent"),
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = hosts ] || [ \"$1\" = ahosts ] || exit 2\n\
+                 line=$(grep -E \"^[^#]*[[:space:]]$2([[:space:]]|$)\" {} | head -n 1)\n\
+                 [ -n \"$line\" ] || exit 2\n\
+                 printf '%s\\n' \"$line\"\n",
+                shell_quote(hosts.to_str().unwrap())
+            ),
+        );
+        // sudo resolves the machine's name on every invocation — that lookup
+        // is what printed the warning — and then runs its argv.
+        hostname_harness_stub(
+            &bin.join("sudo"),
+            "#!/bin/sh\n\
+             host=$(hostname 2>/dev/null)\n\
+             getent hosts \"$host\" >/dev/null 2>&1 || \
+               printf 'sudo: unable to resolve host %s\\n' \"$host\" >&2\n\
+             [ \"$1\" = -n ] && shift\n\
+             exec \"$@\"\n",
+        );
+
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let run = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .env("PATH", &path)
+                .output()
+                .unwrap()
+        };
+        // Before: the fork's name resolves nowhere, so the `sudo` invocation
+        // printed the line the job logs were full of.
+        assert!(
+            !run("getent hosts \"$(hostname)\"").status.success(),
+            "the fork's own name must not resolve before the script runs"
+        );
+        let warned = run("sudo -n true");
+        assert!(
+            String::from_utf8_lossy(&warned.stderr).contains("unable to resolve host fork-7c1f"),
+            "the reported symptom must reproduce first: {}",
+            String::from_utf8_lossy(&warned.stderr)
+        );
+
+        // The fix: the real script appends the machine's own name and the
+        // lookup that warned stops failing.
+        let applied = run(&guest_hostname_script_at(hosts.to_str().unwrap()));
+        assert!(
+            applied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 preloop-golden-bake\n127.0.0.1 fork-7c1f\n",
+            "the entry must follow the bake's 127.0.0.1 convention"
+        );
+        assert!(
+            run("getent hosts \"$(hostname)\"").status.success(),
+            "the fork's own name must resolve once the script has run"
+        );
+        let quiet = run("sudo -n true");
+        assert!(
+            !String::from_utf8_lossy(&quiet.stderr).contains("unable to resolve host"),
+            "the warning must be gone: {}",
+            String::from_utf8_lossy(&quiet.stderr)
+        );
+
+        // And a machine whose name already resolves is left untouched.
+        let again = run(&guest_hostname_script_at(hosts.to_str().unwrap()));
+        assert!(again.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 preloop-golden-bake\n127.0.0.1 fork-7c1f\n",
+            "a second run must not append a duplicate entry"
+        );
+    }
+
+    /// The AgentENV case the first version of this script skipped: the guest
+    /// boots with a hosts file mapping its own name to an address it does not
+    /// own (`10.1.0.59 runnervm… runnervmvrwv9` while the machine's interfaces
+    /// carry `169.254.0.21`). `getent hosts <name>` answers, so a check that
+    /// only asks whether the name resolves passes — while every consumer of
+    /// the name, `sudo` included, gets an address that is not this machine.
+    /// The script must notice, drop the foreign mapping (a resolver answers
+    /// with the *first* match, so appending a second line would leave the
+    /// stale one winning) and leave the machine's own name pointing at
+    /// loopback. A machine whose name maps to one of its own interface
+    /// addresses — GitHub's own `/etc/hosts` shape — is already correct and
+    /// must be left alone.
+    #[cfg(unix)]
+    #[test]
+    fn guest_hostname_script_rewrites_a_stale_foreign_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &hosts,
+            "127.0.0.1 localhost\n\
+             10.1.0.59 runnervm.bnlheokxlokujiv1ylew4udf0c.gx.internal.cloudapp.net runnervmvrwv9\n\
+             # a comment that mentions runnervmvrwv9\n",
+        )
+        .unwrap();
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\n\
+             if [ \"$1\" = -I ]; then printf '169.254.0.21 127.0.0.1\\n'; exit 0; fi\n\
+             printf '%s\\n' runnervmvrwv9\n",
+        );
+        hostname_harness_stub(
+            &bin.join("getent"),
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = hosts ] || [ \"$1\" = ahosts ] || exit 2\n\
+                 line=$(grep -E \"^[^#]*[[:space:]]$2([[:space:]]|$)\" {} | head -n 1)\n\
+                 [ -n \"$line\" ] || exit 2\n\
+                 printf '%s\\n' \"$line\"\n",
+                shell_quote(hosts.to_str().unwrap())
+            ),
+        );
+        hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &guest_hostname_script_at(hosts.to_str().unwrap())])
+                .env("PATH", &path)
+                .output()
+                .unwrap()
+        };
+
+        // Before: the name resolves — to an address the machine does not own.
+        let before = std::process::Command::new("/bin/sh")
+            .args(["-c", "getent hosts \"$(hostname)\""])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            before.status.success(),
+            "the stale mapping must answer first"
+        );
+        assert!(
+            String::from_utf8_lossy(&before.stdout).starts_with("10.1.0.59"),
+            "the trigger must reproduce: {}",
+            String::from_utf8_lossy(&before.stdout)
+        );
+
+        let applied = run();
+        assert!(
+            applied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n\
+             # a comment that mentions runnervmvrwv9\n\
+             127.0.0.1 runnervmvrwv9\n",
+            "the foreign mapping must be replaced, comments untouched"
+        );
+        let after = std::process::Command::new("/bin/sh")
+            .args(["-c", "getent hosts \"$(hostname)\""])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&after.stdout).starts_with("127.0.0.1"),
+            "the machine's name must resolve to a local address: {}",
+            String::from_utf8_lossy(&after.stdout)
+        );
+
+        // GitHub's own shape — the name mapped to one of the machine's
+        // interface addresses — is already correct and must not be rewritten.
+        std::fs::write(&hosts, "127.0.0.1 localhost\n169.254.0.21 runnervmvrwv9\n").unwrap();
+        let untouched = run();
+        assert!(
+            untouched.status.success(),
+            "{}",
+            String::from_utf8_lossy(&untouched.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n169.254.0.21 runnervmvrwv9\n",
+            "a name that resolves to a local interface address is already correct"
+        );
+    }
+
+    /// A machine that still cannot resolve its name after the rewrite must
+    /// fail provisioning, not keep printing the warning on every command
+    /// forever.
+    #[cfg(unix)]
+    #[test]
+    fn guest_hostname_script_fails_when_the_name_still_does_not_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\nprintf '%s\\n' fork-7c1f\n",
+        );
+        // A resolver that never finds the name: the rewrite lands, the re-check
+        // does not, and the script must report it.
+        hostname_harness_stub(&bin.join("getent"), "#!/bin/sh\nexit 2\n");
+        hostname_harness_stub(
+            &bin.join("sudo"),
+            "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n",
+        );
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &guest_hostname_script_at(hosts.to_str().unwrap())])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "a name that still does not resolve must fail provisioning"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("does not resolve to an address"),
+            "the failure must say what did not resolve: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The init is the one script the provisioning path runs for everything a
+    /// hosted VM's own init would have applied, so its composition is part of
+    /// the contract: the hostname half first (the sysctl half escalates
+    /// through passwordless sudo, which resolves the hostname on every
+    /// invocation — with a stale mapping it would print
+    /// `sudo: unable to resolve host` into the apply's stderr), each half in
+    /// its own subshell (either half's early `exit 0` must not skip the
+    /// other), and `set -e` so a half that fails fails provisioning.
+    #[test]
+    fn hosted_runtime_init_orders_the_hostname_before_the_sysctls() {
+        let script = guest_hosted_runtime_init_script();
+        let hostname = script
+            .find("host=$(hostname")
+            .unwrap_or_else(|| panic!("the init must resolve the machine's name: {script}"));
+        let sysctl = script
+            .find("guest sysctls already match the hosted image")
+            .unwrap_or_else(|| panic!("the init must apply the hosted sysctls: {script}"));
+        assert!(
+            hostname < sysctl,
+            "the hostname half must run first: {script}"
+        );
+        assert!(
+            script.starts_with("set -e; ("),
+            "each half must be its own subshell under set -e: {script}"
+        );
+        assert!(
+            script.contains("); ( "),
+            "the two halves must be separate subshells: {script}"
+        );
+        // Both early exits live inside the subshells, so neither can end the
+        // other's half.
+        assert_eq!(script.matches("exit 0").count(), 2, "{script}");
+        // The production roots, not a scratch path.
+        assert!(script.contains("'/etc/hosts'"), "{script}");
+        assert!(script.contains("root='/proc/sys'"), "{script}");
+    }
+
+    /// The composed init run end to end against scratch roots: the fork's own
+    /// name resolves and the sysctls reach the hosted values in one exec, and
+    /// a second run changes nothing. Textual order alone would not catch a
+    /// half whose `exit 0` swallows the other — this runs both halves in one
+    /// shell, the way provisioning does.
+    #[cfg(unix)]
+    #[test]
+    fn hosted_runtime_init_applies_both_halves_in_one_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let root = temp.path().join("sys");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(root.join("vm")).unwrap();
+        std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
+        std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
+        std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
+        // The sysctl half's procps is absent here, so the apply writes the
+        // scratch tree directly — the same branch a guest without procps takes.
+        for tool in ["cat", "tr", "id", "base64", "sh"] {
+            symlink_tool(&bin, tool);
+        }
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\nprintf '%s\\n' fork-7c1f\n",
+        );
+        hostname_harness_stub(
+            &bin.join("getent"),
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = hosts ] || [ \"$1\" = ahosts ] || exit 2\n\
+                 line=$(grep -E \"^[^#]*[[:space:]]$2([[:space:]]|$)\" {} | head -n 1)\n\
+                 [ -n \"$line\" ] || exit 2\n\
+                 printf '%s\\n' \"$line\"\n",
+                shell_quote(hosts.to_str().unwrap())
+            ),
+        );
+        hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
+
+        let script = hosted_runtime_init_script_at(hosts.to_str().unwrap(), root.to_str().unwrap());
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .unwrap()
+        };
+        let first = run();
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 fork-7c1f\n",
+            "the hostname half must land in the same run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("vm/max_map_count")).unwrap(),
+            "262144",
+            "the sysctl half must land in the same run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
+            "1280"
+        );
+        // Idempotent: the second run writes nothing at all.
+        let second = run();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 fork-7c1f\n"
+        );
+    }
+
     #[test]
     fn runner_user_wrapper_drops_privileges_and_creates_the_account() {
         let mut config = test_config(false);
@@ -7740,8 +8720,10 @@ chmod +x "$dest/bin/node"
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            all.contains("ulimit -Hn 524288; ulimit -Sn 524288"),
-            "{all}"
+            all.contains("ulimit -Hn 65536; ulimit -Sn 65536"),
+            "the runner and every step it spawns must run on the hosted descriptor \
+             limit (GitHub-hosted: Max open files 65536/65536), not the exec \
+             channel's 1024/4096: {all}"
         );
         assert!(
             all.contains("ulimit -Hs unlimited; ulimit -Ss 16384"),
@@ -7781,12 +8763,20 @@ chmod +x "$dest/bin/node"
             .unwrap_or_else(|| {
                 panic!("the container engine must start with the hosted stack limit: {script}")
             });
+        // A container's processes inherit the daemon's limits, so the
+        // descriptor pair GitHub-hosted containers carry (65536/65536) has to
+        // be raised here too, in the same launch.
+        let nofile = script
+            .find("ulimit -Hn 65536; ulimit -Sn 65536")
+            .unwrap_or_else(|| {
+                panic!("the container engine must start on the hosted descriptor limit: {script}")
+            });
         let spawn = script
             .find("dockerd >/var/log/dockerd.log")
             .unwrap_or_else(|| panic!("the launch must still start dockerd: {script}"));
         assert!(
-            raise < spawn,
-            "the stack raise must precede the daemon it applies to: {script}"
+            raise < spawn && nofile < spawn,
+            "both raises must precede the daemon they apply to: {script}"
         );
     }
 
@@ -7847,14 +8837,100 @@ chmod +x "$dest/bin/node"
         let raise = script
             .find("ulimit -Hs unlimited; ulimit -Ss 16384")
             .unwrap_or_else(|| panic!("the preloaded engine must be raised: {script}"));
+        let nofile = script
+            .find("ulimit -Hn 65536; ulimit -Sn 65536")
+            .unwrap_or_else(|| {
+                panic!("the preloaded engine must carry the hosted descriptor limit: {script}")
+            });
         let spawn = script
             .find("dockerd >/var/log/dockerd-preload.log")
             .unwrap_or_else(|| panic!("the preload must still start a daemon: {script}"));
         assert!(
-            raise < spawn,
-            "the stack raise must precede the daemon it applies to: {script}"
+            raise < spawn && nofile < spawn,
+            "both raises must precede the daemon they apply to: {script}"
         );
         assert!(script.contains("'postgres:16-alpine'"), "{script}");
+    }
+
+    /// A `runner_user`-less (or `root`) launch keeps the exec channel's
+    /// identity, so it must not assume it can raise a hard limit. Pin both
+    /// halves of that: the wrapper adds the hosted stack pair and the
+    /// best-effort descriptor pair without re-quoting the argv it wraps, and
+    /// the best-effort pair survives a low inherited hard limit where the
+    /// strict form the privileged sites use fails.
+    #[test]
+    fn pass_through_launch_adds_the_hosted_limits_without_switching_accounts() {
+        let config = test_config(false);
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+            "--once".to_owned(),
+        ];
+        let wrapped = as_runner_user(&config, &argv);
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-c");
+        assert!(wrapped[2].contains(GUEST_STACK_ULIMIT), "{}", wrapped[2]);
+        assert!(
+            wrapped[2].contains(GUEST_NOFILE_ULIMIT_BEST_EFFORT),
+            "{}",
+            wrapped[2]
+        );
+        assert!(wrapped[2].contains("exec \"$@\""), "{}", wrapped[2]);
+        assert_eq!(wrapped[3], "sh");
+        assert_eq!(
+            &wrapped[4..],
+            &argv[..],
+            "the launch must stay byte-identical"
+        );
+    }
+
+    /// The best-effort form exists because a launch that cannot raise the hard
+    /// limit must still start: the exec channel's defaults can be below the
+    /// hosted 65536, and `ulimit` prints `EPERM` to stderr and fails when it
+    /// cannot comply. A root exec reaches the hosted pair; a non-root exec
+    /// keeps what it inherited, silently. Both are exercised against a lowered
+    /// hard limit so the semantics cannot drift into either failing the launch
+    /// or hiding a genuine failure at the strict sites.
+    #[cfg(unix)]
+    #[test]
+    fn pass_through_nofile_raise_is_best_effort() {
+        let run = |limits: &str| {
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "ulimit -Hn 1024; ulimit -Sn 1024; {limits}; \
+                         printf '%s %s' \"$(ulimit -Hn)\" \"$(ulimit -Sn)\""
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+        let root = String::from_utf8_lossy(&uid.stdout).trim() == "0";
+        let best_effort = run(GUEST_NOFILE_ULIMIT_BEST_EFFORT);
+        assert!(
+            best_effort.status.success(),
+            "a launch that cannot raise the hard limit must still start: {}",
+            String::from_utf8_lossy(&best_effort.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&best_effort.stderr),
+            "",
+            "the fallback must not print EPERM noise into the job log"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&best_effort.stdout),
+            if root { "65536 65536" } else { "1024 1024" },
+            "a root exec must reach the hosted pair; a non-root exec keeps what it has"
+        );
+        if !root {
+            let strict = run(GUEST_NOFILE_ULIMIT);
+            assert!(
+                !strict.status.success(),
+                "the privileged sites must fail loudly when the raise does not take"
+            );
+        }
     }
 
     /// A base that is not the official runner image may lack `sudo`

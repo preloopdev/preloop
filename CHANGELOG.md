@@ -23,6 +23,71 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A guest job's runtime now matches a GitHub-hosted runner's**: the hosted
+  VM boots with systemd/cloud-init and runs the runner as a systemd service, so
+  the image's `/etc/sysctl.d`, `/etc/security/limits.conf`, systemd
+  `DefaultLimit*` and hostname setup all apply before a step runs. A preloop
+  guest enters the job workload through the VM's exec channel instead — the
+  smolvm guest's PID 1 is `/run/smolvm/init`, with no systemd at all, and an
+  AgentENV job arrives via `aenv exec` off `envd`, outside systemd and PAM — so
+  the golden carried GitHub's files but nothing ever applied them. The engine
+  now applies them itself: a per-guest **hosted runtime init** (hostname
+  resolution plus the hosted sysctls, one idempotent exec per machine) and the
+  process limits raised on every launch that hosts a workload. Every value is
+  asserted by `fixtures/workflows/hosted-runtime-parity.yml` in a step, an
+  ad-hoc `docker run` and a `container:` job.
+
+- **Guest sysctls now match GitHub's hosted runner image**: the microVM guest
+  boots straight into the job workload, so nothing applied the sysctls the
+  hosted `ubuntu-24.04` image bakes into `/etc/sysctl.conf`, and jobs saw
+  kernel defaults — `vm.max_map_count` 65530 instead of 262144, inotify
+  watches 64372 instead of 655360, instances 128 instead of 1280 (read back
+  from a live job VM before and after the change). The engine now applies the
+  hosted values per machine on the same post-boot exec path as the
+  runner-ownership reconciliation: idempotent, escalating through the runner
+  account's passwordless sudo, and failing provisioning if a write the kernel
+  exposes does not take. The write list is built from the keys the guest
+  kernel actually exposes and that differ from the hosted values, so a kernel
+  missing one key still gets every other key instead of aborting the apply (a
+  missing key makes both `sysctl -w` and a direct `/proc/sys` write fail). No
+  golden rebake is required; keys a guest kernel does not expose are skipped,
+  as the hosted image's own sysctl lines for unknown keys are.
+  `vm.overcommit_memory` is deliberately left at `0` —
+  a probe job on a real GitHub-hosted runner (image `20260927.320.1`, kernel
+  `6.17.0-1022-azure`) reads back `0` there too, so Valkey's overcommit
+  warning is parity, not a fidelity gap.
+
+- **Guest forks resolve their own hostname to an address they own**: the
+  curated bake writes the *golden's* name into `/etc/hosts`, but every fork
+  boots under a new name, so `sudo` printed `sudo: unable to resolve host
+  <name>` before each of its invocations — 25 such lines in a single Valkey
+  job, where a hosted-runner log has none. The engine now makes the machine's
+  own name resolve per machine on the same post-boot exec path as the
+  runner-ownership reconciliation: idempotent (a machine whose name already
+  resolves to one of its own addresses writes nothing), escalating through the
+  runner account's passwordless sudo, and failing provisioning if the name
+  still does not resolve. Resolving is not enough on its own: an AgentENV guest
+  booted with a hosts file mapping its name to an address it did **not** own
+  (`10.1.0.59 runnervm…` while its interfaces carried `169.254.0.21`), and a
+  check that only asks whether the name resolves passed there while every
+  consumer of the name got an unreachable address. The check is now "resolves
+  to loopback or a local-interface address", matching what a hosted runner's
+  own `/etc/hosts` entry does (the VM's name mapped to its interface address);
+  a foreign mapping is replaced with the bake's `127.0.0.1 <host>` entry.
+
+- **Guest job processes run on GitHub's file-descriptor limit**: the hosted
+  image's `configure-limits.sh` writes `DefaultLimitNOFILE=65536` and
+  `* soft/hard nofile 65536`, and a hosted step, `container:` job and ad-hoc
+  `docker run` all read back `Max open files 65536 / 65536`; a preloop job
+  inherited the exec channel's defaults instead (1024 soft / 4096 hard on
+  AgentENV), below what suites that raise their own soft limit ask for
+  (valkey's test suite requests 10032) and enough to make the runner die with
+  `EPERM` on `setrlimit`. The runner wrapper (before it drops privileges) and
+  the container-engine launch now raise the pair next to the stack raise; a
+  launch that keeps the exec channel's identity raises it best-effort, since a
+  hard limit can only be raised by root. The earlier 524288 hard limit here was
+  a guess at what GitHub's runner service inherits — the probe shows 65536.
+
 - **Guest job workloads run on GitHub's stack size again**: the hosted
   `ubuntu-24.04` image doubles the kernel's 8192 KiB process stack
   (`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
