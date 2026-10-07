@@ -13,162 +13,33 @@ on: push
 #
 #   preloop run -f fixtures/workflows/hosted-runtime-parity.yml
 #
-# Every value asserted here was read back from a real hosted runner
-# (workflow_dispatch probe on `ubuntu-24.04` and `ubuntu-24.04-arm`, image
-# `20260927.320.1` / `20260927.135.1`, kernel `6.17.0-1022-azure`):
+# The assertions live in `fixtures/hosted-runtime-probe.sh`, the single source
+# of truth shared with the `hosted-runtime-parity` CI job, so the two cannot
+# drift. Each one prints the expected GitHub-hosted value and fails with the
+# observed one. A step, an ad-hoc `docker run` and a `container:` job are all
+# checked: a container's processes inherit the *engine's* limits rather than
+# the runner's, and the kernel values are shared. The ad-hoc `docker run` is
+# also the one place a hosted runner carries none of CI/GITHUB_ACTIONS, because
+# nothing injects them into a container the workflow starts itself.
 #
-#   Max stack size   16777216 / unlimited   (`ulimit -Ss` 16384, `-Hs` unlimited)
-#   Max open files   65536 / 65536
-#   vm.max_map_count 262144, fs.inotify.max_user_watches 655360,
-#   fs.inotify.max_user_instances 1280
-#   the machine's own name resolves to an address of the machine
-#   TERM and COLORTERM are absent from the environment; CI=true and
-#   GITHUB_ACTIONS=true
-#
-# A step, an ad-hoc `docker run` and a `container:` job are all checked: a
-# container's processes inherit the *engine's* limits rather than the runner's,
-# and the kernel values are shared. The ad-hoc `docker run` is also the one
-# place a hosted runner carries none of CI/GITHUB_ACTIONS, because nothing
-# injects them into a container the workflow starts itself.
-#
-# The deep-recursion probe is pydantic's shape: `test_recursive_call` walks
-# Python's recursion limit through pydantic-core's Rust frames and expects a
-# `RecursionError`; at the kernel's 8192 KiB stack it dies with a
-# stack-overflow SIGSEGV (exit 139) instead, which is how this gap showed up on
-# a real workload.
+# `--recursion` adds the deep-recursion probes: pydantic's shape
+# (`test_recursive_call`, which walks Python's recursion limit through
+# pydantic-core's Rust frames and expects a `RecursionError`; at the kernel's
+# 8192 KiB stack it dies with a stack-overflow SIGSEGV instead) and a C probe
+# that needs ~10 MiB of native frames. That is what showed the gap on a real
+# workload, and it needs gcc + pip, so the CI job leaves it off.
 
 jobs:
   host:
     runs-on: ubuntu-latest
     steps:
       - name: hosted runtime values in a step
-        run: |
-          cat >/tmp/parity-probe.sh <<'PROBE'
-          fail() { echo "PARITY FAIL: $*" >&2; exit 1; }
-
-          # The limits a hosted step, container job and ad-hoc container all
-          # report: the image's `DefaultLimitSTACK=16M:infinity` and
-          # `DefaultLimitNOFILE=65536`.
-          stack_soft=$(ulimit -Ss); stack_hard=$(ulimit -Hs)
-          nofile_soft=$(ulimit -Sn); nofile_hard=$(ulimit -Hn)
-          echo "stack soft=${stack_soft} hard=${stack_hard}"
-          echo "nofile soft=${nofile_soft} hard=${nofile_hard}"
-          [ "$stack_soft" = 16384 ] || fail "stack soft is ${stack_soft}KiB, GitHub-hosted is 16384"
-          [ "$stack_hard" = unlimited ] || fail "stack hard is ${stack_hard}, GitHub-hosted is unlimited"
-          [ "$nofile_soft" = 65536 ] || fail "nofile soft is ${nofile_soft}, GitHub-hosted is 65536"
-          [ "$nofile_hard" = 65536 ] || fail "nofile hard is ${nofile_hard}, GitHub-hosted is 65536"
-
-          # The sysctls the hosted image bakes into /etc/sysctl.conf. Shared by
-          # every container on the machine, so every context reports them.
-          for pair in vm.max_map_count=262144 \
-                      fs.inotify.max_user_watches=655360 \
-                      fs.inotify.max_user_instances=1280; do
-            key=${pair%%=*}; want=${pair#*=}
-            got=$(cat "/proc/sys/$(printf '%s' "$key" | tr '.' '/')" 2>/dev/null || echo MISSING)
-            echo "${key}=${got}"
-            [ "$got" = "$want" ] || fail "${key} is ${got}, GitHub-hosted is ${want}"
-          done
-
-          # The machine's own name must resolve to an address of this machine —
-          # loopback or one of its interfaces — the way a hosted runner's does
-          # (GitHub's /etc/hosts maps the VM's name to its interface address).
-          # A stale mapping to an address the machine does not own is the
-          # AgentENV failure mode this checks for.
-          host=$(hostname)
-          addrs=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}')
-          echo "hostname=${host} resolves to ${addrs:-<nothing>}"
-          [ -n "$addrs" ] || fail "the machine's own hostname ${host} does not resolve"
-          local_addrs="127.0.0.1 ::1 $(hostname -I 2>/dev/null) $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-          local_ok=0
-          for addr in $addrs; do
-            for local in $local_addrs; do
-              [ "$addr" = "$local" ] && local_ok=1
-            done
-          done
-          [ "$local_ok" = 1 ] || fail "hostname ${host} resolves to ${addrs}, none of which is an address of this machine"
-
-          # TERM/COLORTERM are absent from a hosted step's environment (the
-          # `dumb` a bash step sees is bash's own default for an unset TERM,
-          # not an exported variable — a hosted probe prints exactly the same).
-          if env | grep -qE '^(TERM|COLORTERM)='; then
-            fail "TERM/COLORTERM must not be exported into a step: $(env | grep -E '^(TERM|COLORTERM)=' | tr '\n' ' ')"
-          fi
-          echo "TERM/COLORTERM: absent (matching GitHub-hosted)"
-          case "${1:-}" in
-            ad-hoc)
-              # A container the workflow starts itself gets neither of these on
-              # a hosted runner: nothing injects them.
-              [ -z "${CI:-}" ] || fail "an ad-hoc docker run must not carry CI, GitHub-hosted does not"
-              [ -z "${GITHUB_ACTIONS:-}" ] || fail "an ad-hoc docker run must not carry GITHUB_ACTIONS, GitHub-hosted does not"
-              ;;
-            *)
-              [ "${CI:-}" = true ] || fail "CI is ${CI:-<unset>}, GitHub-hosted is true"
-              [ "${GITHUB_ACTIONS:-}" = true ] || fail "GITHUB_ACTIONS is ${GITHUB_ACTIONS:-<unset>}, GitHub-hosted is true"
-              ;;
-          esac
-          echo "PARITY OK: $(uname -n) $(id -u)"
-          PROBE
-          sh /tmp/parity-probe.sh
-
-      - name: deep recursion survives what pydantic's tests walk
-        run: |
-          cat >/tmp/recurse.c <<'EOF'
-          #include <stdio.h>
-
-          static volatile int sink;
-
-          /* -O0 keeps every frame real: ~2 KiB of pad per call, 5000 calls
-           * is ~10 MiB — past 8192 KiB, comfortably inside 16384 KiB. */
-          static int descend(int depth) {
-            char pad[2048];
-            pad[0] = (char)depth;
-            if (depth <= 0)
-              return pad[0];
-            return descend(depth - 1) + pad[0];
-          }
-
-          int main(void) {
-            sink = descend(5000);
-            printf("deep recursion survived: %d\n", sink);
-            return 0;
-          }
-          EOF
-          gcc -O0 -o /tmp/recurse /tmp/recurse.c
-          /tmp/recurse || { echo "PARITY FAIL: the deep-recursion probe died (exit $?) — a hosted runner survives it" >&2; exit 1; }
-
-          # The literal upstream shape: pydantic-core's `test_recursive_call`
-          # (pydantic-core/tests/serializers/test_functions.py) recurses through
-          # Python frames and Rust frames and expects pydantic to surface a
-          # `RecursionError`; at 8192 KiB the native stack overflows first and
-          # the process dies with SIGSEGV instead.
-          python3 -m pip install --quiet --disable-pip-version-check pydantic-core
-          python3 - <<'PY'
-          import pydantic_core as pc
-          from pydantic_core import core_schema
-
-          s = pc.SchemaSerializer(
-              core_schema.any_schema(
-                  serialization=core_schema.plain_serializer_function_ser_schema(
-                      lambda value: s.to_python(value)
-                  )
-              )
-          )
-          for mode in ("python", "json"):
-              try:
-                  if mode == "python":
-                      s.to_python(42)
-                  else:
-                      s.to_json(42)
-              except pc.PydanticSerializationError as exc:
-                  assert "RecursionError" in str(exc), f"unexpected failure: {exc}"
-                  print(f"pydantic {mode}: {exc}")
-              else:
-                  raise SystemExit(f"PARITY FAIL: pydantic {mode} did not recurse")
-          print("PARITY OK: pydantic-shaped recursion")
-          PY
+        run: sh fixtures/hosted-runtime-probe.sh --recursion
 
       - name: the same values inside an ad-hoc container
-        run: docker run --rm -v /tmp:/probe ubuntu:24.04 sh /probe/parity-probe.sh ad-hoc
+        run: |
+          docker run --rm -v "$PWD:/ws" -w /ws ubuntu:24.04 \
+            sh fixtures/hosted-runtime-probe.sh --adhoc
 
   container-job:
     runs-on: ubuntu-latest
@@ -176,51 +47,4 @@ jobs:
       image: ubuntu:24.04
     steps:
       - name: hosted runtime values in a container job
-        run: |
-          cat >/tmp/parity-probe.sh <<'PROBE'
-          fail() { echo "PARITY FAIL: $*" >&2; exit 1; }
-
-          # A `container:` job's processes inherit the engine's limits, not the
-          # runner's, so these are the daemon's pair; a hosted container job
-          # reports the same 16384/unlimited stack and 65536/65536 descriptors
-          # as a step.
-          stack_soft=$(ulimit -Ss); stack_hard=$(ulimit -Hs)
-          nofile_soft=$(ulimit -Sn); nofile_hard=$(ulimit -Hn)
-          echo "stack soft=${stack_soft} hard=${stack_hard}"
-          echo "nofile soft=${nofile_soft} hard=${nofile_hard}"
-          [ "$stack_soft" = 16384 ] || fail "stack soft is ${stack_soft}KiB, GitHub-hosted is 16384"
-          [ "$stack_hard" = unlimited ] || fail "stack hard is ${stack_hard}, GitHub-hosted is unlimited"
-          [ "$nofile_soft" = 65536 ] || fail "nofile soft is ${nofile_soft}, GitHub-hosted is 65536"
-          [ "$nofile_hard" = 65536 ] || fail "nofile hard is ${nofile_hard}, GitHub-hosted is 65536"
-
-          for pair in vm.max_map_count=262144 \
-                      fs.inotify.max_user_watches=655360 \
-                      fs.inotify.max_user_instances=1280; do
-            key=${pair%%=*}; want=${pair#*=}
-            got=$(cat "/proc/sys/$(printf '%s' "$key" | tr '.' '/')" 2>/dev/null || echo MISSING)
-            echo "${key}=${got}"
-            [ "$got" = "$want" ] || fail "${key} is ${got}, GitHub-hosted is ${want}"
-          done
-
-          host=$(hostname)
-          addrs=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}')
-          echo "hostname=${host} resolves to ${addrs:-<nothing>}"
-          [ -n "$addrs" ] || fail "the container's own hostname ${host} does not resolve"
-          local_addrs="127.0.0.1 ::1 $(hostname -I 2>/dev/null) $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-          local_ok=0
-          for addr in $addrs; do
-            for local in $local_addrs; do
-              [ "$addr" = "$local" ] && local_ok=1
-            done
-          done
-          [ "$local_ok" = 1 ] || fail "hostname ${host} resolves to ${addrs}, none of which is an address of this machine"
-
-          if env | grep -qE '^(TERM|COLORTERM)='; then
-            fail "TERM/COLORTERM must not be exported into a container job: $(env | grep -E '^(TERM|COLORTERM)=' | tr '\n' ' ')"
-          fi
-          echo "TERM/COLORTERM: absent (matching GitHub-hosted)"
-          [ "${CI:-}" = true ] || fail "CI is ${CI:-<unset>}, GitHub-hosted is true"
-          [ "${GITHUB_ACTIONS:-}" = true ] || fail "GITHUB_ACTIONS is ${GITHUB_ACTIONS:-<unset>}, GitHub-hosted is true"
-          echo "PARITY OK: $(uname -n) $(id -u)"
-          PROBE
-          sh /tmp/parity-probe.sh
+        run: sh fixtures/hosted-runtime-probe.sh
