@@ -2043,16 +2043,17 @@ enum MachineDataState {
     Unknown,
 }
 
-/// Classify a `ps` line by the machine state its argv names.
+/// Machine data directories a `ps` line's argv names, one per token that
+/// carries a boot config under one of `markers`.
 ///
 /// The boot config is handed to `_boot-vm` as a path, either bare or behind a
 /// flag (`--boot-config=<path>`), so the path starts at the data-root marker
 /// inside whichever token carries it. The marker may be the shorter `smolvm`
 /// prefix of the macOS `smolvm-home` root, so the earliest occurrence bounds
 /// the path. Only a token that names `boot-config.json` decides anything; an
-/// argv shape this cannot parse yields [`MachineDataState::Unknown`].
-fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
-    let mut state = MachineDataState::Unknown;
+/// argv shape this cannot parse yields nothing.
+fn boot_config_dirs(line: &str, markers: &[String]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
     for token in line.split_whitespace() {
         let Some(start) = markers
             .iter()
@@ -2062,20 +2063,195 @@ fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
             continue;
         };
         let path = token[start..].trim_matches(['"', '\'']);
-        // The boot config itself is gone once the machine booted, so the
-        // directory is what proves the machine exists.
         if !path.starts_with('/') || !path.ends_with(BOOT_CONFIG_FILE) {
             continue;
         }
-        let Some(dir) = Path::new(path).parent() else {
+        if let Some(dir) = Path::new(path).parent() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs
+}
+
+/// Classify a `ps` line by the machine state its argv names.
+///
+/// The boot config itself is gone once the machine booted, so the directory
+/// is what proves the machine exists.
+fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
+    let dirs = boot_config_dirs(line, markers);
+    if dirs.iter().any(|dir| dir.exists()) {
+        return MachineDataState::Present;
+    }
+    if dirs.is_empty() {
+        MachineDataState::Unknown
+    } else {
+        MachineDataState::Removed
+    }
+}
+
+/// Data-root markers bounding this Preloop home's machine state in process
+/// command lines and in the mount table: the macOS layout (`smolvm-home`)
+/// and the Linux one (`smolvm`).
+///
+/// Both the home as configured and its canonical form are included: `/tmp`
+/// and `/private/tmp` name the same directory on macOS, a process argv
+/// carries whichever the caller passed, and `mount` prints the canonical one.
+fn home_markers() -> Option<Vec<String>> {
+    let home = effective_preloop_home()?;
+    let mut homes = vec![home.clone()];
+    if let Ok(canonical) = home.canonicalize()
+        && canonical != home
+    {
+        homes.push(canonical);
+    }
+    let mut markers = Vec::new();
+    for home in homes {
+        for suffix in ["smolvm", "smolvm-home"] {
+            if let Some(marker) = home.join(suffix).to_str() {
+                markers.push(marker.to_owned());
+            }
+        }
+    }
+    (!markers.is_empty()).then_some(markers)
+}
+
+/// Filesystem form of a path for cross-checking argv against the mount
+/// table: both sides are canonicalized so `/tmp/...` and `/private/tmp/...`
+/// compare equal. A path that cannot be canonicalized (a fixture, an
+/// already-removed directory) is compared as written.
+#[cfg(any(target_os = "macos", test))]
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Suffix of a SmolVM layer-store mount point: the machine data directory
+/// plus `pack/layers-cs`.
+#[cfg(any(target_os = "macos", test))]
+const LAYER_STORE_MOUNT_SUFFIX: &str = "/pack/layers-cs";
+
+/// Layer-store mounts under this Preloop home, each with the machine data
+/// directory it belongs to.
+///
+/// macOS mounts a packed machine's `pack/layers-cs` APFS sparseimage inside
+/// the machine's data directory while the machine runs (`machine start`) and
+/// detaches it on `stop`/`delete`. `mount` prints
+/// `<device> on <mount point> (<options>)`; anything else mounted under the
+/// home is not ours to touch.
+#[cfg(any(target_os = "macos", test))]
+fn layer_store_mounts(markers: &[String], mount_table: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut mounts = Vec::new();
+    for line in mount_table.lines() {
+        let Some((_, rest)) = line.split_once(" on ") else {
             continue;
         };
-        if dir.exists() {
-            return MachineDataState::Present;
+        let Some((path, _)) = rest.rsplit_once(" (") else {
+            continue;
+        };
+        let path = path.trim();
+        if !path.starts_with('/') || !markers.iter().any(|marker| path.contains(marker.as_str())) {
+            continue;
         }
-        state = MachineDataState::Removed;
+        let Some(dir) = path.strip_suffix(LAYER_STORE_MOUNT_SUFFIX) else {
+            continue;
+        };
+        mounts.push((PathBuf::from(path), PathBuf::from(dir)));
     }
-    state
+    mounts
+}
+
+/// Layer-store mounts no live hypervisor is using.
+///
+/// What remains after a hypervisor died without a `stop`/`delete`: an engine
+/// killed mid-teardown, a mutation that deleted the smolvm registry out from
+/// under a running VM, or a SIGKILL purge. A mount whose machine data
+/// directory still has a `_boot-vm` process is live and must be left alone.
+#[cfg(any(target_os = "macos", test))]
+fn orphan_layer_store_mounts(
+    markers: &[String],
+    ps_output: &str,
+    mount_table: &str,
+) -> Vec<PathBuf> {
+    let live: std::collections::BTreeSet<PathBuf> = ps_output
+        .lines()
+        .filter(|line| line.contains(BOOT_VM_PROCESS))
+        .flat_map(|line| boot_config_dirs(line, markers))
+        .map(|dir| canonical_path(&dir))
+        .collect();
+    layer_store_mounts(markers, mount_table)
+        .into_iter()
+        .filter(|(_, dir)| !live.contains(&canonical_path(dir)))
+        .map(|(mount, _)| mount)
+        .collect()
+}
+
+/// Detach layer-store mounts this Preloop home's machines left behind.
+///
+/// A hypervisor killed out-of-band — the crash-purge's SIGKILL, an engine
+/// that exited mid-teardown — leaves its `pack/layers-cs` sparseimage
+/// mounted: the mount outlives the process that made it, and `machine
+/// delete` can no longer reach a machine whose registry row is gone. The
+/// directory then cannot be removed (`Resource busy`), which breaks the
+/// documented way to reset a home, and the attached volume leaks until the
+/// host reboots.
+///
+/// Safe to call while the engine serves: a mount with a live hypervisor is
+/// skipped, and `hdiutil` refuses to detach a busy volume, so a running
+/// machine is never disturbed. The pool runs this at startup and shutdown;
+/// the CLI runs it on every engine exit. A mount that `hdiutil` refuses is
+/// left in place (its hypervisor may have started between the scan and the
+/// detach). No-op where the layer store is not a host mount.
+pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(markers) = home_markers() else {
+            return Ok(0);
+        };
+        let ps = std::process::Command::new("ps")
+            .args(["ax", "-o", "pid=,command="])
+            .output()
+            .map_err(|source| VmError::Launch {
+                program: "ps".to_owned(),
+                source,
+            })?;
+        let mounts = std::process::Command::new("mount")
+            .output()
+            .map_err(|source| VmError::Launch {
+                program: "mount".to_owned(),
+                source,
+            })?;
+        let mut detached = 0usize;
+        for mount in orphan_layer_store_mounts(
+            &markers,
+            &String::from_utf8_lossy(&ps.stdout),
+            &String::from_utf8_lossy(&mounts.stdout),
+        ) {
+            match std::process::Command::new("hdiutil")
+                .args(["detach", "-quiet"])
+                .arg(&mount)
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    detached += 1;
+                    info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
+                }
+                Ok(status) => warn!(
+                    mount = %mount.display(),
+                    %status,
+                    "hdiutil detach refused; leaving the layer mount in place"
+                ),
+                Err(error) => warn!(
+                    mount = %mount.display(),
+                    %error,
+                    "hdiutil detach failed to start"
+                ),
+            }
+        }
+        Ok(detached)
+    }
 }
 
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
@@ -2118,19 +2294,9 @@ pub enum OrphanPurge {
 /// interval while the pool serves (`RemovedDataDir`). Returns the number of
 /// processes killed.
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
-    let Some(preloop_home) = effective_preloop_home() else {
+    let Some(markers) = home_markers() else {
         return Ok(0);
     };
-    let markers: Vec<String> = [
-        preloop_home.join("smolvm"),
-        preloop_home.join("smolvm-home"),
-    ]
-    .iter()
-    .filter_map(|path| path.to_str().map(str::to_owned))
-    .collect();
-    if markers.is_empty() {
-        return Ok(0);
-    }
     let output = std::process::Command::new("ps")
         .args(["ax", "-o", "pid=,command="])
         .output()
@@ -3005,6 +3171,146 @@ mod tests {
         let _ = unknown_child.wait();
         assert!(!process_alive(live_pid), "only the scope spared it");
         assert!(!process_alive(unknown_pid), "only the scope spared it");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Serializes the tests that rewrite `PATH`: fake `mount`/`hdiutil`
+    /// stand-ins resolve through it, and `PATH` is process-global.
+    #[cfg(target_os = "macos")]
+    static PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Prepends `directory` to `PATH` for the test's scope, restoring the
+    /// previous value on drop.
+    #[cfg(target_os = "macos")]
+    struct PathPrependGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PathPrependGuard {
+        fn prepend(directory: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            let mut path = directory.as_os_str().to_owned();
+            path.push(":");
+            if let Some(previous) = &previous {
+                path.push(previous);
+            }
+            // SAFETY: serialized by `PATH_LOCK`.
+            unsafe { std::env::set_var("PATH", path) };
+            Self { previous }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PathPrependGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by `PATH_LOCK`.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// A layer-store mount belongs to a home when it hangs off that home's
+    /// machine directory — in either the raw or the canonical form of the
+    /// path (`mount` prints `/private/tmp/...` for a `/tmp/...` home) — and
+    /// only the mounts no live hypervisor claims may be detached.
+    #[test]
+    fn orphan_layer_store_mounts_spare_machines_with_a_live_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        // Under `/tmp` on purpose: on macOS that is a path *through a
+        // symlink*, so the argv form and the mount-table form differ unless
+        // the scan canonicalizes both sides.
+        let home = std::path::PathBuf::from("/tmp")
+            .join(format!("preloop-layer-mounts-{}", uuid::Uuid::new_v4()));
+        let vms = home.join("smolvm-home/Library/Caches/smolvm/vms");
+        let live = vms.join("aaaaaaaaaaaaaaaa");
+        let orphan = vms.join("bbbbbbbbbbbbbbbb");
+        for dir in [&live, &orphan] {
+            std::fs::create_dir_all(dir.join("pack/layers-cs")).unwrap();
+        }
+        let _home = PreloopHomeGuard::set(&home);
+        let markers = home_markers().expect("this home resolves to markers");
+        let canonical = std::fs::canonicalize(&home).unwrap();
+        let mount_table = format!(
+            "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
+             /dev/disk11s1 on {live}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
+             /dev/disk9s1 on {orphan}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
+             /dev/disk10s1 on /tmp/other-home/smolvm-home/Library/Caches/smolvm/vms/cccccccccccccccc/pack/layers-cs (apfs, local)\n\
+             /dev/disk12s1 on {orphan}/storage (apfs, local)\n",
+            live = canonical
+                .join("smolvm-home/Library/Caches/smolvm/vms/aaaaaaaaaaaaaaaa")
+                .display(),
+            orphan = canonical
+                .join("smolvm-home/Library/Caches/smolvm/vms/bbbbbbbbbbbbbbbb")
+                .display(),
+        );
+        // The live _boot-vm's argv names its machine's boot config (the file
+        // itself is consumed at boot; only the directory is durable).
+        let ps_output = format!(
+            "  501 /Users/x/.smolvm/smolvm-bin _boot-vm {}/boot-config.json\n\
+             502 /usr/bin/unrelated\n",
+            live.display()
+        );
+
+        assert_eq!(
+            orphan_layer_store_mounts(&markers, &ps_output, &mount_table),
+            vec![
+                canonical
+                    .join("smolvm-home/Library/Caches/smolvm/vms/bbbbbbbbbbbbbbbb")
+                    .join("pack/layers-cs")
+            ],
+            "only the mount whose hypervisor is gone may be detached"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The detach pass shells out to `mount` and `hdiutil`; a fake pair on
+    /// `PATH` records the exact argv, so the whole scan → decide → detach
+    /// path is covered without attaching a disk image.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detach_orphaned_layer_mounts_detaches_each_mount_without_a_hypervisor() {
+        let _path_guard = PATH_LOCK.lock();
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-detach-{}", uuid::Uuid::new_v4()));
+        let orphan = home.join("smolvm-home/Library/Caches/smolvm/vms/bbbbbbbbbbbbbbbb");
+        std::fs::create_dir_all(orphan.join("pack/layers-cs")).unwrap();
+        let log = home.join("hdiutil.log");
+        let bin = home.join("fake-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let canonical = std::fs::canonicalize(&orphan).unwrap();
+        let mount = bin.join("mount");
+        std::fs::write(
+            &mount,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \\\n  '/dev/disk3s5 on / (apfs, local, read-only, sealed)' \\\n  '/dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)'\n",
+                canonical.display()
+            ),
+        )
+        .unwrap();
+        let hdiutil = bin.join("hdiutil");
+        std::fs::write(
+            &hdiutil,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for tool in [&mount, &hdiutil] {
+            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = PathPrependGuard::prepend(&bin);
+        let _home = PreloopHomeGuard::set(&home);
+
+        // The real `ps` runs: no `_boot-vm` names this fixture home, so the
+        // mount is provably orphaned.
+        let detached = detach_orphaned_layer_mounts().expect("detach");
+        assert_eq!(detached, 1, "the orphaned layer mount must be detached");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("fake hdiutil log"),
+            format!("detach -quiet {}/pack/layers-cs\n", canonical.display()),
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

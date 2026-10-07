@@ -51,6 +51,9 @@ struct RecordingVmProvider {
     state: Mutex<ProviderState>,
     run_actions: Mutex<Vec<RunAction>>,
     changed: Notify,
+    /// When set, `start` records the machine as running and then blocks until
+    /// notified, so a test can observe the pool mid-provision.
+    start_gate: Option<Arc<Notify>>,
 }
 
 impl RecordingVmProvider {
@@ -66,7 +69,15 @@ impl RecordingVmProvider {
             }),
             run_actions: Mutex::new(run_actions),
             changed: Notify::new(),
+            start_gate: None,
         }
+    }
+
+    /// Block `start` until the gate is released, so a shutdown can be sent
+    /// while a machine is booting.
+    fn with_start_gate(mut self, gate: Arc<Notify>) -> Self {
+        self.start_gate = Some(gate);
+        self
     }
 
     async fn wait_until<F>(&self, predicate: F)
@@ -150,6 +161,9 @@ impl VmProvider for RecordingVmProvider {
         state.events.push(Event::Start(name.as_str().to_owned()));
         drop(state);
         self.notify_changed();
+        if let Some(gate) = &self.start_gate {
+            gate.notified().await;
+        }
         Ok(())
     }
 
@@ -935,6 +949,107 @@ async fn stale_owned_machines_are_removed_without_touching_unrelated_machines() 
             .iter()
             .any(|event| matches!(event, Event::Delete(name) if name == unrelated))
     );
+}
+
+/// A shutdown that arrives while a slot is booting a runner must stop the
+/// pool — and delete the half-built machine — instead of waiting the boot
+/// out until the CLI's bounded stop aborts the whole pool and strands the VM
+/// (with its hypervisor and mounted layer image) on the host.
+#[tokio::test]
+async fn cancellation_during_runner_boot_deletes_the_half_built_machine() {
+    let fixture = Fixture::new("cancel-boot", true);
+    let name_prefix = fixture.config.name_prefix.clone();
+    let gate = Arc::new(Notify::new());
+    let provider = Arc::new(
+        RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
+            .with_start_gate(gate.clone()),
+    );
+    let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    let slot_prefix = format!("{name_prefix}-0-");
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Start(name) if name.starts_with(&slot_prefix)))
+        })
+        .await;
+    let runner = first_slot_machine(&provider.snapshot().await.events, &name_prefix);
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+        .await
+        .expect("a shutdown must stop the pool while a runner is booting");
+    result.unwrap().unwrap();
+
+    let snapshot = provider.snapshot().await;
+    assert!(
+        !snapshot.machines.contains_key(&runner),
+        "the teardown must delete the half-built machine: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+    );
+    gate.notify_waiters();
+}
+
+/// A shutdown that arrives while the golden fork base is being prepared must
+/// stop the pool and remove the half-prepared golden: nothing adopts a golden
+/// without its fingerprint record, so leaving the machine behind only leaks
+/// its VM and layer image.
+#[tokio::test]
+async fn cancellation_during_golden_prepare_removes_the_golden_machine() {
+    let fixture = Fixture::new("cancel-golden", true);
+    let mut config = fixture.config.clone();
+    config.use_fork = true;
+    config.control_socket = Some(fixture.root.join("engine.sock"));
+    let golden = format!("{}-golden", config.name_prefix);
+    let gate = Arc::new(Notify::new());
+    let provider = Arc::new(
+        RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
+            .with_start_gate(gate.clone()),
+    );
+    let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Start(name) if name == &golden))
+        })
+        .await;
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+        .await
+        .expect("a shutdown must stop the pool while the golden is booting");
+    result.unwrap().unwrap();
+
+    let snapshot = provider.snapshot().await;
+    assert!(
+        !snapshot.machines.contains_key(&golden),
+        "the teardown must delete the half-prepared golden: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &golden))
+    );
+    gate.notify_waiters();
 }
 
 #[tokio::test]

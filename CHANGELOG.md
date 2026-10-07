@@ -23,6 +23,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Engine shutdown stops the VMs it owns and never leaves a layer image
+  mounted**: a shutdown signal that arrived while the runner pool was still
+  preparing its golden (unpack or bake) or provisioning a runner never
+  reached the pool's teardown — those continuations did not observe the
+  cancellation token — so the CLI's bounded stop aborted the pool mid-flight
+  and exited with the microVM still running. SmolVM detaches `_boot-vm` from
+  the CLI that spawned it (it survives the parent by design), and a packed
+  machine's `pack/layers-cs` APFS image stays mounted for the life of the VM,
+  so the survivor kept holding its disk and made the Preloop home impossible
+  to remove (`rm -rf` → `Resource busy`) until the host rebooted. The pool now
+  observes the shutdown token at every preparation and provisioning await,
+  tears down on every exit path (slot failures included), and startup and
+  shutdown reconciliation detach layer mounts whose hypervisor is gone; the
+  CLI reaps whatever a cut-short teardown left behind on every engine exit.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the

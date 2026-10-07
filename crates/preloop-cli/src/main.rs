@@ -1968,6 +1968,11 @@ async fn cmd_engine(
         Err(_) => None,
     };
 
+    // Every way out of this process — the normal shutdown below, a slot
+    // failure that ends the pool, an error return — must not leave VMs
+    // running: see `VmTeardownOnExit`.
+    let _vm_teardown = VmTeardownOnExit;
+
     if let Some(pool_task) = pool.as_mut() {
         tokio::select! {
             result = &mut server => { result??; return Ok(()); },
@@ -1986,11 +1991,54 @@ async fn cmd_engine(
             .await
             .is_err()
     {
+        // The pool did not reach its own teardown inside the window (it can
+        // be stuck in a provider call that does not take the token). The
+        // exit guard stops whatever it left behind.
         pool_task.abort();
     }
     server.abort();
     let _ = std::fs::remove_file(socket);
     Ok(())
+}
+
+/// Stop every VM this engine owns as the process exits.
+///
+/// SmolVM's `_boot-vm` hypervisor is detached from the CLI that spawned it —
+/// it survives the parent by design — and each packed machine's
+/// `pack/layers-cs` APFS sparseimage stays mounted for the life of the VM. An
+/// engine that exits with a machine still running (a teardown cut short by
+/// the shutdown window, a slot that failed the pool, an error return) leaves
+/// a hypervisor and a mount nothing can reach: the next engine cannot adopt
+/// them, and the home cannot even be removed — `rm -rf` fails with
+/// `Resource busy` — until the host reboots.
+///
+/// The pool runs its own teardown on every path it reaches; this is the
+/// backstop for the paths it does not. Both steps are safe against a live
+/// machine: the purge keys on this home's boot-config paths (and `All` is
+/// sound because by now this process is exiting, so nothing of ours can be
+/// running), and a mount whose hypervisor still exists is skipped.
+struct VmTeardownOnExit;
+
+impl Drop for VmTeardownOnExit {
+    fn drop(&mut self) {
+        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+            Ok(killed) if killed > 0 => {
+                tracing::info!(
+                    killed,
+                    "purged orphaned SmolVM hypervisor processes at exit"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "orphaned hypervisor purge at exit failed"),
+        }
+        match preloop_vm::detach_orphaned_layer_mounts() {
+            Ok(detached) if detached > 0 => {
+                tracing::info!(detached, "detached orphaned SmolVM layer mounts at exit")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "orphaned layer-mount detach at exit failed"),
+        }
+    }
 }
 
 async fn engine_shutdown_signal() {
