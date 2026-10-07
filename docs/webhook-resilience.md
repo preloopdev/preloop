@@ -1,5 +1,9 @@
 # Webhook resilience
 
+> The queue, retry and detection design that supersedes the parts of this
+> document below is in [GitHub resiliency](./github-resiliency.md); the layers
+> here remain the backstop.
+
 GitHub sends each webhook **once**. A non-2xx response, a 10-second timeout,
 or a host that is not there produces a red row in the App's delivery history
 and nothing else — there is no automatic retry, ever. preloop's answer is a
