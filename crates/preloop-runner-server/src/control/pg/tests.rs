@@ -1739,9 +1739,17 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
     )
     .await
     .unwrap();
-    assert_eq!(cancelled.len(), 2, "two siblings cancelled");
+    // `logic::matrix_fail_fast` selects every non-terminal row of the base:
+    // the two legs and the parent placeholder (still `pending` here — a real
+    // expansion terminalizes the parent when it expands).
+    assert_eq!(
+        cancelled.len(),
+        3,
+        "the base's non-terminal rows are cancelled"
+    );
     assert!(cancelled.contains(&JobId("build-1".to_owned())));
     assert!(cancelled.contains(&JobId("build-2".to_owned())));
+    assert!(cancelled.contains(&JobId("build".to_owned())));
 
     // Verify DB state.
     let st: String = tx
@@ -1779,7 +1787,10 @@ async fn cancel_fail_fast_siblings_respects_the_opt_out() {
     let leg0 = submit_job(run_id, "build-0", 2);
     let leg1 = submit_job(run_id, "build-1", 3);
     let mut submit = submit_run(run_id, vec![build, leg0, leg1]);
-    submit.record.job_fail_fast.insert("build".to_owned(), false);
+    submit
+        .record
+        .job_fail_fast
+        .insert("build".to_owned(), false);
     node.submit_run(submit).await.unwrap();
 
     let mut client = node.writer().await.unwrap();
@@ -1795,6 +1806,14 @@ async fn cancel_fail_fast_siblings_respects_the_opt_out() {
         .await
         .unwrap();
     }
+    // The base opted out: every spec row of the base carries the flag.
+    tx.execute(
+        "UPDATE job_specs SET fail_fast=false \
+         WHERE run_id=$1::text::uuid AND job_id IN ('build','build-0','build-1')",
+        &[&run],
+    )
+    .await
+    .unwrap();
     tx.execute(
         "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
         &[&run],

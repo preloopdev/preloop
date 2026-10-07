@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **Postgres completions no longer load the run graph**: `settle_job` and
+  `complete_job` write the terminal transition, retire the attempt, fail-fast
+  the siblings, fold reusable callers, refresh the dependents'
+  `remaining_needs` and summarize the run with targeted statements. The graph
+  is materialized only when a completion actually makes a dependent
+  promotable — promotion (needs hydration, gates, max-parallel cohorts,
+  deferred expansion) still runs the shared sweep — so a leg of a large
+  fan-out settles without touching the rest of the run. Fail-fast now cancels
+  every non-terminal sibling of the base, releasing its concurrency hold and
+  queueing the runner cancellation, matching the SQLite path.
 
 ### Security
 

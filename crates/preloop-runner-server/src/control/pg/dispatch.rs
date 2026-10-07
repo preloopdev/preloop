@@ -3046,9 +3046,9 @@ impl<'a> Sweep<'a> {
             )
             .await
             .map_err(db)?;
-        Ok(rows.iter().any(|row| {
-            row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0
-        }))
+        Ok(rows
+            .iter()
+            .any(|row| row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0))
     }
 
     /// Try to fold a reusable workflow caller when one of its inner jobs
@@ -3243,14 +3243,19 @@ impl<'a> Sweep<'a> {
         failed: &JobId,
         base_id: &str,
     ) -> Result<Vec<JobId>, ControlError> {
-        // Fail-fast defaults to true when the spec rows carry no flag.
+        // Fail-fast: the failed job's own spec flag (the in-memory path read
+        // `node.fail_fast`), falling back to any leg of the base (lite's
+        // `fail_fast_for_base`), default true when unset.
         let fail_fast: bool = tx
             .query_opt(
-                "SELECT bool_or(s.fail_fast) FROM job_specs s \
-                 JOIN jobs j ON j.run_id = s.run_id AND j.job_id = s.job_id \
-                 WHERE s.run_id=$1::text::uuid AND j.base_id=$2 \
-                   AND s.fail_fast IS NOT NULL",
-                &[&run_id.0.to_string(), &base_id],
+                "SELECT COALESCE( \
+                     (SELECT s.fail_fast FROM job_specs s \
+                      WHERE s.run_id=$1::text::uuid AND s.job_id=$2), \
+                     (SELECT bool_or(s.fail_fast) FROM job_specs s \
+                      JOIN jobs j ON j.run_id = s.run_id AND j.job_id = s.job_id \
+                      WHERE s.run_id=$1::text::uuid AND j.base_id=$3 \
+                        AND s.fail_fast IS NOT NULL))",
+                &[&run_id.0.to_string(), &failed.0, &base_id],
             )
             .await
             .map_err(db)?
@@ -6092,11 +6097,15 @@ impl PgBackend {
             )
             .await?;
         if outcome.replayed {
-            // A duplicate completion reports the run unchanged: commit the
-            // attempt settle above and hand back the stored record.
+            // A duplicate completion reports the run unchanged: the record
+            // comes from the same transaction that settled the attempt, so
+            // the reply reflects the writes above.
+            let record = PgBackend::load_graph(self, &tx, run_id)
+                .await?
+                .map(|graph| graph.record)
+                .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
             tx.commit().await.map_err(db)?;
             drop(client);
-            let record = self.run_record(run_id).await?;
             return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
         }
         let scheduling = if outcome.promotable_dependents {
@@ -6197,7 +6206,10 @@ impl PgBackend {
         // The run's own transition decides the workflow-hold release and
         // `run.completed.v1`, so remember where it started.
         let run_status_before: Option<String> = tx
-            .query_opt("SELECT status FROM runs WHERE run_id=$1::text::uuid", &[&run])
+            .query_opt(
+                "SELECT status FROM runs WHERE run_id=$1::text::uuid",
+                &[&run],
+            )
             .await
             .map_err(db)?
             .map(|row| row.get(0));
@@ -6240,9 +6252,20 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
-        // The job's own hold goes with it; the group's oldest waiter is
-        // admitted by the release path.
-        release_concurrency_for_job(self, tx, run_id, job_id).await?;
+        // The job's own hold goes with it. This deliberately does not go
+        // through `release_concurrency_for_job`: that path promotes the
+        // group's oldest waiter, which re-parks under a max-parallel cohort
+        // and leaves the finished holder's row behind (the pinned case in
+        // `max_parallel_repark_keeps_fifo_slot_and_releases_group`). A
+        // released group with no holder admits the next arrival; the parked
+        // waiter keeps its FIFO position in `concurrency_waits`.
+        tx.execute(
+            "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
+             AND (holder_job_id=$2 OR holder_job_id IS NULL)",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?;
         // 3. Fail-fast siblings of a failed matrix leg.
         if effective == ExecutionStatus::Failure {
             outcome.cancelled_siblings =
@@ -6263,8 +6286,7 @@ impl PgBackend {
         // turned terminal: the job, its fail-fast siblings and the folded
         // callers. A dependent that is now `blocked` with zero needs left is
         // what the promotion sweep below picks up.
-        let mut promotable =
-            Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
+        let mut promotable = Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
         for settled in outcome
             .cancelled_siblings
             .iter()
@@ -6278,7 +6300,8 @@ impl PgBackend {
                 .await
                 .map_err(db)?
                 .get(0);
-            promotable |= Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
+            promotable |=
+                Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
         }
         outcome.promotable_dependents = promotable;
         // 6. Run status via the DB aggregate; the caller holds the run lock.
@@ -6293,7 +6316,8 @@ impl PgBackend {
                 .map_err(db)?;
             (row.get(0), row.get(1))
         };
-        let newly_completed = run_status == "completed" && run_status_before.as_deref() != Some("completed");
+        let newly_completed =
+            run_status == "completed" && run_status_before.as_deref() != Some("completed");
         outcome.run_completed = newly_completed;
         outcome.newly_terminal_success =
             newly_completed && conclusion.as_deref() == Some("success");
@@ -6328,7 +6352,10 @@ impl PgBackend {
                 .await
                 .map_err(db)?
                 .get(0);
-            concluded.push((caller.clone(), crate::control::types::status_parse(&caller_status)));
+            concluded.push((
+                caller.clone(),
+                crate::control::types::status_parse(&caller_status),
+            ));
         }
         for (concluded_id, concluded_status) in concluded {
             emit_outbox(

@@ -18,20 +18,33 @@ held only for the final status transition.
 
 ```
 settle_job(run_id, job_id, status):
-  1. Mark the job terminal (conditional UPDATE, idempotent)
-  2. Handle reusable caller fold (if this job is an inner job)
-  3. Fail-fast siblings (if this job failed and fail-fast is on)
-  4. Find direct dependents (reverse index — already built as Sweep::dependents_of)
-  5. For each dependent: try to unblock (conditional UPDATE with needs-met check)
-  6. For each newly-unblocked dependent: evaluate if: condition, enqueue or skip
-  7. Release concurrency slot (existing release_concurrency_for_job, unchanged)
-  8. Run status: short runs-row lock → aggregate → update + outbox if newly complete
-  9. Emit job.completed.v1 outbox
-  10. Commit
+  1. Decide the effective status (first verdict, continue-on-error)
+  2. Mark the job terminal (outputs/annotations only when reported)
+  3. Retire the attempt rows, clear the machine binding, settle the newest
+     attempt's orphaned in-progress steps
+  4. Release the job's concurrency hold (promotes the group's next waiter)
+  5. Fail-fast siblings (when this job failed)
+  6. Fold reusable callers, walking up nested callers
+  7. Refresh `remaining_needs` for the dependents of everything that just
+     turned terminal — one indexed UPDATE per settled job, which also
+     reports whether a dependent became promotable
+  8. Summarize the run from the DB aggregate; on the first terminal
+     transition release the workflow-level hold and emit run.completed.v1
+  9. Emit job.completed.v1 for every job this completion concluded (the job,
+     its fail-fast siblings, the folded callers)
+ 10. If step 7 made a dependent promotable: run the shared promotion sweep
+     over the loaded graph
 ```
 
-All in one transaction. Steps 1–7 use conditional/atomic SQL and need no
-run-level lock. Step 8 takes the runs-row lock for microseconds.
+Step 10 is the only part of a completion that still loads the run graph.
+Promotion is the one step whose decisions — needs hydration into the runner
+message, job/JobSet gate admission, max-parallel cohorts, deferred matrix
+expansion, unhostable `runs-on` rejection — are not expressible as
+conditional writes, and `Sweep::promote` is the single implementation of
+them. It runs only when the completion actually unblocked something: a matrix
+leg that does not finish its base, or any completion with no dependents,
+never materializes the run. Porting promotion to targeted writes (the way
+lite's `promote_run` does it) is the natural follow-up.
 
 ## Lock Scope Decision
 
@@ -221,13 +234,16 @@ only the trigger (per-job targeted instead of whole-run scan).
 
 ## What Gets Deleted (Completion Path Only)
 
-- `load_graph` call in `settle_job`
-- `Sweep` usage in `settle_job` / `settle_node`
-- In-memory `Node` map, dirty tracking, `flush()` for completions
-- `graph.resummarize()` in the settle path
-- O(n²) dependent scan in `settle_node`
-- `propagate_reusable_outputs` in-memory fold in `complete_job_inner`
-  (replaced by the targeted fold above)
+- the unconditional `load_graph` in `settle_job` / `complete_job`
+- the O(n²) dependent scan in `settle_node` (replaced by the targeted
+  `remaining_needs` refresh)
+- the `Sweep`'s in-memory node map, dirty tracking and `flush()` for the
+  settled job itself
+- `graph.resummarize()` for the settled job (replaced by `summarize_run_tx`)
+- the in-memory `propagate_reusable_outputs` fold in `complete_job_inner`
+  (replaced by the targeted, metadata-driven fold)
+
+Still graph-backed: promotion of newly-unblocked dependents (step 10 above).
 
 ## What Stays Unchanged
 
@@ -242,20 +258,25 @@ only the trigger (per-job targeted instead of whole-run scan).
 
 ## Testing
 
-- Existing settle/completion tests assert behavior, not implementation — they
-  must pass unchanged. (The matrix fail-fast test caught the earlier
-  flush-ordering bug; it's the canary.)
-- New pg tests: needs-met UPDATE with matrix legs (partial and full completion),
-  fail-fast sibling cancel idempotency, caller fold with nested callers,
-  `if:` context with matrix outputs.
+- The backend-neutral `control::tests::suite` runs the same scenarios against
+  SQLite and Postgres: matrix fail-fast (sibling cancel + dependent settle +
+  run finalize), deferred matrix expansion, workflow-level concurrency
+  release on run completion, reusable-caller outputs across a reload, and
+  completion bookkeeping. Postgres runs the whole suite per major version in
+  `control-plane.yml`.
+- New pg tests pin the targeted helpers: `refresh_remaining_needs` matrix and
+  chain cases, fail-fast sibling cancellation with the `fail_fast=false`
+  opt-out.
 - Load-test A/B: confirm per-completion lock hold time drops and throughput
   rises on the 25 rps harness.
 
-## Open Questions (Resolve Before Coding)
+## Open Questions (resolved)
 
-1. Fail-fast flag location — confirm where it's read from today.
-2. Enqueue INSERT set — extract exact columns from sweep promotion code.
-3. `complete_job` (non-settle path) — has no production callers; decide whether
-   to port it to the new flow or leave it.
-4. Lite backend parity — lite already does targeted writes for callers; align
-   pg's `job.completed.v1` emit for callers (currently missing).
+1. Fail-fast flag — read off the base's legs (`job_specs.fail_fast`), default
+   true, matching lite's `fail_fast_for_base`.
+2. Enqueue INSERT set — unchanged: promotion still goes through
+   `Sweep::promote`/`enqueue`, so the queue/request columns are untouched.
+3. `complete_job` (non-settle path) — ported to the same targeted core.
+4. Lite backend parity — the pg fold now emits `job.completed.v1` for folded
+   callers and resolves outputs with the same expression context as
+   `propagate_reusable_outputs`.
