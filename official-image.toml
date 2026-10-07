@@ -62,9 +62,16 @@ golden_step_env_unset = "TERM,COLORTERM"
 # no prlimit value is a literal in the init: each line must agree with the
 # primitive keys above (the unit test `guest_runtime_values_come_from_official_image_toml`
 # fails if they drift).
+#
+# The nofile raise is order-independent: hard first (refused and ignored when
+# the inherited hard is above the target and the kernel rejects lowering it
+# under a higher soft), soft second, hard again to pin it — so an inherited
+# 1024/4096 and an inherited 1048576/1048576 both end at 65536/65536, where a
+# soft-before-hard raise left the AgentENV exec channel at soft 1024 / hard
+# 65536 (the soft raise hit EPERM above the old hard and was swallowed).
 golden_stack_ulimit_raise = "ulimit -Hs unlimited; ulimit -Ss 16384"
-golden_nofile_ulimit_raise = "ulimit -Sn 65536; ulimit -Hn 65536"
-golden_nofile_ulimit_raise_best_effort = "ulimit -Sn 65536 2>/dev/null || true; ulimit -Hn 65536 2>/dev/null || echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2"
+golden_nofile_ulimit_raise = "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536"
+golden_nofile_ulimit_raise_best_effort = "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true; ulimit -Hn 65536 2>/dev/null || echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2"
 golden_stack_soft_bytes = "16777216"
 golden_stack_prlimit = "16777216:unlimited"
 golden_nofile_prlimit = "65536:65536"
