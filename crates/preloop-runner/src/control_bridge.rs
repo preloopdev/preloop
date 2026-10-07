@@ -716,7 +716,11 @@ mod tests {
         .expect("a configured transport yields a bridge");
 
         let bound = bridge.address();
-        assert_ne!(bound.port(), 0, "the advertised address names the bound port");
+        assert_ne!(
+            bound.port(),
+            0,
+            "the advertised address names the bound port"
+        );
         assert_ne!(bound, held, "{held} is held by another process");
     }
 

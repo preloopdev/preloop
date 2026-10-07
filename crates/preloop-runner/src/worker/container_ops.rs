@@ -962,10 +962,8 @@ pub async fn container_engine_access(network: Option<&str>) -> Option<ContainerE
     // Any free port works: the rewrite replaces the whole origin. Reusing the
     // engine's port would collide with whatever the workflow itself listens
     // on there (a published service port, a step's server).
-    let bridge = match crate::control_bridge::spawn_container_reachable(SocketAddr::new(
-        gateway, 0,
-    ))
-    .await
+    let bridge = match crate::control_bridge::spawn_container_reachable(SocketAddr::new(gateway, 0))
+        .await
     {
         Ok(Some(bridge)) => bridge,
         Ok(None) => return None,
