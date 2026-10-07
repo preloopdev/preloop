@@ -4,7 +4,11 @@ name: official-golden
 #
 # Release jobs consume published goldens; they never bake. This workflow owns
 # the bake side, triggered three ways:
-# - `push` touching official-image.toml (a pin bump means rebuild);
+# - `pull_request` touching official-image.toml — but only a change to the
+#   `official_runner_image_base_*` image pins starts a bake: the same file also
+#   carries the `golden_*` launch-time runtime expectations, which are not bake
+#   inputs, and `image-pins-changed` below skips the bake when only those moved
+#   (the weekly runtime-drift bump PR is exactly that case);
 # - weekly `schedule`, which only runs the drift check below;
 # - manual `workflow_dispatch` with an arch selector.
 on:
@@ -84,9 +88,43 @@ jobs:
           git push -u origin "$BRANCH"
           gh pr create --base main --head "$BRANCH"             --title "chore(golden): update official image pins to upstream rebuild"             --body "Weekly drift check found the dump pipeline's floating tags ahead of the pins. Merging rebuilds the official goldens via push trigger."
 
+  image-pins-changed:
+    name: Do the image pins change?
+    # official-image.toml carries two classes of keys: the
+    # `official_runner_image_base_*` image pins, which decide a golden rebuild,
+    # and the `golden_*` launch-time runtime expectations (process limits,
+    # sysctls, hostname contract, step-env contract), which are applied per
+    # guest and per launch and are not baked in. Only the former may start a
+    # ~60 GiB bake.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Diff the image pins between base and head
+        id: diff
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          before="$(git show "FETCH_HEAD:official-image.toml" | grep -E '^official_runner_image_base_(amd64|arm64) = ' || true)"
+          after="$(grep -E '^official_runner_image_base_(amd64|arm64) = ' official-image.toml || true)"
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "the image pins are unchanged; the golden_* runtime keys do not need a bake"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true
+          fi
+
   build-official-x86_64:
     name: Build official x86_64 golden
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64'))
+    needs: image-pins-changed
+    if: ${{ (github.event_name == 'pull_request' && needs.image-pins-changed.outputs.changed == 'true') || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
