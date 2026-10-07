@@ -556,8 +556,8 @@ where
 
 /// Name of the first machine slot 0 created.
 ///
-/// Slot machines carry a generation suffix so a replacement can be built while
-/// its predecessor is still alive, so tests resolve the name instead of
+/// Slot machines carry a generation suffix so consecutive runners get distinct
+/// names across the fork/delete cycle, so tests resolve the name instead of
 /// assuming one machine per slot.
 fn first_slot_machine(events: &[Event], name_prefix: &str) -> String {
     let slot_prefix = format!("{name_prefix}-0-");
@@ -930,54 +930,44 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
     }
 }
 
-/// A slot must build its replacement while the current job is still running,
-/// and must still tear the finished runner down.
+/// A slot must hold at most one VM: the next runner is forked only after the
+/// finished job's machine was deleted.
 ///
-/// Waiting for the job to end before provisioning put a fork plus a full
-/// runner registration in front of every job that arrives while the pool is
-/// saturated — the cost a matrix workflow pays on every shard past the pool
-/// size.
+/// Fork-on-completion trades the successor's head start for half the VMs per
+/// slot; if a fork ever outlived the previous VM, the pool would neither get
+/// that saving nor the speedup.
 #[tokio::test]
-async fn slot_builds_its_replacement_while_the_job_runs() {
+async fn slot_never_holds_two_vms_at_once() {
     let fixture = Fixture::new("replenish", true);
     let provider = Arc::new(RecordingVmProvider::with_machines(
         &[],
-        vec![RunAction::Complete, RunAction::Wait],
+        vec![RunAction::Complete, RunAction::Complete, RunAction::Wait],
     ));
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
     run_until_cancelled(pool, &provider, CancellationToken::new(), 2).await;
 
     let events = provider.snapshot().await.events;
     let slot_prefix = fixture.config.name_prefix.clone() + "-0-";
-    let (first_run, first_runner) = events
-        .iter()
-        .enumerate()
-        .find_map(|(index, event)| match event {
-            Event::Exec(name, argv)
-                if name.starts_with(&slot_prefix) && argv.iter().any(|arg| arg == "run") =>
-            {
-                Some((index, name.clone()))
+    let mut live = std::collections::HashSet::new();
+    let mut created = 0usize;
+    for event in &events {
+        match event {
+            Event::Create(name) if name.starts_with(&slot_prefix) => {
+                created += 1;
+                assert!(
+                    live.insert(name.clone()),
+                    "{name} was forked while {live:?} was still alive: {events:?}"
+                );
             }
-            _ => None,
-        })
-        .expect("the slot ran a runner");
-
-    let replacement_created = events
-        .iter()
-        .enumerate()
-        .position(|(index, event)| {
-            index > first_run
-                && matches!(event, Event::Create(name) if name.starts_with(&slot_prefix) && name != &first_runner)
-        })
-        .expect("the slot created a replacement runner");
-    let first_deleted = events
-        .iter()
-        .position(|event| matches!(event, Event::Delete(name) if name == &first_runner))
-        .expect("the finished runner was deleted");
-
+            Event::Delete(name) => {
+                live.remove(name);
+            }
+            _ => {}
+        }
+    }
     assert!(
-        replacement_created < first_deleted,
-        "replacement must be built before the finished runner is torn down, got {events:?}"
+        created >= 2,
+        "the slot must have replaced its VM after the first job: {events:?}"
     );
 }
 
