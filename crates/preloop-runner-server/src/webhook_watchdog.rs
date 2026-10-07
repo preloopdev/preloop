@@ -544,6 +544,11 @@ struct RepairTarget<'a> {
 /// landed locally are closed; the rest are requested again under the same
 /// per-GUID backoff and attempt cap as the scan, which keeps the retry rate
 /// bounded and never replays untracked history.
+///
+/// The scan is App-scoped and skips rows at the attempt cap *in the query*:
+/// the window is bounded, and a global scan would let another App's backlog,
+/// or rows already at the cap (never retried again), fill it and starve this
+/// App's repairs out of it.
 async fn retry_open_repairs(
     shared: &Arc<SharedState>,
     app: &GitHubAppCredentials,
@@ -553,16 +558,12 @@ async fn retry_open_repairs(
     let open = shared
         .state
         .backend
-        .open_webhook_redeliveries(OPEN_REPAIR_SCAN_LIMIT)
+        .retryable_webhook_redeliveries(&app.app_id, max_attempts(), OPEN_REPAIR_SCAN_LIMIT)
         .await?;
-    let mine: Vec<&WebhookRedeliveryRecord> = open
-        .iter()
-        .filter(|record| record.app_id == app.app_id)
-        .collect();
-    if mine.is_empty() {
+    if open.is_empty() {
         return Ok(0);
     }
-    let guids: Vec<String> = mine
+    let guids: Vec<String> = open
         .iter()
         .map(|record| record.delivery_guid.clone())
         .collect();
@@ -573,15 +574,20 @@ async fn retry_open_repairs(
         .await?;
     let now = now_us();
     let mut redelivered = 0;
-    for record in mine {
+    for record in &open {
         if present.contains(&record.delivery_guid) {
             // A repair that finally landed. Closing it here is what keeps
-            // the backlog gauge meaningful.
-            shared
+            // the backlog gauge meaningful. The close is best-effort: one
+            // store hiccup must not abort the pass before the history scan
+            // runs — the row simply closes on a later pass.
+            if let Err(error) = shared
                 .state
                 .backend
                 .resolve_webhook_redelivery(&record.delivery_guid, now)
-                .await?;
+                .await
+            {
+                tracing::warn!(guid = %record.delivery_guid, ?error, "failed to close webhook repair");
+            }
             continue;
         }
         let target = RepairTarget {
@@ -1223,25 +1229,40 @@ mod tests {
         assert_eq!(stub.attempts(), 1);
     }
 
-    /// An open repair row for `guid`, as an older pass would have left it:
-    /// one attempt, long past its backoff.
-    async fn seed_open_repair(shared: &Arc<SharedState>, guid: &str, delivery_id: i64) {
+    /// One repair row with a chosen owner, attempt count and history:
+    /// first seen `first_seen_secs_ago`, last tried `last_attempt_secs_ago`
+    /// (never, when `None`).
+    async fn seed_repair_row(
+        shared: &Arc<SharedState>,
+        guid: &str,
+        delivery_id: i64,
+        app_id: &str,
+        attempts: u32,
+        first_seen_secs_ago: i64,
+        last_attempt_secs_ago: Option<i64>,
+    ) {
         shared
             .state
             .backend
             .upsert_webhook_redelivery(&WebhookRedeliveryRecord {
                 delivery_guid: guid.to_owned(),
                 github_delivery_id: delivery_id,
-                app_id: "424".to_owned(),
+                app_id: app_id.to_owned(),
                 reason: WebhookRepairReason::RemoteFailure,
-                attempts: 1,
-                first_seen_at_us: now_us() - 3600 * 1_000_000,
-                last_attempt_at_us: Some(now_us() - 3600 * 1_000_000),
+                attempts,
+                first_seen_at_us: now_us() - first_seen_secs_ago * 1_000_000,
+                last_attempt_at_us: last_attempt_secs_ago.map(|secs| now_us() - secs * 1_000_000),
                 resolved_at_us: None,
                 last_error: Some("redelivery request failed: 500".to_owned()),
             })
             .await
             .unwrap();
+    }
+
+    /// An open repair row for `guid`, as an older pass would have left it:
+    /// one attempt, long past its backoff.
+    async fn seed_open_repair(shared: &Arc<SharedState>, guid: &str, delivery_id: i64) {
+        seed_repair_row(shared, guid, delivery_id, "424", 1, 3600, Some(3600)).await;
     }
 
     #[tokio::test]
@@ -1371,6 +1392,136 @@ mod tests {
         assert!(
             cursor.scan_cursor.is_none(),
             "the pre-adoption scan must not be resumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_scan_reaches_repairs_behind_a_full_backlog() {
+        // The retry pass reads a bounded window. Filled by another App's
+        // backlog or by rows of this App that have burned every attempt,
+        // the window never reaches a repair that can still be made; the
+        // scan is scoped and capped in the query, so the starvers cannot
+        // occupy it.
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api_base, attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let (_temp, shared) = shared_with_app(&api_base).await;
+        seed_watermark(&shared, 600).await;
+        // Oldest first: half the window belongs to another App, half to
+        // capped rows of this App.
+        for i in 0..500 {
+            seed_repair_row(
+                &shared,
+                &format!("guid-other-{i}"),
+                1000 + i,
+                "999",
+                1,
+                7200,
+                Some(7200),
+            )
+            .await;
+        }
+        for i in 0..500 {
+            seed_repair_row(
+                &shared,
+                &format!("guid-capped-{i}"),
+                2000 + i,
+                "424",
+                max_attempts(),
+                7100,
+                Some(7100),
+            )
+            .await;
+        }
+        seed_repair_row(&shared, "guid-retryable", 3000, "424", 1, 3600, Some(3600)).await;
+
+        let outcome = watchdog_poll_once(&shared).await.unwrap();
+
+        assert_eq!(
+            outcome.redelivered, 1,
+            "the one repair that can still be made is reached"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shared
+                .state
+                .backend
+                .load_webhook_redelivery("guid-retryable")
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            2
+        );
+        // The backlog gauge still reads the global query: capped rows stay
+        // counted (up to its own window).
+        assert_eq!(
+            shared
+                .state
+                .backend
+                .open_webhook_redeliveries(OPEN_REPAIR_SCAN_LIMIT)
+                .await
+                .unwrap()
+                .len(),
+            OPEN_REPAIR_SCAN_LIMIT,
+            "capped and other-App rows must remain in the gauge's backlog"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_scan_prefers_the_longest_waiting_repairs() {
+        // A window full of rows still in backoff must not hide a row that
+        // is already due: rows are read longest-since-last-attempt first,
+        // not oldest-seen first.
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api_base, attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let (_temp, shared) = shared_with_app(&api_base).await;
+        seed_watermark(&shared, 600).await;
+        // Seen two hours ago, tried one second ago: five minutes of backoff
+        // left, and older by first sight than the row that is due.
+        for i in 0..1000 {
+            seed_repair_row(
+                &shared,
+                &format!("guid-backoff-{i}"),
+                4000 + i,
+                "424",
+                1,
+                7200,
+                Some(1),
+            )
+            .await;
+        }
+        // Seen an hour ago, last tried fifty minutes ago: due now, but the
+        // newest by first sight.
+        seed_repair_row(&shared, "guid-due", 5000, "424", 1, 3600, Some(3000)).await;
+
+        let outcome = watchdog_poll_once(&shared).await.unwrap();
+
+        assert_eq!(outcome.redelivered, 1, "the due repair is reached");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shared
+                .state
+                .backend
+                .load_webhook_redelivery("guid-due")
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            2
+        );
+        assert_eq!(
+            shared
+                .state
+                .backend
+                .load_webhook_redelivery("guid-backoff-0")
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            1,
+            "rows inside their backoff window are not re-requested"
         );
     }
 

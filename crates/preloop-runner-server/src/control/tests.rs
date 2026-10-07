@@ -1670,6 +1670,91 @@ pub(crate) mod suite {
         assert_eq!((stats.received, stats.done), (0, 1));
     }
 
+    /// The repair retry window is App-scoped and skips rows at the attempt
+    /// cap in the query, so a backlog of another App's repairs — or of rows
+    /// that have burned every attempt — cannot fill it and starve this
+    /// App's. Rows are read longest-waiting first, and the backlog gauge
+    /// keeps every unresolved row, capped ones included.
+    pub(crate) async fn retryable_redeliveries_are_scoped_capped_and_ordered(
+        backend: &dyn ControlBackend,
+    ) {
+        use crate::models::{WebhookRedeliveryRecord, WebhookRepairReason};
+        let repair =
+            |guid: &str, app_id: &str, attempts: u32, first_seen_us: i64, last_attempt_us: i64| {
+                WebhookRedeliveryRecord {
+                    delivery_guid: guid.to_owned(),
+                    github_delivery_id: 7,
+                    app_id: app_id.to_owned(),
+                    reason: WebhookRepairReason::RemoteFailure,
+                    attempts,
+                    first_seen_at_us: first_seen_us,
+                    last_attempt_at_us: Some(last_attempt_us),
+                    resolved_at_us: None,
+                    last_error: None,
+                }
+            };
+        // Another App's repair, oldest of all.
+        backend
+            .upsert_webhook_redelivery(&repair("other", "999", 1, 10, 10))
+            .await
+            .unwrap();
+        // This App's repair, at the attempt cap: never retried again.
+        backend
+            .upsert_webhook_redelivery(&repair("capped", "424", 5, 20, 20))
+            .await
+            .unwrap();
+        // This App's retryable repairs, ordered here so the two orders
+        // disagree: "waiting" is newer by first sight but was attempted
+        // longer ago, so only a last-attempt order reads it first.
+        backend
+            .upsert_webhook_redelivery(&repair("recent", "424", 1, 30, 100))
+            .await
+            .unwrap();
+        backend
+            .upsert_webhook_redelivery(&repair("waiting", "424", 1, 40, 50))
+            .await
+            .unwrap();
+
+        let guids = |rows: Vec<WebhookRedeliveryRecord>| -> Vec<String> {
+            rows.into_iter().map(|row| row.delivery_guid).collect()
+        };
+        assert_eq!(
+            guids(
+                backend
+                    .retryable_webhook_redeliveries("424", 5, 10)
+                    .await
+                    .unwrap()
+            ),
+            ["waiting", "recent"],
+            "capped and other-App rows must not occupy the retry window"
+        );
+        assert_eq!(
+            guids(
+                backend
+                    .retryable_webhook_redeliveries("424", 5, 1)
+                    .await
+                    .unwrap()
+            ),
+            ["waiting"],
+            "the window is bounded by the limit"
+        );
+        assert_eq!(
+            guids(
+                backend
+                    .retryable_webhook_redeliveries("999", 5, 10)
+                    .await
+                    .unwrap()
+            ),
+            ["other"],
+            "another App's rows are read for that App only"
+        );
+        assert_eq!(
+            guids(backend.open_webhook_redeliveries(10).await.unwrap()),
+            ["other", "capped", "recent", "waiting"],
+            "the backlog gauge keeps every unresolved row, oldest first"
+        );
+    }
+
     pub(crate) async fn run_record_round_trips_through_tables(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         // The normalized schema reconstructs the run from the submitted job
@@ -6029,6 +6114,14 @@ mod pg {
         suite::webhook_inbox_claim_is_fenced_and_deduplicated(&backend).await;
     }
 
+    #[tokio::test]
+    async fn retryable_redeliveries_are_scoped_capped_and_ordered() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::retryable_redeliveries_are_scoped_capped_and_ordered(&backend).await;
+    }
+
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
         // Distinct `run_number` per submit: the agreed schema keys
         // `runs_number` on (namespace, repo, path, number, attempt), so
@@ -6829,6 +6922,14 @@ mod lite {
     async fn webhook_inbox_claim_is_fenced_and_deduplicated() {
         suite::webhook_inbox_claim_is_fenced_and_deduplicated(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn retryable_redeliveries_are_scoped_capped_and_ordered() {
+        suite::retryable_redeliveries_are_scoped_capped_and_ordered(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]

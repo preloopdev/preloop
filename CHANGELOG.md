@@ -65,7 +65,9 @@ Releases before v0.27.0 predate the changelog.
   table directly from the delivery ids it stores: rows whose delivery landed
   locally close, the rest are requested again under the same per-GUID
   backoff and attempt cap as the scan, so untracked history is still never
-  replayed.
+  replayed. The retry scan reads this App's rows that are still below the
+  attempt cap, so another App's backlog — or rows at the cap — cannot fill
+  the bounded window and starve newer repairs out of it.
 
 - **The conformance campaign survives a second run against the same
   Postgres database**: `conformance-5repos.sh` wiped the campaign home,

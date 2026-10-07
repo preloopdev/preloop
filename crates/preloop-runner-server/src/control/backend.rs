@@ -1014,6 +1014,16 @@ pub(crate) trait ControlBackend: Send + Sync {
         &self,
         limit: usize,
     ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Unresolved repairs of one App that still have attempts left, in
+    /// retry order (see the storage implementations). App-scoped and capped
+    /// in SQL: another App's backlog, or rows already at the cap, can never
+    /// fill the retry window and starve this App's repairs.
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,
@@ -2845,6 +2855,23 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.open_webhook_redeliveries(limit).await,
             Self::Postgres(b) => b.open_webhook_redeliveries(limit).await,
+        }
+    }
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
         }
     }
     async fn resolve_webhook_redelivery(

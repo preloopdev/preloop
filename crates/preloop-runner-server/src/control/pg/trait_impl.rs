@@ -725,6 +725,15 @@ impl ControlBackend for PgBackend {
     ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
         self.open_webhook_redeliveries(limit).await
     }
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        self.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+            .await
+    }
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,

@@ -56,7 +56,10 @@ Invariants worth keeping:
   unfinished first scan) would otherwise never be examined again. The repair
   table stores the delivery id the redelivery endpoint needs; present
   deliveries close their rows, the rest retry under the same per-GUID
-  backoff and cap as the scan, so no untracked history is replayed.
+  backoff and cap as the scan, so no untracked history is replayed. Each
+  pass reads one App's rows that are still below the attempt cap, so a full
+  window of another App's backlog — or of rows at the cap — can never starve
+  a retryable repair out of it.
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.

@@ -723,6 +723,42 @@ impl PgBackend {
             .collect()
     }
 
+    /// Unresolved repairs for one App that are still below the attempt cap,
+    /// in retry order: the row that has waited longest since its last
+    /// attempt first (never-attempted rows at the front), then oldest-first.
+    ///
+    /// Scoping and the cap live in SQL on purpose: the retry pass reads a
+    /// bounded window, and a global query would let another App's backlog —
+    /// or rows already at the cap, which are never retried — fill it and
+    /// starve this App's repairs.
+    pub(super) async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        let client = self.reader().await?;
+        let sql = format!(
+            "SELECT {REDELIVERY_COLUMNS} FROM webhook_redeliveries \
+             WHERE resolved_at IS NULL AND app_id = $1 AND attempts < $2 \
+             ORDER BY last_attempt_at ASC NULLS FIRST, first_seen_at ASC LIMIT $3"
+        );
+        client
+            .query(
+                &sql,
+                &[
+                    &app_id,
+                    &(attempt_cap.min(i32::MAX as u32) as i32),
+                    &codec::limit(limit),
+                ],
+            )
+            .await
+            .map_err(db)?
+            .iter()
+            .map(redelivery_from_row)
+            .collect()
+    }
+
     /// Mark a repair row resolved (first resolution wins).
     ///
     /// Statement: `UPDATE webhook_redeliveries SET resolved_at = $2 WHERE

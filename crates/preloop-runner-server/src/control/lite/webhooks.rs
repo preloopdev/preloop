@@ -723,6 +723,43 @@ impl LiteBackend {
         })
     }
 
+    /// Unresolved repairs for one App that are still below the attempt cap,
+    /// in retry order: the row that has waited longest since its last
+    /// attempt first (never-attempted rows at the front), then oldest-first.
+    ///
+    /// Scoping and the cap live in SQL on purpose: the retry pass reads a
+    /// bounded window, and a global query would let another App's backlog —
+    /// or rows already at the cap, which are never retried — fill it and
+    /// starve this App's repairs.
+    pub(crate) async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        self.read(|tx| {
+            let mut stmt = tx
+                .prepare_cached(&format!(
+                    "SELECT {REDELIVERY_COLUMNS} FROM webhook_redeliveries \
+                     WHERE resolved_at IS NULL AND app_id = ?1 AND attempts < ?2 \
+                     ORDER BY last_attempt_at ASC NULLS FIRST, first_seen_at ASC LIMIT ?3"
+                ))
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        app_id,
+                        attempt_cap.min(i32::MAX as u32) as i64,
+                        limit.min(i64::MAX as usize) as i64
+                    ],
+                    redelivery_row,
+                )
+                .map_err(db)?;
+            rows.map(|row| row.map_err(db).and_then(finish_redelivery))
+                .collect()
+        })
+    }
+
     /// Close an open repair; `false` when unknown or already resolved.
     pub(crate) async fn resolve_webhook_redelivery(
         &self,

@@ -172,9 +172,21 @@ prepare_golden_home() {
   # outside this home (~/.config/preloop/vms), so a clean slate is safe —
   # except for the node key: the required Postgres store outlives this wipe
   # and the engine refuses a database created under a different key.
-  local saved_key=""
+  local saved_key="" real_home
   if [ -f "$CAMPAIGN_HOME/state/hmac-key.bin" ]; then
-    saved_key="$(mktemp)"
+    # The wipe below removes CAMPAIGN_HOME, so the saved copy must live
+    # outside it. `mktemp` without a template honours TMPDIR, which may point
+    # inside the very home being wiped; create the copy beside the home
+    # instead, and verify that location with symlinks resolved — the same
+    # view the wipe has.
+    real_home="$(cd "$CAMPAIGN_HOME" 2>/dev/null && pwd -P || printf '%s' "$CAMPAIGN_HOME")"
+    saved_key="$(mktemp "$(dirname "$real_home")/preloop-hmac-key.XXXXXX")"
+    case "$(cd "$(dirname "$saved_key")" && pwd -P)/$(basename "$saved_key")" in
+      "$real_home"/*)
+        rm -f "$saved_key"
+        fail "temporary key copy $saved_key would be removed with $CAMPAIGN_HOME"
+        ;;
+    esac
     # Never `cp -p` here: carrying a permissive source mode onto the restored
     # key would hand the HMAC signing key to anyone who can read the campaign
     # home. The saved copy is forced private, and `mv` keeps that mode.
