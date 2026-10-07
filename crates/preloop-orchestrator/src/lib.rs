@@ -2049,15 +2049,25 @@ pub fn guest_hostname_script() -> String {
 /// `/etc/hosts`; the shell test below passes a scratch file so the real script
 /// runs end to end without touching the host's resolver, the way
 /// [`scope_rosetta_apt_sources`] stands in for `/etc/apt`.
+///
+/// The name reaches `/etc/hosts` and the matching, so it is treated as
+/// untrusted input: a hostname carrying shell or regex syntax fails
+/// provisioning rather than being interpolated into a program. Every resolver
+/// answer must be local — a resolver hands out the first answer, and a foreign
+/// answer left anywhere in the list still lets a consumer pick it. awk
+/// compares fields as strings, so no hostname byte is ever part of a program.
+///
+/// No `#` comments inside the generated shell text: the statements are joined
+/// with `;` and `\` continuations into one physical line, where a comment
+/// would swallow whatever follows it on the line. The rationale lives here;
+/// `every_generated_script_parses_as_posix_sh` parses the rendered script
+/// with `sh -n`.
 fn guest_hostname_script_at(hosts: &str) -> String {
     let hosts = shell_quote(hosts);
     format!(
         "command -v getent >/dev/null 2>&1 || exit 0; \
          host=$(hostname 2>/dev/null || uname -n); \
          [ -n \"$host\" ] || exit 0; \
-         # The name reaches /etc/hosts and the matching below, so treat it as \
-         # untrusted input: a hostname carrying shell or regex syntax must \
-         # fail provisioning rather than be interpolated into a program.\n \
          case \"$host\" in \
            ''|*[!A-Za-z0-9._-]*) echo \"guest hostname is not a valid hostname\" >&2; exit 1 ;; \
          esac; \
@@ -2079,17 +2089,11 @@ fn guest_hostname_script_at(hosts: &str) -> String {
          name_resolves_locally() {{ \
            resolved=$(name_addrs); \
            [ -n \"$resolved\" ] || return 1; \
-           # Every answer must be local. A resolver hands out the first \
-           # answer, and a foreign answer left anywhere in the list still \
-           # lets a consumer pick it.\n \
            for addr in $resolved; do is_local \"$addr\" || return 1; done; \
            return 0; \
          }}; \
          name_resolves_locally && exit 0; \
          tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts.$$; \
-         # Drop every occurrence of the machine's own name from every \
-         # mapping, and drop a line left with no name at all. awk compares \
-         # fields as strings, so no hostname byte is ever part of a program.\n \
          awk -v host=\"$host\" ' \
            /^[[:space:]]*#/ {{ print; next }} \
            {{ \
@@ -2235,6 +2239,31 @@ pub fn golden_contract_script(user: &str, uid: u32) -> String {
 /// real overlay mount first and fall back to `vfs`; if the daemon then refuses
 /// the previous driver's data, the docker data-root is reset and dockerd is
 /// retried once (images re-pull from the registry).
+///
+/// `raise_engine_chain` raises the live chain in place — `prlimit` reaches a
+/// process a child shell's `ulimit` cannot, and restarting the chain inside a
+/// fork leaves the half-torn-down containerd socket the preload comment warns
+/// about. Only a chain still below the hosted soft limit is touched, so a
+/// daemon (custom base) already at or above it keeps its own; raising a hard
+/// limit needs root, which both launch branches run as. A chain still below
+/// the hosted limits that could not be raised would hand containers the wrong
+/// pair, so the launch fails loudly instead of reporting success.
+///
+/// The krunfw guest kernel has fuse built in, but the VM boots `/dev` as a
+/// plain tmpfs with only the image's baked nodes, so `/dev/fuse` is missing
+/// and fuse-overlayfs (dockerd's fallback when its overlay probe fails) dies
+/// with "fuse: device not found". The script creates the node when the kernel
+/// supports fuse; dockerd then auto-picks fuse-overlayfs (CoW) on kernels
+/// whose overlay probe fails, and overlay2 on stock kernels where it
+/// succeeds. Where overlay is unusable (the krunfw kernel rejects the probe
+/// mount with EINVAL), `vfs` is forced only when fuse is unavailable too —
+/// otherwise fuse-overlayfs auto-detects and works.
+///
+/// No `#` comments inside the generated shell text: the statements are joined
+/// with `;` and `\` continuations into one physical line, so a comment would
+/// swallow the code that follows it (the hostname-script bug fixed in
+/// `f0341dc3`). `every_generated_script_parses_as_posix_sh` renders this
+/// script and parses it with `sh -n`.
 fn docker_start_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
@@ -2242,20 +2271,6 @@ fn docker_start_command() -> Vec<String> {
         run_as_root_or_sudo(&format!(
             "{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT}; \
              command -v dockerd >/dev/null 2>&1 || exit 0; \
-             # A fork inherits its golden's live daemon chain — dockerd, and
-             # the containerd that spawns each container's shim. A container
-             # runs on the limits of that chain, and a golden baked before the
-             # stack raise started it on the VM init's 8192 KiB: a running
-             # process keeps the limits it was born with, so the raise this
-             # script applies to itself cannot reach the inherited chain, and
-             # container steps would keep half of GitHub's stack. Raise the
-             # live chain in place — prlimit reaches a process a child shell's
-             # ulimit cannot, and restarting the chain inside a fork leaves
-             # the half-torn-down containerd socket the preload comment warns
-             # about. Only a chain still below the hosted soft limit is
-             # touched, so a daemon (custom base) already at or above it keeps
-             # its own. Raising a hard limit needs root, which both launch
-             # branches run as.
              raise_engine_chain() {{ \
                raised=0; failed=0; \
                for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
@@ -2275,9 +2290,6 @@ fn docker_start_command() -> Vec<String> {
                    prlimit --pid \"$pid\" --nofile={GOLDEN_NOFILE_PRLIMIT} 2>/dev/null || failed=1; \
                  fi; \
                done; \
-               # A chain still below the hosted limits that could not be \
-               # raised would hand containers the wrong pair, so the launch \
-               # fails loudly instead of reporting success. \
                if [ \"$failed\" -ne 0 ]; then \
                  echo 'could not raise an inherited dockerd/containerd to the hosted process limits' >&2; \
                  return 1; \
@@ -2290,13 +2302,6 @@ fn docker_start_command() -> Vec<String> {
              mkdir -p {DOCKER_DATA_ROOT}; \
              modprobe overlay >/dev/null 2>&1 || true; \
              modprobe fuse >/dev/null 2>&1 || true; \
-             # The krunfw guest kernel has fuse built in, but the VM boots
-             # /dev as a plain tmpfs with only the image's baked nodes, so
-             # /dev/fuse is missing and fuse-overlayfs (dockerd's fallback
-             # when its overlay probe fails) dies with 'fuse: device not
-             # found'). Create the node when the kernel supports fuse; dockerd
-             # then auto-picks fuse-overlayfs (CoW) on kernels whose overlay
-             # probe fails, and overlay2 on stock kernels where it succeeds.
              if grep -q fuse /proc/filesystems; then \
                [ -e /dev/fuse ] || mknod /dev/fuse c 10 229; \
              fi; \
@@ -2305,9 +2310,6 @@ fn docker_start_command() -> Vec<String> {
                umount /tmp/.preloop-ovprobe 2>/dev/null || true; \
                DRIVER=; \
              else \
-               # Overlay unusable (the krunfw kernel rejects the probe mount
-               # with EINVAL). Only force vfs when fuse is unavailable too —
-               # otherwise fuse-overlayfs auto-detects and works.
                [ -e /dev/fuse ] || DRIVER=vfs; \
              fi; \
              rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
@@ -7775,11 +7777,24 @@ done
         assert_eq!(
             GUEST_NOFILE_ULIMIT,
             format!(
-                "ulimit -Sn {}; ulimit -Hn {}",
-                cfg("golden_rlimit_nofile_soft"),
-                cfg("golden_rlimit_nofile_hard")
+                "ulimit -Hn {hard} 2>/dev/null; ulimit -Sn {soft}; ulimit -Hn {hard}",
+                hard = cfg("golden_rlimit_nofile_hard"),
+                soft = cfg("golden_rlimit_nofile_soft")
             ),
-            "golden_nofile_ulimit_raise must compose golden_rlimit_nofile_*"
+            "golden_nofile_ulimit_raise must compose golden_rlimit_nofile_* in the \
+             order-independent hard-soft-hard form"
+        );
+        assert_eq!(
+            GUEST_NOFILE_ULIMIT_BEST_EFFORT,
+            format!(
+                "ulimit -Hn {hard} 2>/dev/null; ulimit -Sn {soft} 2>/dev/null || true; \
+                 ulimit -Hn {hard} 2>/dev/null || echo preloop: RLIMIT_NOFILE hard limit stays \
+                 $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel \
+                 identity >&2",
+                hard = cfg("golden_rlimit_nofile_hard"),
+                soft = cfg("golden_rlimit_nofile_soft")
+            ),
+            "golden_nofile_ulimit_raise_best_effort must compose golden_rlimit_nofile_*"
         );
         assert!(
             !GUEST_NOFILE_ULIMIT.contains("|| true"),
@@ -7969,7 +7984,7 @@ done
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            all.contains("ulimit -Sn 65536; ulimit -Hn 65536"),
+            all.contains("ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536"),
             "the runner and every step it spawns must run on the hosted descriptor \
              limit (GitHub-hosted: Max open files 65536/65536), not the exec \
              channel's 1024/4096: {all}"
@@ -8016,7 +8031,7 @@ done
         // descriptor pair GitHub-hosted containers carry (65536/65536) has to
         // be raised here too, in the same launch.
         let nofile = script
-            .find("ulimit -Sn 65536; ulimit -Hn 65536")
+            .find("ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536")
             .unwrap_or_else(|| {
                 panic!("the container engine must start on the hosted descriptor limit: {script}")
             });
@@ -8098,7 +8113,7 @@ done
             .find("ulimit -Hs unlimited; ulimit -Ss 16384")
             .unwrap_or_else(|| panic!("the preloaded engine must be raised: {script}"));
         let nofile = script
-            .find("ulimit -Sn 65536; ulimit -Hn 65536")
+            .find("ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536")
             .unwrap_or_else(|| {
                 panic!("the preloaded engine must carry the hosted descriptor limit: {script}")
             });
@@ -8159,7 +8174,11 @@ done
                 .args([
                     "-c",
                     &format!(
-                        "ulimit -Hn 1024; ulimit -Sn 1024; {limits}; \
+                        // Soft first: lowering the hard below the current soft
+                        // is EINVAL, and a host whose shell starts at a high
+                        // soft limit (macOS: 1048576) would otherwise leave the
+                        // setup's own error on stderr.
+                        "ulimit -Sn 1024; ulimit -Hn 1024; {limits}; \
                          printf '%s %s' \"$(ulimit -Hn)\" \"$(ulimit -Sn)\""
                     ),
                 ])
@@ -8198,12 +8217,119 @@ done
         // status is the raise's, which is what makes a failed raise on a root
         // launch observable instead of silent.
         assert_eq!(
-            GUEST_NOFILE_ULIMIT, "ulimit -Sn 65536; ulimit -Hn 65536",
+            GUEST_NOFILE_ULIMIT,
+            "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536",
             "the privileged form must stay strict"
         );
         assert!(
             GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("|| true"),
             "the fallback must swallow only the raise's failure"
+        );
+    }
+
+    /// The strict nofile raise must reach the hosted 65536/65536 from both
+    /// inherited pairs, whichever direction they are in.
+    ///
+    /// Below the target, AgentENV's exec channel starts at soft 1024 under a
+    /// hard 4096: the old soft-first form raised the soft first, hit `EPERM`
+    /// above the old hard, and was swallowed by `|| true` at the best-effort
+    /// sites — then the hard raise left the pair at 1024/65536 and the parity
+    /// probe failed. Above the target, the pair is 1048576/1048576 and both
+    /// limits have to come down. The hard-soft-hard order handles each: the
+    /// first hard raise is the privileged one that may be refused (ignored
+    /// when the inherited hard already sits above the target, where the
+    /// kernel rejects lowering it under a higher soft limit), then the soft
+    /// is set, then the hard is pinned — which succeeds when lowering from
+    /// above once the soft is at the target.
+    #[cfg(unix)]
+    #[test]
+    fn nofile_raise_reaches_the_hosted_pair_from_below_and_above() {
+        // Dash is the guest's `sh`; prefer it so the parser and the `ulimit`
+        // semantics under test are the guests'.
+        let shell = ["dash", "sh"]
+            .into_iter()
+            .find(|candidate| {
+                std::process::Command::new(candidate)
+                    .args(["-n", "-c", ":"])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+            .expect("a POSIX shell must be available");
+        // Set up the inherited pair, record it, run the raise, record the
+        // result: `start -> end`, hard/soft.
+        let run = |setup: &str| {
+            std::process::Command::new(shell)
+                .args([
+                    "-c",
+                    &format!(
+                        "{setup}; start=\"$(ulimit -Hn)/$(ulimit -Sn)\"; {GUEST_NOFILE_ULIMIT}; \
+                         printf '%s -> %s/%s' \"$start\" \"$(ulimit -Hn)\" \"$(ulimit -Sn)\""
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+        let root = String::from_utf8_lossy(&uid.stdout).trim() == "0";
+
+        // (soft 1024, hard 4096): the pair AgentENV's exec channel hands a
+        // job. Only root can raise the hard limit; an unprivileged strict
+        // raise cannot move either limit and must leave the pair alone.
+        let below = run("ulimit -Sn 1024; ulimit -Hn 4096");
+        let below = String::from_utf8_lossy(&below.stdout).to_string();
+        let (start, end) = below
+            .split_once(" -> ")
+            .unwrap_or_else(|| panic!("the low pair must be settable: {below}"));
+        assert_eq!(start, "4096/1024", "{below}");
+        if root {
+            assert_eq!(
+                end, "65536/65536",
+                "a privileged launch must reach the hosted pair from below: {below}"
+            );
+        } else {
+            assert_eq!(
+                end, "4096/1024",
+                "an unprivileged launch cannot raise the hard limit and must keep \
+                 what it inherited: {below}"
+            );
+        }
+
+        // (soft 1048576, hard 1048576): a pair already above the target, which
+        // every launch can lower — so this one reaches the hosted pair
+        // everywhere. A host whose hard limit cannot go that high falls back to
+        // the highest pair it reports, and only the (above-target) lowering
+        // case is then skipped.
+        let above = run("ulimit -Sn 1048576; ulimit -Hn 1048576");
+        let above = String::from_utf8_lossy(&above.stdout).to_string();
+        let (start, end) = above
+            .split_once(" -> ")
+            .unwrap_or_else(|| panic!("the high pair must be settable: {above}"));
+        let start_pair = |value: &str| {
+            value
+                .split('/')
+                .map(|part| match part {
+                    "unlimited" => u64::MAX,
+                    other => other.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("the highest pair must read back as limits: {above}")
+                    }),
+                })
+                .collect::<Vec<_>>()
+        };
+        let limits = start_pair(start);
+        assert!(
+            limits.len() == 2,
+            "the highest pair must be hard/soft: {above}"
+        );
+        let (hard, soft) = (limits[0], limits[1]);
+        assert!(
+            hard >= GOLDEN_RLIMIT_NOFILE_SOFT.parse::<u64>().unwrap()
+                && soft >= GOLDEN_RLIMIT_NOFILE_SOFT.parse::<u64>().unwrap(),
+            "the host must be able to hold an at-or-above-target pair: {above}"
+        );
+        assert_eq!(
+            end, "65536/65536",
+            "a pair above the target must come down to the hosted one: {above}"
         );
     }
 
@@ -8302,6 +8428,136 @@ done
             "rosetta multiarch script does not parse: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Every script the guest runs must parse as POSIX sh, rendered with the
+    /// values `official-image.toml` compiles in.
+    ///
+    /// The scripts are assembled from `;`-joined statements across `\`
+    /// continuations into one physical line, so a `#` comment inside them
+    /// swallows whatever follows it on that line. The dockerd start command
+    /// shipped exactly that to production: the comment block above the
+    /// engine-chain failure check made dash reject the whole script with
+    /// `Syntax error: "else" unexpected`, so every per-runner container
+    /// engine failed to start (the hostname script had the same bug before
+    /// `f0341dc3`). A literal `-n` parse of each rendered script is the only
+    /// check that stays honest as the text is assembled — the textual
+    /// assertions elsewhere pin the statements, not their syntax.
+    #[test]
+    fn every_generated_script_parses_as_posix_sh() {
+        // The guest's /bin/sh is dash; use it when this host has one, so the
+        // parser under test is the one the guests actually run.
+        let shell = ["dash", "sh"]
+            .into_iter()
+            .find(|candidate| {
+                std::process::Command::new(candidate)
+                    .args(["-n", "-c", ":"])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+            .expect("a POSIX shell must be available");
+
+        let config = test_config(false);
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+            "--once".to_owned(),
+        ];
+        let mut switched = config.clone();
+        switched.runner_user = Some("runner".to_owned());
+        switched.runner_uid = Some(1001);
+
+        let mut scripts: Vec<(String, String)> = vec![
+            (
+                "guest_hostname_script".to_owned(),
+                guest_hostname_script(),
+            ),
+            ("guest_sysctl_script".to_owned(), guest_sysctl_script()),
+            (
+                "guest_hosted_runtime_init_script".to_owned(),
+                guest_hosted_runtime_init_script(),
+            ),
+            (
+                "runner_account_script".to_owned(),
+                runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+            ),
+            (
+                "runner_ownership_reconcile_script".to_owned(),
+                runner_ownership_reconcile_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+            ),
+            ("base_install_script".to_owned(), base_install_script()),
+            (
+                "docker_start_command".to_owned(),
+                docker_start_command()[2].clone(),
+            ),
+            (
+                "apt_lists_refresh_command".to_owned(),
+                apt_lists_refresh_command()[2].clone(),
+            ),
+            (
+                "preload_images_command".to_owned(),
+                preload_images_command(&["postgres:16-alpine".to_owned()])[2].clone(),
+            ),
+            (
+                "rosetta_multiarch_script".to_owned(),
+                rosetta_multiarch_script(),
+            ),
+            (
+                "scope_rosetta_apt_sources".to_owned(),
+                scope_rosetta_apt_sources("/etc/apt"),
+            ),
+            (
+                "with_guest_hosted_limits".to_owned(),
+                with_guest_hosted_limits(&argv)[2].clone(),
+            ),
+            (
+                "as_runner_user (pass-through)".to_owned(),
+                as_runner_user(&config, &argv)[2].clone(),
+            ),
+            (
+                "as_runner_user (runner account)".to_owned(),
+                as_runner_user(&switched, &argv)[2].clone(),
+            ),
+            ("run_as_root_or_sudo".to_owned(), run_as_root_or_sudo("true")),
+            (
+                "run_as_root_or_sudo_strict".to_owned(),
+                run_as_root_or_sudo_strict("true"),
+            ),
+        ];
+        // Toolchain provisioning for the layers a job can ask for: every
+        // `sh -c` install command and every post-install verify predicate.
+        for layer in [
+            crate::environment::ToolchainLayer::Node("22".to_owned()),
+            crate::environment::ToolchainLayer::Rust("stable".to_owned()),
+            crate::environment::ToolchainLayer::Go("1.24".to_owned()),
+        ] {
+            for (index, command) in layer.install_commands().into_iter().enumerate() {
+                if command[0] == "sh" {
+                    scripts.push((format!("{layer} install[{index}]"), command[2].clone()));
+                }
+            }
+            scripts.push((format!("{layer} verify"), layer.verify_command()));
+        }
+
+        for (name, script) in &scripts {
+            let output = std::process::Command::new(shell)
+                .args(["-n", "-c", script])
+                .output()
+                .expect("the POSIX shell must run");
+            assert!(
+                output.status.success(),
+                "{name} does not parse as POSIX sh ({}):\n{script}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // No `#` comment may reach the composed text: the halves are
+            // joined into one physical line, where it would swallow code.
+            // (awk programs address `#` as data and are excluded.)
+            assert!(
+                !script.contains("; #"),
+                "{name} carries a shell comment inside the joined script:\n{script}"
+            );
+        }
     }
 
     /// The rootfs selected by `ubuntu-22.04` has one-line sources while
