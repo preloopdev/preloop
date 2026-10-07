@@ -1626,11 +1626,17 @@ async fn fetch_branch_protected(
     let Some(token) = contents_read_token(shared, repository, &api_base).await? else {
         return Ok(false);
     };
+    // Branch names are URL-significant: `git check-ref-format` permits `#`, `%`
+    // and `/`, so a raw `release#test` is transmitted as `release` (the rest is
+    // a fragment) and a lookup for an unprotected branch would answer with a
+    // *different* branch's protection. Encode the name as one path segment, the
+    // way the action-tarball URLs already do.
+    let encoded = crate::actions::percent_encode_path_segment(branch);
     let response = crate::github_breaker::send_observed(
         &shared.state.github_breaker,
         crate::shared_http::CLIENT
             .clone()
-            .get(format!("{api_base}/repos/{repository}/branches/{branch}"))
+            .get(format!("{api_base}/repos/{repository}/branches/{encoded}"))
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/vnd.github+json"),
@@ -1643,8 +1649,26 @@ async fn fetch_branch_protected(
     if !status.is_success() {
         anyhow::bail!("GitHub returned {status} for branch {branch:?}");
     }
-    let branch: Value = response.json().await?;
-    Ok(branch
+    let body: Value = response.json().await?;
+    // The answer must be about the branch that was asked for: a server (or
+    // intermediary) that folds or drops part of the encoded name — or resolves
+    // it to another ref — would otherwise lend that branch's protection to
+    // this run. Anything but an exact match is unresolvable, and unresolvable
+    // is unprivileged.
+    match body.get("name").and_then(Value::as_str) {
+        Some(name) if name == branch => {}
+        other => {
+            warn!(
+                repository,
+                branch,
+                resolved = ?other,
+                "branch protection lookup answered for a different branch; \
+                 reporting github.ref_protected = false"
+            );
+            return Ok(false);
+        }
+    }
+    Ok(body
         .get("protected")
         .and_then(Value::as_bool)
         .unwrap_or(false))
@@ -5763,6 +5787,8 @@ jobs:
             delay > std::time::Duration::from_secs(1_700),
             "a spent budget waits for the advertised reset, got {delay:?}"
         );
+    }
+
     /// `github.ref_protected` comes from the forge: branch protection (or a
     /// ruleset) answers `protected`, a branch GitHub does not know answers
     /// false, and non-branch refs are never looked up at all.
@@ -5771,28 +5797,34 @@ jobs:
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-        let stub = axum::Router::new().route(
-            "/repos/owner/repo/branches/:branch",
-            axum::routing::get({
+        let branch_stub = axum::routing::get({
+            let seen = seen.clone();
+            move |axum::extract::Path(branch): axum::extract::Path<String>| {
                 let seen = seen.clone();
-                move |axum::extract::Path(branch): axum::extract::Path<String>| {
-                    let seen = seen.clone();
-                    async move {
-                        seen.lock().push(branch.clone());
-                        if branch == "main" {
-                            axum::Json(serde_json::json!({"name": "main", "protected": true}))
-                                .into_response()
-                        } else {
-                            (
-                                StatusCode::NOT_FOUND,
-                                axum::Json(serde_json::json!({"message": "Branch not found"})),
-                            )
-                                .into_response()
-                        }
+                async move {
+                    seen.lock().push(branch.clone());
+                    let protected = matches!(branch.as_str(), "main" | "release");
+                    if protected || branch == "feature" {
+                        axum::Json(serde_json::json!({"name": branch, "protected": protected}))
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({"message": "Branch not found"})),
+                        )
+                            .into_response()
                     }
                 }
-            }),
-        );
+            }
+        });
+        // A server that answers about a *different* branch must never lend
+        // that branch's protection to this run.
+        let mismatch_stub = axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"name": "release", "protected": true}))
+        });
+        let stub = axum::Router::new()
+            .route("/repos/owner/repo/branches/:branch", branch_stub)
+            .route("/repos/owner/mismatch/branches/:branch", mismatch_stub);
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -5806,10 +5838,39 @@ jobs:
 
         assert!(resolve_ref_protected(&shared, "owner/repo", "refs/heads/main").await);
         assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/heads/feature").await);
+        assert!(resolve_ref_protected(&shared, "owner/repo", "refs/heads/release").await);
+        // `#`, `%` and `/` are all legal in a branch name, so the lookup must
+        // transmit the whole name as one encoded segment: sent raw, the
+        // fragment cut `release#test` down to `release` and the lookup
+        // answered with *that* branch's protection.
+        assert!(
+            !resolve_ref_protected(&shared, "owner/repo", "refs/heads/release#test").await,
+            "release#test must not inherit release's protection"
+        );
+        assert!(
+            !resolve_ref_protected(&shared, "owner/repo", "refs/heads/release/test").await,
+            "release/test must not inherit release's protection"
+        );
+        // A 200 naming another branch is not an answer about the one asked
+        // for: an exact name match is what makes the answer trustworthy.
+        assert!(
+            !resolve_ref_protected(&shared, "owner/mismatch", "refs/heads/release#test").await,
+            "a lookup answered with a different branch name must stay unprivileged"
+        );
         // Tags and pull-request refs cannot be protected; no lookup is made.
         assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/tags/v1.0.0").await);
         assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/pull/7/merge").await);
-        assert_eq!(seen.lock().len(), 2, "only branch refs are looked up");
+        assert_eq!(
+            seen.lock().clone(),
+            vec![
+                "main".to_owned(),
+                "feature".to_owned(),
+                "release".to_owned(),
+                "release#test".to_owned(),
+                "release/test".to_owned(),
+            ],
+            "each lookup must carry the branch name verbatim, as one path segment"
+        );
     }
 
     #[test]
