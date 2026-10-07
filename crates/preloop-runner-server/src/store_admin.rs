@@ -66,7 +66,8 @@ impl StoreTarget {
 #[derive(Debug, Clone)]
 pub struct MigrateOptions {
     /// Adopt a pre-ledger control database after verifying its shape
-    /// (unreleased v3/v4 builds), then apply the pending migrations.
+    /// (an unreleased build: SQLite v4 / Postgres v5), then apply the
+    /// pending migrations.
     pub adopt_baseline: bool,
     /// Take the pre-migration SQLite backup (default on; set false to skip).
     pub backup: bool,
