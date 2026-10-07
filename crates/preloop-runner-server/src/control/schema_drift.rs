@@ -321,6 +321,24 @@ fn reserved_and_unused_objects_stay_unreferenced() {
     );
 }
 
+/// The inventory grep must see a column used in a `DELETE` predicate: that is
+/// a real read of the column, and `DELETE` alone used to be invisible to it.
+/// A table-only `DELETE` stays invisible — the `artifacts` table is
+/// delete-only by design, so its cleanup statements are not uses.
+#[test]
+fn delete_predicates_count_as_column_uses() {
+    let delete = "DELETE FROM provision_requests WHERE lease_owner = ?1";
+    assert_eq!(
+        sql_mentions(delete, "provision_requests", Some("lease_owner")).len(),
+        1,
+        "a DELETE predicate reads the column"
+    );
+    assert!(
+        sql_mentions(delete, "provision_requests", None).is_empty(),
+        "a table-only DELETE is not a read"
+    );
+}
+
 // ── The parsed schemas ──────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
@@ -610,8 +628,10 @@ fn rust_sources() -> Vec<(PathBuf, String)> {
 /// Every mention of `table` (or `table.column` when `column` is set) inside a
 /// SQL read/write statement. SQL is written across several Rust string lines,
 /// so any statement verb within 240 bytes before the mention counts as the
-/// same statement. `DELETE`/`DROP` are deliberately not verbs: the
-/// `artifacts` table is delete-only by design, and deletes are not reads.
+/// same statement. `DROP` is deliberately not a verb, and a bare `DELETE` of
+/// a *table* is not a read (the `artifacts` table is delete-only by design),
+/// but `DELETE ... WHERE <column>` does read that column, so `DELETE` counts
+/// when the needle is a column.
 ///
 /// The window only looks backwards, so a mention that puts the table name
 /// after the column (some `SELECT` shapes) can be missed — this guard is a
@@ -626,7 +646,8 @@ fn sql_mentions(text: &str, table: &str, column: Option<&str>) -> Vec<String> {
         from = at + 1;
         let start = char_window_start(text, at, 240);
         let window = &text[start..at];
-        if !VERBS.iter().any(|verb| find_word(window, verb).is_some()) {
+        let delete_reads_a_column = column.is_some() && find_word(window, "DELETE").is_some();
+        if !delete_reads_a_column && !VERBS.iter().any(|verb| find_word(window, verb).is_some()) {
             continue;
         }
         if column.is_some() && find_word(window, table).is_none() {
