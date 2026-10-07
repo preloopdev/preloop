@@ -520,6 +520,52 @@ user contract, docker, git); leave what they must declare anyway to job-time
 installs. New parity targets belong in `versions.toml` with a comment
 naming the official image version they were taken from.
 
+### Process limits (raised per launch, not baked)
+
+`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
+doubles the kernel's 8192 KiB process stack for hosted runners — the image
+comment reads "Double stack size from default 8192KB":
+
+| Limit           | Hosted value                                                    | Where the image sets it                                             |
+| --------------- | --------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `RLIMIT_STACK`  | **16 MiB soft, `unlimited` hard** (soft 16384 KiB)               | `DefaultLimitSTACK=16M:infinity` in `/etc/systemd/system.conf` and `* soft stack 16384` in `/etc/security/limits.conf` |
+| `RLIMIT_NOFILE` | **65536 soft/hard** (`DefaultLimitNOFILE=65536`)                 | `DefaultLimitNOFILE=65536` in `/etc/systemd/system.conf` and `* soft/hard nofile 65536` in `/etc/security/limits.conf` |
+
+A hosted step inherits them from the `actions.runner.*` service, and a
+container step inherits them from the `dockerd` service. The guest boots
+straight into the job workload, so neither the image's systemd units nor a
+PAM session ever reads those files: the guest runner wrapper
+(`GUEST_STACK_ULIMIT`) and the container-engine launch raise the stack
+explicitly, and the wrapper also raises `RLIMIT_NOFILE` past the hosted
+65536 for suites that raise their own soft limit. Without the stack raise the
+runner chain keeps the VM init's 8192 KiB and deep-recursion tests that pass
+on GitHub overflow the C stack — a `SIGSEGV`/exit 139 where Python's
+`RecursionError` is expected.
+
+The raise is applied per launch, wherever a workload starts:
+
+- the runner wrapper, for the runner process and every step it spawns —
+  with `runner_user` set it drops privileges after the raise, and unset or
+  `root` launches are wrapped in a shell that raises and then `exec`s the
+  same argv, so the exec channel's identity is untouched;
+- the container engine, because a container's processes inherit the limits
+  of the chain that spawns them: the preload daemon baked into the golden
+  (the engine a fork inherits) starts with the raise, a per-runner engine
+  start applies it, and an engine chain inherited from a golden baked before
+  this existed is re-raised in place with `prlimit`, since a running process
+  keeps the limits it was born with.
+
+`fixtures/workflows/guest-stack-limit.yml` is the guest-level check:
+
+```sh
+preloop run -f fixtures/workflows/guest-stack-limit.yml
+```
+
+It asserts the 16384 KiB soft / `unlimited` hard pair in a runner step, in a
+`container:` job, and in an ad-hoc `docker run`, and runs a deep-recursion
+probe shaped like pydantic's crashing optimizer tests — over 8192 KiB of
+frames, well inside 16384 KiB.
+
 ## Runtime knobs
 
 
