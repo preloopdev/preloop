@@ -3660,7 +3660,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Filled in the background so no slot ever waits on RSA generation.
         let keys = Arc::new(KeyPool::new());
         keys.spawn_refill();
-        let building = Arc::new(AtomicUsize::new(0));
+        let building = Arc::new(std::sync::Mutex::new(0));
 
         // On-demand mode: size=0 means no warm pool. Fork runners only when
         // jobs arrive, capped by the host's CPU and memory budget.
@@ -3671,18 +3671,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
 
         // Warm mode: cap the configured pool size by host memory as well as
-        // CPU. Each warm slot forks from the golden and inherits its
-        // committed footprint (growing toward `memory_mib` while a job
-        // runs), and a slot provisions its successor mid-job — so on a
-        // small host the configured size can still exhaust RAM. Sizing down
-        // at startup is safer than OOMing mid-run; `PRELOOP_RUNNER_POOL_SIZE`
-        // remains an explicit override that wins.
+        // CPU. Each slot holds exactly one VM at a time — the VM is deleted
+        // when its job finishes and the slot forks a fresh runner from the
+        // golden — so the host must fit one runner ceiling per slot. Sizing
+        // down at startup is safer than OOMing mid-run;
+        // `PRELOOP_RUNNER_POOL_SIZE` remains an explicit override that wins.
         let warm_size = match host_memory_mib() {
-            Some(total) => self.config.size.min(
-                on_demand_memory_cap(total, u64::from(self.config.memory_mib))
-                    .saturating_div(2)
-                    .max(1),
-            ),
+            Some(total) => self
+                .config
+                .size
+                .min(on_demand_memory_cap(total, u64::from(self.config.memory_mib)).max(1)),
             None => self.config.size,
         };
         if warm_size < self.config.size {
@@ -3777,7 +3775,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         golden_registry: Arc<GoldenRegistry>,
         idle: Arc<std::sync::Mutex<usize>>,
         keys: Arc<KeyPool>,
-        building: Arc<AtomicUsize>,
+        building: Arc<std::sync::Mutex<usize>>,
     ) -> Result<(), OrchestratorError> {
         let max_concurrent = {
             // The memory term below reserves the golden and host headroom.
@@ -3851,7 +3849,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 building: building.clone(),
                 provisioning: provisioning.clone(),
             };
-            let slot_provisioning = provisioning.clone();
             // Shared with the slot's pause watcher: a job parked in a debug
             // session hands the permit back to the pool and re-acquires it
             // when the session closes, so a paused job cannot pin a
@@ -3868,7 +3865,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_shutdown,
                     slot_registry,
                     slot_handles,
-                    slot_provisioning,
                     slot_semaphore,
                     permit_slot,
                 )
@@ -4440,92 +4436,108 @@ struct PoolHandles {
     idle: Arc<std::sync::Mutex<usize>>,
     /// Keypairs generated ahead of time for runner registration.
     keys: Arc<KeyPool>,
-    /// Replacements currently being built across the whole pool.
-    building: Arc<AtomicUsize>,
+    /// Runner boots in flight across the whole pool: slots that finished
+    /// their previous job and are forking their next VM from the golden.
+    building: Arc<std::sync::Mutex<usize>>,
     /// Provisions in flight across the whole pool. Raised so the server's
     /// starvation sweep keeps the queued-job grace clock paused while any
     /// warm-mode slot is still booting its runner.
     provisioning: Arc<std::sync::Mutex<usize>>,
 }
 
-/// What a slot needs in order to build its next runner.
-struct SlotPlan<'a> {
-    /// Pool slot index, used to name machines.
-    slot: usize,
-    /// Generation for the replacement machine name.
-    generation: u64,
-    /// Fork base, when the pool has one.
-    golden: Option<&'a MachineName>,
-    /// Environment selected for the replacement.
-    environment: RunnerEnvironment,
-    /// Runners across the whole pool that are registered and unclaimed.
-    idle: &'a std::sync::Mutex<usize>,
-    /// Keypairs generated ahead of time for runner registration.
-    keys: &'a Arc<KeyPool>,
-    /// Replacements currently being built across the whole pool.
-    building: &'a AtomicUsize,
-    /// Provisions in flight across the whole pool (see `PoolHandles`).
-    provisioning: &'a Arc<std::sync::Mutex<usize>>,
-    /// Whether this slot keeps a warm successor after the current job.
-    prebuild_successor: bool,
-}
-
-/// A claim on one of the replacement builds the backlog justifies.
+/// Counts one in-flight runner boot in the pool-wide `building` gauge.
 ///
-/// Held for the duration of the build so concurrent slots see it, and released
-/// on drop so an error path cannot strand the count.
-struct Reservation<'a> {
-    building: &'a AtomicUsize,
+/// A slot holds this only while it creates and configures its next VM, so
+/// `pool_status.building` reports the fork cost paid between two jobs — the
+/// window this pool traded for running half as many VMs per slot. Dropping the
+/// guard publishes the decremented count, so an error path cannot strand it.
+struct BuildingGuard {
+    active: Arc<std::sync::Mutex<usize>>,
     pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
 }
 
-impl<'a> Reservation<'a> {
-    /// Claim a build slot, or `None` when `wanted` are already in flight.
-    fn take(
-        building: &'a AtomicUsize,
-        wanted: usize,
+impl BuildingGuard {
+    fn enter(
+        active: Arc<std::sync::Mutex<usize>>,
         pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
-    ) -> Option<Self> {
-        let mut current = building.load(Ordering::Acquire);
-        loop {
-            if current >= wanted {
-                return None;
-            }
-            match building.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // Publish the counter's current value, not the pre-CAS
-                    // `current + 1`: a concurrent reservation may have
-                    // incremented again in between, and publishing the stale
-                    // computed value would under-report in-flight builds.
-                    if let Some(ps) = &pool_status {
-                        ps.set_building(building.load(Ordering::Acquire) as u32);
-                    }
-                    return Some(Self {
-                        building,
-                        pool_status,
-                    });
-                }
-                Err(observed) => current = observed,
-            }
+    ) -> Self {
+        // The counter mutation and the status publication share one lock, so
+        // concurrent entrances cannot publish an older count over a newer one.
+        let mut count = active.lock().unwrap();
+        *count += 1;
+        if let Some(ps) = &pool_status {
+            ps.set_building(*count as u32);
+        }
+        drop(count);
+        Self {
+            active,
+            pool_status,
         }
     }
 }
 
-impl Drop for Reservation<'_> {
+impl Drop for BuildingGuard {
     fn drop(&mut self) {
-        self.building.fetch_sub(1, Ordering::AcqRel);
-        // Re-read after the decrement: a concurrent take or drop may have
-        // changed the counter again, and publishing the value captured at
-        // this reservation's own decrement could overwrite a newer status
-        // update with an older one.
+        let mut count = self.active.lock().unwrap();
+        *count = count.saturating_sub(1);
         if let Some(ps) = &self.pool_status {
-            ps.set_building(self.building.load(Ordering::Acquire) as u32);
+            ps.set_building(*count as u32);
         }
+    }
+}
+
+/// Counts one registered-but-unclaimed runner in the pool-wide `idle` gauge.
+///
+/// The runner is idle from the moment its registration succeeds (or it is
+/// handed to the job loop) until a job claims it, and it must stop counting the
+/// moment it is claimed or torn down. The guard owns that whole lifetime and
+/// releases exactly once, so every exit path publishes the same count.
+struct IdleGuard {
+    idle: Arc<std::sync::Mutex<usize>>,
+    pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    active: bool,
+}
+
+impl IdleGuard {
+    fn register(
+        idle: Arc<std::sync::Mutex<usize>>,
+        pool_status: Option<Arc<preloop_observability::status::PoolStatus>>,
+    ) -> Self {
+        // The counter mutation and the status publication share one lock, so
+        // concurrent slot loops can never publish an older count over a newer
+        // one: `snapshot().idle` cannot report an idle runner that was already
+        // claimed.
+        let mut count = idle.lock().unwrap();
+        *count += 1;
+        if let Some(ps) = &pool_status {
+            ps.set_idle(*count as u32);
+        }
+        drop(count);
+        Self {
+            idle,
+            pool_status,
+            active: true,
+        }
+    }
+
+    /// The runner is no longer waiting for work: it was claimed, torn down, or
+    /// replaced. Idempotent, so a later `Drop` cannot double-count.
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let mut count = self.idle.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if let Some(ps) = &self.pool_status {
+            ps.set_idle(*count as u32);
+        }
+    }
+}
+
+impl Drop for IdleGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -4827,7 +4839,6 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     shutdown: CancellationToken,
     golden_registry: Arc<GoldenRegistry>,
     handles: PoolHandles,
-    _slot_provisioning: Arc<std::sync::Mutex<usize>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
@@ -4922,8 +4933,8 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // this point the starvation sweep can see a matching runner directly.
     drop(preparing);
 
-    // Run exactly one job — no successor pre-provisioning. While the job
-    // runs, watch the guest pause marker: a debug-session pause must hand
+    // Run exactly one job on the single-use runner, then delete it. While the
+    // job runs, watch the guest pause marker: a debug-session pause must hand
     // the concurrency permit back to the pool instead of pinning it.
     let pause_watch = config.debug_dir.clone().map(|debug_dir| {
         let provider = provider.clone();
@@ -4945,36 +4956,14 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         &config,
         runner,
         shutdown,
-        SlotPlan {
-            slot,
-            generation: generation + 1,
-            golden: golden.as_ref(),
-            environment,
-            idle: &handles.idle,
-            keys: &handles.keys,
-            building: &handles.building,
-            provisioning: &handles.provisioning,
-            prebuild_successor: false,
-        },
+        handles.idle.clone(),
     )
     .await;
     if let Some(watch) = pause_watch {
         watch.abort();
         let _ = watch.await;
     }
-
-    // Size-zero mode never asks for a successor. Keep defensive cleanup here
-    // so a future lifecycle change cannot leak an unexpectedly returned VM.
-    match result {
-        Ok(Some(successor)) => {
-            notify_runner_gone(&config, &successor.name).await;
-            vm_telemetry_deregister(&config, &successor.name);
-            let _ = provider.delete(&successor.name).await;
-            Ok(())
-        }
-        Ok(None) => Ok(()),
-        Err(error) => Err(error),
-    }
+    result
 }
 
 async fn run_slot<P: VmProvider + 'static>(
@@ -4997,7 +4986,6 @@ async fn run_slot<P: VmProvider + 'static>(
         provisioning,
     } = handles;
     let mut generation: u64 = 0;
-    let mut spare: Option<ReadyRunner> = None;
     let mut golden_backoff: Option<Duration> = None;
 
     while !shutdown.is_cancelled() {
@@ -5104,94 +5092,63 @@ async fn run_slot<P: VmProvider + 'static>(
             )
         };
 
-        // A spare forked from a different environment would run the job on
-        // the wrong base image. Discard it and provision against the golden
-        // this iteration actually selected.
-        if let Some(ready) = spare.take() {
-            if ready.environment.fingerprint == environment.fingerprint {
-                spare = Some(ready);
-            } else {
-                warn!(
-                    slot,
-                    "discarding spare runner built for a different environment"
-                );
-                vm_telemetry_deregister(&config, &ready.name);
-                let _ = provider.delete(&ready.name).await;
-            }
-        }
-
-        let runner = match spare.take() {
-            Some(runner) => runner,
-            None => {
-                generation += 1;
-                match provision_slot(
-                    &provider,
-                    &config,
-                    slot,
-                    generation,
-                    golden.as_ref(),
-                    &keys,
-                    environment.clone(),
-                    &shutdown,
-                )
-                .await
-                {
-                    Ok(Some(runner)) => runner,
-                    // The disk reserve held the start until shutdown.
-                    Ok(None) => break,
-                    Err(error) => {
-                        warn!(slot, %error, "provisioning runner failed; retrying");
-                        tokio::select! {
-                            _ = shutdown.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                        }
-                        continue;
+        // One VM per slot per job: fork the runner this iteration will serve
+        // with, from the golden the queued job's environment selected. The
+        // build guard publishes the fork window; the previous VM was deleted
+        // before this iteration started, so the slot never holds two.
+        generation += 1;
+        let runner = {
+            let _building = BuildingGuard::enter(building.clone(), config.pool_status.clone());
+            match provision_slot(
+                &provider,
+                &config,
+                slot,
+                generation,
+                golden.as_ref(),
+                &keys,
+                environment.clone(),
+                &shutdown,
+            )
+            .await
+            {
+                Ok(Some(runner)) => runner,
+                // The disk reserve held the start until shutdown.
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(slot, %error, "provisioning runner failed; retrying");
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
+                    continue;
                 }
             }
         };
 
-        // Runner is registered (or an already-registered spare); the sweep
-        // can see a matching runner directly now, so resume its grace clock.
+        // Runner is registered; the sweep can see a matching runner directly
+        // now, so resume its grace clock.
         drop(preparing);
 
-        generation += 1;
-        let successor = run_one_runner(
+        // Serve one job and delete the VM. The next iteration forks a fresh
+        // runner from the golden, which costs the fork window (~seconds)
+        // between jobs instead of a second live VM per slot.
+        if let Err(error) = run_one_runner(
             provider.clone(),
             &config,
             runner,
             shutdown.clone(),
-            SlotPlan {
-                slot,
-                generation,
-                golden: golden.as_ref(),
-                environment: environment.clone(),
-                idle: &idle,
-                keys: &keys,
-                building: &building,
-                provisioning: &provisioning,
-                prebuild_successor: true,
-            },
+            idle.clone(),
         )
-        .await;
-        spare = match successor {
-            Ok(spare) => spare,
-            Err(error) => {
-                warn!(slot, %error, "ephemeral runner failed; replenishing slot");
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                }
-                None
+        .await
+        {
+            warn!(slot, %error, "ephemeral runner failed; replenishing slot");
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
-        };
+        }
     }
 
-    if let Some(spare) = spare {
-        notify_runner_gone(&config, &spare.name).await;
-        vm_telemetry_deregister(&config, &spare.name);
-        let _ = provider.delete(&spare.name).await;
-    }
     Ok(())
 }
 
@@ -5228,6 +5185,18 @@ async fn provision_slot<P: VmProvider + 'static>(
             return Err(error.into());
         }
     };
+    // Which golden (environment fingerprint) this VM boots from is the first
+    // question an image-shaped failure asks, and the fingerprint is the only
+    // handle on the golden's content once the machine is up. The name ties
+    // this fork to the `ephemeral runner ready` line that ends it.
+    debug!(
+        machine = name.as_str(),
+        slot,
+        generation,
+        base = %environment.base,
+        fingerprint = environment.fingerprint.as_deref().unwrap_or("-"),
+        "provisioning runner"
+    );
     match provision_runner(provider, config, &name, golden, keys, &environment).await {
         Ok(run) => {
             // A provision that made it (fork or direct create, configure,
@@ -5317,173 +5286,76 @@ async fn wait_for_environment_change(
     }
 }
 
-/// Run one job on a provisioned runner, building its replacement in parallel.
+/// Run one job on a provisioned runner, then delete the runner.
 ///
-/// The runner is single-use, so the moment it announces that it has taken a
-/// job its successor can start booting. That moves fork + configure — the bulk
-/// of a slot's turnaround — off the path of whatever job arrives next, which is
-/// what a matrix workflow deeper than the pool spends its time waiting on.
-///
-/// Returns the replacement when one was built, so the caller can use it
-/// immediately instead of provisioning again.
+/// The runner is single-use: it serves exactly one job, and the slot forks its
+/// next runner from the golden only after this returns. A slot therefore holds
+/// at most one VM, at the cost of the fork + configure + register window
+/// (~seconds) in front of the next job a slot picks up.
 async fn run_one_runner<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: &RunnerPoolConfig,
     runner: ReadyRunner,
     shutdown: CancellationToken,
-    plan: SlotPlan<'_>,
-) -> Result<Option<ReadyRunner>, OrchestratorError> {
+    idle: Arc<std::sync::Mutex<usize>>,
+) -> Result<(), OrchestratorError> {
     let ReadyRunner {
         name,
         run,
         environment,
     } = runner;
     let name = &name;
-    let SlotPlan {
-        slot,
-        generation: next_generation,
-        golden,
-        environment: successor_environment,
-        idle,
-        keys,
-        building,
-        provisioning,
-        prebuild_successor,
-    } = plan;
 
     let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
     // The runner's completion is observed through this oneshot, never by
-    // re-polling the JoinHandle: `tokio::join!(&mut run_task, successor)`
-    // panics with "JoinHandle polled after completion" when the runner exits
-    // before the successor finishes provisioning and `select!` re-polls the
-    // branch — a completed `&mut JoinHandle` cannot be polled again.
+    // re-polling the JoinHandle: a completed `&mut JoinHandle` cannot be
+    // polled again, and `select!` re-polls its branches.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_provider = provider.clone();
     let run_name = name.clone();
-    // The counter mutation and the status publication share one lock, so a
-    // concurrent claim can never publish an older count over a newer one:
-    // `snapshot().idle` cannot report an idle runner that was already
-    // claimed.
-    {
-        let mut idle = idle.lock().unwrap();
-        *idle += 1;
-        if let Some(ps) = &config.pool_status {
-            ps.set_idle(*idle as u32);
-        }
-    }
+    // The runner is registered and unclaimed as soon as it reaches this
+    // function; the guard publishes it in the pool-wide idle gauge until a job
+    // claims it or it is torn down.
+    let mut idle = IdleGuard::register(idle, config.pool_status.clone());
     let run_task = tokio::spawn(async move {
         let result = run_until_exit(&run_provider, &run_name, &run, busy_tx, GUEST_LIVENESS).await;
         let _ = done_tx.send(result);
     });
 
-    // Resolves once the runner reports a job and its replacement is ready. A
-    // runner that exits without taking a job (shutdown, transient failure)
-    // drops the sender, and this yields `None` without provisioning anything.
-    let pending_jobs = config.pending_jobs.as_deref();
-    let successor_claimed = claimed.clone();
-    let build_successor = async {
+    // The guest announces the job it accepted on stdout. From that moment the
+    // runner is busy, not idle; a runner that exits without taking one leaves
+    // the guard to this function's teardown.
+    let claim_claimed = claimed.clone();
+    let claim = async {
         if busy_rx.await.is_err() {
-            {
-                let mut idle = idle.lock().unwrap();
-                *idle = idle.saturating_sub(1);
-                if let Some(ps) = &config.pool_status {
-                    ps.set_idle(*idle as u32);
-                }
-            }
-            return None;
+            return;
         }
-        successor_claimed.store(true, Ordering::Release);
-        let idle_after = {
-            let mut idle = idle.lock().unwrap();
-            *idle = idle.saturating_sub(1);
-            if let Some(ps) = &config.pool_status {
-                ps.set_idle(*idle as u32);
-            }
-            *idle
-        };
-        if !prebuild_successor {
-            return None;
-        }
-        // Booting a VM costs real CPU, and it would be spent alongside the job
-        // that just started, so build exactly as many replacements as the
-        // backlog needs and no more.
-        // absorb. Every claiming slot computes it, so a reservation counter
-        // decides which of them actually build: without it, a matrix one job
-        // wider than the pool had all four slots boot a replacement to serve a
-        // single straggler, and the contention cost more than the wait.
-        let queued = pending_jobs.map_or(0, |pending| pending.load(Ordering::Acquire));
-        // With nothing queued still keep one runner coming, so the pool is not
-        // empty for whatever arrives next.
-        let wanted = queued
-            .saturating_sub(idle_after)
-            .max(usize::from(idle_after == 0));
-        let _reservation = Reservation::take(building, wanted, config.pool_status.clone())?;
-        // The successor boot runs alongside the job; while it is in flight a
-        // matching runner may not be registered yet (all slots busy). Hold
-        // the shared provisioning guard so the server's starvation sweep
-        // keeps the queued-job grace clock paused for the boot duration.
-        let preparing = PreparingGuard::enter(
-            provisioning.clone(),
-            config.preparing_signal.clone(),
-            config.pool_status.clone(),
-        );
-        match provision_slot(
-            &provider,
-            config,
-            slot,
-            next_generation,
-            golden,
-            keys,
-            successor_environment,
-            &shutdown,
-        )
-        .await
-        {
-            Ok(successor) => {
-                drop(preparing);
-                // `None` means the disk reserve held the start until shutdown:
-                // the slot keeps its current job and stops replenishing.
-                successor
-            }
-            Err(error) => {
-                drop(preparing);
-                warn!(slot, %error, "pre-provisioning the replacement runner failed");
-                None
-            }
-        }
+        claim_claimed.store(true, Ordering::Release);
+        idle.release();
     };
 
-    let (result, successor) = tokio::select! {
+    let result = tokio::select! {
         _ = shutdown.cancelled() => {
             // Killing the host-side `smolvm machine exec` process does not
             // terminate the guest command. Abort the wrapper first, then stop
             // the VM so deletion cannot wait indefinitely on a live listener.
             run_task.abort();
             let _ = run_task.await;
-            (provider.stop(name).await.map_err(OrchestratorError::from), None)
+            provider.stop(name).await.map_err(OrchestratorError::from)
         },
         _ = wait_for_environment_change(config, &environment.base, claimed) => {
             run_task.abort();
             let _ = run_task.await;
-            {
-                let mut idle = idle.lock().unwrap();
-                *idle = idle.saturating_sub(1);
-                if let Some(ps) = &config.pool_status {
-                    ps.set_idle(*idle as u32);
-                }
-            }
             info!(machine = name.as_str(), environment = %environment.base, "replacing idle runner for queued environment");
-            (provider.stop(name).await.map_err(OrchestratorError::from), None)
+            provider.stop(name).await.map_err(OrchestratorError::from)
         },
-        pair = async {
-            // Concurrent on purpose: the successor is built while the job is
-            // still running, which is the whole point of the busy signal. The
-            // oneshot is polled once by value, so a runner that exits before
-            // the successor is ready cannot be re-polled into a panic.
-            tokio::join!(done_rx, build_successor)
+        done = async {
+            // The oneshot is polled once by value, so a runner that exits
+            // before it reports a job cannot be re-polled into a panic.
+            tokio::join!(done_rx, claim).0
         } => {
-            let result = match pair.0 {
+            match done {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
                     // `run_until_exit` turns a non-zero guest exit into this
@@ -5504,10 +5376,10 @@ async fn run_one_runner<P: VmProvider + 'static>(
                 Err(_) => Err(OrchestratorError::Pool(
                     "runner task ended without a result".into(),
                 )),
-            };
-            (result, pair.1)
+            }
         },
     };
+    idle.release();
 
     // The runner writes this marker only when the job it ran opted in via
     // `preserve_on_failure` and then genuinely failed, so preservation is
@@ -5540,44 +5412,14 @@ async fn run_one_runner<P: VmProvider + 'static>(
         if let Err(error) = provider.delete(name).await {
             warn!(machine = name.as_str(), %error, "failed to delete preserved machine");
         }
-        return finish(&provider, config, result, successor).await;
+        return result;
     }
 
     // Report the runner's own failure in preference to a teardown failure.
     notify_runner_gone(config, name).await;
     vm_telemetry_deregister(config, name);
     let delete_result = provider.delete(name).await.map_err(OrchestratorError::from);
-    finish(&provider, config, result.and(delete_result), successor).await
-}
-
-/// Hand the replacement back, or discard it if this runner is failing.
-///
-/// A pre-provisioned successor owns a live VM. Returning early on the runner's
-/// error would drop the handle and strand that machine until the pool next
-/// swept stale names, so failure paths delete it explicitly.
-async fn finish<P: VmProvider + 'static>(
-    provider: &Arc<P>,
-    config: &RunnerPoolConfig,
-    result: Result<(), OrchestratorError>,
-    successor: Option<ReadyRunner>,
-) -> Result<Option<ReadyRunner>, OrchestratorError> {
-    match result {
-        Ok(()) => Ok(successor),
-        Err(error) => {
-            if let Some(successor) = successor {
-                notify_runner_gone(config, &successor.name).await;
-                vm_telemetry_deregister(config, &successor.name);
-                if let Err(cleanup) = provider.delete(&successor.name).await {
-                    warn!(
-                        machine = successor.name.as_str(),
-                        %cleanup,
-                        "failed to delete the replacement runner of a failed slot"
-                    );
-                }
-            }
-            Err(error)
-        }
-    }
+    result.and(delete_result)
 }
 
 /// How the runner stream checks that its guest is still alive.
@@ -6777,6 +6619,9 @@ mod lifecycle_tests {
         /// When set, `exec_with_secret_env` (the configure step) blocks until
         /// notified, so a test can observe the pool mid-provision.
         configure_gate: Option<Arc<tokio::sync::Notify>>,
+        /// When set, the guest runner's `run` stream blocks until notified,
+        /// so a test can observe the pool while a job is still executing.
+        run_gate: Option<Arc<tokio::sync::Notify>>,
         /// Guest pause marker state: when set, the exec probe for the debug
         /// pause marker succeeds, so `watch_guest_pause` sees a paused job.
         pause_marker: std::sync::atomic::AtomicBool,
@@ -6819,6 +6664,7 @@ mod lifecycle_tests {
                 fail_delete,
                 announce_busy: false,
                 configure_gate: None,
+                run_gate: None,
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
                 suspends: false,
@@ -6834,6 +6680,11 @@ mod lifecycle_tests {
 
         fn with_configure_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
             self.configure_gate = Some(gate);
+            self
+        }
+
+        fn with_run_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+            self.run_gate = Some(gate);
             self
         }
 
@@ -7946,7 +7797,7 @@ chmod +x "$dest/bin/node"
         let handles = PoolHandles {
             idle: Arc::new(std::sync::Mutex::new(0)),
             keys: Arc::new(KeyPool::new()),
-            building: Arc::new(AtomicUsize::new(0)),
+            building: Arc::new(std::sync::Mutex::new(0)),
             provisioning: Arc::new(std::sync::Mutex::new(0)),
         };
         let shutdown = CancellationToken::new();
@@ -8469,6 +8320,9 @@ chmod +x "$dest/bin/node"
                     ))
                     .await
                     .unwrap();
+            }
+            if let Some(gate) = &self.run_gate {
+                gate.notified().await;
             }
             if self.fail_run && argv.iter().any(|arg| arg == "run") {
                 // `exec_stream` returns the guest process exit code; transport
@@ -9716,31 +9570,10 @@ chmod +x "$dest/bin/node"
         .await
         .expect("provisioning succeeds")
         .expect("a runner is provisioned");
-        let idle = std::sync::Mutex::new(0);
-        let error = run_one_runner(
-            provider,
-            &config,
-            runner,
-            CancellationToken::new(),
-            SlotPlan {
-                slot: 0,
-                generation: 2,
-                golden: None,
-                environment: RunnerEnvironment {
-                    fingerprint: None,
-                    base: config.base_image.clone(),
-                    toolchains: Vec::new(),
-                    curated: true,
-                },
-                idle: &idle,
-                keys: &Arc::new(KeyPool::new()),
-                building: &AtomicUsize::new(0),
-                provisioning: &Arc::new(std::sync::Mutex::new(0)),
-                prebuild_successor: true,
-            },
-        )
-        .await
-        .expect_err("runner failure must propagate");
+        let idle = Arc::new(std::sync::Mutex::new(0));
+        let error = run_one_runner(provider, &config, runner, CancellationToken::new(), idle)
+            .await
+            .expect_err("runner failure must propagate");
         assert!(
             error
                 .to_string()
@@ -9750,7 +9583,7 @@ chmod +x "$dest/bin/node"
     }
 
     #[tokio::test]
-    async fn on_demand_slot_does_not_build_a_throwaway_successor() {
+    async fn on_demand_slot_provisions_exactly_one_runner() {
         let provider =
             Arc::new(TestProvider::new(false, false, false, false, false).announcing_busy());
         let mut config = test_config(false);
@@ -9758,7 +9591,7 @@ chmod +x "$dest/bin/node"
         let handles = PoolHandles {
             idle: Arc::new(std::sync::Mutex::new(0)),
             keys: Arc::new(KeyPool::new()),
-            building: Arc::new(AtomicUsize::new(0)),
+            building: Arc::new(std::sync::Mutex::new(0)),
             provisioning: Arc::new(std::sync::Mutex::new(0)),
         };
 
@@ -9769,7 +9602,6 @@ chmod +x "$dest/bin/node"
             CancellationToken::new(),
             Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
             handles,
-            Arc::new(std::sync::Mutex::new(0)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
         )
@@ -9785,7 +9617,227 @@ chmod +x "$dest/bin/node"
         assert_eq!(
             creates,
             vec!["create:lifecycle-test-0-1"],
-            "size-zero mode must not provision a successor it immediately deletes"
+            "one slot serves one job from exactly one VM"
+        );
+    }
+
+    /// Wait until `predicate` holds for the pool status snapshot.
+    async fn wait_for_pool_status(
+        what: &str,
+        pool_status: &Arc<preloop_observability::status::PoolStatus>,
+        predicate: impl Fn(&preloop_observability::status::PoolSnapshot) -> bool,
+    ) -> preloop_observability::status::PoolSnapshot {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = pool_status.snapshot();
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; last snapshot: {snapshot:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    fn pool_handles() -> PoolHandles {
+        PoolHandles {
+            idle: Arc::new(std::sync::Mutex::new(0)),
+            keys: Arc::new(KeyPool::new()),
+            building: Arc::new(std::sync::Mutex::new(0)),
+            provisioning: Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+
+    /// Wait until the provider has served `runs` jobs and the pool status
+    /// reports no idle runner and no boot or provision in flight: the state
+    /// while a job is executing on the slot's one VM.
+    async fn wait_for_claimed_job(
+        what: &str,
+        pool_status: &Arc<preloop_observability::status::PoolStatus>,
+        provider: &Arc<TestProvider>,
+        runs: usize,
+    ) -> preloop_observability::status::PoolSnapshot {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let seen = provider
+                .events()
+                .await
+                .iter()
+                .filter(|event| event.starts_with("run:"))
+                .count();
+            let snapshot = pool_status.snapshot();
+            if seen >= runs
+                && snapshot.idle == 0
+                && snapshot.building == 0
+                && snapshot.provisioning == 0
+            {
+                return snapshot;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; last snapshot: {snapshot:?} (runs={seen})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Fork-on-completion: a slot holds at most one VM. The next runner is
+    /// forked only after the finished job's VM was deleted, so the slot's
+    /// machines never overlap.
+    #[tokio::test]
+    async fn slot_never_holds_two_vms_at_once() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let config = test_config(false);
+        let shutdown = CancellationToken::new();
+        let slot = tokio::spawn(run_slot(
+            provider.clone(),
+            config.clone(),
+            0,
+            shutdown.clone(),
+            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            pool_handles(),
+        ));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while provider
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.starts_with("run:"))
+            .count()
+            < 3
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "slot never served three jobs"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), slot)
+            .await
+            .expect("the slot stops on shutdown")
+            .expect("the slot task joins")
+            .expect("the slot exits cleanly");
+
+        // Walk the event log: a slot machine may only be created while none of
+        // the slot's earlier machines is still alive.
+        let events = provider.events().await;
+        let slot_prefix = format!("{}-0-", config.name_prefix);
+        let mut live = std::collections::HashSet::new();
+        let mut created = 0usize;
+        for event in &events {
+            if let Some(name) = event.strip_prefix("create:") {
+                if name.starts_with(&slot_prefix) {
+                    created += 1;
+                    assert!(
+                        live.insert(name.to_owned()),
+                        "{name} was created while {live:?} was still alive: {events:?}"
+                    );
+                }
+            } else if let Some(name) = event.strip_prefix("delete:") {
+                live.remove(name);
+            }
+        }
+        assert!(
+            created >= 3,
+            "the slot must have forked a fresh runner after each job: {events:?}"
+        );
+    }
+
+    /// Pool status counts follow one slot through its whole job cycle: boot
+    /// (provisioning + building), claimed job (idle drops to zero), and the
+    /// next boot after the VM is deleted — with no counter left stranded.
+    #[tokio::test]
+    async fn pool_status_counts_stay_accurate_across_a_job() {
+        let configure_gate = Arc::new(tokio::sync::Notify::new());
+        let run_gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false)
+                .announcing_busy()
+                .with_configure_gate(configure_gate.clone())
+                .with_run_gate(run_gate.clone()),
+        );
+        let mut config = test_config(false);
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let shutdown = CancellationToken::new();
+        let slot = tokio::spawn(run_slot(
+            provider.clone(),
+            config.clone(),
+            0,
+            shutdown.clone(),
+            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            pool_handles(),
+        ));
+
+        // Booting: the configure step is gated, so the slot is mid-provision
+        // with nothing registered yet.
+        let booting = wait_for_pool_status("the first boot", &pool_status, |snapshot| {
+            snapshot.building == 1
+        })
+        .await;
+        assert_eq!(
+            (booting.idle, booting.building, booting.provisioning),
+            (0, 1, 1),
+            "a booting slot is provisioning and building, with nothing idle"
+        );
+
+        // Registered and claimed: the job is running, the idle gauge is zero.
+        // The idle window between registration and the claim is a single
+        // scheduler hop, so the wait requires the observed job too.
+        configure_gate.notify_waiters();
+        wait_for_claimed_job("the first job", &pool_status, &provider, 1).await;
+
+        // Job done: the slot deletes that VM and boots its next runner — the
+        // second boot is gated again at configure.
+        run_gate.notify_waiters();
+        let rebuilding = wait_for_pool_status("the replacement boot", &pool_status, |snapshot| {
+            snapshot.building == 1
+        })
+        .await;
+        assert_eq!(
+            (
+                rebuilding.idle,
+                rebuilding.building,
+                rebuilding.provisioning
+            ),
+            (0, 1, 1),
+            "the replacement boot must not leave a stale idle count"
+        );
+        let creates = provider
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.starts_with("create:"))
+            .count();
+        assert_eq!(
+            creates, 2,
+            "the second boot forks a fresh VM after the first was deleted"
+        );
+
+        // The replacement takes the second job, with every boot counter back
+        // at zero.
+        configure_gate.notify_waiters();
+        wait_for_claimed_job("the second job", &pool_status, &provider, 2).await;
+
+        // A held job resumes on shutdown: the runner is stopped and deleted
+        // without stranding any count.
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), slot)
+            .await
+            .expect("the slot stops on shutdown")
+            .expect("the slot task joins")
+            .expect("the slot exits cleanly");
+        let ended = pool_status.snapshot();
+        assert_eq!(
+            (ended.idle, ended.building, ended.provisioning),
+            (0, 0, 0),
+            "every counter must return to zero after the slot stops"
         );
     }
 
