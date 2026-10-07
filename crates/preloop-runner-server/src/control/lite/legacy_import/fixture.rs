@@ -1187,10 +1187,10 @@ fn insert_meta(
             {"byte_count": 512, "line_count": 6}
         ]));
     }
-    if spec.unknown_meta_key {
-        if let Some(object) = meta.as_object_mut() {
-            object.insert("mystery_state".to_owned(), serde_json::json!([1, 2, 3]));
-        }
+    if spec.unknown_meta_key
+        && let Some(object) = meta.as_object_mut()
+    {
+        object.insert("mystery_state".to_owned(), serde_json::json!([1, 2, 3]));
     }
     let blob = cipher.seal(&serde_json::to_vec(&meta)?)?;
     tx.execute(

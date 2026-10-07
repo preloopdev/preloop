@@ -2217,13 +2217,11 @@ fn insert_synthesized_job(
          VALUES (?1,?2,?3,?4,'{}')",
         params![run_id, job_id, display_name, order],
     )?;
-    let mut position = 0_i64;
-    for need in &needs {
+    for (position, need) in needs.iter().enumerate() {
         tx.execute(
             "INSERT INTO job_needs (run_id, job_id, needs_job_id, position) VALUES (?1,?2,?3,?4)",
-            params![run_id, job_id, need.0, position],
+            params![run_id, job_id, need.0, position as i64],
         )?;
-        position += 1;
     }
     Ok(())
 }
@@ -2292,11 +2290,15 @@ fn job_times(
     (started, completed)
 }
 
+/// The OIDC grant a legacy job record carries:
+/// (`oidc_environment`, `job_workflow_ref`, `job_workflow_sha`, id-token granted).
+type OidcGrant = (Option<String>, Option<String>, Option<String>, bool);
+
 fn oidc_for(
     meta: &serde_json::Map<String, serde_json::Value>,
     run_id: &str,
     job_id: &str,
-) -> anyhow::Result<(Option<String>, Option<String>, Option<String>, bool)> {
+) -> anyhow::Result<OidcGrant> {
     let mut environment = None;
     let mut job_workflow_ref = None;
     let mut job_workflow_sha = None;
@@ -2418,7 +2420,9 @@ fn import_logs(
 ) -> anyhow::Result<()> {
     // Merge the table rows with the runtime snapshot's metadata map: an entry
     // can exist in either (chunk pruning vs. row rewrite timing).
-    let mut merged: BTreeMap<String, (i64, i64, i64, Vec<Vec<u8>>)> = BTreeMap::new();
+    /// One merged log's metadata: (byte_count, line_count, updated_at_us, chunks).
+    type MergedLog = (i64, i64, i64, Vec<Vec<u8>>);
+    let mut merged: BTreeMap<String, MergedLog> = BTreeMap::new();
     for log in logs {
         merged.insert(
             log.log_key.clone(),
