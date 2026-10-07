@@ -388,6 +388,16 @@ wait_run() {
   printf '%s\n' timeout
 }
 
+# A rejected submission is this target's verdict, not the campaign's: record
+# it and let the remaining targets run.
+submission_rejected() {
+  local target="$1" target_dir="$2" output="$3"
+  printf '%s\n' "$output" | tee "$target_dir/submit.txt"
+  printf '%s\n' submission-rejected >"$target_dir/status.txt"
+  echo "=== [$target] final status: submission-rejected ==="
+  FAILED_TARGETS="${FAILED_TARGETS}${target}=submission-rejected\n"
+}
+
 run_target() {
   local target="$1" workflow_filter="${2:-}"
   local cfg slug url branch workflow event git_ref ws_dir target_dir submit run_id final_status
@@ -422,12 +432,12 @@ EOF
       submit="$("$CLIENT_BIN" --server "http://127.0.0.1:$PORT" submit \
         -W "$ws_dir/$workflow" --workspace-root "$ws_dir" --repository "$repo_slug" \
         --git-ref "$git_ref" --event "$event" --payload "$target_dir/event.json" 2>&1)" || {
-          printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
-          fail "[$target] workflow submission failed"
+          submission_rejected "$target" "$target_dir" "$submit"
+          return 0
         }
     else
-      printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
-      fail "[$target] workflow submission failed"
+      submission_rejected "$target" "$target_dir" "$submit"
+      return 0
     fi
   fi
   printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
@@ -438,6 +448,9 @@ EOF
   # `set -e`: a transient server hiccup after the run concluded would abort
   # the whole run and lose the recorded result.
   run_snapshot "$run_id" "$target_dir/run.json" || true
+  # Job logs live in the campaign server's store, which the next run wipes.
+  PRELOOP_URL="http://127.0.0.1:$PORT" PRELOOP_TOKEN="$PRELOOP_SYSTEM_TOKEN" \
+    "$SERVER_BIN" logs "$run_id" >"$target_dir/logs.txt" 2>&1 || true
   printf '%s\n' "$final_status" >"$target_dir/status.txt" || true
   echo "=== [$target] final status: $final_status ==="
   case "$final_status" in
