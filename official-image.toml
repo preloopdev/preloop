@@ -18,3 +18,32 @@
 # (orchestrator build.rs codegen, workflow awk, Renovate regex managers).
 official_runner_image_base_amd64 = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795"
 official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:3884ef2266edee7ae2da8f70f54faba5340238e68ede5274d0e90fdec80faf9e"
+
+# ── Golden runtime values (the single source of truth) ──────────────────
+#
+# What a job running in a golden sees on a real GitHub-hosted runner, read
+# back from a probe of `ubuntu-24.04` and `ubuntu-24.04-arm` (image
+# 20260927.320.1 / 20260927.135.1, kernel 6.17.0-1022-azure). Everything
+# that has to match derives from these keys: the orchestrator's guest init
+# and launch wrappers (build.rs codegen -> constants), the parity fixture,
+# the CI job that runs the fixture's probe inside a real guest, and the
+# scheduled drift job that re-probes GitHub and opens a bump PR when one of
+# them moves.
+#
+# Provenance in actions/runner-images: `configure-limits.sh` writes
+# `DefaultLimitSTACK=16M:infinity`, `DefaultLimitNOFILE=65536` and the
+# `* soft/hard stack|nofile` lines into the image; `configure-environment.sh`
+# appends the three sysctls to /etc/sysctl.conf.
+golden_rlimit_stack_soft_kib = "16384"
+golden_rlimit_stack_hard = "unlimited"
+golden_rlimit_nofile_soft = "65536"
+golden_rlimit_nofile_hard = "65536"
+golden_sysctl_vm_max_map_count = "262144"
+golden_sysctl_fs_inotify_max_user_watches = "655360"
+golden_sysctl_fs_inotify_max_user_instances = "1280"
+# The machine's own name must resolve to an address the machine owns
+# (loopback or a local-interface address), the way a hosted runner's does.
+golden_hostname_resolves_locally = "true"
+# Environment keys a hosted step's environment does not carry: the terminal
+# identity, which the guest's exec channel would otherwise leak into steps.
+golden_step_env_unset = "TERM,COLORTERM"

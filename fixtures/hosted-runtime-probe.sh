@@ -4,16 +4,10 @@
 # an ad-hoc `docker run` and in a `container:` job) and for the
 # `hosted-runtime-parity` CI job (which runs it inside a real preloop guest).
 #
-# Every value was read back from a real GitHub-hosted runner (workflow_dispatch
-# probe on `ubuntu-24.04` and `ubuntu-24.04-arm`, image `20260927.320.1` /
-# `20260927.135.1`, kernel `6.17.0-1022-azure`):
-#
-#   Max stack size   16777216 / unlimited   (`ulimit -Ss` 16384, `-Hs` unlimited)
-#   Max open files   65536 / 65536
-#   vm.max_map_count 262144, fs.inotify.max_user_watches 655360,
-#   fs.inotify.max_user_instances 1280
-#   the machine's own name resolves to an address of the machine
-#   TERM and COLORTERM absent from the environment; CI=true, GITHUB_ACTIONS=true
+# Every expected value is read from `official-image.toml` (the golden-image
+# config, `golden_*` keys), which is also what build.rs compiles into the
+# orchestrator's guest init — so the init, this probe and the scheduled GitHub
+# drift check cannot disagree. Nothing here hardcodes an expected value.
 #
 # Usage: hosted-runtime-probe.sh [--adhoc] [--recursion]
 #
@@ -40,62 +34,79 @@ for arg in "$@"; do
     esac
 done
 
+# The repo root is this script's parent: the config sits beside `fixtures/`.
+CONFIG="${GOLDEN_RUNTIME_CONFIG:-$(dirname "$0")/../official-image.toml}"
+[ -r "$CONFIG" ] || {
+    echo "PARITY FAIL: cannot read $CONFIG (the golden runtime config)" >&2
+    exit 2
+}
+cfg() {
+    sed -n "s/^$1[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*$/\1/p" "$CONFIG" | head -n 1
+}
+
 fail() {
     echo "PARITY FAIL: $*" >&2
     exit 1
 }
 
 # ── process limits ──────────────────────────────────────────────────────
-# The image's `DefaultLimitSTACK=16M:infinity` and `DefaultLimitNOFILE=65536`.
+want_stack_soft=$(cfg golden_rlimit_stack_soft_kib)
+want_stack_hard=$(cfg golden_rlimit_stack_hard)
+want_nofile_soft=$(cfg golden_rlimit_nofile_soft)
+want_nofile_hard=$(cfg golden_rlimit_nofile_hard)
 stack_soft=$(ulimit -Ss)
 stack_hard=$(ulimit -Hs)
 nofile_soft=$(ulimit -Sn)
 nofile_hard=$(ulimit -Hn)
-echo "stack  soft=${stack_soft}KiB hard=${stack_hard}   (GitHub-hosted: 16384 / unlimited)"
-echo "nofile soft=${nofile_soft} hard=${nofile_hard}      (GitHub-hosted: 65536 / 65536)"
-[ "$stack_soft" = 16384 ] || fail "stack soft is ${stack_soft}KiB, expected 16384"
-[ "$stack_hard" = unlimited ] || fail "stack hard is ${stack_hard}, expected unlimited"
-[ "$nofile_soft" = 65536 ] || fail "nofile soft is ${nofile_soft}, expected 65536"
-[ "$nofile_hard" = 65536 ] || fail "nofile hard is ${nofile_hard}, expected 65536"
+echo "stack  soft=${stack_soft}KiB hard=${stack_hard}   (golden: ${want_stack_soft} / ${want_stack_hard})"
+echo "nofile soft=${nofile_soft} hard=${nofile_hard}      (golden: ${want_nofile_soft} / ${want_nofile_hard})"
+[ "$stack_soft" = "$want_stack_soft" ] || fail "stack soft is ${stack_soft}KiB, expected ${want_stack_soft}"
+[ "$stack_hard" = "$want_stack_hard" ] || fail "stack hard is ${stack_hard}, expected ${want_stack_hard}"
+[ "$nofile_soft" = "$want_nofile_soft" ] || fail "nofile soft is ${nofile_soft}, expected ${want_nofile_soft}"
+[ "$nofile_hard" = "$want_nofile_hard" ] || fail "nofile hard is ${nofile_hard}, expected ${want_nofile_hard}"
 
 # ── sysctls ─────────────────────────────────────────────────────────────
-# The values `images/ubuntu/scripts/build/configure-environment.sh` writes.
-for pair in vm.max_map_count=262144 \
-    fs.inotify.max_user_watches=655360 \
-    fs.inotify.max_user_instances=1280; do
+for pair in \
+    "vm.max_map_count=$(cfg golden_sysctl_vm_max_map_count)" \
+    "fs.inotify.max_user_watches=$(cfg golden_sysctl_fs_inotify_max_user_watches)" \
+    "fs.inotify.max_user_instances=$(cfg golden_sysctl_fs_inotify_max_user_instances)"; do
     key=${pair%%=*}
     want=${pair#*=}
+    [ -n "$want" ] || fail "official-image.toml is missing the golden value for ${key}"
     got=$(cat "/proc/sys/$(printf '%s' "$key" | tr '.' '/')" 2>/dev/null || echo MISSING)
-    echo "${key}=${got} (GitHub-hosted: ${want})"
+    echo "${key}=${got} (golden: ${want})"
     [ "$got" = "$want" ] || fail "${key} is ${got}, expected ${want}"
 done
 
 # ── the machine's own name ──────────────────────────────────────────────
-# A hosted runner's own name resolves to an address of the machine (GitHub's
-# /etc/hosts maps the VM's name to its interface address). A stale mapping to
-# an address the machine does not own is the AgentENV failure mode.
-host=$(hostname)
-addrs=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}')
-[ -n "$addrs" ] || addrs=$(getent hosts "$host" 2>/dev/null | awk '{print $1}')
-echo "hostname=${host} resolves to ${addrs:-<nothing>}"
-[ -n "$addrs" ] || fail "the machine's own hostname ${host} does not resolve"
-local_addrs="127.0.0.1 ::1 $(hostname -I 2>/dev/null) $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-local_ok=0
-for addr in $addrs; do
-    for local in $local_addrs; do
-        [ "$addr" = "$local" ] && local_ok=1
+if [ "$(cfg golden_hostname_resolves_locally)" = "true" ]; then
+    host=$(hostname)
+    addrs=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}')
+    [ -n "$addrs" ] || addrs=$(getent hosts "$host" 2>/dev/null | awk '{print $1}')
+    echo "hostname=${host} resolves to ${addrs:-<nothing>}"
+    [ -n "$addrs" ] || fail "the machine's own hostname ${host} does not resolve"
+    local_addrs="127.0.0.1 ::1 $(hostname -I 2>/dev/null) $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+    local_ok=0
+    for addr in $addrs; do
+        for local in $local_addrs; do
+            [ "$addr" = "$local" ] && local_ok=1
+        done
     done
-done
-[ "$local_ok" = 1 ] || fail "hostname ${host} resolves to ${addrs}, none of which is an address of this machine"
+    [ "$local_ok" = 1 ] || fail "hostname ${host} resolves to ${addrs}, none of which is an address of this machine"
+fi
 
 # ── the step environment ────────────────────────────────────────────────
-# A hosted step's environment has no TERM and no COLORTERM: the `dumb` a bash
-# step prints for `$TERM` is bash's own default for an unset TERM, not an
-# exported variable.
-if env | grep -qE '^(TERM|COLORTERM)='; then
-    fail "TERM/COLORTERM must not be exported into a step: $(env | grep -E '^(TERM|COLORTERM)=' | tr '\n' ' ')"
-fi
-echo "TERM/COLORTERM: absent (matching GitHub-hosted)"
+# `golden_step_env_unset` lists the keys a hosted step's environment does not
+# carry: the terminal identity, which the guest's exec channel would otherwise
+# leak into steps. The `dumb` a bash step prints for `$TERM` is bash's own
+# default for an unset TERM, not an exported variable.
+for key in $(printf '%s' "$(cfg golden_step_env_unset)" | tr ',' ' '); do
+    [ -n "$key" ] || continue
+    if env | grep -qE "^${key}="; then
+        fail "${key} must not be exported into a step: $(env | grep -E "^${key}=" | tr '\n' ' ')"
+    fi
+done
+echo "unset in the step env: $(cfg golden_step_env_unset)"
 case "$mode" in
     adhoc)
         # Nothing injects CI/GITHUB_ACTIONS into a container the workflow
@@ -112,8 +123,8 @@ case "$mode" in
 esac
 
 # ── deep recursion (opt-in) ─────────────────────────────────────────────
-# pydantic's shape: at the kernel's 8192 KiB stack a workload that walks more
-# than 8 MiB of native frames dies with SIGSEGV instead of returning.
+# pydantic's shape: below the golden's stack a workload that walks more native
+# frames than the limit allows dies with SIGSEGV instead of returning.
 if [ "$recursion" = 1 ]; then
     cat >/tmp/hosted-runtime-recurse.c <<'EOF'
 #include <stdio.h>
@@ -121,7 +132,7 @@ if [ "$recursion" = 1 ]; then
 static volatile int sink;
 
 /* -O0 keeps every frame real: ~2 KiB of pad per call, 5000 calls is ~10 MiB —
- * past 8192 KiB, comfortably inside 16384 KiB. */
+ * past the kernel default, comfortably inside the golden's stack. */
 static int descend(int depth) {
   char pad[2048];
   pad[0] = (char)depth;
