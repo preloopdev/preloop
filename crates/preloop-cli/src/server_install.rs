@@ -1706,6 +1706,7 @@ fn prepare_home(home: &Path, dry_run: bool) -> Result<()> {
 /// first start works with no extra step (zero-config first use). An existing
 /// database is never touched: upgrading is `preloop store migrate`, never
 /// implicit, and a Postgres store is the operator's explicit migrate call.
+#[cfg(target_os = "linux")]
 fn prepare_control_store(home: &Path, dry_run: bool) -> Result<()> {
     if dry_run {
         eprintln!("[preloop] would initialize a brand-new control database");
