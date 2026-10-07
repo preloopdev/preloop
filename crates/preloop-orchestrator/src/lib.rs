@@ -2159,17 +2159,27 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
 /// every step forever. The address matches the bake's convention
 /// (`127.0.0.1 <host>`).
 pub fn guest_hostname_script() -> String {
-    "host=$(hostname 2>/dev/null || uname -n); \
-     [ -n \"$host\" ] || exit 0; \
-     getent hosts \"$host\" >/dev/null 2>&1 && exit 0; \
-     line=\"127.0.0.1 $host\"; \
-     if [ \"$(id -u)\" -eq 0 ]; then printf '%s\\n' \"$line\" >> /etc/hosts; \
-     else printf '%s\\n' \"$line\" | sudo -n tee -a /etc/hosts >/dev/null; fi; \
-     getent hosts \"$host\" >/dev/null 2>&1 || { \
-       echo \"guest hostname $host still does not resolve after /etc/hosts update\" >&2; \
-       exit 1; \
-     }"
-        .to_owned()
+    guest_hostname_script_at("/etc/hosts")
+}
+
+/// `hosts` is the file the machine's own name is appended to. Production
+/// passes `/etc/hosts`; the shell test below passes a scratch file so the real
+/// script runs end to end without touching the host's resolver, the way
+/// [`scope_rosetta_apt_sources`] stands in for `/etc/apt`.
+fn guest_hostname_script_at(hosts: &str) -> String {
+    let hosts = shell_quote(hosts);
+    format!(
+        "host=$(hostname 2>/dev/null || uname -n); \
+         [ -n \"$host\" ] || exit 0; \
+         getent hosts \"$host\" >/dev/null 2>&1 && exit 0; \
+         line=\"127.0.0.1 $host\"; \
+         if [ \"$(id -u)\" -eq 0 ]; then printf '%s\\n' \"$line\" >> {hosts}; \
+         else printf '%s\\n' \"$line\" | sudo -n tee -a {hosts} >/dev/null; fi; \
+         getent hosts \"$host\" >/dev/null 2>&1 || {{ \
+           echo \"guest hostname $host still does not resolve after the hosts-file update\" >&2; \
+           exit 1; \
+         }}"
+    )
 }
 
 /// The guest bootstrap script, one shell round trip.
@@ -7643,7 +7653,9 @@ chmod +x "$dest/bin/node"
     /// bake's `127.0.0.1 <host>` convention, escalate through passwordless
     /// sudo when the exec lands on the image user, and re-check so a machine
     /// that still cannot resolve fails provisioning instead of warning
-    /// forever.
+    /// forever. The behavior itself is executed by
+    /// `guest_hostname_script_makes_the_fork_name_resolve` and
+    /// `guest_hostname_script_fails_when_the_name_still_does_not_resolve`.
     #[test]
     fn guest_hostname_script_is_idempotent_and_verifies() {
         let script = guest_hostname_script();
@@ -7660,7 +7672,7 @@ chmod +x "$dest/bin/node"
             "the entry must follow the bake's 127.0.0.1 convention: {script}"
         );
         assert!(
-            script.contains("tee -a /etc/hosts"),
+            script.contains("tee -a '/etc/hosts'"),
             "the image-user branch must append through sudo: {script}"
         );
         assert!(
@@ -7668,12 +7680,165 @@ chmod +x "$dest/bin/node"
             "escalation must be non-interactive: {script}"
         );
         assert!(
-            script.contains(">> /etc/hosts"),
+            script.contains(">> '/etc/hosts'"),
             "the root branch must append directly: {script}"
         );
         assert!(
             !script.contains("|| true"),
             "a failed append or resolution must stay observable: {script}"
+        );
+    }
+
+    /// A stub executable in a scratch `bin` for the hostname harness below.
+    #[cfg(unix)]
+    fn hostname_harness_stub(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The fork's `/etc/hosts` carries the bake's entries but never the name
+    /// the fork booted under (`base_install_script` writes the *golden's*
+    /// name; the fork's is decided at fork time), so `sudo` resolved its
+    /// hostname to nothing and printed `sudo: unable to resolve host <name>`
+    /// before every command — 25 lines in one valkey job, where a
+    /// hosted-runner log has none. Run the real script against a scratch hosts
+    /// file with `hostname`, the resolver and the escalator stubbed, and show
+    /// the trigger before and the resolution after: the same before/after
+    /// REVIEW.md §1a asks for, since on `main` nothing ever wrote the mapping.
+    #[cfg(unix)]
+    #[test]
+    fn guest_hostname_script_makes_the_fork_name_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &hosts,
+            "127.0.0.1 localhost\n127.0.0.1 preloop-golden-bake\n",
+        )
+        .unwrap();
+
+        // The name is decided at fork time.
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\nprintf '%s\\n' fork-7c1f\n",
+        );
+        // `getent hosts <name>` answered from the scratch file the way nss
+        // `files` answers it: the first match and exit 0, else exit 2.
+        hostname_harness_stub(
+            &bin.join("getent"),
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = hosts ] || exit 2\n\
+                 line=$(grep -E \"^[^#]*[[:space:]]$2([[:space:]]|$)\" {} | head -n 1)\n\
+                 [ -n \"$line\" ] || exit 2\n\
+                 printf '%s\\n' \"$line\"\n",
+                shell_quote(hosts.to_str().unwrap())
+            ),
+        );
+        // sudo resolves the machine's name on every invocation — that lookup
+        // is what printed the warning — and then runs its argv.
+        hostname_harness_stub(
+            &bin.join("sudo"),
+            "#!/bin/sh\n\
+             host=$(hostname 2>/dev/null)\n\
+             getent hosts \"$host\" >/dev/null 2>&1 || \
+               printf 'sudo: unable to resolve host %s\\n' \"$host\" >&2\n\
+             [ \"$1\" = -n ] && shift\n\
+             exec \"$@\"\n",
+        );
+
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let run = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .env("PATH", &path)
+                .output()
+                .unwrap()
+        };
+        // Before: the fork's name resolves nowhere, so the `sudo` invocation
+        // printed the line the job logs were full of.
+        assert!(
+            !run("getent hosts \"$(hostname)\"").status.success(),
+            "the fork's own name must not resolve before the script runs"
+        );
+        let warned = run("sudo -n true");
+        assert!(
+            String::from_utf8_lossy(&warned.stderr).contains("unable to resolve host fork-7c1f"),
+            "the reported symptom must reproduce first: {}",
+            String::from_utf8_lossy(&warned.stderr)
+        );
+
+        // The fix: the real script appends the machine's own name and the
+        // lookup that warned stops failing.
+        let applied = run(&guest_hostname_script_at(hosts.to_str().unwrap()));
+        assert!(
+            applied.status.success(),
+            "{}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 preloop-golden-bake\n127.0.0.1 fork-7c1f\n",
+            "the entry must follow the bake's 127.0.0.1 convention"
+        );
+        assert!(
+            run("getent hosts \"$(hostname)\"").status.success(),
+            "the fork's own name must resolve once the script has run"
+        );
+        let quiet = run("sudo -n true");
+        assert!(
+            !String::from_utf8_lossy(&quiet.stderr).contains("unable to resolve host"),
+            "the warning must be gone: {}",
+            String::from_utf8_lossy(&quiet.stderr)
+        );
+
+        // And a machine whose name already resolves is left untouched.
+        let again = run(&guest_hostname_script_at(hosts.to_str().unwrap()));
+        assert!(again.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n127.0.0.1 preloop-golden-bake\n127.0.0.1 fork-7c1f\n",
+            "a second run must not append a duplicate entry"
+        );
+    }
+
+    /// A machine that still cannot resolve its name after the append must fail
+    /// provisioning, not keep printing the warning on every command forever.
+    #[cfg(unix)]
+    #[test]
+    fn guest_hostname_script_fails_when_the_name_still_does_not_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        hostname_harness_stub(
+            &bin.join("hostname"),
+            "#!/bin/sh\nprintf '%s\\n' fork-7c1f\n",
+        );
+        // A resolver that never finds the name: the append lands, the re-check
+        // does not, and the script must report it.
+        hostname_harness_stub(&bin.join("getent"), "#!/bin/sh\nexit 2\n");
+        hostname_harness_stub(
+            &bin.join("sudo"),
+            "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n",
+        );
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &guest_hostname_script_at(hosts.to_str().unwrap())])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "a name that still does not resolve must fail provisioning"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("still does not resolve"),
+            "the failure must say what did not resolve: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
