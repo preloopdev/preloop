@@ -957,9 +957,31 @@ pub async fn container_engine_access(network: Option<&str>) -> Option<ContainerE
     let host_origin = host_origin.trim_end_matches('/').to_owned();
     // Only the bridged configuration needs translation: loopback is what a
     // container would resolve to itself.
-    let bridge_address = crate::control_bridge::loopback_address(&host_origin)?;
+    crate::control_bridge::loopback_address(&host_origin)?;
     let gateway = network_gateway(network.unwrap_or("bridge")).await?;
-    let container_address = SocketAddr::new(gateway, bridge_address.port());
+    // Any free port works: the rewrite replaces the whole origin. Reusing the
+    // engine's port would collide with whatever the workflow itself listens
+    // on there (a published service port, a step's server).
+    let bridge = match crate::control_bridge::spawn_container_reachable(SocketAddr::new(
+        gateway, 0,
+    ))
+    .await
+    {
+        Ok(Some(bridge)) => bridge,
+        Ok(None) => return None,
+        Err(error) => {
+            // No free port on the gateway, or the gateway is not a guest
+            // address. Container steps then cannot reach the engine at all.
+            warn!(
+                %host_origin,
+                %gateway,
+                %error,
+                "container-facing control bridge unavailable; container steps cannot reach the engine"
+            );
+            return None;
+        }
+    };
+    let container_address = bridge.address();
     // Keep the advertised scheme: the splice is transparent, so a TLS origin
     // stays TLS and the container's trust store decides.
     let scheme = if host_origin.starts_with("https://") {
@@ -968,20 +990,6 @@ pub async fn container_engine_access(network: Option<&str>) -> Option<ContainerE
         "http"
     };
     let container_origin = format!("{scheme}://{container_address}");
-    let bridge = match crate::control_bridge::spawn_container_reachable(container_address).await {
-        Ok(bridge) => bridge,
-        Err(error) => {
-            // Without a listener the rewritten origin cannot work, so leave
-            // the environment alone rather than move the failure.
-            warn!(
-                %host_origin,
-                %container_address,
-                %error,
-                "container-facing control bridge unavailable; container steps keep the advertised origin"
-            );
-            return None;
-        }
-    };
     info!(
         %host_origin,
         %container_origin,
@@ -991,7 +999,7 @@ pub async fn container_engine_access(network: Option<&str>) -> Option<ContainerE
     Some(ContainerEngineAccess {
         host_origin,
         container_origin,
-        _bridge: bridge,
+        _bridge: Some(bridge),
     })
 }
 

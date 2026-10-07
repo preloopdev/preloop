@@ -164,12 +164,11 @@ pub async fn spawn_from_env_lookup(
 /// guest interface, unlike a wildcard bind. The blast radius stays exactly the
 /// one control-plane origin the runner is already authenticated against.
 ///
-/// Returns an error when no control transport is configured — translation
-/// without a listener would only move a container's connection-refused to
-/// another address — or when the bind fails: the network's gateway may not be
-/// up yet, or another process (which the runner cannot prove serves this
-/// control plane) may hold the address. Callers then leave container URLs
-/// untouched, which is the pre-fix behavior rather than a wrong origin.
+/// Callers pass port 0 and advertise [`ControlBridge::address`], so a port the
+/// workflow itself holds never blocks the bridge. Returns an error when no
+/// control transport is configured (translation without a listener would only
+/// move a container's connection-refused to another address) or when the
+/// gateway address cannot be bound at all (the network is not up).
 pub async fn spawn_container_reachable(address: SocketAddr) -> Result<Option<ControlBridge>> {
     spawn_container_reachable_lookup(
         address,
@@ -188,16 +187,9 @@ async fn spawn_container_reachable_lookup(
 ) -> Result<Option<ControlBridge>> {
     let settings = BridgeSettings::from_lookup(&var, &var_os)
         .ok_or_else(|| anyhow::anyhow!("no control-plane transport is configured"))?;
-    match settings.spawn(address).await {
-        Ok(bridge) => {
-            info!(%address, "control-plane bridge listening for containers");
-            Ok(Some(bridge))
-        }
-        // An occupied address is not proof that a control-plane bridge holds
-        // it: treating a foreign listener as ours would hand container steps
-        // an origin it cannot serve. Callers leave container URLs untouched.
-        Err(error) => Err(error.into()),
-    }
+    let bridge = settings.spawn(address).await?;
+    info!(address = %bridge.address(), "control-plane bridge listening for containers");
+    Ok(Some(bridge))
 }
 
 /// The upstream transport and tuning a bridge listener runs with, resolved
@@ -702,26 +694,30 @@ mod tests {
         assert_eq!(response, b"pong");
     }
 
-    /// An occupied address must not be treated as a control bridge: binding
-    /// fails, the runner leaves container URLs untouched, and the job sees the
-    /// pre-fix behavior instead of an origin a foreign listener happens to hold.
+    /// The container bridge takes any free port: a port the workflow already
+    /// holds (a published service port, a step's server) must not stop
+    /// container steps from reaching the engine.
     #[tokio::test]
-    async fn container_reachable_bridge_refuses_an_occupied_address() {
+    async fn container_reachable_bridge_takes_a_free_port() {
         let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = holder.local_addr().unwrap();
+        let held = holder.local_addr().unwrap();
         let vars = std::collections::HashMap::from([(
             CONTROL_UPSTREAM_ENV,
             "http://127.0.0.1:1".to_string(),
         )]);
 
-        let result = spawn_container_reachable_lookup(
-            address,
+        let bridge = spawn_container_reachable_lookup(
+            "127.0.0.1:0".parse().unwrap(),
             |name| vars.get(name).cloned(),
             |name| vars.get(name).map(std::ffi::OsString::from),
         )
-        .await;
+        .await
+        .unwrap()
+        .expect("a configured transport yields a bridge");
 
-        assert!(result.is_err(), "{address} is held by another process");
+        let bound = bridge.address();
+        assert_ne!(bound.port(), 0, "the advertised address names the bound port");
+        assert_ne!(bound, held, "{held} is held by another process");
     }
 
     /// No control transport means no bridge to point container steps at;

@@ -658,9 +658,10 @@ Fix (runner-side, because only the guest knows a container-reachable
 address): when a job's network is created the runner resolves the network's
 **gateway** (`docker network inspect … .IPAM.Config`, taking the first IPv4
 `Gateway` and falling back to IPv6 only when there is no IPv4 one — the host
-end of a container's default route) and binds the same control bridge there
-(`control_bridge::spawn_container_reachable`), then rewrites the advertised
-origin to `<scheme>://<gateway>:<port>` (the advertised scheme is kept) in
+end of a container's default route) and binds a control bridge there on a
+free port (`control_bridge::spawn_container_reachable` with port 0), then
+rewrites the advertised origin to `<scheme>://<gateway>:<bridge port>` (the
+advertised scheme is kept) in
 every environment a container process
 receives — `docker exec` env for run steps and node actions, `docker run` env
 for `docker://` action containers, and the workflow-declared env of the job and
@@ -676,9 +677,6 @@ Limits:
 - An `https` origin keeps its scheme, so the engine's certificate must cover
   the container-facing address (the bridge splices TCP without terminating
   TLS). A certificate issued for `127.0.0.1` is not valid for the gateway.
-- If the network gateway's address/port is already held by another process,
-  the runner does not bind a bridge and container steps keep the advertised
-  origin (the pre-fix behavior) rather than a foreign address.
 - A workflow that forces another network with `container.options:
   --network=…` points its steps at a gateway the runner did not bind; the
   engine URLs then fail to connect exactly as before. Official-runner
