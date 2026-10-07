@@ -33,6 +33,16 @@ jobs:
   host:
     runs-on: ubuntu-latest
     steps:
+      # The assertions and their expected values live in the repository, so
+      # every job here checks the tree out first — the same shape as the
+      # `hosted-runtime-parity` CI job. A backend that seeds the workspace
+      # from the submission's files would find them either way; one that
+      # delivers the run's checkout instead (AgentENV) would otherwise fail
+      # on a missing file before asserting anything.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
       - name: hosted runtime values in a step
         run: sh fixtures/hosted-runtime-probe.sh --recursion
 
@@ -46,5 +56,11 @@ jobs:
     container:
       image: ubuntu:24.04
     steps:
+      # Runs inside the job container (GitHub's runner semantics), which
+      # `ubuntu:24.04` supports: it ships git, and the runner supplies node.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
       - name: hosted runtime values in a container job
         run: sh fixtures/hosted-runtime-probe.sh
