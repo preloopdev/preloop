@@ -323,13 +323,18 @@ fn display_segments(value: &Value, segments: &mut Vec<String>) {
 /// `server: [{version: 8.1.4, file: …}]` reads
 /// `test-ubuntu-latest-compatibility (8.1.4, valkey-8.1.4-noble-x86_64.tar.gz)`
 /// — and the whole name is capped at 100 characters, trailing `...`.
+///
+/// The cap applies with or without segments: `JobNameBuilder.Build` picks the
+/// bare name when nothing was appended and runs the length check afterwards,
+/// so a job with no scalar leaves (no matrix at all, or only `null`/empty
+/// cells) still truncates.
 pub fn display_job_name(base: &str, matrix: &IndexMap<String, Value>) -> String {
     let mut segments = Vec::new();
     for value in matrix.values() {
         display_segments(value, &mut segments);
     }
     if segments.is_empty() {
-        return base.to_owned();
+        return truncate_display_name(base.to_owned());
     }
     truncate_display_name(format!("{base} ({})", segments.join(", ")))
 }
@@ -1318,5 +1323,30 @@ jobs:
         let name = display_job_name("job", &matrix);
         assert!(name.ends_with("..."));
         assert!(name.is_char_boundary(name.len() - 3));
+    }
+
+    /// The cap applies to the bare name too: `JobNameBuilder.Build` selects
+    /// the bare name when no segment was appended and runs the length check
+    /// unconditionally, so a matrix whose cells carry no scalar leaves (only
+    /// `null`, or an empty object/array) still truncates a long job key.
+    #[test]
+    fn display_name_caps_bare_name_without_segments() {
+        let long_base = "b".repeat(120);
+        for matrix in [
+            IndexMap::<String, Value>::new(),
+            IndexMap::from([("empty".to_string(), json!(null))]),
+            IndexMap::from([("blank".to_string(), json!(""))]),
+            IndexMap::from([("object".to_string(), json!({}))]),
+            IndexMap::from([("array".to_string(), json!([[], {}]))]),
+        ] {
+            let name = display_job_name(&long_base, &matrix);
+            assert_eq!(name.encode_utf16().count(), 100, "matrix: {matrix:?}");
+            assert_eq!(name, format!("{}...", "b".repeat(97)));
+        }
+
+        // Under the cap the bare name is returned unchanged.
+        let mut nothing = IndexMap::new();
+        nothing.insert("empty".into(), json!(null));
+        assert_eq!(display_job_name("build", &nothing), "build");
     }
 }
