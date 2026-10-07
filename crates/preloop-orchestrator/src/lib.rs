@@ -8627,7 +8627,8 @@ done
         // takes. Every other tool both halves call is linked in, so the test
         // exercises the real scripts rather than the harness PATH.
         for tool in [
-            "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp", "tee",
+            "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp",
+            "tee", "rm", "uname", "hostname",
         ] {
             symlink_tool(&bin, tool);
         }
