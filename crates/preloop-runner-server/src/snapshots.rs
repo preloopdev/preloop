@@ -4339,7 +4339,15 @@ pub async fn forge_api_repo_tarball(
         return Err(ApiError::bad_request("invalid archive path"));
     }
     if owner == "snapshots" {
-        return snapshot_repo_tarball(&shared, &repo, &git_ref, &request).await;
+        // The request body is not `Sync`: keep only the credential, and let the
+        // request go before awaiting, or the handler future is not `Send`.
+        let token = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(snapshot_authorization_token);
+        drop(request);
+        return snapshot_repo_tarball(&shared, &repo, &git_ref, token).await;
     }
     if let Err(response) = authorize_forge_relay(&shared.state, &request) {
         return Ok(*response);
@@ -4364,15 +4372,11 @@ async fn snapshot_repo_tarball(
     shared: &Arc<SharedState>,
     run_id_raw: &str,
     git_ref: &str,
-    request: &Request,
+    token: Option<String>,
 ) -> Result<Response<Body>, ApiError> {
     let run_id = snapshot_route_run_id(run_id_raw)?;
-    let token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(snapshot_authorization_token)
-        .ok_or_else(|| ApiError::unauthorized("snapshot archive authentication required"))?;
+    let token =
+        token.ok_or_else(|| ApiError::unauthorized("snapshot archive authentication required"))?;
     let storage_repository = match authorize_snapshot_token(&shared.state, &token, run_id).await {
         Ok(repository) => repository,
         Err(error) if error.status() == StatusCode::UNAUTHORIZED => {
