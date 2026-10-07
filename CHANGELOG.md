@@ -34,11 +34,14 @@ Releases before v0.27.0 predate the changelog.
   8192 KiB, half of GitHub's. pydantic's deep-recursion serializer tests —
   which walk Python's recursion limit through pydantic-core's Rust frames and
   assert a `RecursionError` — died with a stack-overflow `SIGSEGV` (exit 139)
-  on that half-sized stack while the same commit passed on GitHub. The guest
-  runner wrapper now raises the limit to the hosted 16384 KiB soft /
-  `unlimited` hard before dropping to the runner account, and the container
-  engine starts with it too, because a container's processes inherit the
-  daemon's limits.
+  on that half-sized stack while the same commit passed on GitHub. Every
+  guest launch that hosts a workload now raises the limit to the hosted
+  16384 KiB soft / `unlimited` hard: the runner wrapper (including the
+  `runner_user`-unset and `root` launches, which keep their account and gain
+  the raise), the container engine's own start, and the golden's preload
+  daemon, whose live chain a fork inherits as its container engine. A chain
+  inherited from a golden baked before this fix is re-raised in place, so
+  containers do not keep the half-sized stack either.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest

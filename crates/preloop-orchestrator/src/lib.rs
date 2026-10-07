@@ -1794,7 +1794,12 @@ const RUNNER_ROOT: &str = "/home/runner";
 ///
 /// Soft is the hosted value; hard stays `unlimited` as the image sets it, so a
 /// step that raises its own soft limit keeps working. Raising a hard limit
-/// needs root (CAP_SYS_RESOURCE), which both launch sites run as.
+/// needs root (CAP_SYS_RESOURCE), and every launch site that applies this
+/// pair runs as root: the runner wrapper (switched or not), the container
+/// engine's own start, and the golden-side preload daemon that forks inherit.
+/// A chain already running keeps the limits it was born with, so
+/// [`docker_start_command`] re-raises an inherited one rather than trusting
+/// it.
 const GUEST_STACK_ULIMIT: &str = "ulimit -Hs unlimited; ulimit -Ss 16384";
 
 /// Standard loopback entries for `/etc/hosts`.
@@ -2350,6 +2355,11 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// the same raise the runner wrapper applies): a container's processes inherit
 /// the daemon's limits, so without it every container step would run on the
 /// VM init's half-sized stack while the same step on GitHub runs on 16 MiB.
+/// A daemon the fork inherited from its golden instead — preload leaves the
+/// chain running so forks never restart it — carries whatever limits it was
+/// started with, so the command re-raises that live chain (dockerd and
+/// containerd) before exiting, covering goldens baked before the raise
+/// existed.
 ///
 /// Readiness is `docker info` rather than `pgrep dockerd`, because a forked VM
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
@@ -2372,7 +2382,32 @@ fn docker_start_command() -> Vec<String> {
         run_as_root_or_sudo(&format!(
             "{GUEST_STACK_ULIMIT}; \
              command -v dockerd >/dev/null 2>&1 || exit 0; \
-             docker info >/dev/null 2>&1 && exit 0; \
+             # A fork inherits its golden's live daemon chain — dockerd, and
+             # the containerd that spawns each container's shim. A container
+             # runs on the limits of that chain, and a golden baked before the
+             # stack raise started it on the VM init's 8192 KiB: a running
+             # process keeps the limits it was born with, so the raise this
+             # script applies to itself cannot reach the inherited chain, and
+             # container steps would keep half of GitHub's stack. Raise the
+             # live chain in place — prlimit reaches a process a child shell's
+             # ulimit cannot, and restarting the chain inside a fork leaves
+             # the half-torn-down containerd socket the preload comment warns
+             # about. Only a chain still below the hosted soft limit is
+             # touched, so a daemon (custom base) already at or above it keeps
+             # its own. Raising a hard limit needs root, which both launch
+             # branches run as.
+             raise_engine_chain() {{ \
+               for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
+                 soft=; \
+                 while read -r word1 word2 word3 value _rest; do \
+                   [ \"$word1/$word2/$word3\" = \"Max/stack/size\" ] && {{ soft=$value; break; }}; \
+                 done 2>/dev/null < \"/proc/$pid/limits\"; \
+                 case \"$soft\" in ''|*[!0-9]*) continue ;; esac; \
+                 [ \"$soft\" -lt 16777216 ] && prlimit --pid \"$pid\" --stack=16777216:unlimited 2>/dev/null; \
+               done; \
+               return 0; \
+             }}; \
+             docker info >/dev/null 2>&1 && {{ raise_engine_chain; exit 0; }}; \
              rm -f /var/run/docker.pid; \
              mkdir -p {DOCKER_DATA_ROOT}; \
              modprobe overlay >/dev/null 2>&1 || true; \
@@ -2420,9 +2455,9 @@ fn docker_start_command() -> Vec<String> {
                fi; \
                return 0; \
              }}; \
-             if start_dockerd; then exit 0; fi; \
+             if start_dockerd; then raise_engine_chain; exit 0; fi; \
              rm -rf {DOCKER_DATA_ROOT}/*; \
-             if start_dockerd; then exit 0; fi; \
+             if start_dockerd; then raise_engine_chain; exit 0; fi; \
              echo 'dockerd failed to start after data-root reset' >&2; \
              exit 1"
         )),
@@ -3053,27 +3088,8 @@ async fn preload_images<P: VmProvider>(
     // The trailing `sync` is load-bearing: forking captures the disk, not the
     // page cache, so hundreds of MB of fresh layers would otherwise reach forks
     // as metadata pointing at unreadable blobs (EIO on every inherited image).
-    let refs = images
-        .iter()
-        .map(|image| format!("'{}'", image.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = run_as_root_or_sudo(&format!(
-        "command -v dockerd >/dev/null 2>&1 || {{ echo 'no dockerd' >&2; exit 1; }}; \
-         mkdir -p {DOCKER_DATA_ROOT}; \
-         docker info >/dev/null 2>&1 || (dockerd >/var/log/dockerd-preload.log 2>&1 &); \
-         for _ in $(seq 1 150); do docker info >/dev/null 2>&1 && break; sleep 0.2; done; \
-         docker info >/dev/null 2>&1 || {{ echo 'dockerd never became ready' >&2; exit 1; }}; \
-         pulled=0; \
-         for image in {refs}; do \
-           docker pull -q \"$image\" >/dev/null 2>&1 && pulled=$((pulled+1)) \
-             || echo \"preload miss: $image\" >&2; \
-         done; \
-         sync; \
-         echo \"$pulled\""
-    ));
     let output = provider
-        .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
+        .exec(golden, &preload_images_command(images))
         .await?;
     // Report what actually landed. An earlier version logged the requested
     // count unconditionally, hiding a preload that pulled nothing at all.
@@ -3095,6 +3111,43 @@ async fn preload_images<P: VmProvider>(
         "preloaded container images into golden"
     );
     Ok(())
+}
+
+/// The golden-side command that brings up a container engine and pulls
+/// `images` into it.
+///
+/// The engine is started with the hosted stack limit ([`GUEST_STACK_ULIMIT`]):
+/// the daemon lives on in the golden's process table, forks inherit it as the
+/// engine that serves their container steps, and a container's processes
+/// inherit the limits of the chain that spawned them. Started without the
+/// raise, every forked runner would hand its containers the VM init's 8192 KiB
+/// — half of GitHub's — even though its own runner wrapper had raised the
+/// stack for step processes.
+fn preload_images_command(images: &[String]) -> Vec<String> {
+    let refs = images
+        .iter()
+        .map(|image| format!("'{}'", image.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        run_as_root_or_sudo(&format!(
+            "{GUEST_STACK_ULIMIT}; \
+             command -v dockerd >/dev/null 2>&1 || {{ echo 'no dockerd' >&2; exit 1; }}; \
+             mkdir -p {DOCKER_DATA_ROOT}; \
+             docker info >/dev/null 2>&1 || (dockerd >/var/log/dockerd-preload.log 2>&1 &); \
+             for _ in $(seq 1 150); do docker info >/dev/null 2>&1 && break; sleep 0.2; done; \
+             docker info >/dev/null 2>&1 || {{ echo 'dockerd never became ready' >&2; exit 1; }}; \
+             pulled=0; \
+             for image in {refs}; do \
+               docker pull -q \"$image\" >/dev/null 2>&1 && pulled=$((pulled+1)) \
+                 || echo \"preload miss: $image\" >&2; \
+             done; \
+             sync; \
+             echo \"$pulled\""
+        )),
+    ]
 }
 
 /// Scope native Ubuntu apt repositories before installing amd64 libraries on
@@ -6471,12 +6524,41 @@ fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
     )
 }
 
+/// Wrap a guest argv so it launches on the hosted stack limit without
+/// switching accounts.
+///
+/// The `runner_user`-less and `runner_user: root` launches keep their identity
+/// (the exec channel's user — root, or the image's own `USER`); only the
+/// limit is added. The wrapped argv travels as the shell's positional
+/// parameters (`sh -c '<raise>; exec "$@"' sh <argv…>`), so nothing is
+/// re-quoted and the launch stays byte-identical after the wrapper: a
+/// mis-quoted argument cannot corrupt a step command, and the exec records
+/// the pool's tests read still carry the original argv.
+///
+/// Raising a soft limit towards the existing hard limit needs no privileges,
+/// so this works whether the exec landed on root or on the image user.
+fn with_guest_stack_limit(argv: &[String]) -> Vec<String> {
+    let mut wrapped = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("{GUEST_STACK_ULIMIT}; exec \"$@\""),
+        "sh".to_owned(),
+    ];
+    wrapped.extend_from_slice(argv);
+    wrapped
+}
+
 fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
+    // Unset or root means no account switch, not no limits: the guest applies
+    // neither the image's systemd nor its PAM limits on this path either, so
+    // the runner would keep the VM init's 8192 KiB stack and every step it
+    // spawns would too. The launch is wrapped instead of replaced — the exec
+    // channel's identity (root, or the image user) stays exactly as it was.
     let Some(user) = &config.runner_user else {
-        return argv.to_vec();
+        return with_guest_stack_limit(argv);
     };
     if user == "root" {
-        return argv.to_vec();
+        return with_guest_stack_limit(argv);
     }
     let uid = config.runner_uid.unwrap_or(1001);
     let home = format!("/home/{user}");
@@ -7708,6 +7790,73 @@ chmod +x "$dest/bin/node"
         );
     }
 
+    /// A fork inherits its golden's live daemon chain, and a running process
+    /// keeps the limits it was born with. A golden baked before the raise
+    /// would hand containers 8192 KiB no matter what the newly-started daemon
+    /// gets, so the command re-raises the inherited chain in place instead of
+    /// trusting it.
+    #[test]
+    fn docker_start_command_reraise_covers_an_inherited_engine_chain() {
+        let command = docker_start_command();
+        let script = &command[2];
+        let guard = script
+            .find("raise_engine_chain() {")
+            .unwrap_or_else(|| panic!("the inherited chain must be re-raised: {script}"));
+        // Reached before the inherited daemon short-circuits the launch, or a
+        // pre-fix golden keeps its container steps at half the hosted stack.
+        let inherited_exit = script
+            .find("docker info >/dev/null 2>&1 && { raise_engine_chain; exit 0; }")
+            .unwrap_or_else(|| {
+                panic!("the inherited daemon must be re-raised, not trusted: {script}")
+            });
+        assert!(guard < inherited_exit, "{script}");
+        // prlimit speaks raw bytes; 16777216 is the hosted 16384 KiB soft
+        // limit, with the hard limit left unlimited as the image sets it.
+        assert!(
+            script.contains("--stack=16777216:unlimited"),
+            "the live chain must be raised to the hosted stack: {script}"
+        );
+        assert!(
+            script.contains("\"/proc/$pid/limits\""),
+            "the raise must only touch a chain still below the hosted limit: {script}"
+        );
+        // Containerd spawns every container shim, so its limits — not only
+        // dockerd's — are what a container process inherits.
+        assert!(script.contains("pgrep -x containerd"), "{script}");
+        // A fresh daemon can still adopt a surviving containerd from the
+        // golden, so both start retries raise the chain too.
+        assert_eq!(
+            script
+                .matches("then raise_engine_chain; exit 0; fi;")
+                .count(),
+            2,
+            "{script}"
+        );
+    }
+
+    /// The preload daemon is the engine a fork inherits, so the golden must
+    /// start it on the hosted stack limit: a container's processes inherit the
+    /// limits of the chain that spawned them, and nothing raises the stack
+    /// again between a golden's preload and a job's container step.
+    #[test]
+    fn preload_images_command_raises_the_hosted_stack_limit() {
+        let command = preload_images_command(&["postgres:16-alpine".to_owned()]);
+        assert_eq!(command[0], "sh");
+        assert_eq!(command[1], "-c");
+        let script = &command[2];
+        let raise = script
+            .find("ulimit -Hs unlimited; ulimit -Ss 16384")
+            .unwrap_or_else(|| panic!("the preloaded engine must be raised: {script}"));
+        let spawn = script
+            .find("dockerd >/var/log/dockerd-preload.log")
+            .unwrap_or_else(|| panic!("the preload must still start a daemon: {script}"));
+        assert!(
+            raise < spawn,
+            "the stack raise must precede the daemon it applies to: {script}"
+        );
+        assert!(script.contains("'postgres:16-alpine'"), "{script}");
+    }
+
     /// A base that is not the official runner image may lack `sudo`
     /// entirely, so `/etc/sudoers.d` does not exist and `useradd` is not on
     /// the exec shell's default PATH. Every best-effort provisioning step
@@ -7749,18 +7898,36 @@ chmod +x "$dest/bin/node"
         );
     }
 
+    /// Unset and root still skip the account switch, but not the limits: the
+    /// launch is wrapped around the same argv, so the exec channel's identity
+    /// is untouched while the runner and every step it spawns inherit the
+    /// hosted stack.
     #[test]
-    fn runner_user_wrapper_passes_root_and_unset_through() {
+    fn runner_user_wrapper_passes_root_and_unset_through_with_the_stack_limit() {
         let mut config = test_config(false);
         let argv = vec![
+            "/usr/bin/env".to_owned(),
+            "PRELOOP_MACHINE_NAME=runner".to_owned(),
             "/opt/preloop/bin/preloop-runner".to_owned(),
             "run".to_owned(),
         ];
-        // Unset: no switching.
-        assert_eq!(as_runner_user(&config, &argv), argv);
-        // Explicit root: no switching.
-        config.runner_user = Some("root".to_owned());
-        assert_eq!(as_runner_user(&config, &argv), argv);
+        for user in [None, Some("root".to_owned())] {
+            config.runner_user = user.clone();
+            let wrapped = as_runner_user(&config, &argv);
+            assert_eq!(wrapped[0], "sh", "{user:?}");
+            assert_eq!(wrapped[1], "-c", "{user:?}");
+            assert_eq!(
+                wrapped[2], "ulimit -Hs unlimited; ulimit -Ss 16384; exec \"$@\"",
+                "the pass-through launch must run on the hosted stack: {user:?}"
+            );
+            // The original argv travels as the shell's positional parameters,
+            // so nothing is re-quoted and the launch is untouched.
+            assert_eq!(wrapped[3], "sh", "the shell needs a $0 placeholder");
+            assert_eq!(&wrapped[4..], argv.as_slice(), "{user:?}");
+            // No privilege drop on this path: setpriv would change the
+            // account behavior the launch had.
+            assert!(!wrapped[2].contains("setpriv"), "{user:?} {}", wrapped[2]);
+        }
     }
 
     #[test]
