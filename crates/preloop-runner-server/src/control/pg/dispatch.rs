@@ -2870,10 +2870,11 @@ impl<'a> Sweep<'a> {
                             node.environment_gate = gate;
                         }
                         self.mark(run_id, job_id);
+                        // `settle_node` records the failure in the sweep's
+                        // outcome; pushing it a second time would count the
+                        // job twice and re-report its check run.
                         self.settle_node(run_id, job_id, ExecutionStatus::Failure)
                             .await?;
-                        self.outcome
-                            .push(ExecutionStatus::Failure, run_id, job_id.clone());
                         return Ok(());
                     }
                     crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
@@ -2966,10 +2967,11 @@ impl<'a> Sweep<'a> {
                 %reason,
                 "runs-on unsatisfiable by runner pool; failing the job"
             );
+            // `settle_node` records the failure in the sweep's outcome;
+            // pushing it a second time would count the job twice and
+            // re-report its check run.
             self.settle_node(run_id, job_id, ExecutionStatus::Failure)
                 .await?;
-            self.outcome
-                .push(ExecutionStatus::Failure, run_id, job_id.clone());
             return Ok(true);
         }
         Ok(false)
@@ -6386,8 +6388,10 @@ impl PgBackend {
         let built = match claim.built {
             Ok(built) => built,
             Err(status) => {
+                // `settle_node` records the failure in the sweep's outcome;
+                // pushing it a second time would count the job twice and
+                // re-report its check run.
                 sweep.settle_node(run_id, &node_id, status).await?;
-                sweep.outcome.failed.push((run_id, node_id));
                 let outcome = std::mem::take(&mut sweep.outcome);
                 sweep.flush().await?;
                 tx.commit().await.map_err(db)?;

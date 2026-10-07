@@ -86,6 +86,27 @@ Releases before v0.27.0 predate the changelog.
   control bridge exists, are untouched. Host steps,
   the runner itself, and the official runner's Docker command shape are
   unchanged.
+- **Environment-gate denials record one failure, not two**: the Postgres
+  promotion paths pushed a settled job into the sweep's failure list after
+  `settle_node` had already recorded it, so an environment gate denied on the
+  promotion sweep (and an unsatisfiable `runs-on` resolved at promotion, and
+  a failed deferred expansion) counted twice — duplicate `JobStatus` events
+  and check-run reports, and an inflated `PromoteOutcome::failed`.
+  `settle_node` is the single recorder again.
+
+- **Environment approvals serialize with the promotion sweep** (Postgres):
+  `record_environment_approval` now takes the run lock (`FOR NO KEY UPDATE`)
+  before reading the gate and locks the job row (`FOR UPDATE OF j`), so an
+  approval racing a sweep that is concluding the job can no longer commit a
+  decision built from the stale `pending` snapshot, and the approval's
+  whole-blob gate write cannot erase a concurrent announce stamp.
+
+- **Environment resolution and reviewer-team expansion use the configured
+  PAT**: the resolver read only `PRELOOP_GITHUB_TOKEN`, so a PAT-only setup
+  whose credential lives in the config file (`github.pat`) resolved rules
+  through the empty TOML fallback and failed every team-reviewer check
+  closed. Both paths now read `AppState::static_github_pat()`, the same
+  credential source the rest of the server uses.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

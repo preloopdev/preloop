@@ -1,6 +1,7 @@
 //! Environment protection rules resolved from GitHub.
 //!
-//! When a GitHub App (or `PRELOOP_GITHUB_TOKEN`) is configured, the protection
+//! When a GitHub App (or a configured static PAT: `PRELOOP_GITHUB_TOKEN`, else
+//! the config file's `github.pat`) is configured, the protection
 //! rules for a job's `environment:` live on the repository, not in preloop's
 //! config: `GET /repos/{o}/{r}/environments/{name}` carries `wait_timer`,
 //! `required_reviewers` (+ `prevent_self_review`) and the branch-policy mode,
@@ -249,9 +250,10 @@ impl EnvironmentResolver {
         }
 
         let app = crate::github_app::select_app_for_repo(shared, repository).await;
-        let pat = std::env::var("PRELOOP_GITHUB_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        // The configured PAT (`PRELOOP_GITHUB_TOKEN` or the config file's
+        // `github.pat`) — the same credential `AppState` hands the rest of
+        // the server, so a config-file-only PAT covers resolution too.
+        let pat = shared.state.static_github_pat();
         let result: anyhow::Result<Arc<EnvironmentRules>> = if let Some(creds) = &app {
             self.github_configured.store(true, Ordering::Release);
             self.repo_sources
@@ -398,12 +400,9 @@ impl EnvironmentResolver {
             permissions.insert("contents".to_owned(), "read".to_owned());
             crate::github_app::get_or_mint_token(&creds, repository, &permissions).await?
         } else {
-            std::env::var("PRELOOP_GITHUB_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no GitHub credential covers {repository} for team expansion")
-                })?
+            shared.state.static_github_pat().ok_or_else(|| {
+                anyhow::anyhow!("no GitHub credential covers {repository} for team expansion")
+            })?
         };
         let members =
             fetch_team_members(&crate::github::github_api_base(), &token, org, slug).await?;
@@ -1051,6 +1050,63 @@ mod tests {
                 .await
                 .unwrap(),
             "prevent_self_review denies the run's own actor"
+        );
+    }
+
+    /// A config-file PAT (`github.pat`, no `PRELOOP_GITHUB_TOKEN`) is the
+    /// credential `AppState` hands out, so resolution and reviewer-team
+    /// expansion must use it: an env-var-only lookup would fall back to the
+    /// (empty) TOML map for rules and fail every team check closed.
+    #[tokio::test]
+    async fn config_file_pat_resolves_rules_and_team_members() {
+        let stub = StubApi::serve(
+            json!({
+                "protection_rules": [{
+                    "type": "required_reviewers",
+                    "reviewers": [
+                        {"type": "Team", "reviewer": {"slug": "deployers", "organization": {"login": "acme"}}},
+                    ],
+                }],
+            }),
+            json!({}),
+            json!({}),
+        )
+        .await;
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _unset = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", stub.base.as_str());
+        // The config-file credential shape: `AppState::new` populates
+        // `github_pat` from `github.pat`, so seed the field it would hold.
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().join("state"))
+            .await
+            .unwrap();
+        state.github_pat = Some(preloop_gha_protocol::SecretString::new("ghp_config_token"));
+        let shared = Arc::new(crate::state::SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
+        resolver.set_github_configured();
+        let rules = resolver
+            .resolve_at(&stub.base, &shared, "owner/repo", "prod")
+            .await
+            .unwrap();
+        assert_eq!(
+            rules.reviewers,
+            vec![EnvironmentReviewer::Team {
+                org: "acme".to_owned(),
+                slug: "deployers".to_owned(),
+            }],
+            "the configured PAT fetches the environment's rules"
+        );
+        assert!(
+            resolver
+                .reviewer_authorized(&shared, "owner/repo", "prod", "teammate", "ci-bot")
+                .await
+                .unwrap(),
+            "the configured PAT expands the reviewer team"
         );
     }
 }

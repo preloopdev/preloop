@@ -1642,12 +1642,24 @@ impl PgBackend {
         let result = {
             let mut client = self.writer().await?;
             let tx = client.transaction().await.map_err(db)?;
+            // Serialize with the promotion sweep: the sweep holds this same
+            // run lock (`FOR NO KEY UPDATE`) while it loads the graph and
+            // flushes gate rows, so a read taken outside it could hand the
+            // sweep a stale gate to overwrite — or record an approval against
+            // a row the sweep is already concluding. The job row lock
+            // (`FOR UPDATE OF j`) closes the narrower window against writers
+            // that only touch the job row (the announce stamp, a deployment
+            // id): the read-modify-write of `environment_gate` here replaces
+            // the whole JSON blob.
+            if !PgBackend::lock_run(&tx, run_id).await? {
+                return Err(ControlError::NotFound("job not found".to_owned()));
+            }
             let run_key = run_id.0.to_string();
             let row = tx
                 .query_opt(
                     "SELECT j.status, j.environment_gate::text, r.namespace_id, r.repository \
                      FROM jobs j JOIN runs r ON r.run_id = j.run_id \
-                     WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
+                     WHERE j.run_id = $1::text::uuid AND j.job_id = $2 FOR UPDATE OF j",
                     &[&run_key, &job_id.0],
                 )
                 .await

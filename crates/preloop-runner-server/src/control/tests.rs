@@ -1254,6 +1254,57 @@ pub(crate) mod suite {
         );
     }
 
+    /// A deferred build that fails before producing a subtree settles its
+    /// node exactly once: `settle_node` records the failure in the returned
+    /// outcome, so a duplicate would re-report the node's check run.
+    pub(crate) async fn failed_deferred_expansion_settles_the_node_once(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let fan_id = JobId("fan".to_owned());
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]))
+            .await
+            .unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        let outcome = backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Err(ExecutionStatus::Failure),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.failed,
+            vec![(run_id, fan_id.clone())],
+            "a failed build settles its node once, got {outcome:?}"
+        );
+        assert_eq!(
+            backend.job_queue_state(run_id, &fan_id).await.unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "the failed build's node is terminal"
+        );
+    }
+
     /// A deferred matrix node fans out with its own scoped `inputs`: the
     /// caller's `with:` values when the node was materialized inside a
     /// reusable callee (its stored plan carries them), else the run's dispatch
@@ -1951,6 +2002,109 @@ pub(crate) mod suite {
                 .unwrap(),
             Some(("none".to_owned(), "failure".to_owned())),
             "a denied job never dispatches"
+        );
+    }
+
+    /// A gate denied by the *promotion* sweep (a needs-satisfied job whose
+    /// environment is evaluated there, not the parked-release path) settles
+    /// the job exactly once: `settle_node` records the failure, so the
+    /// sweep's outcome must carry one entry — a duplicate would re-report the
+    /// check run and inflate `PromoteOutcome::failed`.
+    pub(crate) async fn denied_environment_gate_at_promotion_fails_the_job_once(
+        backend: &dyn ControlBackend,
+    ) {
+        let mut rules = EnvironmentRulesMap::new();
+        rules.entry("owner/repo".to_owned()).or_default().insert(
+            "prod".to_owned(),
+            crate::config::EnvironmentRules {
+                deployment_branches: vec!["main".to_owned()],
+                ..Default::default()
+            },
+        );
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules,
+        ));
+        let run_id = RunId::new();
+        let deploy_id = JobId("deploy".to_owned());
+        // `deploy` waits behind `gen`, so the deny lands on the sweep that
+        // `complete_job(gen)` runs — the promotion pass, not submit.
+        let mut deploy = submit_job(run_id, "deploy", 2);
+        deploy.queued.needs = vec![JobId("gen".to_owned())];
+        deploy.queued.environment = Some(serde_json::json!("prod"));
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), deploy],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.scheduling.failed,
+            vec![(run_id, deploy_id.clone())],
+            "a denied environment fails the job exactly once, got {:?}",
+            outcome.scheduling
+        );
+        assert_eq!(
+            backend.job_queue_state(run_id, &deploy_id).await.unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "a denied deployment never dispatches"
+        );
+    }
+
+    /// `runs-on` that no registered runner can host concludes the job in the
+    /// promotion sweep exactly once (the hydration path, distinct from the
+    /// submit-time hostability check): `settle_node` records the failure, so
+    /// the outcome must not carry a second copy that would re-report the
+    /// check run.
+    pub(crate) async fn unhostable_runs_on_at_promotion_fails_the_job_once(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let build_id = JobId("build".to_owned());
+        let mut build = submit_job(run_id, "build", 2);
+        build.queued.needs = vec![JobId("gen".to_owned())];
+        // No windows runner is registered: the resolved platform is
+        // unhostable.
+        build.queued.runs_on = vec!["windows-latest".to_owned()];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), build],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.scheduling.failed,
+            vec![(run_id, build_id.clone())],
+            "an unhostable job fails exactly once, got {:?}",
+            outcome.scheduling
+        );
+        assert_eq!(
+            backend.job_queue_state(run_id, &build_id).await.unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "an unhostable job never queues"
         );
     }
 
@@ -6123,6 +6277,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn failed_deferred_expansion_settles_the_node_once() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::failed_deferred_expansion_settles_the_node_once(&backend).await;
+    }
+
+    #[tokio::test]
     async fn deferred_matrix_expansion_scopes_its_inputs() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -6240,6 +6402,22 @@ mod pg {
             return skip_no_postgres();
         };
         suite::environment_gate_parks_until_satisfied(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn denied_environment_gate_at_promotion_fails_the_job_once() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::denied_environment_gate_at_promotion_fails_the_job_once(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn unhostable_runs_on_at_promotion_fails_the_job_once() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unhostable_runs_on_at_promotion_fails_the_job_once(&backend).await;
     }
 
     #[tokio::test]
@@ -6518,6 +6696,109 @@ mod pg {
             return skip_no_postgres();
         };
         suite::webhook_inbox_claim_is_fenced_and_deduplicated(&backend).await;
+    }
+
+    /// `record_environment_approval` takes the run lock before it reads the
+    /// gate, so it serializes with the promotion sweep (which holds the same
+    /// lock across load + flush). An approval racing a sweep that already
+    /// concluded the job must observe the settled row — `AlreadyTerminal`,
+    /// no audit row, gate untouched — instead of committing a decision built
+    /// from a stale `pending` snapshot.
+    #[tokio::test]
+    async fn environment_approval_serializes_with_the_promotion_sweep() {
+        use crate::control::types::{
+            EnvironmentApproval, EnvironmentApprovalResult, EnvironmentDecision,
+        };
+        let Some((_pg, url)) = fresh_database_opt().await else {
+            return skip_no_postgres();
+        };
+        let backend = std::sync::Arc::new(connect(&url).await);
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]))
+            .await
+            .unwrap();
+        backend
+            .set_environment_gate(
+                run_id,
+                &job_id,
+                Some(crate::models::EnvironmentGateState {
+                    environment_name: Some("prod".to_owned()),
+                    approval_requested_at_unix_nanos: Some(crate::models::now_unix_nanos()),
+                    approvals_required: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The sweep's shape: the run row locked while the job is concluded
+        // failure. The lock stays open so the approval below has to wait it
+        // out rather than read the stale row. The backend's pooled
+        // connections resolve unqualified names through `search_path` set at
+        // connect time; this bare connection has to ask for the same.
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("second connection");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("SET search_path TO control")
+            .await
+            .expect("control search path");
+        let tx = client.transaction().await.unwrap();
+        tx.query_one(
+            "SELECT 1 FROM runs WHERE run_id = $1::text::uuid FOR NO KEY UPDATE",
+            &[&run_id.0.to_string()],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "UPDATE jobs SET status = 'failure', queue_state = 'none' \
+             WHERE run_id = $1::text::uuid AND job_id = $2",
+            &[&run_id.0.to_string(), &job_id.0],
+        )
+        .await
+        .unwrap();
+
+        let racer = {
+            let backend = std::sync::Arc::clone(&backend);
+            let job_id = job_id.clone();
+            tokio::spawn(async move {
+                backend
+                    .record_environment_approval(EnvironmentApproval {
+                        run_id,
+                        job_id,
+                        decision: EnvironmentDecision::Approve,
+                        actor: Some("octocat".to_owned()),
+                        admin_override: false,
+                        note: Some("ship it".to_owned()),
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !racer.is_finished(),
+            "the approval waits for the sweep's run lock"
+        );
+        tx.commit().await.unwrap();
+        let outcome = racer.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome.result, EnvironmentApprovalResult::AlreadyTerminal),
+            "the approval observes the sweep's settled row, got {:?}",
+            outcome.result
+        );
+        assert!(
+            backend
+                .environment_approvals(run_id, &job_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no decision is recorded against a job the sweep already failed"
+        );
     }
 
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
@@ -7279,6 +7560,12 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn failed_deferred_expansion_settles_the_node_once() {
+        suite::failed_deferred_expansion_settles_the_node_once(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
     async fn deferred_matrix_expansion_scopes_its_inputs() {
         suite::deferred_matrix_expansion_scopes_its_inputs(&LiteBackend::in_memory().unwrap())
             .await;
@@ -7345,6 +7632,22 @@ mod lite {
     #[tokio::test]
     async fn environment_gate_parks_until_satisfied() {
         suite::environment_gate_parks_until_satisfied(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn denied_environment_gate_at_promotion_fails_the_job_once() {
+        suite::denied_environment_gate_at_promotion_fails_the_job_once(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unhostable_runs_on_at_promotion_fails_the_job_once() {
+        suite::unhostable_runs_on_at_promotion_fails_the_job_once(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]
