@@ -23,6 +23,16 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+
+- **Matrix job names render object-valued cells the way GitHub does**: a
+  `strategy.matrix` cell that is an object — valkey's `server: [{version,
+  file}]` compatibility matrix, say — was named with the raw JSON
+  (`test-ubuntu-latest-compatibility ({"version":"8.1.4","file":"…"})`), so the
+  check name published for the commit did not match GitHub's. The display name
+  now walks each cell the way the official runner's `JobNameBuilder` does
+  (scalar leaves in declaration order, object keys omitted) and caps the result
+  at 100 characters; the internal job id keeps its unambiguous form.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
