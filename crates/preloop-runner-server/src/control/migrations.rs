@@ -53,12 +53,13 @@ pub(crate) fn refusal(ledger: Ledger) -> String {
             .to_owned(),
         Ledger::Foreign => "control database holds tables but no control schema; refusing to \
              initialize over existing state. Point the server at a dedicated control database, \
-             or import (`preloop store import`, docs/control-migrations.md)."
+             or import a legacy store (`preloop store import-legacy`, docs/control-migrations.md)."
             .to_owned(),
         Ledger::Unledgered => "control database has a control schema but no \
-             `refinery_schema_history` ledger: it predates tracked migrations (unreleased v3/v4 \
-             builds). Adopt it explicitly with `preloop store migrate --adopt-baseline`, which \
-             verifies the schema first, or recreate/import; the server never adopts it silently."
+             `refinery_schema_history` ledger: it predates tracked migrations (an unreleased \
+             pre-ledger build: SQLite v4 / Postgres v5). Adopt it explicitly with \
+             `preloop store migrate --adopt-baseline`, which verifies the schema first, or \
+             recreate/import; the server never adopts it silently."
             .to_owned(),
         Ledger::MissingMeta => "control database has a migration ledger but no `schema_meta` \
              table: the schema is incomplete (a partial create or manual surgery). Restore the \

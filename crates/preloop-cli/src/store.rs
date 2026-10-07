@@ -33,8 +33,9 @@ struct MigrateArgs {
     store: Option<String>,
 
     /// Adopt a pre-ledger control database after verifying its shape
-    /// (unreleased v3/v4 builds), then apply pending migrations. Refused
-    /// unless the database's structure is exactly a known migration point.
+    /// (an unreleased build: SQLite v4 / Postgres v5), then apply pending
+    /// migrations. Refused unless the database's structure is exactly a
+    /// known migration point.
     #[arg(long)]
     adopt_baseline: bool,
 
