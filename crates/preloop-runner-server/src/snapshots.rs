@@ -6697,29 +6697,28 @@ mod archive_tests {
         let path = write_snapshot_archive(&repo, &sha, &prefix).await.unwrap();
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(&raw[..2], b"\x1f\x8b", "archive must be gzipped");
-        // The tar entry names live in the (uncompressed) tar headers; the
-        // first one must be the single top-level directory the action moves
-        // the repository contents out of.
-        let gz = std::process::Command::new("gzip")
-            .args(["-dc", path.to_str().unwrap()])
-            .output()
-            .unwrap();
-        assert!(gz.status.success());
-        let header = &gz.stdout[..100.min(gz.stdout.len())];
-        let entry = String::from_utf8_lossy(header);
-        let name = entry.split('\0').next().unwrap_or_default();
-        assert_eq!(
-            name, prefix,
-            "first archive entry must be the top-level dir"
-        );
+        // `tar` sees one top-level directory holding the tree, which is the
+        // directory `actions/checkout` moves the contents out of. The raw
+        // first block is git's `pax_global_header` (commit id metadata), as in
+        // the forge's own tarballs; `tar` does not list it.
         let listing = std::process::Command::new("tar")
-            .args(["-tf", path.to_str().unwrap()])
+            .args(["-tzf", path.to_str().unwrap()])
             .output()
             .unwrap();
         assert!(listing.status.success());
         let listing = String::from_utf8_lossy(&listing.stdout);
+        let entries: Vec<&str> = listing.lines().collect();
+        assert_eq!(
+            entries.first().copied(),
+            Some(prefix.as_str()),
+            "first listed entry must be the top-level dir: {listing}"
+        );
         assert!(
-            listing.contains(&format!("{prefix}tracked.txt")),
+            entries.iter().all(|entry| entry.starts_with(&prefix)),
+            "every entry must live under {prefix}: {listing}"
+        );
+        assert!(
+            entries.contains(&format!("{prefix}tracked.txt").as_str()),
             "the tree must be inside the prefixed directory: {listing}"
         );
         let _ = std::fs::remove_file(&path);
