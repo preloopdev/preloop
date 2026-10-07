@@ -66,8 +66,8 @@ while IFS='|' read -r runner_version cell scenario_prefix validate_ownership exc
 done <<< "$TARGETS"
 
 # The CI recipe already runs the workspace tests. Standalone conformance builds
-# only the server it executes; runner-watch is told not to repeat the suite.
-cargo build --quiet -p preloop-runner-server
+# only the binaries it executes; runner-watch is told not to repeat the suite.
+cargo build --quiet -p preloop-runner-server -p preloop-cli
 # Pin the engine config into the throwaway state dir. Without this the replay
 # server reads the developer's ~/.preloop/config.toml, so conformance would
 # depend on host credentials — and a stale or malformed App key there aborts
@@ -80,6 +80,11 @@ cat > "$STATE_DIR/config.toml" <<'EOF'
 [environments]
 "preloopdev/preloop-conformance-sample" = ["staging"]
 EOF
+# The control store is migration-ledgered, and `preloop serve` refuses a
+# database with no ledger instead of creating one: a fresh conformance state
+# dir initializes its store the way an install does (`preloop store migrate`)
+# before the replay server starts.
+./target/debug/preloop store migrate --store "$STATE_DIR/server-state/preloop.db"
 # The goldens carry real GitHub-issued registration tokens this control plane
 # cannot verify, so the replay server opts into the permissive registration
 # policy — the same sanctioned exception `preloop-conformance` uses. Without
