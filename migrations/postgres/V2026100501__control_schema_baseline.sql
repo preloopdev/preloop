@@ -1,7 +1,9 @@
 -- Control schema v1 baseline (PostgreSQL).
 --
 -- Frozen copy of `crates/preloop-runner-server/src/control/pg/schema.sql`
--- as of base commit 05126635 (the schema the pre-migration runtime created).
+-- as of base commit 992e3b81 — the schema the pre-migration runtime creates
+-- (Postgres v5: `check_run_updates` carries the outbox `version`/`lease_owner`
+-- columns and no foreign key, per #365).
 -- Migration files are immutable: refinery stores a checksum per version and
 -- refuses a changed file (abort_divergent), so never edit an applied
 -- migration — add a new V<version>__<name>.sql instead. An executable parity
@@ -671,12 +673,13 @@ CREATE TABLE check_run_updates (
     job_id                  text NOT NULL,
     installation_id         bigint NOT NULL,
     check_run_id            bigint,
+    version                 bigint NOT NULL DEFAULT 0,
     payload                 jsonb NOT NULL,
     not_before              timestamptz NOT NULL DEFAULT now(),
     attempts                integer NOT NULL DEFAULT 0,
     leased_until            timestamptz,
-    PRIMARY KEY (run_id, job_id),
-    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+    lease_owner             text,
+    PRIMARY KEY (run_id, job_id)
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 
