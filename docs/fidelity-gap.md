@@ -634,6 +634,61 @@ Every item below broke a real workflow step and was fixed in preloop:
   batches whose claimed sizes already exceed `max_bytes` are skipped the
   same way.
 
+### 1c.6 Container jobs could not reach the engine (fixed)
+
+Every `container:` job whose first step was an `actions/checkout` the server
+had redirected (snapshot or forge relay) died in that step with
+`connect ECONNREFUSED 127.0.0.1:<port>` after three retries — valkey's
+`ci.yml` legs with `container: debian:bookworm` / `almalinux:8` (no `git` in
+either image, so checkout takes its REST-tarball fallback) failed ~20 s in.
+Host jobs in the same run succeeded.
+
+Root cause: the engine advertises itself to jobs at its loopback origin
+(`PRELOOP_CONTROL_ORIGIN`, e.g. `http://127.0.0.1:9198`), which inside the
+guest is the runner's control bridge. A job container has its own network
+namespace, where `127.0.0.1` is the container itself, so every engine URL a
+container step received — the redirected checkout's `github-server-url`
+input, `ACTIONS_RUNTIME_URL` / `ACTIONS_RESULTS_URL` / `ACTIONS_CACHE_URL` /
+`ACTIONS_ID_TOKEN_REQUEST_URL` (cache, artifacts, OIDC), and the
+`GIT_CONFIG_*` snapshot origin rewrites — was unreachable. GitHub-hosted
+runners hand containers `api.github.com`, which is reachable from anywhere;
+preloop's engine is not.
+
+Fix (runner-side, because only the guest knows a container-reachable
+address): when a job's network is created the runner resolves the network's
+**gateway** (`docker network inspect … .IPAM.Config`, taking the first IPv4
+`Gateway` and falling back to IPv6 only when there is no IPv4 one — the host
+end of a container's default route) and binds the same control bridge there
+(`control_bridge::spawn_container_reachable`), then rewrites the advertised
+origin to `<scheme>://<gateway>:<port>` (the advertised scheme is kept) in
+every environment a container process
+receives — `docker exec` env for run steps and node actions, `docker run` env
+for `docker://` action containers, and the workflow-declared env of the job and
+service containers themselves — in the same layer where the official
+runner rewrites container paths (`TranslateToContainerPath`). A configured HTTP proxy also gets the
+container-facing address appended to the containers' `NO_PROXY`/`no_proxy`
+lists, since a bypass list naming the loopback origin no longer covers it.
+Host steps and the runner itself keep the loopback origin, and the official runner's Docker
+command shape is untouched (no `--add-host`, no custom subnets).
+
+Limits:
+
+- An `https` origin keeps its scheme, so the engine's certificate must cover
+  the container-facing address (the bridge splices TCP without terminating
+  TLS). A certificate issued for `127.0.0.1` is not valid for the gateway.
+- If the network gateway's address/port is already held by another process,
+  the runner does not bind a bridge and container steps keep the advertised
+  origin (the pre-fix behavior) rather than a foreign address.
+- A workflow that forces another network with `container.options:
+  --network=…` points its steps at a gateway the runner did not bind; the
+  engine URLs then fail to connect exactly as before. Official-runner
+  semantics have no equivalent problem only because GitHub's URLs are public.
+- A runner started on the Docker host itself (no VM, no control bridge) gets
+  no translation: its `PRELOOP_CONTROL_ORIGIN` mode does not exist there, and
+  the engine's loopback listen address is not reachable from a Linux
+  container's namespace. Point such deployments at a host-reachable
+  `PRELOOP_RUNNER_URL`.
+
 ---
 
 ## 2. Upstream surface we must emulate

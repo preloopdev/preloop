@@ -1814,6 +1814,14 @@ async fn initialize_containers(
     // Create job network
     create_network(&network, &label, log).await?;
 
+    // A container's network namespace resolves the engine origin the job
+    // message advertises (the runner's loopback bridge) to the container
+    // itself, so the runner binds the same bridge on this network's gateway
+    // and rewrites engine URLs for container steps. Created after the network
+    // so the gateway address exists; held by the job so the listener lives
+    // exactly as long as the containers that need it.
+    job.container_engine = container_engine_access(Some(&network)).await.map(Arc::new);
+
     // Derive workspace paths
     let runner_work = std::path::Path::new(workspace)
         .parent()
@@ -1859,6 +1867,7 @@ async fn initialize_containers(
             &runner_externals,
             &runner_actions,
             &toolcache,
+            job.container_engine.as_deref(),
             log,
         )
         .await?;
@@ -1870,7 +1879,15 @@ async fn initialize_containers(
     let mut service_containers = Vec::new();
     for service in service_specs {
         let name = container_name(&service.image, &label);
-        let id = start_service_container(service, &name, &label, &network, log).await?;
+        let id = start_service_container(
+            service,
+            &name,
+            &label,
+            &network,
+            job.container_engine.as_deref(),
+            log,
+        )
+        .await?;
         service_containers.push((service.alias.clone(), id, name));
     }
 
