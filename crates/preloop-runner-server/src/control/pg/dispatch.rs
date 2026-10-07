@@ -704,6 +704,18 @@ pub(super) async fn enqueue_cancellation(
         return Ok(false);
     };
     let request_id: i64 = row.get(0);
+    queue_job_cancellation(tx, request_id, reason).await?;
+    Ok(true)
+}
+
+/// Queue the `job_cancellations` row for one attempt, deduplicated while an
+/// undelivered cancellation is already pending. The graph-free half of
+/// [`enqueue_cancellation`], for callers that already resolved the request.
+pub(super) async fn queue_job_cancellation(
+    tx: &Transaction<'_>,
+    request_id: i64,
+    reason: Option<&str>,
+) -> Result<(), ControlError> {
     tx.execute(
         "INSERT INTO job_cancellations (request_id, reason) \
          SELECT $1, $2 WHERE NOT EXISTS (\
@@ -713,7 +725,7 @@ pub(super) async fn enqueue_cancellation(
     )
     .await
     .map_err(db)?;
-    Ok(true)
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2990,460 +3002,255 @@ impl<'a> Sweep<'a> {
         .await
     }
 
-    /// Settle a node terminal: status, release gates, retire requests, run
-    /// resummary, decrement dependent `remaining_needs` rows.
-    /// Jobs in `run_id` that directly depend on `job_id` or its `base_id`.
+    /// Recompute the `remaining_needs` fast-path counter for every job that
+    /// declares `job_id` or its matrix base as a need, and report whether any
+    /// of them is now promotable (`blocked`, zero remaining needs).
     ///
-    /// Driven by the `job_needs_reverse` index (`job_needs(run_id,
-    /// needs_job_id)`). A declared need matches a job id or its matrix base,
-    /// and an expanded matrix parent is replaced by its legs — so a base need
-    /// must wait for *every* leg, and a leg's id never appears in the
-    /// dependent's `job_needs` row. Both the job id and the base id are
-    /// probed. This is the targeted replacement for scanning the whole run
-    /// graph when a job settles (Phase 1 item 8); callers apply their own
-    /// status/queue-state filters to the returned ids.
-    pub(super) async fn dependents_of(
+    /// This is the targeted replacement for the in-memory decrement
+    /// `Settle::settle_node` performed over the loaded graph: a declared need
+    /// matches a job id or its matrix base, and an expanded matrix parent is
+    /// replaced by its legs, so a base need stays counted until *every* leg is
+    /// terminal and a leg's own id never appears in the dependent's
+    /// `job_needs` row.
+    pub(super) async fn refresh_remaining_needs(
         tx: &Transaction<'_>,
         run_id: RunId,
         job_id: &JobId,
         base_id: &str,
-    ) -> Result<Vec<JobId>, ControlError> {
+    ) -> Result<bool, ControlError> {
         let rows = tx
             .query(
-                "SELECT DISTINCT job_id FROM job_needs \
-                 WHERE run_id = $1::text::uuid \
-                 AND (needs_job_id = $2 OR needs_job_id = $3)",
+                "UPDATE jobs d SET remaining_needs = COALESCE(( \
+                     SELECT SUM(need.remaining) FROM ( \
+                       SELECT (SELECT count(*) FROM jobs j \
+                               WHERE j.run_id = d.run_id \
+                                 AND (j.job_id = n.needs_job_id \
+                                      OR j.base_id = n.needs_job_id) \
+                                 AND j.status NOT IN \
+                                   ('success','failure','cancelled','skipped','timed_out') \
+                                 AND NOT (j.kind = 'matrix_parent' AND EXISTS ( \
+                                   SELECT 1 FROM jobs c WHERE c.run_id = j.run_id \
+                                     AND c.parent_job_id = j.job_id)))::int AS remaining \
+                       FROM job_needs n \
+                       WHERE n.run_id = d.run_id AND n.job_id = d.job_id \
+                     ) need), 0) \
+                 WHERE d.run_id = $1::text::uuid \
+                   AND d.status NOT IN \
+                     ('success','failure','cancelled','skipped','timed_out') \
+                   AND d.job_id IN ( \
+                     SELECT n.job_id FROM job_needs n \
+                     WHERE n.run_id = $1::text::uuid \
+                       AND (n.needs_job_id = $2 OR n.needs_job_id = $3)) \
+                 RETURNING d.queue_state, d.remaining_needs",
                 &[&run_id.0.to_string(), &job_id.0, &base_id],
             )
             .await
             .map_err(db)?;
-        Ok(rows
-            .iter()
-            .map(|row| JobId(row.get::<_, String>(0)))
-            .collect())
+        Ok(rows.iter().any(|row| {
+            row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0
+        }))
     }
 
     /// Try to fold a reusable workflow caller when one of its inner jobs
-    /// completes. If all inner jobs are terminal, computes the caller's
-    /// outputs (evaluating output_definitions against inner outputs),
-    /// sets the aggregate status, and marks the caller terminal.
+    /// completes. If every inner job of one of its callers is terminal,
+    /// resolves the caller's `outputs` from its `output_definitions` (the
+    /// shared `reusable_workflows::propagate_reusable_outputs` semantics),
+    /// sets the caller's aggregate status and marks it terminal.
     ///
-    /// Returns the caller ID if folded, None if the job has no caller parent,
-    /// the parent is not a caller, or inner jobs are still running.
-    /// The caller walks up the chain by calling this repeatedly.
+    /// Returns the caller ID if folded. The caller walks up the chain by
+    /// calling this repeatedly, so nested reusable workflows fold outermost-
+    /// last.
     pub(super) async fn try_fold_reusable_caller(
+        backend: &PgBackend,
         tx: &Transaction<'_>,
         run_id: RunId,
         inner_job_id: &JobId,
     ) -> Result<Option<JobId>, ControlError> {
         let run = run_id.0.to_string();
-        // Find the parent and verify it's a reusable caller.
-        let parent: Option<(String, String)> = tx
-            .query_opt(
-                "SELECT parent_job_id, kind FROM jobs \
-                 WHERE run_id=$1::text::uuid AND job_id=$2",
-                &[&run, &inner_job_id.0],
-            )
-            .await
-            .map_err(db)?
-            .and_then(|row| {
-                let parent: Option<String> = row.get(0);
-                let kind: String = row.get(1);
-                parent.map(|p| (p, kind))
-            });
-        let (caller_id, kind) = match parent {
-            Some((p, k)) if k == "reusable_caller" => (p, k),
-            _ => return Ok(None),
-        };
-        let _ = kind;
-
-        // All inner jobs terminal?
-        let remaining: i64 = tx
-            .query_one(
-                "SELECT COUNT(*) FROM jobs \
-                 WHERE run_id=$1::text::uuid AND parent_job_id=$2 \
-                 AND status NOT IN \
-                   ('success','failure','cancelled','skipped','timed_out')",
-                &[&run, &caller_id],
-            )
-            .await
-            .map_err(db)?
-            .get(0);
-        if remaining > 0 {
-            return Ok(None);
-        }
-
-        // Load the caller's metadata (output definitions, inputs).
-        let meta_json: Option<String> = tx
-            .query_opt(
-                "SELECT reusable_call::text FROM job_specs \
-                 WHERE run_id=$1::text::uuid AND job_id=$2",
-                &[&run, &caller_id],
-            )
-            .await
-            .map_err(db)?
-            .and_then(|row| row.get::<_, Option<String>>(0));
-        let meta: preloop_gha_parser::ReusableCallMetadata = meta_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .ok_or_else(|| {
-                ControlError::backend(anyhow::anyhow!("reusable caller missing metadata"))
-            })?;
-
-        // Load inner jobs' outputs and statuses.
-        let rows = tx
+        // Candidate callers: every spec row whose reusable metadata lists the
+        // completed job as an inner job. The metadata (`inner_job_ids`) is the
+        // authoritative edge — a callee's job id carries no `parent_job_id`
+        // (only matrix legs do), and lite's fold reads the same list.
+        let candidates = tx
             .query(
-                "SELECT job_id, outputs::text, status FROM jobs \
-                 WHERE run_id=$1::text::uuid AND parent_job_id=$2",
-                &[&run, &caller_id],
+                "SELECT job_id, reusable_call::text FROM job_specs \
+                 WHERE run_id=$1::text::uuid AND reusable_call IS NOT NULL \
+                   AND reusable_call <> 'null'::jsonb",
+                &[&run],
             )
             .await
             .map_err(db)?;
-        let mut jobs_map = serde_json::Map::new();
-        let mut statuses = Vec::new();
-        for row in rows {
-            let jid: String = row.get(0);
-            let outputs: Option<String> = row.get(1);
-            let status: String = row.get(2);
-            // Strip the caller prefix for the context (matches old logic).
-            let prefix = format!("{}/", caller_id);
-            let short = jid.strip_prefix(&prefix).unwrap_or(&jid);
-            let mut job_outputs_map = serde_json::Map::new();
-            if let Some(o) = outputs {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&o) {
-                    if let Some(obj) = v.as_object() {
-                        for (k, v) in obj {
-                            job_outputs_map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-            let mut job_record = serde_json::Map::new();
-            job_record.insert(
-                "outputs".to_owned(),
-                serde_json::Value::Object(job_outputs_map),
-            );
-            jobs_map.insert(short.to_owned(), serde_json::Value::Object(job_record));
-            // Map status string to ExecutionStatus for aggregation.
-            let st = match status.as_str() {
-                "success" => ExecutionStatus::Success,
-                "failure" => ExecutionStatus::Failure,
-                "cancelled" => ExecutionStatus::Cancelled,
-                "skipped" => ExecutionStatus::Skipped,
-                _ => continue,
+        for row in candidates {
+            let caller_id: String = row.get(0);
+            let spec: super::graph::ReusableNodeSpec = row
+                .get::<_, Option<String>>(1)
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .ok_or_else(|| {
+                    ControlError::backend(anyhow::anyhow!(
+                        "reusable caller {caller_id} has an undecodable spec"
+                    ))
+                })?;
+            let Some(meta) = spec.meta else {
+                continue;
             };
-            statuses.push(st);
-        }
-
-        // Build expression context and evaluate output definitions.
-        let mut context = preloop_gha_expressions::Context::default();
-        context.insert("jobs", serde_json::Value::Object(jobs_map));
-        let mut inputs_map = serde_json::Map::new();
-        for (k, v) in &meta.inputs {
-            inputs_map.insert(k.clone(), v.clone());
-        }
-        context.insert("inputs", serde_json::Value::Object(inputs_map));
-        let mut caller_outputs = BTreeMap::new();
-        for (name, expr) in &meta.output_definitions {
-            let resolved = preloop_gha_parser::eval::resolve_string(expr, &context)
-                .unwrap_or_else(|_| expr.clone());
-            // Outputs are strings on GitHub (matches old logic).
-            caller_outputs.insert(name.clone(), serde_json::Value::String(resolved));
-        }
-
-        // Aggregate status: failure > cancelled > skipped > success.
-        let aggregate = crate::runtime_scheduling::aggregate_need_status(&statuses)
-            .unwrap_or(ExecutionStatus::Skipped);
-        let status_str = match aggregate {
-            ExecutionStatus::Success => "success",
-            ExecutionStatus::Failure => "failure",
-            ExecutionStatus::Cancelled => "cancelled",
-            ExecutionStatus::Skipped => "skipped",
-            _ => "failure",
-        };
-        let outputs_json = serde_json::to_string(&caller_outputs).map_err(ControlError::backend)?;
-
-        // Terminalize the caller.
-        tx.execute(
-            "UPDATE jobs SET status=$3, outputs=$4::text::jsonb, queue_state='none', \
-                    completed_at=COALESCE(completed_at, now()) \
-             WHERE run_id=$1::text::uuid AND job_id=$2",
-            &[&run, &caller_id, &status_str, &outputs_json],
-        )
-        .await
-        .map_err(db)?;
-
-        Ok(Some(JobId(caller_id)))
-    }
-
-    /// Evaluate a newly-unblocked job's `if:` condition via targeted queries.
-    /// Mirrors `dependency_decision` but builds the context from SQL instead
-    /// of the in-memory graph.
-    ///
-    /// Returns Run (enqueue), Skip (mark skipped), Wait (not ready — should
-    /// not happen after try_unblock_dependent), or Error (mark failure).
-    pub(super) async fn evaluate_if_condition(
-        tx: &Transaction<'_>,
-        run_id: RunId,
-        job_id: &JobId,
-    ) -> Result<sched_helpers::DependencyDecision, ControlError> {
-        use sched_helpers::DependencyDecision;
-        let run = run_id.0.to_string();
-
-        // Q1: the job's needs, base context, and if condition.
-        let (needs, condition_context_json, if_condition): (
-            Vec<String>,
-            Option<String>,
-            Option<String>,
-        ) = {
-            let rows = tx
-                .query(
-                    "SELECT n.needs_job_id, m.condition_context::text, s.if_condition \
-                     FROM jobs j \
-                     LEFT JOIN job_needs n ON n.run_id=j.run_id AND n.job_id=j.job_id \
-                     LEFT JOIN job_messages m ON m.run_id=j.run_id AND m.job_id=j.job_id \
-                     LEFT JOIN job_specs s ON s.run_id=j.run_id AND s.job_id=j.job_id \
-                     WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
-                    &[&run, &job_id.0],
-                )
-                .await
-                .map_err(db)?;
-            let mut needs = Vec::new();
-            let mut ctx = None;
-            let mut cond = None;
-            for row in &rows {
-                if let Some(n) = row.get::<_, Option<String>>(0) {
-                    if !needs.contains(&n) {
-                        needs.push(n);
-                    }
-                }
-                if ctx.is_none() {
-                    ctx = row.get::<_, Option<String>>(1);
-                }
-                if cond.is_none() {
-                    cond = row.get::<_, Option<String>>(2);
-                }
+            if !meta.inner_job_ids.iter().any(|id| id == &inner_job_id.0) {
+                continue;
             }
-            (needs, ctx, cond)
-        };
-        if needs.is_empty() {
-            return Ok(DependencyDecision::Run);
-        }
-
-        // Q2: statuses + outputs for all jobs matching the direct needs
-        // (matrix-aware: job_id OR base_id).
-        let mut need_statuses: BTreeMap<String, Vec<ExecutionStatus>> = BTreeMap::new();
-        let mut need_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
-            BTreeMap::new();
-        {
+            // Already folded (the resolved outputs are the fold's marker).
+            let folded: bool = tx
+                .query_one(
+                    "SELECT outputs IS NOT NULL FROM jobs \
+                     WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &caller_id],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            if folded {
+                continue;
+            }
+            // All inner jobs terminal? (`inner_job_ids` order is the GitHub
+            // evaluation order; statuses come from the rows.)
             let rows = tx
                 .query(
-                    "SELECT n.needs_job_id, j.status, j.outputs::text, j.job_id \
-                     FROM job_needs n \
-                     JOIN jobs j ON j.run_id=n.run_id \
-                       AND (j.job_id=n.needs_job_id OR j.base_id=n.needs_job_id) \
-                     WHERE n.run_id=$1::text::uuid AND n.job_id=$2",
-                    &[&run, &job_id.0],
+                    "SELECT job_id, status, outputs::text FROM jobs \
+                     WHERE run_id=$1::text::uuid AND job_id = ANY($2)",
+                    &[&run, &meta.inner_job_ids],
                 )
                 .await
                 .map_err(db)?;
+            let mut statuses = Vec::new();
+            let mut by_id: BTreeMap<String, (ExecutionStatus, Option<String>)> = BTreeMap::new();
             for row in &rows {
-                let need_id: String = row.get(0);
-                let status_str: String = row.get(1);
-                let outputs_str: Option<String> = row.get(2);
-                let status = match status_str.as_str() {
-                    "success" => ExecutionStatus::Success,
-                    "failure" => ExecutionStatus::Failure,
-                    "cancelled" => ExecutionStatus::Cancelled,
-                    "skipped" => ExecutionStatus::Skipped,
-                    "in_progress" => ExecutionStatus::InProgress,
-                    "queued" => ExecutionStatus::Queued,
-                    _ => ExecutionStatus::Pending,
-                };
-                need_statuses
-                    .entry(need_id.clone())
-                    .or_default()
-                    .push(status);
-                if let Some(o) = outputs_str {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&o) {
-                        if let Some(obj) = v.as_object() {
-                            let entry = need_outputs.entry(need_id).or_default();
-                            for (k, v) in obj {
-                                entry.insert(k.clone(), v.clone());
-                            }
+                let status = crate::control::types::status_parse(row.get::<_, String>(1).as_str());
+                by_id.insert(
+                    row.get::<_, String>(0),
+                    (status, row.get::<_, Option<String>>(2)),
+                );
+            }
+            let all_complete = !meta.inner_job_ids.is_empty()
+                && meta.inner_job_ids.iter().all(|id| {
+                    by_id
+                        .get(id)
+                        .is_some_and(|(status, _)| status.is_terminal())
+                });
+            if !all_complete {
+                return Ok(None);
+            }
+            // Expression context: `jobs.<inner-id-without-caller-prefix>
+            // .outputs.<name>` plus the call's `with:` inputs.
+            let mut jobs_map = serde_json::Map::new();
+            for inner_id in &meta.inner_job_ids {
+                let prefix = format!("{caller_id}/");
+                let short = inner_id.strip_prefix(&prefix).unwrap_or(inner_id);
+                let mut job_outputs_map = serde_json::Map::new();
+                if let Some(Some(outputs)) = by_id.get(inner_id).map(|(_, outputs)| outputs) {
+                    if let Ok(serde_json::Value::Object(obj)) =
+                        serde_json::from_str::<serde_json::Value>(outputs)
+                    {
+                        for (k, v) in obj {
+                            job_outputs_map.insert(k, v);
                         }
                     }
                 }
+                let mut job_record = serde_json::Map::new();
+                job_record.insert(
+                    "outputs".to_owned(),
+                    serde_json::Value::Object(job_outputs_map),
+                );
+                jobs_map.insert(short.to_owned(), serde_json::Value::Object(job_record));
             }
-        }
-        // All direct needs must be terminal, else Wait.
-        for statuses in need_statuses.values() {
-            if statuses.is_empty()
-                || statuses.iter().any(|s| {
-                    !matches!(
-                        s,
-                        ExecutionStatus::Success
-                            | ExecutionStatus::Failure
-                            | ExecutionStatus::Cancelled
-                            | ExecutionStatus::Skipped
-                    )
-                })
-            {
-                return Ok(DependencyDecision::Wait);
+            let mut context = preloop_gha_expressions::Context::default();
+            context.insert("jobs", serde_json::Value::Object(jobs_map));
+            let mut inputs_map = serde_json::Map::new();
+            for (k, v) in &meta.inputs {
+                inputs_map.insert(k.clone(), v.clone());
             }
-        }
-
-        // Q3: transitive ancestor statuses for success()/failure()/cancelled().
-        let ancestor_statuses: Vec<ExecutionStatus> = {
-            let rows = tx
-                .query(
-                    "WITH RECURSIVE ancestors(need_id) AS ( \
-                       SELECT needs_job_id FROM job_needs \
-                       WHERE run_id=$1::text::uuid AND job_id=$2 \
-                       UNION \
-                       SELECT n.needs_job_id FROM job_needs n \
-                       JOIN ancestors a ON n.job_id=a.need_id \
-                       WHERE n.run_id=$1::text::uuid \
-                     ) \
-                     SELECT DISTINCT j.status FROM jobs j \
-                     JOIN ancestors a ON (j.job_id=a.need_id OR j.base_id=a.need_id) \
-                     WHERE j.run_id=$1::text::uuid",
-                    &[&run, &job_id.0],
+            context.insert("inputs", serde_json::Value::Object(inputs_map));
+            let mut caller_outputs = BTreeMap::new();
+            for (name, expr) in &meta.output_definitions {
+                let resolved = preloop_gha_parser::eval::resolve_string(expr, &context)
+                    .unwrap_or_else(|_| expr.clone());
+                // Outputs are strings on GitHub: every `GITHUB_OUTPUT` value is
+                // text and `needs.<caller>.outputs.<name>` comparisons are
+                // string comparisons.
+                caller_outputs.insert(name.clone(), serde_json::Value::String(resolved));
+            }
+            // Aggregate status: failure > cancelled > skipped > success. A
+            // caller that already turned terminal (cancelled mid-flight) keeps
+            // its conclusion — the conditional UPDATE below only moves live
+            // callers.
+            for inner_id in &meta.inner_job_ids {
+                if let Some((status, _)) = by_id.get(inner_id) {
+                    statuses.push(*status);
+                }
+            }
+            let aggregate = crate::runtime_scheduling::aggregate_need_status(&statuses)
+                .unwrap_or(ExecutionStatus::Skipped);
+            let outputs_json =
+                serde_json::to_string(&caller_outputs).map_err(ControlError::backend)?;
+            let updated = tx
+                .execute(
+                    "UPDATE jobs SET outputs=$3::text::jsonb, status=$4, queue_state='none', \
+                            completed_at=COALESCE(completed_at, now()) \
+                     WHERE run_id=$1::text::uuid AND job_id=$2 \
+                       AND status NOT IN \
+                         ('success','failure','cancelled','skipped','timed_out')",
+                    &[&run, &caller_id, &outputs_json, &status_str(aggregate)],
                 )
                 .await
                 .map_err(db)?;
-            rows.iter()
-                .map(|row| match row.get::<_, String>(0).as_str() {
-                    "success" => ExecutionStatus::Success,
-                    "failure" => ExecutionStatus::Failure,
-                    "cancelled" => ExecutionStatus::Cancelled,
-                    "skipped" => ExecutionStatus::Skipped,
-                    "in_progress" => ExecutionStatus::InProgress,
-                    "queued" => ExecutionStatus::Queued,
-                    _ => ExecutionStatus::Pending,
-                })
-                .collect()
-        };
-        let aggregate = crate::runtime_scheduling::aggregate_need_status(&ancestor_statuses)
-            .unwrap_or(ExecutionStatus::Skipped);
-
-        // Build the needs JSON context.
-        let mut needs_json = serde_json::Map::new();
-        for need_id in &needs {
-            let statuses = need_statuses.get(need_id).cloned().unwrap_or_default();
-            let result = crate::runtime_scheduling::aggregate_need_status(&statuses)
-                .map(|s| match s {
-                    ExecutionStatus::Success => "success",
-                    ExecutionStatus::Failure => "failure",
-                    ExecutionStatus::Cancelled => "cancelled",
-                    ExecutionStatus::Skipped => "skipped",
-                    _ => "success",
-                })
-                .unwrap_or("success");
-            let outputs = need_outputs.get(need_id).cloned().unwrap_or_default();
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "result".to_owned(),
-                serde_json::Value::String(result.to_owned()),
-            );
-            entry.insert(
-                "outputs".to_owned(),
-                serde_json::Value::Object(
-                    outputs.into_iter().collect::<serde_json::Map<String, _>>(),
-                ),
-            );
-            needs_json.insert(need_id.clone(), serde_json::Value::Object(entry));
-        }
-
-        // Build the eval context: base + status flags + needs.
-        let mut context: preloop_gha_expressions::Context = condition_context_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        // with_status flags (mirrors dependency_decision).
-        context.insert(
-            "success",
-            serde_json::Value::Bool(aggregate == ExecutionStatus::Success),
-        );
-        context.insert(
-            "failure",
-            serde_json::Value::Bool(aggregate == ExecutionStatus::Failure),
-        );
-        context.insert(
-            "cancelled",
-            serde_json::Value::Bool(aggregate == ExecutionStatus::Cancelled),
-        );
-        context.insert("needs", serde_json::Value::Object(needs_json));
-
-        let condition = preloop_gha_expressions::effective_condition(if_condition.as_deref());
-        match preloop_gha_expressions::eval_bool(&condition, &context) {
-            Ok(true) => Ok(DependencyDecision::Run),
-            Ok(false) => Ok(DependencyDecision::Skip),
-            Err(_) => Ok(DependencyDecision::Error),
-        }
-    }
-
-    /// Try to unblock a dependent job: set `queue_state='ready'` only if every
-    /// need is satisfied. A need on a job id waits for that job; a need on a
-    /// matrix base id waits for *every* leg (a leg's own id never appears in
-    /// `job_needs`). Expanded matrix parents don't count — their legs do.
-    ///
-    /// Atomic: the check and the write are one statement, so two completions
-    /// racing to unblock the same dependent can't both succeed or lose a
-    /// wakeup. Returns true if this call unblocked the job.
-    pub(super) async fn try_unblock_dependent(
-        tx: &Transaction<'_>,
-        run_id: RunId,
-        job_id: &JobId,
-    ) -> Result<bool, ControlError> {
-        let updated = tx
-            .execute(
-                "UPDATE jobs SET queue_state='ready', enqueued_at=now() \
-                 WHERE run_id=$1::text::uuid AND job_id=$2 \
-                 AND queue_state='blocked' \
-                 AND NOT EXISTS ( \
-                   SELECT 1 FROM job_needs n \
-                   WHERE n.run_id=$1::text::uuid AND n.job_id=$2 \
-                   AND EXISTS ( \
-                     SELECT 1 FROM jobs dep \
-                     WHERE dep.run_id=$1::text::uuid \
-                     AND (dep.job_id=n.needs_job_id OR dep.base_id=n.needs_job_id) \
-                     AND dep.status NOT IN \
-                       ('success','failure','cancelled','skipped','timed_out') \
-                     AND NOT ( \
-                       dep.kind='matrix_parent' AND EXISTS ( \
-                         SELECT 1 FROM jobs c \
-                         WHERE c.run_id=dep.run_id AND c.parent_job_id=dep.job_id \
-                       ) \
-                     ) \
-                   ) \
-                 )",
-                &[&run_id.0.to_string(), &job_id.0],
+            if updated == 0 {
+                // A caller cancelled between the checks keeps its conclusion;
+                // its outputs still land so dependents can read them.
+                tx.execute(
+                    "UPDATE jobs SET outputs=$3::text::jsonb \
+                     WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &caller_id, &outputs_json],
+                )
+                .await
+                .map_err(db)?;
+            }
+            // A terminal caller must not leave the placeholder attempts it
+            // minted in flight, and its own hold goes with it.
+            retire_node_requests(
+                tx,
+                run_id,
+                &JobId(caller_id.clone()),
+                Retirement::Settle(aggregate),
             )
-            .await
-            .map_err(db)?;
-        Ok(updated > 0)
+            .await?;
+            release_concurrency_for_job(backend, tx, run_id, &JobId(caller_id.clone())).await?;
+            return Ok(Some(JobId(caller_id)));
+        }
+        Ok(None)
     }
 
     /// Cancel a failed leg's matrix siblings (fail-fast). Returns the IDs of
     /// jobs actually cancelled. Idempotent: running it twice cancels nothing
     /// the second time.
     ///
-    /// The `fail_fast` flag comes from `job_specs` (default true when null,
-    /// matching the old in-memory default). Only non-terminal siblings are
-    /// touched; the failed job itself is excluded.
+    /// Parity with lite's `apply_matrix_fail_fast`: the flag is read off the
+    /// base's legs (`job_specs.fail_fast`, default true when unset); every
+    /// non-terminal sibling of the base is cancelled, an in-flight one gets a
+    /// deduplicated runner cancellation, and its concurrency presence is
+    /// released (a leaked hold parks the whole group).
     pub(super) async fn cancel_fail_fast_siblings(
+        backend: &PgBackend,
         tx: &Transaction<'_>,
         run_id: RunId,
         failed: &JobId,
         base_id: &str,
     ) -> Result<Vec<JobId>, ControlError> {
-        // Fail-fast defaults to true when the spec row is missing or null.
+        // Fail-fast defaults to true when the spec rows carry no flag.
         let fail_fast: bool = tx
             .query_opt(
-                "SELECT fail_fast FROM job_specs \
-                 WHERE run_id=$1::text::uuid AND job_id=$2",
-                &[&run_id.0.to_string(), &failed.0],
+                "SELECT bool_or(s.fail_fast) FROM job_specs s \
+                 JOIN jobs j ON j.run_id = s.run_id AND j.job_id = s.job_id \
+                 WHERE s.run_id=$1::text::uuid AND j.base_id=$2 \
+                   AND s.fail_fast IS NOT NULL",
+                &[&run_id.0.to_string(), &base_id],
             )
             .await
             .map_err(db)?
@@ -3452,23 +3259,46 @@ impl<'a> Sweep<'a> {
         if !fail_fast {
             return Ok(Vec::new());
         }
-        let rows = tx
+        let siblings = tx
             .query(
-                "UPDATE jobs SET status='cancelled', queue_state='none', \
-                        completed_at=COALESCE(completed_at, now()) \
-                 WHERE run_id=$1::text::uuid AND base_id=$2 AND job_id != $3 \
-                 AND kind='matrix_leg' \
-                 AND status NOT IN \
-                   ('success','failure','cancelled','skipped','timed_out') \
-                 RETURNING job_id",
+                "SELECT j.job_id, j.status, \
+                        (SELECT q.request_id FROM job_requests q \
+                         WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                           AND q.result IS NULL \
+                         ORDER BY q.request_id DESC LIMIT 1) \
+                 FROM jobs j \
+                 WHERE j.run_id=$1::text::uuid AND j.base_id=$2 AND j.job_id <> $3 \
+                   AND j.status IN ('pending','queued','in_progress') \
+                 ORDER BY j.job_order",
                 &[&run_id.0.to_string(), &base_id, &failed.0],
             )
             .await
             .map_err(db)?;
-        Ok(rows
-            .iter()
-            .map(|row| JobId(row.get::<_, String>(0)))
-            .collect())
+        let mut cancelled = Vec::new();
+        for row in &siblings {
+            let sibling = JobId(row.get::<_, String>(0));
+            let status: String = row.get(1);
+            let request_id: Option<i64> = row.get(2);
+            if status == "in_progress"
+                && let Some(request_id) = request_id
+            {
+                queue_job_cancellation(tx, request_id, Some("fail_fast")).await?;
+            }
+            tx.execute(
+                "UPDATE jobs SET status='cancelled', queue_state='none', \
+                        completed_at=COALESCE(completed_at, now()), \
+                        claimed_by_runner_id=NULL \
+                 WHERE run_id=$1::text::uuid AND job_id=$2 \
+                 AND status NOT IN \
+                   ('success','failure','cancelled','skipped','timed_out')",
+                &[&run_id.0.to_string(), &sibling.0],
+            )
+            .await
+            .map_err(db)?;
+            release_concurrency_for_job(backend, tx, run_id, &sibling).await?;
+            cancelled.push(sibling);
+        }
+        Ok(cancelled)
     }
 
     pub(super) async fn settle_node(
@@ -6122,23 +5952,36 @@ pub(super) async fn attempt_log_key(
         .unwrap_or_else(|| format!("{}:{}", run_id.0, job_id.0)))
 }
 
-/// Outcome of the targeted settle core (no graph).
+/// Outcome of the targeted settle core (no graph load).
 struct SettleCoreOutcome {
     effective_status: ExecutionStatus,
-    cancelled_siblings: usize,
-    promoted: usize,
+    /// The job already held a terminal (non-cancelled) verdict: nothing was
+    /// written and the caller reports the run unchanged.
+    replayed: bool,
+    cancelled_siblings: Vec<JobId>,
+    /// Reusable callers folded terminal by this completion, innermost first.
+    folded_callers: Vec<JobId>,
+    /// A dependent just became promotable — the caller runs the promotion
+    /// sweep for the run.
+    promotable_dependents: bool,
+    newly_terminal_success: bool,
     run_completed: bool,
     conclusion: Option<String>,
+    live_log_key: String,
 }
 
 impl Default for SettleCoreOutcome {
     fn default() -> Self {
         Self {
             effective_status: ExecutionStatus::Pending,
-            cancelled_siblings: 0,
-            promoted: 0,
+            replayed: false,
+            cancelled_siblings: Vec::new(),
+            folded_callers: Vec::new(),
+            promotable_dependents: false,
+            newly_terminal_success: false,
             run_completed: false,
             conclusion: None,
+            live_log_key: String::new(),
         }
     }
 }
@@ -6164,27 +6007,32 @@ impl PgBackend {
         {
             settle_request_tx(&tx, request_id, completion.status).await?;
         }
-        // Targeted core: no graph load, no sweep, no flush.
+        // Targeted core: no graph load, no sweep, no flush. `complete_job` has
+        // no annotations on its wire shape.
         let outputs: BTreeMap<String, serde_json::Value> = completion
             .outputs
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let outcome = self
-            .settle_job_targeted(&tx, run_id, &job_id, completion.status, &outputs)
+            .settle_job_targeted(&tx, run_id, &job_id, completion.status, &outputs, &[])
             .await?;
+        let scheduling = if outcome.promotable_dependents {
+            self.promote_unblocked(&tx, run_id).await?
+        } else {
+            crate::runtime_scheduling::SchedulingOutcome::default()
+        };
         let queue_nonempty = Self::work_pending_on(&tx).await?;
         tx.commit().await.map_err(db)?;
         drop(client);
         Ok(CompleteOutcome {
             effective_status: outcome.effective_status,
-            newly_terminal_success: outcome.run_completed
-                && outcome.effective_status == ExecutionStatus::Success,
-            cancelled_siblings: vec![],
-            scheduling: crate::runtime_scheduling::SchedulingOutcome::default(),
-            live_log_key: String::new(),
+            newly_terminal_success: outcome.newly_terminal_success,
+            cancelled_siblings: outcome.cancelled_siblings,
+            scheduling,
+            live_log_key: outcome.live_log_key,
             queue_nonempty,
-            replayed: false,
+            replayed: outcome.replayed,
         })
     }
 
@@ -6226,16 +6074,36 @@ impl PgBackend {
             }
             attempt = Some(request_id);
         }
-        // Targeted core: no graph load, no sweep, no flush.
-        // The handler masked `comp.annotations` against the provider.
+        // Targeted core: no graph load, no sweep, no flush. The handler masked
+        // `comp.annotations` against the provider.
         let outputs: BTreeMap<String, serde_json::Value> = comp
             .outputs
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         let outcome = self
-            .settle_job_targeted(&tx, run_id, &job_id, comp.status, &outputs)
+            .settle_job_targeted(
+                &tx,
+                run_id,
+                &job_id,
+                comp.status,
+                &outputs,
+                &comp.annotations,
+            )
             .await?;
+        if outcome.replayed {
+            // A duplicate completion reports the run unchanged: commit the
+            // attempt settle above and hand back the stored record.
+            tx.commit().await.map_err(db)?;
+            drop(client);
+            let record = self.run_record(run_id).await?;
+            return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
+        }
+        let scheduling = if outcome.promotable_dependents {
+            self.promote_unblocked(&tx, run_id).await?
+        } else {
+            crate::runtime_scheduling::SchedulingOutcome::default()
+        };
         if let Some(request_id) = attempt {
             settle_request_tx(&tx, request_id, outcome.effective_status).await?;
             // The attempt's step results land on its manifest.
@@ -6262,22 +6130,26 @@ impl PgBackend {
         tx.commit().await.map_err(db)?;
         Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
             effective_status: outcome.effective_status,
-            cancelled_siblings: vec![],
-            scheduling: crate::runtime_scheduling::SchedulingOutcome::default(),
+            cancelled_siblings: outcome.cancelled_siblings,
+            scheduling,
             queue_nonempty,
-            newly_terminal_success: outcome.run_completed
-                && outcome.effective_status == ExecutionStatus::Success,
-            live_log_key: String::new(),
+            newly_terminal_success: outcome.newly_terminal_success,
+            live_log_key: outcome.live_log_key,
             next_runs_on,
         })))
     }
 
-    /// Targeted settle flow: mark terminal, fold callers, fail-fast, unblock
-    /// dependents, evaluate conditions, promote. No graph load.
+    /// Targeted settle flow: mark terminal, retire the attempt's rows, release
+    /// the job's hold, fail-fast siblings, fold reusable callers, refresh the
+    /// dependents' counters and stamp the run — all without loading the run
+    /// graph.
     ///
-    /// This is the new implementation replacing the load_graph → sweep → flush
-    /// path. It uses the targeted helpers: dependents_of, try_unblock_dependent,
-    /// cancel_fail_fast_siblings, try_fold_reusable_caller, evaluate_if_condition.
+    /// Promotion is the one step that still needs the graph (needs hydration,
+    /// job/JobSet gates, max-parallel cohorts, deferred expansion are not
+    /// expressible as conditional writes), so it stays with the shared
+    /// [`Sweep`] — but only when this completion actually made a dependent
+    /// promotable (`promotable_dependents`). A leg of a large fan-out
+    /// therefore settles without ever materializing the run.
     async fn settle_job_targeted(
         &self,
         tx: &Transaction<'_>,
@@ -6285,234 +6157,212 @@ impl PgBackend {
         job_id: &JobId,
         status: ExecutionStatus,
         outputs: &BTreeMap<String, serde_json::Value>,
+        annotations: &[serde_json::Value],
     ) -> Result<SettleCoreOutcome, ControlError> {
         let run = run_id.0.to_string();
-        let status_str = match status {
-            ExecutionStatus::Success => "success",
-            ExecutionStatus::Failure => "failure",
-            ExecutionStatus::Cancelled => "cancelled",
-            ExecutionStatus::Skipped => "skipped",
-            _ => "failure",
-        };
-
-        // 1. Mark the job terminal (idempotent).
-        let outputs_json = serde_json::to_string(outputs).unwrap_or_else(|_| "{}".to_owned());
-        let marked = tx
-            .execute(
-                "UPDATE jobs SET status=$3, outputs=$4::text::jsonb, queue_state='none', \
-                        completed_at=COALESCE(completed_at, now()), \
-                        claimed_by_runner_id=NULL \
-                 WHERE run_id=$1::text::uuid AND job_id=$2 \
-                 AND status NOT IN \
-                   ('success','failure','cancelled','skipped','timed_out')",
-                &[&run, &job_id.0, &status_str, &outputs_json],
-            )
-            .await
-            .map_err(db)?;
-        if marked == 0 {
-            // Already terminal — idempotent no-op.
-            return Ok(SettleCoreOutcome::default());
-        }
-
-        let mut outcome = SettleCoreOutcome::default();
-        outcome.effective_status = status;
-
-        // Get base_id for dependent lookup and fail-fast.
-        let base_id: String = tx
-            .query_one(
-                "SELECT base_id FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+        // 1. Prior state: the first-verdict rule, `continue-on-error`, and the
+        // base id fail-fast and the dependent refresh key on.
+        let row = tx
+            .query_opt(
+                "SELECT j.status, j.base_id, COALESCE(s.continue_on_error, false) \
+                 FROM jobs j \
+                 LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                 WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
                 &[&run, &job_id.0],
             )
             .await
             .map_err(db)?
-            .get(0);
-
-        // 2. Reusable caller fold: walk up the chain.
-        let mut current_job = job_id.clone();
-        let mut current_base = base_id.clone();
+            .ok_or_else(|| ControlError::NotFound(format!("job {job_id}")))?;
+        let prior = crate::control::types::status_parse(row.get::<_, String>(0).as_str());
+        let base_id: String = row.get(1);
+        let continue_on_error: bool = row.get(2);
+        let decision = crate::control::logic::completion_decision(logic::CompletionRow {
+            job_id: job_id.clone(),
+            prior_status: prior,
+            reported_status: status,
+            continue_on_error,
+            run_will_be_terminal: false,
+        });
+        let effective = decision.effective_status;
+        let mut outcome = SettleCoreOutcome {
+            effective_status: effective,
+            replayed: decision.replayed,
+            live_log_key: attempt_log_key(tx, run_id, job_id, None).await?,
+            ..SettleCoreOutcome::default()
+        };
+        if decision.replayed {
+            // A terminal (non-cancelled) verdict sticks; nothing to write.
+            return Ok(outcome);
+        }
+        // The run's own transition decides the workflow-hold release and
+        // `run.completed.v1`, so remember where it started.
+        let run_status_before: Option<String> = tx
+            .query_opt("SELECT status FROM runs WHERE run_id=$1::text::uuid", &[&run])
+            .await
+            .map_err(db)?
+            .map(|row| row.get(0));
+        // 2. The job's terminal write. Outputs/annotations only land when the
+        // runner reported any — an empty map is not a result.
+        let outputs_json = (!outputs.is_empty())
+            .then(|| serde_json::to_string(outputs).unwrap_or_else(|_| "{}".to_owned()));
+        let annotations_json = (!annotations.is_empty())
+            .then(|| serde_json::to_string(annotations).unwrap_or_else(|_| "[]".to_owned()));
+        tx.execute(
+            "UPDATE jobs SET status=$3, queue_state='none', \
+                    completed_at=COALESCE(completed_at, now()), \
+                    claimed_by_runner_id=NULL, \
+                    outputs=COALESCE($4::text::jsonb, outputs), \
+                    annotations=COALESCE($5::text::jsonb, annotations) \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[
+                &run,
+                &job_id.0,
+                &status_str(effective),
+                &outputs_json,
+                &annotations_json,
+            ],
+        )
+        .await
+        .map_err(db)?;
+        // Retire the job's open attempts, drop its machine binding, and settle
+        // the newest attempt's orphaned in-progress steps with it.
+        retire_node_requests(tx, run_id, job_id, Retirement::Settle(effective)).await?;
+        clear_assignment(tx, run_id, job_id).await?;
+        tx.execute(
+            concat!(
+                "UPDATE job_steps SET conclusion=$3, finished_at=COALESCE(finished_at, ",
+                ts!("$4"),
+                ") WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 ORDER BY request_id DESC LIMIT 1) AND conclusion = 'in_progress'"
+            ),
+            &[&run, &job_id.0, &status_str(effective), &now_us()],
+        )
+        .await
+        .map_err(db)?;
+        // The job's own hold goes with it; the group's oldest waiter is
+        // admitted by the release path.
+        release_concurrency_for_job(self, tx, run_id, job_id).await?;
+        // 3. Fail-fast siblings of a failed matrix leg.
+        if effective == ExecutionStatus::Failure {
+            outcome.cancelled_siblings =
+                Sweep::cancel_fail_fast_siblings(self, tx, run_id, job_id, &base_id).await?;
+        }
+        // 4. Reusable caller fold, walking up nested callers.
+        let mut current = job_id.clone();
         loop {
-            match Sweep::try_fold_reusable_caller(tx, run_id, &current_job).await? {
-                Some(caller_id) => {
-                    // Emit outbox for the folded caller (pg/lite parity).
-                    emit_outbox(
-                        tx,
-                        Some(run_id),
-                        "job.completed.v1",
-                        serde_json::json!({"job_id": caller_id.0}),
-                    )
-                    .await?;
-                    // Continue walking up from the caller.
-                    let caller_base: String = tx
-                        .query_one(
-                            "SELECT base_id FROM jobs \
-                             WHERE run_id=$1::text::uuid AND job_id=$2",
-                            &[&run, &caller_id.0],
-                        )
-                        .await
-                        .map_err(db)?
-                        .get(0);
-                    current_job = caller_id;
-                    current_base = caller_base;
+            match Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await? {
+                Some(caller) => {
+                    current = caller.clone();
+                    outcome.folded_callers.push(caller);
                 }
                 None => break,
             }
         }
-
-        // 3. Fail-fast: if the (original) job failed, cancel siblings.
-        // Note: use the original job_id/base_id, not the folded caller.
-        if status == ExecutionStatus::Failure {
-            let cancelled = Sweep::cancel_fail_fast_siblings(tx, run_id, job_id, &base_id).await?;
-            outcome.cancelled_siblings = cancelled.len();
-            // Cancelled siblings are terminal; their dependents will be
-            // processed when we check dependents below (they share the base).
+        // 5. Refresh the dependents' `remaining_needs` for everything that just
+        // turned terminal: the job, its fail-fast siblings and the folded
+        // callers. A dependent that is now `blocked` with zero needs left is
+        // what the promotion sweep below picks up.
+        let mut promotable =
+            Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
+        for settled in outcome
+            .cancelled_siblings
+            .iter()
+            .chain(outcome.folded_callers.iter())
+        {
+            let settled_base: String = tx
+                .query_one(
+                    "SELECT base_id FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &settled.0],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            promotable |= Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
         }
-
-        // 4. Find dependents of the completed job AND any folded callers.
-        // For simplicity, we check dependents of the original job and the
-        // final folded caller (if any). Intermediate callers have no direct
-        // dependents (they point at the top caller).
-        let mut to_check = vec![(job_id.clone(), base_id.clone())];
-        if current_job != *job_id {
-            to_check.push((current_job.clone(), current_base.clone()));
-        }
-        let mut dependents = Vec::new();
-        for (jid, bid) in &to_check {
-            let mut deps = Sweep::dependents_of(tx, run_id, jid, bid).await?;
-            dependents.append(&mut deps);
-        }
-        // Deduplicate.
-        dependents.sort_by(|a, b| a.0.cmp(&b.0));
-        dependents.dedup_by(|a, b| a.0 == b.0);
-
-        // 5. Try to unblock each dependent, evaluate condition, promote.
-        for dependent in dependents {
-            if Sweep::try_unblock_dependent(tx, run_id, &dependent).await? {
-                match Sweep::evaluate_if_condition(tx, run_id, &dependent).await? {
-                    sched_helpers::DependencyDecision::Run => {
-                        // Promote: mark ready and enqueue.
-                        tx.execute(
-                            "UPDATE jobs SET queue_state='ready', status='queued' \
-                             WHERE run_id=$1::text::uuid AND job_id=$2",
-                            &[&run, &dependent.0],
-                        )
-                        .await
-                        .map_err(db)?;
-                        // Create the job_requests row so runners can claim it.
-                        // Without this, the claim path INSERTs with wrong
-                        // defaults and violates job_requests_result_check.
-                        let namespace: String = tx
-                            .query_one(
-                                "SELECT namespace_id FROM jobs \
-                                 WHERE run_id=$1::text::uuid AND job_id=$2",
-                                &[&run, &dependent.0],
-                            )
-                            .await
-                            .map_err(db)?
-                            .get(0);
-                        let agent_job_id = uuid::Uuid::new_v4().to_string();
-                        let timeline_id = uuid::Uuid::new_v4().to_string();
-                        // Only INSERT if the job doesn't already have an in-flight
-                        // request. Otherwise we'd create duplicate rows and the
-                        // runner could claim the job twice.
-                        let existing: i64 = tx
-                            .query_one(
-                                "SELECT count(*) FROM job_requests \
-                                 WHERE run_id=$1::text::uuid AND job_id=$2 AND result IS NULL",
-                                &[&run, &dependent.0],
-                            )
-                            .await
-                            .map_err(db)?
-                            .get(0);
-                        if existing == 0 {
-                            tx.execute(
-                                "INSERT INTO job_requests (run_id, job_id, namespace_id, \
-                                 agent_job_id, timeline_id) \
-                                 VALUES ($1::text::uuid,$2,$3,$4::text::uuid,$5::text::uuid) \
-                                 ON CONFLICT DO NOTHING",
-                                &[&run, &dependent.0, &namespace, &agent_job_id, &timeline_id],
-                            )
-                            .await
-                            .map_err(db)?;
-                        }
-                        emit_outbox(
-                            tx,
-                            Some(run_id),
-                            "job.queued.v1",
-                            serde_json::json!({"job_id": dependent.0, "status": "queued"}),
-                        )
-                        .await?;
-                        outcome.promoted += 1;
-                    }
-                    sched_helpers::DependencyDecision::Skip => {
-                        // Mark skipped (terminal).
-                        tx.execute(
-                            "UPDATE jobs SET status='skipped', queue_state='none', \
-                                    completed_at=COALESCE(completed_at, now()) \
-                             WHERE run_id=$1::text::uuid AND job_id=$2",
-                            &[&run, &dependent.0],
-                        )
-                        .await
-                        .map_err(db)?;
-                        // Skipped jobs are terminal; their dependents will be
-                        // unblocked in a future completion (or we could recurse).
-                    }
-                    sched_helpers::DependencyDecision::Error => {
-                        // Mark failure.
-                        tx.execute(
-                            "UPDATE jobs SET status='failure', queue_state='none', \
-                                    completed_at=COALESCE(completed_at, now()) \
-                             WHERE run_id=$1::text::uuid AND job_id=$2",
-                            &[&run, &dependent.0],
-                        )
-                        .await
-                        .map_err(db)?;
-                    }
-                    sched_helpers::DependencyDecision::Wait => {
-                        // Should not happen after try_unblock_dependent succeeded,
-                        // but be safe.
-                    }
-                }
-            }
-        }
-
-        // 6. Release concurrency for the completed job.
-        // NOTE: We skip release_concurrency_for_job here because it incorrectly
-        // promotes waiters in the max_parallel case. Instead, directly delete
-        // the completed job's holds. The waiter stays parked in concurrency_waits.
-        // (Test: max_parallel_repark_keeps_fifo_slot_and_releases_group)
-        tx.execute(
-            "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
-             AND (holder_job_id=$2 OR holder_job_id IS NULL)",
-            &[&run, &job_id.0],
-        )
-        .await
-        .map_err(db)?;
-
-        // 7. Run status via DB aggregate (short lock held by caller).
+        outcome.promotable_dependents = promotable;
+        // 6. Run status via the DB aggregate; the caller holds the run lock.
         summarize_run_tx(tx, run_id).await?;
-        // Query the resulting run status for the outcome.
-        let run_status_str: String = tx
-            .query_one(
-                "SELECT status FROM runs WHERE run_id=$1::text::uuid",
-                &[&run],
+        let (run_status, conclusion): (String, Option<String>) = {
+            let row = tx
+                .query_one(
+                    "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?;
+            (row.get(0), row.get(1))
+        };
+        let newly_completed = run_status == "completed" && run_status_before.as_deref() != Some("completed");
+        outcome.run_completed = newly_completed;
+        outcome.newly_terminal_success =
+            newly_completed && conclusion.as_deref() == Some("success");
+        outcome.conclusion = conclusion.clone();
+        if newly_completed {
+            // A terminal run must not hold a workflow-level slot: release the
+            // group and promote its next waiter.
+            release_concurrency_for_run(self, tx, run_id).await?;
+            emit_outbox(
+                tx,
+                Some(run_id),
+                "run.completed.v1",
+                serde_json::json!({
+                    "conclusion": conclusion.unwrap_or_else(|| "success".to_owned())
+                }),
             )
-            .await
-            .map_err(db)?
-            .get(0);
-        outcome.run_completed =
-            matches!(run_status_str.as_str(), "success" | "failure" | "cancelled");
-        outcome.conclusion = Some(run_status_str);
-
-        // 8. Emit job.completed.v1 for the original job.
-        emit_outbox(
-            tx,
-            Some(run_id),
-            "job.completed.v1",
-            serde_json::json!({"job_id": job_id.0, "status": status_str}),
-        )
-        .await?;
-
+            .await?;
+        }
+        // 7. Outbox: every job this completion turned terminal — the job, its
+        // fail-fast siblings and the folded callers — so the check-run
+        // projection concludes each one.
+        let mut concluded = vec![(job_id.clone(), effective)];
+        for sibling in &outcome.cancelled_siblings {
+            concluded.push((sibling.clone(), ExecutionStatus::Cancelled));
+        }
+        for caller in &outcome.folded_callers {
+            let caller_status: String = tx
+                .query_one(
+                    "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &caller.0],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            concluded.push((caller.clone(), crate::control::types::status_parse(&caller_status)));
+        }
+        for (concluded_id, concluded_status) in concluded {
+            emit_outbox(
+                tx,
+                Some(run_id),
+                "job.completed.v1",
+                serde_json::json!({
+                    "job_id": concluded_id.0,
+                    "status": status_str(concluded_status),
+                }),
+            )
+            .await?;
+        }
         Ok(outcome)
+    }
+
+    /// Promote whatever the targeted settle unblocked: the shared sweep over
+    /// the run's graph, so needs hydration, gates, cohorts and deferred
+    /// expansion behave exactly as they do on the submit/cancel paths. Only
+    /// called when the completion made a dependent promotable.
+    async fn promote_unblocked<'a>(
+        &'a self,
+        tx: &'a Transaction<'a>,
+        run_id: RunId,
+    ) -> Result<crate::runtime_scheduling::SchedulingOutcome, ControlError> {
+        let mut sweep = Sweep::new(self, tx).await?;
+        let graph = PgBackend::load_graph(self, tx, run_id)
+            .await?
+            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+        sweep.graphs.insert(run_id, graph);
+        sweep.sweep().await?;
+        let scheduling = std::mem::take(&mut sweep.outcome);
+        sweep.flush().await?;
+        Ok(scheduling)
     }
 
     /// The live attempt's request id for a `(run, job)`: the explicit agent

@@ -1529,51 +1529,11 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
     );
 }
 
-/// `dependents_of` finds direct dependents via the reverse index, probing
-/// both the job id and the matrix base id (Phase 1 item 8).
+/// `refresh_remaining_needs` waits for every leg of a matrix base: a need on
+/// the base is only met when all of its legs are terminal, and the expanded
+/// parent placeholder does not count.
 #[tokio::test]
-async fn dependents_of_finds_direct_dependents() {
-    let Some((_pg, node, _)) = backend_pair().await else {
-        return skip_no_postgres();
-    };
-    let run_id = RunId(uuid::Uuid::new_v4());
-    // build <- test <- deploy: test needs build, deploy needs test.
-    let mut build = submit_job(run_id, "build", 1);
-    let mut test = submit_job(run_id, "test", 2);
-    test.queued.needs = vec![JobId("build".to_owned())];
-    let mut deploy = submit_job(run_id, "deploy", 3);
-    deploy.queued.needs = vec![JobId("test".to_owned())];
-    node.submit_run(submit_run(run_id, vec![build, test, deploy]))
-        .await
-        .unwrap();
-
-    let mut client = node.writer().await.unwrap();
-    let tx = client.transaction().await.unwrap();
-    // Dependents of "build" is just "test" — not the transitive "deploy".
-    let deps =
-        super::dispatch::Sweep::dependents_of(&tx, run_id, &JobId("build".to_owned()), "build")
-            .await
-            .unwrap();
-    assert_eq!(deps, vec![JobId("test".to_owned())]);
-    // Dependents of "test" is "deploy".
-    let deps =
-        super::dispatch::Sweep::dependents_of(&tx, run_id, &JobId("test".to_owned()), "test")
-            .await
-            .unwrap();
-    assert_eq!(deps, vec![JobId("deploy".to_owned())]);
-    // Nothing depends on "deploy".
-    let deps =
-        super::dispatch::Sweep::dependents_of(&tx, run_id, &JobId("deploy".to_owned()), "deploy")
-            .await
-            .unwrap();
-    assert!(deps.is_empty());
-    tx.rollback().await.unwrap();
-}
-
-/// `try_unblock_dependent` with a matrix: a need on the base waits for every
-/// leg. The expanded parent placeholder does not count.
-#[tokio::test]
-async fn try_unblock_dependent_matrix_waits_for_all_legs() {
+async fn refresh_remaining_needs_waits_for_every_matrix_leg() {
     let Some((_pg, node, _)) = backend_pair().await else {
         return skip_no_postgres();
     };
@@ -1610,44 +1570,61 @@ async fn try_unblock_dependent_matrix_waits_for_all_legs() {
         .unwrap();
     }
 
-    // One leg done -> test stays blocked.
+    // One leg done -> test stays counted against the remaining leg.
     tx.execute(
         "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-0'",
         &[&run],
     )
     .await
     .unwrap();
-    let unblocked =
-        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
-            .await
-            .unwrap();
-    assert!(!unblocked, "test waits for all legs");
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(!promotable, "test waits for every leg");
+    let remaining: i32 = tx
+        .query_one(
+            "SELECT remaining_needs FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='test'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 1, "one leg is still non-terminal");
 
-    // All legs done -> test unblocks (parent placeholder does not block).
+    // All legs done -> test is promotable (parent placeholder does not block).
     tx.execute(
         "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-1'",
         &[&run],
     )
     .await
     .unwrap();
-    let unblocked =
-        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
-            .await
-            .unwrap();
-    assert!(unblocked, "test unblocks when every leg is terminal");
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build-1".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "test is promotable once every leg is terminal");
     tx.rollback().await.unwrap();
 }
 
-/// `try_unblock_dependent` flips a blocked job to ready only when every need
-/// is terminal. Atomic: the check and write are one statement.
+/// `refresh_remaining_needs` reports the dependent a completion unblocked and
+/// leaves the transitive ones alone: build <- test <- deploy.
 #[tokio::test]
-async fn try_unblock_dependent_needs_all_terminal() {
+async fn refresh_remaining_needs_reports_only_the_unblocked_dependent() {
     let Some((_pg, node, _)) = backend_pair().await else {
         return skip_no_postgres();
     };
     let run_id = RunId(uuid::Uuid::new_v4());
-    // build <- test <- deploy.
-    let mut build = submit_job(run_id, "build", 1);
+    let build = submit_job(run_id, "build", 1);
     let mut test = submit_job(run_id, "test", 2);
     test.queued.needs = vec![JobId("build".to_owned())];
     let mut deploy = submit_job(run_id, "deploy", 3);
@@ -1660,56 +1637,49 @@ async fn try_unblock_dependent_needs_all_terminal() {
     let tx = client.transaction().await.unwrap();
     let run = run_id.0.to_string();
 
-    // Mark build terminal directly.
+    // build terminal -> test is promotable, deploy is not.
     tx.execute(
         "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build'",
         &[&run],
     )
     .await
     .unwrap();
-
-    // test's only need (build) is terminal -> unblocks.
-    let unblocked =
-        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
-            .await
-            .unwrap();
-    assert!(unblocked, "test should unblock when build is terminal");
-    let qs: String = tx
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "test should unblock when build is terminal");
+    let deploy_remaining: i32 = tx
         .query_one(
-            "SELECT queue_state FROM jobs WHERE run_id=$1::text::uuid AND job_id='test'",
+            "SELECT remaining_needs FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='deploy'",
             &[&run],
         )
         .await
         .unwrap()
         .get(0);
-    assert_eq!(qs, "ready");
+    assert_eq!(deploy_remaining, 1, "deploy still waits on test");
 
-    // deploy's need (test) is not terminal -> stays blocked.
-    let unblocked =
-        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("deploy".to_owned()))
-            .await
-            .unwrap();
-    assert!(!unblocked, "deploy should stay blocked while test runs");
-
-    // Idempotent: unblocking test again is a no-op (already ready).
-    let unblocked =
-        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
-            .await
-            .unwrap();
-    assert!(!unblocked, "already-ready job is not unblocked twice");
-
-    // Mark test terminal -> deploy unblocks.
+    // test terminal -> deploy is promotable.
     tx.execute(
         "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='test'",
         &[&run],
     )
     .await
     .unwrap();
-    let unblocked =
-        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("deploy".to_owned()))
-            .await
-            .unwrap();
-    assert!(unblocked, "deploy should unblock when test is terminal");
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("test".to_owned()),
+        "test",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "deploy should unblock when test is terminal");
     tx.rollback().await.unwrap();
 }
 
@@ -1761,6 +1731,7 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
     .unwrap();
 
     let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
         &tx,
         run_id,
         &JobId("build-0".to_owned()),
@@ -1785,6 +1756,7 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
 
     // Idempotent: second call cancels nothing.
     let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
         &tx,
         run_id,
         &JobId("build-0".to_owned()),
@@ -1793,5 +1765,64 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
     .await
     .unwrap();
     assert!(cancelled.is_empty(), "second call is a no-op");
+    tx.rollback().await.unwrap();
+}
+
+/// A `fail_fast: false` leg opts its base out: the siblings keep running.
+#[tokio::test]
+async fn cancel_fail_fast_siblings_respects_the_opt_out() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let leg0 = submit_job(run_id, "build-0", 2);
+    let leg1 = submit_job(run_id, "build-1", 3);
+    let mut submit = submit_run(run_id, vec![build, leg0, leg1]);
+    submit.record.job_fail_fast.insert("build".to_owned(), false);
+    node.submit_run(submit).await.unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+    for leg in ["build-0", "build-1"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build', \
+                    status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    tx.execute(
+        "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(
+        cancelled.is_empty(),
+        "fail_fast=false must leave the siblings alone"
+    );
+    let st: String = tx
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='build-1'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(st, "in_progress");
     tx.rollback().await.unwrap();
 }
