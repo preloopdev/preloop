@@ -23,6 +23,20 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Workspace snapshots publish again when `/tmp` is a different filesystem**:
+  the snapshot was staged in the process temp directory and published into the
+  state directory with `rename(2)`, which the kernel refuses across mounts
+  (`EXDEV`). On the common production layout — tmpfs `/tmp` over an LVM/ext4
+  state volume — every local submission's snapshot failed to publish, so the
+  run fell back to a checkout of a commit the forge has never seen and its jobs
+  died in setup (exit 2). Staging now lives under `state/snapshots/.staging`,
+  on the destination's own filesystem by construction; a publish that still
+  crosses devices copies into the destination directory and renames from there
+  (keeping the publish atomic); a failed publish is logged at error level with
+  the OS error and both paths; and a local submission whose snapshot cannot be
+  created is refused with that reason instead of being queued. Abandoned
+  staging trees are collected at startup.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the
