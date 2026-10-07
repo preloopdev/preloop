@@ -215,7 +215,12 @@ Releases before v0.27.0 predate the changelog.
   batch, the ready-queue front gauges and the reaper's ready scans now read
   one global queue order — `priority DESC, run_order, job_order`, with
   `run_id, job_id` as tie-breakers — on both backends; the pool key groups
-  equal label sets for pruning and never ranks them. A new
+  equal label sets for pruning and never ranks them. A runner's own fresh
+  bindings are read before the paged queue, so a first window of older
+  unassigned jobs can no longer take a runner off the job the control plane
+  bound to it: the binding is exclusive and expires after 120s, and the
+  four-tier preference puts it above every unassigned candidate wherever in
+  the queue it sits. A new
   `jobs_ready_global` partial index (`queue_state = 'ready'`) carries that
   order, so the claim stays an index read instead of a sort of the whole
   ready queue (0.2 ms vs 28 ms at 20k ready jobs); `jobs_ready` is kept for

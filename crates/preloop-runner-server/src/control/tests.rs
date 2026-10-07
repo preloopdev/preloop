@@ -4459,6 +4459,79 @@ pub(crate) mod suite {
         assert_eq!(claimed.queued.job_id, JobId("target".to_owned()));
     }
 
+    /// A fresh binding to the polling runner outranks unassigned candidates
+    /// wherever it sits in the global queue: 64 claimable unassigned jobs
+    /// (older, all matching the runner) fill the first window and the
+    /// runner's own binding waits behind them. The paged scan reads one
+    /// window at a time and would take the window's unassigned job; the four-
+    /// tier preference — and the binding's 120s expiry — require the
+    /// runner's own job first. The fillers are submitted with pool
+    /// assignments off so they carry no binding and no pool-pending row (a
+    /// fresh pool-pending row blocks all claimers until it ages out);
+    /// `set_pool_assignments` flips the backend into the pool mode the last
+    /// submit's enqueue-time pairing runs in.
+    pub(crate) async fn claim_takes_a_binding_past_a_window_of_unassigned_jobs<F>(
+        backend: &dyn ControlBackend,
+        set_pool_assignments: F,
+    ) where
+        F: Fn(bool),
+    {
+        let mut registration = register_runner_with_labels("r1", &["self-hosted", "preloop-cpane"]);
+        registration.pool_proven = true;
+        let runner = backend.register_runner(registration).await.unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        // The fillers: plain claimable queue candidates, one full window.
+        set_pool_assignments(false);
+        let fillers_run = RunId::new();
+        let fillers = (0..64)
+            .map(|i| {
+                submit_job_on(
+                    fillers_run,
+                    &format!("filler-{i:03}"),
+                    1 + i,
+                    &["self-hosted"],
+                )
+            })
+            .collect::<Vec<_>>();
+        backend
+            .submit_run(submit_run(fillers_run, fillers))
+            .await
+            .unwrap();
+
+        // Pool assignments on: the enqueue-time pairing binds the next job
+        // to the idle, pool-proven runner — the 65th ready row.
+        set_pool_assignments(true);
+        let bound_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                bound_run,
+                vec![submit_job_on(bound_run, "bound", 100, &["preloop-cpane"])],
+            ))
+            .await
+            .unwrap();
+
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &["self-hosted", "preloop-cpane"],
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the runner's own binding must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(
+            claimed.queued.job_id,
+            JobId("bound".to_owned()),
+            "a fresh binding to the polling runner outranks the unassigned window"
+        );
+    }
+
     /// A settled attempt's deferred token-mint recipe must not outlive its
     /// job: the completion drops the `github_token_requests` row, so a later
     /// `acquire_context` no longer sees it.
@@ -7019,6 +7092,17 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn claim_takes_a_binding_past_a_window_of_unassigned_jobs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claim_takes_a_binding_past_a_window_of_unassigned_jobs(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn settle_drops_the_deferred_token_request() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -8445,6 +8529,15 @@ mod lite {
     async fn claim_pages_past_windows_of_other_label_sets() {
         suite::claim_pages_past_windows_of_other_label_sets(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn claim_takes_a_binding_past_a_window_of_unassigned_jobs() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::claim_takes_a_binding_past_a_window_of_unassigned_jobs(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
     }
 
     #[tokio::test]
