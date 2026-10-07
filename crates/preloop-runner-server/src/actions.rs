@@ -167,14 +167,16 @@ fn sha_entry_fresh(sha: &Option<String>, at: std::time::Instant) -> bool {
     at.elapsed() < ttl
 }
 
-/// Whether `url` targets the configured GitHub host — any of the
-/// `github_urls` endpoints — compared by host and effective port, and
-/// deliberately ignoring the scheme.
+/// Whether the static PAT may be attached to a request for `url`: the URL
+/// must target a configured GitHub host — any of the `github_urls`
+/// endpoints, compared by host and effective port — over a transport that
+/// keeps the PAT off the wire.
 ///
-/// The static PAT must follow the engine when it is redirected to a
-/// plain-http GitHub emulator (gh-simulate local mode, `http://127.0.0.1:…`),
-/// yet must never leak to an unrelated origin. A scheme check gets the first
-/// case wrong; an origin check gets both right.
+/// HTTPS always qualifies. Plain HTTP qualifies only for a loopback host:
+/// the PAT has to follow the engine onto a local GitHub emulator
+/// (gh-simulate local mode, `http://127.0.0.1:…`), but a configured
+/// *remote* `http://` origin would carry the PAT across the network in
+/// cleartext. An unrelated origin never qualifies, whatever the scheme.
 fn url_targets_configured_github(url: &str, urls: &GitHubUrls) -> bool {
     let Ok(target) = reqwest::Url::parse(url) else {
         return false;
@@ -182,13 +184,30 @@ fn url_targets_configured_github(url: &str, urls: &GitHubUrls) -> bool {
     let Some(target_host) = target.host_str() else {
         return false;
     };
-    [&urls.api_url, &urls.server_url, &urls.graphql_url]
-        .iter()
-        .filter_map(|configured| reqwest::Url::parse(configured).ok())
-        .any(|configured| {
-            configured.host_str() == Some(target_host)
-                && configured.port_or_known_default() == target.port_or_known_default()
-        })
+    let transport_ok = match target.scheme() {
+        "https" => true,
+        "http" => is_loopback_host(target_host),
+        _ => false,
+    };
+    transport_ok
+        && [&urls.api_url, &urls.server_url, &urls.graphql_url]
+            .iter()
+            .filter_map(|configured| reqwest::Url::parse(configured).ok())
+            .any(|configured| {
+                configured.host_str() == Some(target_host)
+                    && configured.port_or_known_default() == target.port_or_known_default()
+            })
+}
+
+/// `localhost`, or a literal IPv4/IPv6 loopback address (`127.0.0.0/8`,
+/// `::1`). `host_str` keeps IPv6 literals bracketed.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Resolve an action ref (branch, tag, or short SHA) to the commit SHA GitHub
@@ -790,9 +809,10 @@ mod tests {
     }
 
     /// The static PAT follows the engine onto a configured plain-http
-    /// GitHub emulator, but never to an unrelated host (or a lookalike).
+    /// GitHub emulator on loopback, but never to an unrelated host (or a
+    /// lookalike), and never over plain http to a remote host.
     #[test]
-    fn pat_targets_configured_github_regardless_of_scheme() {
+    fn pat_targets_configured_github_over_a_safe_transport() {
         let sim = GitHubUrls {
             server_url: "http://127.0.0.1:8888".to_string(),
             api_url: "http://127.0.0.1:8888".to_string(),
@@ -827,6 +847,49 @@ mod tests {
             &real
         ));
         assert!(!url_targets_configured_github("not a url", &real));
+
+        // A configured *remote* emulator over plain http would carry the PAT
+        // in cleartext: refused. The same origin over https qualifies.
+        let remote = GitHubUrls {
+            server_url: "http://ghsim.internal:8888".to_string(),
+            api_url: "http://ghsim.internal:8888".to_string(),
+            graphql_url: "http://ghsim.internal:8888".to_string(),
+        };
+        assert!(!url_targets_configured_github(
+            "http://ghsim.internal:8888/repos/o/r/tarball/main",
+            &remote
+        ));
+        let remote_tls = GitHubUrls {
+            server_url: "https://ghes.internal".to_string(),
+            api_url: "https://ghes.internal/api/v3".to_string(),
+            graphql_url: "https://ghes.internal/api/graphql".to_string(),
+        };
+        assert!(url_targets_configured_github(
+            "https://ghes.internal/api/v3/repos/o/r/commits/main",
+            &remote_tls
+        ));
+        // A plain-http request to a configured https host is a downgrade.
+        assert!(!url_targets_configured_github(
+            "http://api.github.com/repos/o/r/commits/main",
+            &real
+        ));
+
+        // Every loopback spelling qualifies over plain http.
+        for base in [
+            "http://localhost:8888",
+            "http://[::1]:8888",
+            "http://127.0.0.2:8888",
+        ] {
+            let local = GitHubUrls {
+                server_url: base.to_string(),
+                api_url: base.to_string(),
+                graphql_url: base.to_string(),
+            };
+            assert!(
+                url_targets_configured_github(&format!("{base}/repos/o/r/tarball/main"), &local),
+                "{base} is loopback"
+            );
+        }
     }
 
     /// `archive_sha256_hex` is the lowercase hex SHA-256 of the bytes —
