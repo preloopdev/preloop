@@ -636,6 +636,18 @@ Every item below broke a real workflow step and was fixed in preloop:
 
 ### 1c.6 Container jobs could not reach the engine (fixed)
 
+**Local mode only.** This applies to the deployment where the runner reaches
+the engine through the mounted control bridge (the orchestrator sets
+`PRELOOP_CONTROL_ORIGIN` with `PRELOOP_CONTROL_SOCKET` or
+`PRELOOP_CONTROL_UPSTREAM`, `crates/preloop-orchestrator/src/lib.rs:2611-2636`).
+In the hosted mode there is no control transport, so
+`container_engine_access` returns `None` at the origin lookup
+(`crates/preloop-runner/src/worker/container_ops.rs:956`) and nothing below
+happens: a hosted engine advertises a routable URL and containers reach it
+directly, exactly as they reach `api.github.com` on GitHub. Each guest VM
+runs exactly one job (the pool registers runners with `--ephemeral`,
+`lib.rs:6284`), so the container-facing bridge is per job in a per-job VM.
+
 Every `container:` job whose first step was an `actions/checkout` the server
 had redirected (snapshot or forge relay) died in that step with
 `connect ECONNREFUSED 127.0.0.1:<port>` after three retries — valkey's
@@ -666,13 +678,12 @@ every environment a container process
 receives — `docker exec` env for run steps and node actions, `docker run` env
 for `docker://` action containers, and the workflow-declared env of the job and
 service containers themselves — in the same layer where the official
-runner rewrites container paths (`TranslateToContainerPath`). A configured HTTP proxy also gets the
-container-facing address appended to the containers' `NO_PROXY`/`no_proxy`
-lists, since a bypass list naming the loopback origin no longer covers it
-(host- and workflow-supplied lists keep their entries and gain the
-container-facing authority; a container with no bypass list at all gets
-exactly that authority, so its engine requests never ride the workflow's
-proxy).
+runner rewrites container paths (`TranslateToContainerPath`). A `NO_PROXY`/
+`no_proxy` list the host environment declares also gains the container-facing
+address when it is injected into a container, since a bypass list naming the
+loopback origin no longer covers the rewritten address; a list the workflow
+declares gains it in place. A host with no bypass list keeps having none —
+the runner does not invent one.
 Host steps and the runner itself keep the loopback origin, and the official runner's Docker
 command shape is untouched (no `--add-host`, no custom subnets).
 

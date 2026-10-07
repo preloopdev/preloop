@@ -166,8 +166,9 @@ pub async fn spawn_from_env_lookup(
 ///
 /// Callers pass port 0 and advertise [`ControlBridge::address`], so a port the
 /// workflow itself holds never blocks the bridge. Returns an error when no
-/// control transport is configured (translation without a listener would only
-/// move a container's connection-refused to another address) or when the
+/// control transport is configured (the hosted deployment, where the engine
+/// URL is routable and no bridge exists; translation without a listener would
+/// only move a container's connection-refused to another address) or when the
 /// gateway address cannot be bound at all (the network is not up).
 pub async fn spawn_container_reachable(address: SocketAddr) -> Result<Option<ControlBridge>> {
     spawn_container_reachable_lookup(
