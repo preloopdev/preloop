@@ -138,8 +138,8 @@ Releases before v0.27.0 predate the changelog.
 
 - **Control-plane CI stops installing lld and PostgreSQL with apt**: the
   three `control` jobs now link against the runner image's own `ld.lld-18`
-  (the unversioned name `-fuse-ld=lld` resolves is all that was missing) and
-  run PostgreSQL from a container —
+  (only the unversioned `ld.lld` name expected by `-fuse-ld=lld` was missing)
+  and run PostgreSQL from a container —
   `mirror.gcr.io/library/postgres:<major>`, `--network host`, trust auth on
   loopback, `max_connections=400` for the two-node race tests. Both
   `apt-get update` passes and the pgdg repository are gone; the container is
