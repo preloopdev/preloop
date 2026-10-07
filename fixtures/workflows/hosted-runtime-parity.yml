@@ -56,8 +56,14 @@ jobs:
     container:
       image: ubuntu:24.04
     steps:
-      # Runs inside the job container (GitHub's runner semantics), which
-      # `ubuntu:24.04` supports: it ships git, and the runner supplies node.
+      # `ubuntu:24.04` ships no git. A hosted run's checkout still works
+      # because `actions/checkout` can fall back to the REST archive for the
+      # real repository, but a preloop run tests an immutable *local* snapshot
+      # that exists only behind the engine's git endpoint — the archive API
+      # cannot serve it — so the in-container checkout needs git on PATH.
+      - name: git for the in-container checkout
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
