@@ -8918,7 +8918,7 @@ done
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            all.contains("ulimit -Hn 65536; ulimit -Sn 65536"),
+            all.contains("ulimit -Sn 65536; ulimit -Hn 65536"),
             "the runner and every step it spawns must run on the hosted descriptor \
              limit (GitHub-hosted: Max open files 65536/65536), not the exec \
              channel's 1024/4096: {all}"
@@ -9026,7 +9026,7 @@ done
         // golden, so both start retries raise the chain too.
         assert_eq!(
             script
-                .matches("then raise_engine_chain; exit 0; fi;")
+                .matches("then raise_engine_chain || exit 1; exit 0; fi;")
                 .count(),
             2,
             "{script}"
