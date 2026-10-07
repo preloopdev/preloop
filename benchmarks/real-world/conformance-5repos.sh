@@ -175,7 +175,11 @@ prepare_golden_home() {
   local saved_key=""
   if [ -f "$CAMPAIGN_HOME/state/hmac-key.bin" ]; then
     saved_key="$(mktemp)"
-    cp -p "$CAMPAIGN_HOME/state/hmac-key.bin" "$saved_key"
+    # Never `cp -p` here: carrying a permissive source mode onto the restored
+    # key would hand the HMAC signing key to anyone who can read the campaign
+    # home. The saved copy is forced private, and `mv` keeps that mode.
+    cp "$CAMPAIGN_HOME/state/hmac-key.bin" "$saved_key"
+    chmod 600 "$saved_key"
   fi
   release_campaign_home
   if ! rm -rf "$CAMPAIGN_HOME"; then

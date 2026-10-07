@@ -45,7 +45,18 @@ Invariants worth keeping:
   yet, the watermark starts at the grace boundary. A new store (cutover,
   deleted state dir) has no rows for deliveries another store already
   handled, and repairing them would replay three days of closed PRs and
-  superseded pushes. Recover a known gap by redelivering it from GitHub.
+  superseded pushes. The boundary is drawn and persisted at the first poll
+  *attempt*, before the history call, so a history outage cannot move it
+  forward past deliveries that failed while polling was down. Recover a
+  known gap by redelivering it from GitHub.
+- **Open repairs are retried on every pass**, whatever the watermark says.
+  Judging is one-shot — the watermark advances past everything examined — so
+  a delivery judged missing below it (a redelivery request GitHub refused, a
+  redelivery that never landed, or a repair left by an older build's
+  unfinished first scan) would otherwise never be examined again. The repair
+  table stores the delivery id the redelivery endpoint needs; present
+  deliveries close their rows, the rest retry under the same per-GUID
+  backoff and cap as the scan, so no untracked history is replayed.
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.
