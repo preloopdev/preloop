@@ -2648,8 +2648,16 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     state
         .test_db_mutate(|tx| {
+            // A check-run mapping only exists on a run that reports checks
+            // (webhook or `--push`); stamp both so the projector delivers
+            // the completion, as it would for a real reporting run.
             tx.set_job_check_run(run_id, &JobId("build".into()), CHECK_RUN_ID as i64)
                 .unwrap();
+            tx.execute(
+                "UPDATE runs SET reports_check_runs = 1 WHERE run_id = ?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
         })
         .await;
 
@@ -2674,6 +2682,8 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
             .iter()
             .any(|(id, body)| *id == CHECK_RUN_ID && body["status"] == "completed")
         {
+            // The cancel queues the completion; the sender delivers it.
+            crate::github::drain_check_run_sender(&state.shared()).await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
@@ -2730,8 +2740,15 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
     let job_id = JobId("build".to_owned());
     state
         .test_db_mutate(|tx| {
+            // A check-run mapping only exists on a run that reports checks;
+            // stamp both so the projector delivers the completion.
             tx.set_job_check_run(run_id, &job_id, CHECK_RUN_ID as i64)
                 .unwrap();
+            tx.execute(
+                "UPDATE runs SET reports_check_runs = 1 WHERE run_id = ?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
         })
         .await;
     {
@@ -2768,6 +2785,8 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
             .last()
             .is_some_and(|body| body["status"] == "completed")
         {
+            // The cancel queues the completion; the sender delivers it.
+            crate::github::drain_check_run_sender(&state.shared()).await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
