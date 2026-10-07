@@ -54,6 +54,9 @@ struct RecordingVmProvider {
     /// When set, `start` records the machine as running and then blocks until
     /// notified, so a test can observe the pool mid-provision.
     start_gate: Option<Arc<Notify>>,
+    /// When set, `pack` fails: the artifact build leaves its builder behind,
+    /// which is what the pool's error path must clean up.
+    fail_pack: bool,
 }
 
 impl RecordingVmProvider {
@@ -70,6 +73,7 @@ impl RecordingVmProvider {
             run_actions: Mutex::new(run_actions),
             changed: Notify::new(),
             start_gate: None,
+            fail_pack: false,
         }
     }
 
@@ -77,6 +81,13 @@ impl RecordingVmProvider {
     /// while a machine is booting.
     fn with_start_gate(mut self, gate: Arc<Notify>) -> Self {
         self.start_gate = Some(gate);
+        self
+    }
+
+    /// Fail `pack`, standing in for a packaging error after the builder
+    /// booted.
+    fn with_failing_pack(mut self) -> Self {
+        self.fail_pack = true;
         self
     }
 
@@ -290,6 +301,15 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
+        {
+            let mut state = self.state.lock().await;
+            state.pack_calls += 1;
+            state.events.push(Event::Pack(name.as_str().to_owned()));
+        }
+        self.notify_changed();
+        if self.fail_pack {
+            return Err(provider_error("pack"));
+        }
         // Mirror the smolvm 1.7.2 pack contract: `<output>` is an ELF
         // launcher stub and `<output>.smolmachine` carries the packed VM
         // data. The orchestrator consumes the sidecar; the stub is discarded.
@@ -297,11 +317,6 @@ impl VmProvider for RecordingVmProvider {
         let sidecar = PathBuf::from(format!("{}.smolmachine", output.display()));
         fs::write(&stub, b"elf-launcher-stub").map_err(|_| provider_error("pack"))?;
         fs::write(&sidecar, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
-        let mut state = self.state.lock().await;
-        state.pack_calls += 1;
-        state.events.push(Event::Pack(name.as_str().to_owned()));
-        drop(state);
-        self.notify_changed();
         Ok(())
     }
 }
@@ -629,6 +644,46 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
             .filter(|event| matches!(event, Event::Create(name) if name.ends_with("-builder")))
             .count(),
         1
+    );
+}
+
+/// An artifact build that fails after the builder booted must not strand the
+/// builder: the pool's error path tears its machines down like every other
+/// exit. The CLI's exit guard only reaps hypervisor processes — not the
+/// layer mounts a killed hypervisor holds, and not AgentENV sandboxes.
+#[tokio::test]
+async fn artifact_build_failure_tears_the_builder_down() {
+    let fixture = Fixture::new("artifact-fail", false);
+    let provider = Arc::new(RecordingVmProvider::with_machines(&[], vec![]).with_failing_pack());
+    let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
+    let error = pool
+        .run(CancellationToken::new())
+        .await
+        .expect_err("a failed pack must fail the pool");
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("pack"),
+        "the pack failure must be reported: {error}"
+    );
+
+    let builder = format!("{}-builder", fixture.config.name_prefix);
+    let snapshot = provider.snapshot().await;
+    assert!(
+        snapshot.events.contains(&Event::Start(builder.clone())),
+        "the fixture must have booted the builder: {:?}",
+        snapshot.events
+    );
+    assert!(
+        !snapshot.machines.contains_key(&builder),
+        "the failed build's builder must be deleted: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &builder)),
+        "the teardown must delete the builder: {:?}",
+        snapshot.events
     );
 }
 

@@ -3615,17 +3615,37 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if self.provider.capabilities().file_packs
             && (self.config.use_packed_artifact || self.config.control_socket.is_none())
         {
-            let Some(artifact) = unless_shutdown(&shutdown, self.prepare_artifact(true)).await
-            else {
-                return self.teardown(&golden_registry).await;
-            };
-            artifact?;
+            match unless_shutdown(&shutdown, self.prepare_artifact(true)).await {
+                // A shutdown mid-build: the prepare may already have booted
+                // its builder, so the teardown must still run.
+                None => return self.teardown(&golden_registry).await,
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    // The builder is a machine this pool owns (booted before
+                    // most of the steps that can fail). The error exit must
+                    // not strand it: the CLI's exit guard reaps SmolVM
+                    // hypervisors, but not the layer mounts they hold or
+                    // AgentENV sandboxes.
+                    if let Err(teardown) = self.teardown(&golden_registry).await {
+                        warn!(%teardown, "pool teardown after the artifact build failed");
+                    }
+                    return Err(error);
+                }
+            }
         }
         self.sweep_stale_artifacts().await;
         let Some(sweep) = unless_shutdown(&shutdown, self.remove_stale_machines()).await else {
             return self.teardown(&golden_registry).await;
         };
-        sweep?;
+        if let Err(error) = sweep {
+            // A sweep that failed halfway may have left machines behind;
+            // give the teardown a chance to finish the cleanup before
+            // reporting the failure.
+            if let Err(teardown) = self.teardown(&golden_registry).await {
+                warn!(%teardown, "pool teardown after the startup sweep failed");
+            }
+            return Err(error);
+        }
 
         // Reconcile leaked VM state for the whole time the pool serves. The
         // startup pass above cannot see a delete that fails later, and an

@@ -154,14 +154,25 @@ VM is gone":
 
 Startup, shutdown, and process exit therefore run both halves of the same
 reap: SIGKILL the `_boot-vm` processes whose boot-config path is under this
-home (`preloop_vm::purge_orphaned_vms`), then detach the layer mounts no live
-hypervisor claims (`preloop_vm::detach_orphaned_layer_mounts`). A mount
+home's machine data root (`preloop_vm::purge_orphaned_vms`), then detach the
+layer mounts no live hypervisor claims
+(`preloop_vm::detach_orphaned_layer_mounts`). Ownership is decided by a
+parsed path, compared component-wise against the data root in both its
+configured and canonical spelling: a neighboring home whose path merely
+shares a prefix (`…/smolvm` vs `…/smolvm-vm-other`) is never matched. A mount
 belonging to a running machine is skipped, and `hdiutil` refuses a busy
 volume on its own, so the reap is safe to run while the engine serves — the
 pool does exactly that at the end of every teardown. If a home must be reset
 by hand after an engine was SIGKILLed, run those two steps before `rm -rf`
 (deleting the registry row first makes `machine stop` unable to reach the
 leaked VM).
+
+An AgentENV start that the pool cancels mid-flight does not strand its
+sandbox: the provider runs `aenv start` in a task that outlives the caller,
+records the server-assigned id as soon as the start completes (persisted, so
+even a later engine start can delete it), and deletes the sandbox outright
+when the machine was torn down while it ran. Only a sandbox whose id never
+came back — the engine process itself died mid-start — is left to its TTL.
 
 ## Disk sizing
 

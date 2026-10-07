@@ -34,9 +34,17 @@ Releases before v0.27.0 predate the changelog.
   so the survivor kept holding its disk and made the Preloop home impossible
   to remove (`rm -rf` → `Resource busy`) until the host rebooted. The pool now
   observes the shutdown token at every preparation and provisioning await,
-  tears down on every exit path (slot failures included), and startup and
-  shutdown reconciliation detach layer mounts whose hypervisor is gone; the
-  CLI reaps whatever a cut-short teardown left behind on every engine exit.
+  tears down on every exit path (slot failures included, and a failed
+  artifact build no longer leaves its builder booted), and startup and
+  shutdown reconciliation detach layer mounts whose hypervisor is gone. The
+  CLI now settles the pool — cancel, bounded wait, abort and join — before
+  its exit guard scans on *every* exit path (server return and error returns
+  included), so a slot cannot boot a VM after the scan. The reaper claims a
+  process only when its argv parses to a boot config under this home's
+  machine data root, compared component-wise, so a neighboring home whose
+  path merely shares a prefix (`…/smolvm` vs `…/smolvm-vm-other`) is never
+  touched; an AgentENV start cancelled mid-flight records or reaps its
+  server-assigned sandbox instead of leaving it to its TTL.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

@@ -1973,18 +1973,43 @@ async fn cmd_engine(
     // running: see `VmTeardownOnExit`.
     let _vm_teardown = VmTeardownOnExit;
 
-    if let Some(pool_task) = pool.as_mut() {
+    /// Why the engine is stopping; each result is handled *after* the pool
+    /// has settled, never by an early return past its teardown.
+    enum Stop {
+        Server(anyhow::Result<()>),
+        Pool(anyhow::Result<()>),
+        Signal,
+    }
+
+    let stop = if let Some(pool_task) = pool.as_mut() {
         tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            result = pool_task => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
+            result = &mut server => Stop::Server(
+                result
+                    .map_err(anyhow::Error::from)
+                    .and_then(std::convert::identity),
+            ),
+            result = pool_task => Stop::Pool(
+                result
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result.map_err(anyhow::Error::from)),
+            ),
+            _ = engine_shutdown_signal() => Stop::Signal,
         }
     } else {
         tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
+            result = &mut server => Stop::Server(
+                result
+                    .map_err(anyhow::Error::from)
+                    .and_then(std::convert::identity),
+            ),
+            _ = engine_shutdown_signal() => Stop::Signal,
         }
-    }
+    };
+    let result = match stop {
+        Stop::Server(result) | Stop::Pool(result) => Some(result),
+        Stop::Signal => None,
+    };
+
     shutdown.cancel();
     if let Some(pool_task) = pool.as_mut()
         && tokio::time::timeout(Duration::from_secs(30), &mut *pool_task)
@@ -1993,12 +2018,18 @@ async fn cmd_engine(
     {
         // The pool did not reach its own teardown inside the window (it can
         // be stuck in a provider call that does not take the token). The
-        // exit guard stops whatever it left behind.
+        // exit guard stops whatever it left behind — but only once the task
+        // is actually gone: its slots must not be able to boot a VM after
+        // the guard's scan, or that VM is stranded on the host.
         pool_task.abort();
+        let _ = pool_task.await;
     }
     server.abort();
     let _ = std::fs::remove_file(socket);
-    Ok(())
+    match result {
+        Some(result) => result,
+        None => Ok(()),
+    }
 }
 
 /// Stop every VM this engine owns as the process exits.
