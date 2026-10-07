@@ -146,6 +146,24 @@ file_size() {
   stat -f %z "$1" 2>/dev/null || stat -c %s "$1"
 }
 
+# A killed engine can leave its microVMs running and, on macOS, their image
+# layer volumes mounted inside the home; either makes the wipe fail with
+# "Resource busy". Engines that tear down on exit leave nothing to do here.
+release_campaign_home() {
+  local real pid mount_point
+  real="$(cd "$CAMPAIGN_HOME" 2>/dev/null && pwd -P || printf '%s' "$CAMPAIGN_HOME")"
+  for pid in $(ps -axo pid=,command= | grep -F '_boot-vm' \
+    | grep -F -e "$CAMPAIGN_HOME/" -e "$real/" | awk '{print $1}'); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  command -v hdiutil >/dev/null 2>&1 || return 0
+  mount | sed -n 's|^.* on \(.*\) (.*$|\1|p' \
+    | grep -F -e "$CAMPAIGN_HOME/" -e "$real/" \
+    | while IFS= read -r mount_point; do
+        hdiutil detach -force "$mount_point" >/dev/null 2>&1 || true
+      done
+}
+
 prepare_golden_home() {
   # Dedicated temp home: a crashed run leaves VM disks (tens of GiB) that
   # crowd out the next golden unpack. The golden artifact itself lives
@@ -157,6 +175,7 @@ prepare_golden_home() {
     saved_key="$(mktemp)"
     cp -p "$CAMPAIGN_HOME/state/hmac-key.bin" "$saved_key"
   fi
+  release_campaign_home
   rm -rf "$CAMPAIGN_HOME"
   if [ -n "$saved_key" ]; then
     mkdir -p "$CAMPAIGN_HOME/state"
