@@ -210,6 +210,19 @@ Releases before v0.27.0 predate the changelog.
   the runner itself, and the official runner's Docker command shape are
   unchanged.
 
+- **Container jobs without Git can check out**: `actions/checkout` on a
+  minimal image takes its no-git path, which resolves
+  `{github-server-url}/api/v3` and downloads
+  `GET /repos/{owner}/{repo}/tarball/{ref}`. The engine answered that with a
+  404, so every `container:` job whose first step was a redirected checkout
+  failed. The endpoint now serves the run's own snapshot as a `git archive`
+  shaped like the forge's tarball (one `{owner}-{repo}-{sha}/` top-level
+  directory) and relays other repositories to the forge anonymously, with the
+  guest control socket carrying these two read-only repository shapes. The
+  snapshot archive serves only the requesting run's own commit: a
+  repository-scoped cache holds every cached run's commits, and naming
+  another run's SHA must not archive its tree.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the

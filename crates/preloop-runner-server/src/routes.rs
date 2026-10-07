@@ -846,6 +846,14 @@ pub fn build_app(
             "/api/v3/repos/:owner/:repo",
             get(crate::snapshots::forge_api_repo),
         )
+        // The archive half of the same surface: `actions/checkout` without a
+        // `git` binary (minimal container images) downloads
+        // `/repos/{o}/{r}/tarball/{ref}` from its `{server}/api/v3` base, for
+        // the run's snapshot and for relayed forge repositories alike.
+        .route(
+            "/api/v3/repos/:owner/:repo/tarball/*git_ref",
+            get(crate::snapshots::forge_api_repo_tarball),
+        )
         .route(
             "/api/v1/runners",
             post(register_runner_native)
