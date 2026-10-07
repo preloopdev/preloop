@@ -1774,6 +1774,29 @@ const DOCKER_DATA_ROOT: &str = "/storage/docker";
 /// while hosted runners have no `/lib` prefix to catch on.
 const RUNNER_ROOT: &str = "/home/runner";
 
+/// The process stack limit GitHub's hosted images give every runner.
+///
+/// `actions/runner-images` doubles the kernel's 8192 KiB default for hosted
+/// runners — `images/ubuntu/scripts/build/configure-limits.sh` writes
+/// `DefaultLimitSTACK=16M:infinity` into `/etc/systemd/system.conf` and
+/// `* soft stack 16384` into `/etc/security/limits.conf`, under a comment
+/// reading "Double stack size from default 8192KB". A hosted runner's step
+/// inherits it from the `actions.runner.*` service, so that pair is what a
+/// workflow sees on `ubuntu-latest`.
+///
+/// The guest boots straight into the job workload — no systemd unit and no
+/// PAM session ever reads those files — so the runner chain would inherit the
+/// VM init's 8192 KiB, half of GitHub's. Deep recursion is where the gap
+/// shows: pydantic's `test_recursive_call` and `test_fallback_cycle_change`
+/// walk Python's recursion limit through pydantic-core's Rust frames and die
+/// with a stack-overflow `SIGSEGV` (exit 139) under 8192 KiB, where the same
+/// commit passes on GitHub under 16384 KiB.
+///
+/// Soft is the hosted value; hard stays `unlimited` as the image sets it, so a
+/// step that raises its own soft limit keeps working. Raising a hard limit
+/// needs root (CAP_SYS_RESOURCE), which both launch sites run as.
+const GUEST_STACK_ULIMIT: &str = "ulimit -Hs unlimited; ulimit -Ss 16384";
+
 /// Standard loopback entries for `/etc/hosts`.
 ///
 /// The base image ships an **empty** `/etc/hosts`, and `nsswitch.conf` is
@@ -2323,6 +2346,11 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// Never fatal. A pool without a working container engine still runs every job
 /// that does not use `container:` or `services:`.
 ///
+/// The daemon is started with the hosted stack limit ([`GUEST_STACK_ULIMIT`],
+/// the same raise the runner wrapper applies): a container's processes inherit
+/// the daemon's limits, so without it every container step would run on the
+/// VM init's half-sized stack while the same step on GitHub runs on 16 MiB.
+///
 /// Readiness is `docker info` rather than `pgrep dockerd`, because a forked VM
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
 /// the zombie, concludes Docker is up, and leaves the runner with no daemon.
@@ -2342,7 +2370,8 @@ fn docker_start_command() -> Vec<String> {
         "sh".to_owned(),
         "-c".to_owned(),
         run_as_root_or_sudo(&format!(
-            "command -v dockerd >/dev/null 2>&1 || exit 0; \
+            "{GUEST_STACK_ULIMIT}; \
+             command -v dockerd >/dev/null 2>&1 || exit 0; \
              docker info >/dev/null 2>&1 && exit 0; \
              rm -f /var/run/docker.pid; \
              mkdir -p {DOCKER_DATA_ROOT}; \
@@ -6513,9 +6542,12 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // (CAP_SYS_RESOURCE), hence the sudo in the exec-as-image-user branch;
     // setpriv then runs as root there too, so --init-groups is correct in
     // both branches (setgroups needs root — the --keep-groups variant was
-    // only a workaround for the self-drop).
+    // only a workaround for the self-drop). [`GUEST_STACK_ULIMIT`] mirrors the
+    // hosted stack limit in the same wrapper, because the guest applies
+    // neither the image's systemd nor its PAM limits; without it the runner
+    // and every step it spawns keep the VM init's half-sized stack.
     let inner = format!(
-        "ulimit -Hn 524288; ulimit -Sn 524288; \
+        "ulimit -Hn 524288; ulimit -Sn 524288; {GUEST_STACK_ULIMIT}; \
          exec setpriv --reuid {uid} --regid {uid} --init-groups env \
            PRELOOP_RUNNER_USER={user} PRELOOP_RUNNER_UID={uid} HOME={home} {program} {args}"
     );
@@ -7630,6 +7662,11 @@ chmod +x "$dest/bin/node"
             "{all}"
         );
         assert!(
+            all.contains("ulimit -Hs unlimited; ulimit -Ss 16384"),
+            "the runner and every step it spawns must run on the hosted stack \
+             size, not the VM init's half of it: {all}"
+        );
+        assert!(
             all.contains("setpriv --reuid 1001 --regid 1001 --init-groups"),
             "{all}"
         );
@@ -7641,6 +7678,33 @@ chmod +x "$dest/bin/node"
         assert!(
             all.contains("PRELOOP_RUNNER_USER=runner PRELOOP_RUNNER_UID=1001"),
             "{all}"
+        );
+    }
+
+    /// The container engine carries the hosted stack limit too: a container's
+    /// processes inherit the daemon's limits, so `container:` jobs would
+    /// otherwise run on the VM init's half-sized stack while the same step on
+    /// GitHub runs on 16 MiB.
+    #[test]
+    fn docker_start_command_raises_the_hosted_stack_limit() {
+        let command = docker_start_command();
+        assert_eq!(command[0], "sh");
+        assert_eq!(command[1], "-c");
+        let script = &command[2];
+        // `run_as_root_or_sudo` splices the launch inline for the root branch
+        // and base64'd for the image-user branch; both carry the same script,
+        // so the inline copy is the one to order-check.
+        let raise = script
+            .find("ulimit -Hs unlimited; ulimit -Ss 16384")
+            .unwrap_or_else(|| {
+                panic!("the container engine must start with the hosted stack limit: {script}")
+            });
+        let spawn = script
+            .find("dockerd >/var/log/dockerd.log")
+            .unwrap_or_else(|| panic!("the launch must still start dockerd: {script}"));
+        assert!(
+            raise < spawn,
+            "the stack raise must precede the daemon it applies to: {script}"
         );
     }
 

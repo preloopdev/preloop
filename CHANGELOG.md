@@ -23,6 +23,23 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Guest job workloads run on GitHub's stack size again**: the hosted
+  `ubuntu-24.04` image doubles the kernel's 8192 KiB process stack
+  (`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
+  writes `DefaultLimitSTACK=16M:infinity` into `/etc/systemd/system.conf` and
+  `* soft stack 16384` into `/etc/security/limits.conf`), and a hosted step
+  inherits it from the `actions.runner.*` service. The guest boots straight
+  into the job workload, so neither the image's systemd units nor a PAM
+  session ever applies those files: the runner chain kept the VM init's
+  8192 KiB, half of GitHub's. pydantic's deep-recursion serializer tests —
+  which walk Python's recursion limit through pydantic-core's Rust frames and
+  assert a `RecursionError` — died with a stack-overflow `SIGSEGV` (exit 139)
+  on that half-sized stack while the same commit passed on GitHub. The guest
+  runner wrapper now raises the limit to the hosted 16384 KiB soft /
+  `unlimited` hard before dropping to the runner account, and the container
+  engine starts with it too, because a container's processes inherit the
+  daemon's limits.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the
