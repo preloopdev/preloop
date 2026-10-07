@@ -12,29 +12,43 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# What the action spends: `contents` to push review fixes to the PR branch,
+# `pull-requests` and `issues` for reviews, comments and check runs. No
+# `id-token`: this run authenticates with `GH_TOKEN` below, and Pullfrog's
+# server only verifies OIDC tokens from GitHub's own issuer, so an id-token
+# minted by this engine is a credential nothing here can spend.
 permissions:
   contents: write
   pull-requests: write
   issues: write
-  id-token: write
 
 jobs:
   pullfrog:
     # `@pullfrog …` (or `/pullfrog …`) from someone with write access. The
     # repo is public, so an unrestricted comment trigger would hand the
     # agent's model credentials to any GitHub user.
+    #
+    # Fork PRs are skipped, the same guard runner-conformance.yml uses. A fork
+    # run gets a read-only `GITHUB_TOKEN` and no secrets (`docs/fidelity-gap.md`
+    # section 3c), so the action finds neither a writable token nor the model
+    # credentials it needs — it clones ~470 MB on the self-hosted pool and dies
+    # at the model check. A concurrency group cannot fence fork runs off
+    # either, because group keys are repository-wide, so the job never starts.
     if: >
        (github.event_name == 'workflow_dispatch' ||
         github.event_name == 'pull_request' ||
         (github.event_name == 'issue_comment' &&
          (contains(github.event.comment.body, '@pullfrog') || contains(github.event.comment.body, '/pullfrog')) &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) &&
+       (github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository) &&
        github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' &&
        github.actor != 'pullfrog[bot]'
     # One review per PR: a newer commit or request supersedes the running one.
     # Job-level, so the comments the `if:` above skips never enter the group,
     # and a group per PR, so one PR's push never cancels another PR's review.
-    # (The VM pool bounds how many run at once.)
+    # Only trusted runs reach this group — a same-repo branch, or a comment
+    # from a write-access author — and the VM pool bounds how many run at once.
     concurrency:
       group: pullfrog-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: true
