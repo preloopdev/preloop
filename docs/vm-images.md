@@ -482,6 +482,54 @@ parity targets to bake (or pin) so CI results on Preloop match GitHub:
 | `ubuntu` admin user | **uid 1000**                   | Workflows/actions that `chown` to 1000 or assume the admin account (a documented GitHub container-job gotcha) |
 
 
+### Kernel limits (applied per machine, not baked)
+
+The hosted `ubuntu-24.04` image writes three sysctls into `/etc/sysctl.conf`
+at build time (`actions/runner-images`
+`images/ubuntu/scripts/build/configure-environment.sh`, image version
+`20261004.327`; read back from `/proc/sys` by a probe job on a hosted runner,
+kernel `6.17.0-1022-azure`):
+
+| Sysctl | Hosted value | Why it matters |
+| ------ | ------------ | -------------- |
+| `vm.max_map_count` | **262144** | mmap-heavy workloads: Redis/Valkey's test suites, Elasticsearch-style tooling |
+| `fs.inotify.max_user_watches` | **655360** | file watchers in bundlers, test runners, `kind` |
+| `fs.inotify.max_user_instances` | **1280** | same; the kernel default (128) breaks tooling that opens many watchers |
+
+Preloop's guest boots straight into the job workload — no init runs
+`/etc/sysctl.d` or `/etc/sysctl.conf` — so an image-level sysctl file would
+never take effect and jobs saw raw kernel defaults (`vm.max_map_count` 65530,
+inotify watches 64372, instances 128, read back from a live job VM on the
+campaign golden, kernel 6.12.95 aarch64). The engine therefore applies these
+values per machine, in `guest_sysctl_script()` on the same post-boot exec path
+as the runner-ownership reconciliation: idempotent (a matching machine writes
+nothing and pays one exec round trip), escalating through the runner account's
+passwordless sudo when the exec lands on the image user, and failing
+provisioning if a write the kernel exposes does not take. No golden rebake is
+needed. Keys the guest kernel does not expose are skipped, exactly as the
+hosted image's `/etc/sysctl.conf` lines for unknown keys are inert there.
+
+**Values deliberately *not* matched.** `vm.overcommit_memory` stays at the
+kernel default `0`: the probe job reads `0` on GitHub-hosted runners too, so
+Valkey's `Memory overcommit must be enabled!` warning is fidelity, not a gap —
+both sides print it. `vm.mmap_rnd_bits` (also written by the hosted image
+script) is kernel hardening with no workflow-visible effect and is left alone;
+the probe cannot read it back on GitHub-hosted either, so the hosted
+`sysctl.conf` line is inert there too. Transparent hugepages are a kernel
+build property, not a runtime setting: the hosted kernel reports `[always]`,
+while the libkrunfw guest kernel (6.12.x) is built without
+`CONFIG_TRANSPARENT_HUGEPAGE` and exposes no
+`/sys/kernel/mm/transparent_hugepage` at all — nothing can change that at
+runtime, and no workflow behavior depends on it. The same applies to
+`net.mptcp.enabled`: GitHub-hosted has MPTCP enabled (1) and the guest kernel
+is built without `CONFIG_MPTCP`, which is why Valkey's `unit/mptcp` server
+cannot start here (a kernel-binary gap, not a sysctl one). `kernel.pid_max`
+(4194304 hosted, 32768 guest) and `net.core.rmem_max` (1048576 hosted, 212992
+guest) differ as kernel/systemd/cloud-image defaults with no workflow-visible
+effect and are left as they are. `ulimit -n` is a superset of the hosted
+contract (the runner starts with a 524288 hard/soft nofile limit where the
+hosted image grants 65536, which the Valkey suite raises past).
+
 ### Setup-action boundary
 
 GitHub maintains first-party setup actions for Node

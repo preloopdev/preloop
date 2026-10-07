@@ -2139,6 +2139,88 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Sysctls GitHub's hosted `ubuntu-24.04` image applies, with their values.
+///
+/// Provenance: `actions/runner-images` appends these to `/etc/sysctl.conf`
+/// when the image is built —
+/// `images/ubuntu/scripts/build/configure-environment.sh`
+/// (<https://github.com/actions/runner-images/blob/5f7588b285eccc2edbeb1cd79d65ee0b577e4b4a/images/ubuntu/scripts/build/configure-environment.sh#L48-L55>)
+/// — and a probe job on a hosted runner (image `20261004.327.1`, kernel
+/// `6.17.0-1022-azure`) reads them back from `/proc/sys` as the effective
+/// values. `vm.max_map_count` matters to any mmap-heavy workload (Redis and
+/// Valkey suites, Elasticsearch-style tooling); the inotify limits are what
+/// the image raises for file watchers (`kind` scale, bundlers, test runners).
+///
+/// Deliberately absent: `vm.mmap_rnd_bits` (kernel hardening the image also
+/// writes, with no workflow-visible effect) and `vm.overcommit_memory`, which
+/// the probe proves is `0` on GitHub-hosted runners too — the kernel default
+/// the guest already has. Valkey's overcommit warning is therefore fidelity,
+/// not a gap: it appears on both sides.
+pub const GITHUB_GUEST_SYSCTLS: &[(&str, &str)] = &[
+    ("vm.max_map_count", "262144"),
+    ("fs.inotify.max_user_watches", "655360"),
+    ("fs.inotify.max_user_instances", "1280"),
+];
+
+/// Bring a machine's sysctls in line with GitHub's hosted image.
+///
+/// The guest boots straight into the job workload — no init runs
+/// `/etc/sysctl.d` or `/etc/sysctl.conf` — so an image-level sysctl file would
+/// never take effect and every job saw raw kernel defaults (`vm.max_map_count`
+/// 65530, inotify watches and instances a fraction of the hosted values).
+/// Apply the hosted values per machine, from the same post-boot exec path as
+/// [`runner_ownership_reconcile_script`], so no golden rebake is needed.
+///
+/// Idempotent: the first loop only compares `/proc/sys` values and exits
+/// without writing when the machine already matches. A needed write escalates
+/// the way the ownership reconciliation does (directly when the exec landed on
+/// root, else through passwordless sudo, which the runner account has), then
+/// re-reads every key, so a write the kernel rejected fails provisioning
+/// instead of silently handing jobs a different environment than GitHub's.
+/// Keys the guest kernel does not expose are skipped rather than fatal:
+/// GitHub's `/etc/sysctl.conf` lines for unknown keys are equally inert.
+/// Writes use `sysctl` when the image ships procps, else `/proc/sys` directly.
+pub fn guest_sysctl_script() -> String {
+    let pairs = GITHUB_GUEST_SYSCTLS
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The privileged half, base64'd so quoting survives both exec branches.
+    let apply = format!(
+        "set -e; \
+         if command -v sysctl >/dev/null 2>&1; then sysctl -w {pairs}; \
+         else \
+           for pair in {pairs}; do \
+             printf '%s' \"${{pair#*=}}\" > \"/proc/sys/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           done; \
+         fi"
+    );
+    use base64::Engine as _;
+    let apply_b64 = base64::engine::general_purpose::STANDARD.encode(&apply);
+    format!(
+        "needs=0; \
+         for pair in {pairs}; do \
+           path=\"/proc/sys/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then needs=1; fi; \
+         done; \
+         if [ \"$needs\" -eq 0 ]; then echo 'guest sysctls already match the hosted image'; exit 0; fi; \
+         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh; \
+         else printf %s '{apply_b64}' | base64 -d | sudo -n sh; fi; \
+         failed=''; \
+         for pair in {pairs}; do \
+           path=\"/proc/sys/$(printf '%s' \"${{pair%%=*}}\" | tr '.' '/')\"; \
+           if [ -e \"$path\" ] && [ \"$(cat \"$path\")\" != \"${{pair#*=}}\" ]; then \
+             failed=\"$failed $pair(got:$(cat \"$path\"))\"; \
+           fi; \
+         done; \
+         if [ -n \"$failed\" ]; then \
+           echo \"guest sysctls did not reach the hosted values:$failed (wanted: {pairs})\" >&2; \
+           exit 1; \
+         fi"
+    )
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -6248,6 +6330,38 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
 
+    // Match GitHub's hosted sysctls on every machine whose sysctls are still
+    // at kernel defaults — same always-run path as the ownership
+    // reconciliation above, and for the same reason: the guest has no init
+    // applying `/etc/sysctl.*`, so what the hosted image bakes in must be
+    // applied per machine or jobs run against different limits than GitHub's
+    // (`vm.max_map_count`, inotify watchers). See [`GITHUB_GUEST_SYSCTLS`] for
+    // the provenance of each value; a machine that already matches pays one
+    // exec round trip and no writes.
+    {
+        let script = guest_sysctl_script();
+        let output = provider
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), script])
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OrchestratorError::Config(format!(
+                "guest sysctl reconciliation failed on {} (exit {}): {} — the machine \
+                 could not reach GitHub's hosted values for {}",
+                name.as_str(),
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown"),
+                GITHUB_GUEST_SYSCTLS
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
     for label in runner_environment_labels(&environment.base) {
@@ -7574,6 +7688,73 @@ chmod +x "$dest/bin/node"
             script.contains("stat -L -c %u"),
             "the probe must dereference an adopted symlink home: {script}"
         );
+    }
+
+    /// The guest has no init applying `/etc/sysctl.*`, so the values GitHub's
+    /// hosted image bakes into `/etc/sysctl.conf` must be written per machine
+    /// or every job runs against kernel defaults. Pin the hosted values and
+    /// the shape of the script: a comparison-only pre-check (an already-correct
+    /// machine writes nothing), escalation through passwordless sudo when the
+    /// exec lands on the image user, and a post-write re-read so a rejected
+    /// write fails provisioning instead of silently diverging.
+    #[test]
+    fn guest_sysctl_script_pins_hosted_values() {
+        let script = guest_sysctl_script();
+        for pair in [
+            "vm.max_map_count=262144",
+            "fs.inotify.max_user_watches=655360",
+            "fs.inotify.max_user_instances=1280",
+        ] {
+            assert!(
+                script.contains(pair),
+                "hosted value {pair} must be applied: {script}"
+            );
+        }
+        assert!(
+            script.contains("needs=0"),
+            "an already-correct machine must skip the writes: {script}"
+        );
+        assert!(
+            script.contains("exit 0"),
+            "the matching case must exit before escalating: {script}"
+        );
+        assert!(
+            script.contains("sudo -n sh"),
+            "the image-user case must escalate: {script}"
+        );
+        assert!(
+            !script.contains("|| true"),
+            "a rejected write must stay observable: {script}"
+        );
+        // The privileged half travels base64-encoded; decode every blob and
+        // assert the writes it carries.
+        let decoded = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .filter_map(|blob| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(blob)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            decoded.contains("sysctl -w vm.max_map_count=262144 fs.inotify.max_user_watches=655360 fs.inotify.max_user_instances=1280"),
+            "the privileged half must write every hosted value: {decoded}"
+        );
+        assert!(
+            decoded.contains("/proc/sys/"),
+            "images without procps need the direct /proc/sys fallback: {decoded}"
+        );
+        // GitHub-hosted runners run with vm.overcommit_memory=0 (probe of
+        // image 20261004.327.1): Valkey's overcommit warning is expected on
+        // both sides, and forcing it to 1 here would *diverge* from GitHub.
+        assert!(!script.contains("overcommit"), "{script}");
     }
 
     #[test]

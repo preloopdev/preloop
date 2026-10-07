@@ -23,6 +23,22 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Guest sysctls now match GitHub's hosted runner image**: the microVM guest
+  boots straight into the job workload, so nothing applied the sysctls the
+  hosted `ubuntu-24.04` image bakes into `/etc/sysctl.conf`, and jobs saw
+  kernel defaults — `vm.max_map_count` 65530 instead of 262144, inotify
+  watches 64372 instead of 655360, instances 128 instead of 1280 (read back
+  from a live job VM before and after the change). The engine now applies the
+  hosted values per machine on the same post-boot exec path as the
+  runner-ownership reconciliation: idempotent, escalating through the runner
+  account's passwordless sudo, and failing provisioning if a write the kernel
+  exposes does not take. No golden rebake is required; keys a guest kernel
+  does not expose are skipped, as the hosted image's own sysctl lines for
+  unknown keys are. `vm.overcommit_memory` is deliberately left at `0` —
+  a probe job on a real GitHub-hosted runner (image `20261004.327.1`, kernel
+  `6.17.0-1022-azure`) reads back `0` there too, so Valkey's overcommit
+  warning is parity, not a fidelity gap.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the

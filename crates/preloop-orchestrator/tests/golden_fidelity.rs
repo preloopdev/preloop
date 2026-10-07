@@ -10,8 +10,8 @@
 //! come to roughly 90 GB and are the job of setup actions and containers.
 
 use preloop_orchestrator::{
-    BASE_NODE_VERSION, base_install_script, base_packages, compiler_packages, docker_data_root,
-    docker_packages, loopback_hosts,
+    BASE_NODE_VERSION, GITHUB_GUEST_SYSCTLS, base_install_script, base_packages, compiler_packages,
+    docker_data_root, docker_packages, guest_sysctl_script, loopback_hosts,
 };
 
 /// Commands a workflow may reasonably assume exist, because `ubuntu-latest`
@@ -410,6 +410,44 @@ fn baseline_excludes_toolchains_that_belong_to_setup_actions() {
              passes locally and fails on GitHub"
         );
     }
+}
+
+#[test]
+fn guest_sysctls_match_the_hosted_image() {
+    // GitHub's hosted image writes these into /etc/sysctl.conf at build time
+    // (actions/runner-images images/ubuntu/scripts/build/configure-environment.sh)
+    // and a probe job on a hosted runner reads them back from /proc/sys.
+    // The golden's guest boots without an init applying /etc/sysctl.*, so the
+    // same values are applied per machine; if this list drifts, suites that
+    // depend on them (Redis/Valkey's vm.max_map_count, file watchers) diverge
+    // silently from ubuntu-latest.
+    let expected = [
+        ("vm.max_map_count", "262144"),
+        ("fs.inotify.max_user_watches", "655360"),
+        ("fs.inotify.max_user_instances", "1280"),
+    ];
+    assert_eq!(
+        GITHUB_GUEST_SYSCTLS,
+        expected.as_slice(),
+        "the hosted sysctl baseline changed — re-probe a real hosted runner \
+         before updating this list"
+    );
+    let script = guest_sysctl_script();
+    for (key, value) in expected {
+        assert!(
+            script.contains(&format!("{key}={value}")),
+            "the guest script must carry {key}={value}: {script}"
+        );
+    }
+    // vm.overcommit_memory is 0 on hosted runners too (probe of image
+    // 20261004.327.1, kernel 6.17.0-1022-azure), so Valkey's overcommit
+    // warning is expected on both sides; forcing it to 1 would diverge.
+    assert!(
+        !GITHUB_GUEST_SYSCTLS
+            .iter()
+            .any(|(key, _)| *key == "vm.overcommit_memory"),
+        "overcommit must stay at the value GitHub-hosted runners have: 0"
+    );
 }
 
 #[test]
