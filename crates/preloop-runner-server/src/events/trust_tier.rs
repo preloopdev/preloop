@@ -39,7 +39,10 @@ pub enum TrustTier {
     Deployment,
     /// Fired by the internal schedule executor.
     Schedule,
-    /// Fired by any other webhook event with unknown trust.
+    /// Fired by a webhook event with no trust rule of its own: the
+    /// fail-closed default. Every supported adapter classifies its events,
+    /// so this tier now only appears on runs persisted before their event
+    /// was classified (and on any future adapter that forgets to).
     Untrusted,
 }
 
@@ -69,8 +72,9 @@ impl TrustTier {
     }
 
     /// Returns true if the tier runs code that GitHub would run with its
-    /// restricted fork profile: a `pull_request` from a fork, or a fail-closed
-    /// unknown event.
+    /// restricted fork profile: a `pull_request` from a fork, or the
+    /// fail-closed `Untrusted` default (a webhook event whose adapter never
+    /// classified it).
     ///
     /// GitHub gives these jobs a read-only `GITHUB_TOKEN` *regardless* of the
     /// workflow's declared `permissions:` block ("Pull requests from public
