@@ -3864,10 +3864,9 @@ pub(crate) async fn rerun_run_inner(
         Err(error) => return Err(ApiError::from(error)),
     };
 
-    shared
-        .state
-        .queue_depth
-        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+    // Post-commit: refresh the node-local labels the runner supervisor
+    // reads. The ready-queue depth gauge itself is the sampler's; the wake
+    // beside the waiter notification below refreshes it early.
     if let Ok(mut next) = shared.state.next_job_runs_on.write() {
         *next = outcome.next_runs_on.clone();
     }
@@ -3894,8 +3893,10 @@ pub(crate) async fn rerun_run_inner(
     }
 
     // A rerun restarts the run's lifecycle; anything the reset dispatched
-    // (or parked) needs the same waiter wake a submit sends.
+    // (or parked) needs the same waiter wake a submit sends, plus the
+    // sampler wake that keeps the queue-depth gauge current.
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
     shared
         .state
         .emit(preloop_gha_protocol::NdjsonEvent::RunStatus {

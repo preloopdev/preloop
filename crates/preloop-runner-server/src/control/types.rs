@@ -435,9 +435,9 @@ pub(crate) struct RerunOutcome {
     pub(crate) selected: BTreeSet<JobId>,
     /// Whether the attempt was parked behind a workflow-level gate.
     pub(crate) held: bool,
-    /// Ready-queue depth after the transition.
-    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the next ready job, for `next_job_runs_on`.
+    /// (The ready-queue depth gauge is the sampler's; a rerun never counts
+    /// the queue itself.)
     pub(crate) next_runs_on: Vec<String>,
 }
 

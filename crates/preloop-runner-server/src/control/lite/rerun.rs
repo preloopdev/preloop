@@ -669,7 +669,6 @@ fn rerun_run_tx(
         rerun_jobs,
         selected: set.clone(),
         held,
-        queue_depth: jobs::ready_count(tx)?,
         next_runs_on: jobs::next_ready_labels(tx)?,
     })
 }
@@ -1123,7 +1122,6 @@ fn arrival_cancelled(
         rerun_jobs: Vec::new(),
         selected: set.clone(),
         held: false,
-        queue_depth: jobs::ready_count(tx)?,
         next_runs_on: jobs::next_ready_labels(tx)?,
     })
 }

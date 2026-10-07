@@ -365,7 +365,6 @@ impl PgBackend {
                         rerun_jobs: Vec::new(),
                         selected: set.clone(),
                         held: false,
-                        queue_depth: self.queue_depth().await?,
                         next_runs_on: self.ready_front_labels().await?,
                     });
                 }
@@ -780,7 +779,6 @@ impl PgBackend {
             rerun_jobs,
             selected: set.clone(),
             held,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
         })
     }
