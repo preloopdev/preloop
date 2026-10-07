@@ -1149,9 +1149,12 @@ async fn issue_comment_webhook_jobs_receive_stored_secrets() {
     tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
         .await
         .unwrap();
+    // The step references the secret by name, like the pullfrog workflow's
+    // step `env:` does; the spec carries referenced names (a `uses:` step
+    // marks the job dynamic and carries the whole scope).
     tokio::fs::write(
         ws_dir.join(".github/workflows/test.yml"),
-        "on: issue_comment\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "on: issue_comment\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        env:\n          COMMENT_TRIGGER_TOKEN: ${{ secrets.COMMENT_TRIGGER_TOKEN }}\n",
     )
     .await
     .unwrap();
@@ -1165,6 +1168,11 @@ async fn issue_comment_webhook_jobs_receive_stored_secrets() {
         secrets.global.insert(
             "COMMENT_TRIGGER_TOKEN".to_owned(),
             "comment-trigger-value".to_owned(),
+        );
+        // Never referenced by the workflow: the spec must not name it.
+        secrets.global.insert(
+            "UNREFERENCED_TOKEN".to_owned(),
+            "unreferenced-value".to_owned(),
         );
     }
     let app = app(state.clone(), CancellationToken::new());
@@ -1230,6 +1238,10 @@ async fn issue_comment_webhook_jobs_receive_stored_secrets() {
     assert!(
         spec.names.contains("COMMENT_TRIGGER_TOKEN"),
         "issue_comment jobs must resolve stored secrets (spec: {spec:?})"
+    );
+    assert!(
+        !spec.names.contains("UNREFERENCED_TOKEN"),
+        "only names the workflow references are attached (spec: {spec:?})"
     );
     assert_eq!(
         variable_value(&message, "system.github.token.permissions"),
