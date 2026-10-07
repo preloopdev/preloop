@@ -8641,7 +8641,7 @@ done
         // exercises the real scripts rather than the harness PATH.
         for tool in [
             "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp",
-            "tee", "rm", "uname",
+            "tee", "rm", "uname", "head",
         ] {
             symlink_tool(&bin, tool);
         }
