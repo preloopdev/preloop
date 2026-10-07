@@ -2326,10 +2326,12 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     let accepted = submit_push_run(&app, SHA, TREE).await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     let parsed_run_id: RunId = run_id.parse().unwrap();
-    // Check-run creation on submit is detached from the HTTP response, so
-    // wait for the background reporting task to populate the check run id.
+    // Submit only records the desired check-run state; the background sender
+    // creates the check. The harness spawns no sender, so drain it inline
+    // until the mapping appears.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
+            crate::github::drain_check_run_sender(&state.shared()).await;
             let ready = {
                 let tx = state.test_tx().await;
                 tx.runs
@@ -2673,6 +2675,7 @@ async fn push_intake_reports_no_check_run_for_expandable_placeholders() {
     // wait for the background reporting task to populate the mapping.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
+            crate::github::drain_check_run_sender(&state.shared()).await;
             let ready = {
                 let inner = state.test_tx().await;
                 inner
@@ -2759,6 +2762,11 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
             // endpoint matches the whole remaining path.
             "/repos/owner/repo/commits/*ref",
             get(|Path(r#ref): Path<String>| async move {
+                // The wildcard also catches the check-run sender's
+                // `commits/{sha}/check-runs` dedup lookup: nothing exists yet.
+                if r#ref.ends_with("/check-runs") {
+                    return Json(json!({"total_count": 0, "check_runs": []}));
+                }
                 assert_eq!(r#ref, "feat/x", "dirty sync must verify the branch head");
                 Json(json!({
                     "sha": MATERIALIZED,
@@ -2865,11 +2873,18 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
     .await;
     assert_eq!(status, StatusCode::OK, "dirty sync must succeed: {body}");
     assert_eq!(pr_creates.load(Ordering::SeqCst), 1, "PR created");
-    let check = check_creates
-        .lock()
-        .first()
-        .cloned()
-        .expect("queued check run");
+    // The sync records desired check-run state; the background projector
+    // queues it and the sender creates the check. The harness spawns no
+    // sender, so drain it until the POST lands.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while check_creates.lock().is_empty() {
+            crate::github::drain_check_run_sender(&state.shared()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued check run");
+    let check = check_creates.lock().first().cloned().unwrap();
     assert_eq!(
         check["head_sha"], MATERIALIZED,
         "checks attach to the materialized head commit, not the base"
