@@ -668,7 +668,11 @@ for `docker://` action containers, and the workflow-declared env of the job and
 service containers themselves — in the same layer where the official
 runner rewrites container paths (`TranslateToContainerPath`). A configured HTTP proxy also gets the
 container-facing address appended to the containers' `NO_PROXY`/`no_proxy`
-lists, since a bypass list naming the loopback origin no longer covers it.
+lists, since a bypass list naming the loopback origin no longer covers it
+(host- and workflow-supplied lists keep their entries and gain the
+container-facing authority; a container with no bypass list at all gets
+exactly that authority, so its engine requests never ride the workflow's
+proxy).
 Host steps and the runner itself keep the loopback origin, and the official runner's Docker
 command shape is untouched (no `--add-host`, no custom subnets).
 

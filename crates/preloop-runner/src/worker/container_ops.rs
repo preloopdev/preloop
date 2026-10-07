@@ -1332,10 +1332,32 @@ fn push_docker_inherited_env(args: &mut Vec<String>, key: &str) {
 /// - `NO_PROXY`/`no_proxy` from `$NO_PROXY` or `$no_proxy`
 ///
 /// Uses TryAdd semantics: only injects if not already set by the container's own env.
+///
+/// Divergence from the official shape, required by the engine rewrite: when a
+/// proxy is injected and *nothing* in the container bypasses it, the
+/// container-facing engine authority is added to both bypass spellings.
+/// Without it a proxied job container sends its rewritten engine URLs
+/// (cache, artifacts, a redirected checkout) to a proxy that cannot reach the
+/// job's Docker network. A host or workflow-supplied list is never replaced:
+/// the official runner itself treats the engine's local origin as bypassed
+/// (`RunnerWebProxy.IsBypassed` short-circuits `uri.IsLoopback`), and preloop's
+/// container-facing origin is no longer loopback.
 fn inject_proxy_env(
     args: &mut Vec<String>,
     user_env: &HashMap<String, String>,
     engine: Option<&ContainerEngineAccess>,
+) {
+    inject_proxy_env_lookup(args, user_env, engine, |name| std::env::var(name).ok());
+}
+
+/// [`inject_proxy_env`] with the host environment behind a `lookup` closure,
+/// so tests can supply proxy settings without writing the process environment
+/// (`set_var` is unsafe under edition 2024 and this crate forbids `unsafe`).
+fn inject_proxy_env_lookup(
+    args: &mut Vec<String>,
+    user_env: &HashMap<String, String>,
+    engine: Option<&ContainerEngineAccess>,
+    lookup: impl Fn(&str) -> Option<String>,
 ) {
     let proxy_vars = [
         ("HTTP_PROXY", "http_proxy"),
@@ -1344,15 +1366,20 @@ fn inject_proxy_env(
     ];
 
     let mut proxy_injected = false;
+    // The host's bypass list, when one exists, is injected below already
+    // extended; the gateway-only fallback must not append a second `NO_PROXY`
+    // that Docker would apply last, dropping the host's entries.
+    let mut bypass_injected = false;
     for (upper, lower) in &proxy_vars {
         // Read from host environment (check both cases)
-        let value = std::env::var(upper)
-            .or_else(|_| std::env::var(lower))
-            .unwrap_or_default();
+        let value = lookup(upper).or_else(|| lookup(lower)).unwrap_or_default();
         if value.is_empty() {
             continue;
         }
         proxy_injected = true;
+        if *upper == "NO_PROXY" {
+            bypass_injected = true;
+        }
         // The container-facing engine origin must bypass the proxy: a bypass
         // list inherited for the advertised loopback origin does not cover
         // the gateway the container actually reaches the engine at.
@@ -1373,12 +1400,20 @@ fn inject_proxy_env(
         }
     }
     // A proxy without a bypass list at all would route the engine through it.
-    // A user-supplied list was already extended by `append_container_env`.
-    if proxy_injected && let Some(engine) = engine {
+    // The host's list (just injected, extended) or the container's own list
+    // (extended by `append_container_env`/`translate_engine_origin` when the
+    // environment was translated) is the bypass configuration whenever either
+    // exists.
+    let user_bypass = ["NO_PROXY", "no_proxy"]
+        .iter()
+        .any(|key| user_env.contains_key(*key));
+    if proxy_injected
+        && !bypass_injected
+        && !user_bypass
+        && let Some(engine) = engine
+    {
         for bypass in ["NO_PROXY", "no_proxy"] {
-            if !user_env.contains_key(bypass) {
-                push_docker_create_env(args, bypass, engine.no_proxy_authority());
-            }
+            push_docker_create_env(args, bypass, engine.no_proxy_authority());
         }
     }
 }
@@ -1900,6 +1935,95 @@ mod tests {
     fn strip_scheme_yields_proxy_bypass_list_authorities() {
         assert_eq!(strip_scheme("http://172.18.0.1:9198"), "172.18.0.1:9198");
         assert_eq!(strip_scheme("https://[fd00::1]:9198/"), "[fd00::1]:9198");
+    }
+
+    /// Values of `-e KEY=VALUE` arguments for one key, in argv order.
+    fn env_arg_values<'a>(args: &'a [String], key: &str) -> Vec<&'a str> {
+        let prefix = format!("{key}=");
+        args.iter()
+            .filter_map(|arg| arg.strip_prefix(prefix.as_str()))
+            .collect()
+    }
+
+    /// Proxy injection must not clobber a bypass list. The host's list is
+    /// injected already carrying the container-facing authority, and the
+    /// gateway-only fallback must not append a second `NO_PROXY` — Docker
+    /// applies the last `-e` value, so the host's entries were dropped from
+    /// every proxied container (e.g. an internal registry stopped bypassing).
+    #[test]
+    fn inject_proxy_env_extends_the_host_bypass_list_once() {
+        let access =
+            ContainerEngineAccess::for_tests("http://127.0.0.1:9198", "http://172.18.0.1:9198");
+        let host = HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://proxy.example:3128".to_string(),
+            ),
+            ("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string()),
+        ]);
+        let mut args = Vec::new();
+        inject_proxy_env_lookup(&mut args, &HashMap::new(), Some(&access), |name| {
+            host.get(name).cloned()
+        });
+
+        assert_eq!(
+            env_arg_values(&args, "NO_PROXY"),
+            ["localhost,127.0.0.1,172.18.0.1:9198"]
+        );
+        assert_eq!(
+            env_arg_values(&args, "no_proxy"),
+            ["localhost,127.0.0.1,172.18.0.1:9198"]
+        );
+        assert_eq!(
+            env_arg_values(&args, "HTTP_PROXY"),
+            ["http://proxy.example:3128"]
+        );
+        assert_eq!(env_arg_values(&args, "http_proxy").len(), 1);
+    }
+
+    /// A proxy with no bypass list anywhere would route the rewritten engine
+    /// origin through it; the fallback adds exactly the container-facing
+    /// authority (the one address that must bypass the workflow's proxy).
+    #[test]
+    fn inject_proxy_env_adds_the_engine_bypass_when_nothing_bypasses() {
+        let access =
+            ContainerEngineAccess::for_tests("http://127.0.0.1:9198", "http://172.18.0.1:9198");
+        let host = HashMap::from([(
+            "HTTPS_PROXY".to_string(),
+            "http://proxy.example:3128".to_string(),
+        )]);
+        let mut args = Vec::new();
+        inject_proxy_env_lookup(&mut args, &HashMap::new(), Some(&access), |name| {
+            host.get(name).cloned()
+        });
+
+        assert_eq!(env_arg_values(&args, "NO_PROXY"), ["172.18.0.1:9198"]);
+        assert_eq!(env_arg_values(&args, "no_proxy"), ["172.18.0.1:9198"]);
+    }
+
+    /// A bypass list the container declares itself (extended in place by the
+    /// caller's translation) is the container's configuration; injecting a
+    /// second, narrower list would be the one Docker applies.
+    #[test]
+    fn inject_proxy_env_leaves_a_container_bypass_list_alone() {
+        let access =
+            ContainerEngineAccess::for_tests("http://127.0.0.1:9198", "http://172.18.0.1:9198");
+        let host = HashMap::from([(
+            "HTTP_PROXY".to_string(),
+            "http://proxy.example:3128".to_string(),
+        )]);
+        let user = HashMap::from([("NO_PROXY".to_string(), "corp.example".to_string())]);
+        let mut args = Vec::new();
+        inject_proxy_env_lookup(&mut args, &user, Some(&access), |name| {
+            host.get(name).cloned()
+        });
+
+        assert!(env_arg_values(&args, "NO_PROXY").is_empty());
+        assert!(env_arg_values(&args, "no_proxy").is_empty());
+        assert_eq!(
+            env_arg_values(&args, "HTTP_PROXY"),
+            ["http://proxy.example:3128"]
+        );
     }
 
     #[test]

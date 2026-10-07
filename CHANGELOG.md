@@ -34,9 +34,10 @@ Releases before v0.27.0 predate the changelog.
   in every environment a container process receives — `docker exec` for run
   steps and node actions, `docker run` for `docker://` actions, and the
   workflow-declared env of the job and service containers themselves — the
-  same layer where the official runner rewrites container paths — and appends
-  the container-facing address to the containers' proxy bypass list when one
-  is configured. Host steps,
+  same layer where the official runner rewrites container paths — and adds
+  the container-facing address to the containers' proxy bypass list
+  (preserving host- and workflow-supplied entries, and adding that authority
+  alone when no list exists). Host steps,
   the runner itself, and the official runner's Docker command shape are
   unchanged.
 
