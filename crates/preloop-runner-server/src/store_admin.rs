@@ -20,6 +20,7 @@
 use crate::control::migrate_runner;
 use crate::control::migrations::{self, Ledger, MIGRATIONS};
 use crate::store::{STORE_URL_ENV, StoreUrl, parse_store_url};
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Where the control store lives (the same grammar as `preloop serve
@@ -187,6 +188,16 @@ pub async fn status(target: StoreTarget) -> anyhow::Result<StoreStatus> {
 /// initialized here (the operator runs `store migrate`). Synchronous on
 /// purpose: the installer calls it outside any runtime, and the work is one
 /// file check plus (only on a fresh install) the embedded migrations.
+///
+/// The database path is never followed: a symlink there would aim the
+/// create, the migration and the chmod at its target, so one is refused when
+/// the preparation would write through it (a link to an existing store is
+/// simply nothing to prepare). A privileged caller (euid 0) additionally
+/// requires the parent directory to be exclusively its own: a root-owned
+/// create inside a directory the service account can rewrite is the same
+/// attack one level up. `preloop server install` no longer takes that path —
+/// it runs the preparation as the service account itself, so root never
+/// creates, writes or chmods anything inside the service-owned tree.
 pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
     let raw = std::env::var(STORE_URL_ENV).unwrap_or_default();
     let StoreUrl::Sqlite(path) = parse_store_url(&raw)? else {
@@ -197,18 +208,37 @@ pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
     } else {
         path
     };
-    if path.exists() && std::fs::metadata(&path)?.len() > 0 {
-        return Ok(false);
+    // Brand-new means absent or empty, judged with `symlink_metadata` (never
+    // `exists`/`metadata`, which follow links — the very move this refuses):
+    // a dangling link reads as absent, and an empty root-owned target reads
+    // as empty, either of which would hand the create below to the link.
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if std::fs::metadata(&path).is_ok_and(|target| target.is_file() && target.len() > 0) {
+                // An existing store through a link: nothing to prepare.
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "refusing to initialize {}: it is a symlink; remove it, or point \
+                 {STORE_URL_ENV} at the real path",
+                path.display()
+            );
+        }
+        Ok(meta) if !meta.is_file() => anyhow::bail!(
+            "refusing to initialize {}: it is not a regular file",
+            path.display()
+        ),
+        Ok(meta) if meta.len() > 0 => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        prepare_parent_directory(parent)?;
     }
-    let mut conn = rusqlite::Connection::open(&path)?;
-    private_file(&path)?;
-    conn.pragma_update(None, "foreign_keys", true)?;
-    conn.pragma_update(None, "busy_timeout", 5000_i64)?;
+    let mut conn = open_sqlite(&path)?;
     if !matches!(migrations::sqlite_ledger(&conn)?, Ledger::Empty) {
         return Ok(false);
     }
@@ -229,6 +259,65 @@ pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
 
 // ── SQLite ──────────────────────────────────────────────────────────────
 
+/// Create the database's parent directory (if needed). A privileged caller
+/// (euid 0) is held to an exclusive tree: the create, the write and the
+/// chmod below must not land anywhere another account can steer them with a
+/// symlink or a directory it can rewrite.
+// SAFETY: `geteuid` takes no arguments and only reads the process's
+// effective uid; there is no other way to ask "am I privileged?" and the
+// answer only selects a stricter check.
+#[allow(unsafe_code)]
+fn prepare_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        return guarded_create_directory(parent);
+    }
+    std::fs::create_dir_all(parent)?;
+    Ok(())
+}
+
+/// [`prepare_parent_directory`] for a privileged caller: refuse an existing
+/// directory that is not exclusively this account's own, create it, then
+/// check what exists now (`create_dir_all` follows a symlink).
+// SAFETY: `geteuid` as in [`prepare_parent_directory`].
+#[allow(unsafe_code)]
+#[cfg(unix)]
+fn guarded_create_directory(parent: &Path) -> anyhow::Result<()> {
+    // `uid_t` is `u32` on every unix target this crate builds for.
+    let uid = unsafe { libc::geteuid() };
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => exclusive_directory(parent, uid)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", parent.display()));
+        }
+    }
+    std::fs::create_dir_all(parent)?;
+    exclusive_directory(parent, uid)
+}
+
+/// A directory a privileged preparation writes into must be a real directory
+/// owned by the preparing uid and writable by no one else: anything else can
+/// place a symlink between the check and the write, which is how a
+/// service-owned state tree aims a root-owned create at a target of its
+/// choosing.
+#[cfg(unix)]
+fn exclusive_directory(dir: &Path, uid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("inspect {}", dir.display()))?;
+    anyhow::ensure!(
+        meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0,
+        "refusing to initialize the control database in {} (owner uid {}, mode {:o}): \
+         the directory is not exclusively this process's own; run the preparation as \
+         the account that owns the store",
+        dir.display(),
+        meta.uid(),
+        meta.mode() & 0o7777,
+    );
+    Ok(())
+}
+
 /// Owner-only, matching every other state artifact the engine writes.
 fn private_file(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -246,6 +335,9 @@ fn open_sqlite(path: &Path) -> anyhow::Result<rusqlite::Connection> {
     {
         std::fs::create_dir_all(parent)?;
     }
+    // SQLite's own open never follows a symlink at the database itself (its
+    // unix VFS passes O_NOFOLLOW); `prepare_brand_new_local` refuses one
+    // earlier so the error names the path instead of SQLite's.
     let conn = rusqlite::Connection::open(path)?;
     private_file(path)?;
     conn.pragma_update(None, "foreign_keys", true)?;
@@ -540,4 +632,40 @@ async fn status_postgres(url: &str) -> anyhow::Result<StoreStatus> {
         pending,
         unknown,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// A privileged preparation writes only into a directory exclusively its
+    /// own: the owner must be the preparing uid and neither group nor others
+    /// may write. A directory owned by another account — the service-owned
+    /// state tree of a previous install — is the case the guard exists for.
+    #[test]
+    fn a_privileged_preparation_needs_an_exclusive_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = std::fs::metadata(dir.path()).unwrap().uid();
+        exclusive_directory(dir.path(), uid).unwrap();
+
+        let error = exclusive_directory(dir.path(), uid.wrapping_add(1)).unwrap_err();
+        assert!(error.to_string().contains("exclusively"), "{error}");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = exclusive_directory(dir.path(), uid).unwrap_err();
+        assert!(error.to_string().contains("exclusively"), "{error}");
+    }
+
+    /// A symlink is never an exclusive directory: it resolves somewhere the
+    /// preparer did not verify.
+    #[test]
+    fn a_symlinked_directory_is_never_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = std::fs::metadata(dir.path()).unwrap().uid();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let error = exclusive_directory(&link, uid).unwrap_err();
+        assert!(error.to_string().contains("exclusively"), "{error}");
+    }
 }

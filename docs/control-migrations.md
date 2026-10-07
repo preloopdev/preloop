@@ -74,8 +74,10 @@ structurally identical to a fresh run.
   `preloop store import-legacy --source <old> --target <new>`.
 - Brand-new local installs stay zero-config: `preloop run`, `preloop init`
   (foreground) and `preloop server install` initialize an absent SQLite store
-  through the same embedded migrations. An existing store is never touched by
-  those paths — upgrading is always the explicit `store migrate`.
+  through the same embedded migrations (a system install runs that step as
+  the service account, after the state tree is handed over to it). An
+  existing store is never touched by those paths — upgrading is always the
+  explicit `store migrate`.
 
 ## CI
 

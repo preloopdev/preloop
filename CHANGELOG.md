@@ -99,6 +99,16 @@ Releases before v0.27.0 predate the changelog.
 
 ### Security
 
+- **A system install initializes the control database as the `preloop`
+  service account, never as root**: the store lives in the state tree the
+  install chowns to the service, so a root-owned create, write or chmod
+  there could be aimed anywhere the account can place a symlink — a dangling
+  `state/preloop.db` link had root create and chmod a file of the attacker's
+  choosing. The installer now prepares the store after the ownership
+  transfer, dropped to the service account, and the brand-new preparation
+  refuses a symlinked database path (and, for a privileged caller, a parent
+  directory that is not exclusively its own) instead of following it.
+
 - **The static GitHub PAT no longer crosses the network over plain HTTP**:
   action resolution and action tarball downloads attached the PAT to any
   request for a configured GitHub origin regardless of scheme, so a
