@@ -74,7 +74,12 @@ Releases before v0.27.0 predate the changelog.
   runner-ownership reconciliation: idempotent (a machine whose name already
   resolves to one of its own addresses writes nothing), escalating through the
   runner account's passwordless sudo, and failing provisioning if the name
-  still does not resolve. Resolving is not enough on its own: an AgentENV guest
+  still does not resolve. The name is treated as untrusted input: it is
+  validated as a hostname (`[A-Za-z0-9._-]`) and matched as a string, so it is
+  never interpolated into a shell or `sed` program, and every answer the
+  resolver returns — not just one of them — must be an address of this machine.
+  A launch that keeps the exec channel's identity says on stderr when it could
+  not raise the descriptor hard limit instead of skipping it silently. Resolving is not enough on its own: an AgentENV guest
   booted with a hosts file mapping its name to an address it did **not** own
   (`10.1.0.59 runnervm…` while its interfaces carried `169.254.0.21`), and a
   check that only asks whether the name resolves passed there while every

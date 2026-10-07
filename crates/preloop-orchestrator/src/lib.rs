@@ -2349,10 +2349,21 @@ fn guest_hostname_script_at(hosts: &str) -> String {
         "command -v getent >/dev/null 2>&1 || exit 0; \
          host=$(hostname 2>/dev/null || uname -n); \
          [ -n \"$host\" ] || exit 0; \
+         # The name reaches /etc/hosts and the matching below, so treat it as \
+         # untrusted input: a hostname carrying shell or regex syntax must \
+         # fail provisioning rather than be interpolated into a program. \
+         case \"$host\" in \
+           ''|*[!A-Za-z0-9._-]*) echo \"guest hostname is not a valid hostname\" >&2; exit 1 ;; \
+         esac; \
          local_addrs() {{ \
            {{ printf '127.0.0.1\\n::1\\n'; hostname -I 2>/dev/null | tr ' ' '\\n'; \
               ip -o addr show 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1; }} \
              | sed '/^$/d' | sort -u; \
+         }}; \
+         is_local() {{ \
+           case \"$1\" in 127.*|::1) return 0 ;; esac; \
+           for local in $(local_addrs); do [ \"$1\" = \"$local\" ] && return 0; done; \
+           return 1; \
          }}; \
          name_addrs() {{ \
            addrs=$(getent ahosts \"$host\" 2>/dev/null | awk '{{print $1}}'); \
@@ -2362,16 +2373,29 @@ fn guest_hostname_script_at(hosts: &str) -> String {
          name_resolves_locally() {{ \
            resolved=$(name_addrs); \
            [ -n \"$resolved\" ] || return 1; \
-           for addr in $resolved; do \
-             for local in $(local_addrs); do \
-               [ \"$addr\" = \"$local\" ] && return 0; \
-             done; \
-           done; \
-           return 1; \
+           # Every answer must be local. A resolver hands out the first \
+           # answer, and a foreign answer left anywhere in the list still \
+           # lets a consumer pick it. \
+           for addr in $resolved; do is_local \"$addr\" || return 1; done; \
+           return 0; \
          }}; \
          name_resolves_locally && exit 0; \
          tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts.$$; \
-         sed -E -n \"/^[[:space:]]*#/{{\np\nb\n}}\ns/(^|[[:space:]])$host([[:space:]]|\\$)/\\1/g\ns/[[:space:]]+$//\n/^[[:space:]]*[0-9A-Fa-f:.]+[[:space:]]*$/!p\" {hosts} > \"$tmp\" 2>/dev/null || : > \"$tmp\"; \
+         # Drop every occurrence of the machine's own name from every \
+         # mapping, and drop a line left with no name at all. awk compares \
+         # fields as strings, so no hostname byte is ever part of a program. \
+         awk -v host=\"$host\" ' \
+           /^[[:space:]]*#/ {{ print; next }} \
+           {{ \
+             n = split($0, field, /[[:space:]]+/); \
+             out = \"\"; names = 0; \
+             for (i = 1; i <= n; i++) {{ \
+               if (i > 1 && field[i] == host) continue; \
+               if (i > 1) names++; \
+               out = (out == \"\" ? field[i] : out \" \" field[i]); \
+             }} \
+             if (names > 0) print out; \
+           }}' {hosts} > \"$tmp\" 2>/dev/null || : > \"$tmp\"; \
          printf '127.0.0.1 %s\\n' \"$host\" >> \"$tmp\"; \
          if [ \"$(id -u)\" -eq 0 ]; then cat \"$tmp\" > {hosts}; \
          else cat \"$tmp\" | sudo -n tee {hosts} >/dev/null; fi; \
@@ -2656,6 +2680,7 @@ fn docker_start_command() -> Vec<String> {
              # its own. Raising a hard limit needs root, which both launch
              # branches run as.
              raise_engine_chain() {{ \
+               raised=0; failed=0; \
                for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
                  stack=; nofile=; \
                  while read -r word1 word2 word3 value _rest; do \
@@ -2665,15 +2690,25 @@ fn docker_start_command() -> Vec<String> {
                  case \"$stack\" in ''|*[!0-9]*) stack= ;; esac; \
                  case \"$nofile\" in ''|*[!0-9]*) nofile= ;; esac; \
                  if [ -n \"$stack\" ] && [ \"$stack\" -lt {GOLDEN_STACK_SOFT_BYTES} ]; then \
-                   prlimit --pid \"$pid\" --stack={GOLDEN_STACK_PRLIMIT} 2>/dev/null; \
+                   raised=1; \
+                   prlimit --pid \"$pid\" --stack={GOLDEN_STACK_PRLIMIT} 2>/dev/null || failed=1; \
                  fi; \
                  if [ -n \"$nofile\" ] && [ \"$nofile\" -lt {GOLDEN_RLIMIT_NOFILE_SOFT} ]; then \
-                   prlimit --pid \"$pid\" --nofile={GOLDEN_NOFILE_PRLIMIT} 2>/dev/null; \
+                   raised=1; \
+                   prlimit --pid \"$pid\" --nofile={GOLDEN_NOFILE_PRLIMIT} 2>/dev/null || failed=1; \
                  fi; \
                done; \
+               # A chain still below the hosted limits that could not be \
+               # raised would hand containers the wrong pair, so the launch \
+               # fails loudly instead of reporting success. \
+               if [ \"$failed\" -ne 0 ]; then \
+                 echo 'could not raise an inherited dockerd/containerd to the hosted process limits' >&2; \
+                 return 1; \
+               fi; \
+               [ \"$raised\" -eq 1 ] && echo 'raised the inherited engine chain to the hosted process limits'; \
                return 0; \
              }}; \
-             docker info >/dev/null 2>&1 && {{ raise_engine_chain; exit 0; }}; \
+             docker info >/dev/null 2>&1 && {{ raise_engine_chain || exit 1; exit 0; }}; \
              rm -f /var/run/docker.pid; \
              mkdir -p {DOCKER_DATA_ROOT}; \
              modprobe overlay >/dev/null 2>&1 || true; \
@@ -2721,9 +2756,9 @@ fn docker_start_command() -> Vec<String> {
                fi; \
                return 0; \
              }}; \
-             if start_dockerd; then raise_engine_chain; exit 0; fi; \
+             if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi; \
              rm -rf {DOCKER_DATA_ROOT}/*; \
-             if start_dockerd; then raise_engine_chain; exit 0; fi; \
+             if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi; \
              echo 'dockerd failed to start after data-root reset' >&2; \
              exit 1"
         )),
@@ -8302,6 +8337,22 @@ done
             "local addresses must include the interfaces': {script}"
         );
         assert!(
+            script.contains("A-Za-z0-9._-"),
+            "the hostname must be validated before anything uses it: {script}"
+        );
+        assert!(
+            script.contains("awk -v host=\"$host\""),
+            "the name must be matched as a string, never interpolated into a program: {script}"
+        );
+        assert!(
+            !script.contains("sed -E"),
+            "no hostname may reach a sed program: {script}"
+        );
+        assert!(
+            script.contains("is_local \"$addr\" || return 1"),
+            "every resolved answer must be local, not just one of them: {script}"
+        );
+        assert!(
             !script.contains("|| true"),
             "a failed rewrite or resolution must stay observable: {script}"
         );
@@ -8673,9 +8724,9 @@ done
         assert_eq!(
             GUEST_NOFILE_ULIMIT,
             format!(
-                "ulimit -Hn {}; ulimit -Sn {}",
-                cfg("golden_rlimit_nofile_hard"),
-                cfg("golden_rlimit_nofile_soft")
+                "ulimit -Sn {}; ulimit -Hn {}",
+                cfg("golden_rlimit_nofile_soft"),
+                cfg("golden_rlimit_nofile_hard")
             ),
             "golden_nofile_ulimit_raise must compose golden_rlimit_nofile_*"
         );
@@ -8684,8 +8735,8 @@ done
             "{GUEST_NOFILE_ULIMIT}"
         );
         assert!(
-            GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("|| true"),
-            "the fallback must stay a fallback"
+            GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("RLIMIT_NOFILE hard limit stays"),
+            "the fallback must say what it could not raise, not swallow it"
         );
 
         // The live-chain prlimit forms agree with the same values.
@@ -9072,10 +9123,11 @@ done
             "a launch that cannot raise the hard limit must still start: {}",
             String::from_utf8_lossy(&best_effort.stderr)
         );
-        assert_eq!(
-            String::from_utf8_lossy(&best_effort.stderr),
-            "",
-            "the fallback must not print EPERM noise into the job log"
+        let stderr = String::from_utf8_lossy(&best_effort.stderr);
+        assert!(
+            stderr.is_empty() || stderr.contains("RLIMIT_NOFILE hard limit stays"),
+            "the fallback must either reach the hosted pair silently or say what it \
+             could not raise: {stderr}"
         );
         // Either the raise took (root, or a platform that permits raising the
         // hard limit) or the launch kept what it inherited — never a third

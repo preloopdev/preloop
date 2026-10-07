@@ -30,6 +30,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
       - name: Read the golden runtime off this hosted runner
         run: |
           set -euo pipefail
@@ -49,7 +52,16 @@ jobs:
               [ "$addr" = "$local" ] && local_ok=true
             done
             echo "golden_hostname_resolves_locally=${local_ok}"
-            echo "golden_step_env_unset=$(env | grep -oE '^(TERM|COLORTERM)=' | tr -d '=' | paste -sd, -)"
+            # `golden_step_env_unset` lists the keys a hosted step does NOT
+            # carry. Report the subset that is genuinely absent: reporting the
+            # present ones would rewrite the contract to "" every week.
+            unset_keys=""
+            for key in $(awk -F'"' '/^golden_step_env_unset = / { print $2; exit }' official-image.toml | tr ',' ' '); do
+              if ! printenv "$key" >/dev/null 2>&1; then
+                unset_keys="${unset_keys:+$unset_keys,}$key"
+              fi
+            done
+            echo "golden_step_env_unset=${unset_keys}"
           } > "golden-runtime-${{ matrix.runner }}.txt"
           cat "golden-runtime-${{ matrix.runner }}.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -104,13 +116,16 @@ jobs:
           # The composed keys the init uses must follow the primitive ones, or
           # guest_runtime_values_come_from_official_image_toml fails in CI.
           sed -i "s|^golden_stack_ulimit_raise = \".*\"$|golden_stack_ulimit_raise = \"ulimit -Hs $(cfg golden_rlimit_stack_hard); ulimit -Ss $(cfg golden_rlimit_stack_soft_kib)\"|" official-image.toml
-          sed -i "s|^golden_nofile_ulimit_raise = \".*\"$|golden_nofile_ulimit_raise = \"ulimit -Hn $(cfg golden_rlimit_nofile_hard); ulimit -Sn $(cfg golden_rlimit_nofile_soft)\"|" official-image.toml
-          sed -i "s|^golden_nofile_ulimit_raise_best_effort = \".*\"$|golden_nofile_ulimit_raise_best_effort = \"ulimit -Hn $(cfg golden_rlimit_nofile_hard) 2>/dev/null; ulimit -Sn $(cfg golden_rlimit_nofile_soft) 2>/dev/null || true\"|" official-image.toml
+          sed -i "s|^golden_nofile_ulimit_raise = \".*\"$|golden_nofile_ulimit_raise = \"ulimit -Sn $(cfg golden_rlimit_nofile_soft); ulimit -Hn $(cfg golden_rlimit_nofile_hard)\"|" official-image.toml
+          sed -i "s|^golden_nofile_ulimit_raise_best_effort = \".*\"$|golden_nofile_ulimit_raise_best_effort = \"ulimit -Sn $(cfg golden_rlimit_nofile_soft) 2>/dev/null \\|\\| true; ulimit -Hn $(cfg golden_rlimit_nofile_hard) 2>/dev/null \\|\\| { printf 'preloop: RLIMIT_NOFILE hard limit stays %s; raising it needs root and this launch keeps the exec channel identity\\n' \\$(ulimit -Hn) >&2; }\"|" official-image.toml
           sed -i "s|^golden_stack_soft_bytes = \".*\"$|golden_stack_soft_bytes = \"$(( $(cfg golden_rlimit_stack_soft_kib) * 1024 ))\"|" official-image.toml
           sed -i "s|^golden_stack_prlimit = \".*\"$|golden_stack_prlimit = \"$(cfg golden_stack_soft_bytes):$(cfg golden_rlimit_stack_hard)\"|" official-image.toml
           sed -i "s|^golden_nofile_prlimit = \".*\"$|golden_nofile_prlimit = \"$(cfg golden_rlimit_nofile_soft):$(cfg golden_rlimit_nofile_hard)\"|" official-image.toml
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # The checkout keeps `persist-credentials: false`; authenticate the
+          # push with the workflow token explicitly.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           BRANCH="chore/golden-runtime-drift-$(date -u +%F)"
           git checkout -b "$BRANCH"
           git add official-image.toml

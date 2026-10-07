@@ -132,7 +132,11 @@ jobs:
   build-official-x86_64:
     name: Build official x86_64 golden
     needs: image-pins-changed
-    if: ${{ (github.event_name == 'pull_request' && needs.image-pins-changed.outputs.changed == 'true') || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) }}
+    # `!cancelled()` keeps the job eligible when `image-pins-changed` was
+    # skipped (it only runs for pull requests) — a bare `if` would inherit an
+    # implicit `success()` and skip every manual bake. The pull-request branch
+    # then requires the gate to have run and found the pins moved.
+    if: ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64')) || (github.event_name == 'pull_request' && needs.image-pins-changed.result == 'success' && needs.image-pins-changed.outputs.changed == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:

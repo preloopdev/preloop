@@ -86,11 +86,19 @@ if [ "$(cfg golden_hostname_resolves_locally)" = "true" ]; then
     echo "hostname=${host} resolves to ${addrs:-<nothing>}"
     [ -n "$addrs" ] || fail "the machine's own hostname ${host} does not resolve"
     local_addrs="127.0.0.1 ::1 $(hostname -I 2>/dev/null) $(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-    local_ok=0
+    local_ok=1
     for addr in $addrs; do
+        case "$addr" in
+            127.* | ::1) continue ;;
+        esac
+        found=0
         for local in $local_addrs; do
-            [ "$addr" = "$local" ] && local_ok=1
+            [ "$addr" = "$local" ] && found=1
         done
+        # Every answer must be local: the resolver hands out the first one,
+        # and a foreign answer anywhere in the list still lets a consumer pick
+        # it (the AgentENV case this checks for).
+        [ "$found" = 1 ] || local_ok=0
     done
     [ "$local_ok" = 1 ] || fail "hostname ${host} resolves to ${addrs}, none of which is an address of this machine"
 fi

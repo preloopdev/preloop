@@ -794,7 +794,9 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     assert_eq!(
         run[2],
         "ulimit -Hs unlimited; ulimit -Ss 16384; \
-         ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true; \
+         ulimit -Sn 65536 2>/dev/null || true; \
+         ulimit -Hn 65536 2>/dev/null || \
+           { printf 'preloop: RLIMIT_NOFILE hard limit stays %s; raising it needs root and this launch keeps the exec channel identity\\n' $(ulimit -Hn) >&2; }; \
          exec \"$@\""
     );
     assert_eq!(run[3], "sh");
@@ -864,7 +866,9 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
                 "sh",
                 "-c",
                 "ulimit -Hs unlimited; ulimit -Ss 16384; \
-                 ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true; \
+                 ulimit -Sn 65536 2>/dev/null || true; \
+                 ulimit -Hn 65536 2>/dev/null || \
+                   { printf 'preloop: RLIMIT_NOFILE hard limit stays %s; raising it needs root and this launch keeps the exec channel identity\\n' $(ulimit -Hn) >&2; }; \
                  exec \"$@\"",
                 "sh"
             ]
