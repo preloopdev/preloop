@@ -78,13 +78,21 @@ async fn migrate(args: MigrateArgs) -> anyhow::Result<()> {
     };
     let report = store_admin::migrate(target.clone(), options).await?;
     if let Some(adopted) = report.adopted {
-        let verb = if args.dry_run { "would adopt" } else { "adopted" };
+        let verb = if args.dry_run {
+            "would adopt"
+        } else {
+            "adopted"
+        };
         println!("[preloop] {verb} pre-ledger control database at migration {adopted}");
     }
     if report.applied.is_empty() && report.pending_before.is_empty() {
         println!("[preloop] control database already at the latest migration");
     } else if !report.applied.is_empty() {
-        let verb = if args.dry_run { "would apply" } else { "applied" };
+        let verb = if args.dry_run {
+            "would apply"
+        } else {
+            "applied"
+        };
         println!(
             "[preloop] {verb} migrations: {}",
             version_list(&report.applied)

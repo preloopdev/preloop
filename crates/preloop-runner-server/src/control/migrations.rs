@@ -184,8 +184,9 @@ pub(crate) fn sqlite_ledger(conn: &rusqlite::Connection) -> rusqlite::Result<Led
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let has_legacy_ledger = table_exists("schema_migrations")?;
     if has_ledger {
-        let mut statement =
-            conn.prepare(&format!("SELECT version FROM \"{LEDGER_TABLE}\" ORDER BY version"))?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT version FROM \"{LEDGER_TABLE}\" ORDER BY version"
+        ))?;
         let versions = statement
             .query_map([], |row| row.get::<_, i32>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -206,8 +207,8 @@ pub(crate) fn sqlite_ledger(conn: &rusqlite::Connection) -> rusqlite::Result<Led
 /// Verify a SQLite control database: ledger present and exactly this build's
 /// migrations. `Err` is the operator-facing message (see [`check_ledger`]).
 pub(crate) fn verify_sqlite(conn: &rusqlite::Connection) -> Result<(), String> {
-    let ledger =
-        sqlite_ledger(conn).map_err(|error| format!("control database migration ledger is unreadable: {error}"))?;
+    let ledger = sqlite_ledger(conn)
+        .map_err(|error| format!("control database migration ledger is unreadable: {error}"))?;
     check_ledger(ledger)
 }
 
@@ -294,8 +295,10 @@ mod tests {
         .unwrap();
         for version in versions {
             conn.execute(
-                &format!("INSERT INTO \"{LEDGER_TABLE}\" (version, name, applied_on, checksum) \
-                          VALUES (?1, 'x', '2026-10-05T00:00:00Z', '0')"),
+                &format!(
+                    "INSERT INTO \"{LEDGER_TABLE}\" (version, name, applied_on, checksum) \
+                          VALUES (?1, 'x', '2026-10-05T00:00:00Z', '0')"
+                ),
                 [version],
             )
             .unwrap();

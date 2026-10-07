@@ -322,9 +322,9 @@ async fn ensure_schema(client: &mut Client) -> Result<(), ControlError> {
                 .map_err(super::migrations::backend_error);
         }
         #[cfg(not(any(test, feature = "test-support")))]
-        return Err(super::migrations::backend_error(super::migrations::refusal(
-            super::migrations::Ledger::Empty,
-        )));
+        return Err(super::migrations::backend_error(
+            super::migrations::refusal(super::migrations::Ledger::Empty),
+        ));
     }
     super::migrations::check_ledger(ledger).map_err(super::migrations::backend_error)
 }

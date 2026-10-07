@@ -7421,7 +7421,10 @@ mod lite {
             .err()
             .expect("a legacy store must be refused");
         assert!(error.to_string().contains("legacy"), "{error}");
-        assert!(error.to_string().contains("preloop store import-legacy"), "{error}");
+        assert!(
+            error.to_string().contains("preloop store import-legacy"),
+            "{error}"
+        );
 
         // A fresh file initializes (test-support) through the migration
         // runner and carries the build's ledger.

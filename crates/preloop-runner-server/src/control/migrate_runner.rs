@@ -60,7 +60,11 @@ fn postgres_runner(target: Target) -> refinery::Runner {
 /// of [`MIGRATIONS`]. Test-only: the parity test asserts the two agree.
 #[cfg(test)]
 fn embedded_versions(runner: &refinery::Runner) -> Vec<i32> {
-    runner.get_migrations().iter().map(|m| m.version()).collect()
+    runner
+        .get_migrations()
+        .iter()
+        .map(|m| m.version())
+        .collect()
 }
 
 /// Apply every pending SQLite migration, returning the versions applied.
@@ -112,9 +116,7 @@ pub(crate) async fn initialize_empty_postgres(
     client: &mut tokio_postgres::Client,
 ) -> anyhow::Result<()> {
     client
-        .batch_execute(&format!(
-            "SELECT pg_advisory_lock({POSTGRES_SETUP_LOCK})"
-        ))
+        .batch_execute(&format!("SELECT pg_advisory_lock({POSTGRES_SETUP_LOCK})"))
         .await?;
     let result = async {
         let exists: bool = client
@@ -134,9 +136,7 @@ pub(crate) async fn initialize_empty_postgres(
     }
     .await;
     let _ = client
-        .batch_execute(&format!(
-            "SELECT pg_advisory_unlock({POSTGRES_SETUP_LOCK})"
-        ))
+        .batch_execute(&format!("SELECT pg_advisory_unlock({POSTGRES_SETUP_LOCK})"))
         .await;
     result
 }
@@ -195,10 +195,7 @@ fn sqlite_fingerprint(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
 /// the embedded migrations up to and including `through` (an exact
 /// `sqlite_master` match; no data is compared). `Err` names the first
 /// difference so an operator can see why adoption refused.
-pub(crate) fn verify_shape_sqlite(
-    conn: &rusqlite::Connection,
-    through: i32,
-) -> anyhow::Result<()> {
+pub(crate) fn verify_shape_sqlite(conn: &rusqlite::Connection, through: i32) -> anyhow::Result<()> {
     anyhow::ensure!(
         MIGRATIONS.contains(&through),
         "unknown adoption version {through}"
@@ -284,7 +281,8 @@ where
             // A definition printed while `search_path` resolves the schema
             // prints it unqualified; elsewhere it prints `schema.` — strip
             // both so the two sides compare equal.
-            line.replace(&format!("{schema}."), "").replace("control.", "")
+            line.replace(&format!("{schema}."), "")
+                .replace("control.", "")
         })
         .collect::<Vec<_>>();
     Ok(lines.join("\n"))
@@ -323,7 +321,10 @@ pub(crate) async fn verify_shape_postgres(
                     "CREATE SCHEMA IF NOT EXISTS control;",
                     &format!("CREATE SCHEMA {scratch};"),
                 )
-                .replace("SET search_path = control;", &format!("SET search_path = {scratch};"))
+                .replace(
+                    "SET search_path = control;",
+                    &format!("SET search_path = {scratch};"),
+                )
                 .replace("control.", &format!("{scratch}."));
             tx.batch_execute(&sql).await?;
         }
@@ -537,9 +538,7 @@ mod tests {
         // Structural parity with a fresh database.
         let mut fresh = rusqlite::Connection::open_in_memory().unwrap();
         run_sqlite(&mut fresh).unwrap();
-        let fingerprint = |conn: &rusqlite::Connection| {
-            sqlite_fingerprint(conn).unwrap()
-        };
+        let fingerprint = |conn: &rusqlite::Connection| sqlite_fingerprint(conn).unwrap();
         assert_eq!(
             fingerprint(&conn),
             fingerprint(&fresh),
@@ -629,7 +628,9 @@ mod tests {
         ];
         for (table, expected) in counts {
             let found: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(found, expected, "row count changed for {table}");
         }
@@ -681,11 +682,8 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         let failing = vec![
             refinery::Migration::unapplied("V1__first", "CREATE TABLE t1 (id INTEGER);").unwrap(),
-            refinery::Migration::unapplied(
-                "V2__second",
-                "INSERT INTO missing_table VALUES (1);",
-            )
-            .unwrap(),
+            refinery::Migration::unapplied("V2__second", "INSERT INTO missing_table VALUES (1);")
+                .unwrap(),
         ];
         let runner = |migrations: &[refinery::Migration]| {
             let mut runner = refinery::Runner::new(migrations)
@@ -740,9 +738,7 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         initialize_empty_sqlite(&mut conn).unwrap();
         conn.execute(
-            &format!(
-                "UPDATE \"{LEDGER_TABLE}\" SET checksum = '0' WHERE version = ?1"
-            ),
+            &format!("UPDATE \"{LEDGER_TABLE}\" SET checksum = '0' WHERE version = ?1"),
             [MIGRATIONS[0]],
         )
         .unwrap();
@@ -891,7 +887,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            crate::control::migrations::postgres_ledger(&old).await.unwrap(),
+            crate::control::migrations::postgres_ledger(&old)
+                .await
+                .unwrap(),
             Ledger::Unledgered
         );
         // A populated pre-ledger baseline upgrades through the same probe →
@@ -902,7 +900,9 @@ mod tests {
         assert_eq!(probe.version, MIGRATIONS[0]);
         let applied = adopt_postgres(&mut old, probe.version).await.unwrap();
         assert_eq!(applied, MIGRATIONS[1..].to_vec());
-        crate::control::migrations::verify_postgres(&old).await.unwrap();
+        crate::control::migrations::verify_postgres(&old)
+            .await
+            .unwrap();
         let index: i64 = old
             .query_one(
                 "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'control' \
