@@ -325,7 +325,10 @@ mod tests {
             (&crate::events::issues::Adapter, "issues"),
             (&crate::events::issue_comment::Adapter, "issue_comment"),
             (&crate::events::discussion::Adapter, "discussion"),
-            (&crate::events::discussion_comment::Adapter, "discussion_comment"),
+            (
+                &crate::events::discussion_comment::Adapter,
+                "discussion_comment",
+            ),
             (&crate::events::label::Adapter, "label"),
             (&crate::events::milestone::Adapter, "milestone"),
             (&crate::events::watch::Adapter, "watch"),
@@ -334,7 +337,10 @@ mod tests {
             (&crate::events::public::Adapter, "public"),
             (&crate::events::gollum::Adapter, "gollum"),
             (&crate::events::page_build::Adapter, "page_build"),
-            (&crate::events::repository_dispatch::Adapter, "repository_dispatch"),
+            (
+                &crate::events::repository_dispatch::Adapter,
+                "repository_dispatch",
+            ),
             (&crate::events::check_run::Adapter, "check_run"),
             (&crate::events::check_suite::Adapter, "check_suite"),
             (&crate::events::delete::Adapter, "delete"),
