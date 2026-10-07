@@ -61,6 +61,15 @@ Releases before v0.27.0 predate the changelog.
   the runner itself, and the official runner's Docker command shape are
   unchanged.
 
+- **A burst of pull-request deliveries no longer parks the webhook worker
+  pool in merge-state polling**: a delivery whose payload head is no longer
+  the pull request's current head falls back after a single probe instead of
+  re-polling a merge that cannot be produced, at most half the worker pool may
+  be waiting on GitHub's mergeability computation at once (a delivery that
+  cannot claim a slot falls back to `refs/pull/{n}/head` rather than holding a
+  worker), and a fork delivery the fork-workflow policy will skip spends no
+  GitHub calls on a merge nothing will run.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
