@@ -152,13 +152,15 @@ file_size() {
 release_campaign_home() {
   local real pid mount_point
   real="$(cd "$CAMPAIGN_HOME" 2>/dev/null && pwd -P || printf '%s' "$CAMPAIGN_HOME")"
-  for pid in $(ps -axo pid=,command= | grep -F '_boot-vm' \
-    | grep -F -e "$CAMPAIGN_HOME/" -e "$real/" | awk '{print $1}'); do
+  # Match the hypervisor's argv (`_boot-vm <path inside the home>`), never a
+  # mere substring: a shell whose script mentions both would match too.
+  for pid in $(ps -axo pid=,command= | awk -v a="$CAMPAIGN_HOME/" -v b="$real/" '
+    { for (i = 2; i < NF; i++) if ($i == "_boot-vm" && (index($(i + 1), a) == 1 || index($(i + 1), b) == 1)) { print $1; break } }'); do
     kill -9 "$pid" 2>/dev/null || true
   done
   command -v hdiutil >/dev/null 2>&1 || return 0
   mount | sed -n 's|^.* on \(.*\) (.*$|\1|p' \
-    | grep -F -e "$CAMPAIGN_HOME/" -e "$real/" \
+    | { grep -F -e "$CAMPAIGN_HOME/" -e "$real/" || true; } \
     | while IFS= read -r mount_point; do
         hdiutil detach -force "$mount_point" >/dev/null 2>&1 || true
       done
@@ -176,7 +178,14 @@ prepare_golden_home() {
     cp -p "$CAMPAIGN_HOME/state/hmac-key.bin" "$saved_key"
   fi
   release_campaign_home
-  rm -rf "$CAMPAIGN_HOME"
+  if ! rm -rf "$CAMPAIGN_HOME"; then
+    # Put the key back before giving up, or the next run mints a new one.
+    if [ -n "$saved_key" ]; then
+      mkdir -p "$CAMPAIGN_HOME/state"
+      mv "$saved_key" "$CAMPAIGN_HOME/state/hmac-key.bin"
+    fi
+    fail "cannot wipe $CAMPAIGN_HOME"
+  fi
   if [ -n "$saved_key" ]; then
     mkdir -p "$CAMPAIGN_HOME/state"
     mv "$saved_key" "$CAMPAIGN_HOME/state/hmac-key.bin"
