@@ -21,6 +21,15 @@ Releases before v0.27.0 predate the changelog.
   `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
   authenticated.
 
+### Changed
+- **The container-engine bootstrap is a real shell file**:
+  `docker_start_command`'s script moved to `scripts/docker-start.sh`, embedded
+  with `include_str!` and rendered by substituting its placeholders. The shell
+  text is now reviewed, commented and `sh -n`-parsed as shell, instead of being
+  assembled from Rust string continuations — the form that let a comment
+  swallow the statements after it and shipped `Syntax error: "else"
+  unexpected` to production runners.
+
 ### Fixed
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
