@@ -624,6 +624,52 @@ pub(crate) mod suite {
         assert!(backend.live_assignments().await.unwrap().is_empty());
     }
 
+    /// An interactive run submitted after an older push run reaches the front
+    /// of the ready queue because its jobs carry the shared run priority.
+    pub(crate) async fn interactive_runs_are_claimed_ahead_of_older_pushes(
+        backend: &dyn ControlBackend,
+    ) {
+        let push_run = RunId::new();
+        let comment_run = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("priority-runner"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        backend
+            .submit_run(submit_run(
+                push_run,
+                vec![submit_job(push_run, "push-job", 1)],
+            ))
+            .await
+            .unwrap();
+
+        let mut comment = submit_run(comment_run, vec![submit_job(comment_run, "comment-job", 2)]);
+        Arc::make_mut(&mut comment.record.submission).event = "issue_comment".to_owned();
+        comment.record.event = "issue_comment".to_owned();
+        backend.submit_run(comment).await.unwrap();
+        assert_eq!(
+            backend.queue_stats().await.unwrap().ready,
+            2,
+            "both jobs should be ready before the claim"
+        );
+
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected the interactive job to claim first, got {other:?}"),
+        };
+        assert_eq!(claimed.queued.run_id, comment_run);
+        assert_eq!(claimed.queued.job_id, JobId("comment-job".to_owned()));
+    }
+
     /// Status events appended after the change are stamped with the version
     /// of the row they report on. Drives one job through claim and success and
     /// one run through queued and completed, appending a status event at each
@@ -6279,6 +6325,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn interactive_runs_are_claimed_ahead_of_older_pushes() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::interactive_runs_are_claimed_ahead_of_older_pushes(&backend).await;
+    }
+
+    #[tokio::test]
     async fn status_events_are_stamped_with_row_versions() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -7643,6 +7697,14 @@ mod lite {
     #[tokio::test]
     async fn submit_poll_complete_lifecycle() {
         suite::submit_poll_complete_lifecycle(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn interactive_runs_are_claimed_ahead_of_older_pushes() {
+        suite::interactive_runs_are_claimed_ahead_of_older_pushes(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]

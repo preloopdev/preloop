@@ -308,7 +308,11 @@ async fn insert_job_row(
             &node.pool_key,
             &serde_json::to_string(&node.runs_on).unwrap_or_else(|_| "[]".into()),
             &node.runner_group,
-            &node.priority,
+            // The run's event decides queue priority (comment/dispatch runs
+            // first); one place for submit- and expansion-time rows.
+            &node
+                .priority
+                .max(logic::run_priority(&graph.record.submission.event)),
             &node.run_order,
             &node.job_order,
             &node.enqueued_at_us,

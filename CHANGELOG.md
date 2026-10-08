@@ -55,6 +55,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
+  ready-queue priority over older automatic jobs; Pullfrog reviews run only on
+  explicit comments or manual dispatches instead of every pull request update.
+
 - **Breaking:** the `[environments]` config table is removed. GitHub
   accepts any `environment:` name and auto-creates it unprotected, so an
   unknown name is no longer rejected (no more 403 at submit) and gating is
