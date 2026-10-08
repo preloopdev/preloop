@@ -299,23 +299,38 @@ fn hydrate_message(
             ])
             .map_err(db)?;
         }
-        if let Some(name) = deferred_environment.as_deref()
-            && let Some(actions_environment) = message.actions_environment.as_mut()
-        {
-            match preloop_gha_parser::eval::resolve_string(name, &context) {
-                Ok(resolved) => {
-                    actions_environment.name = resolved.clone();
-                    environment_name = Some(resolved);
+        if let Some(name) = deferred_environment.as_deref() {
+            // The message carries the environment object only when the job
+            // builder resolved (or deferred) one; a deferred name without
+            // it can never resolve — the same verdict an eval error lands on.
+            if let Some(actions_environment) = message.actions_environment.as_mut() {
+                match preloop_gha_parser::eval::resolve_string(name, &context) {
+                    Ok(resolved) => {
+                        actions_environment.name = resolved.clone();
+                        environment_name = Some(resolved);
+                    }
+                    Err(error) => {
+                        // Nothing downstream re-resolves this: the raw
+                        // template must not become the deployment's name,
+                        // and the gate must not hold the job forever. Stamp
+                        // the marker — `evaluate_environment_gate` fails the
+                        // job closed on the check just below.
+                        tracing::error!(
+                            run_id = %job.run_id,
+                            job = %job.job_id.0,
+                            environment = %name,
+                            %error,
+                            "deployment environment expression failed to evaluate after needs completed"
+                        );
+                        job.environment_gate
+                            .get_or_insert_with(crate::models::EnvironmentGateState::default)
+                            .unresolvable_name = Some(name.to_owned());
+                    }
                 }
-                Err(error) => {
-                    tracing::error!(
-                        run_id = %job.run_id,
-                        job = %job.job_id.0,
-                        environment = %name,
-                        %error,
-                        "deployment environment expression failed to evaluate after needs completed"
-                    );
-                }
+            } else {
+                job.environment_gate
+                    .get_or_insert_with(crate::models::EnvironmentGateState::default)
+                    .unresolvable_name = Some(name.to_owned());
             }
         }
     }

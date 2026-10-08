@@ -550,6 +550,12 @@ pub struct EnvironmentGateState {
     /// Optional review comment carried by the rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected_note: Option<String>,
+    /// The environment name (a `${{ … }}` template) whose evaluation failed
+    /// after the job's needs went terminal — the name can never resolve, so
+    /// the next gate evaluation fails closed instead of holding forever.
+    /// Stamped by hydration (`hydrate_needs_context` / `hydrate_message`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolvable_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

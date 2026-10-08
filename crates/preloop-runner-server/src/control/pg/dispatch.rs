@@ -1983,6 +1983,9 @@ async fn resume_held_node(
         let mut queued = graph::queued_of(job_id, graph.record.run_id, node, message);
         sched_helpers::hydrate_needs_context(&mut queued, &graph.record);
         apply_resolved_runs_on(node, queued.runs_on);
+        // Gate markers hydration stamps (an environment name that can never
+        // resolve) travel to the node, where the parked-gate sweep fails it.
+        node.environment_gate = queued.environment_gate.clone();
         message = queued.message;
         PgBackend::write_node_message(tx, graph.record.run_id, job_id, &message).await?;
     }
@@ -1995,6 +1998,16 @@ async fn resume_held_node(
         // Caller nodes park for expansion, not dispatch.
         node.status = ExecutionStatus::Pending;
         node.queue_state = logic::QueueState::Blocked;
+        return Ok(());
+    }
+    if node
+        .environment_gate
+        .as_ref()
+        .is_some_and(|gate| gate.unresolvable_name.is_some())
+    {
+        // The environment name can never resolve: leave the node held — the
+        // parked-gate sweep fails it closed instead of dispatching under a
+        // template name.
         return Ok(());
     }
     node.concurrency_acquired_at_us = Some(now);
@@ -2929,6 +2942,7 @@ impl<'a> Sweep<'a> {
         job_id: &JobId,
     ) -> Result<bool, ControlError> {
         let mut resolved = None;
+        let mut hydrated_gate = None;
         if let Some(message) = self.message(run_id, job_id).await? {
             let (mut queued, record) = {
                 let graph = self.graphs.get(&run_id).expect("loaded");
@@ -2941,6 +2955,10 @@ impl<'a> Sweep<'a> {
             sched_helpers::hydrate_needs_context(&mut queued, &record);
             PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
             resolved = Some(queued.runs_on.clone());
+            // `hydrate_needs_context` stamps gate markers (an environment
+            // name that can never resolve) — carry them onto the node so the
+            // gate evaluation below sees the failure.
+            hydrated_gate = Some(queued.environment_gate.clone());
             self.messages
                 .insert((run_id, job_id.clone()), Some(queued.message));
             self.hydrated.insert((run_id, job_id.clone()));
@@ -2949,6 +2967,9 @@ impl<'a> Sweep<'a> {
             && let Some(node) = self.node_mut(run_id, job_id)
         {
             apply_resolved_runs_on(node, runs_on);
+            if let Some(gate) = hydrated_gate {
+                node.environment_gate = gate;
+            }
             self.mark(run_id, job_id);
         }
         let runs_on = resolved.unwrap_or_else(|| {

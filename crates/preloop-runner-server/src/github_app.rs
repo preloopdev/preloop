@@ -634,19 +634,33 @@ fn classify_installation_error(error: anyhow::Error) -> AppLookupError {
 /// even when its installation lookup fails, exactly as `select_app_for_repo`
 /// always has: a lone misconfigured App is still the only App minting can
 /// try, and the mint failure policy (not selection) decides what happens.
-///
-/// A lookup that fails without a definitive "not installed" answer is
-/// reported as [`AppLookupError::Transient`]: an empty list would otherwise
-/// be indistinguishable from "no App covers this repository", and a caller
-/// that falls back to weaker protection on the latter must not do so on the
-/// former.
+/// The fallback lives here — in the adapter — so push/check-run token
+/// callers keep the historical behavior while
+/// [`candidate_apps_for_repo_inner`] stays fail-closed for protection-rule
+/// callers.
 pub async fn candidate_apps_for_repo(
     shared: &crate::state::SharedState,
     repository: &str,
 ) -> Vec<GitHubAppCredentials> {
-    candidate_apps_for_repo_inner(shared, repository)
-        .await
-        .unwrap_or_default()
+    match candidate_apps_for_repo_inner(shared, repository).await {
+        Ok(candidates) => candidates,
+        Err(AppLookupError::NotInstalled) => Vec::new(),
+        Err(AppLookupError::Transient(_)) => {
+            // A registry of exactly one App still falls back to it: the lone
+            // App is the only one minting can try, and the mint failure
+            // policy (not selection) decides what a failed lookup means.
+            // Callers needing the fail-closed verdict use
+            // `candidate_apps_for_repo_inner` directly (the environment
+            // resolver does).
+            shared
+                .state
+                .github_apps
+                .as_ref()
+                .filter(|registry| registry.apps.len() == 1)
+                .map(|registry| vec![registry.default_app().clone()])
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// [`candidate_apps_for_repo`] without the error-collapsing adapter: callers
@@ -2890,6 +2904,49 @@ mod tests {
         assert!(
             error.to_string().contains("401"),
             "the error must surface the status: {error:#}"
+        );
+    }
+    #[tokio::test]
+    async fn candidate_adapter_keeps_sole_app_on_transient_lookup() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+
+        let stub = Router::new().route(
+            "/app/installations/101",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "temporary outage") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let mut app = GitHubAppCredentials::for_tests("101", test_key(), MintFailurePolicy::Error);
+        app.installation_id = Some(101);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().join("state"))
+            .await
+            .unwrap();
+        state.github_apps = Some(GitHubApps {
+            apps: vec![app],
+            default_index: 0,
+        });
+        let shared = Arc::new(crate::state::SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        assert!(matches!(
+            candidate_apps_for_repo_inner(&shared, "owner/repo").await,
+            Err(AppLookupError::Transient(_))
+        ));
+        assert_eq!(
+            candidate_apps_for_repo(&shared, "owner/repo").await.len(),
+            1,
+            "the non-fail-closed adapter retains the sole App for minting"
         );
     }
 }

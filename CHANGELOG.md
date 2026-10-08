@@ -110,6 +110,18 @@ Releases before v0.27.0 predate the changelog.
   closed. Both paths now read `AppState::static_github_pat()`, the same
   credential source the rest of the server uses.
 
+- **Environment protection follow-ups:** GitHub team reviewers without an
+  inline organization now resolve against the repository owner, and an empty
+  protected-branch set follows GitHub's all-branches deployment semantics.
+- **Removed environment protection releases armed jobs:** deleting reviewers,
+  timers, branch policy, and custom rules on GitHub no longer leaves a job
+  held behind stale gate state.
+- **Deferred environment names fail or hydrate deterministically:** jobs no
+  longer wait forever after a `${{ needs.* }}` name cannot be resolved.
+- **Environment policy pagination fails closed:** truncated protected-branch,
+  branch-policy, and team-member lists remain unresolved instead of being
+  treated as complete.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the

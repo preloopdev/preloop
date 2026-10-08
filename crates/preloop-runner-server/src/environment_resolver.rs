@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use serde_json::Value;
 
 use crate::config::{EnvironmentReviewer, EnvironmentRules, EnvironmentRulesMap};
@@ -256,32 +257,57 @@ impl EnvironmentResolver {
         // never-fetched key to "no rules"), letting a protected environment
         // run unprotected. The key stays pending and stale GitHub rules keep
         // answering.
-        let app = match crate::github_app::candidate_apps_for_repo_inner(shared, repository).await {
-            Ok(candidates) => candidates.into_iter().next(),
-            Err(crate::github_app::AppLookupError::NotInstalled) => None,
-            Err(crate::github_app::AppLookupError::Transient(error)) => {
-                return Err(error.context(
-                    "GitHub App installation lookup failed; the repository's \
+        let candidates =
+            match crate::github_app::candidate_apps_for_repo_inner(shared, repository).await {
+                Ok(candidates) => candidates,
+                Err(crate::github_app::AppLookupError::NotInstalled) => Vec::new(),
+                Err(crate::github_app::AppLookupError::Transient(error)) => {
+                    return Err(error.context(
+                        "GitHub App installation lookup failed; the repository's \
                      environment rules cannot be sourced",
-                ));
-            }
-        };
+                    ));
+                }
+            };
         // The configured PAT (`PRELOOP_GITHUB_TOKEN` or the config file's
         // `github.pat`) — the same credential `AppState` hands the rest of
         // the server, so a config-file-only PAT covers resolution too.
         let pat = shared.state.static_github_pat();
-        let result: anyhow::Result<Arc<EnvironmentRules>> = if let Some(creds) = &app {
+        let result: anyhow::Result<Arc<EnvironmentRules>> = if !candidates.is_empty() {
             self.github_configured.store(true, Ordering::Release);
-            let token = environment_token(creds, repository).await?;
-            let rules = fetch_environment_rules(api_base, &token, repository, environment)
-                .await
-                .map(Arc::new);
-            if rules.is_ok() {
+            // Every installed candidate mints the same scoped token for the
+            // repository, so try each in turn (the push path does the same):
+            // a mint or fetch failure under one App must not fail the
+            // repository while another App still covers it.
+            let mut last_error = None;
+            let mut rules = None;
+            for creds in &candidates {
+                let fetched = match environment_token(creds, repository).await {
+                    Ok(token) => {
+                        fetch_environment_rules(api_base, &token, repository, environment).await
+                    }
+                    Err(error) => Err(error),
+                };
+                match fetched {
+                    Ok(fetched_rules) => {
+                        rules = Some(Arc::new(fetched_rules));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if rules.is_some() {
                 self.repo_sources
                     .write()
                     .insert(repository.to_owned(), RulesSource::Github);
             }
-            rules
+            match rules {
+                Some(rules) => Ok(rules),
+                None => Err(last_error.unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "no candidate GitHub App could read {repository}'s environment rules"
+                    )
+                })),
+            }
         } else if let Some(token) = pat {
             self.github_configured.store(true, Ordering::Release);
             let rules = fetch_environment_rules(api_base, &token, repository, environment)
@@ -341,16 +367,25 @@ impl EnvironmentResolver {
             .collect();
         let mut keys = self.pending_keys();
         keys.extend(stale);
-        for (repo, env) in keys {
-            if let Err(error) = self.resolve(shared, &repo, &env).await {
-                tracing::warn!(
-                    repository = %repo,
-                    environment = %env,
-                    %error,
-                    "environment rules refresh failed; gate keeps last-known state"
-                );
-            }
-        }
+        // Bounded concurrency: each resolve is a few API round-trips, and
+        // the reaper's sweep waits on this pass — serialized fetches would
+        // scale the whole gate sweep with the stale set (and a hung
+        // endpoint would starve every other key). `resolve` collapses
+        // concurrent same-key fetches internally, so overlap is safe.
+        futures::stream::iter(keys)
+            .map(|(repo, env)| async move {
+                if let Err(error) = self.resolve(shared, &repo, &env).await {
+                    tracing::warn!(
+                        repository = %repo,
+                        environment = %env,
+                        %error,
+                        "environment rules refresh failed; gate keeps last-known state"
+                    );
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
     }
 
     /// Whether `sender` may approve `environment`'s reviewer gate on behalf
@@ -567,7 +602,12 @@ async fn fetch_environment_rules(
                 rules.reviewers = rule
                     .get("reviewers")
                     .and_then(Value::as_array)
-                    .map(|reviewers| reviewers.iter().filter_map(parse_reviewer).collect())
+                    .map(|reviewers| {
+                        reviewers
+                            .iter()
+                            .filter_map(|reviewer| parse_reviewer(reviewer, repository))
+                            .collect()
+                    })
                     .unwrap_or_default();
             }
             _ => {}
@@ -639,7 +679,14 @@ async fn fetch_environment_rules(
 }
 
 /// One `required_reviewers` reviewer entry → our identity form.
-fn parse_reviewer(value: &Value) -> Option<EnvironmentReviewer> {
+///
+/// GitHub's environments API reports team reviewers with an
+/// `organization_id` and only sometimes the nested `organization` object —
+/// live responses can omit it entirely. A repository's team reviewers always
+/// belong to the repository's owning organization, so the org falls back to
+/// the repository owner; a team whose org can be determined neither way is
+/// dropped (fail closed: an unexpandable team can never approve).
+fn parse_reviewer(value: &Value, repository: &str) -> Option<EnvironmentReviewer> {
     let kind = value.get("type").and_then(Value::as_str)?;
     let reviewer = value.get("reviewer")?;
     match kind {
@@ -648,12 +695,19 @@ fn parse_reviewer(value: &Value) -> Option<EnvironmentReviewer> {
             .and_then(Value::as_str)
             .map(|login| EnvironmentReviewer::User(login.to_owned())),
         "Team" => {
-            // Team reviewers carry `slug` plus their owning `organization`.
+            // Team reviewers carry `slug` plus their owning `organization`
+            // when the API inlines it; otherwise the repository's owner is
+            // the org — GitHub only attaches teams of the repo's org.
             let slug = reviewer.get("slug").and_then(Value::as_str)?.to_owned();
             let org = reviewer
                 .pointer("/organization/login")
                 .and_then(Value::as_str)
-                .map(str::to_owned)?;
+                .map(str::to_owned)
+                .or_else(|| {
+                    repository
+                        .split_once('/')
+                        .map(|(owner, _)| owner.to_owned())
+                })?;
             Some(EnvironmentReviewer::Team { org, slug })
         }
         _ => None,
@@ -674,7 +728,7 @@ async fn fetch_branch_policies(
              ?per_page=100&page={page}"
         );
         let Some(json) = github_get(api_base, token, &path).await? else {
-            break;
+            return Ok(policies);
         };
         let page_policies: Vec<Value> = json
             .get("branch_policies")
@@ -684,10 +738,17 @@ async fn fetch_branch_policies(
         let reached_end = page_policies.len() < 100;
         policies.extend(page_policies);
         if reached_end {
-            break;
+            return Ok(policies);
         }
     }
-    Ok(policies)
+    // The last allowed page came back full: the list is truncated, and a
+    // partial policy set must not read as the environment's whole policy.
+    // Error so the resolve fails closed instead of deploying on a silently
+    // incomplete allowlist.
+    anyhow::bail!(
+        "deployment-branch-policies for {repository}/{encoded_env} exceeds \
+         {MAX_POLICY_PAGES} pages; treating the list as truncated (fail closed)"
+    );
 }
 
 /// The repo's protected branch names (exact-match expansion of GitHub's
@@ -701,19 +762,28 @@ async fn fetch_protected_branches(
     for page in 1..=MAX_PROTECTED_PAGES {
         let path = format!("/repos/{repository}/branches?protected=true&per_page=100&page={page}");
         let Some(json) = github_get(api_base, token, &path).await? else {
-            break;
+            return Ok(names);
         };
-        let Some(list) = json.as_array() else { break };
+        let Some(list) = json.as_array() else {
+            return Ok(names);
+        };
         names.extend(
             list.iter()
                 .filter_map(|branch| branch.get("name").and_then(Value::as_str))
                 .map(str::to_owned),
         );
         if list.len() < 100 {
-            break;
+            return Ok(names);
         }
     }
-    Ok(names)
+    // The last allowed page came back full: the protected-branch list is
+    // truncated. A `protected_branches` policy evaluated against a partial
+    // list would deny refs GitHub allows — error so the resolve fails
+    // closed instead of pinning an incomplete allowlist.
+    anyhow::bail!(
+        "protected branches for {repository} exceed {MAX_PROTECTED_PAGES} \
+         pages; treating the list as truncated (fail closed)"
+    );
 }
 
 /// Page through `GET /orgs/{org}/teams/{slug}/members`.
@@ -733,25 +803,32 @@ async fn fetch_team_members(
             // Team not visible to the installation → deny membership.
             return Ok(Vec::new());
         };
-        let Some(list) = json.as_array() else { break };
+        let Some(list) = json.as_array() else {
+            return Ok(logins);
+        };
         logins.extend(
             list.iter()
                 .filter_map(|member| member.get("login").and_then(Value::as_str))
                 .map(str::to_owned),
         );
         if list.len() < 100 {
-            break;
+            return Ok(logins);
         }
     }
-    Ok(logins)
+    // The last allowed page came back full: the member list is truncated.
+    // A partial roster would deny members GitHub authorizes — error (fail
+    // closed) rather than cache an incomplete list.
+    anyhow::bail!(
+        "team {org}/{slug} members exceed {MAX_MEMBER_PAGES} pages; treating \
+         the list as truncated (fail closed)"
+    );
 }
 
 #[cfg(test)]
 #[allow(unsafe_code)] // SAFETY: env writes confined to serialized tests.
 mod tests {
     use super::*;
-    use axum::routing::get;
-    use axum::{Json, Router};
+    use axum::routing::{get, post};
     use serde_json::json;
 
     /// In-process GitHub API stub for the fixed repository/environment used
@@ -810,7 +887,7 @@ mod tests {
                     get(|| async { Json(json!([{"name": "main"}, {"name": "release/1.0"}])) }),
                 )
                 .route(
-                    "/orgs/acme/teams/deployers/members",
+                    "/orgs/owner/teams/deployers/members",
                     get(|| async { Json(json!([{"login": "teammate"}, {"login": "octocat"}])) }),
                 )
                 .route(
@@ -870,7 +947,7 @@ mod tests {
                         "prevent_self_review": true,
                         "reviewers": [
                             {"type": "User", "reviewer": {"login": "octocat"}},
-                            {"type": "Team", "reviewer": {"slug": "deployers", "organization": {"login": "acme"}}},
+                            {"type": "Team", "reviewer": {"slug": "deployers"}},
                         ],
                     },
                 ],
@@ -904,7 +981,7 @@ mod tests {
             vec![
                 EnvironmentReviewer::User("octocat".to_owned()),
                 EnvironmentReviewer::Team {
-                    org: "acme".to_owned(),
+                    org: "owner".to_owned(),
                     slug: "deployers".to_owned()
                 },
             ]
@@ -1028,7 +1105,7 @@ mod tests {
                     "prevent_self_review": true,
                     "reviewers": [
                         {"type": "User", "reviewer": {"login": "octocat"}},
-                        {"type": "Team", "reviewer": {"slug": "deployers", "organization": {"login": "acme"}}},
+                        {"type": "Team", "reviewer": {"slug": "deployers"}},
                     ],
                 }],
             }),
@@ -1086,7 +1163,7 @@ mod tests {
                 "protection_rules": [{
                     "type": "required_reviewers",
                     "reviewers": [
-                        {"type": "Team", "reviewer": {"slug": "deployers", "organization": {"login": "acme"}}},
+                        {"type": "Team", "reviewer": {"slug": "deployers"}},
                     ],
                 }],
             }),
@@ -1118,7 +1195,7 @@ mod tests {
         assert_eq!(
             rules.reviewers,
             vec![EnvironmentReviewer::Team {
-                org: "acme".to_owned(),
+                org: "owner".to_owned(),
                 slug: "deployers".to_owned(),
             }],
             "the configured PAT fetches the environment's rules"
@@ -1129,6 +1206,184 @@ mod tests {
                 .await
                 .unwrap(),
             "the configured PAT expands the reviewer team"
+        );
+    }
+    #[tokio::test]
+    async fn resolve_at_tries_later_app_when_first_mint_fails() {
+        use axum::http::StatusCode;
+
+        let app = Router::new()
+            .route(
+                "/app/installations/101",
+                get(|| async { Json(json!({"account": {"login": "owner"}})) }),
+            )
+            .route(
+                "/app/installations/202",
+                get(|| async { Json(json!({"account": {"login": "owner"}})) }),
+            )
+            .route(
+                "/app/installations/101/access_tokens",
+                post(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"message": "first App unavailable"})),
+                    )
+                }),
+            )
+            .route(
+                "/app/installations/202/access_tokens",
+                post(|| async {
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "token": "installation-token",
+                            "expires_at": "2030-01-01T00:00:00Z"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/repos/owner/repo/environments/prod",
+                get(|| async {
+                    Json(json!({
+                        "protection_rules": [{"type": "wait_timer", "wait_timer": 7}]
+                    }))
+                }),
+            )
+            .route(
+                "/repos/owner/repo/environments/prod/deployment_protection_rules",
+                get(|| async { Json(json!({"custom_deployment_protection_rules": []})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _env = pat_env(&base).await;
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let mut first = crate::github_app::GitHubAppCredentials::for_tests(
+            "101",
+            key.clone(),
+            crate::github_app::MintFailurePolicy::Error,
+        );
+        first.installation_id = Some(101);
+        let mut second = crate::github_app::GitHubAppCredentials::for_tests(
+            "202",
+            key,
+            crate::github_app::MintFailurePolicy::Error,
+        );
+        second.installation_id = Some(202);
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().join("state"))
+            .await
+            .unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![first, second],
+            default_index: 0,
+        });
+        let shared = Arc::new(crate::state::SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
+        resolver.set_github_configured();
+
+        let rules = resolver
+            .resolve_at(&base, &shared, "owner/repo", "prod")
+            .await
+            .expect("the later candidate App should supply the rules");
+        assert_eq!(rules.wait_timer_minutes, 7);
+    }
+
+    #[tokio::test]
+    async fn pagination_truncation_fails_closed() {
+        let branches: Vec<Value> = (0..100)
+            .map(|index| json!({"name": format!("branch-{index}")}))
+            .collect();
+        let policies: Vec<Value> = (0..100)
+            .map(|index| json!({"type": "branch", "name": format!("branch-{index}")}))
+            .collect();
+        let members: Vec<Value> = (0..100)
+            .map(|index| json!({"login": format!("member-{index}")}))
+            .collect();
+        let app = Router::new()
+            .route(
+                "/repos/owner/repo/branches",
+                get({
+                    let branches = branches.clone();
+                    move || {
+                        let branches = branches.clone();
+                        async move { Json(branches) }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/environments/prod/deployment-branch-policies",
+                get({
+                    let policies = policies.clone();
+                    move || {
+                        let policies = policies.clone();
+                        async move { Json(json!({"branch_policies": policies})) }
+                    }
+                }),
+            )
+            .route(
+                "/orgs/owner/teams/deployers/members",
+                get({
+                    let members = members.clone();
+                    move || {
+                        let members = members.clone();
+                        async move { Json(members) }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let protected_error = fetch_protected_branches(&base, "token", "owner/repo")
+            .await
+            .expect_err("a full page at the cap must be treated as truncation");
+        assert!(protected_error.to_string().contains("truncated"));
+
+        let policy_error = fetch_branch_policies(&base, "token", "owner/repo", "prod")
+            .await
+            .expect_err("a full policy page at the cap must be treated as truncation");
+        assert!(policy_error.to_string().contains("truncated"));
+
+        let member_error = fetch_team_members(&base, "token", "owner", "deployers")
+            .await
+            .expect_err("a full member page at the cap must be treated as truncation");
+        assert!(member_error.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn team_reviewer_uses_repo_owner_when_organization_is_omitted() {
+        let reviewer = json!({
+            "type": "Team",
+            "reviewer": {"slug": "deployers", "organization_id": 1234}
+        });
+        assert_eq!(
+            parse_reviewer(&reviewer, "owner/repo"),
+            Some(EnvironmentReviewer::Team {
+                org: "owner".to_owned(),
+                slug: "deployers".to_owned(),
+            })
+        );
+
+        let nested = json!({
+            "type": "Team",
+            "reviewer": {
+                "slug": "deployers",
+                "organization": {"login": "acme"}
+            }
+        });
+        assert_eq!(
+            parse_reviewer(&nested, "owner/repo"),
+            Some(EnvironmentReviewer::Team {
+                org: "acme".to_owned(),
+                slug: "deployers".to_owned(),
+            })
         );
     }
 }

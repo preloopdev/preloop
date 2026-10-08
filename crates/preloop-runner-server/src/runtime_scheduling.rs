@@ -72,9 +72,13 @@ pub(crate) fn environment_url_literal(environment: &serde_json::Value) -> Option
 /// to exact names by the resolver), `custom_branch_policies` allows refs
 /// matching the branch/tag name patterns (fnmatch, `*` never crosses `/`).
 /// A restricted policy whose relevant list is empty denies the ref: GitHub
-/// creates the policy as "matching nothing deploys". The TOML fallback is
-/// the same shape: non-empty `deployment_branches`/`deployment_tags` means
-/// restricted; an entirely empty rule allows any ref.
+/// creates the policy as "matching nothing deploys" — with one exception:
+/// `protected_branches` on a repository with *no* protected branches lets
+/// every branch deploy ("If no branch protection rules are defined for any
+/// branch in the repository, then all branches can deploy"), while tags stay
+/// denied (tags cannot satisfy a protected-branch policy). The TOML fallback
+/// is the same shape: non-empty `deployment_branches`/`deployment_tags`
+/// means restricted; an entirely empty rule allows any ref.
 fn ref_allowed(rule: &crate::config::EnvironmentRules, git_ref: &str) -> bool {
     let branch = git_ref.strip_prefix("refs/heads/");
     let tag = git_ref.strip_prefix("refs/tags/");
@@ -85,6 +89,11 @@ fn ref_allowed(rule: &crate::config::EnvironmentRules, git_ref: &str) -> bool {
         return true;
     }
     if rule.protected_branches_only {
+        if rule.deployment_branches.is_empty() {
+            // Branch refs (and defensive bare branch names) are allowed;
+            // every other qualified ref, including tags, is denied.
+            return branch.is_some() || (!git_ref.starts_with("refs/") && tag.is_none());
+        }
         // Exact-name match against the repo's protected branches; tags and
         // other refs can never satisfy this policy.
         return branch
@@ -115,6 +124,21 @@ fn ref_allowed(rule: &crate::config::EnvironmentRules, git_ref: &str) -> bool {
                 })
         }
     }
+}
+
+/// Whether this rule set imposes any gate: branch policy, wait timer,
+/// reviewers, or a custom protection rule. An environment GitHub knows but
+/// protects with nothing resolves to a default rule set — identical to "no
+/// rules at all" — and must release an armed gate (a reviewer list deleted
+/// on GitHub resolves to this shape).
+fn rules_gate_anything(rule: &crate::config::EnvironmentRules) -> bool {
+    rule.branch_policy_restricted
+        || rule.protected_branches_only
+        || !rule.deployment_branches.is_empty()
+        || !rule.deployment_tags.is_empty()
+        || rule.wait_timer_minutes > 0
+        || rule.required_reviewers > 0
+        || !rule.custom_protection_rules.is_empty()
 }
 
 /// Evaluate the operator's `[environment_rules]` for one job at scheduler
@@ -151,6 +175,16 @@ pub fn check_environment_gates(
     let Some(env_name) = env_name else {
         return EnvironmentGateOutcome::Proceed;
     };
+    // A name still carrying a template (`${{ needs.* }}`) is decided by the
+    // promotion sweep once the needs complete and `hydrate_needs_context`
+    // resolves it — a job with unfinished needs cannot dispatch anyway, so
+    // arming a hold here would only deadlock it: `held` jobs never hydrate,
+    // and the parked-gate sweep cannot finish a name whose context is still
+    // being computed. Needs-less jobs keep the hold below — a template that
+    // can never resolve must not sneak onto a runner.
+    if resolved_environment_name_of(&env_name).is_none() && !job.needs.is_empty() {
+        return EnvironmentGateOutcome::Proceed;
+    }
     evaluate_environment_gate(
         &resolver.lookup_sync(repository, &env_name),
         git_ref,
@@ -182,6 +216,23 @@ pub fn evaluate_environment_gate(
     now_unix_nanos: i64,
 ) -> EnvironmentGateOutcome {
     use crate::environment_resolver::EnvironmentLookup;
+    // A name whose evaluation already failed (hydration stamped the marker
+    // once every need went terminal) can never resolve: fail the job closed
+    // rather than holding it forever on a `${{ … }}` that will always error.
+    if let Some(unresolvable) = gate
+        .as_ref()
+        .and_then(|gate| gate.unresolvable_name.as_deref())
+    {
+        let unresolvable = unresolvable.to_owned();
+        tracing::warn!(
+            run_id = %run_id.0,
+            job_id = %job_id.0,
+            environment = unresolvable,
+            "environment gate denied: the environment name's expression failed \
+             to evaluate after its needs completed"
+        );
+        return EnvironmentGateOutcome::Failed;
+    }
     let lookup = match lookup {
         EnvironmentLookup::Resolved(rules) => rules.clone(),
         EnvironmentLookup::Pending => {
@@ -206,10 +257,11 @@ pub fn evaluate_environment_gate(
         );
         return EnvironmentGateOutcome::Wait;
     }
-    let Some(rule) = lookup else {
-        // No rules for this environment: release any stale gate state and
-        // proceed. A GitHub 404 resolves the same way — environments
-        // auto-create unprotected.
+    let Some(rule) = lookup.filter(|rule| rules_gate_anything(rule)) else {
+        // No rules for this environment — or every rule was removed on
+        // GitHub (an empty rule set gates nothing) — so release any stale
+        // gate state and proceed. A GitHub 404 resolves the same way:
+        // environments auto-create unprotected.
         *gate = None;
         return EnvironmentGateOutcome::Proceed;
     };
@@ -716,14 +768,22 @@ pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
     let Some(name) = deferred_environment_name.as_deref() else {
         return;
     };
+    // The message carries the environment object only when the job builder
+    // resolved (or deferred) one; a deferred name without it can never
+    // resolve, which is the same verdict an evaluation failure lands on.
     let Some(actions_environment) = job.message.actions_environment.as_mut() else {
+        job.environment_gate
+            .get_or_insert_with(EnvironmentGateState::default)
+            .unresolvable_name = Some(name.to_owned());
         return;
     };
     match preloop_gha_parser::eval::resolve_string(name, &context) {
         Ok(resolved) => actions_environment.name = resolved,
         Err(error) => {
-            // Nothing downstream re-resolves this, so a raw template would
-            // become the deployment's name in the environment record.
+            // Nothing downstream re-resolves this: the raw template must not
+            // become the deployment's name, and the gate must not hold the
+            // job forever waiting on a name that can never evaluate. Stamp
+            // the marker — `evaluate_environment_gate` fails the job closed.
             tracing::error!(
                 run_id = %job.run_id.0,
                 job = %job.job_id.0,
@@ -731,6 +791,9 @@ pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
                 %error,
                 "deployment environment expression failed to evaluate after needs completed"
             );
+            job.environment_gate
+                .get_or_insert_with(EnvironmentGateState::default)
+                .unresolvable_name = Some(name.to_owned());
         }
     }
 }
@@ -1638,6 +1701,100 @@ bogus_field = true
         assert_eq!(gate.wait_until_unix_nanos, Some(NOW + 10 * MIN));
         assert_eq!(gate.approval_requested_at_unix_nanos, Some(NOW));
         assert_eq!(gate.approvals.len(), 1);
+    }
+
+    #[test]
+    fn protected_branches_without_protection_rules_allow_branches_but_not_tags() {
+        let lookup = crate::environment_resolver::EnvironmentLookup::Resolved(Some(
+            std::sync::Arc::new(crate::config::EnvironmentRules {
+                branch_policy_restricted: true,
+                protected_branches_only: true,
+                ..Default::default()
+            }),
+        ));
+        let mut gate = None;
+        assert_eq!(
+            evaluate_environment_gate(
+                &lookup,
+                "refs/heads/feature",
+                RunId::new(),
+                &JobId("deploy".to_owned()),
+                "prod",
+                &mut gate,
+                NOW,
+            ),
+            EnvironmentGateOutcome::Proceed
+        );
+        assert_eq!(
+            evaluate_environment_gate(
+                &lookup,
+                "refs/tags/feature",
+                RunId::new(),
+                &JobId("deploy".to_owned()),
+                "prod",
+                &mut gate,
+                NOW,
+            ),
+            EnvironmentGateOutcome::Failed,
+            "protected-branch mode still denies tags",
+        );
+    }
+
+    #[test]
+    fn default_github_rules_release_an_armed_approval_gate() {
+        let reviewer_rules = rules_for(crate::config::EnvironmentRules {
+            required_reviewers: 1,
+            ..Default::default()
+        });
+        let mut job = gate_job("prod");
+        assert_eq!(
+            check_environment_gates(
+                &reviewer_rules,
+                "owner/repo",
+                "refs/heads/main",
+                &mut job,
+                NOW,
+            ),
+            EnvironmentGateOutcome::Wait
+        );
+        let default_lookup = crate::environment_resolver::EnvironmentLookup::Resolved(Some(
+            std::sync::Arc::new(crate::config::EnvironmentRules::default()),
+        ));
+        let mut gate = job.environment_gate;
+        assert_eq!(
+            evaluate_environment_gate(
+                &default_lookup,
+                "refs/heads/main",
+                job.run_id,
+                &job.job_id,
+                "prod",
+                &mut gate,
+                NOW + MIN,
+            ),
+            EnvironmentGateOutcome::Proceed
+        );
+        assert!(gate.is_none());
+    }
+
+    #[test]
+    fn unresolvable_hydration_marker_fails_the_gate() {
+        let lookup = crate::environment_resolver::EnvironmentLookup::Resolved(None);
+        let mut gate = Some(EnvironmentGateState {
+            unresolvable_name: Some("${{ needs.build.outputs.env }}".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            evaluate_environment_gate(
+                &lookup,
+                "${{ needs.build.outputs.env }}",
+                RunId::new(),
+                &JobId("deploy".to_owned()),
+                "${{ needs.build.outputs.env }}",
+                &mut gate,
+                NOW,
+            ),
+            EnvironmentGateOutcome::Failed
+        );
     }
 
     #[test]

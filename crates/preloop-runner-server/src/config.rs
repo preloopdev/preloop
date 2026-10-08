@@ -435,14 +435,24 @@ pub struct EnvironmentRules {
     /// from both sides, so `main` matches `refs/heads/main`. GitHub treats
     /// deployment branch policies as `File.fnmatch` patterns (a `*` never
     /// crosses `/`), so matching goes through
-    /// `preloop_gha_parser::glob_match`. Empty means any branch may deploy.
+    /// `preloop_gha_parser::glob_match`. Empty means branches are
+    /// unrestricted only when *no* policy is configured — a configured
+    /// policy (a non-empty `deployment_branches`/`deployment_tags` or a
+    /// GitHub-side `deployment_branch_policy`, which sets
+    /// `branch_policy_restricted`) with an empty branch list deploys no
+    /// branch. Under GitHub's `protected_branches` mode the resolver expands
+    /// the repo's protected branches into this list and sets
+    /// `protected_branches_only`; an empty list there means the repository
+    /// has no branch protection rules, and GitHub lets every branch deploy.
     /// A run on a disallowed ref fails the job closed at admission.
     #[serde(default)]
     pub deployment_branches: Vec<String>,
     /// Git tag patterns allowed to deploy to this environment, matched
     /// against `refs/tags/*` refs (GitHub's `type: "tag"` deployment branch
     /// policies). Branches are never checked against tag patterns and vice
-    /// versa. Empty means any tag may deploy.
+    /// versa. Empty means tags are unrestricted only when *no* policy is
+    /// configured — a configured policy with an empty tag list deploys no
+    /// tag, and GitHub's `protected_branches` mode denies every tag.
     #[serde(default)]
     pub deployment_tags: Vec<String>,
     /// Minutes a job waits after becoming eligible before it may start.
