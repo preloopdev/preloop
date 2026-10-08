@@ -1479,7 +1479,10 @@ async fn late_skipped_completion_preserves_cancellation() {
     let run = RunId::new();
     node.submit_run(submit_run(
         run,
-        vec![submit_job(run, "cancelled", 1), submit_job(run, "pending", 2)],
+        vec![
+            submit_job(run, "cancelled", 1),
+            submit_job(run, "pending", 2),
+        ],
     ))
     .await
     .unwrap();
@@ -1849,7 +1852,10 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
     node.submit_run(submit_run(run_id, vec![build, leg0, leg1, leg2]))
         .await
         .unwrap();
-    let runner = node.register_runner(register_runner("fail-fast")).await.unwrap();
+    let runner = node
+        .register_runner(register_runner("fail-fast"))
+        .await
+        .unwrap();
 
     let mut client = node.writer().await.unwrap();
     let tx = client.transaction().await.unwrap();
@@ -1949,7 +1955,10 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(provisions, 0, "fail-fast cancellation clears provision requests");
+    assert_eq!(
+        provisions, 0,
+        "fail-fast cancellation clears provision requests"
+    );
 
     // Idempotent: second call cancels nothing.
     let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
