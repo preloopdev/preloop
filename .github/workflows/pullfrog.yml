@@ -12,11 +12,8 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# What the action spends: `contents` to push review fixes to the PR branch,
-# `pull-requests` and `issues` for reviews, comments and check runs. No
-# `id-token`: this run authenticates with `GH_TOKEN` below, and Pullfrog's
-# server only verifies OIDC tokens from GitHub's own issuer, so an id-token
-# minted by this engine is a credential nothing here can spend.
+# The action uses `GH_TOKEN` for GitHub API and git access.
+# `id-token` is not required.
 permissions:
   contents: write
   pull-requests: write
@@ -24,20 +21,9 @@ permissions:
 
 jobs:
   pullfrog:
-    # `@pullfrog …` (or `/pullfrog …`) from someone with write access. The
-    # repo is public, so an unrestricted comment trigger would hand the
-    # agent's model credentials to any GitHub user.
-    #
-    # Fork PRs never run, through two gates:
-    #   * `pull_request` events are skipped unless the head repo is this repo,
-    #     the same guard runner-conformance.yml uses.
-    #   * `issue_comment` payloads carry no head repo, so the first step below
-    #     resolves the PR's head through the API and skips the rest of the job.
-    # A fork review cannot work anyway — a fork run gets a read-only
-    # `GITHUB_TOKEN` and no secrets (`docs/fidelity-gap.md` §3c), so the action
-    # finds neither a writable token nor the model credentials it needs, and a
-    # fork's clone is ~470 MB on the self-hosted pool. A concurrency group
-    # cannot fence fork runs off either: group keys are repository-wide.
+    # Only authorized commenters can trigger reviews. Fork pull requests are
+    # excluded because their workflows do not receive secrets or write access.
+    # The event-specific guards below enforce both restrictions.
     if: >
        (github.event_name == 'workflow_dispatch' ||
         github.event_name == 'pull_request' ||
@@ -48,23 +34,16 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository) &&
        github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' &&
        github.actor != 'pullfrog[bot]'
-    # One review per PR: a newer commit or request supersedes the running one.
-    # Job-level, so the comments the `if:` above skips never enter the group,
-    # and a group per PR, so one PR's push never cancels another PR's review.
-    # Only trusted runs reach this group — a same-repo branch, or a comment
-    # from a write-access author — and the VM pool bounds how many run at once.
+    # Keep one active review per PR; newer commits or requests supersede the
+    # previous review without cancelling reviews for other PRs.
     concurrency:
       group: pullfrog-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: true
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     steps:
-      # `issue_comment` payloads carry no head repo, so a comment on a fork PR
-      # is invisible to the job-level `if:` above. Resolve the head through the
-      # API URL the payload itself names and gate every later step on it. Needs
-      # a real GitHub token (docs/github-tokens.md §3); an unresolved or failed
-      # lookup skips the run, so the gate fails closed. Comments on plain
-      # issues have no PR to resolve and are unaffected.
+      # Comment events do not include the PR head repository. Resolve it
+      # through the API and fail closed when the lookup fails or finds a fork.
       - name: Skip fork PRs on comment triggers
         id: fork_gate
         if: github.event_name == 'issue_comment' && github.event.issue.pull_request
@@ -143,31 +122,11 @@ jobs:
           model: anthropic/claude-sonnet-5-5
           effort: high
         env:
-          # LOAD-BEARING, do not delete: the action clones into
-          # `pullfrog-XXXXXX` under the system temp dir and never cleans up.
-          # `/tmp` on the self-hosted host is a tmpfs at 50% of RAM, so each
-          # leaked clone costs ~470 MB of memory permanently. Without this the
-          # leak filled /tmp and the kernel OOM-killed the runner VM and the
-          # control plane (#194, #195; regressed once by a comment cleanup).
-          # runner.temp is disk-backed and cleared between jobs.
+          # Use runner.temp, which is cleared between jobs, for action clones.
           TMPDIR: ${{ runner.temp }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # The action's external-token path: use this credential for git and
-          # the GitHub API instead of trading an OIDC token at Pullfrog's
-          # server. That exchange only trusts GitHub's own OIDC issuer, so on
-          # preloop it failed every run with "Token verification failed".
-          #
-          # LOAD-BEARING — it must also carry `pull-requests: write`, or the
-          # review POST (pulls.createReview) is a 403: a run with a read-only
-          # token still exits with the review unposted. `github.token` is a
-          # GitHub App installation token and the engine clamps it to what
-          # that installation actually grants (the preloop-dev App grants
-          # `pull_requests: read`, and the engine warns "the GitHub App
-          # installation does not grant [pull_requests: write]"). Either
-          #   * grant the App installation `pull-requests: write` (and
-          #     `contents: write` to let reviews push fixes), which makes the
-          #     `github.token` fallback below sufficient, or
-          #   * store a token that carries the scope as PULLFROG_GH_TOKEN in
-          #     the engine's secret store — it wins here when present.
+          # The token must have `pull-requests: write` to publish reviews.
+          # Prefer an explicitly configured token; otherwise use the workflow
+          # token, subject to the permissions granted to this run.
           GH_TOKEN: ${{ secrets.PULLFROG_GH_TOKEN || github.token }}
