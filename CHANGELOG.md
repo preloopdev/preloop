@@ -40,6 +40,8 @@ Releases before v0.27.0 predate the changelog.
   secrets, the declared permission set, and OIDC. Only fork pull-request
   workflows keep the withheld-secret profile. Runs persisted before this
   change keep their recorded tier.
+  A present unknown tier also fails closed; a missing tier remains the
+  trusted-native case.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
