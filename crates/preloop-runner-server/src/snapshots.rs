@@ -29,11 +29,11 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 /// test was never created.
 const SNAPSHOT_STAGING_DIR: &str = ".staging";
 
-/// How long an entry under [`SNAPSHOT_STAGING_DIR`] must sit untouched before
-/// the startup sweep treats it as abandoned. Snapshot capture is seconds to
-/// minutes even for large repositories; an hour without a write means the
-/// engine that owned it died between `create_dir_all` and the publish, or so
-/// long ago that it can no longer publish.
+/// How long a staging heartbeat may be stale before the startup sweep treats
+/// its entry as abandoned. Snapshot capture is seconds to minutes even for
+/// large repositories; a heartbeat keeps long captures safe while the process
+/// is alive, and an old heartbeat means the owner died between staging and
+/// publish.
 const SNAPSHOT_STAGING_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// TTL for cached GitHub repository metadata (numeric ID + visibility).
@@ -396,6 +396,29 @@ pub async fn create_workspace_snapshot(
                 staging_root.display()
             ))
         })?;
+    let heartbeat_path = staging_root.join(".heartbeat");
+    tokio::fs::write(&heartbeat_path, b"")
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to create snapshot staging heartbeat {}: {error}",
+                heartbeat_path.display()
+            ))
+        })?;
+    let heartbeat_staging_root = staging_root.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                tokio::fs::write(heartbeat_staging_root.join(".heartbeat"), b"").await
+            {
+                debug!(%error, "Snapshot staging heartbeat stopped");
+                break;
+            }
+        }
+    });
 
     // Detect the workspace's GitHub upstream concurrently with snapshot
     // creation. Best-effort: a missing remote or unresolvable slug leaves
@@ -412,6 +435,8 @@ pub async fn create_workspace_snapshot(
         ),
         detect_workspace_upstream(&workspace, shared, github_pat),
     );
+    heartbeat.abort();
+    let _ = heartbeat.await;
     if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await
         && staging_root.exists()
     {
@@ -1657,7 +1682,6 @@ async fn publish_staged_repository(staging: &FsPath, destination: &FsPath) -> Re
                         destination.display()
                     ))
                 })?
-                .join(SNAPSHOT_STAGING_DIR)
                 .join(format!(".publish-{}", uuid::Uuid::new_v4()));
             let source = staging.to_path_buf();
             let staged = in_place.clone();
@@ -3011,8 +3035,10 @@ pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
 /// tree is a full copy of a bare repository — left alone they accumulate at
 /// the size of the repositories being snapshotted.
 ///
-/// Entries younger than [`SNAPSHOT_STAGING_GRACE`] are spared: another engine
-/// process sharing the state directory may be capturing a snapshot right now.
+/// The `.heartbeat` file is refreshed throughout each capture, so a live
+/// capture is spared even when child-file writes do not update the staging
+/// root's mtime. Entries without a heartbeat use the root mtime for backwards
+/// compatibility.
 async fn sweep_abandoned_snapshot_staging(snapshots_dir: &FsPath) {
     let staging_root = snapshots_dir.join(SNAPSHOT_STAGING_DIR);
     let mut entries = match tokio::fs::read_dir(&staging_root).await {
@@ -3042,7 +3068,7 @@ async fn sweep_abandoned_snapshot_staging(snapshots_dir: &FsPath) {
             }
         };
         let path = entry.path();
-        match entry_age(&path).await {
+        match snapshot_staging_age(&path).await {
             Some(age) if age < SNAPSHOT_STAGING_GRACE => continue,
             Some(_) => {}
             // Unreadable metadata is not a reason to delete: the age is the
@@ -3241,6 +3267,13 @@ async fn entry_age(path: &FsPath) -> Option<std::time::Duration> {
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.elapsed().ok())
+}
+async fn snapshot_staging_age(path: &FsPath) -> Option<std::time::Duration> {
+    let heartbeat = path.join(".heartbeat");
+    match entry_age(&heartbeat).await {
+        Some(age) => Some(age),
+        None => entry_age(path).await,
+    }
 }
 
 async fn remove_cache_entry(path: &FsPath) {
@@ -6388,13 +6421,17 @@ mod snapshot_sweep_tests {
         .unwrap();
         let live = staging_root.join(format!("{}-{}", RunId::new(), uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&live).unwrap();
-        // Age the abandoned tree past the grace window; the live one keeps the
-        // mtime `create_dir_all` just gave it.
+        std::fs::write(abandoned.join(".heartbeat"), b"").unwrap();
+        std::fs::write(live.join(".heartbeat"), b"").unwrap();
+        // Age the abandoned heartbeat past the grace window. The live root is
+        // intentionally stale too: its fresh heartbeat represents a capture
+        // that is still writing into repository.git.
         let stale = filetime::FileTime::from_unix_time(
             chrono::Utc::now().timestamp() - SNAPSHOT_STAGING_GRACE.as_secs() as i64 - 60,
             0,
         );
-        filetime::set_file_mtime(&abandoned, stale).unwrap();
+        filetime::set_file_mtime(&abandoned.join(".heartbeat"), stale).unwrap();
+        filetime::set_file_mtime(&live, stale).unwrap();
 
         sweep_workspace_snapshots(&shared).await;
 
@@ -6441,7 +6478,7 @@ mod snapshot_staging_tests {
             return false;
         }
         // A read-only mount is not a usable staging root.
-        let probe = path.join(format!("preloop-device-probe-{}", std::process::id()));
+        let probe = path.join(format!("preloop-device-probe-{}", uuid::Uuid::new_v4()));
         match std::fs::create_dir(&probe) {
             Ok(()) => {
                 let _ = std::fs::remove_dir(&probe);
@@ -6632,8 +6669,11 @@ mod snapshot_staging_tests {
         let destination = snapshots_dir.join(RunId::new().to_string());
 
         let other = OtherFilesystem::create(&snapshots_dir, temp.path());
-        let staging = match &other {
-            Some(other) => other.path.join("repository.git"),
+        let staging_dir_guard = other
+            .as_ref()
+            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
+        let staging = match &staging_dir_guard {
+            Some(staging_dir) => staging_dir.path().join("repository.git"),
             // No second filesystem on this host: reproduce the kernel's answer
             // for the cross-device rename the recovery exists for.
             None => snapshots_dir
@@ -6701,8 +6741,11 @@ mod snapshot_staging_tests {
         std::fs::create_dir_all(&state_dir).unwrap();
 
         let other = OtherFilesystem::create(&state_dir, temp.path());
-        let tmpdir = match &other {
-            Some(other) => other.path.join("tmp"),
+        let tmpdir_guard = other
+            .as_ref()
+            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
+        let tmpdir = match &tmpdir_guard {
+            Some(tmpdir) => tmpdir.path().to_path_buf(),
             // No second filesystem to point `TMPDIR` at: the publish below
             // still runs, but only a host with a spare device can make the
             // rename cross-device. The recovery itself is covered by
