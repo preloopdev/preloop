@@ -144,9 +144,11 @@ fn auto_pr_candidate(run: &crate::models::RunRecord) -> Option<(String, String, 
     if run.conclusion.as_deref() != Some("success") || run.event != "push" {
         return None;
     }
-    // Only webhook-delivered runs carry a trust tier (the dispatcher stamps
-    // it). A native `/api/v1/runs` caller setting `event = "push"` is a local
-    // submission, not a GitHub push, and must not trigger auto-PR.
+    // Only durable webhook deliveries may trigger auto-PR. Trust-tier fields in
+    // a native submission are user input and do not prove webhook provenance.
+    if run.webhook_delivery_id.is_none() {
+        return None;
+    }
     crate::events::trust_tier::tier_of(&run.submission)?;
     // Push-back runs are client-managed: `github_push.rs` owns their PR.
     if run.submission.push.is_some() {
@@ -455,10 +457,18 @@ mod tests {
                             [run_id.to_string()],
                         )
                         .unwrap();
-                        // The webhook dispatcher stamps the trust tier; native
-                        // submissions carry none and are never auto-PR'd.
+                        // The webhook dispatcher stamps both provenance and
+                        // trust tier; a native client controls neither.
                         tx.execute(
-                            "UPDATE run_submissions                              SET submission = json_set(submission, '$.trust_tier', 'internal')                              WHERE run_id = ?1",
+                            "UPDATE runs SET webhook_delivery_id = ?1, origin = 'webhook' \
+                             WHERE run_id = ?2",
+                            [format!("auto-pr-{run_id}"), run_id.to_string()],
+                        )
+                        .unwrap();
+                        tx.execute(
+                            "UPDATE run_submissions \
+                             SET submission = json_set(submission, '$.trust_tier', 'internal') \
+                             WHERE run_id = ?1",
                             [run_id.to_string()],
                         )
                         .unwrap();

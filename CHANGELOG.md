@@ -41,6 +41,8 @@ Releases before v0.27.0 predate the changelog.
   every other origin requires HTTPS. Point a remote emulator or GHES at an
   `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
   authenticated.
+- **Webhook auto-PR requires delivery provenance**: native submissions cannot
+  trigger it by setting a trust-tier field.
 
 ### Fixed
 
