@@ -47,8 +47,14 @@ pub async fn upload_bundle(
             "failed to prepare bundle verification: {error}"
         )));
     }
-    let verified =
-        git_command_in(&verify_repo, &["bundle", "verify", temp.to_str().unwrap()]).await;
+    let verified = git_command(&[
+        "--git-dir",
+        verify_repo.to_str().unwrap(),
+        "bundle",
+        "verify",
+        temp.to_str().unwrap(),
+    ])
+    .await;
     let _ = tokio::fs::remove_dir_all(&verify_repo).await;
     if let Err(error) = verified {
         let _ = tokio::fs::remove_file(&temp).await;
