@@ -2977,15 +2977,31 @@ impl<'a> Sweep<'a> {
         Ok(false)
     }
 
-    /// The environment name a job's gate evaluates against: the armed gate's
-    /// stamp, else the hydrated message's `actions_environment` (deferred
-    /// names resolved), else the spec literal. `None` for environment-less
+    /// The environment name a job's gate evaluates against: the hydrated
+    /// message's `actions_environment` (deferred names resolved), else the
+    /// armed gate's stamp, else the spec literal. `None` for environment-less
     /// jobs.
+    ///
+    /// The message wins over the stamp: a gate armed while the name was still
+    /// a `${{ needs.* }}` template stamped that text, and re-evaluating the
+    /// template after `hydrate_needs_context` resolved the real name would
+    /// decide against an environment nobody configured.
     async fn environment_name_for(
         &mut self,
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<Option<String>, ControlError> {
+        let message_name = self.message(run_id, job_id).await?.and_then(|message| {
+            message
+                .actions_environment
+                .map(|environment| environment.name)
+        });
+        if let Some(name) = message_name
+            .as_deref()
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+        {
+            return Ok(Some(name.to_owned()));
+        }
         let node_gate = self
             .graphs
             .get(&run_id)
@@ -2994,23 +3010,15 @@ impl<'a> Sweep<'a> {
         if let Some(name) = node_gate.as_ref().and_then(|g| g.environment_name.clone()) {
             return Ok(Some(name));
         }
-        let message_name = self.message(run_id, job_id).await?.and_then(|message| {
-            message
-                .actions_environment
-                .map(|environment| environment.name)
-        });
-        if let Some(name) = message_name {
-            return Ok(Some(name));
-        }
-        let literal = self
-            .graphs
-            .get(&run_id)
-            .and_then(|g| g.nodes.get(job_id))
-            .and_then(|node| {
-                crate::runtime_scheduling::environment_gate_name_of(node.environment.as_ref())
-            })
-            .map(str::to_owned);
-        Ok(literal)
+        Ok(message_name.or_else(|| {
+            self.graphs
+                .get(&run_id)
+                .and_then(|g| g.nodes.get(job_id))
+                .and_then(|node| {
+                    crate::runtime_scheduling::environment_gate_name_of(node.environment.as_ref())
+                })
+                .map(str::to_owned)
+        }))
     }
 
     /// Hydrate + enqueue one promotable job.
@@ -6917,10 +6925,22 @@ async fn release_parked_nodes(
             .and_then(|json| from_json(&json).ok());
         // The resolved name wins: a `Pending` arm records the post-hydration
         // name so the sweep re-evaluates against the environment GitHub
-        // knows, not the expression text.
-        let env_name = gate
-            .as_ref()
-            .and_then(|gate| gate.environment_name.clone())
+        // knows, not the expression text. A message whose name is still a
+        // template (`${{ needs.* }}` before its needs complete) proves nothing
+        // beyond what the stamp already records.
+        let message_name = sweep
+            .message(run_id, &job_id)
+            .await?
+            .and_then(|message| message.actions_environment)
+            .map(|environment| environment.name);
+        let env_name = message_name
+            .as_deref()
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+            .map(str::to_owned)
+            .or_else(|| {
+                gate.as_ref()
+                    .and_then(|gate| gate.environment_name.clone())
+            })
             .or_else(|| {
                 crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
                     .map(str::to_owned)

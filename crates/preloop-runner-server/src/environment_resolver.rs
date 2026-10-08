@@ -249,28 +249,50 @@ impl EnvironmentResolver {
             return Ok(entry.rules.clone());
         }
 
-        let app = crate::github_app::select_app_for_repo(shared, repository).await;
+        // A lookup that failed without a definitive "no App is installed"
+        // answer must not fall through to the TOML fallback: a multi-App
+        // registry whose lookups all timed out would otherwise overwrite an
+        // established GitHub-sourced entry with local rules (or resolve a
+        // never-fetched key to "no rules"), letting a protected environment
+        // run unprotected. The key stays pending and stale GitHub rules keep
+        // answering.
+        let app = match crate::github_app::candidate_apps_for_repo_inner(shared, repository).await {
+            Ok(candidates) => candidates.into_iter().next(),
+            Err(crate::github_app::AppLookupError::NotInstalled) => None,
+            Err(crate::github_app::AppLookupError::Transient(error)) => {
+                return Err(error.context(
+                    "GitHub App installation lookup failed; the repository's \
+                     environment rules cannot be sourced",
+                ));
+            }
+        };
         // The configured PAT (`PRELOOP_GITHUB_TOKEN` or the config file's
         // `github.pat`) — the same credential `AppState` hands the rest of
         // the server, so a config-file-only PAT covers resolution too.
         let pat = shared.state.static_github_pat();
         let result: anyhow::Result<Arc<EnvironmentRules>> = if let Some(creds) = &app {
             self.github_configured.store(true, Ordering::Release);
-            self.repo_sources
-                .write()
-                .insert(repository.to_owned(), RulesSource::Github);
             let token = environment_token(creds, repository).await?;
-            fetch_environment_rules(api_base, &token, repository, environment)
+            let rules = fetch_environment_rules(api_base, &token, repository, environment)
                 .await
-                .map(Arc::new)
+                .map(Arc::new);
+            if rules.is_ok() {
+                self.repo_sources
+                    .write()
+                    .insert(repository.to_owned(), RulesSource::Github);
+            }
+            rules
         } else if let Some(token) = pat {
             self.github_configured.store(true, Ordering::Release);
-            self.repo_sources
-                .write()
-                .insert(repository.to_owned(), RulesSource::Github);
-            fetch_environment_rules(api_base, &token, repository, environment)
+            let rules = fetch_environment_rules(api_base, &token, repository, environment)
                 .await
-                .map(Arc::new)
+                .map(Arc::new);
+            if rules.is_ok() {
+                self.repo_sources
+                    .write()
+                    .insert(repository.to_owned(), RulesSource::Github);
+            }
+            rules
         } else {
             // No credential covers this repository: the local TOML table is
             // the whole story (the brief's local-mode fallback).

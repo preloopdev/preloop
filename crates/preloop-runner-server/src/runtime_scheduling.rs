@@ -17,17 +17,27 @@ pub enum EnvironmentGateOutcome {
 /// How long a pending-approval gate stays open before the job fails closed.
 pub const ENVIRONMENT_APPROVAL_WINDOW_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
-/// Resolve the literal `environment:` name for rule lookup from the raw
-/// `environment:` value — the form both a live `QueuedJob` and the persisted
-/// `job_specs` row expose. Expression-based names arrive here unresolvable
-/// (same as the registry existence check in `build_job_artifacts`); they match
-/// no rules and proceed.
+/// Resolve the literal `environment:` name from the raw `environment:` value —
+/// the form the persisted `job_specs` row exposes (a `QueuedJob` carries the
+/// same value until it is built into a runner message).
 pub(crate) fn environment_gate_name_of(environment: Option<&serde_json::Value>) -> Option<&str> {
     match environment? {
         serde_json::Value::String(name) => Some(name.as_str()),
         serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
         _ => None,
     }
+}
+
+/// The environment name a gate may evaluate against, or `None` while the name
+/// is still an unevaluated `${{ … }}` template.
+///
+/// A deferred name (`${{ needs.* }}`) is finished by `hydrate_needs_context`
+/// once its needs complete; until then it names no real GitHub environment, so
+/// looking it up would only manufacture a bogus 404 — which GitHub answers the
+/// same way for "no such environment" and "auto-created unprotected". The gate
+/// holds instead (`evaluate_environment_gate`), fail closed.
+pub(crate) fn resolved_environment_name_of(name: &str) -> Option<&str> {
+    (!preloop_gha_parser::eval::has_expressions(name)).then_some(name)
 }
 
 /// The statically known `environment.url` of a stored `environment:` value —
@@ -112,6 +122,14 @@ fn ref_allowed(rule: &crate::config::EnvironmentRules, git_ref: &str) -> bool {
 /// occupies a concurrency slot, and before queueing so a denied job's
 /// environment secrets never reach a runner.
 ///
+/// The name evaluated is the one the runner message carries
+/// (`actions_environment.name`): the parser resolves `matrix.*` there, and a
+/// `needs`-deferred name is finished by `hydrate_needs_context` before the
+/// promotion sweep re-evaluates the gate. Evaluating the raw spec value
+/// instead would gate `${{ matrix.env }}` under its own text — which no
+/// repository configures — while the job's secrets, OIDC claim and deployment
+/// would all use the resolved environment.
+///
 /// Gate progress is stamped on `job.environment_gate`, which travels in the
 /// persisted job snapshot: a restart re-arms from the stamps rather than
 /// dropping an armed gate (fail closed). Removing an environment's rules
@@ -123,7 +141,13 @@ pub fn check_environment_gates(
     job: &mut QueuedJob,
     now_unix_nanos: i64,
 ) -> EnvironmentGateOutcome {
-    let env_name = environment_gate_name_of(job.environment.as_ref()).map(str::to_owned);
+    let env_name = job
+        .message
+        .actions_environment
+        .as_ref()
+        .map(|environment| environment.name.as_str())
+        .or_else(|| environment_gate_name_of(job.environment.as_ref()))
+        .map(str::to_owned);
     let Some(env_name) = env_name else {
         return EnvironmentGateOutcome::Proceed;
     };
@@ -162,11 +186,26 @@ pub fn evaluate_environment_gate(
         EnvironmentLookup::Resolved(rules) => rules.clone(),
         EnvironmentLookup::Pending => {
             let gate = gate.get_or_insert_with(EnvironmentGateState::default);
-            gate.environment_name
-                .get_or_insert_with(|| env_name.to_owned());
+            gate.environment_name = Some(env_name.to_owned());
             return EnvironmentGateOutcome::Wait;
         }
     };
+    // An unevaluated name (`${{ needs.* }}` before its needs complete) is no
+    // environment GitHub knows: any lookup against the template text answers
+    // "no rules", which would release a job that production rules protect.
+    // Hold until `hydrate_needs_context` resolves the name and the sweep
+    // re-evaluates it. The gate is not cleared, so the hold survives.
+    if resolved_environment_name_of(env_name).is_none() {
+        let gate = gate.get_or_insert_with(EnvironmentGateState::default);
+        gate.environment_name = Some(env_name.to_owned());
+        tracing::debug!(
+            run_id = %run_id.0,
+            job_id = %job_id.0,
+            environment = env_name,
+            "environment gate: name still an unevaluated expression; holding"
+        );
+        return EnvironmentGateOutcome::Wait;
+    }
     let Some(rule) = lookup else {
         // No rules for this environment: release any stale gate state and
         // proceed. A GitHub 404 resolves the same way — environments
@@ -175,8 +214,10 @@ pub fn evaluate_environment_gate(
         return EnvironmentGateOutcome::Proceed;
     };
     let gate = gate.get_or_insert_with(EnvironmentGateState::default);
-    gate.environment_name
-        .get_or_insert_with(|| env_name.to_owned());
+    // The stamp tracks the name this evaluation ran against. Keeping a stale
+    // stamp would make the sweeps re-evaluate the template text after
+    // `hydrate_needs_context` resolved the real name.
+    gate.environment_name = Some(env_name.to_owned());
 
     // 0. A recorded rejection concludes the deployment as a failure,
     // regardless of what the current rules say (GitHub: rejecting a pending
@@ -1224,6 +1265,109 @@ mod environment_gate_tests {
         assert!(
             job.environment_gate.is_none(),
             "no rules must not arm gate state"
+        );
+    }
+
+    /// The gate evaluates the name the runner message carries, not the raw
+    /// spec text: `environment: ${{ matrix.env }}` used to be looked up as the
+    /// literal string `${{ matrix.env }}`, which no repository configures, so
+    /// the job proceeded unprotected while its secrets, OIDC claim and
+    /// deployment all used the resolved environment.
+    #[test]
+    fn matrix_expression_environment_gates_on_the_resolved_name() {
+        let mut job = gate_job("${{ matrix.env }}");
+        job.message.actions_environment =
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: "prod".to_owned(),
+                url: None,
+            });
+        let rules = rules_for(crate::config::EnvironmentRules {
+            required_reviewers: 1,
+            ..Default::default()
+        });
+        let outcome =
+            check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW);
+        assert_eq!(
+            outcome,
+            EnvironmentGateOutcome::Wait,
+            "the resolved environment's reviewer gate must arm"
+        );
+        assert_eq!(
+            job.environment_gate
+                .as_ref()
+                .and_then(|gate| gate.environment_name.as_deref()),
+            Some("prod"),
+            "the stamp records the environment the gate is armed against"
+        );
+    }
+
+    /// An unevaluated name is not an environment GitHub can know: a lookup
+    /// against the template text answers "no rules", and proceeding on that
+    /// would release a job whose production rules are only resolved once the
+    /// needs complete.
+    #[test]
+    fn unresolved_deferred_environment_name_holds() {
+        let mut job = gate_job("${{ needs.setup.outputs.env }}");
+        job.message.actions_environment =
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: "${{ needs.setup.outputs.env }}".to_owned(),
+                url: None,
+            });
+        let outcome = check_environment_gates(
+            &no_rules(),
+            "owner/repo",
+            "refs/heads/main",
+            &mut job,
+            NOW,
+        );
+        assert_eq!(
+            outcome,
+            EnvironmentGateOutcome::Wait,
+            "an unresolved environment name must hold, not proceed"
+        );
+    }
+
+    /// A gate armed while the name was still a template must not keep the
+    /// template as its stamp once the resolved name is evaluated: the sweeps
+    /// re-read the stamp, and a stale one would re-evaluate the expression
+    /// text after `hydrate_needs_context` resolved the real environment.
+    #[test]
+    fn gate_stamp_tracks_the_resolved_name() {
+        let mut job = gate_job("${{ needs.setup.outputs.env }}");
+        job.message.actions_environment =
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: "${{ needs.setup.outputs.env }}".to_owned(),
+                url: None,
+            });
+        let rules = rules_for(crate::config::EnvironmentRules {
+            required_reviewers: 1,
+            ..Default::default()
+        });
+        let _ = check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW);
+        assert_eq!(
+            job.environment_gate
+                .as_ref()
+                .and_then(|gate| gate.environment_name.as_deref()),
+            Some("${{ needs.setup.outputs.env }}"),
+            "the hold records the name it is waiting to resolve"
+        );
+
+        // The needs complete and the promotion sweep re-evaluates the real
+        // name: the stamp must follow it.
+        job.message.actions_environment =
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: "prod".to_owned(),
+                url: None,
+            });
+        let outcome =
+            check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW);
+        assert_eq!(outcome, EnvironmentGateOutcome::Wait);
+        assert_eq!(
+            job.environment_gate
+                .as_ref()
+                .and_then(|gate| gate.environment_name.as_deref()),
+            Some("prod"),
+            "the stamp must follow the resolved name"
         );
     }
 

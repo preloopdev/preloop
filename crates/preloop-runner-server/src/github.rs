@@ -1475,19 +1475,31 @@ async fn post_deployment_status(
     .map(|_| ())
 }
 
-/// PATCH a check run's status (and clear/surface actions) for the
-/// environment review surface. GitHub only accepts `actions` alongside
-/// `status: action_required`; `None` clears on the approving transition.
+/// PATCH a check run for the environment review surface.
+///
+/// `action_required` is a check-run *conclusion*, never a status: the writable
+/// statuses are `queued`, `in_progress` and `completed`, and GitHub rejects a
+/// PATCH whose status is not one of them (`422`). `actions` — the
+/// Approve/Reject buttons whose click arrives as
+/// `check_run.requested_action` — are accepted only on a completed run whose
+/// conclusion is `action_required`. `conclusion: None` sends `in_progress`,
+/// clearing the review surface on the approving transition.
 async fn patch_check_run_actions(
     shared: &Arc<SharedState>,
     token: &str,
     repo: &str,
     check_run_id: u64,
-    status: &str,
+    conclusion: Option<&str>,
     actions: Option<Value>,
     summary: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut body = serde_json::json!({ "status": status });
+    let mut body = match conclusion {
+        Some(conclusion) => serde_json::json!({
+            "status": "completed",
+            "conclusion": conclusion,
+        }),
+        None => serde_json::json!({ "status": "in_progress" }),
+    };
     if let Some(actions) = actions {
         body["actions"] = actions;
     }
@@ -1566,7 +1578,7 @@ pub async fn announce_environment_gates(shared: &Arc<SharedState>, run: Option<R
                 &token,
                 &row.repository,
                 check_run_id,
-                "action_required",
+                Some("action_required"),
                 Some(environment_review_actions()),
                 Some(&format!(
                     "Deployment to environment `{}` is awaiting review",
@@ -1628,12 +1640,15 @@ pub async fn report_environment_review(
         // lifecycle updates continue; the gate is already released. Rejected:
         // leave the run `action_required` — the terminal PATCH from
         // `report_check_run_completed` lands on top anyway.
-        let (status, summary) = if approved {
+        let (conclusion, summary) = if approved {
             let who = reviewer.unwrap_or("a reviewer");
-            ("in_progress", format!("Deployment approved by {who}"))
+            (None, format!("Deployment approved by {who}"))
         } else {
             let who = reviewer.unwrap_or("a reviewer");
-            ("action_required", format!("Deployment rejected by {who}"))
+            (
+                Some("action_required"),
+                format!("Deployment rejected by {who}"),
+            )
         };
         let summary = match note {
             Some(note) if !note.is_empty() => format!("{summary}: {note}"),
@@ -1644,7 +1659,7 @@ pub async fn report_environment_review(
             &token,
             &row.repository,
             check_run_id,
-            status,
+            conclusion,
             if approved {
                 None
             } else {
@@ -6753,6 +6768,20 @@ jobs:
             gate.approval_requested_at_unix_nanos.is_some(),
             "the required-reviewer gate must stamp the wait"
         );
+        // The review surface is a *completed* check run whose conclusion is
+        // `action_required`: `action_required` is not a writable status, and
+        // GitHub rejects the PATCH (422) when it is sent as one.
+        let announce_calls = requests.lock().clone();
+        assert!(
+            announce_calls.iter().any(|request| request.contains("check-runs/99")
+                && request.contains("\"status\":\"completed\"")
+                && request.contains("\"conclusion\":\"action_required\"")
+                && request.contains("\"actions\"")
+                && request.contains("\"identifier\":\"approve\"")
+                && request.contains("\"identifier\":\"reject\"")),
+            "the announce PATCHes a completed action_required check run with the \
+             Approve/Reject actions: {announce_calls:?}"
+        );
 
         // The Approve click delivers `check_run.requested_action` under the
         // reviewer's login.
@@ -6860,6 +6889,104 @@ jobs:
                 .iter()
                 .all(|(_, url)| url.as_deref() == Some("https://staging.example.com")),
             "every status carries the environment url: {requests:?}"
+        );
+    }
+
+    /// A transient App-installation lookup failure is not "no credential
+    /// covers this repository". Treating it as the latter resolved the
+    /// repository to the local TOML table — empty by default — so the gate
+    /// read "no protection" and the job ran with the protected environment's
+    /// secrets and OIDC claim. The key stays pending (fail closed) instead.
+    #[tokio::test]
+    async fn transient_app_lookup_holds_environment_rules_fail_closed() {
+        use axum::routing::get;
+        // `true` → 500 on the installations endpoint (a GitHub outage of the
+        // kind that also fails 5xx/timeouts); `false` → a definitive "no
+        // installation on this owner".
+        let fail = std::sync::Arc::new(parking_lot::Mutex::new(true));
+        let stub = axum::Router::new().route(
+            "/app/installations",
+            get({
+                let fail = fail.clone();
+                move || {
+                    let fail = *fail.lock();
+                    async move {
+                        if fail {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "{\"message\":\"server error\"}",
+                            )
+                        } else {
+                            (StatusCode::OK, "[]")
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _pat = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = WebhookFixture::new(&temp).await;
+        let mut state = fixture.state.clone();
+        // Two Apps: the single-App fallback (a lone App is still the only App
+        // minting can try) deliberately does not apply.
+        state.github_app = None;
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![
+                crate::github_app::GitHubAppCredentials::for_tests(
+                    "111111",
+                    rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+                crate::github_app::GitHubAppCredentials::for_tests(
+                    "222222",
+                    rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+            ],
+            default_index: 0,
+        });
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+
+        let lookup = crate::github_app::candidate_apps_for_repo_inner(&shared, "owner/repo").await;
+        assert!(
+            matches!(lookup, Err(crate::github_app::AppLookupError::Transient(_))),
+            "a 5xx installation lookup is transient, not 'not installed': {lookup:?}"
+        );
+
+        let error = state
+            .environment_resolver
+            .resolve_at(&api_base, &shared, "owner/repo", "prod")
+            .await
+            .expect_err("a transient lookup failure must not resolve rules");
+        assert!(
+            error.to_string().contains("installation lookup failed"),
+            "the failure names the App lookup: {error}"
+        );
+        assert!(
+            matches!(
+                state.environment_resolver.lookup_sync("owner/repo", "prod"),
+                crate::environment_resolver::EnvironmentLookup::Pending
+            ),
+            "the key stays pending so the gate holds instead of proceeding unprotected"
+        );
+
+        // A definitive "no installation" answer is an answer: the repository
+        // is uncovered and the local (empty) rule set applies.
+        *fail.lock() = false;
+        let lookup = crate::github_app::candidate_apps_for_repo_inner(&shared, "owner/repo").await;
+        assert!(
+            matches!(lookup, Ok(ref candidates) if candidates.is_empty()),
+            "no App is installed on the owner: {lookup:?}"
         );
     }
 

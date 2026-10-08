@@ -21,12 +21,12 @@ Releases before v0.27.0 predate the changelog.
   seconds and refreshed by the reaper. `[environment_rules]` TOML remains
   the source for repositories no credential covers, and for local mode.
 - Reviewer approvals arrive as `check_run.requested_action` webhooks: the
-  held job's check run is PATCHed to `action_required` with Approve/Reject
-  actions, the deployment status is `pending`, and an authorized click
-  releases the job (`queued`) or rejects it (the job fails, matching
-  GitHub). Approvals, rejections, and the native admin override are
-  recorded in a new durable `environment_approvals` table that outlives the
-  run and its archival.
+  held job's check run completes with an `action_required` conclusion and
+  Approve/Reject buttons, the deployment status is `pending`, and an
+  authorized click releases the job or rejects it (the job fails, matching
+  GitHub). The check run returns to `in_progress` after approval. Approvals,
+  rejections, and the native admin override are recorded in a durable
+  `environment_approvals` table that outlives the run and its archival.
 - Every `environment:` job now gets a GitHub Deployment whose statuses
   track the job: `pending` while reviewers deliberate, `queued` on
   approval, `in_progress` at job start, `success`/`failure` at conclusion.
@@ -52,6 +52,8 @@ Releases before v0.27.0 predate the changelog.
 - Environment rules that cannot be fetched hold the job fail-closed
   (a resolver `Pending` state) instead of proceeding unprotected; a job
   not approved within 24 hours fails closed.
+- Environment names are evaluated before protection lookup. Jobs whose names
+  depend on unfinished `needs` outputs remain held until the name resolves.
 
 ### Security
 

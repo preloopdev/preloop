@@ -212,6 +212,40 @@ impl LiteBackend {
     }
 }
 
+/// The environment name recorded on a job's stored runner message, when it
+/// has one. Read from `job_messages.message_template`; the same source
+/// `environment_deployment` resolves the deployed name from.
+fn message_environment_name(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<Option<String>, ControlError> {
+    let template: Option<String> = tx
+        .prepare_cached(
+            "SELECT message_template FROM job_messages WHERE run_id = ?1 AND job_id = ?2",
+        )
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id), job_id.0], |row| row.get(0))
+        .optional()
+        .map_err(db)?;
+    Ok(template.and_then(|template| {
+        serde_json::from_str::<serde_json::Value>(&template)
+            .ok()
+            .and_then(|message| {
+                message
+                    .get("environment")
+                    .or_else(|| message.get("actionsEnvironment"))
+                    .cloned()
+            })
+            .and_then(|environment| {
+                environment
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    }))
+}
+
 /// Resolve `(environment_name, environment_url)` for one job from its three
 /// sources: the armed gate blob (post-hydration stamp), the stored runner
 /// message (`environment` / `actionsEnvironment` — deferred names resolve
@@ -242,14 +276,20 @@ fn resolve_environment_parts(
             })
     });
     let spec = spec_env.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    let environment = gate
-        .and_then(|gate| gate.environment_name)
+    // A hydrated message name outranks the stamp: an arm taken while the name
+    // was still a `${{ needs.* }}` template stamped that text, and the sweeps
+    // must re-evaluate the environment GitHub actually knows once
+    // `hydrate_needs_context` resolves it.
+    let message_name = message_environment
+        .as_ref()
+        .and_then(|env| env.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+        .map(str::to_owned);
+    let environment = message_name
         .or_else(|| {
-            message_environment
-                .as_ref()
-                .and_then(|env| env.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
+            gate.as_ref()
+                .and_then(|gate| gate.environment_name.clone())
         })
         .or_else(|| {
             spec.as_ref().and_then(|value| {
@@ -436,10 +476,17 @@ fn release_parked_jobs(
         let mut gate = job.environment_gate.clone();
         // The resolved name wins: a `Pending` arm records the post-hydration
         // name so the sweep re-evaluates against the environment GitHub
-        // knows, not the expression text.
-        let env_name = gate
-            .as_ref()
-            .and_then(|gate| gate.environment_name.clone())
+        // knows, not the expression text. A message whose name is still a
+        // template (`${{ needs.* }}` before its needs complete) proves nothing
+        // beyond what the stamp already records.
+        let env_name = message_environment_name(tx, run_id, &job.job_id)?
+            .as_deref()
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+            .map(str::to_owned)
+            .or_else(|| {
+                gate.as_ref()
+                    .and_then(|gate| gate.environment_name.clone())
+            })
             .or_else(|| {
                 crate::runtime_scheduling::environment_gate_name_of(
                     spec.as_ref().and_then(|spec| spec.environment.as_ref()),
