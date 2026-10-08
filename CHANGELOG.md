@@ -99,6 +99,16 @@ Releases before v0.27.0 predate the changelog.
 
 ### Security
 
+- **A system install initializes the control database as the `preloop`
+  service account, never as root**: the store lives in the state tree the
+  install chowns to the service, so a root-owned create, write or chmod
+  there could be aimed anywhere the account can place a symlink — a dangling
+  `state/preloop.db` link had root create and chmod a file of the attacker's
+  choosing. The installer now prepares the store after the ownership
+  transfer, dropped to the service account, and the brand-new preparation
+  refuses a symlinked database path (and, for a privileged caller, a parent
+  directory that is not exclusively its own) instead of following it.
+
 - **The static GitHub PAT no longer crosses the network over plain HTTP**:
   action resolution and action tarball downloads attached the PAT to any
   request for a configured GitHub origin regardless of scheme, so a
@@ -313,6 +323,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- Control-database schema is now versioned and migratable: refinery 0.10 runs
+  the forward-only migration sets in `migrations/{sqlite,postgres}` (rerun
+  history attempt keys, environment deployments/review audit, fork-approval
+  sweep index), the ledger `refinery_schema_history` is the sole version
+  authority, and `preloop store migrate|status` is the explicit
+  initialize/upgrade path. `preloop serve` never migrates: a missing, older,
+  newer or divergent schema refuses with the recovery command, and a legacy
+  store refuses with `preloop store import-legacy`. SQLite migrations take a
+  consistent pre-migration backup (`VACUUM INTO`) as the rollback path;
+  populated baseline fixtures and an executable parity test against
+  `schema.sql` keep upgrades lossless. Brand-new local installs still
+  initialize on first `preloop run`/`init`/`server install`.
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and
