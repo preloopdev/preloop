@@ -1721,7 +1721,26 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
         .await
         .unwrap();
     }
-    // Fail-fast defaults to true (no job_specs row).
+    // The in-flight siblings carry the live binding/pool rows a claimed leg
+    // accrues; fail-fast cancellation must clear them like `settle_node`.
+    for leg in ["build-1", "build-2"] {
+        tx.execute(
+            "INSERT INTO job_assignments (run_id, job_id, runner_id) \
+             VALUES ($1::text::uuid, $2, 1) \
+             ON CONFLICT (run_id, job_id) DO NOTHING",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, labels) \
+             VALUES ($1::text::uuid, $2, 'ns', 'pk', '{}'::jsonb) \
+             ON CONFLICT (run_id, job_id) DO NOTHING",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
     // Mark leg0 as failed.
     tx.execute(
         "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
@@ -1761,6 +1780,24 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
         .unwrap()
         .get(0);
     assert_eq!(st, "cancelled");
+    let assignments: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM job_assignments WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(assignments, 0, "fail-fast cancellation clears assignments");
+    let provisions: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM provision_requests WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(provisions, 0, "fail-fast cancellation clears provision requests");
 
     // Idempotent: second call cancels nothing.
     let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(

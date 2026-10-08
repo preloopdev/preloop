@@ -3300,6 +3300,7 @@ impl<'a> Sweep<'a> {
             )
             .await
             .map_err(db)?;
+            clear_assignment(tx, run_id, &sibling).await?;
             release_concurrency_for_job(backend, tx, run_id, &sibling).await?;
             cancelled.push(sibling);
         }
