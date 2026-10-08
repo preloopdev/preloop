@@ -1005,6 +1005,19 @@ impl TestDb<'_> {
         self.0.execute(sql, params)
     }
 
+    /// `EXPLAIN QUERY PLAN` detail lines for one statement, so index tests
+    /// can assert which access path (and whether a sort) the planner picks.
+    pub fn query_plan(&self, sql: &str) -> Vec<String> {
+        let mut stmt = self
+            .0
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare EXPLAIN QUERY PLAN");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("run EXPLAIN QUERY PLAN");
+        rows.map(|row| row.expect("plan row")).collect()
+    }
+
     /// `job_assignments` staleness: `assigned_at`/`first_assigned_at`.
     pub fn set_assignment_times(
         &self,

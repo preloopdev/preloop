@@ -5277,6 +5277,69 @@ pub(crate) mod suite {
             outcome_b.run_number
         );
     }
+
+    /// Ids and instants have one canonical stored form on both backends: run
+    /// uuids lowercase (RFC 4122 text form), instants whole microseconds
+    /// since the Unix epoch. A sub-microsecond input is truncated toward the
+    /// epoch (`as_micros` / `timestamp_micros`), never rounded; nanosecond
+    /// `bigint` stamps keep full precision.
+    ///
+    /// The provenance of the run's `created_at` still differs and is recorded
+    /// here instead of hidden: SQLite stores the submitted value (truncated
+    /// to µs), Postgres takes the database clock (`DEFAULT now()`). Only the
+    /// precision rule and the nanosecond column are asserted identical.
+    pub(crate) async fn ids_and_timestamps_are_stored_canonically(backend: &dyn ControlBackend) {
+        let nanos = 1_700_000_000_123_456_789_i64;
+        let run_id = RunId(uuid::Uuid::parse_str("0F8FAD5B-D9CB-469F-A165-70867728950E").unwrap());
+        let mut record = super::run_record(run_id);
+        // Upper-case spelling, deliberately: the stored form is the canonical
+        // lowercase one on both backends.
+        record.created_at = chrono::DateTime::from_timestamp_nanos(nanos);
+        record.fork_approval_requested_at_unix_nanos = Some(nanos);
+        record
+            .job_names
+            .insert(JobId("build".to_owned()), "build".to_owned());
+        backend
+            .submit_run(SubmitRun {
+                namespace: "default".to_owned(),
+                record,
+                jobs: vec![submit_job(run_id, "build", 1)],
+                workflow_concurrency: None,
+                empty_concurrency_group: false,
+                check_hostable: false,
+            })
+            .await
+            .unwrap();
+
+        let loaded = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            loaded.run_id.0.to_string(),
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "a run id must round-trip in the lowercase canonical form"
+        );
+        assert_eq!(
+            loaded.job_names.get(&JobId("build".to_owned())),
+            Some(&"build".to_owned()),
+            "the job id round-trips verbatim: {:?}",
+            loaded.job_names
+        );
+        let subsec = loaded.created_at.timestamp_subsec_nanos();
+        assert_eq!(
+            subsec % 1000,
+            0,
+            "microsecond columns must not keep sub-microsecond digits ({subsec} ns)"
+        );
+        assert_eq!(
+            loaded.created_at,
+            chrono::DateTime::from_timestamp_micros(loaded.created_at.timestamp_micros()).unwrap(),
+            "the stored instant must be its own microsecond truncation"
+        );
+        assert_eq!(
+            loaded.fork_approval_requested_at_unix_nanos,
+            Some(nanos),
+            "nanosecond-typed stamps must keep full precision"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -6454,6 +6517,14 @@ mod pg {
         };
         suite::duplicate_run_number_is_reallocated(&backend).await;
     }
+
+    #[tokio::test]
+    async fn ids_and_timestamps_are_stored_canonically() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::ids_and_timestamps_are_stored_canonically(&backend).await;
+    }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
@@ -7524,6 +7595,152 @@ mod lite {
     #[tokio::test]
     async fn duplicate_run_number_is_reallocated() {
         suite::duplicate_run_number_is_reallocated(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn ids_and_timestamps_are_stored_canonically() {
+        suite::ids_and_timestamps_are_stored_canonically(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    /// `job_requests.timeline_id` is deliberately not UNIQUE: several attempts
+    /// of one job share a timeline (pg cannot — its column is UNIQUE and
+    /// `timelines` FKs to one request). The
+    /// `job_requests_timeline_cascade` trigger removes the timeline row only
+    /// when the last request referencing it is deleted.
+    #[tokio::test]
+    async fn timeline_is_shared_across_attempts_and_pruned_by_trigger() {
+        fn timeline_rows(tx: &crate::control::lite::TestDb<'_>, timeline_id: &str) -> i64 {
+            tx.0.query_row(
+                "SELECT count(*) FROM timelines WHERE timeline_id = ?1",
+                rusqlite::params![timeline_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        }
+
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let run_key = run_id.0.to_string();
+        let timeline_id = uuid::Uuid::new_v4().to_string();
+        let retry_agent = uuid::Uuid::new_v4().to_string();
+        backend
+            .test_db_mutate(|tx| {
+                // Submission already minted one unclaimed attempt; settle it
+                // onto a shared timeline, then add the retry on the same
+                // timeline. Sharing is only meaningful once the previous
+                // attempt is settled — that is also what keeps the partial
+                // inflight index ("one open attempt per job") satisfied.
+                let first_agent: String =
+                    tx.0.query_row(
+                        "SELECT agent_job_id FROM job_requests \
+                         WHERE run_id = ?1 AND job_id = 'build'",
+                        rusqlite::params![run_key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                tx.execute(
+                    "INSERT INTO timelines (timeline_id, change_id) VALUES (?1, 0)",
+                    rusqlite::params![timeline_id],
+                )
+                .unwrap();
+                tx.execute(
+                    "UPDATE job_requests SET timeline_id = ?2, result = 'failure' \
+                     WHERE agent_job_id = ?1",
+                    rusqlite::params![first_agent, timeline_id],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO job_requests (run_id, job_id, namespace_id, \
+                     agent_job_id, timeline_id, claimed_at) \
+                     VALUES (?1, 'build', 'default', ?2, ?3, 0)",
+                    rusqlite::params![run_key, retry_agent, timeline_id],
+                )
+                .expect("two attempts of one job may share the timeline id");
+                assert_eq!(
+                    timeline_rows(tx, &timeline_id),
+                    1,
+                    "one shared timeline row"
+                );
+                tx.execute(
+                    "DELETE FROM job_requests WHERE agent_job_id = ?1",
+                    rusqlite::params![retry_agent],
+                )
+                .unwrap();
+                assert_eq!(
+                    timeline_rows(tx, &timeline_id),
+                    1,
+                    "the timeline outlives the retry (the settled attempt still references it)"
+                );
+                tx.execute(
+                    "DELETE FROM job_requests WHERE agent_job_id = ?1",
+                    rusqlite::params![first_agent],
+                )
+                .unwrap();
+                assert_eq!(
+                    timeline_rows(tx, &timeline_id),
+                    0,
+                    "the cascade trigger prunes the orphaned timeline"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The claim query's `ORDER BY` must be served by `jobs_ready` without a
+    /// temp B-tree: the key order is the whole point of the index (pg carries
+    /// the same key). While `namespace_id` sat second, SQLite sorted the last
+    /// three ORDER BY terms on every poll.
+    #[tokio::test]
+    async fn jobs_ready_serves_the_claim_order_without_a_sort() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let plan = backend
+            .test_db_mutate(|tx| {
+                tx.query_plan(&format!(
+                    "SELECT j.run_id FROM jobs j \
+                     WHERE j.queue_state = 'ready' AND ({}) \
+                     ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+                     LIMIT 64 OFFSET 0",
+                    crate::control::types::NAMESPACE_ADMITS_CLAIM
+                ))
+            })
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| detail.contains("jobs_ready")),
+            "the claim query must use the jobs_ready index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("B-TREE")),
+            "the ready-queue order must come from the index, not a sort: {plan:?}"
+        );
+    }
+
+    /// Latest-attempt lookups must use `job_requests_attempts`: the partial
+    /// inflight index cannot serve settled attempts, and the row order must
+    /// come from the index.
+    #[tokio::test]
+    async fn attempt_lookups_use_the_attempts_index() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let plan = backend
+            .test_db_mutate(|tx| {
+                tx.query_plan(
+                    "SELECT request_id FROM job_requests \
+                     WHERE run_id = '00000000-0000-0000-0000-000000000000' AND job_id = 'build' \
+                     ORDER BY request_id DESC LIMIT 1",
+                )
+            })
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("job_requests_attempts")),
+            "latest-attempt lookups must use job_requests_attempts: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("B-TREE")),
+            "the attempt order must come from the index, not a sort: {plan:?}"
+        );
     }
 }
 
