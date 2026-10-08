@@ -4534,10 +4534,11 @@ mod tests {
         );
         let snapshot_repository = state_dir.join(&snapshot.repository);
         assert_eq!(
-            git_in(
+            String::from_utf8(git_in(
                 &snapshot_repository,
-                &["log", "--format=%P", "-1", &merge.sha]
-            ),
+                &["log", "--format=%P", "-1", &merge.sha],
+            ))
+            .unwrap(),
             format!("{} {}\n", merge.base_sha, merge.head_sha),
             "the checked-out merge must have fetched base first and dirty head second"
         );
