@@ -798,9 +798,10 @@ pub struct AppState {
     /// Default 90 follows GitHub; `0` disables the sweep. Resolved from
     /// `retention_days` in the config file, `PRELOOP_RETENTION_DAYS` wins.
     pub retention_days: u64,
-    /// Per-environment protection rules (`[environment_rules]`), loaded at
-    /// startup. Empty by default (no rules).
-    pub environment_rules: crate::config::EnvironmentRulesMap,
+    /// Environment protection rules resolver: `[environment_rules]` TOML as
+    /// the local fallback, GitHub's environments API when an App (or
+    /// `PRELOOP_GITHUB_TOKEN`) covers the run's repository.
+    pub environment_resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
     /// File-backed live log segments for real-time console tail persistence.
@@ -942,21 +943,6 @@ pub struct SecretStore {
     /// `global` for jobs of that repository whose `environment:` resolves to
     /// that environment.
     pub env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
-    /// Registered environments, keyed by `owner/repo` then environment name.
-    /// A job's `environment:` must be registered for its repository; a job
-    /// claiming any other name fails closed before secrets are injected or
-    /// an OIDC environment subject is minted.
-    pub environments: BTreeMap<String, BTreeSet<String>>,
-}
-
-impl SecretStore {
-    /// Whether `environment:` `env` names a registered environment of
-    /// `repo`. Jobs claiming an unregistered environment fail closed.
-    pub fn is_environment_registered(&self, repo: &str, env: &str) -> bool {
-        self.environments
-            .get(repo)
-            .is_some_and(|envs| envs.contains(env))
-    }
 }
 
 /// Redacting `Debug`: the store holds plaintext secret values, so a single
@@ -986,7 +972,6 @@ impl std::fmt::Debug for SecretStore {
             .field("global_names", &self.global.keys().collect::<Vec<_>>())
             .field("repo_names", &repo_names)
             .field("env_names", &env_names)
-            .field("environments", &self.environments)
             .finish()
     }
 }
@@ -1335,7 +1320,6 @@ impl AppState {
             global: config.secrets,
             repo: config.repo_secrets,
             env: config.env_secrets,
-            environments: config.environments,
         }));
         let secret_provider: Arc<dyn crate::secret_provider::SecretProvider> =
             Arc::new(crate::secret_provider::BuiltinSecretProvider::new(
@@ -1497,7 +1481,9 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
             retention_days,
-            environment_rules: config.environment_rules.clone(),
+            environment_resolver: crate::environment_resolver::EnvironmentResolver::local(
+                config.environment_rules.clone(),
+            ),
             state_dir,
             log_segments,
             system_token,

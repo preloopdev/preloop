@@ -91,12 +91,57 @@ impl ControlBackend for LiteBackend {
     ) -> Result<(), ControlError> {
         self.set_reports_check_runs(run_id, reported).await
     }
-    async fn promote_ready_jobs(
+    async fn promote_ready_jobs(&self, run: Option<RunId>) -> Result<PromoteOutcome, ControlError> {
+        self.promote_ready_jobs(run).await
+    }
+    fn set_environment_resolver(
         &self,
-        run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
-    ) -> Result<PromoteOutcome, ControlError> {
-        self.promote_ready_jobs(run, rules).await
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
+    ) {
+        LiteBackend::set_environment_resolver(self, resolver);
+    }
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        self.environment_approvals(run_id, job_id).await
+    }
+    async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        self.pending_environment_approvals(run_id).await
+    }
+    async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        self.mark_environment_approval_announced(run_id, job_id)
+            .await
+    }
+    async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        self.job_deployment_id(run_id, job_id).await
+    }
+    async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError> {
+        self.set_job_deployment(run_id, job_id, deployment_id).await
+    }
+    async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError> {
+        self.pending_environment_approval_for_check_run(check_run_id)
+            .await
     }
     async fn environment_gate(
         &self,
@@ -104,6 +149,13 @@ impl ControlBackend for LiteBackend {
         job_id: &JobId,
     ) -> Result<Option<EnvironmentGateRead>, ControlError> {
         self.environment_gate(run_id, job_id).await
+    }
+    async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        self.environment_deployment(run_id, job_id).await
     }
     async fn renew_request(
         &self,

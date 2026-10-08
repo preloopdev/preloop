@@ -1872,15 +1872,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
             // Skipped jobs are terminal at submit: no gate evaluation (a
             // `Wait` verdict would park a node that never admits), no plan-id
-            // in the masker cache.
+            // in the masker cache. Environment protection is evaluated only
+            // for jobs that can dispatch immediately — a `needs:`-blocked job
+            // gates when promotion admits it, after `hydrate_needs_context`
+            // resolves a deferred `environment:` name. Arming it now would
+            // park the job `held` with an unevaluated name its release sweep
+            // could not resolve until the needs completed — and a gate-armed
+            // row takes the held branch below, so the job could never reach
+            // the hydration that resolves it.
             if !pb.skipped {
-                if crate::runtime_scheduling::check_environment_gates(
-                    &shared.state.environment_rules,
-                    &submission.repository,
-                    &submission.git_ref,
-                    &mut queued_job,
-                    crate::models::now_unix_nanos(),
-                ) == crate::runtime_scheduling::EnvironmentGateOutcome::Proceed
+                if pb.job.needs.is_empty()
+                    && crate::runtime_scheduling::check_environment_gates(
+                        &shared.state.environment_resolver,
+                        &submission.repository,
+                        &submission.git_ref,
+                        &mut queued_job,
+                        crate::models::now_unix_nanos(),
+                    ) == crate::runtime_scheduling::EnvironmentGateOutcome::Proceed
                 {
                     queued_job.environment_gate = None;
                 }
@@ -2197,6 +2205,18 @@ pub async fn submit_run(
             }
         }
     }
+    // Environment gates armed at submission announce themselves on GitHub:
+    // the check run PATCH and the deployment's pending status. Detached —
+    // the check runs themselves mint in a spawned task, and rows this pass
+    // misses retry on the reaper's sweep anyway.
+    {
+        let shared = shared.clone();
+        let run_id = accepted.run_id;
+        tokio::spawn(async move {
+            crate::github::announce_environment_gates(&shared, Some(run_id)).await;
+        });
+    }
+
     Ok(Json(accepted))
 }
 
@@ -2392,32 +2412,19 @@ pub(crate) fn build_job_artifacts(
         job.oidc_id_token_granted,
     );
 
-    // The environment registry. `environment:` names an
-    // operator-registered deployment tier; a workflow claiming an
-    // unregistered name gets nothing — no environment secrets, no
-    // environment OIDC subject — and the job fails closed rather than
-    // minting a token for a never-created, never-approved environment.
-    // This check runs ahead of `policy.allows_secrets` because the OIDC
-    // subject is minted for jobs even when secret injection is disabled.
-    // Note: expression-based names (`${{ needs.* }}`, `${{ vars.* }}`, …)
-    // arrive here as `None` — the parser only resolves `matrix.*` at build
-    // time — so they are not rejected here, but they also receive no
-    // environment secrets and no environment OIDC subject (both are keyed
-    // off this same field). The name later resolved by
-    // `hydrate_needs_context` is not re-validated against the registry;
-    // it only reaches the runner's deployment record.
-    if let Some(env_name) = job.oidc_environment.as_deref()
-        && !shared
-            .state
-            .secrets
-            .read()
-            .is_environment_registered(&submission.repository, env_name)
-    {
-        return Err(ApiError::forbidden(format!(
-            "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
-            submission.repository
-        )));
-    }
+    // Environment names are GitHub's to validate, not preloop's: GitHub
+    // accepts any `environment:` name, auto-creates it on first reference,
+    // and applies whatever protection rules the repository configured for it
+    // (none = no gate). preloop therefore rejects *no* name here — the
+    // protection rules come from the repository (`environment_resolver`), and
+    // a name nothing knows about behaves exactly like GitHub's: the job runs
+    // with the environment tier's stored secrets (by name) and no gate. The
+    // only fail-closed path left is a repo whose rules could not be fetched:
+    // the resolver answers `Pending` and the gate holds the job until GitHub
+    // answers. Note: expression-based names (`${{ needs.* }}`, `${{ vars.* }}`,
+    // …) arrive here as `None` — the parser only resolves `matrix.*` at build
+    // time — and are resolved by `hydrate_needs_context` before the gate is
+    // armed.
 
     // Environment secrets are per-job: a job's `environment:` selects the
     // tier. Precedence per name is run > environment > repo > global
@@ -3542,19 +3549,55 @@ pub async fn approve_job(
     Path((run_id, job_id)): Path<(RunId, JobId)>,
     Json(body): Json<ApproveJobRequest>,
 ) -> Result<Json<ApproveJobResponse>, ApiError> {
-    // One transaction records the approval — or fails the job closed when the
-    // window lapsed — and re-runs the run's promotion sweep, so a gate the
-    // approval satisfies releases its job before this returns.
+    // The native endpoint keeps working for operators but has no user
+    // identity to authorize against a GitHub reviewer list — every approval
+    // it records is an admin override (logged as such, stamped on the gate).
+    // One transaction records the decision — or fails the job closed when
+    // the window lapsed — and re-runs the run's promotion sweep, so a gate
+    // the approval satisfies releases its job before this returns.
     let outcome = shared
         .state
         .backend
         .record_environment_approval(crate::control::types::EnvironmentApproval {
             run_id,
             job_id: job_id.clone(),
+            decision: crate::control::types::EnvironmentDecision::Approve,
+            actor: None,
+            admin_override: true,
             note: body.note.clone(),
         })
         .await
         .map_err(ApiError::from)?;
+    // Settle the gate's GitHub side-channel post-commit, best-effort: a
+    // satisfied gate flips the check run back to `in_progress` and posts the
+    // deployment's `queued` status; a partial approval updates the summary.
+    match outcome.result {
+        crate::control::types::EnvironmentApprovalResult::Recorded {
+            satisfied: true, ..
+        } => {
+            crate::github::report_environment_review(
+                &shared,
+                run_id,
+                &job_id,
+                true,
+                None,
+                body.note.as_deref(),
+            )
+            .await;
+        }
+        crate::control::types::EnvironmentApprovalResult::Rejected => {
+            crate::github::report_environment_review(
+                &shared,
+                run_id,
+                &job_id,
+                false,
+                None,
+                body.note.as_deref(),
+            )
+            .await;
+        }
+        _ => {}
+    }
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
@@ -3567,6 +3610,12 @@ pub async fn approve_job(
         crate::control::types::EnvironmentApprovalResult::NotAwaiting => Err(ApiError::conflict(
             "job is not awaiting environment approval",
         )),
+        crate::control::types::EnvironmentApprovalResult::Rejected => {
+            shared.state.message_notify.notify_waiters();
+            // The native endpoint only ever issues Approve, so reaching this
+            // arm means the reject raced in via the webhook — report it.
+            Err(ApiError::conflict("job was rejected"))
+        }
         crate::control::types::EnvironmentApprovalResult::Expired => {
             shared.state.message_notify.notify_waiters();
             shared.state.sampler_notify.notify_waiters();
@@ -3746,7 +3795,7 @@ pub async fn approve_fork(
     let outcome = shared
         .state
         .backend
-        .promote_ready_jobs(Some(run_id), &shared.state.environment_rules)
+        .promote_ready_jobs(Some(run_id))
         .await
         .map_err(ApiError::from)?;
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
@@ -4467,8 +4516,10 @@ mod tests {
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
         // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+        // The guard restores the previous value when the test ends, so a
+        // leaked stub base cannot poison later tests.
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", api_base) };
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
@@ -4560,12 +4611,14 @@ mod tests {
 
     const ENV_WORKFLOW: &str = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo hi\n";
 
-    /// `environment:` is an unvalidated string. A workflow claiming an
-    /// environment the operator never registered must fail closed — even
-    /// when that environment has secrets configured (the pentest shape: env
-    /// secret injected + OIDC `sub` asserting the unregistered environment).
+    /// `environment:` names are GitHub's to validate: GitHub accepts any
+    /// name, auto-creates it on first reference, and applies whatever
+    /// protection rules the repository configured for it. A name nothing
+    /// knows about must therefore submit like any other job — its secrets (by
+    /// name) still apply, and the gate is decided by the environment's rules
+    /// (none = runs immediately), never by a preloop-side registry.
     #[tokio::test]
-    async fn unregistered_environment_rejects_run_submission() {
+    async fn unknown_environment_submits_without_registry() {
         use axum::http::StatusCode;
         let (status, body) = submit_push_run(
             "[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
@@ -4574,29 +4627,52 @@ mod tests {
         .await;
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
-            "a job claiming an unregistered environment must fail closed, got: {body}"
-        );
-        assert!(
-            body.contains("not registered"),
-            "the rejection must name the missing registration, got: {body}"
+            StatusCode::OK,
+            "GitHub auto-creates an unknown environment; the submission must be accepted, got: {body}"
         );
     }
 
-    /// An environment the operator registered in `[environments]` keeps
-    /// working — the registry gates existence, not legitimate use.
+    /// A job claiming an environment whose rules are configured keeps the
+    /// rules: the submission is accepted (the gate is armed at admission, not
+    /// at submit) and the environment's secrets are selected by name.
     #[tokio::test]
-    async fn registered_environment_accepts_run_submission() {
+    async fn environment_with_rules_submits_and_arms_gate() {
         use axum::http::StatusCode;
         let (status, body) = submit_push_run(
-            "[environments]\n\"owner/repo\" = [\"production\"]\n[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
+            "[environment_rules.\"owner/repo\".production]\nwait_timer_minutes = 5\n",
             ENV_WORKFLOW,
         )
         .await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "a job claiming a registered environment must be accepted, got: {body}"
+            "a job claiming an environment with rules must be accepted, got: {body}"
+        );
+    }
+
+    /// The removed registry key fails the config load loudly instead of
+    /// silently changing what the operator thinks is enforced.
+    #[tokio::test]
+    async fn environments_registry_key_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[environments]\n\"owner/repo\" = [\"production\"]\n",
+        )
+        .unwrap();
+        let result = AppState::new_with_config(temp.path().to_path_buf(), config_path).await;
+        assert!(
+            result.is_err(),
+            "a non-empty [environments] table must fail the config load"
+        );
+        let message = match result {
+            Ok(_) => unreachable!("asserted above"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            message.contains("[environments]"),
+            "the error must name the removed table, got: {message}"
         );
     }
 

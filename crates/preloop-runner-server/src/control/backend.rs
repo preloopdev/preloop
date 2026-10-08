@@ -43,6 +43,11 @@ pub(crate) struct PromoteOutcome {
     pub(crate) promoted: usize,
     /// Jobs failed closed by a denied or expired environment gate.
     pub(crate) failed: usize,
+    /// The jobs the pass failed, for callers that need per-job resolution
+    /// (e.g. the approval handler reporting whether *its* job concluded).
+    pub(crate) failed_jobs: Vec<JobId>,
+    /// Global ready-queue depth after the pass.
+    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the ready-queue front after the pass.
     pub(crate) next_runs_on: Vec<String>,
 }
@@ -266,23 +271,84 @@ pub(crate) trait ControlBackend: Send + Sync {
         approval: EnvironmentApproval,
     ) -> Result<EnvironmentApprovalOutcome, ControlError>;
 
-    /// Re-run scheduler admission for the jobs a run parked at submit — the
-    /// fork-PR approval hold and armed environment protection gates — then
-    /// promote whatever the release unblocked. One transaction per run.
+    /// Re-run scheduler admission for the jobs a run parked — the fork-PR
+    /// approval hold and armed environment protection gates — then promote
+    /// whatever the release unblocked. One transaction per run.
     ///
     /// `Some(run_id)` is the approve/release path (approve-fork, approve-job,
     /// a hold lifting). `None` sweeps every run currently parking a
     /// gate-armed job: wait timers and approval windows close on wall-clock
-    /// time, so the reaper drives that sweep. A parked job whose run is still
+    /// time, so the reaper drives that sweep (after refreshing the
+    /// environment-rules resolver). Environment rules come from the
+    /// backend's own resolver — the same `EnvironmentResolver` `AppState`
+    /// installs — so a `Pending` lookup holds the job fail-closed until the
+    /// reaper's refresh fills it. A parked job whose run is still
     /// fork-approval-pending stays parked; a job whose gate fails closed
-    /// (deployment-branch mismatch, approval window expired) is concluded
-    /// `Failure`. Returns the promoted/failed counts and the post-pass queue
-    /// gauges the caller stores on its wake atomics.
-    async fn promote_ready_jobs(
+    /// (deployment-branch mismatch, approval window expired, rejection) is
+    /// concluded `Failure`. Returns the promoted/failed counts, the failed
+    /// job ids, and the post-pass queue gauges the caller stores.
+    async fn promote_ready_jobs(&self, run: Option<RunId>) -> Result<PromoteOutcome, ControlError>;
+
+    /// Install the environment-rules resolver the gate evaluation consults
+    /// inside its transactions. AppState's resolver is the same object, so
+    /// `Pending` lookups the backend triggers surface in the shared pending
+    /// set the reaper drains. Tests install a TOML-only resolver.
+    fn set_environment_resolver(
         &self,
-        run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
-    ) -> Result<PromoteOutcome, ControlError>;
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
+    );
+
+    /// The durable review-decision audit rows for one job, oldest first
+    /// (`environment_approvals`). These outlive the gate and the run: the
+    /// table is deliberately never archived or pruned with the run row.
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError>;
+
+    /// The jobs still parked on an armed required-reviewer gate (the gate's
+    /// `approval_requested_at` is set and no approval satisfies it yet),
+    /// with the GitHub side-channel ids the announce/approve paths PATCH.
+    /// `Some(run_id)` narrows to one run; `None` scans every run (the reaper
+    /// sweep + the check-run webhook lookup).
+    async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError>;
+
+    /// One held approval-gated job by its GitHub check run id — the
+    /// `check_run.requested_action` webhook's join key.
+    async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError>;
+
+    /// Stamp `approval_announced` on the job's gate: the Approve/Reject
+    /// check-run PATCH was delivered (or the job reports no check run and
+    /// nothing would show). In-place update — concurrent approvals survive.
+    async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError>;
+
+    /// The job's GitHub deployment id (`jobs.deployment_id`), when the
+    /// reporting path created one for a job with `environment:`.
+    async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError>;
+
+    /// Record the GitHub deployment id the reporting path created for the
+    /// job's `environment:`.
+    async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError>;
 
     /// One job's stored `environment:` value, its armed environment gate and
     /// its current status — the approve-job handler's read before it records
@@ -292,6 +358,15 @@ pub(crate) trait ControlBackend: Send + Sync {
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<Option<EnvironmentGateRead>, ControlError>;
+
+    /// One job's GitHub deployment side-channel row: check run, deployment
+    /// id, resolved environment name/url, head sha. `Ok(None)` for jobs
+    /// without `environment:` or whose name no source resolves.
+    async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError>;
 
     /// Renew a claimed request's lease. Returns the record on success;
     /// `Stale` if the runner no longer owns it, `NotFound` if unknown.
@@ -1678,16 +1753,17 @@ impl Backend {
         }
     }
 
-    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
-    /// The backend evaluates these inside its promotion and reaper
+    /// Install the shared environment-rules resolver once bootstrap builds
+    /// it (`AppState`'s `EnvironmentResolver`: TOML fallback + GitHub fetch).
+    /// The backends consult it inside their promotion and reaper
     /// transactions, where the job rows live.
-    pub(crate) fn set_environment_rules(
+    pub(crate) fn set_environment_resolver(
         &self,
-        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     ) {
         match self {
-            Self::Sqlite(backend) => backend.set_environment_rules(rules),
-            Self::Postgres(backend) => backend.set_environment_rules(rules),
+            Self::Sqlite(backend) => backend.set_environment_resolver(resolver),
+            Self::Postgres(backend) => backend.set_environment_resolver(resolver),
         }
     }
 
@@ -1841,14 +1917,84 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.set_reports_check_runs(run_id, reported).await,
         }
     }
-    async fn promote_ready_jobs(
-        &self,
-        run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
-    ) -> Result<PromoteOutcome, ControlError> {
+    async fn promote_ready_jobs(&self, run: Option<RunId>) -> Result<PromoteOutcome, ControlError> {
         match self {
-            Self::Sqlite(b) => b.promote_ready_jobs(run, rules).await,
-            Self::Postgres(b) => b.promote_ready_jobs(run, rules).await,
+            Self::Sqlite(b) => b.promote_ready_jobs(run).await,
+            Self::Postgres(b) => b.promote_ready_jobs(run).await,
+        }
+    }
+    fn set_environment_resolver(
+        &self,
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
+    ) {
+        match self {
+            Self::Sqlite(b) => b.set_environment_resolver(resolver),
+            Self::Postgres(b) => b.set_environment_resolver(resolver),
+        }
+    }
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.environment_approvals(run_id, job_id).await,
+            Self::Postgres(b) => b.environment_approvals(run_id, job_id).await,
+        }
+    }
+    async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.pending_environment_approvals(run_id).await,
+            Self::Postgres(b) => b.pending_environment_approvals(run_id).await,
+        }
+    }
+    async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.pending_environment_approval_for_check_run(check_run_id)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.pending_environment_approval_for_check_run(check_run_id)
+                    .await
+            }
+        }
+    }
+    async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.mark_environment_approval_announced(run_id, job_id).await,
+            Self::Postgres(b) => b.mark_environment_approval_announced(run_id, job_id).await,
+        }
+    }
+    async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_deployment_id(run_id, job_id).await,
+            Self::Postgres(b) => b.job_deployment_id(run_id, job_id).await,
+        }
+    }
+    async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_job_deployment(run_id, job_id, deployment_id).await,
+            Self::Postgres(b) => b.set_job_deployment(run_id, job_id, deployment_id).await,
         }
     }
     async fn environment_gate(
@@ -1859,6 +2005,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.environment_gate(run_id, job_id).await,
             Self::Postgres(b) => b.environment_gate(run_id, job_id).await,
+        }
+    }
+    async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.environment_deployment(run_id, job_id).await,
+            Self::Postgres(b) => b.environment_deployment(run_id, job_id).await,
         }
     }
     async fn renew_request(

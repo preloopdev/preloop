@@ -665,52 +665,87 @@ Semantics:
   `permissions:` by design; the ceiling does not apply to it.
 ### 8.3 Environment protection rules
 
-Per-environment branch policies, wait timers, and required reviewers,
-mirroring GitHub's environment protection rules. The existing `[environments]`
-registry keeps gating existence (bare names stay valid); rules are additive:
+When a GitHub App (or `PRELOOP_GITHUB_TOKEN`) covers a repository, preloop
+sources its environment protection rules from GitHub's environments API —
+the same `github.com/environments/{env}` configuration the UI edits — and
+enforces it at scheduler admission:
+
+- **Deployment branch policies** — `protected_branches` expands to the
+  repo's protected-branch list; `custom_branch_policies` name patterns
+  (branch and tag) match against the run's `git_ref`. A policy configured
+  but matching nothing denies the ref, exactly as GitHub does.
+- **Wait timer** — `wait_timer` minutes hold the job `pending`; the
+  deadline is stamped durably and released by the 10-second gate sweep.
+- **Required reviewers** — the job parks on an `action_required` check run
+  carrying Approve/Reject actions and a `pending` deployment status.
+  Reviewers click through GitHub; each click arrives as a
+  `check_run.requested_action` webhook, is authorized against the
+  environment's reviewer set (teams expanded via the org members API) plus
+  `prevent_self_review`, and the recorded decision releases the job or
+  fails it closed. A reviewer rejection fails the job, matching GitHub.
+- **Custom deployment protection rules** — third-party App rules enabled
+  on the environment fail the job closed: their contract is a callback
+  token preloop cannot impersonate.
+
+The check run's Approve/Reject actions are what GitHub's "Review pending
+deployments" buttons produce; the App must subscribe to `check_run`
+webhooks for them to arrive. Required App permissions: `Actions: read` and
+`Checks: write` (check runs already need these), `Deployments: write`
+(creating deployments + statuses), `Contents: read` (the read floor for
+the environments GETs), and `Members: read` at the org level when
+environment reviewers include teams. A missing grant degrades that one
+surface — an unauthorized review is simply ignored — and the job holds
+until the rules resolve. GitHub answers 404 for resources a credential cannot
+see, so a missing environment is only accepted as "no protection" when the
+same credential can read the repository's Actions surface; otherwise the
+fetch fails and the job holds (it is retried once the grant exists).
+
+The GitHub deployment for an `environment:` job is created lazily on the
+first announce and carries the resolved name; `environment.url` (or
+`environment_url`) rides on each deployment status, and the statuses
+track the job: `pending` while reviewers deliberate, `queued` once
+approved, `in_progress` at job start, `success`/`failure` at conclusion.
+
+`environment.url` may reference `steps.<id>.outputs`, which exist only once
+the job has run: the runner evaluates the expression at job completion and
+reports the result over the completion protocol, and that evaluated value is
+what the terminal deployment status carries. Until the report lands only a
+literal URL is known — an unevaluated `${{ … }}` template is never posted
+to GitHub.
+
+The `[environments]` registry is gone. GitHub accepts any `environment:`
+name, auto-creates the environment unprotected on first reference, and
+applies whatever protection rules the repository configured for it — so
+preloop no longer rejects unknown names, and no longer sources gating from a
+local registry. A config file still carrying a non-empty `[environments]`
+table fails the load with an error naming the removed table: silently
+ignoring it would change what the operator believes is enforced.
+Environment secrets stay keyed by name under `[env_secrets]`.
+
+With no GitHub credential configured (local mode), `[environment_rules]`
+TOML remains the whole story, unchanged:
 
 ```toml
-[environments]
-"owner/repo" = ["prod"]
-
 [environment_rules."owner/repo".prod]
 deployment_branches = ["main"]  # refs/heads/ prefix optional; empty = any ref
 wait_timer_minutes = 10         # 0 = no wait
 required_reviewers = 1          # 0 = no approval gate
 ```
 
+In local mode there are no user identities, so `required_reviewers` above
+1 is still rejected at config load — one token holder could satisfy any
+quorum alone. The GitHub path lifts that cap: the reviewer list is a set
+of identities, and one approval from it satisfies the gate.
+
+The native `POST /api/v1/runs/:run_id/jobs/:job_id/approve` endpoint keeps
+working for operators but bypasses the reviewer list — every approval it
+records is stamped `admin_override` and logged at warn, for audit.
+
 Enforcement happens at scheduler admission, before concurrency gating and
 before the job is queued — so a denied or waiting job never occupies a
 concurrency slot, and a denied job's environment secrets never reach a
-runner:
-
-- **Branch policy.** The run's `git_ref` must match `deployment_branches`
-  (compared after stripping a leading `refs/heads/` from both sides, so
-  `main` matches `refs/heads/main`). A run on any other ref fails the job
-  closed at admission.
-- **Wait timer.** After the job becomes eligible it waits the configured
-  minutes before it may start. The wait is visible (the job reports status
-  `pending`) and cancellable (`preloop cancel`, run/job cancel APIs). The
-  deadline is stamped on the job and survives restarts; the 10-second
-  background sweep re-runs admission so timers release without waiting for
-  another scheduling event.
-- **Required reviewers.** The job waits in a pending-approval state until
-  the configured number of approvals is recorded. Approvals are explicit and
-  human-driven: `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system
-  bearer token; optional `{"note": "..."}` for the audit trail), e.g. via
-  `preloop-runner-client approve <run-id> <job-id> [--note ...]`. Preloop
-  has no user identities — the approver is whoever holds the operator
-  credential — so
-  for a single-operator server this is a deliberate confirmation step, not
-  a second human. Because one token holder could satisfy any quorum alone
-  by calling the approval endpoint repeatedly, `required_reviewers` is
-  capped at 1; values above 1 are rejected at config load (fail closed).
-  A job not approved within 24 hours of entering the gate
-  fails closed.
-
-Removing an environment's rules releases its armed gates. Gate denials and
-approvals are logged with run, job, and environment.
-
+runner. Removing an environment's rules releases its armed gates; a job
+not approved within 24 hours of entering the gate fails closed.
 
 ## See also
 

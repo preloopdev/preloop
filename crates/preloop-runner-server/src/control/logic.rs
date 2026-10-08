@@ -1882,6 +1882,21 @@ pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<Executi
     statuses
 }
 
+/// `POST /repos/{o}/{r}/deployments` body for an environment job: the run's
+/// head sha as `ref` (GitHub deploys the commit the workflow ran against),
+/// `auto_merge` off (preloop never mutates the ref), `transient_environment`
+/// off. `environment_url` is deliberately absent — the create API ignores
+/// it; it rides on the deployment *status* rows instead.
+pub(crate) fn deployment_create_payload(environment: &str, head_sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ref": head_sha,
+        "environment": environment,
+        "auto_merge": false,
+        "transient_environment": false,
+        "required_contexts": [],
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Request lifecycle
 // ─────────────────────────────────────────────────────────────────────────

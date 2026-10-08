@@ -10,6 +10,32 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- Environment protection rules now come from GitHub. When a GitHub App (or
+  `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
+  `environment:` are read from the repository's environments API —
+  deployment branch policies (including `protected_branches` expansion via
+  the protected-branch list), `wait_timer`, `required_reviewers` with
+  `prevent_self_review` (teams expanded via the org members API), and
+  custom deployment protection rules (which fail the job closed: their
+  callback contract cannot be impersonated). Rules are cached for 60
+  seconds and refreshed by the reaper. `[environment_rules]` TOML remains
+  the source for repositories no credential covers, and for local mode.
+- Reviewer approvals arrive as `check_run.requested_action` webhooks: the
+  held job's check run completes with an `action_required` conclusion and
+  Approve/Reject buttons, the deployment status is `pending`, and an
+  authorized click releases the job or rejects it (the job fails, matching
+  GitHub). The check run returns to `in_progress` after approval. Approvals,
+  rejections, and the native admin override are recorded in a durable
+  `environment_approvals` table that outlives the run and its archival.
+- Every `environment:` job now gets a GitHub Deployment whose statuses
+  track the job: `pending` while reviewers deliberate, `queued` on
+  approval, `in_progress` at job start, `success`/`failure` at conclusion.
+  `environment.url` is evaluated by the runner at job completion (so
+  `steps.<id>.outputs` works) and reported over the completion protocol;
+  the evaluated value rides on the deployment statuses.
+- The App manifest requests `actions: read` and `deployments: write` (check
+  runs already needed `checks: write`) so the environment surfaces work
+  without a second install.
 - A schema-drift guard keeps the SQLite (`control/lite/schema.sql`) and
   Postgres (`control/pg/schema.sql`) control schemas aligned: same tables,
   column names, foreign keys and indexes, with every deliberate difference
@@ -29,6 +55,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **Breaking:** the `[environments]` config table is removed. GitHub
+  accepts any `environment:` name and auto-creates it unprotected, so an
+  unknown name is no longer rejected (no more 403 at submit) and gating is
+  decided by the environment's rules. A config file with a non-empty
+  `[environments]` table now fails to load with an error naming the removed
+  table. Environment secrets stay keyed by name under `[env_secrets]`.
+- **Breaking:** the control-store schema version bumped (SQLite 4 → 5,
+  Postgres 5 → 6) for the `environment_approvals` table and the job's
+  environment-gate columns. There are no migrations: existing dev databases
+  are refused at boot and must be recreated.
+- Environment deployment statuses use the hydrated environment name, and
+  server-side completion handling drops secret-bearing `environment.url`
+  values even when a client did not mask them.
+- Environment rules that cannot be fetched hold the job fail-closed
+  (a resolver `Pending` state) instead of proceeding unprotected; a job
+  not approved within 24 hours fails closed.
+- Environment names are evaluated before protection lookup. Jobs whose names
+  depend on unfinished `needs` outputs remain held until the name resolves.
 - SQLite's `jobs_ready` key is now `(pool_key, priority DESC, run_order,
   job_order)` — exactly the claim / ready-queue `ORDER BY`, the key Postgres
   already carries. `namespace_id` sat between the pool key and the priority,
@@ -86,6 +130,63 @@ Releases before v0.27.0 predate the changelog.
   control bridge exists, are untouched. Host steps,
   the runner itself, and the official runner's Docker command shape are
   unchanged.
+- **Environment-gate denials record one failure, not two**: the Postgres
+  promotion paths pushed a settled job into the sweep's failure list after
+  `settle_node` had already recorded it, so an environment gate denied on the
+  promotion sweep (and an unsatisfiable `runs-on` resolved at promotion, and
+  a failed deferred expansion) counted twice — duplicate `JobStatus` events
+  and check-run reports, and an inflated `PromoteOutcome::failed`.
+  `settle_node` is the single recorder again.
+
+- **Environment approvals serialize with the promotion sweep** (Postgres):
+  `record_environment_approval` now takes the run lock (`FOR NO KEY UPDATE`)
+  before reading the gate and locks the job row (`FOR UPDATE OF j`), so an
+  approval racing a sweep that is concluding the job can no longer commit a
+  decision built from the stale `pending` snapshot, and the approval's
+  whole-blob gate write cannot erase a concurrent announce stamp.
+
+- **Environment resolution and reviewer-team expansion use the configured
+  PAT**: the resolver read only `PRELOOP_GITHUB_TOKEN`, so a PAT-only setup
+  whose credential lives in the config file (`github.pat`) resolved rules
+  through the empty TOML fallback and failed every team-reviewer check
+  closed. Both paths now read `AppState::static_github_pat()`, the same
+  credential source the rest of the server uses.
+
+- **Environment protection follow-ups:** GitHub team reviewers without an
+  inline organization now resolve against the repository owner, and an empty
+  protected-branch set follows GitHub's all-branches deployment semantics.
+- **Removed environment protection releases armed jobs:** deleting reviewers,
+  timers, branch policy, and custom rules on GitHub no longer leaves a job
+  held behind stale gate state.
+- **Deferred environment names fail or hydrate deterministically:** jobs no
+  longer wait forever after a `${{ needs.* }}` name cannot be resolved.
+- **Environment policy pagination fails closed:** truncated protected-branch,
+  branch-policy, and team-member lists remain unresolved instead of being
+  treated as complete.
+- **Manifest-created GitHub Apps subscribe to `check_run`**: without it
+  GitHub never delivered `check_run.requested_action`, so environment
+  Approve/Reject clicks on `action_required` check runs went unheard.
+- **Environment deployment/review tokens carry `checks: write`**: the
+  minted installation token asked only for `deployments: write` +
+  `contents: read`, so the `action_required` Approve/Reject check-run
+  PATCHes were rejected by GitHub.
+- **Deployment and review reporting fall back to the config-file PAT**:
+  `resolve_repo_token` consulted only `PRELOOP_GITHUB_TOKEN`, so a PAT in
+  `github.pat` got no deployment statuses or review buttons (and could send
+  an empty bearer). It now reads `AppState::static_github_pat()`.
+- **Environment gates stay announced-retryable until every GitHub surface
+  lands**: a gate scanned before its check run id was persisted, or whose
+  deployment create failed, was stamped `announced` and never retried —
+  permanently losing the Approve/Reject buttons or the `pending` status.
+- **A late `in_progress` deployment status no longer revives a finished
+  deployment**: the asynchronous post now fences on the persisted job state.
+- **Skipped `environment:` jobs no longer mint phantom deployments**:
+  concluding a job that never ran (and whose gate never engaged) created a
+  deployment plus a `failure` status; GitHub creates none for skipped jobs.
+- **`check_run.requested_action` must name the held job's repository**: a
+  delivery whose `repository.full_name` mismatched (or was missing) the
+  gated job's repository could record an environment review for it; it is
+  ignored now.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

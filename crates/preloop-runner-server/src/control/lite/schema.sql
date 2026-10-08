@@ -184,6 +184,15 @@ CREATE TABLE jobs (
     outputs                 TEXT,
     annotations             TEXT,
     check_run_id            INTEGER,
+    -- GitHub deployment id for jobs with `environment:` (created when the
+    -- run reports checks; deployment statuses update on gate decisions and
+    -- job completion). `NULL` for unreported or environment-less jobs.
+    deployment_id           INTEGER,
+    -- The job's `environment.url`, evaluated by the runner after its steps
+    -- and reported in the completion (`completejob` `environmentUrl`). The
+    -- server posts it as the deployment status's `environment_url`; `NULL`
+    -- until a completion reports one (or for environment-less jobs).
+    environment_url         TEXT,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
@@ -571,6 +580,33 @@ CREATE TABLE check_run_updates (
     PRIMARY KEY (run_id, job_id)
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
+
+-- ── Environment approvals (durable audit) ────────────────────────────
+-- One row per recorded environment review decision (approval or
+-- rejection), written in the same transaction that flips the gate, so a
+-- crash cannot separate the decision from its record. Deliberately NOT
+-- archived with the run and never deleted by retention: GitHub keeps an
+-- environment's review history after the run is gone, and this table is
+-- the only durable record of who released a gate. `run_id`/`job_id` carry
+-- no foreign key for exactly that reason — the run row they name may be
+-- deleted while the audit row must survive.
+CREATE TABLE environment_approvals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace_id    TEXT NOT NULL,
+    run_id          TEXT NOT NULL,
+    job_id          TEXT NOT NULL,
+    repository      TEXT NOT NULL,
+    environment     TEXT NOT NULL,
+    decision        TEXT NOT NULL CHECK (decision IN ('approved','rejected')),
+    -- GitHub login of the reviewing user; NULL for the operator's
+    -- system-token (admin) override, which carries no user identity.
+    actor           TEXT,
+    admin_override  INTEGER NOT NULL DEFAULT 0,
+    -- Reviewer comment, when one was supplied (native approve endpoint).
+    comment         TEXT,
+    decided_at      INTEGER NOT NULL
+);
+CREATE INDEX environment_approvals_gate ON environment_approvals(run_id, job_id);
 
 -- ── Artifacts ────────────────────────────────────────────────────────
 -- Artifact catalog rows. Bytes live in the file-backed ArtifactStore; the

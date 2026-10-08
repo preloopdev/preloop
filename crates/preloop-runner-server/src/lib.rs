@@ -12,6 +12,7 @@ mod check_run_outbox;
 pub mod concurrency;
 pub mod config;
 pub mod credential_store;
+pub mod environment_resolver;
 pub mod errors;
 mod event_feed;
 pub mod events;
