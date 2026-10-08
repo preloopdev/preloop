@@ -38,7 +38,18 @@ pub async fn upload_bundle(
     tokio::fs::write(&temp, &body)
         .await
         .map_err(|error| ApiError::internal(format!("failed to store git bundle: {error}")))?;
-    let verified = git_command(&["bundle", "verify", temp.to_str().unwrap()]).await;
+    // `git bundle verify` needs an object database to check prerequisites;
+    // verify in an isolated temporary bare repository before publishing.
+    let verify_repo = root.join(format!(".verify-{bundle_id}.git"));
+    if let Err(error) = git_command(&["init", "--bare", verify_repo.to_str().unwrap()]).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(ApiError::internal(format!(
+            "failed to prepare bundle verification: {error}"
+        )));
+    }
+    let verified =
+        git_command_in(&verify_repo, &["bundle", "verify", temp.to_str().unwrap()]).await;
+    let _ = tokio::fs::remove_dir_all(&verify_repo).await;
     if let Err(error) = verified {
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(ApiError::bad_request(format!(
