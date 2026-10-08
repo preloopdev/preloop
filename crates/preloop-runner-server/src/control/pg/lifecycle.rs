@@ -1341,12 +1341,16 @@ impl PgBackend {
                                              AND (q.result IS NULL OR q.session_id IS NOT NULL)) \
                          UNION ALL \
                          SELECT h.run_id, COALESCE(h.completed_at, h.created_at) \
-                         FROM run_history h) expired \
+                         FROM run_history h \
+                         WHERE h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                                WHERE run_id = h.run_id) \
+                           AND NOT EXISTS (SELECT 1 FROM runs live \
+                                           WHERE live.run_id = h.run_id)) expired \
                      GROUP BY run_id \
-                     HAVING MIN(finished_at) < ",
+                     HAVING MAX(finished_at) < ",
                     ts!("$1"),
                     " \
-                     ORDER BY MIN(finished_at), run_id \
+                     ORDER BY MAX(finished_at), run_id \
                      LIMIT $2"
                 ),
                 &[&cutoff_us, &limit],

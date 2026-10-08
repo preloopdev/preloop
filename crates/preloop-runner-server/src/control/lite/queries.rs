@@ -467,6 +467,9 @@ impl LiteBackend {
                    ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
                       AND r.run_attempt = j.run_attempt \
                  WHERE r.repository = ?2 AND (?3 IS NULL OR r.head_sha = ?3) \
+                   AND r.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                        WHERE run_id = r.run_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = r.run_id) \
                  UNION ALL \
                  SELECT s.run_id, je.key, CAST(je.value AS INTEGER), je.key \
                  FROM run_submissions s JOIN runs r ON r.run_id = s.run_id, \
@@ -478,7 +481,8 @@ impl LiteBackend {
                  FROM run_history h, json_each(h.record_details, '$.job_check_run_ids') je \
                  WHERE h.repository = ?2 AND (?3 IS NULL OR h.head_sha = ?3) \
                    AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
-                                       WHERE run_id = h.run_id)";
+                                       WHERE run_id = h.run_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id)";
             let exact = tx
                 .prepare_cached(&format!(
                     "SELECT run_id, job_id FROM ({CANDIDATES}) WHERE check_run_id = ?1 \
@@ -1084,7 +1088,11 @@ impl LiteBackend {
                          SELECT h.run_id, 1, \
                                 COALESCE(h.completed_at, h.started_at, h.created_at), \
                                 h.workflow_path, h.event, COALESCE(h.conclusion, 'success') \
-                         FROM run_history h) \
+                         FROM run_history h \
+                         WHERE h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                                WHERE run_id = h.run_id) \
+                           AND NOT EXISTS (SELECT 1 FROM runs live \
+                                           WHERE live.run_id = h.run_id)) \
                      WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
                        AND (?2 IS NULL OR status = ?2 OR (?2 = 'completed' AND terminal_rank = 1)) \
                        AND (?3 IS NULL OR event = ?3) \
@@ -1127,8 +1135,11 @@ impl LiteBackend {
                 .prepare_cached(
                     "SELECT run_id FROM runs WHERE repository = ?1 COLLATE NOCASE \
                      UNION ALL \
-                     SELECT run_id FROM run_history \
-                     WHERE repository = ?1 COLLATE NOCASE",
+                     SELECT h.run_id FROM run_history h \
+                     WHERE h.repository = ?1 COLLATE NOCASE \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                            WHERE run_id = h.run_id) \
+                       AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id)",
                 )
                 .map_err(db)?;
             let rows = stmt
