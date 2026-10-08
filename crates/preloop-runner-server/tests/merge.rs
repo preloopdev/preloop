@@ -370,7 +370,14 @@ async fn hosted_bundle_submission_merges_the_uploaded_dirty_commit() {
     let tree = git(&fixture.workspace, &["write-tree"]);
     let head = git(
         &fixture.workspace,
-        &["commit-tree", &tree, "-p", &fixture.head, "-m", "hosted submit"],
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &fixture.head,
+            "-m",
+            "hosted submit",
+        ],
     );
     git(
         &fixture.workspace,
@@ -413,13 +420,21 @@ async fn hosted_bundle_submission_merges_the_uploaded_dirty_commit() {
     assert_eq!(merge.base_sha, fixture.base);
     assert_eq!(merge.head_sha, head);
     assert_eq!(record.github["sha"], serde_json::json!(merge.sha));
+    assert!(
+        queued_message_for(&inner, run_id)
+            .preloop_snapshot_origin_rewrite
+            .is_some()
+    );
     let served = fixture.state_dir.join("snapshots").join(run_id);
     assert_eq!(
         git(&served, &["log", "--format=%P", "-1", &merge.sha]),
         format!("{} {head}", fixture.base)
     );
     assert_eq!(
-        git(&served, &["show", &format!("{}:hosted-dirty.txt", merge.sha)]),
+        git(
+            &served,
+            &["show", &format!("{}:hosted-dirty.txt", merge.sha)]
+        ),
         "uploaded"
     );
 }
