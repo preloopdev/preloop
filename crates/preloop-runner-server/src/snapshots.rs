@@ -1658,6 +1658,19 @@ async fn create_workspace_snapshot_inner(
             })?;
             crate::merge_builder::MergeHead::Commit(head)
         };
+        if Some(tree.as_str()) != source_tree.as_deref() {
+            // The dirty snapshot commit is engine-created and intentionally
+            // is not on origin. Import its objects into the merge mirror
+            // before the shared builder resolves the head; only the base is
+            // fetched from the forge.
+            let mut import = Command::new("git");
+            import
+                .env("GIT_DIR", &mirror)
+                .args(["fetch", "--no-tags"])
+                .arg(staging_repository.as_os_str())
+                .arg(&commit_sha);
+            run_git(&mut import, "import dirty snapshot into merge mirror").await?;
+        }
         let source = crate::merge_builder::MergeSource {
             mirror,
             fetch_url: Some(origin_url.to_owned()),
