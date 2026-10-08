@@ -26,6 +26,9 @@ Releases before v0.27.0 predate the changelog.
   testing a different tree. `--no-merge` restores testing the branch alone,
   and `push` events are unchanged (they test the commit itself). The server
   also validates and serves prebuilt merges for other submission paths.
+- **Hosted dirty submits**: `--push` bundles the working-tree commit for
+  engine-side testing and publishes it after success; `--create-pr` opens a
+  pull request and reports checks on the tested commit.
 
 ### Security
 

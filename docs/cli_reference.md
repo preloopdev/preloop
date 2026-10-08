@@ -63,6 +63,11 @@ Behavior notes:
   Non-interactive runs (pipes, CI, `--detach`) never pause.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
+- **Hosted dirty submits**: `--push` tests a commit made from the working tree,
+  then publishes that commit after success. `--create-pr` also opens a PR and
+  reports checks on the tested commit. The local branch moves only by explicit
+  confirmation when the tree is unchanged; GitHub `origin` and publish
+  credentials are required.
 - **`pull_request` test merge**: like GitHub, a local `--event pull_request`
   run tests the merge of the pull request's *current* base tip into the head
   (the workspace `HEAD`, or the snapshot commit when the tree is dirty), not
