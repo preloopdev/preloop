@@ -36,6 +36,22 @@ Releases before v0.27.0 predate the changelog.
 - The App manifest requests `actions: read` and `deployments: write` (check
   runs already needed `checks: write`) so the environment surfaces work
   without a second install.
+- A schema-drift guard keeps the SQLite (`control/lite/schema.sql`) and
+  Postgres (`control/pg/schema.sql`) control schemas aligned: same tables,
+  column names, foreign keys and indexes, with every deliberate difference
+  listed and reasoned in `control/schema_drift.rs` (partition children, the
+  xid8 outbox columns and their ordering index, the pg-only
+  `job_messages.job_timeout_s`, the shared `timeline_id`, and the
+  `runner_sessions.runner_id` FK). The guard fails on an undocumented
+  difference and on a stale entry, so aligning the backends shrinks the list
+  instead of letting it rot.
+- Coverage for id and time storage on both backends: a run id and job
+  round-trip in lowercase-canonical form, a sub-microsecond instant reads
+  back as whole microseconds (nanosecond `bigint` stamps keep full
+  precision), SQLite accepts several attempts of one job sharing a
+  `timeline_id` (the deliberate pg-`UNIQUE` divergence) and its
+  `job_requests_timeline_cascade` trigger prunes the shared timeline with the
+  last request.
 
 ### Changed
 
@@ -57,6 +73,29 @@ Releases before v0.27.0 predate the changelog.
   not approved within 24 hours fails closed.
 - Environment names are evaluated before protection lookup. Jobs whose names
   depend on unfinished `needs` outputs remain held until the name resolves.
+- SQLite's `jobs_ready` key is now `(pool_key, priority DESC, run_order,
+  job_order)` — exactly the claim / ready-queue `ORDER BY`, the key Postgres
+  already carries. `namespace_id` sat between the pool key and the priority,
+  so SQLite sorted the last three ORDER BY terms on every poll; the claim
+  query now reads the ready front in index order (`EXPLAIN QUERY PLAN` goes
+  from `USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY` to no sort). SQLite
+  also gains `job_requests_attempts (run_id, job_id, request_id DESC)`, the
+  same index Postgres has, which serves the latest-attempt lookups and the
+  `jobs` -> `job_requests` cascade that the partial inflight index cannot.
+  Both are fresh-database changes: an existing database keeps working
+  unchanged, because a missing index is never an error.
+- The control schema no longer carries objects nothing uses:
+  `run_submissions.secret_refs`, `jobs.not_before`,
+  `provision_requests.lease_owner`/`leased_until`,
+  `runner_sessions.engine_node_id`, `log_files.byte_count`/`line_count`,
+  `artifacts.upload_token_hash` and Postgres's `runners_labels` GIN index
+  (label matching reads `runners.labels` in Rust and uses no operator a GIN
+  index serves). No code referenced any of them, so an existing control
+  database that still has the columns keeps working. The namespace
+  platform columns (`cell_generation`, `config_version`,
+  `namespace_limits.max_job_timeout_minutes`/`priority_tier`/
+  `run_history_retention_days`, `namespace_policies`) stay and are marked
+  platform-owned in the schema.
 
 ### Security
 
