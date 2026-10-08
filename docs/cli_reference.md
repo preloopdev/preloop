@@ -99,7 +99,7 @@ automatically, and an explicit `--payload` field always wins:
 |---|---|---|
 | changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
 | PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
-| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else the remote's advertised default branch | GitHub applies PR branch filters to the **target** branch, not the head branch |
 | branch / tag | the current checkout | It is the ref being tested |
 
 The base for the diff is `--base` when given, otherwise the branch's tracking

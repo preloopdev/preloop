@@ -24,9 +24,8 @@ Releases before v0.27.0 predate the changelog.
   listing the conflicted files, exactly where GitHub refuses to run
   `pull_request` workflows; an unreachable base fails loudly instead of
   testing a different tree. `--no-merge` restores testing the branch alone,
-  and `push` events are unchanged (they test the commit itself). The same
-  builder and serving path are shared with hosted submits and the webhook
-  fallback (`WorkflowSubmission::prebuilt_merge`).
+  and `push` events are unchanged (they test the commit itself). The server
+  also validates and serves prebuilt merges for other submission paths.
 
 ### Security
 
