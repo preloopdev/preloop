@@ -42,11 +42,12 @@ Releases before v0.27.0 predate the changelog.
   looked unprotected to tools that key on it — kache, for one, publishes
   remote cache entries only from protected-branch pushes, which left its
   remote cache unwritten and every later lookup a miss. Non-branch refs
-  (tags, `refs/pull/*`) stay `false` and are never looked up; an unresolved
-  lookup falls back to `false`, the unprivileged answer. The value is
-  engine-resolved only — a native submission cannot assert it — and a branch
-  is looked up under its exact, URL-encoded name, so `release#test` never
-  answers with `release`'s protection.
+  (tags — even ones a tag ruleset protects — and `refs/pull/*`) stay `false`
+  and are never looked up; an unresolved lookup falls back to `false`, the
+  unprivileged answer. The value is engine-resolved only — a native
+  submission cannot assert it — and a branch is looked up under its exact,
+  URL-encoded name, so `release#test` never answers with `release`'s
+  protection.
 
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
@@ -142,15 +143,15 @@ Releases before v0.27.0 predate the changelog.
   and run PostgreSQL from a container —
   `mirror.gcr.io/library/postgres:<major>`, `--network host`, trust auth on
   loopback, `max_connections=400` for the two-node race tests. Both
-  `apt-get update` passes and the pgdg repository are gone; the container is
-  ready in seconds instead of the ~1 minute the install and cluster start
-  took.
+  `apt-get update` passes and the pgdg repository are gone: measured on the
+  engine, the lld link plus container start takes 13–26 s per `control` job,
+  where the apt install plus cluster start took 33–38 s.
 
 - **Read-only kache jobs skip the remote push**: kache publishes only from
-  protected-branch pushes, so a pull-request job's post step listed the whole
-  bucket (tens of thousands of keys) and uploaded nothing — about 25 seconds
-  per job. `save-cache` is now tied to `github.event_name == 'push'` in all
-  four kache steps.
+  protected-branch pushes, so a pull-request job's post step listed all
+  27,090 remote keys and uploaded nothing — 17–19 s per job. `save-cache` is
+  now tied to `github.event_name == 'push'` in every kache step (`ci.yml`'s
+  four jobs and the server-conformance job).
 
 ## [0.33.9] - 2026-10-02
 

@@ -41,6 +41,10 @@ jobs:
           manifest-key: conformance
           min-compile-ms: 2000
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
       - name: Replay configured official runner flows
         run: bash ./benchmarks/conformance/run.sh
       - name: Name the diverging scenarios

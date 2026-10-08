@@ -1587,11 +1587,12 @@ async fn contents_read_token(
 }
 
 /// GitHub's `github.ref_protected` for `git_ref`: whether branch protection
-/// rules or rulesets apply to it. Only `refs/heads/*` can be protected; tags,
-/// pull-request refs, a local workspace, and any lookup that fails resolve
-/// to `false`. That is the unprivileged answer — consumers grant more to a
-/// protected ref (cache writers publish only from one, OIDC trust policies
-/// key on the claim) — so an unknown ref must never read as protected.
+/// rules or rulesets apply to it. Only `refs/heads/*` is resolved here; tags
+/// (which a tag ruleset can protect), pull-request refs, a local workspace,
+/// and any lookup that fails resolve to `false`. That is the unprivileged
+/// answer — consumers grant more to a protected ref (cache writers publish
+/// only from one, OIDC trust policies key on the claim) — so an unknown ref
+/// must never read as protected.
 pub async fn resolve_ref_protected(
     shared: &Arc<SharedState>,
     repository: &str,
