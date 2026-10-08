@@ -209,9 +209,8 @@ pub struct PushRequest {
 /// cannot wait for it, so the merge is built locally: `sha` is a two-parent
 /// merge commit (first parent the base tip, second the pull request head)
 /// that exists only in the engine's mirror. Jobs therefore fetch from the
-/// engine, never the forge. The engine validates that the commit exists in
-/// `mirror_repository` with exactly the claimed parents and tree before
-/// serving it.
+/// engine, never the forge. The engine validates that the mirror belongs to
+/// the named repository and that the commit has the claimed parents and tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrebuiltMerge {
     /// The two-parent merge commit the run tests.
@@ -222,6 +221,8 @@ pub struct PrebuiltMerge {
     pub base_sha: String,
     /// Second parent: the pull request's head commit.
     pub head_sha: String,
+    /// Repository whose cache mirror contains this merge.
+    pub repository: String,
     /// State-directory-relative path of the bare mirror holding the merge and
     /// its parents (for example `checkout-cache/repositories/<key>.git`).
     pub mirror_repository: String,

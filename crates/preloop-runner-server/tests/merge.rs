@@ -371,17 +371,9 @@ async fn prebuilt_merge_is_built_served_and_validated() {
 
     // Build the merge in an engine mirror. The fixture's bare origin is a
     // local path, so no credential and no network are involved.
-    let mirror = fixture
-        .state_dir
-        .join("checkout-cache")
-        .join("repositories")
-        .join("merge-test.git");
-    let source = MergeSource {
-        mirror: mirror.clone(),
-        fetch_url: Some(fixture.origin.to_string_lossy().to_string()),
-        token: None,
-        forge_host: None,
-    };
+    let mut source = webhook_merge_source(&shared, "owner/repo").await.unwrap();
+    let mirror = source.mirror.clone();
+    source.fetch_url = Some(fixture.origin.to_string_lossy().to_string());
     let request = MergeRequest {
         repository: "owner/repo".to_owned(),
         pull_request_number: Some(7),
@@ -407,7 +399,14 @@ async fn prebuilt_merge_is_built_served_and_validated() {
     // the merge from the engine.
     let record = prebuilt_merge_record(&shared, &mirror, &merge, Some(7))
         .expect("a mirror under the state directory has a relative path");
-    assert!(record.mirror_repository.ends_with("merge-test.git"));
+    assert_eq!(record.repository, "owner/repo");
+    assert_eq!(
+        record.mirror_repository,
+        mirror
+            .strip_prefix(&fixture.state_dir)
+            .unwrap()
+            .to_string_lossy()
+    );
     let run_id = RunId::new();
     let snapshot = attach_prebuilt_merge(&shared, run_id, &record)
         .await
@@ -436,12 +435,46 @@ async fn prebuilt_merge_is_built_served_and_validated() {
         ],
     );
     assert_eq!(git(&clone, &["cat-file", "-t", &merge.sha]), "commit");
+    let run_app = app(state.clone(), CancellationToken::new());
+    let mut submission = fixture.submission(false);
+    submission["prebuilt_merge"] = serde_json::to_value(&record).unwrap();
+    let accepted = request_json(&run_app, Method::POST, "/api/v1/runs", submission).await;
+    let submitted_run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let submitted = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == submitted_run_id)
+        .expect("prebuilt run record");
+    assert_eq!(submitted.github["sha"], serde_json::json!(merge.sha));
+    assert!(
+        queued_message_for(&inner, submitted_run_id)
+            .preloop_snapshot_origin_rewrite
+            .is_some()
+    );
 
+    let mut mismatched_submission = fixture.submission(false);
+    mismatched_submission["repository"] = serde_json::json!("owner/other");
+    mismatched_submission["prebuilt_merge"] = serde_json::to_value(&record).unwrap();
+    let (status, _) = request_json_status(
+        &run_app,
+        Method::POST,
+        "/api/v1/runs",
+        mismatched_submission,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     // Nothing in a submission is trusted: wrong parents and escaping paths are
     // refused before a served repository is created.
     let mut tampered = record.clone();
     tampered.head_sha = "0".repeat(40);
     let error = attach_prebuilt_merge(&shared, RunId::new(), &tampered)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MergeError::InvalidPrebuilt(_)), "{error:?}");
+    let mut cross_repository = record.clone();
+    cross_repository.repository = "owner/other".to_owned();
+    let error = attach_prebuilt_merge(&shared, RunId::new(), &cross_repository)
         .await
         .unwrap_err();
     assert!(matches!(error, MergeError::InvalidPrebuilt(_)), "{error:?}");

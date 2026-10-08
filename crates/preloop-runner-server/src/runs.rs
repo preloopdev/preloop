@@ -1279,6 +1279,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         None
     };
     let workspace_snapshot = if let Some(prebuilt) = submission.prebuilt_merge.as_ref() {
+        if prebuilt.repository != submission.repository {
+            return Err(ApiError::bad_request(
+                "prebuilt merge repository does not match run repository",
+            ));
+        }
         // A self-built merge whose commit exists only in the engine: the run's
         // jobs must fetch it from here, so serving is not optional. The
         // submission is validated against the mirror before anything is

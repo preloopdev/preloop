@@ -104,6 +104,7 @@ impl Default for MergeSource {
 /// Resolved parents of a merge.
 #[derive(Debug, Clone)]
 pub struct MergeParents {
+    pub repository: String,
     pub base_sha: String,
     pub head_sha: String,
 }
@@ -111,6 +112,8 @@ pub struct MergeParents {
 /// A built merge commit.
 #[derive(Debug, Clone)]
 pub struct MergedMerge {
+    /// Repository whose cache mirror contains this merge and its parents.
+    pub repository: String,
     /// The two-parent merge commit; exists in the served repository.
     pub sha: String,
     /// Its tree.
@@ -522,7 +525,11 @@ pub async fn fetch_inputs(
             });
         }
     }
-    Ok(MergeParents { base_sha, head_sha })
+    Ok(MergeParents {
+        repository: request.repository.clone(),
+        base_sha,
+        head_sha,
+    })
 }
 
 /// Parse `git merge-tree --write-tree --name-only -z` output.
@@ -646,6 +653,7 @@ async fn finish_merge(
         });
     }
     Ok(MergeOutcome::Merged(MergedMerge {
+        repository: parents.repository.clone(),
         sha,
         tree,
         base_sha: parents.base_sha.clone(),
@@ -823,6 +831,18 @@ async fn same_repository(left: &Path, right: &Path) -> bool {
         _ => false,
     }
 }
+fn repository_mirror_relative(shared: &SharedState, repository: &str) -> PathBuf {
+    use sha2::Digest;
+
+    let server_url = shared.state.github_urls.server_url.trim_end_matches('/');
+    let key = format!(
+        "{:x}",
+        sha2::Sha256::digest(format!("{server_url}/{repository}").as_bytes())
+    );
+    PathBuf::from("checkout-cache")
+        .join("repositories")
+        .join(format!("merge-{key}.git"))
+}
 
 /// Prepare the engine mirror a webhook delivery's merge is built in, together
 /// with the forge coordinates to fetch from.
@@ -837,17 +857,12 @@ pub async fn webhook_merge_source(
     shared: &SharedState,
     repository: &str,
 ) -> Result<MergeSource, MergeError> {
-    use sha2::Digest;
-
-    let key = format!("{:x}", sha2::Sha256::digest(repository.as_bytes()));
+    let server_url = shared.state.github_urls.server_url.trim_end_matches('/');
     let mirror = shared
         .state
         .state_dir
-        .join("checkout-cache")
-        .join("repositories")
-        .join(format!("merge-{key}.git"));
+        .join(repository_mirror_relative(shared, repository));
     ensure_mirror(&mirror).await?;
-    let server_url = shared.state.github_urls.server_url.trim_end_matches('/');
     let forge_host = reqwest::Url::parse(server_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned));
@@ -873,11 +888,16 @@ pub fn prebuilt_merge_record(
     pull_request_number: Option<u64>,
 ) -> Option<preloop_gha_protocol::PrebuiltMerge> {
     let relative = mirror.strip_prefix(&shared.state.state_dir).ok()?;
+    let expected = repository_mirror_relative(shared, &merge.repository);
+    if relative != expected.as_path() {
+        return None;
+    }
     Some(preloop_gha_protocol::PrebuiltMerge {
         sha: merge.sha.clone(),
         tree: merge.tree.clone(),
         base_sha: merge.base_sha.clone(),
         head_sha: merge.head_sha.clone(),
+        repository: merge.repository.clone(),
         mirror_repository: relative.to_string_lossy().to_string(),
         pull_request_number,
     })
@@ -1065,6 +1085,13 @@ pub async fn attach_prebuilt_merge(
             prebuilt.mirror_repository
         )));
     }
+    let expected = repository_mirror_relative(shared, &prebuilt.repository);
+    if relative != expected.as_path() {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "mirror repository `{}` is not the cache for `{}`",
+            prebuilt.mirror_repository, prebuilt.repository
+        )));
+    }
     let mirror = tokio::fs::canonicalize(state_dir.join(relative))
         .await
         .map_err(|error| {
@@ -1109,6 +1136,7 @@ pub async fn attach_prebuilt_merge(
     }
 
     let merge = MergedMerge {
+        repository: prebuilt.repository.clone(),
         sha: prebuilt.sha.clone(),
         tree: tree.clone(),
         base_sha: prebuilt.base_sha.clone(),
