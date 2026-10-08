@@ -3154,13 +3154,12 @@ impl<'a> Sweep<'a> {
                 let prefix = format!("{caller_id}/");
                 let short = inner_id.strip_prefix(&prefix).unwrap_or(inner_id);
                 let mut job_outputs_map = serde_json::Map::new();
-                if let Some(Some(outputs)) = by_id.get(inner_id).map(|(_, outputs)| outputs) {
-                    if let Ok(serde_json::Value::Object(obj)) =
+                if let Some(Some(outputs)) = by_id.get(inner_id).map(|(_, outputs)| outputs)
+                    && let Ok(serde_json::Value::Object(obj)) =
                         serde_json::from_str::<serde_json::Value>(outputs)
-                    {
-                        for (k, v) in obj {
-                            job_outputs_map.insert(k, v);
-                        }
+                {
+                    for (k, v) in obj {
+                        job_outputs_map.insert(k, v);
                     }
                 }
                 let mut job_record = serde_json::Map::new();
@@ -6274,14 +6273,11 @@ impl PgBackend {
         }
         // 4. Reusable caller fold, walking up nested callers.
         let mut current = job_id.clone();
-        loop {
-            match Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await? {
-                Some(caller) => {
-                    current = caller.clone();
-                    outcome.folded_callers.push(caller);
-                }
-                None => break,
-            }
+        while let Some(caller) =
+            Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await?
+        {
+            current = caller.clone();
+            outcome.folded_callers.push(caller);
         }
         // 5. Refresh the dependents' `remaining_needs` for everything that just
         // turned terminal: the job, its fail-fast siblings and the folded
