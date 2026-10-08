@@ -116,9 +116,11 @@ jobs:
           persist-credentials: false
       - name: Diff the image pins between base and head
         id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
           before="$(git show "FETCH_HEAD:official-image.toml" | grep -E '^official_runner_image_base_(amd64|arm64) = ' || true)"
           after="$(grep -E '^official_runner_image_base_(amd64|arm64) = ' official-image.toml || true)"
           if [ "$before" = "$after" ]; then
