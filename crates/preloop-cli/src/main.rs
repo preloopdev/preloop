@@ -907,9 +907,16 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     payload: Option<PathBuf>,
 
-    /// Base ref for pull_request or merge_group events.
+    /// Pull-request base ref for merge construction and hosted bundle
+    /// prerequisites.
     #[arg(long)]
     base: Option<String>,
+
+    /// Commit message for the real submit-time commit created by `--push`
+    /// when the working tree is dirty. Without this flag, `$EDITOR` is
+    /// prefilled; non-interactive runs use a generated message.
+    #[arg(short = 'm', long = "message")]
+    message: Option<String>,
     /// Open a live debug session when a job fails. Without this flag, failed
     /// AgentENV jobs are cleaned up normally. SmolVM retains its historical
     /// terminal-attached default for compatibility.
@@ -2987,16 +2994,24 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     .await?;
 
     let push_requested = args.push || args.create_pr;
-    // A dirty working tree is allowed with --push: CI runs on the server's
-    // snapshot of the uncommitted state, and after it passes the CLI
-    // materializes a commit whose tree is exactly what CI tested (see
-    // `decide_dirty_push_opts`). A clean tree pins the push to HEAD directly.
+    // Dirty push submissions are committed before they leave this process.
+    // The commit is created in a private index, so the user's index, refs, and
+    // working tree remain untouched while the engine receives a real C.
     let dirty = if push_requested {
         git_porcelain().context("failed to check the working tree for --push")?
     } else {
         Vec::new()
     };
     let dirty_push = push_requested && !dirty.is_empty();
+    let submit_commit = if dirty_push {
+        Some(create_submit_commit(
+            args.message.as_deref(),
+            &dirty,
+            &detect_git_ref(),
+        )?)
+    } else {
+        None
+    };
     let tested_head = if push_requested && !dirty_push {
         Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
     } else {
@@ -3044,27 +3059,44 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
     if push_requested {
-        // The base commit: for a clean tree this IS the tested commit; for a
-        // dirty tree it is the parent of the materialized CI-verified commit.
-        submission.sha = git_rev_parse("HEAD")?;
-        // The server names the requester in the PR body it opens.
+        // C is the exact commit CI will test. Clean submissions keep HEAD;
+        // dirty submissions carry C and its tree in the hosted bundle.
+        submission.sha = submit_commit
+            .as_ref()
+            .map(|commit| commit.sha.clone())
+            .unwrap_or(git_rev_parse("HEAD")?);
         if let Some(name) = git_config_user_name() {
             submission.actor = name;
         }
         submission.push = Some(preloop_gha_protocol::PushRequest {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
-            // The server verifies the branch head for a dirty-tree push (the
-            // materialized commit) instead of the base sha.
-            dirty: dirty_push,
+            dirty: false,
         });
-        if let Some((_, head_tree)) = tested_head {
-            submission.push_tree = Some(head_tree);
+        submission.push_tree = submit_commit
+            .as_ref()
+            .map(|commit| commit.tree.clone())
+            .or_else(|| tested_head.map(|(_, head_tree)| head_tree));
+        if let Some(commit) = submit_commit.as_ref()
+            && event == "pull_request"
+            && let Some(head) = submission
+                .payload
+                .get_mut("pull_request")
+                .and_then(|pr| pr.get_mut("head"))
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            head.insert("sha".to_owned(), serde_json::json!(commit.sha));
         }
     }
 
     let client = build_client();
     let url = server_url();
+    if let Some(commit) = submit_commit.as_ref() {
+        let bundle_id =
+            upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await?;
+        submission.git_bundle_id = Some(bundle_id);
+        let _ = std::fs::remove_file(&commit.bundle_path);
+    }
     // Secrets redact on plain serialization; sending them is opt-in.
     let mut request = client
         .post(format!("{url}/api/v1/runs"))
@@ -3606,6 +3638,183 @@ fn git_porcelain() -> anyhow::Result<Vec<String>> {
         .map(str::to_owned)
         .collect())
 }
+#[derive(Debug)]
+struct SubmitCommit {
+    sha: String,
+    tree: String,
+    bundle_path: PathBuf,
+}
+
+/// Create the immutable commit uploaded for a dirty hosted submit. Git
+/// `commit-tree` bypasses commit-msg hooks by design; only a private index is
+/// used, so the user's staging area and branch pointer never move.
+fn create_submit_commit(
+    explicit_message: Option<&str>,
+    dirty: &[String],
+    git_ref: &str,
+) -> anyhow::Result<SubmitCommit> {
+    let parent = git_rev_parse("HEAD")?;
+    let index = std::env::temp_dir().join(format!("preloop-index-{}", std::process::id()));
+    let _ = std::fs::remove_file(&index);
+    let add = std::process::Command::new("git")
+        .env("GIT_INDEX_FILE", &index)
+        .args(["add", "-A"])
+        .output()
+        .context("git add (private submit index)")?;
+    if !add.status.success() {
+        anyhow::bail!(
+            "git add (private submit index): {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+    let tree_output = std::process::Command::new("git")
+        .env("GIT_INDEX_FILE", &index)
+        .args(["write-tree"])
+        .output()
+        .context("git write-tree (private submit index)")?;
+    let _ = std::fs::remove_file(&index);
+    if !tree_output.status.success() {
+        anyhow::bail!(
+            "git write-tree (private submit index): {}",
+            String::from_utf8_lossy(&tree_output.stderr).trim()
+        );
+    }
+    let tree = String::from_utf8_lossy(&tree_output.stdout).trim().to_owned();
+    let branch = git_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(git_ref)
+        .to_owned();
+    let mut message = explicit_message
+        .map(str::to_owned)
+        .unwrap_or_else(|| generated_submit_message(&branch, dirty));
+    if explicit_message.is_none()
+        && let Ok(editor) = std::env::var("EDITOR")
+        && !editor.trim().is_empty()
+    {
+        let path = std::env::temp_dir().join(format!("preloop-message-{}", std::process::id()));
+        std::fs::write(&path, &message).context("write prefilled submit message")?;
+        let status = std::process::Command::new("sh")
+            .args(["-c", &format!("{editor} \"$1\""), "preloop", &path.to_string_lossy()])
+            .status()
+            .context("run $EDITOR for submit commit")?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&path);
+            anyhow::bail!("$EDITOR failed while composing the submit commit");
+        }
+        message = std::fs::read_to_string(&path).context("read submit message")?;
+        let _ = std::fs::remove_file(&path);
+    }
+    if !message.contains("Preloop-Tested-Tree:") {
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+        message.push_str(&format!("\nPreloop-Tested-Tree: {tree}\n"));
+    }
+    let name = git_config_user_name()
+        .ok_or_else(|| anyhow::anyhow!("git user.name is required for a dirty submit"))?;
+    let email = git_config_user_email()
+        .ok_or_else(|| anyhow::anyhow!("git user.email is required for a dirty submit"))?;
+    let commit = std::process::Command::new("git")
+        .env("GIT_AUTHOR_NAME", &name)
+        .env("GIT_AUTHOR_EMAIL", &email)
+        .env("GIT_COMMITTER_NAME", &name)
+        .env("GIT_COMMITTER_EMAIL", &email)
+        .args(["commit-tree", &tree, "-p", &parent, "-m", &message])
+        .output()
+        .context("git commit-tree (submit commit)")?;
+    if !commit.status.success() {
+        anyhow::bail!(
+            "git commit-tree (submit commit): {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+    }
+    let sha = String::from_utf8_lossy(&commit.stdout).trim().to_owned();
+    let ref_name = format!("refs/preloop/submit/{}", std::process::id());
+    run_git_status(["update-ref", &ref_name, &sha])?;
+    let bundle_path =
+        std::env::temp_dir().join(format!("preloop-submit-{}.bundle", std::process::id()));
+    let bundle = std::process::Command::new("git")
+        .args(["bundle", "create", bundle_path.to_str().unwrap(), "--all"])
+        .output()
+        .context("git bundle create")?;
+    let _ = run_git_status(["update-ref", "-d", &ref_name]);
+    if !bundle.status.success() {
+        anyhow::bail!(
+            "git bundle create: {}",
+            String::from_utf8_lossy(&bundle.stderr).trim()
+        );
+    }
+    Ok(SubmitCommit {
+        sha,
+        tree,
+        bundle_path,
+    })
+}
+
+fn generated_submit_message(branch: &str, dirty: &[String]) -> String {
+    let mut dirs = dirty
+        .iter()
+        .filter_map(|line| line.get(3..))
+        .filter_map(|path| path.split('/').next())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.dedup();
+    format!(
+        "wip({branch}): {} files in {}",
+        dirty.len(),
+        if dirs.is_empty() {
+            ".".to_owned()
+        } else {
+            dirs.join(", ")
+        }
+    )
+}
+
+fn run_git_status<const N: usize>(args: [&str; N]) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .context("run git command")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn upload_git_bundle(
+    client: &reqwest::Client,
+    url: &str,
+    path: &std::path::Path,
+    token: Option<String>,
+) -> anyhow::Result<String> {
+    let body = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read git bundle {}", path.display()))?;
+    let mut request = client
+        .post(format!("{url}/api/v1/bundles"))
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.context("upload git bundle")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("bundle upload returned {status}: {body}");
+    }
+    let body: serde_json::Value = response.json().await.context("decode bundle upload")?;
+    body["bundle_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("bundle upload response omitted bundle_id"))
+}
+
 
 /// Decide, after CI on a dirty tree, whether to materialize the tested tree,
 /// push it, and open a PR. Precedence: explicit `--create-pr` flag >
@@ -3727,6 +3936,18 @@ fn git_config_user_name() -> Option<String> {
     let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!name.is_empty()).then_some(name)
 }
+fn git_config_user_email() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "user.email"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!email.is_empty()).then_some(email)
+}
+
 
 async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
     let client = build_client();

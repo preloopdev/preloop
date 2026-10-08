@@ -87,7 +87,7 @@ use compat_ghes::*;
 pub mod cache_artifacts;
 use cache_artifacts::*;
 pub mod snapshots;
-use snapshots::*;
+pub mod bundles;
 pub mod merge_builder;
 pub mod recording;
 use recording::*;
