@@ -29,20 +29,17 @@ Releases before v0.27.0 predate the changelog.
   per attempt and cannot be replaced while the job runs: the worker's
   `renewjob`/`completejob`, its step and job log uploads, and the cache and
   artifact Twirp calls all present it, and the job-lifecycle routes refuse the
-  only credential a worker can re-acquire on its own. So a job that ran past
-  ~50 minutes lost its lease — every later `renewjob` was rejected — and the
-  reaper failed it three minutes later while the step was still running,
-  tearing the machine down and dropping the in-progress step's output from the
-  run log. The lifetime now matches the debug-worker credential's (six-hour
-  GitHub job limit plus the four-hour pause-credit window), grown by the
-  job's own declared `timeout-minutes` and capped at GitHub's maximum job
-  timeout (five days on self-hosted runners; hosted runners are cut off at
-  six hours). `nodejs/node`'s `test-linux.yml` `Build` step
-  (`make build-ci` on four vCPUs) runs longer than the old lifetime, so both
-  of its jobs failed this way with no output after the sccache setup step. The
-  reaper also logs an expired-lease settlement with the run, job, request,
-  last renewal instant, and the window it applied: this failure mode has no
-  runner-side report to explain it, and the log said nothing at all before.
+  only credential a worker can re-acquire on its own. A job that outlived the
+  old lifetime stopped renewing its lease, and the reaper failed it while the
+  step was still running — tearing the machine down and dropping the
+  in-progress step's output from the run log. The lifetime now matches the
+  debug-worker credential's (six-hour GitHub job limit plus the four-hour
+  pause-credit window), grown by the job's own declared `timeout-minutes` and
+  capped at GitHub's maximum job timeout (five days on self-hosted runners;
+  hosted runners are cut off at six hours). The reaper also logs an
+  expired-lease settlement with the run, job, request, last renewal instant,
+  and the window it applied: this failure mode has no runner-side report to
+  explain it, and the log said nothing at all before.
 
 - **A job's `timeout-minutes` is capped by the server at GitHub's own
   maximum**: five days on self-hosted runners, the point GitHub's service
