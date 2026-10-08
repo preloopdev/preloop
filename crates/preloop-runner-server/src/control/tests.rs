@@ -5312,9 +5312,7 @@ pub(crate) mod suite {
     /// whose label set sorts first as text (`["",["self-hosted","zzz"]]` <
     /// `["",["self-hosted"]]`) must not displace the older run's job at the
     /// front while that job is still ready.
-    pub(crate) async fn front_labels_follow_queue_order_not_pool_key(
-        backend: &dyn ControlBackend,
-    ) {
+    pub(crate) async fn front_labels_follow_queue_order_not_pool_key(backend: &dyn ControlBackend) {
         let older = RunId::new();
         let mut first = submit_run(
             older,
