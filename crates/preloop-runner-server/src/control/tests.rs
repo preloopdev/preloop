@@ -4279,6 +4279,413 @@ pub(crate) mod suite {
         assert_eq!(claimed.queued.run_id, big);
     }
 
+    /// The claim reads the ready queue in ONE order across label sets: the
+    /// pool key groups equal label sets for pruning, it never ranks them.
+    /// `["",["preloop-cpane","self-hosted"]]` sorts before
+    /// `["",["self-hosted"]]`, so a batch ordered by pool key leads with the
+    /// `preloop-cpane` job: a runner matching both would take the newer job
+    /// and starve the older one (production: 91 `preloop-cpane` jobs, all
+    /// started; the 15 jobs of the older `self-hosted` key, one an hour
+    /// older, never). The queue order — `priority DESC, run_order,
+    /// job_order` — decides instead.
+    pub(crate) async fn claim_takes_the_oldest_job_across_label_sets(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner_with_labels(
+                "r1",
+                &["self-hosted", "preloop-cpane"],
+            ))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let both = ["self-hosted", "preloop-cpane"];
+        let run_id = RunId::new();
+        // Both jobs in one run: submit order decides within it on both
+        // backends (`run_order` counts runs, `job_order` jobs).
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![
+                    submit_job_on(run_id, "oldest", 1, &["self-hosted"]),
+                    submit_job_on(run_id, "newer", 2, &["preloop-cpane", "self-hosted"]),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &both,
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a runner matching both label sets must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(
+            claimed.queued.job_id,
+            JobId("oldest".to_owned()),
+            "the queue order decides, not the pool key's text order"
+        );
+
+        // The other label set is still served: once the head settles, the
+        // next claim takes it.
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("oldest".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &both,
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the remaining job must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("newer".to_owned()));
+    }
+
+    /// Claim the next job as `runner` and return `(run, job, agent job id)`.
+    async fn claim_next(
+        backend: &dyn ControlBackend,
+        session_id: &str,
+        runner_id: i64,
+    ) -> (RunId, JobId, uuid::Uuid) {
+        let outcome = backend
+            .poll_session(poll_with_labels(session_id, runner_id, &["self-hosted"]))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a ready job must be claimed, got {outcome:?}");
+        };
+        (
+            claimed.queued.run_id,
+            claimed.queued.job_id,
+            claimed.request.agent_job_id,
+        )
+    }
+
+    async fn finish_job(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &JobId,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+    ) {
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: job_id.clone(),
+                agent_job_id: Some(agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_id),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Runs are ordered by when they arrived, not by their workflow's run
+    /// number. The run number is a per-workflow counter (run #800 of a busy
+    /// workflow versus run #3 of a quiet one), so comparing it across
+    /// workflows lets the quiet workflow jump the queue forever. The older
+    /// run, submitted second here with the larger run number, goes first.
+    pub(crate) async fn claim_orders_runs_by_arrival_not_run_number(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner_with_labels("r1", &["self-hosted"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let newer = RunId::new();
+        let older = RunId::new();
+        let mut newer_run = submit_run(newer, vec![submit_job(newer, "new-job", 1)]);
+        newer_run.record.run_number = 3;
+        newer_run.record.created_at = now;
+        backend.submit_run(newer_run).await.unwrap();
+        let mut older_run = submit_run(older, vec![submit_job(older, "old-job", 2)]);
+        older_run.record.run_number = 800;
+        older_run.record.created_at = now - chrono::Duration::hours(1);
+        backend.submit_run(older_run).await.unwrap();
+
+        let (run, job, agent) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            job,
+            JobId("old-job".to_owned()),
+            "the run that arrived first goes first, whatever its run number"
+        );
+        finish_job(backend, run, &job, agent, runner.runner.id).await;
+        let (_, job, _) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(job, JobId("new-job".to_owned()));
+    }
+
+    /// Jobs a deferred matrix expands into keep their run's place in the
+    /// queue. They used to be inserted with `run_order = 0, job_order = 0`,
+    /// which sorted them ahead of every other run's ready jobs: a newer run's
+    /// legs jumped the older run's job.
+    pub(crate) async fn expanded_jobs_keep_their_runs_place_in_the_queue(
+        backend: &dyn ControlBackend,
+    ) {
+        let runner = backend
+            .register_runner(register_runner_with_labels("r1", &["self-hosted"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let older = RunId::new();
+        let mut older_run = submit_run(older, vec![submit_job(older, "old-job", 1)]);
+        older_run.record.created_at = now - chrono::Duration::hours(1);
+        backend.submit_run(older_run).await.unwrap();
+
+        // The newer run: `gen` feeds a deferred matrix `fan`.
+        let newer = RunId::new();
+        let mut fan = submit_job(newer, "fan", 3);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut newer_run = submit_run(newer, vec![submit_job(newer, "gen", 2), fan]);
+        newer_run.record.created_at = now;
+        backend.submit_run(newer_run).await.unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: newer,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        built_matrix_leg(newer, "fan-1", "fan", 1, 2),
+                        built_matrix_leg(newer, "fan-2", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+
+        let (run, job, agent) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            job,
+            JobId("old-job".to_owned()),
+            "the older run's job goes before the newer run's expanded legs"
+        );
+        finish_job(backend, run, &job, agent, runner.runner.id).await;
+        let (run, job, agent) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            job,
+            JobId("fan-1".to_owned()),
+            "legs sharing the placeholder's job_order fall back to job_id"
+        );
+        finish_job(backend, run, &job, agent, runner.runner.id).await;
+        let (_, job, _) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(job, JobId("fan-2".to_owned()));
+    }
+
+    /// Every ready-queue front read (`next_job_runs_on`: the submit and poll
+    /// outcomes and `queue_stats`) reports the queue head in the same global
+    /// order the claim takes, never the lexically first pool key's labels:
+    /// the pg front read (the submit/poll outcome path) was pool-key-led
+    /// while lite's already took the head.
+    pub(crate) async fn ready_front_reports_the_queue_head_across_label_sets(
+        backend: &dyn ControlBackend,
+    ) {
+        let runner = backend
+            .register_runner(register_runner_with_labels(
+                "r1",
+                &["self-hosted", "preloop-cpane"],
+            ))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let both = ["self-hosted", "preloop-cpane"];
+        let run_id = RunId::new();
+        let outcome = backend
+            .submit_run(submit_run(
+                run_id,
+                vec![
+                    submit_job_on(run_id, "oldest", 1, &["self-hosted"]),
+                    submit_job_on(run_id, "newer", 2, &["preloop-cpane", "self-hosted"]),
+                ],
+            ))
+            .await
+            .unwrap();
+        let head = vec!["self-hosted".to_owned()];
+        let behind = vec!["preloop-cpane".to_owned(), "self-hosted".to_owned()];
+        assert_eq!(
+            outcome.next_runs_on, head,
+            "the front is the global queue head, not the first pool key"
+        );
+
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!(stats.ready, 2);
+        assert_eq!(stats.next_runs_on, head);
+
+        // Claiming the head moves the front to the job behind it, in every
+        // read that reports one.
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &both,
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the head must be claimable, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("oldest".to_owned()));
+        assert_eq!(claimed.next_runs_on, behind);
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!(stats.next_runs_on, behind);
+    }
+
+    /// Paging reaches a runner's job across windows of jobs it cannot serve,
+    /// whatever the pool keys sort like: 130 older jobs of a label set this
+    /// runner does not carry, then the job it can take. The window is the
+    /// global queue order, so the scan pages through them instead of
+    /// stopping at the first (lexically earliest) pool key.
+    pub(crate) async fn claim_pages_past_windows_of_other_label_sets(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner_with_labels("r1", &["preloop-cpane"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = RunId::new();
+        // The fillers' pool key (`["",["self-hosted"]]`) sorts AFTER the
+        // target's (`["",["preloop-cpane"]]`): under a pool-key-led batch the
+        // target would be claimed without paging at all, which is exactly the
+        // reordering this test forbids.
+        let mut jobs = (0..130)
+            .map(|i| submit_job_on(run_id, &format!("filler-{i:03}"), 1 + i, &["self-hosted"]))
+            .collect::<Vec<_>>();
+        jobs.push(submit_job_on(run_id, "target", 300, &["preloop-cpane"]));
+        backend.submit_run(submit_run(run_id, jobs)).await.unwrap();
+
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &["preloop-cpane"],
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a matching job two windows deep must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("target".to_owned()));
+    }
+
+    /// A fresh binding to the polling runner outranks unassigned candidates
+    /// wherever it sits in the global queue: 64 claimable unassigned jobs
+    /// (older, all matching the runner) fill the first window and the
+    /// runner's own binding waits behind them. The paged scan reads one
+    /// window at a time and would take the window's unassigned job; the four-
+    /// tier preference — and the binding's 120s expiry — require the
+    /// runner's own job first. The fillers are submitted with pool
+    /// assignments off so they carry no binding and no pool-pending row (a
+    /// fresh pool-pending row blocks all claimers until it ages out);
+    /// `set_pool_assignments` flips the backend into the pool mode the last
+    /// submit's enqueue-time pairing runs in.
+    pub(crate) async fn claim_takes_a_binding_past_a_window_of_unassigned_jobs<F>(
+        backend: &dyn ControlBackend,
+        set_pool_assignments: F,
+    ) where
+        F: Fn(bool),
+    {
+        let mut registration = register_runner_with_labels("r1", &["self-hosted", "preloop-cpane"]);
+        registration.pool_proven = true;
+        let runner = backend.register_runner(registration).await.unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        // The fillers: plain claimable queue candidates, one full window.
+        set_pool_assignments(false);
+        let fillers_run = RunId::new();
+        let fillers = (0..64)
+            .map(|i| {
+                submit_job_on(
+                    fillers_run,
+                    &format!("filler-{i:03}"),
+                    1 + i,
+                    &["self-hosted"],
+                )
+            })
+            .collect::<Vec<_>>();
+        backend
+            .submit_run(submit_run(fillers_run, fillers))
+            .await
+            .unwrap();
+
+        // Pool assignments on: the enqueue-time pairing binds the next job
+        // to the idle, pool-proven runner — the 65th ready row.
+        set_pool_assignments(true);
+        let bound_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                bound_run,
+                vec![submit_job_on(bound_run, "bound", 100, &["preloop-cpane"])],
+            ))
+            .await
+            .unwrap();
+
+        let outcome = backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &["self-hosted", "preloop-cpane"],
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the runner's own binding must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(
+            claimed.queued.job_id,
+            JobId("bound".to_owned()),
+            "a fresh binding to the polling runner outranks the unassigned window"
+        );
+    }
+
     /// A settled attempt's deferred token-mint recipe must not outlive its
     /// job: the completion drops the `github_token_requests` row, so a later
     /// `acquire_context` no longer sees it.
@@ -6815,6 +7222,57 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn claim_takes_the_oldest_job_across_label_sets() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claim_takes_the_oldest_job_across_label_sets(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn claim_orders_runs_by_arrival_not_run_number() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claim_orders_runs_by_arrival_not_run_number(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn expanded_jobs_keep_their_runs_place_in_the_queue() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::expanded_jobs_keep_their_runs_place_in_the_queue(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn ready_front_reports_the_queue_head_across_label_sets() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::ready_front_reports_the_queue_head_across_label_sets(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn claim_pages_past_windows_of_other_label_sets() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claim_pages_past_windows_of_other_label_sets(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn claim_takes_a_binding_past_a_window_of_unassigned_jobs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claim_takes_a_binding_past_a_window_of_unassigned_jobs(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn settle_drops_the_deferred_token_request() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -8221,6 +8679,47 @@ mod lite {
     async fn claim_scan_finds_a_matching_job_past_the_window() {
         suite::claim_scan_finds_a_matching_job_past_the_window(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn claim_takes_the_oldest_job_across_label_sets() {
+        suite::claim_takes_the_oldest_job_across_label_sets(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn claim_orders_runs_by_arrival_not_run_number() {
+        suite::claim_orders_runs_by_arrival_not_run_number(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn expanded_jobs_keep_their_runs_place_in_the_queue() {
+        suite::expanded_jobs_keep_their_runs_place_in_the_queue(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ready_front_reports_the_queue_head_across_label_sets() {
+        suite::ready_front_reports_the_queue_head_across_label_sets(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn claim_pages_past_windows_of_other_label_sets() {
+        suite::claim_pages_past_windows_of_other_label_sets(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn claim_takes_a_binding_past_a_window_of_unassigned_jobs() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::claim_takes_a_binding_past_a_window_of_unassigned_jobs(&backend, |on| {
+            backend.set_config(on, false, std::time::Duration::from_secs(300));
+        })
+        .await;
     }
 
     #[tokio::test]

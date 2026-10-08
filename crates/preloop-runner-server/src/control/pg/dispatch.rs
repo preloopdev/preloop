@@ -3900,7 +3900,10 @@ fn submit_node(
         runs_on: job.runs_on.clone(),
         runner_group: job.runner_group.clone(),
         priority: 0,
-        run_order: record.run_number as i64,
+        // The run's submit time, like SQLite: arrival order across workflows.
+        // (The workflow run number is a per-workflow counter, not comparable
+        // between workflows.)
+        run_order: record.created_at.timestamp_micros(),
         job_order: position as i32,
         enqueued_at_us: None,
         claimed_by_runner_id: None,
@@ -4716,13 +4719,19 @@ impl PgBackend {
     }
 
     /// [`Self::ready_front_labels`] on a caller's connection or open transaction.
+    ///
+    /// The front is the queue head in the shared global dispatch order
+    /// (`priority DESC, run_order, job_order` — the `jobs_ready_global`
+    /// index), never the lexically first pool key: the pool key groups equal
+    /// label sets for pruning, it does not rank them, so ordering by it would
+    /// report a different job than the claim takes.
     pub(super) async fn ready_front_labels_on(
         client: &impl GenericClient,
     ) -> Result<Vec<String>, ControlError> {
         let row = client
             .query_opt(
                 "SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
-                 ORDER BY pool_key, priority DESC, run_order, job_order LIMIT 1",
+                 ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
                 &[],
             )
             .await
@@ -4917,16 +4926,29 @@ impl PgBackend {
     /// `claim_position`: the ready job this runner should take, using the
     /// shared four-tier preference over the current ready batch.
     ///
-    /// Statements: a read of the ready batch (`LIMIT 64` in queue order with
-    /// assignments and pool-pending rows joined in), then the preferred
-    /// candidate's claim. The claim locks the job row with `FOR UPDATE SKIP
-    /// LOCKED`: concurrent pollers collapse onto the same head candidate, and
-    /// a row another poller is claiming must be skipped at once — a plain
-    /// conditional `UPDATE` would queue on that row until the winner's whole
-    /// transaction commits, then match nothing. No lock is taken on the rest
-    /// of the batch. The batch is paged until a candidate matches or the
-    /// ready set is exhausted: a runner whose pool sorts past the first batch
-    /// must still see the jobs it can serve.
+    /// Statements: a read of the runner's own fresh bindings (the top two
+    /// preference tiers, wherever they sit in the queue), then a read of the
+    /// ready batch (`LIMIT 64` in queue order with assignments and
+    /// pool-pending rows joined in), then the preferred candidate's claim.
+    /// The claim locks the job row with `FOR UPDATE SKIP LOCKED`: concurrent
+    /// pollers collapse onto the same head candidate, and a row another
+    /// poller is claiming must be skipped at once — a plain conditional
+    /// `UPDATE` would queue on that row until the winner's whole transaction
+    /// commits, then match nothing. No lock is taken on the rest of the
+    /// batch. The batch is paged until a candidate matches or the ready set
+    /// is exhausted, so a runner whose labels match only jobs deep in the
+    /// queue still finds them.
+    ///
+    /// The batch is the queue in ONE global order — `priority DESC,
+    /// run_order, job_order`, then the `run_id, job_id` tie-breakers that make
+    /// the order total and keep `OFFSET` paging stable — never the pool key's
+    /// text order: the key groups equal label sets for pruning, it does not
+    /// rank them, and ranking by it starves every label set whose key sorts
+    /// after another's (a runner matching both takes the lexically earlier
+    /// key's job even when the other is older). The bindings read first are
+    /// in that same order: a fresh assignment to the polling runner outranks
+    /// unassigned candidates, so a first window of them must not take the
+    /// runner off its own binding before it expires.
     async fn claim_one(
         &self,
         tx: &Transaction<'_>,
@@ -4945,7 +4967,9 @@ impl PgBackend {
         // Jobs whose namespace admits no new claim (state or running caps)
         // never become candidates; `capped` marks the ones whose claim must
         // first serialize on the namespace's limit rows.
-        let batch_sql = format!(
+        // The candidate columns both claim reads decode; shared so the
+        // assigned-tier scan and the paged queue scan cannot drift.
+        let candidate_columns = format!(
             "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, \
                     a.runner_id, \
                     COALESCE(a.assigned_at > now() - interval '120 seconds', false), \
@@ -4958,97 +4982,162 @@ impl PgBackend {
                     (j.enqueued_at IS NOT NULL \
                      AND j.enqueued_at <= now() - interval '120 seconds'), \
                     (p.requested_at > now() - interval '120 seconds'), \
-                    j.namespace_id, j.pool_key, {capped} \
+                    j.namespace_id, j.pool_key, {capped}",
+            capped = crate::control::types::NAMESPACE_CLAIM_CAPPED,
+        );
+        let batch_sql = format!(
+            "{candidate_columns} \
              FROM jobs j \
              LEFT JOIN job_assignments a ON a.run_id = j.run_id \
                 AND a.job_id = j.job_id \
              LEFT JOIN provision_requests p ON p.run_id = j.run_id \
                 AND p.job_id = j.job_id \
              WHERE j.queue_state = 'ready' AND ({admits}) \
-             ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+             ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
              LIMIT 64 OFFSET $1",
-            capped = crate::control::types::NAMESPACE_CLAIM_CAPPED,
             admits = crate::control::types::NAMESPACE_ADMITS_CLAIM,
         );
-        for _attempt in 0..CLAIM_ATTEMPTS {
-            let mut offset: i64 = 0;
-            loop {
-                // The pool key prunes by label set; the shared eligibility
-                // ladder and matcher still decide.
-                let rows = tx.query(batch_sql.as_str(), &[&offset]).await.map_err(db)?;
-                let exhausted = rows.len() < 64;
-                let mut candidates = Vec::with_capacity(rows.len());
-                // `(namespace, pool_key, capped)` per candidate, kept index-
-                // aligned with `candidates` (both are `swap_remove`d together).
-                let mut namespaces: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
-                for (position, row) in rows.iter().enumerate() {
-                    let assigned: Option<i64> = row.get(4);
-                    let assignment_fresh: bool = row.get(5);
-                    let first_assigned_fresh: bool = row.get(6);
-                    let registered: bool = row.get(7);
-                    let assignment = row.get::<_, bool>(8).then_some((
-                        assigned,
-                        assignment_fresh,
-                        first_assigned_fresh,
-                        registered,
-                    ));
-                    let enqueue_ceiling_expired: bool = row.get(9);
-                    // A NULL marks a non-matching LEFT JOIN (no provision
-                    // row); `provision_fresh` is tri-state.
-                    let provision_fresh: Option<bool> = row.get(10);
-                    // `claim_permitted` verbatim (lite/poll.rs): assignment
-                    // rows bind verified sessions while fresh, stale/orphaned
-                    // bindings open to any verified caller, a fresh
-                    // pool-pending row blocks everyone, and unassigned jobs
-                    // are only claimable when strict assignments are off.
-                    // The old model swept stale bindings before checking in
-                    // permissive mode — a stale assignment/pool_pending row
-                    // counts as absent there.
-                    let assignment = if !require_assignments && !assignment_fresh {
-                        None
+        // The assigned tier, read before the paged queue: a fresh binding to
+        // the polling runner outranks every unassigned candidate — the four-
+        // tier preference exists to hand THIS runner its bindings before they
+        // expire — but the paged scan sees one window at a time and would
+        // take an unassigned job from the first window. The runner's own
+        // bindings are read in the same global queue order within the tier;
+        // enqueue pairing skips busy runners (any binding or live request),
+        // so a runner holds at most one fresh binding and one page is
+        // exhaustive.
+        let assigned_sql = verified_runner_id.map(|_| {
+            format!(
+                "{candidate_columns} \
+                 FROM jobs j \
+                 JOIN job_assignments a ON a.run_id = j.run_id \
+                    AND a.job_id = j.job_id \
+                 LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                    AND p.job_id = j.job_id \
+                 WHERE j.queue_state = 'ready' AND ({admits}) \
+                   AND a.runner_id = $1 \
+                   AND a.assigned_at > now() - interval '120 seconds' \
+                 ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
+                 LIMIT 64",
+                admits = crate::control::types::NAMESPACE_ADMITS_CLAIM,
+            )
+        });
+        // One decoded read batch: candidates in read order, with the
+        // per-candidate `(namespace, pool_key, capped)` triples index-aligned
+        // (both are `swap_remove`d together).
+        type ClaimBatch = (Vec<logic::ClaimCandidate>, Vec<(String, String, bool)>);
+        // Decode a read batch into candidates against the shared eligibility
+        // ladder. `base_position` is the batch's offset in the order it was
+        // read: the paged scan's page offset, 0 for the assigned scan.
+        let decode = |rows: &[tokio_postgres::Row],
+                      base_position: u64|
+         -> Result<ClaimBatch, ControlError> {
+            let mut candidates = Vec::with_capacity(rows.len());
+            let mut namespaces: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
+            for (position, row) in rows.iter().enumerate() {
+                let assigned: Option<i64> = row.get(4);
+                let assignment_fresh: bool = row.get(5);
+                let first_assigned_fresh: bool = row.get(6);
+                let registered: bool = row.get(7);
+                let assignment = row.get::<_, bool>(8).then_some((
+                    assigned,
+                    assignment_fresh,
+                    first_assigned_fresh,
+                    registered,
+                ));
+                let enqueue_ceiling_expired: bool = row.get(9);
+                // A NULL marks a non-matching LEFT JOIN (no provision
+                // row); `provision_fresh` is tri-state.
+                let provision_fresh: Option<bool> = row.get(10);
+                // `claim_permitted` verbatim (lite/poll.rs): assignment
+                // rows bind verified sessions while fresh, stale/orphaned
+                // bindings open to any verified caller, a fresh
+                // pool-pending row blocks everyone, and unassigned jobs
+                // are only claimable when strict assignments are off.
+                // The old model swept stale bindings before checking in
+                // permissive mode — a stale assignment/pool_pending row
+                // counts as absent there.
+                let assignment = if !require_assignments && !assignment_fresh {
+                    None
+                } else {
+                    assignment
+                };
+                let provision_fresh = if !require_assignments && provision_fresh == Some(false) {
+                    None
+                } else {
+                    provision_fresh
+                };
+                let claimable = if assignment.is_some() {
+                    if !first_assigned_fresh || enqueue_ceiling_expired {
+                        verified
                     } else {
-                        assignment
-                    };
-                    let provision_fresh = if !require_assignments && provision_fresh == Some(false)
-                    {
-                        None
-                    } else {
-                        provision_fresh
-                    };
-                    let claimable = if assignment.is_some() {
-                        if !first_assigned_fresh || enqueue_ceiling_expired {
-                            verified
-                        } else {
-                            match assigned {
-                                None => verified,
-                                Some(id) => {
-                                    if !registered || !assignment_fresh {
-                                        verified
-                                    } else {
-                                        Some(id) == verified_runner_id
-                                    }
+                        match assigned {
+                            None => verified,
+                            Some(id) => {
+                                if !registered || !assignment_fresh {
+                                    verified
+                                } else {
+                                    Some(id) == verified_runner_id
                                 }
                             }
                         }
-                    } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
-                        false
-                    } else if provision_fresh.is_some() {
-                        verified
-                    } else {
-                        !require_assignments
-                    };
-                    candidates.push(logic::ClaimCandidate {
-                        run_id: codec::run_id(&row.get::<_, String>(0))?,
-                        job_id: JobId(row.get::<_, String>(1)),
-                        runs_on: codec::from_json(row.get::<_, String>(2).as_str())?,
-                        runner_group: row.get(3),
-                        assigned_runner_id: assigned,
-                        assignment_fresh,
-                        queue_position: position as u64,
-                        claimable,
-                    });
-                    namespaces.push((row.get(11), row.get(12), row.get(13)));
+                    }
+                } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
+                    false
+                } else if provision_fresh.is_some() {
+                    verified
+                } else {
+                    !require_assignments
+                };
+                candidates.push(logic::ClaimCandidate {
+                    run_id: codec::run_id(&row.get::<_, String>(0))?,
+                    job_id: JobId(row.get::<_, String>(1)),
+                    runs_on: codec::from_json(row.get::<_, String>(2).as_str())?,
+                    runner_group: row.get(3),
+                    assigned_runner_id: assigned,
+                    assignment_fresh,
+                    // Position in the order the batch was read: the paged
+                    // scan reports the GLOBAL queue position (the page
+                    // offset counts), the assigned scan its own order.
+                    queue_position: base_position + position as u64,
+                    claimable,
+                });
+                namespaces.push((row.get(11), row.get(12), row.get(13)));
+            }
+            Ok((candidates, namespaces))
+        };
+        for _attempt in 0..CLAIM_ATTEMPTS {
+            // The assigned tier first (see `assigned_sql`): the runner's own
+            // fresh bindings, wherever they sit in the global queue.
+            if let (Some(proven), Some(assigned_sql)) =
+                (verified_runner_id, assigned_sql.as_deref())
+            {
+                let rows = tx.query(assigned_sql, &[&proven]).await.map_err(db)?;
+                let (mut candidates, mut namespaces) = decode(&rows, 0)?;
+                while let Some(index) = logic::claim_preference(
+                    &candidates,
+                    Some(proven),
+                    &caps.labels,
+                    None,
+                    &runner_match,
+                ) {
+                    let chosen = candidates.swap_remove(index);
+                    let (namespace, pool_key, capped) = namespaces.swap_remove(index);
+                    if self
+                        .claim_candidate(tx, runner_id, &chosen, &namespace, &pool_key, capped)
+                        .await?
+                    {
+                        return Ok(Some((chosen.run_id, chosen.job_id)));
+                    }
                 }
+            }
+            let mut offset: i64 = 0;
+            loop {
+                // The batch is the ready queue in global dispatch order; the
+                // shared eligibility ladder and matcher decide.
+                let rows = tx.query(batch_sql.as_str(), &[&offset]).await.map_err(db)?;
+                let exhausted = rows.len() < 64;
+                let (mut candidates, mut namespaces) = decode(&rows, offset as u64)?;
                 // Walk the candidates in preference order, claiming the first
                 // whose row lock lands. A skipped (locked) or already-claimed
                 // row advances to the next-eligible candidate.
@@ -5062,33 +5151,14 @@ impl PgBackend {
                 ) {
                     let chosen = candidates.swap_remove(index);
                     let (namespace, pool_key, capped) = namespaces.swap_remove(index);
-                    if capped
-                        && !self
-                            .capped_claim_admitted(tx, &namespace, &pool_key, &chosen)
-                            .await?
+                    if !self
+                        .claim_candidate(tx, runner_id, &chosen, &namespace, &pool_key, capped)
+                        .await?
                     {
-                        // Another claim took the namespace's last slot after
-                        // the batch was read.
                         raced = true;
                         continue;
                     }
-                    let claimed = tx
-                        .execute(
-                            "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
-                             claimed_by_runner_id = $3, claimed_at = now() \
-                             FROM (SELECT run_id, job_id FROM jobs \
-                                   WHERE run_id = $1::text::uuid AND job_id = $2 \
-                                     AND queue_state = 'ready' \
-                                   FOR UPDATE SKIP LOCKED) c \
-                             WHERE j.run_id = c.run_id AND j.job_id = c.job_id",
-                            &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
-                        )
-                        .await
-                        .map_err(db)?;
-                    if claimed > 0 {
-                        return Ok(Some((chosen.run_id, chosen.job_id)));
-                    }
-                    raced = true;
+                    return Ok(Some((chosen.run_id, chosen.job_id)));
                 }
                 if raced {
                     // A concurrent claim moved rows under us: re-read from the
@@ -5102,6 +5172,45 @@ impl PgBackend {
             }
         }
         Ok(None)
+    }
+
+    /// Attempt the claim fence for one chosen candidate: the namespace-cap
+    /// re-check under its limit-row locks, then the conditional `FOR UPDATE
+    /// SKIP LOCKED` update. `false` means the row moved under us — locked or
+    /// claimed by a concurrent poller, or its namespace cap filled — and the
+    /// caller advances to the next candidate.
+    async fn claim_candidate(
+        &self,
+        tx: &Transaction<'_>,
+        runner_id: Option<i64>,
+        chosen: &logic::ClaimCandidate,
+        namespace: &str,
+        pool_key: &str,
+        capped: bool,
+    ) -> Result<bool, ControlError> {
+        if capped
+            && !self
+                .capped_claim_admitted(tx, namespace, pool_key, chosen)
+                .await?
+        {
+            // Another claim took the namespace's last slot after the batch
+            // was read.
+            return Ok(false);
+        }
+        let claimed = tx
+            .execute(
+                "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
+                 claimed_by_runner_id = $3, claimed_at = now() \
+                 FROM (SELECT run_id, job_id FROM jobs \
+                       WHERE run_id = $1::text::uuid AND job_id = $2 \
+                         AND queue_state = 'ready' \
+                       FOR UPDATE SKIP LOCKED) c \
+                 WHERE j.run_id = c.run_id AND j.job_id = c.job_id",
+                &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
+            )
+            .await
+            .map_err(db)?;
+        Ok(claimed > 0)
     }
 
     /// Re-check a capped namespace's admission under its limit-row locks.
@@ -6421,7 +6530,7 @@ impl PgBackend {
             }
             BuiltExpansion::Matrix { jobs } => {
                 let registered = self
-                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, &node_id, jobs)
                     .await?;
                 // The parent leaves the run's status map; its legs take over.
                 if let Some(node) = sweep.node_mut(run_id, &node_id) {
@@ -6444,7 +6553,7 @@ impl PgBackend {
                 reusable_calls,
             } => {
                 let registered = self
-                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, &caller_id, jobs)
                     .await?;
                 if let Some(node) = sweep.node_mut(run_id, &caller_id) {
                     node.status = ExecutionStatus::InProgress;
@@ -6485,6 +6594,7 @@ impl PgBackend {
         tx: &Transaction<'_>,
         sweep: &mut Sweep<'_>,
         run_id: RunId,
+        placeholder: &JobId,
         jobs: Vec<BuiltJob>,
     ) -> Result<usize, ControlError> {
         let platforms = Self::registered_platforms_on(tx).await?;
@@ -6508,6 +6618,19 @@ impl PgBackend {
             .map(|(k, v)| (k, v as i64))
             .collect();
         let now = now_us();
+        // Expanded jobs keep their run's place in the queue: the run's
+        // `run_order` and the placeholder's `job_order`. A literal 0/0 would
+        // sort them ahead of every other run's jobs.
+        let (run_order, job_order) = sweep
+            .graphs
+            .get(&run_id)
+            .map(|graph| {
+                graph.nodes.get(placeholder).map_or_else(
+                    || (graph.record.created_at.timestamp_micros(), 0),
+                    |node| (node.run_order, node.job_order),
+                )
+            })
+            .unwrap_or((0, 0));
         let mut registered = 0usize;
         for built in jobs {
             let BuiltJob {
@@ -6541,8 +6664,8 @@ impl PgBackend {
                 runs_on: plan.runs_on.clone(),
                 runner_group: plan.runner_group.clone(),
                 priority: 0,
-                run_order: 0,
-                job_order: 0,
+                run_order,
+                job_order,
                 enqueued_at_us: None,
                 claimed_by_runner_id: None,
                 claimed_at_us: None,

@@ -205,10 +205,17 @@ CREATE TABLE jobs (
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 );
--- Claim order: `SELECT .. WHERE queue_state = 'ready' ORDER BY pool_key,
--- priority DESC, run_order, job_order`. The key columns are exactly the
--- ORDER BY (pg's index carries the same key), so the ready front is read in
--- order instead of sorting the whole ready set on every poll.
+-- ready-queue scans read the ready set in ONE global order — priority DESC,
+-- run_order, job_order, then the run_id, job_id tie-breakers that make the
+-- order total and keep OFFSET paging stable (the claim batch, the front gauge
+-- and the reaper's ready scans). The key columns are exactly that ORDER BY;
+-- without it every claim sorts the whole ready queue.
+CREATE INDEX jobs_ready_global ON jobs(priority DESC, run_order, job_order, run_id, job_id)
+    WHERE queue_state = 'ready';
+-- Label-set grouping for the per-pool quota predicates and the pool-status
+-- page. The key's leading column groups equal label sets; it never ranks
+-- them — the claim reads the global order above, and ordering by the pool
+-- key starves every label set whose key sorts after another's.
 CREATE INDEX jobs_ready ON jobs(pool_key, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
 CREATE INDEX jobs_pending_expansion ON jobs(enqueued_at) WHERE queue_state = 'pending_expansion';

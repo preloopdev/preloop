@@ -204,6 +204,40 @@ Releases before v0.27.0 predate the changelog.
   delivery whose `repository.full_name` mismatched (or was missing) the
   gated job's repository could record an environment review for it; it is
   ignored now.
+- **The scheduler claims the oldest ready job again, whatever its `runs-on`
+  labels.** The ready queue was read in pool-key order (the key is a
+  canonical label-set string), and pool keys sort as text: every runner
+  matching both `["preloop-cpane","self-hosted"]` and `["self-hosted"]` took
+  the lexically earlier key's jobs first, so a label set whose key sorted
+  later starved behind the other's — on the production cell 91
+  `preloop-cpane` jobs all started while 15 `self-hosted` jobs (one an hour
+  older, the required "Runner light conformance" check) never did. The claim
+  batch, the ready-queue front gauges and the reaper's ready scans now read
+  one global queue order — `priority DESC, run_order, job_order`, with
+  `run_id, job_id` as tie-breakers — on both backends; the pool key groups
+  equal label sets for pruning and never ranks them. A runner's own fresh
+  bindings are read before the paged queue, so a first window of older
+  unassigned jobs can no longer take a runner off the job the control plane
+  bound to it: the binding is exclusive and expires after 120s, and the
+  four-tier preference puts it above every unassigned candidate wherever in
+  the queue it sits. A new
+  `jobs_ready_global` partial index (`queue_state = 'ready'`) carries that
+  order, so the claim stays an index read instead of a sort of the whole
+  ready queue (0.2 ms vs 28 ms at 20k ready jobs); `jobs_ready` is kept for
+  the per-pool quota predicates. The index is added by migration
+  `V2026100507`; the claim order is correct without it, so a database that
+  has not migrated yet only loses the speedup.
+
+- **Runs are queued in arrival order on Postgres, and expanded jobs keep
+  their run's place.** Postgres ordered the queue by the workflow's run
+  number — a per-workflow counter — so run #3 of one workflow was claimed
+  before run #800 of another that arrived earlier. `run_order` is now the
+  run's submit time on both backends. Jobs a deferred matrix or a reusable
+  workflow expands into were inserted with `run_order = 0, job_order = 0`,
+  which put them ahead of every other run's ready jobs on both backends;
+  they now take their run's `run_order` and the placeholder's `job_order`.
+  Legs of one matrix share that `job_order`, so among themselves they fall
+  back to `job_id`.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
