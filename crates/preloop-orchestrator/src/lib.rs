@@ -6920,9 +6920,7 @@ fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
     let mut wrapped = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!(
-            "{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""
-        ),
+        format!("{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
         "sh".to_owned(),
     ];
     wrapped.extend_from_slice(argv);
@@ -8849,12 +8847,10 @@ done
             "{GUEST_NOFILE_ULIMIT}"
         );
         assert!(
-            GUEST_NOFILE_ULIMIT.starts_with(
-                &format!(
-                    "ulimit -Hn {} 2>/dev/null || true; ",
-                    cfg("golden_rlimit_nofile_hard")
-                )
-            ),
+            GUEST_NOFILE_ULIMIT.starts_with(&format!(
+                "ulimit -Hn {} 2>/dev/null || true; ",
+                cfg("golden_rlimit_nofile_hard")
+            )),
             "only the first hard raise is allowed to be ignored: {GUEST_NOFILE_ULIMIT}"
         );
         assert_eq!(
@@ -9097,19 +9093,15 @@ done
             script.contains("base64 -d | sudo -n sh; fi"),
             "the image-user branch must preserve the failure status: {script}"
         );
-        let raise = script
-            .find(GUEST_STACK_ULIMIT)
-            .unwrap_or_else(|| {
-                panic!("the container engine must start with the hosted stack limit: {script}")
-            });
+        let raise = script.find(GUEST_STACK_ULIMIT).unwrap_or_else(|| {
+            panic!("the container engine must start with the hosted stack limit: {script}")
+        });
         // A container's processes inherit the daemon's limits, so the
         // descriptor pair GitHub-hosted containers carry (65536/65536) has to
         // be raised here too, in the same launch.
-        let nofile = script
-            .find(GUEST_NOFILE_ULIMIT)
-            .unwrap_or_else(|| {
-                panic!("the container engine must start on the hosted descriptor limit: {script}")
-            });
+        let nofile = script.find(GUEST_NOFILE_ULIMIT).unwrap_or_else(|| {
+            panic!("the container engine must start on the hosted descriptor limit: {script}")
+        });
         let spawn = script
             .find("dockerd >/var/log/dockerd.log")
             .unwrap_or_else(|| panic!("the launch must still start dockerd: {script}"));
@@ -9187,11 +9179,9 @@ done
         let raise = script
             .find(GUEST_STACK_ULIMIT)
             .unwrap_or_else(|| panic!("the preloaded engine must be raised: {script}"));
-        let nofile = script
-            .find(GUEST_NOFILE_ULIMIT)
-            .unwrap_or_else(|| {
-                panic!("the preloaded engine must carry the hosted descriptor limit: {script}")
-            });
+        let nofile = script.find(GUEST_NOFILE_ULIMIT).unwrap_or_else(|| {
+            panic!("the preloaded engine must carry the hosted descriptor limit: {script}")
+        });
         let spawn = script
             .find("dockerd >/var/log/dockerd-preload.log")
             .unwrap_or_else(|| panic!("the preload must still start a daemon: {script}"));
