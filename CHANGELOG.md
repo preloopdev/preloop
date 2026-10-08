@@ -132,6 +132,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Isolated test credentials and store URLs**: Store-URL integration tests run
+  in a separate test binary. Git LFS fixtures ignore ambient App and PAT
+  credentials, keeping no-credential cases deterministic.
+
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
   control bridge), which a container's network namespace resolves to the

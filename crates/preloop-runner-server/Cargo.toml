@@ -140,6 +140,11 @@ name = "runner_deprecations"
 path = "tests/runner_deprecations.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "store_env"
+path = "tests/store_env.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
