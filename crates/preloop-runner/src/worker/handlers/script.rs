@@ -182,6 +182,16 @@ pub async fn run_script_in_container(
     }
     env.insert("HOME".to_string(), "/github/home".to_string());
 
+    // Engine URLs are advertised at the runner's loopback origin, which a
+    // container resolves to its own loopback; rewrite them to the origin this
+    // container can reach (its network's gateway, see
+    // `ContainerEngineAccess`). ACTIONS_* endpoints, a redirected
+    // `actions/checkout`'s github-server-url input, and snapshot git-config
+    // rewrites all carry that origin.
+    if let Some(access) = ctx.job.container_engine.as_ref() {
+        access.translate_env(&mut env);
+    }
+
     let container_args_ref: Vec<&str> = container_args.iter().map(|s| s.as_str()).collect();
     let shell_desc = if let Some(custom) = container_shell {
         custom.to_string()
