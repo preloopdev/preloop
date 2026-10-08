@@ -7,6 +7,7 @@
 
 use super::codec::{self, now_us};
 use super::db;
+use crate::control::logic;
 use crate::control::types::*;
 use crate::models::{QueuedJob, RunRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
@@ -347,6 +348,12 @@ pub(super) fn insert_job(
     job_order: i64,
     spec_extras: &SpecExtras<'_>,
 ) -> Result<(), ControlError> {
+    let event: String = tx
+        .prepare_cached("SELECT event FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id)], |row| row.get(0))
+        .map_err(db)?;
+    let priority = logic::run_priority(&event);
     let now = now_us();
     tx.prepare_cached(
         "INSERT INTO jobs (run_id, job_id, namespace_id, kind, parent_job_id, \
@@ -354,7 +361,7 @@ pub(super) fn insert_job(
              runner_group, priority, run_order, job_order, enqueued_at, \
              deps_ready_at, concurrency_wait_at, concurrency_acquired_at, \
              environment_gate, created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?15,?16,?17,?18,?19,?20) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
          ON CONFLICT (run_id, job_id) DO NOTHING",
     )
     .map_err(db)?
@@ -371,6 +378,7 @@ pub(super) fn insert_job(
         compute_pool_key(&job.runs_on, job.runner_group.as_deref()),
         serde_json::to_string(&job.runs_on).unwrap_or_default(),
         job.runner_group,
+        priority,
         run_order,
         job_order,
         job.enqueued_at_unix_nanos
