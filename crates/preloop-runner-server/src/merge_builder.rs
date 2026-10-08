@@ -187,12 +187,12 @@ impl MergeError {
                      --no-merge to test the branch alone."
                 ))
             }
-            Self::InvalidPrebuilt(_) => {
-                ApiError::bad_request(format!("could not build the pull-request test merge: {self}"))
-            }
-            Self::Git { .. } | Self::Io { .. } => {
-                ApiError::internal(format!("could not build the pull-request test merge: {self}"))
-            }
+            Self::InvalidPrebuilt(_) => ApiError::bad_request(format!(
+                "could not build the pull-request test merge: {self}"
+            )),
+            Self::Git { .. } | Self::Io { .. } => ApiError::internal(format!(
+                "could not build the pull-request test merge: {self}"
+            )),
         }
     }
 }
@@ -376,8 +376,10 @@ async fn fetch_into_mirror(
         message: error.to_string(),
     })?;
     if !output.status.success() {
-        let message =
-            sanitized_fetch_error(url, String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        let message = sanitized_fetch_error(
+            url,
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        );
         return Err(MergeError::Fetch {
             refspec: refspec.to_owned(),
             url: crate::snapshots::sanitize_remote_url(url),
@@ -458,24 +460,38 @@ pub async fn fetch_inputs(
         MergeHead::Branch(name) => {
             let source_ref = format!("refs/heads/{name}");
             let local_ref = format!("refs/preloop/merge/heads/{name}");
-            let url = source.fetch_url.as_deref().ok_or_else(|| {
-                MergeError::MissingCommit {
+            let url = source
+                .fetch_url
+                .as_deref()
+                .ok_or_else(|| MergeError::MissingCommit {
                     sha: source_ref.clone(),
                     repository: source.mirror.display().to_string(),
-                }
-            })?;
-            fetch_into_mirror(source, url, &format!("+{source_ref}:{local_ref}"), &local_ref).await?
+                })?;
+            fetch_into_mirror(
+                source,
+                url,
+                &format!("+{source_ref}:{local_ref}"),
+                &local_ref,
+            )
+            .await?
         }
         MergeHead::PullRef(number) => {
             let source_ref = format!("refs/pull/{number}/head");
             let local_ref = format!("refs/preloop/merge/pull/{number}/head");
-            let url = source.fetch_url.as_deref().ok_or_else(|| {
-                MergeError::MissingCommit {
+            let url = source
+                .fetch_url
+                .as_deref()
+                .ok_or_else(|| MergeError::MissingCommit {
                     sha: source_ref.clone(),
                     repository: source.mirror.display().to_string(),
-                }
-            })?;
-            fetch_into_mirror(source, url, &format!("+{source_ref}:{local_ref}"), &local_ref).await?
+                })?;
+            fetch_into_mirror(
+                source,
+                url,
+                &format!("+{source_ref}:{local_ref}"),
+                &local_ref,
+            )
+            .await?
         }
     };
 
@@ -625,16 +641,18 @@ async fn finish_merge(
 /// alternate to the shared object cache. Idempotent, and a no-op when both
 /// paths are the same repository.
 pub async fn link_mirror(served: &Path, mirror: &Path) -> Result<(), MergeError> {
-    let served = tokio::fs::canonicalize(served).await.map_err(|error| {
-        MergeError::Io {
+    let served = tokio::fs::canonicalize(served)
+        .await
+        .map_err(|error| MergeError::Io {
             path: served.display().to_string(),
             message: error.to_string(),
-        }
-    })?;
-    let mirror = tokio::fs::canonicalize(mirror).await.map_err(|error| MergeError::Io {
-        path: mirror.display().to_string(),
-        message: error.to_string(),
-    })?;
+        })?;
+    let mirror = tokio::fs::canonicalize(mirror)
+        .await
+        .map_err(|error| MergeError::Io {
+            path: mirror.display().to_string(),
+            message: error.to_string(),
+        })?;
     if served == mirror {
         return Ok(());
     }
@@ -658,8 +676,7 @@ pub async fn link_mirror(served: &Path, mirror: &Path) -> Result<(), MergeError>
     let objects_text = objects.to_string_lossy().into_owned();
     let already_present = alternates.iter().any(|line| {
         line == &objects_text
-            || std::fs::canonicalize(line)
-                .is_ok_and(|canonical| canonical == objects)
+            || std::fs::canonicalize(line).is_ok_and(|canonical| canonical == objects)
     });
     if !already_present {
         alternates.push(objects_text);
@@ -690,10 +707,8 @@ pub async fn publish_merge(
     merge: &MergedMerge,
     pull_request_number: Option<u64>,
 ) -> Result<(), MergeError> {
-    let mut refs: Vec<(String, String)> = vec![(
-        "refs/heads/snapshot".to_owned(),
-        merge.sha.clone(),
-    )];
+    let mut refs: Vec<(String, String)> =
+        vec![("refs/heads/snapshot".to_owned(), merge.sha.clone())];
     if let Some(number) = pull_request_number {
         refs.push((format!("refs/pull/{number}/merge"), merge.sha.clone()));
     }
@@ -716,10 +731,22 @@ pub async fn publish_merge(
         }
     }
     for (operation, args) in [
-        ("symbolic-ref HEAD", vec!["symbolic-ref", "HEAD", "refs/heads/snapshot"]),
-        ("config uploadpack.allowReachableSHA1InWant", vec!["config", "uploadpack.allowReachableSHA1InWant", "true"]),
-        ("config uploadpack.allowTipSHA1InWant", vec!["config", "uploadpack.allowTipSHA1InWant", "true"]),
-        ("config uploadpack.allowFilter", vec!["config", "uploadpack.allowFilter", "true"]),
+        (
+            "symbolic-ref HEAD",
+            vec!["symbolic-ref", "HEAD", "refs/heads/snapshot"],
+        ),
+        (
+            "config uploadpack.allowReachableSHA1InWant",
+            vec!["config", "uploadpack.allowReachableSHA1InWant", "true"],
+        ),
+        (
+            "config uploadpack.allowTipSHA1InWant",
+            vec!["config", "uploadpack.allowTipSHA1InWant", "true"],
+        ),
+        (
+            "config uploadpack.allowFilter",
+            vec!["config", "uploadpack.allowFilter", "true"],
+        ),
     ] {
         let output = Command::new("git")
             .arg("--git-dir")
@@ -761,9 +788,7 @@ pub async fn build_merge(
     // When the merge is built straight into the mirror it stays unreferenced
     // until a run's served repository publishes it: the mirror is shared and
     // must not advertise a `snapshot` ref of its own.
-    if distinct
-        && let MergeOutcome::Merged(merge) = &outcome
-    {
+    if distinct && let MergeOutcome::Merged(merge) = &outcome {
         publish_merge(served, merge, request.pull_request_number).await?;
     }
     Ok(outcome)
@@ -890,7 +915,9 @@ async fn protect_mirror_for_run(
     mirror: &Path,
     merge_sha: &str,
 ) -> Option<String> {
-    let state_dir = tokio::fs::canonicalize(&shared.state.state_dir).await.ok()?;
+    let state_dir = tokio::fs::canonicalize(&shared.state.state_dir)
+        .await
+        .ok()?;
     let mirror = tokio::fs::canonicalize(mirror).await.ok()?;
     let relative = mirror.strip_prefix(&state_dir).ok()?;
     if !mirror.starts_with(state_dir.join("checkout-cache")) {
@@ -1039,9 +1066,11 @@ pub async fn attach_prebuilt_merge(
             prebuilt.sha, prebuilt.mirror_repository
         )));
     }
-    let parents = rev_parse(&mirror, &format!("{}^@", prebuilt.sha)).await.map_err(|_| {
-        MergeError::InvalidPrebuilt(format!("merge commit {} has no parents", prebuilt.sha))
-    })?;
+    let parents = rev_parse(&mirror, &format!("{}^@", prebuilt.sha))
+        .await
+        .map_err(|_| {
+            MergeError::InvalidPrebuilt(format!("merge commit {} has no parents", prebuilt.sha))
+        })?;
     let parents: Vec<&str> = parents.split_whitespace().collect();
     if parents.len() != 2
         || !parents[0].eq_ignore_ascii_case(&prebuilt.base_sha)

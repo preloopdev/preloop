@@ -1687,9 +1687,7 @@ async fn create_workspace_snapshot_inner(
                     &format!("refs/heads/{}", local.base_branch),
                     &merged.base_sha,
                 ]);
-                if let Err(error) =
-                    run_git(&mut publish_base, "publish merge base ref").await
-                {
+                if let Err(error) = run_git(&mut publish_base, "publish merge base ref").await {
                     warn!(error = ?error, "failed to publish the fetched base tip in the snapshot");
                 }
                 Some(SnapshotMerge {

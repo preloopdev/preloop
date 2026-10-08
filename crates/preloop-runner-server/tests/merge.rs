@@ -71,8 +71,14 @@ impl MergeFixture {
         std::fs::write(workspace.join("shared.txt"), "shared base\n").unwrap();
         git(&workspace, &["add", "-A"]);
         git(&workspace, &["commit", "-qm", "base"]);
-        git(&workspace, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-        git(&workspace, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(
+            &workspace,
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
+        );
+        git(
+            &workspace,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
         git(&workspace, &["push", "-q", "origin", "main"]);
 
         git(&workspace, &["checkout", "-q", "-b", "feature"]);
@@ -153,35 +159,38 @@ async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
     )
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
-    let run = get_run_json(&app, &run_id).await;
-
-    let merge_sha = run["workspace_snapshot"]["commit_sha"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_ne!(
-        merge_sha, fixture.head,
-        "the run must test the merge, not the branch tip"
-    );
-    assert_eq!(run["github"]["sha"], serde_json::json!(merge_sha));
-    assert_eq!(run["github"]["ref"], "refs/pull/7/merge");
-    // GitHub's shape: base.sha is the CURRENT base tip, head.sha the head.
-    assert_eq!(
-        run["github"]["event"]["pull_request"]["base"]["sha"],
-        serde_json::json!(fixture.base)
-    );
-    assert_eq!(
-        run["github"]["event"]["pull_request"]["head"]["sha"],
-        serde_json::json!(fixture.head)
-    );
-    assert_eq!(
-        run["workspace_snapshot"]["merge"]["base_sha"],
-        serde_json::json!(fixture.base)
-    );
-    assert_eq!(
-        run["workspace_snapshot"]["merge"]["head_sha"],
-        serde_json::json!(fixture.head)
-    );
+    let (merge_sha, message) = {
+        let inner = state.test_tx().await;
+        let record = inner
+            .runs
+            .values()
+            .find(|run| run.run_id.to_string() == run_id)
+            .expect("run record");
+        let snapshot = record
+            .workspace_snapshot
+            .as_ref()
+            .expect("run must record its snapshot");
+        let merge = snapshot.merge.as_ref().expect("merge record");
+        assert_eq!(snapshot.commit_sha, merge.sha);
+        assert_eq!(merge.base_sha, fixture.base);
+        assert_eq!(merge.head_sha, fixture.head);
+        assert_ne!(
+            merge.sha, fixture.head,
+            "the run must test the merge, not the branch tip"
+        );
+        assert_eq!(record.github["sha"], serde_json::json!(merge.sha));
+        assert_eq!(record.github["ref"], "refs/pull/7/merge");
+        // GitHub's shape: base.sha is the CURRENT base tip, head.sha the head.
+        assert_eq!(
+            record.github["event"]["pull_request"]["base"]["sha"],
+            serde_json::json!(fixture.base)
+        );
+        assert_eq!(
+            record.github["event"]["pull_request"]["head"]["sha"],
+            serde_json::json!(fixture.head)
+        );
+        (merge.sha.clone(), queued_message_for(&inner, &run_id))
+    };
 
     // The merge is a real two-parent commit: the fetched base tip first, the
     // head second (never the stale branch point).
@@ -192,7 +201,12 @@ async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
         format!("{} {}", fixture.base, fixture.head)
     );
     let files = git(&served, &["ls-tree", "--name-only", &merge_sha]);
-    for path in ["base-only.txt", "base-new.txt", "head-only.txt", "shared.txt"] {
+    for path in [
+        "base-only.txt",
+        "base-new.txt",
+        "head-only.txt",
+        "shared.txt",
+    ] {
         assert!(
             files.contains(path),
             "merge tree must contain {path}: {files}"
@@ -213,8 +227,6 @@ async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
     assert_eq!(git(&clone, &["cat-file", "-t", &merge_sha]), "commit");
 
     // The job message pins the merge as the checked-out commit.
-    let inner = state.test_tx().await;
-    let message = queued_message_for(&inner, &run_id);
     assert_eq!(
         message.preloop_snapshot_commit.as_deref(),
         Some(merge_sha.as_str())
@@ -288,37 +300,43 @@ async fn unreachable_upstream_fails_clearly() {
 #[tokio::test]
 async fn no_merge_tests_the_branch_alone() {
     let fixture = MergeFixture::clean();
-    let (_state, app) = fixture.app().await;
-    let accepted = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        fixture.submission(true),
-    )
-    .await;
-    let run = get_run_json(&app, accepted["run_id"].as_str().unwrap()).await;
+    let (state, app) = fixture.app().await;
+    let accepted = request_json(&app, Method::POST, "/api/v1/runs", fixture.submission(true)).await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let record = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .expect("run record");
     assert_eq!(
-        run["github"]["sha"],
+        record.github["sha"],
         serde_json::json!(fixture.head),
         "--no-merge must test the branch tip"
     );
-    assert!(run["workspace_snapshot"]["merge"].is_null());
+    assert!(record.workspace_snapshot.as_ref().unwrap().merge.is_none());
 }
 
 /// `push` events test the commit itself; they never grow a merge.
 #[tokio::test]
 async fn push_events_never_merge() {
     let fixture = MergeFixture::clean();
-    let (_state, app) = fixture.app().await;
+    let (state, app) = fixture.app().await;
     let mut submission = fixture.submission(false);
     submission["event"] = serde_json::json!("push");
     submission["workflow_yaml"] = serde_json::json!(
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo push\n"
     );
     let accepted = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
-    let run = get_run_json(&app, accepted["run_id"].as_str().unwrap()).await;
-    assert_eq!(run["github"]["sha"], serde_json::json!(fixture.head));
-    assert!(run["workspace_snapshot"]["merge"].is_null());
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let record = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .expect("run record");
+    assert_eq!(record.github["sha"], serde_json::json!(fixture.head));
+    assert!(record.workspace_snapshot.as_ref().unwrap().merge.is_none());
 }
 
 /// The shared builder contract: fetch + merge + serve, deterministic, and the
@@ -370,11 +388,18 @@ async fn prebuilt_merge_is_built_served_and_validated() {
         .expect("a mirror under the state directory has a relative path");
     assert!(record.mirror_repository.ends_with("merge-test.git"));
     let run_id = RunId::new();
-    let snapshot = attach_prebuilt_merge(&shared, run_id, &record).await.unwrap();
+    let snapshot = attach_prebuilt_merge(&shared, run_id, &record)
+        .await
+        .unwrap();
     assert_eq!(snapshot.commit_sha, merge.sha);
     assert_eq!(snapshot.source, SnapshotSource::SelfBuiltMerge);
     assert_eq!(
-        snapshot.merge.as_ref().unwrap().mirror_repository.as_deref(),
+        snapshot
+            .merge
+            .as_ref()
+            .unwrap()
+            .mirror_repository
+            .as_deref(),
         Some(record.mirror_repository.as_str())
     );
     let served = fixture.state_dir.join("snapshots").join(run_id.to_string());
@@ -416,7 +441,10 @@ async fn webhook_merge_source_prepares_a_reusable_mirror() {
     let shared = state.shared();
     let source = webhook_merge_source(&shared, "owner/repo").await.unwrap();
     assert!(source.mirror.starts_with(&fixture.state_dir));
-    assert!(source.mirror.join("HEAD").is_file(), "mirror must be a git dir");
+    assert!(
+        source.mirror.join("HEAD").is_file(),
+        "mirror must be a git dir"
+    );
     assert!(
         source
             .fetch_url
