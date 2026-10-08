@@ -606,7 +606,7 @@ status snapshot gains conditions `events_dead_letter`, `events_spool_backlog`,
 | **GitHub REST API 5xx** | breaker; per-call class | ingest unaffected (no API call); processing parks (`Outage`), no attempt burned; check-run writes defer | breaker half-open probe; backoff drain by priority | CI runs late, not absent; checks delayed |
 | **GitHub API rate-limited (429 / secondary)** | `retry-after`, `x-ratelimit-*` | wait exact `retry-after`; priority drain; per-installation budgets on writes | automatic | delayed checks; no lost runs |
 | **GitHub git down** (`ls-remote`/fetch fails) | fetch error class | mirror serves already-fetched commits (workflow YAML, diffs, merge); new commits defer; jobs already dispatched check out from engine snapshots | next pass re-fetches | new pushes queue up; in-flight jobs unaffected |
-| **Webhooks not delivered** (edge, App misconfig, Funnel) | reconciler synthesis; App health monitor | reconciler synthesizes push events (full fidelity) and PR events after the API returns | automatic within grace + scan interval | CI starts ~3 min late instead of never |
+| **Webhooks not delivered** (edge unavailable, App misconfigured) | reconciler synthesis; App health monitor | reconciler synthesizes push events (full fidelity) and PR events after the API returns | automatic within grace + scan interval | CI starts ~3 min late instead of never |
 | **Webhook payload lost beyond GitHub's 3-day history** | watchdog cap hit (standing finding) | locally retained payload (30 days) replays; beyond that, reconciler re-derives from git | operator replay or reconcile | worst case: run re-created (never silently dropped) |
 | **Our store slow (>2 s)** | ingest budget | spool + 202; import when PG recovers | automatic | none |
 | **Our store down** | spool depth, import errors | spool + 202; processing paused (claim fails) | boot/periodic import; dedupe by identity | none while the spool holds; reconciler covers beyond |
@@ -641,7 +641,8 @@ dedupe), 4 independent, 5 independent, 6 independent.
 Verification per PR: unit tests + the PG scratch cluster
 (`PRELOOP_TEST_POSTGRES_URL`), plus a failure-injection smoke run against a
 stub GitHub that returns 500/429 for the changed path (the repo already has
-stub-server test infrastructure). Build/test on macstudio only.
+stub-server test infrastructure). Build and test on the project's supported
+build hosts only.
 
 ## 7. Decisions and open questions
 
