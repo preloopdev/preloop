@@ -85,8 +85,9 @@ and their impact on preloop.
 ### v2.336.0 summary
 
 Runner-side deltas for v2.336.0 are implemented where they map cleanly onto preloop.
-Remaining gaps: background-step cancel-control steps (#4482; the coordinator
-itself is implemented), worker-wait parity (#4553), and structured download
+Remaining gaps: an official-runner capture for the background-step
+coordinator (#4482; the coordinator and its wait/wait-all/cancel controls are
+implemented), worker-wait parity (#4553), and structured download
 telemetry vs info logs.
 The committed conformance corpus is recorded from the official v2.336.0 runner.
 
