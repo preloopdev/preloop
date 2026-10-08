@@ -22,28 +22,16 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Changed
-- **The container-engine bootstrap is a real shell file**:
-  `docker_start_command`'s script moved to `scripts/docker-start.sh`, embedded
-  with `include_str!` and rendered by substituting its placeholders. The shell
-  text is now reviewed, commented and `sh -n`-parsed as shell, instead of being
-  assembled from Rust string continuations — the form that let a comment
-  swallow the statements after it and shipped `Syntax error: "else"
-  unexpected` to production runners.
+- **The container-engine bootstrap is now maintained as a shell file** at
+  `scripts/docker-start.sh` and syntax-checked before it is sent to guests.
 
 ### Fixed
-- **A failed container-engine start now reports why**: after both start
-  attempts fail, the bootstrap tails the last lines of `/var/log/dockerd.log`
-  into stderr. The provider turns a non-zero guest exit into an error carrying
-  that stderr, so the engine's `background container engine start failed`
-  warning now shows the daemon's own reason (measured: `failed to start
-  containerd: exec: "containerd": executable file not found in $PATH`) instead
-  of only the script's exit line — the daemon's log itself dies with the VM.
+- **Failed container-engine starts now include daemon diagnostics** by
+  forwarding the tail of `/var/log/dockerd.log` after both retries fail.
 
-- **A file-backed guest script splices with its trailing newline removed**:
-  the root-or-sudo wrapper inlines the script as `then {script}; else …`, so a
-  script ending in a newline left that `;` alone on a line and dash rejected
-  the whole command (`Syntax error: ";" unexpected`). Trailing whitespace means
-  nothing to the shell, so the wrapper now trims it for every caller.
+- **Root/sudo guest-script wrapping now handles trailing whitespace**, so
+  file-backed scripts remain valid when inlined.
+
 
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
