@@ -99,6 +99,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Security
 
+- **The environment-rule cache is bounded to environments in use**: cached
+  rules were never evicted and every expired entry was refetched each reaper
+  tick, so a fork PR with a matrix of made-up environment names could pin
+  memory and spend the App's GitHub API budget (shared with check-run
+  reporting) indefinitely. Only keys a lookup re-requests are refreshed, and
+  keys idle for 10 minutes are evicted.
+
 - **A system install initializes the control database as the `preloop`
   service account, never as root**: the store lives in the state tree the
   install chowns to the service, so a root-owned create, write or chmod

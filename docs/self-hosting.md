@@ -720,7 +720,14 @@ preloop no longer rejects unknown names, and no longer sources gating from a
 local registry. A config file still carrying a non-empty `[environments]`
 table fails the load with an error naming the removed table: silently
 ignoring it would change what the operator believes is enforced.
-Environment secrets stay keyed by name under `[env_secrets]`.
+Environment secrets stay keyed by name under `[env_secrets]` (GitHub's API
+never returns secret values, so preloop holds them). They behave like
+secrets stored in that environment on GitHub: any non-fork job that names
+the environment receives them once the environment's protection rules
+pass. Nothing else guards them — an environment with no protection rules on
+GitHub (including one GitHub auto-created on first reference) releases its
+stored secrets to any workflow that names it. Configure protection rules on
+GitHub for every environment whose secrets you store in preloop.
 
 With no GitHub credential configured (local mode), `[environment_rules]`
 TOML remains the whole story, unchanged:

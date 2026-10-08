@@ -30,8 +30,15 @@
 //! fail-closed gate and queues the key for the reaper's [`resolve`] pass —
 //! the job holds until GitHub answers rather than deploying unprotected on a
 //! cold cache.
+//!
+//! The cache only tracks environments jobs are using: every lookup stamps
+//! its key, the reaper refreshes only keys a lookup re-queued, and keys idle
+//! for [`IDLE_EVICT`] are dropped. Workflow authors (fork PRs included) pick
+//! environment names freely, so an unbounded cache that refreshed every key
+//! forever would let a matrix of made-up names pin memory and drain the
+//! GitHub API budget.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -56,6 +63,11 @@ const MAX_PROTECTED_PAGES: u32 = 10;
 const MAX_MEMBER_PAGES: u32 = 10;
 /// Team membership stays cached this long; reviewer-set churn is rare.
 const MEMBERS_TTL: Duration = Duration::from_secs(300);
+/// A cached key (resolved entry or pending fetch) no lookup has touched for
+/// this long is evicted. Held jobs look their key up on every sweep tick, so
+/// only environments nothing is waiting on age out; a later lookup simply
+/// re-resolves (a GitHub-sourced key holds as `Pending` for one tick).
+const IDLE_EVICT: Duration = Duration::from_secs(600);
 
 /// What the synchronous gate path knows about one `(repo, environment)`.
 #[derive(Debug, Clone)]
@@ -80,6 +92,14 @@ enum RulesSource {
 struct ResolvedEntry {
     rules: Arc<EnvironmentRules>,
     fetched_at: Instant,
+    /// Last time a lookup or resolve touched the key (eviction clock).
+    last_used: parking_lot::Mutex<Instant>,
+}
+
+impl ResolvedEntry {
+    fn touch(&self) {
+        *self.last_used.lock() = Instant::now();
+    }
 }
 
 /// `(repository, environment)` — the resolver's cache key.
@@ -107,9 +127,10 @@ pub struct EnvironmentResolver {
     repo_sources: parking_lot::RwLock<HashMap<String, RulesSource>>,
     /// GitHub-fetched rules, `(repo, env)` → entry.
     entries: parking_lot::RwLock<HashMap<(String, String), ResolvedEntry>>,
-    /// Keys awaiting a fetch (first-seen misses + refresh failures). The
-    /// reaper drains this every tick.
-    pending: parking_lot::Mutex<BTreeSet<(String, String)>>,
+    /// Keys awaiting a fetch (first-seen misses, expired entries a lookup
+    /// touched, refresh failures) → when a lookup last asked for them. The
+    /// reaper drains this every tick; keys nobody asks for again expire.
+    pending: parking_lot::Mutex<BTreeMap<(String, String), Instant>>,
     /// In-flight fetches, one per key, so concurrent submissions for the
     /// same environment collapse onto one API round-trip.
     inflight: InflightMap,
@@ -127,7 +148,7 @@ impl EnvironmentResolver {
             github_configured: AtomicBool::new(false),
             repo_sources: parking_lot::RwLock::new(HashMap::new()),
             entries: parking_lot::RwLock::new(HashMap::new()),
-            pending: parking_lot::Mutex::new(BTreeSet::new()),
+            pending: parking_lot::Mutex::new(BTreeMap::new()),
             inflight: tokio::sync::Mutex::new(HashMap::new()),
             team_members: parking_lot::RwLock::new(HashMap::new()),
         }
@@ -164,20 +185,19 @@ impl EnvironmentResolver {
     /// always resolves on the next reaper tick.
     pub fn lookup_sync(&self, repository: &str, environment: &str) -> EnvironmentLookup {
         let key = (repository.to_owned(), environment.to_owned());
-        if let Some(entry) = self
-            .entries
-            .read()
-            .get(&key)
-            .map(|entry| (entry.rules.clone(), entry.fetched_at))
-        {
-            if entry.1.elapsed() > RULES_TTL {
-                self.pending.lock().insert(key);
+        let cached = self.entries.read().get(&key).map(|entry| {
+            entry.touch();
+            (entry.rules.clone(), entry.fetched_at)
+        });
+        if let Some((rules, fetched_at)) = cached {
+            if fetched_at.elapsed() > RULES_TTL {
+                self.pending.lock().insert(key, Instant::now());
             }
-            return EnvironmentLookup::Resolved(Some(entry.0));
+            return EnvironmentLookup::Resolved(Some(rules));
         }
         match self.repo_sources.read().get(repository).copied() {
             Some(RulesSource::Github) => {
-                self.pending.lock().insert(key);
+                self.pending.lock().insert(key, Instant::now());
                 EnvironmentLookup::Pending
             }
             Some(RulesSource::Toml) => {
@@ -187,7 +207,7 @@ impl EnvironmentResolver {
             // nothing to fetch — answer from TOML directly. With credentials,
             // `resolve` must probe the repo first, so hold as pending.
             None if self.github_configured.load(Ordering::Acquire) => {
-                self.pending.lock().insert(key);
+                self.pending.lock().insert(key, Instant::now());
                 EnvironmentLookup::Pending
             }
             None => EnvironmentLookup::Resolved(self.toml_rules(repository, environment)),
@@ -196,7 +216,7 @@ impl EnvironmentResolver {
 
     /// Keys queued by `Pending` lookups or expired entries.
     pub fn pending_keys(&self) -> Vec<(String, String)> {
-        self.pending.lock().iter().cloned().collect()
+        self.pending.lock().keys().cloned().collect()
     }
 
     /// Resolve `(repo, environment)` rules, fetching from GitHub when the
@@ -235,6 +255,7 @@ impl EnvironmentResolver {
         if let Some(entry) = self.entries.read().get(&key)
             && entry.fetched_at.elapsed() <= RULES_TTL
         {
+            entry.touch();
             return Ok(entry.rules.clone());
         }
         // Collapse concurrent resolutions for the same environment.
@@ -246,6 +267,7 @@ impl EnvironmentResolver {
         if let Some(entry) = self.entries.read().get(&key)
             && entry.fetched_at.elapsed() <= RULES_TTL
         {
+            entry.touch();
             self.pending.lock().remove(&key);
             return Ok(entry.rules.clone());
         }
@@ -334,6 +356,7 @@ impl EnvironmentResolver {
                     ResolvedEntry {
                         rules: rules.clone(),
                         fetched_at: Instant::now(),
+                        last_used: parking_lot::Mutex::new(Instant::now()),
                     },
                 );
                 self.pending.lock().remove(&key);
@@ -341,9 +364,11 @@ impl EnvironmentResolver {
             }
             Err(error) => {
                 // A resolved-but-stale entry keeps its last-known rules; a
-                // never-resolved key stays pending so the gate holds.
+                // never-resolved key stays pending so the gate holds. The
+                // pending stamp keeps the time a lookup last *asked* — a
+                // failing fetch nobody waits on must still expire.
                 if self.entries.read().get(&key).is_none() {
-                    self.pending.lock().insert(key);
+                    self.pending.lock().entry(key).or_insert_with(Instant::now);
                 } else {
                     self.pending.lock().remove(&key);
                 }
@@ -352,21 +377,18 @@ impl EnvironmentResolver {
         }
     }
 
-    /// Re-resolve every queued key (first-seen misses and expired entries).
-    /// Called once per reaper tick, ahead of the gate sweep, so a `Pending`
-    /// hold never outlives the fetch that unblocks it.
+    /// Evict idle keys, then re-resolve every queued key (first-seen misses
+    /// and expired entries a lookup touched). Called once per reaper tick,
+    /// ahead of the gate sweep, so a `Pending` hold never outlives the fetch
+    /// that unblocks it.
+    ///
+    /// Only keys a lookup asked for are refreshed: an expired entry nothing
+    /// looks up is not fetched again, and is evicted once idle for
+    /// [`IDLE_EVICT`]. Held jobs look their key up on every sweep, so their
+    /// rules stay fresh while unused names cost nothing.
     pub async fn refresh_stale(&self, shared: &crate::state::SharedState) {
-        // Expired resolved entries re-queue for refresh without becoming
-        // `Pending` (stale rules keep answering in the meantime).
-        let stale: Vec<(String, String)> = self
-            .entries
-            .read()
-            .iter()
-            .filter(|(_, entry)| entry.fetched_at.elapsed() > RULES_TTL)
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut keys = self.pending_keys();
-        keys.extend(stale);
+        self.evict_idle(Instant::now()).await;
+        let keys = self.pending_keys();
         // Bounded concurrency: each resolve is a few API round-trips, and
         // the reaper's sweep waits on this pass — serialized fetches would
         // scale the whole gate sweep with the stale set (and a hung
@@ -386,6 +408,24 @@ impl EnvironmentResolver {
             .buffer_unordered(8)
             .collect::<Vec<_>>()
             .await;
+    }
+
+    /// Drop resolved entries, pending keys, team-member lists and in-flight
+    /// slots no lookup has used within [`IDLE_EVICT`] of `now`.
+    async fn evict_idle(&self, now: Instant) {
+        let idle = |at: Instant| now.saturating_duration_since(at) > IDLE_EVICT;
+        self.entries
+            .write()
+            .retain(|_, entry| !idle(*entry.last_used.lock()));
+        self.pending.lock().retain(|_, asked_at| !idle(*asked_at));
+        self.team_members
+            .write()
+            .retain(|_, (fetched_at, _)| !idle(*fetched_at));
+        // A slot whose only owner is the map has no fetch in flight.
+        self.inflight
+            .lock()
+            .await
+            .retain(|_, slot| Arc::strong_count(slot) > 1);
     }
 
     /// Whether `sender` may approve `environment`'s reviewer gate on behalf
@@ -836,6 +876,8 @@ mod tests {
     /// by these tests.
     struct StubApi {
         base: String,
+        /// `GET /repos/owner/repo/environments/prod` requests served.
+        env_hits: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StubApi {
@@ -856,6 +898,8 @@ mod tests {
             protection_rules: Value,
             actions_readable: bool,
         ) -> Self {
+            let env_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hits = env_hits.clone();
             let stub = Router::new()
                 .route(
                     "/repos/owner/repo/environments/prod/deployment-branch-policies",
@@ -875,6 +919,7 @@ mod tests {
                     "/repos/owner/repo/environments/prod",
                     get(move || {
                         let env = env_json.clone();
+                        hits.fetch_add(1, Ordering::SeqCst);
                         async move {
                             if env.is_null() {
                                 return Err(axum::http::StatusCode::NOT_FOUND);
@@ -904,7 +949,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
-            Self { base }
+            Self { base, env_hits }
         }
     }
 
@@ -1385,6 +1430,95 @@ mod tests {
                 org: "acme".to_owned(),
                 slug: "deployers".to_owned(),
             })
+        );
+    }
+
+    /// Only environments a lookup still asks for stay cached and refreshed:
+    /// an expired entry nothing looks up is not re-queued, idle keys are
+    /// evicted, and a key that keeps being looked up survives. A fork matrix
+    /// of made-up names therefore costs one fetch per name, not a refresh
+    /// loop and a permanent map entry.
+    #[tokio::test]
+    async fn unused_environment_keys_are_neither_refreshed_nor_kept() {
+        let stub = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
+        let _env = pat_env(&stub.base).await;
+        let shared = shared().await;
+        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
+        resolver.set_github_configured();
+        resolver
+            .resolve_at(&stub.base, &shared, "owner/repo", "prod")
+            .await
+            .unwrap();
+
+        // Expired but unused: the refresh pass must not fetch it again.
+        let expired = Instant::now().checked_sub(RULES_TTL * 2).unwrap();
+        resolver
+            .entries
+            .write()
+            .get_mut(&("owner/repo".to_owned(), "prod".to_owned()))
+            .unwrap()
+            .fetched_at = expired;
+        assert!(
+            resolver.pending_keys().is_empty(),
+            "an expired entry nothing looks up must not be queued for refresh"
+        );
+        // A lookup (a held job's sweep) re-queues it.
+        assert!(matches!(
+            resolver.lookup_sync("owner/repo", "prod"),
+            EnvironmentLookup::Resolved(Some(_))
+        ));
+        assert_eq!(
+            resolver.pending_keys(),
+            vec![("owner/repo".to_owned(), "prod".to_owned())]
+        );
+
+        // Within the idle window everything survives an eviction pass.
+        resolver.evict_idle(Instant::now()).await;
+        assert!(matches!(
+            resolver.lookup_sync("owner/repo", "prod"),
+            EnvironmentLookup::Resolved(Some(_))
+        ));
+
+        // Past it, the entry and its pending refresh are gone; the next
+        // lookup holds (fail closed) until the reaper resolves it again.
+        resolver
+            .evict_idle(Instant::now() + IDLE_EVICT + Duration::from_secs(1))
+            .await;
+        assert!(resolver.entries.read().is_empty());
+        assert!(resolver.pending_keys().is_empty());
+        assert!(matches!(
+            resolver.lookup_sync("owner/repo", "prod"),
+            EnvironmentLookup::Pending
+        ));
+    }
+
+    /// The reaper's refresh pass must not refetch an expired environment no
+    /// job is looking up: before the fix every expired key was refetched on
+    /// every tick, forever.
+    #[tokio::test]
+    async fn refresh_pass_skips_expired_environments_nothing_uses() {
+        let stub = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
+        let _env = pat_env(&stub.base).await;
+        let shared = shared().await;
+        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
+        resolver.set_github_configured();
+        resolver
+            .resolve_at(&stub.base, &shared, "owner/repo", "prod")
+            .await
+            .unwrap();
+        assert_eq!(stub.env_hits.load(Ordering::SeqCst), 1);
+
+        resolver
+            .entries
+            .write()
+            .get_mut(&("owner/repo".to_owned(), "prod".to_owned()))
+            .unwrap()
+            .fetched_at = Instant::now().checked_sub(RULES_TTL * 2).unwrap();
+        resolver.refresh_stale(&shared).await;
+        assert_eq!(
+            stub.env_hits.load(Ordering::SeqCst),
+            1,
+            "an expired environment nothing looks up must not be refetched"
         );
     }
 }
