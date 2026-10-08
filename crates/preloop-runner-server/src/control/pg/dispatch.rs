@@ -2934,6 +2934,36 @@ impl<'a> Sweep<'a> {
         self.enqueue(run_id, job_id).await
     }
 
+    /// Hydrate needs context (and the deferred environment name) into the
+    /// node's stored message, applying resolved `runs-on` labels to the
+    /// node. `true` when a message row existed to hydrate.
+    async fn hydrate_node(&mut self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+        let Some(message) = self.message(run_id, job_id).await? else {
+            return Ok(false);
+        };
+        let (mut queued, record) = {
+            let graph = self.graphs.get(&run_id).expect("loaded");
+            let node = graph.nodes.get(job_id).expect("loaded");
+            (
+                graph::queued_of(job_id, run_id, node, message),
+                graph.record.clone(),
+            )
+        };
+        sched_helpers::hydrate_needs_context(&mut queued, &record);
+        PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
+        let runs_on = queued.runs_on.clone();
+        let environment_gate = queued.environment_gate.clone();
+        self.messages
+            .insert((run_id, job_id.clone()), Some(queued.message));
+        self.hydrated.insert((run_id, job_id.clone()));
+        if let Some(node) = self.node_mut(run_id, job_id) {
+            node.environment_gate = environment_gate;
+            apply_resolved_runs_on(node, runs_on);
+            self.mark(run_id, job_id);
+        }
+        Ok(true)
+    }
+
     /// Hydrate needs/`runs-on` and fail the job when the resolved labels are
     /// unhostable or unsatisfiable. `true` means the node was settled.
     async fn hydrate_and_reject_labels(
@@ -2941,44 +2971,13 @@ impl<'a> Sweep<'a> {
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<bool, ControlError> {
-        let mut resolved = None;
-        let mut hydrated_gate = None;
-        if let Some(message) = self.message(run_id, job_id).await? {
-            let (mut queued, record) = {
-                let graph = self.graphs.get(&run_id).expect("loaded");
-                let node = graph.nodes.get(job_id).expect("loaded");
-                (
-                    graph::queued_of(job_id, run_id, node, message),
-                    graph.record.clone(),
-                )
-            };
-            sched_helpers::hydrate_needs_context(&mut queued, &record);
-            PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
-            resolved = Some(queued.runs_on.clone());
-            // `hydrate_needs_context` stamps gate markers (an environment
-            // name that can never resolve) — carry them onto the node so the
-            // gate evaluation below sees the failure.
-            hydrated_gate = Some(queued.environment_gate.clone());
-            self.messages
-                .insert((run_id, job_id.clone()), Some(queued.message));
-            self.hydrated.insert((run_id, job_id.clone()));
-        }
-        if let Some(runs_on) = resolved.clone()
-            && let Some(node) = self.node_mut(run_id, job_id)
-        {
-            apply_resolved_runs_on(node, runs_on);
-            if let Some(gate) = hydrated_gate {
-                node.environment_gate = gate;
-            }
-            self.mark(run_id, job_id);
-        }
-        let runs_on = resolved.unwrap_or_else(|| {
-            self.graphs
-                .get(&run_id)
-                .and_then(|graph| graph.nodes.get(job_id))
-                .map(|node| node.runs_on.clone())
-                .unwrap_or_default()
-        });
+        self.hydrate_node(run_id, job_id).await?;
+        let runs_on = self
+            .graphs
+            .get(&run_id)
+            .and_then(|graph| graph.nodes.get(job_id))
+            .map(|node| node.runs_on.clone())
+            .unwrap_or_default();
         if let Some(reason) = promotion_label_reason(self.backend, self.tx, &runs_on).await? {
             tracing::warn!(
                 %run_id,
@@ -3044,26 +3043,7 @@ impl<'a> Sweep<'a> {
 
     /// Hydrate + enqueue one promotable job.
     async fn enqueue(&mut self, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
-        // Hydrate needs context into the stored message template.
-        if let Some(message) = self.message(run_id, job_id).await? {
-            let (mut queued, record) = {
-                let graph = self.graphs.get(&run_id).expect("loaded");
-                let node = graph.nodes.get(job_id).expect("loaded");
-                (
-                    graph::queued_of(job_id, run_id, node, message),
-                    graph.record.clone(),
-                )
-            };
-            sched_helpers::hydrate_needs_context(&mut queued, &record);
-            PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
-            let runs_on = queued.runs_on.clone();
-            self.messages
-                .insert((run_id, job_id.clone()), Some(queued.message));
-            self.hydrated.insert((run_id, job_id.clone()));
-            if let Some(node) = self.node_mut(run_id, job_id) {
-                apply_resolved_runs_on(node, runs_on);
-            }
-        }
+        self.hydrate_node(run_id, job_id).await?;
         let now = self.now;
         let graph = self.graph(run_id).await?;
         let Some(node) = graph.nodes.get_mut(job_id) else {
@@ -6810,17 +6790,27 @@ impl PgBackend {
         let spec_env: Option<serde_json::Value> = row
             .get::<_, Option<String>>(6)
             .and_then(|json| from_json(&json).ok());
-        let environment = gate
-            .and_then(|gate| gate.environment_name)
+        // The hydrated message name wins over the gate's stamp: an arm
+        // taken while the name was still a `${{ needs.* }}` template stamped
+        // that text, and posting it would mint a GitHub deployment under the
+        // expression instead of the environment GitHub actually knows. An
+        // unevaluated message name is skipped — it proves nothing beyond the
+        // stamp.
+        let environment = template_env
+            .as_ref()
+            .and_then(|env| env.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+            .map(str::to_owned)
             .or_else(|| {
-                template_env
-                    .as_ref()
-                    .and_then(|env| env.get("name"))
-                    .and_then(serde_json::Value::as_str)
+                gate.as_ref()
+                    .and_then(|gate| gate.environment_name.as_deref())
+                    .and_then(crate::runtime_scheduling::resolved_environment_name_of)
                     .map(str::to_owned)
             })
             .or_else(|| {
                 crate::runtime_scheduling::environment_gate_name_of(spec_env.as_ref())
+                    .and_then(crate::runtime_scheduling::resolved_environment_name_of)
                     .map(str::to_owned)
             });
         let Some(environment) = environment else {
@@ -6954,7 +6944,7 @@ async fn release_parked_nodes(
             .await?
             .and_then(|message| message.actions_environment)
             .map(|environment| environment.name);
-        let env_name = message_name
+        let mut env_name = message_name
             .as_deref()
             .and_then(crate::runtime_scheduling::resolved_environment_name_of)
             .map(str::to_owned)
@@ -6963,6 +6953,42 @@ async fn release_parked_nodes(
                 crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
                     .map(str::to_owned)
             });
+        if env_name.as_deref().is_some_and(|name| {
+            crate::runtime_scheduling::resolved_environment_name_of(name).is_none()
+        }) {
+            // The name is still a template. A `held` node never reaches the
+            // promotion sweep's hydration, so its message would carry the
+            // expression forever: while needs are still running the gate
+            // stays armed, but once they settle the name resolves here —
+            // hydrate the stored message as `enqueue` does, then re-read it.
+            // A node the dependency decision rules out (`if: false`, a
+            // failed need) never deploys, so its gate is moot — hand it back
+            // to the promotion path to settle instead of holding forever.
+            match sweep.decide(run_id, &job_id).await? {
+                DependencyDecision::Wait => continue,
+                DependencyDecision::Run => {
+                    sweep.hydrate_node(run_id, &job_id).await?;
+                    env_name = sweep
+                        .message(run_id, &job_id)
+                        .await?
+                        .and_then(|message| message.actions_environment)
+                        .map(|environment| environment.name)
+                        .and_then(|name| {
+                            crate::runtime_scheduling::resolved_environment_name_of(&name)
+                                .map(str::to_owned)
+                        })
+                        .or(env_name);
+                }
+                _ => {
+                    if let Some(node) = sweep.node_mut(run_id, &job_id) {
+                        node.queue_state = logic::QueueState::Blocked;
+                        node.status = ExecutionStatus::Queued;
+                    }
+                    sweep.mark(run_id, &job_id);
+                    continue;
+                }
+            }
+        }
         let Some(env_name) = env_name else {
             // No environment on the node: the (now lifted) fork hold is the
             // only thing that parked it, so hand it back to the ordinary

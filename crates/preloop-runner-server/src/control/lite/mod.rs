@@ -50,7 +50,7 @@ use std::time::Duration;
 
 /// The schema this build reads and writes. Greenfield: any other stamped
 /// version is refused at open (no migrations).
-pub(crate) const SCHEMA_VERSION: &str = "4";
+pub(crate) const SCHEMA_VERSION: &str = "5";
 
 /// The translated schema (see the file header for the type mapping).
 const SCHEMA_SQL: &str = include_str!("schema.sql");

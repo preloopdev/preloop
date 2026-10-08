@@ -287,10 +287,17 @@ fn resolve_environment_parts(
         .and_then(crate::runtime_scheduling::resolved_environment_name_of)
         .map(str::to_owned);
     let environment = message_name
-        .or_else(|| gate.as_ref().and_then(|gate| gate.environment_name.clone()))
+        .or_else(|| {
+            gate.as_ref()
+                .and_then(|gate| gate.environment_name.as_deref())
+                .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+                .map(str::to_owned)
+        })
         .or_else(|| {
             spec.as_ref().and_then(|value| {
-                crate::runtime_scheduling::environment_gate_name_of(Some(value)).map(str::to_owned)
+                crate::runtime_scheduling::environment_gate_name_of(Some(value))
+                    .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+                    .map(str::to_owned)
             })
         })?;
     let environment_url = resolved_url
@@ -468,7 +475,13 @@ fn release_parked_jobs(
         return Ok(());
     }
     let resolver = backend.environment_resolver();
-    for job in parked_jobs(tx, run_id)? {
+    // A job parked while its environment name was still a `${{ needs.* }}`
+    // template never reaches `promote_run`'s hydration — the sweep only
+    // hydrates `blocked` candidates. Load the graph so this pass can
+    // hydrate the stored message once the name's needs settle, and hand
+    // dependency-dead jobs back to `promote_run` instead of holding them.
+    let graph = jobs::run_graph(tx, run_id)?;
+    for mut job in parked_jobs(tx, run_id)? {
         let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
         let mut gate = job.environment_gate.clone();
         // The resolved name wins: a `Pending` arm records the post-hydration
@@ -476,7 +489,7 @@ fn release_parked_jobs(
         // knows, not the expression text. A message whose name is still a
         // template (`${{ needs.* }}` before its needs complete) proves nothing
         // beyond what the stamp already records.
-        let env_name = message_environment_name(tx, run_id, &job.job_id)?
+        let mut env_name = message_environment_name(tx, run_id, &job.job_id)?
             .as_deref()
             .and_then(crate::runtime_scheduling::resolved_environment_name_of)
             .map(str::to_owned)
@@ -487,6 +500,51 @@ fn release_parked_jobs(
                 )
                 .map(str::to_owned)
             });
+        if env_name.as_deref().is_some_and(|name| {
+            crate::runtime_scheduling::resolved_environment_name_of(name).is_none()
+        }) {
+            // The name is still a template. Its needs still running is the
+            // ordinary case — the gate stays armed and the sweep revisits.
+            // Once every need is terminal the name can resolve: hydrate the
+            // stored message (as the promotion path does) and re-read it.
+            // A job the dependency decision rules out (`if: false`, a failed
+            // need) never deploys, so its gate is moot — hand it back to
+            // `promote_run` to settle instead of holding it forever.
+            let needs = jobs::job_needs(tx, run_id, &job.job_id)?;
+            let ctx: String = tx
+                .prepare_cached(
+                    "SELECT condition_context FROM job_messages \
+                     WHERE run_id = ?1 AND job_id = ?2",
+                )
+                .map_err(db)?
+                .query_row(params![run, job.job_id.0], |row| row.get(0))
+                .optional()
+                .map_err(db)?
+                .unwrap_or_else(|| "{}".to_owned());
+            let condition_context: preloop_gha_expressions::Context =
+                serde_json::from_str(&ctx).unwrap_or_default();
+            match promote::dependency_decision(
+                &graph,
+                &needs,
+                spec.as_ref().and_then(|s| s.if_condition.as_deref()),
+                &condition_context,
+            )? {
+                crate::runtime_scheduling::DependencyDecision::Wait => continue,
+                crate::runtime_scheduling::DependencyDecision::Run => {
+                    env_name = promote::hydrate_message(tx, &graph, &mut job)?.or(env_name);
+                }
+                _ => {
+                    tx.prepare_cached(
+                        "UPDATE jobs SET queue_state = 'blocked', status = 'queued' \
+                         WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'held'",
+                    )
+                    .map_err(db)?
+                    .execute(params![run, job.job_id.0])
+                    .map_err(db)?;
+                    continue;
+                }
+            }
+        }
         let Some(env_name) = env_name else {
             // No environment on the job: the (now lifted) fork hold is the
             // only thing that parked it, so hand it back to the ordinary

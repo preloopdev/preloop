@@ -45,10 +45,13 @@ Releases before v0.27.0 predate the changelog.
   decided by the environment's rules. A config file with a non-empty
   `[environments]` table now fails to load with an error naming the removed
   table. Environment secrets stay keyed by name under `[env_secrets]`.
-- **Breaking:** the control-store schema version bumped (SQLite 3 → 4,
-  Postgres 4 → 5) for the `environment_approvals` table and the job's
+- **Breaking:** the control-store schema version bumped (SQLite 4 → 5,
+  Postgres 5 → 6) for the `environment_approvals` table and the job's
   environment-gate columns. There are no migrations: existing dev databases
   are refused at boot and must be recreated.
+- Environment deployment statuses use the hydrated environment name, and
+  server-side completion handling drops secret-bearing `environment.url`
+  values even when a client did not mask them.
 - Environment rules that cannot be fetched hold the job fail-closed
   (a resolver `Pending` state) instead of proceeding unprotected; a job
   not approved within 24 hours fails closed.

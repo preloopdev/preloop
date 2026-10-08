@@ -2449,6 +2449,149 @@ pub(crate) mod suite {
         );
     }
 
+    /// A gate armed while the environment name was still a
+    /// `${{ needs.* }}` template stamps that text; once hydration resolves
+    /// the name into the stored runner message, the deployment row must
+    /// report the environment GitHub actually knows — never the template.
+    pub(crate) async fn deferred_environment_name_resolves_on_the_deployment_row(
+        backend: &dyn ControlBackend,
+    ) {
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            EnvironmentRulesMap::new(),
+        ));
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment =
+            Some(serde_json::json!("${{ needs.build.outputs.env }}"));
+        submit.jobs[0].queued.environment_gate = Some(crate::models::EnvironmentGateState {
+            environment_name: Some("${{ needs.build.outputs.env }}".to_owned()),
+            ..Default::default()
+        });
+        // The hydrated runner message carries the name the gate evaluated
+        // post-resolution — produced by `hydrate_needs_context` once the
+        // needs completed.
+        submit.jobs[0].queued.message.actions_environment =
+            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+                name: "staging".to_owned(),
+                url: None,
+            });
+        backend.submit_run(submit).await.unwrap();
+
+        let row = backend
+            .environment_deployment(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("an environment job has a deployment row");
+        assert_eq!(
+            row.environment, "staging",
+            "the hydrated message name wins over the template stamp"
+        );
+    }
+
+    /// A job whose `environment` name defers to `needs` outputs parks at
+    /// submit and must be released by the sweep once the name resolves: the
+    /// release path hydrates the stored message (which `promote_run` only
+    /// does for `blocked` candidates) and re-evaluates the gate. A regression
+    /// that skips hydration holds the job forever — the need completed and
+    /// nothing ever dispatches.
+    pub(crate) async fn deferred_environment_name_releases_after_needs(
+        backend: &dyn ControlBackend,
+    ) {
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            EnvironmentRulesMap::new(),
+        ));
+        let run_id = RunId::new();
+        let mut submit = submit_run(
+            run_id,
+            vec![
+                submit_job(run_id, "build", 1),
+                submit_job(run_id, "deploy", 2),
+            ],
+        );
+        submit
+            .record
+            .job_needs
+            .insert(JobId("deploy".to_owned()), vec![JobId("build".to_owned())]);
+        let deploy = &mut submit.jobs[1].queued;
+        deploy.needs = vec![JobId("build".to_owned())];
+        deploy.environment = Some(serde_json::json!("${{ needs.build.outputs.env }}"));
+        deploy.environment_gate = Some(crate::models::EnvironmentGateState {
+            environment_name: Some("${{ needs.build.outputs.env }}".to_owned()),
+            ..Default::default()
+        });
+        deploy.message.actions_environment = Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: "${{ needs.build.outputs.env }}".to_owned(),
+            url: None,
+        });
+        backend.submit_run(submit).await.unwrap();
+
+        // `deploy` is parked; only `build` is ready.
+        assert_eq!(
+            backend
+                .job_queue_state(run_id, &JobId("build".to_owned()))
+                .await
+                .unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned()))
+        );
+        assert_eq!(
+            backend
+                .job_queue_state(run_id, &JobId("deploy".to_owned()))
+                .await
+                .unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned()))
+        );
+
+        let (runner, session) = live_runner(backend, "env-defer-runner").await;
+        let claimed = match backend.poll_session(poll(&session, runner)).await.unwrap() {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected the build job, got {other:?}"),
+        };
+        assert_eq!(claimed.queued.job_id, JobId("build".to_owned()));
+        let mut outputs = preloop_gha_protocol::OutputMap::new();
+        outputs.insert("env".to_owned(), serde_json::json!("staging"));
+        backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id,
+                    job_id: JobId("build".to_owned()),
+                    agent_job_id: Some(claimed.request.agent_job_id),
+                    status: ExecutionStatus::Success,
+                    outputs,
+                    annotations: Vec::new(),
+                    step_results: Vec::new(),
+                    environment_url: None,
+                },
+                settle: Some(AttemptSettle {
+                    agent_job_id: claimed.request.agent_job_id,
+                    runner_id: runner,
+                }),
+            })
+            .await
+            .unwrap();
+
+        // The release sweep hydrates `deploy`'s message, re-evaluates the
+        // gate against "staging" (no rules configured → proceed) and hands
+        // the job to the ordinary promotion path.
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        assert_eq!(
+            outcome.promoted, 1,
+            "the resolved environment name releases the parked job"
+        );
+        let deploy_id = JobId("deploy".to_owned());
+        assert_eq!(
+            backend.job_queue_state(run_id, &deploy_id).await.unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned())),
+            "a resolved name with no protection must dispatch"
+        );
+        let row = backend
+            .environment_deployment(run_id, &deploy_id)
+            .await
+            .unwrap()
+            .expect("the deployment row outlives the hold");
+        assert_eq!(row.environment, "staging");
+    }
+
     /// The `environment_approvals` audit row outlives the decision, the job
     /// and the run: it is written in the decision's own transaction and
     /// archival never deletes it. `backdate` moves the completed run past the
@@ -6453,6 +6596,22 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn deferred_environment_name_resolves_on_the_deployment_row() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::deferred_environment_name_resolves_on_the_deployment_row(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_environment_name_releases_after_needs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::deferred_environment_name_releases_after_needs(&backend).await;
+    }
+
+    #[tokio::test]
     async fn environment_approval_audit_survives_archival() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -7674,6 +7833,20 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn deferred_environment_name_resolves_on_the_deployment_row() {
+        suite::deferred_environment_name_resolves_on_the_deployment_row(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deferred_environment_name_releases_after_needs() {
+        suite::deferred_environment_name_releases_after_needs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
     async fn environment_approval_audit_survives_archival() {
         let backend = LiteBackend::in_memory().unwrap();
         let db = &backend;
@@ -8252,6 +8425,28 @@ mod lite {
         assert_eq!(
             String::from_utf8(version).unwrap(),
             crate::control::lite::SCHEMA_VERSION
+        );
+
+        // A database stamped by the previous build must refuse to boot:
+        // accepting its colliding version would defer the missing-column
+        // failure until a job reaches the environment path.
+        let old = dir.path().join("old.db");
+        rusqlite::Connection::open(&old)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL); \
+                 INSERT INTO schema_meta (key, value) VALUES ('schema_version', x'34');",
+            )
+            .unwrap();
+        let error = LiteBackend::open(&old, false, false, std::time::Duration::from_secs(300))
+            .err()
+            .expect("the previous schema version must be refused");
+        assert!(
+            error.to_string().contains("version 4")
+                && error
+                    .to_string()
+                    .contains(crate::control::lite::SCHEMA_VERSION),
+            "{error}"
         );
     }
 

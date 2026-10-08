@@ -26,9 +26,9 @@
 CREATE SCHEMA IF NOT EXISTS control;
 SET search_path = control;
 
--- Cell-local boot invariants. `schema_version` is exactly 1 (greenfield;
--- other values are refused) and `key_fingerprint` fences nodes with
--- different cluster HMAC keys from sharing the same database.
+-- Cell-local boot invariants. `schema_version` stamps the build's schema
+-- (greenfield; other values are refused at open) and `key_fingerprint`
+-- fences nodes with different cluster HMAC keys from sharing the database.
 CREATE TABLE schema_meta (
     key                     text PRIMARY KEY,
     value                   bytea NOT NULL

@@ -1872,15 +1872,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
             // Skipped jobs are terminal at submit: no gate evaluation (a
             // `Wait` verdict would park a node that never admits), no plan-id
-            // in the masker cache.
+            // in the masker cache. Environment protection is evaluated only
+            // for jobs that can dispatch immediately — a `needs:`-blocked job
+            // gates when promotion admits it, after `hydrate_needs_context`
+            // resolves a deferred `environment:` name. Arming it now would
+            // park the job `held` with an unevaluated name its release sweep
+            // could not resolve until the needs completed — and a gate-armed
+            // row takes the held branch below, so the job could never reach
+            // the hydration that resolves it.
             if !pb.skipped {
-                if crate::runtime_scheduling::check_environment_gates(
-                    &shared.state.environment_resolver,
-                    &submission.repository,
-                    &submission.git_ref,
-                    &mut queued_job,
-                    crate::models::now_unix_nanos(),
-                ) == crate::runtime_scheduling::EnvironmentGateOutcome::Proceed
+                if pb.job.needs.is_empty()
+                    && crate::runtime_scheduling::check_environment_gates(
+                        &shared.state.environment_resolver,
+                        &submission.repository,
+                        &submission.git_ref,
+                        &mut queued_job,
+                        crate::models::now_unix_nanos(),
+                    ) == crate::runtime_scheduling::EnvironmentGateOutcome::Proceed
                 {
                     queued_job.environment_gate = None;
                 }

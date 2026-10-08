@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// A job's declared `needs:` aggregate (`aggregate_need_status` over the
 /// matching ancestor statuses) evaluated against its `if:` condition —
 /// `dependency_decision` on the `RunGraph` view.
-fn dependency_decision(
+pub(super) fn dependency_decision(
     graph: &RunGraph,
     needs: &[JobId],
     if_condition: Option<&str>,
@@ -196,7 +196,7 @@ fn under_max_parallel(
 /// deferred `environment:` expression resolved against the needs context,
 /// else the literal spec name. The environment gate evaluates against this
 /// resolved name (GitHub evaluates rules against the resolved environment).
-fn hydrate_message(
+pub(super) fn hydrate_message(
     tx: &Transaction<'_>,
     graph: &RunGraph,
     job: &mut JobRow,
