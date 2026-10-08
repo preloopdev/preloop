@@ -1288,17 +1288,59 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .as_deref()
         .map(std::path::Path::new)
         .or(shared.state.local_workspace.as_deref());
-    let workspace_snapshot = if let Some(workspace) = local_workspace {
+    // A local `pull_request` run tests the merge of the CURRENT base tip into
+    // the head (GitHub's `refs/pull/<n>/merge`), not the branch alone: the
+    // base has usually moved since the branch was cut, and testing the branch
+    // alone misses exactly the breakage the merge exists to catch. `--no-merge`
+    // and every non-pull_request event keep the branch-alone behaviour. A base
+    // that cannot be fetched fails the submission loudly — silently testing a
+    // different tree than the one the PR would merge is never acceptable.
+    let local_pull_request_merge = if submission.event == "pull_request"
+        && !submission.no_merge
+        && local_workspace.is_some()
+    {
+        let Some(base_branch) = pull_request_base_branch(&submission) else {
+            return Err(ApiError::bad_request(
+                "cannot determine the pull request's base branch: pass `--base <branch>`, \
+                 include `pull_request.base.ref` in `--payload`, or re-run with --no-merge \
+                 to test the branch alone",
+            ));
+        };
+        Some(crate::merge_builder::LocalPullRequestMerge {
+            repository: submission.repository.clone(),
+            pull_request_number: submission_pull_request_number(&submission.payload),
+            base_branch,
+        })
+    } else {
+        None
+    };
+    let workspace_snapshot = if let Some(prebuilt) = submission.prebuilt_merge.as_ref() {
+        // A self-built merge whose commit exists only in the engine: the run's
+        // jobs must fetch it from here, so serving is not optional. The
+        // submission is validated against the mirror before anything is
+        // served, and a failure is fatal — falling back to a forge checkout
+        // would run the wrong tree.
+        match crate::merge_builder::attach_prebuilt_merge(shared, run_id, prebuilt).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return Err(error.into_api_error()),
+        }
+    } else if let Some(workspace) = local_workspace {
         match create_workspace_snapshot(
             &shared.state.state_dir,
             workspace,
             run_id,
             Some(shared),
             shared.state.static_github_pat().as_deref(),
+            local_pull_request_merge.as_ref(),
         )
         .await
         {
             Ok(snapshot) => Some(snapshot),
+            // A merge-requested run must never fall back to a normal
+            // checkout: that is the branch-alone tree the merge request
+            // exists to replace. Other snapshot failures keep the historical
+            // best-effort fallback.
+            Err(error) if local_pull_request_merge.is_some() => return Err(error),
             Err(error) => {
                 warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
                 None
@@ -1448,10 +1490,21 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 // against itself and see nothing, and pointing `head.sha` at
                 // the real workspace HEAD diffed it against an identical
                 // tree (and a sha absent from the snapshot store).
-                let base_sha = snapshot
-                    .before_sha
-                    .clone()
-                    .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
+                //
+                // When the run tests a self-built merge, GitHub's own shape
+                // applies instead: `base.sha` is the current base tip the
+                // merge was built against and `head.sha` the head that was
+                // merged, so changed-file actions keep diffing the user's
+                // changes against the base.
+                let (base_sha, head_sha) = match &snapshot.merge {
+                    Some(merge) => (merge.base_sha.clone(), merge.head_sha.clone()),
+                    None => (
+                        snapshot.before_sha.clone().unwrap_or_else(|| {
+                            "0000000000000000000000000000000000000000".to_owned()
+                        }),
+                        snapshot.commit_sha.clone(),
+                    ),
+                };
                 if let Some(pr) = payload
                     .get_mut("pull_request")
                     .and_then(|v| v.as_object_mut())
@@ -1460,7 +1513,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                         base.insert("sha".to_owned(), serde_json::json!(base_sha));
                     }
                     if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
-                        head.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+                        head.insert("sha".to_owned(), serde_json::json!(head_sha));
                     }
                 }
             }
@@ -1468,17 +1521,24 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // The github context was built before the snapshot existed; refresh
         // the pieces that now describe the local tree.
         //
-        // `github.sha` is the workspace's real HEAD commit, not the
-        // synthetic snapshot commit: the snapshot commit exists only in
-        // this engine's store, so a workflow step that fetches
-        // `${{ github.sha }}` from the real remote (custom checkouts)
-        // would be answered "not our ref". The workspace HEAD is the
-        // identity the run is really based on. `sha` feeds every job's
-        // `job.workflow_sha` (what `$/` resolves against), so it moves too.
-        sha = snapshot
-            .head_sha
-            .clone()
-            .unwrap_or_else(|| snapshot.commit_sha.clone());
+        // Without a merge, `github.sha` is the workspace's real HEAD commit,
+        // not the synthetic snapshot commit: the snapshot commit exists only
+        // in this engine's store, so a workflow step that fetches
+        // `${{ github.sha }}` from the real remote (custom checkouts) would
+        // be answered "not our ref". The workspace HEAD is the identity the
+        // run is really based on. `sha` feeds every job's `job.workflow_sha`
+        // (what `$/` resolves against), so it moves too.
+        //
+        // With a merge, `github.sha` is the merge commit — exactly like
+        // GitHub's `refs/pull/<n>/merge` — and the run's checkout fetches it
+        // from the engine's snapshot repository, which serves it.
+        sha = match &snapshot.merge {
+            Some(merge) => merge.sha.clone(),
+            None => snapshot
+                .head_sha
+                .clone()
+                .unwrap_or_else(|| snapshot.commit_sha.clone()),
+        };
         if let Some(object) = github.as_object_mut() {
             object.insert("event".to_owned(), submission.payload.clone());
             object.insert("sha".to_owned(), serde_json::json!(sha));
@@ -2261,6 +2321,65 @@ pub fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>)
     );
 }
 
+/// The branch a local `pull_request` run's test merge targets: the payload's
+/// `pull_request.base.ref` when present, then the submission's `--base`, then
+/// the branch the CLI derived for trigger filtering (which is the PR's target
+/// branch). Normalized to a plain branch name so `refs/heads/main` and
+/// `origin/main` all fetch `refs/heads/main`.
+fn pull_request_base_branch(submission: &WorkflowSubmission) -> Option<String> {
+    let payload_base = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .and_then(|value| value.as_str());
+    payload_base
+        .map(str::to_owned)
+        .or_else(|| submission.base_ref.clone())
+        .or_else(|| submission.filter_branch.clone())
+        .map(|raw| normalize_branch_name(&raw))
+        .filter(|branch| !branch.is_empty())
+}
+
+/// The pull request number a local `pull_request` submission refers to, for
+/// `refs/pull/<n>/merge` labelling.
+fn submission_pull_request_number(payload: &serde_json::Value) -> Option<u64> {
+    payload
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            payload
+                .get("pull_request")
+                .and_then(|pr| pr.get("number"))
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+/// Strip the remote-qualified spellings of a branch name.
+///
+/// Mirrors the CLI's own normalization: `refs/heads/main`, `refs/remotes/
+/// origin/main`, `origin/main`, and `upstream/main` all become `main`. A
+/// branch containing slashes (`feature/auth`) keeps them — only the known
+/// remote prefixes are stripped.
+fn normalize_branch_name(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix("refs/heads/") {
+        return rest.to_owned();
+    }
+    if let Some(rest) = raw.strip_prefix("refs/remotes/") {
+        return rest
+            .split_once('/')
+            .map(|(_, branch)| branch.to_owned())
+            .unwrap_or_else(|| rest.to_owned());
+    }
+    for remote in ["origin/", "upstream/"] {
+        if let Some(rest) = raw.strip_prefix(remote) {
+            return rest.to_owned();
+        }
+    }
+    raw.to_owned()
+}
+
 /// Per-job runner artifacts: agent message plus the correlation records the
 /// broker and results/timeline services use to track the delivered request.
 pub(crate) struct BuiltJobArtifacts {
@@ -2542,8 +2661,12 @@ pub(crate) fn build_job_artifacts(
         }
         // Self-repository actions can use this snapshot even when the workflow
         // has no actions/checkout step. Preserve the marker for local workspace
-        // snapshots independently of checkout rewriting.
-        if redirected > 0 || snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace {
+        // snapshots and self-built merges (whose commit exists only here)
+        // independently of checkout rewriting.
+        if redirected > 0
+            || snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace
+            || snapshot.source == crate::snapshots::SnapshotSource::SelfBuiltMerge
+        {
             agent_msg.preloop_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
         // Local-workspace runs test code the forge has never seen, so anything

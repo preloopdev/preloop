@@ -969,6 +969,14 @@ struct RunArgs {
         action = clap::ArgAction::Set
     )]
     pr_draft: bool,
+
+    /// Test the branch alone instead of the merge of the pull request's
+    /// current base tip into it. Only affects `--event pull_request` runs
+    /// against a local engine: by default those run on the merge (the base
+    /// tip is fetched from origin), like GitHub's `refs/pull/<n>/merge`.
+    /// Use this when the base branch cannot be fetched.
+    #[arg(long)]
+    no_merge: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -3009,6 +3017,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // list the server was just handed.
         changed_paths_known: derived_changed_paths.is_some(),
         filter_branch: derived_filter_branch,
+        // A local `pull_request` run tests the merge of the current base tip
+        // into the head by default (like GitHub's `refs/pull/<n>/merge`);
+        // `--no-merge` is the explicit escape back to testing the branch
+        // alone.
+        no_merge: args.no_merge,
         // `--debug` keeps the failed runner waiting for a verdict;
         // `--preserve-on-failure` only keeps a completed failed VM for shell.
         preserve_on_failure,

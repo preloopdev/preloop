@@ -88,6 +88,8 @@ pub mod cache_artifacts;
 use cache_artifacts::*;
 pub mod snapshots;
 use snapshots::*;
+pub mod merge_builder;
+use merge_builder::*;
 pub mod recording;
 use recording::*;
 pub mod state;
