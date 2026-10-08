@@ -22,6 +22,11 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Fixed
+- **Golden workflows pass security checks**: the runtime-drift workflow now
+  pins `actions/download-artifact` to a commit from that action's repository,
+  and the image-pin comparison passes the PR base branch through an environment
+  variable instead of expanding it directly into shell code.
+
 - **A push to a pull request no longer piles up golden bakes**:
   `official-golden.yml` now runs under a per-PR concurrency group with
   `cancel-in-progress` for `pull_request` runs only, so a superseded push
