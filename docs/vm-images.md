@@ -477,7 +477,8 @@ what your workflows invoke implicitly into the image you configure.
 | Env var                                      | Effect                                                                                                             |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `PRELOOP_GOLDEN_OCI_REF`                     | Override the per-architecture packed golden OCI reference the official golden is fetched from                      |
-| `PRELOOP_GOLDEN_URL`                         | Select a release-asset mirror of the official packed golden instead; its optional checksum is fetched from the same URL plus `.sha256` |
+| `PRELOOP_GOLDEN_URL`                         | Select a release-asset mirror of the official packed golden instead. A mirror **must** be verifiable: the checksum is this URL plus `.sha256`, or `PRELOOP_GOLDEN_SHA256` names the digest; an unverified mirror is refused |
+| `PRELOOP_GOLDEN_SHA256`                      | Expected SHA-256 of the packed golden, for mirrors that publish no `.sha256` sidecar                             |
 | `PRELOOP_USE_FORK`                           | Run the pool as host forks instead of booting microVMs (default true)                                              |
 | `PRELOOP_RUNNER_POOL_SIZE`                   | Pool size (warm forks / VMs)                                                                                       |
 | `PRELOOP_RUNNER_CPUS`                        | vCPUs allocated to each runner VM (default 8)                                                                      |

@@ -110,8 +110,21 @@ impl EnvironmentSpec {
     /// The image is used exactly as it is: no packages, toolchains, PATH or
     /// environment overrides. Workflow `setup-*` actions select exact language
     /// versions at job time, as they do on GitHub-hosted runners.
+    ///
+    /// The runner account comes from `PRELOOP_RUNNER_USER`/`_UID` — the same
+    /// variables `serve` resolves it from — because a configured image bakes
+    /// that account into its golden: a host that changes either must not adopt
+    /// the artifact baked for the previous one. Reading it here (rather than
+    /// only at the bake) is what keeps every caller, `preloop golden-path`
+    /// included, naming the same payload.
     pub fn for_base(base: String) -> Self {
         Self::from_base(base)
+    }
+
+    /// Resolve the environment for a base image under an explicit account,
+    /// for callers that already resolved one.
+    pub fn for_base_with_account(base: String, user: &str, uid: u32) -> Self {
+        Self::from_base_with_account(base, user, uid)
     }
 
     /// Resolve a queued job's base image from its `runs-on` labels.
@@ -145,6 +158,11 @@ impl EnvironmentSpec {
     }
 
     fn from_base(base: String) -> Self {
+        let (user, uid) = resolve_runner_account();
+        Self::from_base_with_account(base, &user, uid)
+    }
+
+    fn from_base_with_account(base: String, user: &str, uid: u32) -> Self {
         let normalized = serde_json::json!({
             "base": &base,
             // The pool only rebuilds when the fingerprint-suffixed artifact
@@ -152,16 +170,17 @@ impl EnvironmentSpec {
             // fingerprint or the pool silently keeps the old golden forever.
             //
             // The official golden is built by the release pipeline from a
-            // published runner image, not here: its identity is the digest
-            // pinned in `official_golden_reference`, so a freshly published
-            // golden is picked up (and an unchanged one is not re-downloaded).
-            // A configured image is baked locally, so its fingerprint is the
-            // bake contract itself — bump a step of `golden_contract_script`
-            // and every golden is rebuilt.
+            // published runner image, not here: its identity is whatever
+            // source this host would fetch it from — the digest pinned in
+            // `official_golden_source`, a `PRELOOP_GOLDEN_OCI_REF` override,
+            // or the `PRELOOP_GOLDEN_URL` mirror, which selects a different
+            // pack with a different name. A configured image is baked
+            // locally, so its fingerprint is the bake contract itself — bump
+            // a step of `golden_contract_script` and every golden is rebuilt.
             "golden": if is_official_golden(&base) {
-                crate::official_golden_reference()
+                crate::official_golden_source()
             } else {
-                crate::golden_contract_script(crate::DEFAULT_RUNNER_USER, crate::DEFAULT_RUNNER_UID)
+                crate::golden_contract_script(user, uid)
             },
             // Rosetta x86_64 translation exists only on Apple Silicon hosts.
             // The golden prep installs the amd64 loader + libc so dynamically
@@ -185,6 +204,26 @@ impl EnvironmentSpec {
         let fingerprint = hex_digest(&bytes);
         Self { base, fingerprint }
     }
+}
+
+/// The runner account this host would run jobs as.
+///
+/// Mirrors the resolution `serve` performs: `PRELOOP_RUNNER_USER` (an empty
+/// value disables the switch, i.e. the guest's own user runs the runner) and
+/// `PRELOOP_RUNNER_UID`, defaulting to the hosted `runner`/1001. Kept here so
+/// the fingerprint — and therefore `preloop golden-path` — always names the
+/// account the bake will actually install.
+fn resolve_runner_account() -> (String, u32) {
+    let user = match std::env::var("PRELOOP_RUNNER_USER") {
+        Ok(value) if value.is_empty() => crate::DEFAULT_RUNNER_USER.to_owned(),
+        Ok(value) => value,
+        Err(_) => crate::DEFAULT_RUNNER_USER.to_owned(),
+    };
+    let uid = std::env::var("PRELOOP_RUNNER_UID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(crate::DEFAULT_RUNNER_UID);
+    (user, uid)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -291,45 +330,77 @@ mod tests {
         );
     }
 
-    /// The fingerprint of a configured image is the bake contract: changing a
-    /// contract step must rebuild the golden, and the official golden must not
-    /// be keyed on that contract (it is baked by the release pipeline, so a
-    /// contract change must not re-download an unchanged artifact).
+    /// The runner account is part of a configured image's bake contract: the
+    /// contract text embeds it, so changing `PRELOOP_RUNNER_USER`/`_UID` must
+    /// produce a different artifact name instead of adopting the golden baked
+    /// for the previous account.
     #[test]
-    fn fingerprint_tracks_the_bake_contract_for_configured_images_only() {
-        let contract =
-            crate::golden_contract_script(crate::DEFAULT_RUNNER_USER, crate::DEFAULT_RUNNER_UID);
-        let spec = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".into());
-        let normalized = serde_json::json!({
-            "base": "ghcr.io/acme/runner:latest",
-            "golden": format!("{contract}\ntrue\n"),
-            "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-            "node_externals": crate::node_externals::expected_runtimes()
-                .iter()
-                .map(|(runtime, version)| format!("{runtime}={version}"))
-                .collect::<Vec<_>>(),
-        });
-        assert_ne!(
-            spec.fingerprint,
-            hex_digest(&serde_json::to_vec(&normalized).unwrap()),
-            "a contract change must invalidate a configured image's golden"
+    fn fingerprint_tracks_the_configured_runner_account() {
+        let base = "ghcr.io/acme/runner:latest".to_owned();
+        let default = EnvironmentSpec::for_base_with_account(
+            base.clone(),
+            crate::DEFAULT_RUNNER_USER,
+            crate::DEFAULT_RUNNER_UID,
         );
+        let other_user = EnvironmentSpec::for_base_with_account(base.clone(), "builder", 1001);
+        let other_uid = EnvironmentSpec::for_base_with_account(base, "runner", 2000);
 
+        assert_ne!(default.fingerprint, other_user.fingerprint);
+        assert_ne!(default.fingerprint, other_uid.fingerprint);
+        assert_ne!(other_user.fingerprint, other_uid.fingerprint);
+        assert_eq!(default.base, "ghcr.io/acme/runner:latest");
+    }
+
+    /// The official golden is keyed by *where this host fetches it from*: the
+    /// pinned digest, the `PRELOOP_GOLDEN_OCI_REF` override, or the mirror URL.
+    /// A changed mirror must not keep serving the pack the previous one left
+    /// at the payload path, and it must not be keyed on the bake contract
+    /// either (the release pipeline bakes it, so a contract edit cannot move
+    /// the published artifact).
+    #[test]
+    fn fingerprint_tracks_the_official_golden_source() {
         let official = EnvironmentSpec::for_base(OFFICIAL_GOLDEN.into());
-        let normalized = serde_json::json!({
-            "base": OFFICIAL_GOLDEN,
-            "golden": crate::official_golden_reference(),
-            "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-            "node_externals": crate::node_externals::expected_runtimes()
-                .iter()
-                .map(|(runtime, version)| format!("{runtime}={version}"))
-                .collect::<Vec<_>>(),
-        });
-        assert_eq!(
+        let oci_source = format!("oci:{}", crate::official_golden_reference());
+        let expected = |golden: &str| {
+            let normalized = serde_json::json!({
+                "base": OFFICIAL_GOLDEN,
+                "golden": golden,
+                "rosetta_libs": cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+                "node_externals": crate::node_externals::expected_runtimes()
+                    .iter()
+                    .map(|(runtime, version)| format!("{runtime}={version}"))
+                    .collect::<Vec<_>>(),
+            });
+            hex_digest(&serde_json::to_vec(&normalized).unwrap())
+        };
+
+        assert_eq!(official.fingerprint, expected(&oci_source));
+        assert_ne!(
             official.fingerprint,
-            hex_digest(&serde_json::to_vec(&normalized).unwrap()),
-            "the official golden is keyed by its published reference"
+            expected("https://mirror.example/new-pack.smolmachine"),
+            "a mirror switch must not reuse the pack the previous source left behind"
         );
+        assert_ne!(
+            official.fingerprint,
+            expected(&crate::golden_contract_script(
+                crate::DEFAULT_RUNNER_USER,
+                crate::DEFAULT_RUNNER_UID
+            )),
+            "the official golden is published, not baked here"
+        );
+        // The in-guest bake a non-pack backend performs boots this image, so
+        // it must be a real digest-pinned reference — the sentinel itself is
+        // not an image any backend can start.
+        match crate::official_boot_image() {
+            Some(image) => assert!(
+                image.contains("@sha256:"),
+                "a non-pack backend can only boot a digest-pinned image: {image}"
+            ),
+            None => assert!(
+                !matches!(std::env::consts::ARCH, "aarch64" | "x86_64"),
+                "every supported architecture must have a pinned runner image"
+            ),
+        }
     }
 
     #[test]

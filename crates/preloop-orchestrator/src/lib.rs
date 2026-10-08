@@ -1171,6 +1171,43 @@ pub(crate) fn official_golden_reference() -> String {
         .unwrap_or_default()
 }
 
+/// The source the official golden would be fetched from on this host: the
+/// `PRELOOP_GOLDEN_URL` mirror when one is set, else
+/// [`official_golden_reference`].
+///
+/// Also the official environment's fingerprint input (see
+/// `EnvironmentSpec::from_base`): it decides both which pack lands at the
+/// payload path and whether a pack is fetched at all, so a mirror flip or a
+/// newly published golden must move the fingerprint — `ensure_golden_payload`
+/// returns immediately for an existing file and would otherwise serve the
+/// previous pack forever.
+pub(crate) fn official_golden_source() -> String {
+    golden_url_override().unwrap_or_else(|| format!("oci:{}", official_golden_reference()))
+}
+
+/// `PRELOOP_GOLDEN_URL` when it names a mirror. An exported-but-blank value
+/// behaves like an unset one, exactly as [`download_prebaked_golden_with_space`]
+/// resolves it.
+fn golden_url_override() -> Option<String> {
+    std::env::var("PRELOOP_GOLDEN_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// The official runner image a non-file-pack backend boots to build its
+/// golden in-guest, honouring neither `PRELOOP_GOLDEN_OCI_REF` nor
+/// `PRELOOP_GOLDEN_URL`: those name a *packed* artifact, which only a backend
+/// that restores packs can consume.
+///
+/// `None` on an architecture with no published runner image.
+pub(crate) fn official_boot_image() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(OFFICIAL_RUNNER_IMAGE_BASE_ARM64),
+        "x86_64" => Some(OFFICIAL_RUNNER_IMAGE_BASE_AMD64),
+        _ => None,
+    }
+}
+
 async fn download_prebaked_golden(
     payload: &Path,
     release_version: &str,
@@ -1225,13 +1262,21 @@ async fn download_prebaked_golden_with_space(
     } else {
         None
     };
+    let mirror = forced_url.is_some();
     for url in golden_url_candidates(release_version, resolved_tag.as_deref(), forced_url) {
         info!(
             url = %url,
             target = %payload.display(),
             "Downloading pre-baked golden from release asset (this may take several minutes)"
         );
-        if download_release_asset(&client, &url, payload, available_space).await? {
+        // A forced mirror's bytes become the golden *without* any other gate,
+        // so they must be verified: an operator pointing `PRELOOP_GOLDEN_URL`
+        // at a mirror is trusting that host, and an unverified payload turns a
+        // compromised mirror into every job's image. The published
+        // `linux-amd64`/`linux-arm64` assets we release ourselves are the only
+        // source allowed to skip verification (a missing sidecar there is an
+        // accident, and refusing would strand every host that updates first).
+        if download_release_asset(&client, &url, payload, available_space, mirror).await? {
             return Ok(true);
         }
     }
@@ -1247,6 +1292,7 @@ async fn download_release_asset(
     url: &str,
     payload: &Path,
     available_space: AvailableSpace,
+    require_checksum: bool,
 ) -> Result<bool, OrchestratorError> {
     let probe = match client.get(url).send().await {
         Ok(response) if response.status().is_success() => response,
@@ -1268,22 +1314,41 @@ async fn download_release_asset(
 
     // Fetch the companion checksum before committing bandwidth to the body.
     // A truncated or corrupted golden only fails much later, when a VM tries
-    // to boot it, so a mismatch must be caught here. Releases that do not
-    // publish a checksum are tolerated with a warning (the download is still
-    // the best path when the alternative is a full local build).
-    let expected_sha256 = match tokio::time::timeout(
-        Duration::from_secs(15),
-        client.get(format!("{url}.sha256")).send(),
-    )
-    .await
-    {
-        Ok(Ok(res)) if res.status().is_success() => match res.text().await {
-            Ok(text) => parse_sha256_checksum(&text),
-            Err(_) => None,
+    // to boot it, so a mismatch must be caught here. `PRELOOP_GOLDEN_SHA256`
+    // pins the digest for hosts whose mirror publishes no sidecar (the
+    // exported-but-blank rule applies here too). Releases that do not publish
+    // a checksum are tolerated for our own assets with a warning — the
+    // download is still the best path when the alternative is a full local
+    // build — but a forced mirror must be verifiable, see the caller.
+    let pinned_sha256 = std::env::var("PRELOOP_GOLDEN_SHA256")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| parse_sha256_checksum(&value));
+    let expected_sha256 = match pinned_sha256 {
+        Some(sha256) => Some(sha256),
+        None => match tokio::time::timeout(
+            Duration::from_secs(15),
+            client.get(format!("{url}.sha256")).send(),
+        )
+        .await
+        {
+            Ok(Ok(res)) if res.status().is_success() => match res.text().await {
+                Ok(text) => parse_sha256_checksum(&text),
+                Err(_) => None,
+            },
+            _ => None,
         },
-        _ => None,
     };
     if expected_sha256.is_none() {
+        if require_checksum {
+            warn!(
+                url = %url,
+                "PRELOOP_GOLDEN_URL is set but the mirror publishes no checksum: refusing an \
+                 unverified payload. Publish `<asset>.sha256` beside it, or pin the digest with \
+                 PRELOOP_GOLDEN_SHA256"
+            );
+            return Ok(false);
+        }
         warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
     }
 
@@ -1793,6 +1858,28 @@ pub const DEFAULT_RUNNER_USER: &str = "runner";
 /// Default UID for [`DEFAULT_RUNNER_USER`], matching the hosted image.
 pub const DEFAULT_RUNNER_UID: u32 = 1001;
 
+/// Whether `user` may be used as the runner account.
+///
+/// Deliberately narrow: the name reaches root-run guest scripts unquoted by
+/// design (it is a *name*, not data), so anything a Linux account name cannot
+/// contain is refused rather than escaped. `root` is allowed as the explicit
+/// "do not switch user" value; an empty name is not.
+pub fn is_valid_account_name(user: &str) -> bool {
+    if user == "root" {
+        return true;
+    }
+    let mut chars = user.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '_' | '-')
+    })
+}
+
 /// Create the unprivileged runner account and hand it every path a job writes.
 ///
 /// Part of [`golden_contract_script`] — and therefore of the environment
@@ -1802,12 +1889,23 @@ pub const DEFAULT_RUNNER_UID: u32 = 1001;
 /// idempotent: the same script runs against an image that already has the
 /// account (the official golden's `runner`) and against one that does not.
 ///
+/// An account the image already carries is *reconciled* to `uid` rather than
+/// assumed to have it: the runtime drops privileges to the configured uid, so
+/// an image whose `runner` sits at another uid would otherwise run jobs as a
+/// uid that owns nothing in its own home. `usermod -u` also re-owns the
+/// account's files, and [`golden_ownership_script`] then covers the rest.
+///
 /// Ownership is *not* here: the walk over the runner home happens once, in
 /// [`golden_ownership_script`], because on overlayfs a recursive `chown`
 /// copies every file it touches into the per-VM upper layer.
 pub fn runner_account_script(user: &str, uid: u32) -> String {
     format!(
         "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} -s /bin/bash {user} 2>/dev/null; \
+         if [ \"$(id -u {user} 2>/dev/null)\" != \"{uid}\" ]; then \
+           usermod -u {uid} {user} 2>/dev/null || \
+             printf 'preloop: could not move %s to uid %s; jobs run as that uid and may not own their home\\n' \
+               '{user}' '{uid}' >&2; \
+         fi; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/_work; \
@@ -1879,11 +1977,23 @@ pub fn golden_glibc_check_script() -> &'static str {
 /// `EnvironmentSpec::from_base`), so editing a step rebuilds every golden baked
 /// from an image instead of adopting one the old contract produced.
 pub fn golden_contract_script(user: &str, uid: u32) -> String {
+    // `PRELOOP_RUNNER_USER=root` restores the old "run as root" behavior, and
+    // `as_runner_user` runs the runner unchanged for it. The account steps must
+    // skip then: creating and chowning a `root` account (and moving its home
+    // to `/home/root`) would leave the image in a state nothing runs as.
+    let account = if user == "root" {
+        String::new()
+    } else {
+        runner_account_script(user, uid)
+    };
+    let ownership = if user == "root" {
+        String::new()
+    } else {
+        golden_ownership_script(uid)
+    };
     format!(
         "set -e; {glibc}; {account}; {ownership}",
         glibc = golden_glibc_check_script(),
-        account = runner_account_script(user, uid),
-        ownership = golden_ownership_script(uid),
     )
 }
 
@@ -2119,29 +2229,31 @@ async fn write_bake_manifest<P: VmProvider>(
     Ok(())
 }
 
-/// PATH the guest runner process exports to every step.
+/// PATH the guest runner falls back to when the image declares none.
 ///
-/// The system directories, matching what a hosted step shell sees from
-/// `/etc/environment`. Nothing is prepended for a language toolchain: GitHub's
-/// own PATH carries neither `/usr/local/cargo/bin` nor `/usr/local/go/bin`, and
-/// the toolchains those directories used to hold (the curated Rust and Go
-/// bakes) are gone. `setup-*` actions put the tool they install on
-/// `$GITHUB_PATH`, which is how a hosted runner resolves `cargo`/`go` too.
+/// GitHub's hosted images declare their PATH in `/etc/environment`, and the
+/// runner must see exactly that: the image's toolchains are where *it* put
+/// them, and a host-side static PATH cannot know them (the deleted curated
+/// bakes put Cargo and Go at fixed `/usr/local` addresses; the official image
+/// does not). [`guest_env_prefix`] therefore runs the runner through a shell
+/// that sources `/etc/environment` and only falls back to this list when the
+/// image carries no PATH of its own.
 pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
 }
 
-/// `env` prefix for guest runner invocations, empty when nothing needs setting.
+/// The `KEY=value` entries the runner is launched with: the variables the pool
+/// sets, with no launcher shell. [`guest_env_prefix`] adds the shell that
+/// sources the image's `/etc/environment` on top of these.
 ///
 /// Control-socket routing and failure-marker debugging are independent
 /// features: a pool can debug failed jobs without a mounted control socket and
 /// vice versa, so neither may gate the other.
-fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
-    let mut env = Vec::new();
-    env.push(format!("PATH={}", guest_runner_path(config)));
-    // The guest needs its own VM name so a debug session can tell a controller
-    // which machine to open a shell into. Nothing else in the guest knows it.
-    env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
+fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    let mut env = vec![
+        format!("PATH={}", guest_runner_path(config)),
+        format!("PRELOOP_MACHINE_NAME={}", name.as_str()),
+    ];
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
@@ -2167,10 +2279,38 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
         env.push(format!("PRELOOP_PAUSE_MARKER={GUEST_PAUSE_MARKER}"));
     }
-    if !env.is_empty() {
-        env.insert(0, "/usr/bin/env".to_owned());
-    }
     env
+}
+
+/// `env` prefix for guest runner invocations: the runner is launched through
+/// `sh -c` so the image's `/etc/environment` is sourced first.
+///
+/// `/etc/environment` is where a Linux image declares the PATH its toolchains
+/// live on, and `smolvm machine exec` starts the process without a login shell
+/// that would read it; a step calling a preinstalled tool would fail command
+/// lookup. Sourcing it *is* the hosted-runner parity fix, and an image without
+/// the file keeps [`guest_runner_path`]'s system default. The pool's own
+/// variables are re-asserted by `env` after the source, so a malformed
+/// `/etc/environment` cannot unset `HOME` or the control routing.
+fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    let env = guest_env_entries(config, name);
+    // `env` re-asserts every variable above *after* the image's environment is
+    // sourced, so a malformed `/etc/environment` cannot unset `HOME` or the
+    // control routing. It also resolves the program through the PATH the
+    // source may have replaced (a running process keeps the PATH it started
+    // with), which is exactly the heap the image declares.
+    let pairs = env
+        .iter()
+        .map(|entry| shell_quote(entry))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let launcher = format!(
+        "if [ -r /etc/environment ]; then . /etc/environment; fi; \
+         exec /usr/bin/env {pairs} \"$0\" \"$@\""
+    );
+    let mut argv = vec!["sh".to_owned(), "-c".to_owned(), launcher];
+    argv.extend(env);
+    argv
 }
 
 /// Local ephemeral-runner pool configuration.
@@ -2399,6 +2539,20 @@ impl RunnerPoolConfig {
             ));
         }
         MachineName::new(format!("{}-0", self.name_prefix))?;
+        if let Some(user) = &self.runner_user {
+            // The account name is interpolated into root-run guest scripts
+            // (`runner_account_script`, `as_runner_user`) and into the
+            // `sudoers.d` filename. Restrict it to what a Linux account name
+            // may be, so a configured value cannot smuggle shell syntax into
+            // a root shell (or escape the sudoers directory).
+            if !is_valid_account_name(user) {
+                return Err(OrchestratorError::Config(format!(
+                    "runner user `{user}` is not a valid account name: use a lowercase \
+                     letter or underscore followed by lowercase letters, digits, \
+                     underscores, or dashes (or `root`)"
+                )));
+            }
+        }
         if self.base_image.trim().is_empty()
             || self.server_url.trim().is_empty()
             || self.release_version.trim().is_empty()
@@ -2600,12 +2754,23 @@ fn rosetta_multiarch_script() -> String {
     // failed apt step must surface as a nonzero exit. The lenient
     // `|| true` form would report success and bake a golden whose forks all
     // fail `test -f /lib64/ld-linux-x86-64.so.2` consumers.
+    //
+    // An image without apt cannot be given the amd64 runtime — the loader and
+    // its libraries only come from Debian/Ubuntu packages. That is not a bake
+    // failure for a *configured* image, which is used as-is: the operator opted
+    // into whatever it carries, and job VMs that need x86_64 translation are
+    // the price. Say so loudly and continue; an arm64 guest keeps the image's
+    // own arm64 runtime either way.
     run_as_root_or_sudo_strict(&format!(
         "set -e; \
          case \"$(uname -m)\" in \
            aarch64|arm64) ;; \
            *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
          esac; \
+         if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg >/dev/null 2>&1; then \
+           echo 'preloop: this image has no dpkg/apt, so the amd64 runtime for Rosetta x86_64 translation cannot be installed; x86_64 binaries will not run in jobs' >&2; \
+           exit 0; \
+         fi; \
          {}; \
          dpkg --add-architecture amd64; \
          CODENAME=$(. /etc/os-release 2>/dev/null && echo \"$VERSION_CODENAME\"); \
@@ -2637,39 +2802,49 @@ fn rosetta_multiarch_script() -> String {
 /// The package set covers the loader, libc, C++ runtime, zlib, and systemd
 /// (valkey's official x86_64 tarballs link `libsystemd.so.0`); apt pulls the
 /// amd64 transitive deps.
+///
+/// Returns whether the golden gained the amd64 runtime. `false` means the
+/// guest skipped it — no apt, or apt sources that are not Ubuntu's — which is
+/// a real limitation for a configured image used as-is, not a bake failure.
 async fn prepare_rosetta_multiarch<P: VmProvider>(
     provider: &P,
     golden: &MachineName,
-) -> Result<(), OrchestratorError> {
+    unpacked_pack: bool,
+) -> Result<bool, OrchestratorError> {
     if !(cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64") {
-        return Ok(());
+        return Ok(true);
     }
-    // Ubuntu 24.04 uses deb822 `ubuntu.sources`; the pinned 22.04 image uses
-    // one-line `/etc/apt/sources.list` instead. Both arm64 sources point at
-    // ports.ubuntu.com, which has no amd64 packages. Scope native sources to
-    // arm64 before adding amd64, including any third-party `.list` entries
-    // without an architecture restriction, or every later apt-get update
-    // probes those mirrors for amd64 and fails. Add the explicit amd64 archive
-    // across all four suites: the base suite alone may be older than the
-    // image's security-update glibc, whose mutual Breaks pins block
-    // installation. One suite per deb line; the one-line format misparses
-    // extra suites as components. `sync` flushes before forking the golden.
     let script = rosetta_multiarch_script();
     let output = provider
         .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
         .await?;
     if output.exit_code != 0 {
-        return Err(OrchestratorError::Config(format!(
-            "rosetta multiarch install failed (exit {}): {}",
-            output.exit_code,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        // Fatal for a *packed* golden: the pack's jobs expect amd64 (it was
+        // built from the official multiarch image), so a half-installed base
+        // must not be adoptable. A configured image is the operator's own
+        // contract and is used as-is — refusing to bake it over a missing
+        // translation runtime would be the "everything must be checked" rule
+        // this design deleted.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if unpacked_pack {
+            return Err(OrchestratorError::Config(format!(
+                "rosetta multiarch install failed (exit {}): {stderr}",
+                output.exit_code
+            )));
+        }
+        warn!(
+            machine = golden.as_str(),
+            exit = output.exit_code,
+            "rosetta multiarch install failed; x86_64 binaries will not run in this \
+             golden's jobs: {stderr}"
+        );
+        return Ok(false);
     }
     info!(
         machine = golden.as_str(),
         "installed amd64 multiarch libs into golden for Rosetta x86_64 translation"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
@@ -2841,6 +3016,7 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
     config: &RunnerPoolConfig,
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
+    shutdown: &CancellationToken,
 ) -> Result<(), OrchestratorError> {
     // Adoption first: without it every engine restart repays the golden's full
     // build or unpack (tens of GB of storage writes) before the first job.
@@ -2855,8 +3031,16 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
         provider.delete(golden).await?;
         vm_telemetry_deregister(config, golden);
     }
+    // Give up before the expensive part when a shutdown is already pending.
+    // The caller checks `is_cancelled` afterwards and reports a clean stop
+    // instead of a download or bake error.
+    if shutdown.is_cancelled() {
+        return Err(OrchestratorError::Pool(
+            "golden preparation cancelled by shutdown".into(),
+        ));
+    }
     let prepared = if provider.capabilities().file_packs {
-        unpack_golden_pack(provider, config, golden, env_spec).await
+        unpack_golden_pack(provider, config, golden, env_spec, shutdown).await
     } else {
         bake_golden_in_guest(provider, config, golden, env_spec).await
     };
@@ -2874,6 +3058,23 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
     Ok(())
 }
 
+/// Refuse to start an expensive preparation while a shutdown is pending.
+///
+/// The warm is idempotent and resumable, so abandoning it costs one restart's
+/// preparation; waiting would make a restart sit through a multi-gigabyte
+/// download or an eleven-minute bake. Callers treat the error as a clean stop
+/// (they check [`CancellationToken::is_cancelled`]) rather than a failure.
+fn abort_preparation_if_shutting_down(
+    shutdown: &CancellationToken,
+) -> Result<(), OrchestratorError> {
+    if shutdown.is_cancelled() {
+        return Err(OrchestratorError::Pool(
+            "golden preparation cancelled by shutdown".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Unpack the packed artifact for `env_spec` into the forkable golden.
 ///
 /// Socket mappings are supplied by the local machine definition, never read
@@ -2884,9 +3085,10 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     config: &RunnerPoolConfig,
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
+    shutdown: &CancellationToken,
 ) -> Result<(), OrchestratorError> {
     let payload = artifact_payload(&config.artifact_stem, &env_spec.base);
-    ensure_golden_payload(provider, config, env_spec, &payload).await?;
+    ensure_golden_payload(provider, config, env_spec, &payload, shutdown).await?;
     // Unpacking writes the golden's filesystem; its disk can grow to the
     // configured storage ceiling, and job forks grow on top of it. Not a
     // refusal: how much of the ceiling a given golden writes is image-specific
@@ -2926,10 +3128,10 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     provider.start(golden).await?;
     vm_telemetry_register(config, golden, "golden", Some(&spec));
     await_guest_ready(provider.as_ref(), golden).await?;
-    // Fatal, not a warning: on Apple Silicon the multiarch shim is the golden's
-    // contract, and a failed install leaves a reusable base that is adoptable
-    // on later restarts (amd64 arch added, loader missing).
-    prepare_rosetta_multiarch(provider.as_ref(), golden).await?;
+    // Fatal for a packed golden: its jobs expect the multiarch shim, and a
+    // failed install leaves a reusable base that is adoptable on later
+    // restarts (amd64 arch added, loader missing).
+    prepare_rosetta_multiarch(provider.as_ref(), golden, true).await?;
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -2958,20 +3160,47 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     Ok(())
 }
 
+/// The image a non-file-pack backend boots for `env_spec`.
+///
+/// A configured image is its own base. The official sentinel resolves to the
+/// pinned runner image: the same one the release pipeline packs, so both
+/// golden sources stay the same image and the in-guest contract keeps the
+/// result equivalent to the published pack.
+fn golden_boot_image(env_spec: &EnvironmentSpec) -> Result<String, OrchestratorError> {
+    if !is_official_golden(&env_spec.base) {
+        return Ok(env_spec.base.clone());
+    }
+    official_boot_image().map(str::to_owned).ok_or_else(|| {
+        OrchestratorError::Config(format!(
+            "there is no official golden for {}: no runner image is pinned for this \
+                 architecture and this backend cannot restore the packed artifact. Configure \
+                 one with PRELOOP_RUNNER_BASE_IMAGE or `[golden] base_image`",
+            std::env::consts::ARCH
+        ))
+    })
+}
+
 /// Boot the environment's image, apply the golden contract, freeze it as the
 /// fork base.
 ///
 /// The non-file-pack path: there is no artifact to unpack, and the backend's
 /// forkable snapshot is what carries the contract's guest writes into clones.
+///
+/// The official sentinel is not an image the backend can boot, so it resolves
+/// to the pinned runner image here — the same image the release pipeline
+/// packs for the pack-restoring backends. `PRELOOP_GOLDEN_OCI_REF` and
+/// `PRELOOP_GOLDEN_URL` name *packed* artifacts and are deliberately not
+/// consulted: there is nothing on this path that could restore a pack.
 async fn bake_golden_in_guest<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
 ) -> Result<(), OrchestratorError> {
+    let base = golden_boot_image(env_spec)?;
     let spec = MachineSpec {
         name: golden.clone(),
-        image: env_spec.base.clone(),
+        image: base,
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: config.storage_gib,
@@ -2993,7 +3222,7 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
     provider.start(golden).await?;
     vm_telemetry_register(config, golden, "golden", Some(&spec));
     await_guest_ready(provider.as_ref(), golden).await?;
-    prepare_rosetta_multiarch(provider.as_ref(), golden).await?;
+    prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
     apply_golden_contract(provider.as_ref(), config, golden).await?;
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
@@ -3052,11 +3281,16 @@ async fn apply_golden_contract<P: VmProvider>(
 /// used to fall back on is gone, and so is the class of failures that came with
 /// it (unpinned packages, an apt archive that moved past the pins). A
 /// configured image is baked here, as-is plus the runner contract.
+///
+/// `shutdown` is only consulted before the expensive work: a warm abandoned
+/// mid-transfer resumes on the next start, and an operator restart must not
+/// wait out a multi-gigabyte download.
 async fn ensure_golden_payload<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
     env_spec: &EnvironmentSpec,
     payload: &Path,
+    shutdown: &CancellationToken,
 ) -> Result<(), OrchestratorError> {
     if payload.is_file() {
         return Ok(());
@@ -3065,6 +3299,7 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
         std::fs::create_dir_all(parent)?;
     }
     if is_official_golden(&env_spec.base) {
+        abort_preparation_if_shutting_down(shutdown)?;
         info!(payload = %payload.display(), "downloading the official golden");
         return match download_prebaked_golden(payload, &config.release_version).await {
             Ok(true) => Ok(()),
@@ -3079,6 +3314,7 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
             Err(error) => Err(error),
         };
     }
+    abort_preparation_if_shutting_down(shutdown)?;
     info!(
         base_image = %env_spec.base,
         "building a golden from the configured image"
@@ -3112,7 +3348,7 @@ async fn build_golden_artifact<P: VmProvider + 'static>(
         .map_err(OrchestratorError::Config)?;
     let spec = MachineSpec {
         name: name.clone(),
-        image: env_spec.base.clone(),
+        image: golden_boot_image(env_spec)?,
         cpus: config.cpus,
         memory_mib: config.memory_mib,
         storage_gib: builder_storage_gib,
@@ -3238,8 +3474,26 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // server-side snapshots) has no artifact to build, download, or
         // relocate: its golden is prepared directly from the base image by
         // `prepare_fork_base` below.
-        if self.provider.capabilities().file_packs {
-            self.prepare_artifact().await?;
+        //
+        // A shutdown that arrives before the warm starts must not begin a
+        // multi-gigabyte download at all; the caller only needs the pool to
+        // stop, and the next start resumes from the same point.
+        if shutdown.is_cancelled() {
+            self.remove_stale_machines().await?;
+            return Ok(());
+        }
+        if self.provider.capabilities().file_packs
+            && let Err(error) = self.prepare_artifact(&shutdown).await
+        {
+            // A shutdown issued mid-download reads as a preparation error;
+            // report the stop, not a failure. Nothing is half-adopted: the
+            // payload is only renamed into place once complete.
+            if shutdown.is_cancelled() {
+                info!(%error, "shutdown during artifact preparation; stopping the pool");
+                self.remove_stale_machines().await?;
+                return Ok(());
+            }
+            return Err(error);
         }
         self.sweep_stale_artifacts().await;
         self.remove_stale_machines().await?;
@@ -3272,7 +3526,30 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if self.config.use_fork {
             let environment = EnvironmentSpec::for_base(self.config.base_image.clone());
             let golden = MachineName::new(format!("{}-golden", golden_cache.name_prefix))?;
-            prepare_fork_base(&self.provider, &self.config, &golden, &environment).await?;
+            // A shutdown arriving mid-warm must not wait for the rest of a
+            // multi-gigabyte download or an eleven-minute bake: an operator
+            // restarting the engine should not sit through either. The warm is
+            // idempotent (an interrupted payload is never adopted, and the
+            // next start resumes the download), so abandoning it is safe.
+            if let Err(error) = prepare_fork_base(
+                &self.provider,
+                &self.config,
+                &golden,
+                &environment,
+                &shutdown,
+            )
+            .await
+            {
+                if shutdown.is_cancelled() {
+                    info!(
+                        machine = golden.as_str(),
+                        "shutdown during golden preparation; leaving it for the next start"
+                    );
+                    self.remove_stale_machines().await?;
+                    return Ok(());
+                }
+                return Err(error);
+            }
             golden_cache.insert(environment.fingerprint, golden).await;
         }
 
@@ -3582,15 +3859,18 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        self.prepare_artifact().await
+        self.prepare_artifact(&CancellationToken::new()).await
     }
 
     /// Ensure the packed artifact for the pool's configured image exists:
     /// download the official golden, or bake a configured image into a pack.
-    async fn prepare_artifact(&self) -> Result<(), OrchestratorError> {
+    async fn prepare_artifact(
+        &self,
+        shutdown: &CancellationToken,
+    ) -> Result<(), OrchestratorError> {
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         let payload = self.config.artifact_payload();
-        ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload).await
+        ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
     }
 
     async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
@@ -4267,13 +4547,14 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
                 let config = config.clone();
                 let name_prefix = golden_cache.name_prefix().to_owned();
                 let fp = fingerprint.clone();
+                let shutdown = shutdown.clone();
                 async move {
                     let name = MachineName::new(format!(
                         "{}-golden-{}",
                         name_prefix,
                         &fp[..12.min(fp.len())]
                     ))?;
-                    prepare_fork_base(&provider, &config, &name, &env_spec).await?;
+                    prepare_fork_base(&provider, &config, &name, &env_spec, &shutdown).await?;
                     Ok(name)
                 }
             })
@@ -4426,13 +4707,14 @@ async fn run_slot<P: VmProvider + 'static>(
                     let config = config.clone();
                     let name_prefix = golden_cache.name_prefix().to_owned();
                     let fp = fingerprint.clone();
+                    let shutdown = shutdown.clone();
                     async move {
                         let name = MachineName::new(format!(
                             "{}-golden-{}",
                             name_prefix,
                             &fp[..12.min(fp.len())]
                         ))?;
-                        prepare_fork_base(&provider, &config, &name, &env_spec).await?;
+                        prepare_fork_base(&provider, &config, &name, &env_spec, &shutdown).await?;
                         Ok(name)
                     }
                 })
@@ -5677,7 +5959,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     if user == "root" {
         return argv.to_vec();
     }
-    let uid = config.runner_uid.unwrap_or(1001);
+    let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
     let home = format!("/home/{user}");
     let program = shell_quote(&argv[0]);
     let args = argv[1..]
@@ -6667,29 +6949,49 @@ chmod +x "$dest/bin/node"
         config.control_origin = Some("http://127.0.0.1:9090".to_owned());
         let name = MachineName::new("runner").unwrap();
 
-        let env = guest_env_prefix(&config, &name);
+        let env = guest_env_entries(&config, &name);
 
         assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
         assert!(!env.contains(&"PRELOOP_CONTROL_ORIGIN=http://192.168.1.20:9090".to_owned()));
     }
 
-    /// The guest runner PATH is the system PATH, exactly as a hosted step
-    /// shell sees it from `/etc/environment`: no toolchain directory is
-    /// prepended, and no Rust home is exported. The curated Rust/Go bakes that
-    /// used to justify both are gone, and `setup-*` actions (or a cargo
-    /// install into `~/.cargo/bin`, which the runner exposes through
-    /// `$GITHUB_PATH`) are how a hosted runner resolves those tools too.
+    /// The guest runner's environment is the image's, not the host's: the
+    /// launcher sources `/etc/environment` before handing over, so the PATH a
+    /// hosted step shell would get is the PATH a step here gets. The curated
+    /// Rust/Go bakes that used to justify host-side toolchain entries are
+    /// gone, so the pool's own list stays a system default and nothing
+    /// exports a Rust home.
     #[test]
-    fn runner_path_is_the_system_path() {
+    fn runner_env_comes_from_the_image_environment_file() {
         let config = test_config(false);
         let name = MachineName::new("runner").unwrap();
 
-        let env = guest_env_prefix(&config, &name);
+        let argv = guest_env_prefix(&config, &name);
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        let launcher = &argv[2];
+        assert!(
+            launcher.contains(". /etc/environment"),
+            "the image's environment must be sourced: {launcher}"
+        );
+        assert!(
+            launcher.contains("exec /usr/bin/env"),
+            "the pool's variables must survive the source: {launcher}"
+        );
+        // The `KEY=value` words after the launcher are the runner's
+        // environment, so the entries the assertions below read are exactly
+        // what `env` applies.
+        assert_eq!(
+            &argv[3],
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        assert_eq!(argv[4], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
 
+        let env = guest_env_entries(&config, &name);
         let path = env
             .iter()
             .find_map(|entry| entry.strip_prefix("PATH="))
-            .expect("the runner is launched with an explicit PATH");
+            .expect("the runner is launched with a PATH");
         assert_eq!(
             path,
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -6715,7 +7017,7 @@ chmod +x "$dest/bin/node"
         config.control_upstream = Some("http://10.0.0.161:9090".to_owned());
         let name = MachineName::new("runner").unwrap();
 
-        let env = guest_env_prefix(&config, &name);
+        let env = guest_env_entries(&config, &name);
 
         assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
         assert!(env.contains(&"PRELOOP_CONTROL_UPSTREAM=http://10.0.0.161:9090".to_owned()));
@@ -6903,6 +7205,96 @@ chmod +x "$dest/bin/node"
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    /// The runner account name is interpolated unquoted into root-run guest
+    /// scripts and into the `sudoers.d` filename, so the only safe contract is
+    /// to refuse anything that is not a Linux account name.
+    #[test]
+    fn runner_account_names_are_restricted_to_account_syntax() {
+        for valid in ["runner", "root", "_preloop", "ci-runner", "runner2"] {
+            assert!(is_valid_account_name(valid), "{valid} must be allowed");
+        }
+        for invalid in [
+            "",
+            "Runner",
+            "1runner",
+            "-runner",
+            "run ner",
+            "runner;id",
+            "runner$(id)",
+            "runner`id`",
+            "../root",
+            "runner\nroot",
+            "runner:root",
+        ] {
+            assert!(
+                !is_valid_account_name(invalid),
+                "{invalid:?} must be refused: it reaches a root shell unquoted"
+            );
+        }
+
+        // And the pool refuses it before touching machine state.
+        let mut config = test_config(false);
+        config.runner_user = Some("runner;id".to_owned());
+        let error = config
+            .validate()
+            .expect_err("an injectable runner user must be refused");
+        let message = error.to_string();
+        assert!(message.contains("runner;id"), "{message}");
+        assert!(message.contains("account name"), "{message}");
+        // The default and the explicit root keep validating.
+        config.runner_user = Some(DEFAULT_RUNNER_USER.to_owned());
+        config
+            .validate()
+            .expect("the default account must validate");
+        config.runner_user = Some("root".to_owned());
+        config.validate().expect("root must validate");
+    }
+
+    /// `PRELOOP_RUNNER_USER=root` runs the runner as the guest's own user:
+    /// there is no account to create, no ownership to hand over, and moving a
+    /// would-be `root` account's home would leave the image broken.
+    #[test]
+    fn root_runner_user_skips_the_account_and_ownership_steps() {
+        let contract = golden_contract_script("root", DEFAULT_RUNNER_UID);
+        assert!(
+            !contract.contains("useradd"),
+            "root must not be created as an account: {contract}"
+        );
+        assert!(
+            !contract.contains("NOPASSWD"),
+            "root needs no sudoers entry: {contract}"
+        );
+        assert!(
+            !contract.contains("find /home/runner"),
+            "root owns nothing that needs handing over: {contract}"
+        );
+        // The glibc requirement is a property of the image, not the account.
+        assert!(contract.contains("no glibc dynamic loader"), "{contract}");
+    }
+
+    /// An account the image already carries must be *moved* to the configured
+    /// uid, not assumed to have it: the runtime drops to that uid, so an image
+    /// whose `runner` sits at 1000 would hand jobs a uid that owns nothing.
+    #[test]
+    fn existing_runner_accounts_are_reconciled_to_the_configured_uid() {
+        let script = runner_account_script("runner", 2000);
+        assert!(
+            script.contains(r#"if [ "$(id -u runner 2>/dev/null)" != "2000" ]; then"#),
+            "{script}"
+        );
+        assert!(script.contains("usermod -u 2000 runner"), "{script}");
+        // A refusal must not be silent, but must not fail the bake either: the
+        // account may be one the image manages.
+        assert!(
+            script.contains("could not move %s to uid %s"),
+            "a refused usermod must say so: {script}"
+        );
+        assert!(
+            !script.contains("exit 1"),
+            "the reconciliation is best-effort: {script}"
+        );
     }
 
     #[test]
@@ -8263,9 +8655,15 @@ chmod +x "$dest/bin/node"
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
 
-        prepare_fork_base(&provider, &config, &golden, &env_spec)
-            .await
-            .expect("golden preparation succeeds");
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("golden preparation succeeds");
 
         assert_eq!(
             *provider.prune_pack_calls.lock().await,
@@ -8294,9 +8692,15 @@ chmod +x "$dest/bin/node"
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
         let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
 
-        prepare_fork_base(&provider, &config, &golden, &env_spec)
-            .await
-            .expect_err("start failure aborts golden preparation");
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("start failure aborts golden preparation");
 
         assert!(
             provider.prune_pack_calls.lock().await.is_empty(),
@@ -9007,9 +9411,15 @@ chmod +x "$dest/bin/node"
         let golden = MachineName::new("lifecycle-test-nopack-golden").unwrap();
         let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
 
-        prepare_fork_base(&provider, &config, &golden, &env_spec)
-            .await
-            .expect("the in-guest golden preparation succeeds");
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the in-guest golden preparation succeeds");
 
         let created = provider.created_images.lock().await.clone();
         assert!(

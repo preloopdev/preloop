@@ -815,11 +815,26 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     );
 
     // The guest is always told its own machine name: a debug session needs it
-    // to tell a controller which VM to open a shell into.
+    // to tell a controller which VM to open a shell into. The environment is
+    // applied by the launcher shell that sources the image's
+    // `/etc/environment`, so the argv is `sh -c <launcher>` followed by the
+    // `KEY=value` entries in the same order `env` receives them.
+    let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
+    let machine = format!("PRELOOP_MACHINE_NAME={runner}");
     let expected_prefix = vec![
-        "/usr/bin/env".to_owned(),
-        format!("PATH={}", preloop_orchestrator::guest_runner_path(&config)),
-        format!("PRELOOP_MACHINE_NAME={runner}"),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        [
+            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "exec /usr/bin/env ",
+            &format!("'{path}' '{machine}' "),
+            "'PRELOOP_CONTROL_ORIGIN=https://preloop.example' ",
+            "'PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock' ",
+            "\"$0\" \"$@\"",
+        ]
+        .concat(),
+        path.clone(),
+        machine.clone(),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
     ];
@@ -899,24 +914,37 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .expect("runner configure command")
             .clone();
 
-        // The prefix is everything before the runner executable itself.
+        // The prefix is the launcher plus this case's environment entries; the
+        // runner executable itself comes after them.
         let prefix: Vec<&str> = configure
             .iter()
             .take_while(|arg| !arg.ends_with(&config.runner_binary_name))
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
-        // The runner's PATH is exactly the system directories a hosted step
-        // shell sees: the deleted Rust/Go language installs (and their
-        // `/usr/local/cargo/bin` and `/usr/local/go/bin` entries) are gone.
-        let want_base = vec![
-            "/usr/bin/env",
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            machine_name.as_str(),
-        ];
-        let mut want = want_base;
-        want.extend(expected);
-        assert_eq!(prefix, want);
+        // The runner's fallback PATH is the system directories a hosted step
+        // shell sees; the launcher replaces it with the image's
+        // `/etc/environment` PATH whenever the image declares one. The deleted
+        // Rust/Go language installs (and their `/usr/local/cargo/bin` and
+        // `/usr/local/go/bin` entries) are gone.
+        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
+        let mut entries = vec![path.clone(), machine_name.clone()];
+        entries.extend(expected.iter().map(|entry| (*entry).to_owned()));
+        let pairs = entries
+            .iter()
+            .map(|entry| format!("'{entry}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let launcher = [
+            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "exec /usr/bin/env ",
+            &pairs,
+            " \"$0\" \"$@\"",
+        ]
+        .concat();
+        let mut want = vec!["sh".to_owned(), "-c".to_owned(), launcher];
+        want.extend(entries);
+        assert_eq!(prefix, want.iter().map(String::as_str).collect::<Vec<_>>());
         // Nor may anything export the deleted Rust/Go install homes: a runner
         // told RUSTUP_HOME/CARGO_HOME would point rustup at paths the golden
         // no longer carries.

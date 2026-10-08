@@ -463,7 +463,8 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
 | `PRELOOP_RUNNER_CPUS` | vCPUs allocated to each runner VM (default 8) |
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true) |
-| `PRELOOP_GOLDEN_URL` | Mirror of the official packed golden; the checksum URL is this value plus `.sha256`. When set it replaces the OCI reference |
+| `PRELOOP_GOLDEN_URL` | Mirror of the official packed golden; the checksum URL is this value plus `.sha256`. When set it replaces the OCI reference, and the mirror must be verifiable — an unverified mirror is refused |
+| `PRELOOP_GOLDEN_SHA256` | Expected SHA-256 of the packed golden, for mirrors that publish no `.sha256` sidecar |
 | `PRELOOP_GOLDEN_OCI_REF` | Override the per-architecture packed golden OCI reference; the engine has digest-pinned defaults for both the official arm64 and x86_64 GHCR artifacts |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Image a custom golden is baked from, used as-is plus the GitHub-runner machinery. Wins over the `[golden] base_image` that `preloop init` records; `runs-on: ubuntu-latest`/`ubuntu-24.04` and an unconfigured pool use the official packed golden regardless |
 | `PRELOOP_VERIFY_BASE_IMAGE` / `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Require a digest-pinned OCI base's GitHub attestation and Cosign signature before `build-golden` |

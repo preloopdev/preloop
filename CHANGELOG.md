@@ -50,7 +50,44 @@ Releases before v0.27.0 predate the changelog.
   runner's PATH is the system PATH, and tool versions come from the workflow's
   `setup-*` actions, as they do on GitHub.
 
+- **A golden is keyed by everything that changes it.** The official golden's
+  fingerprint now covers the source this host would fetch it from
+  (`PRELOOP_GOLDEN_OCI_REF` or the `PRELOOP_GOLDEN_URL` mirror), so changing
+  the mirror re-fetches instead of serving the previous pack forever; a
+  configured image's fingerprint covers its effective runner account, so
+  changing `PRELOOP_RUNNER_USER`/`_UID` rebuilds instead of adopting a golden
+  baked for the account before it. A backend that cannot restore packs
+  (AgentENV) boots the pinned official runner image for the official golden —
+  the sentinel itself is not an image — and an unconfigured pool no longer
+  fails to start there.
+
+- **The guest runner inherits the image's environment.** It is launched
+  through a shell that sources `/etc/environment`, so the PATH a step sees is
+  the image's own — the tools a hosted image preinstalls keep resolving —
+  while the pool's variables are re-asserted afterwards. An image that
+  already carries a `runner` account at another uid now has that account moved
+  to the configured uid instead of running jobs as a uid that owns nothing.
+  The Rosetta amd64 install is no longer fatal for a configured image without
+  apt: the bake warns that x86_64 binaries will not run instead of refusing an
+  otherwise usable image.
+
+- **Stopping the engine no longer waits for a golden transfer.**
+  `prepare_fork_base` checks the shutdown token before starting a download or
+  bake, so a restart during the warm returns promptly; the transfer resumes on
+  the next start.
+
 ### Security
+
+- **The golden's runner account name is validated** before it reaches the
+  root-run bake scripts and the `sudoers.d` filename: anything that is not a
+  Linux account name (or `root`) is refused, closing a shell-injection hole
+  for a hostile or mistyped `PRELOOP_RUNNER_USER`.
+
+- **A `PRELOOP_GOLDEN_URL` mirror must be verifiable.** Its bytes become the
+  image every job runs, so an unverified payload is now refused: the mirror
+  must publish `<asset>.sha256` or the host must pin the digest with
+  `PRELOOP_GOLDEN_SHA256`. The engine's own release assets keep the previous
+  tolerated-with-a-warning behavior.
 
 - **The static GitHub PAT no longer crosses the network over plain HTTP**:
   action resolution and action tarball downloads attached the PAT to any

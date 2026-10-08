@@ -262,7 +262,8 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | `true` | Run the pool as forks of the golden rather than one boot per job |
-| `PRELOOP_GOLDEN_URL` | release asset | Mirror of the official packed golden; the optional checksum is fetched from the same URL plus `.sha256`. When set it replaces the OCI reference |
+| `PRELOOP_GOLDEN_URL` | release asset | Mirror of the official packed golden. When set it replaces the OCI reference, and the mirror must be verifiable: the checksum is this URL plus `.sha256`, or `PRELOOP_GOLDEN_SHA256` names the digest. An unverified mirror is refused |
+| `PRELOOP_GOLDEN_SHA256` | — | Expected SHA-256 of the packed golden, for mirrors that publish no `.sha256` sidecar |
 | `PRELOOP_GOLDEN_OCI_REF` | per-architecture official GHCR artifacts | OCI packed golden reference downloaded automatically on the matching host architecture |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` | Host-side Node externals directory |
