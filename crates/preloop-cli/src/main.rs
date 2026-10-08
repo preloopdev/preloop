@@ -3377,11 +3377,17 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // Push-back runs on any conclusion: a draft PR with red checks is
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
+        let tree_unchanged = submit_commit
+            .as_ref()
+            .is_none_or(|commit| submit_tree_unchanged(&dirty, commit));
         let push_error = if push_requested {
-            if dirty_push {
-                // The PR decision happens after CI for a dirty tree: the
-                // user saw the result and chooses y/N/d now (or a label /
-                // explicit flag decides in non-interactive runs).
+            if dirty_push && !tree_unchanged {
+                eprintln!(
+                    "not pushing submit commit: the working tree changed since submission; \
+                     re-submit to test the new tree"
+                );
+                Some(anyhow::anyhow!("working tree changed since submit"))
+            } else if dirty_push {
                 match decide_dirty_push_opts(
                     &dirty,
                     args.push,
@@ -3421,6 +3427,14 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         } else {
             None
         };
+        if push_error.is_none()
+            && dirty_push
+            && tree_unchanged
+            && status == ExecutionStatus::Success
+            && let Some(commit) = submit_commit.as_ref()
+        {
+            offer_branch_move(&commit.sha)?;
+        }
         if let Some(error) = &push_error {
             eprintln!(
                 "push failed: {error:#}\n\
@@ -3820,6 +3834,31 @@ async fn upload_git_bundle(
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("bundle upload response omitted bundle_id"))
 }
+fn submit_tree_unchanged(initial_dirty: &[String], commit: &SubmitCommit) -> bool {
+    let parent = git_rev_parse(&format!("{}^", commit.sha)).ok();
+    let head = git_rev_parse("HEAD").ok();
+    parent == head && git_porcelain().ok().as_deref() == Some(initial_dirty)
+}
+
+/// Moving the checked-out branch to C changes the user's worktree, so it is
+/// offered only after an explicit answer and only when the tree still matches
+/// the tree submitted for CI.
+fn offer_branch_move(commit: &str) -> anyhow::Result<()> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    eprint!("CI-tested commit {commit} is pushed. Move this branch to it? [y/N] ");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading branch-move answer")?;
+    if input.trim().eq_ignore_ascii_case("y") {
+        run_git_status(["reset", "--mixed", commit])?;
+        eprintln!("moved the current branch to {commit}");
+    }
+    Ok(())
+}
+
 
 /// Decide, after CI on a dirty tree, whether to materialize the tested tree,
 /// push it, and open a PR. Precedence: explicit `--create-pr` flag >
