@@ -9183,13 +9183,15 @@ done
     /// hard 4096: the old soft-first form raised the soft first, hit `EPERM`
     /// above the old hard, and was swallowed by `|| true` at the best-effort
     /// sites — then the hard raise left the pair at 1024/65536 and the parity
-    /// probe failed. Above the target, the pair is 1048576/1048576 and both
-    /// limits have to come down. The hard-soft-hard order handles each: the
-    /// first hard raise is the privileged one that may be refused (ignored
-    /// when the inherited hard already sits above the target, where the
-    /// kernel rejects lowering it under a higher soft limit), then the soft
-    /// is set, then the hard is pinned — which succeeds when lowering from
-    /// above once the soft is at the target.
+    /// probe failed. Above the target, the soft limit is at the hard one —
+    /// 1048576/1048576 where the host allows it (macOS), a Linux runner's
+    /// inherited 524288/524288 otherwise — and both limits have to come down.
+    /// The hard-soft-hard order handles each: the first hard raise is the
+    /// privileged one that may be refused (ignored when the inherited hard
+    /// already sits above the target, where the kernel rejects lowering it
+    /// under a higher soft limit), then the soft is set, then the hard is
+    /// pinned — which succeeds when lowering from above once the soft is at
+    /// the target.
     #[cfg(unix)]
     #[test]
     fn nofile_raise_reaches_the_hosted_pair_from_below_and_above() {
@@ -9244,12 +9246,16 @@ done
             );
         }
 
-        // (soft 1048576, hard 1048576): a pair already above the target, which
-        // every launch can lower — so this one reaches the hosted pair
-        // everywhere. A host whose hard limit cannot go that high falls back to
-        // the highest pair it reports, and only the (above-target) lowering
-        // case is then skipped.
-        let above = run("ulimit -Sn 1048576; ulimit -Hn 1048576");
+        // An inherited pair already above the target: the soft limit raised to
+        // the hard one — the state the soft-before-hard order broke (a soft
+        // limit above the target, under a hard limit at or above it). The hard
+        // is capped at the hosted 1048576 when the host reports `unlimited`
+        // (macOS) or higher; a Linux runner's inherited 524288 works as-is.
+        let above = run(
+            "H=$(ulimit -Hn); case \"$H\" in unlimited|*[!0-9]*) H=1048576 ;; esac; \
+             if [ \"$H\" -gt 1048576 ]; then H=1048576; fi; \
+             ulimit -Hn \"$H\" 2>/dev/null; ulimit -Sn \"$H\"; ulimit -Hn \"$H\"",
+        );
         let above = String::from_utf8_lossy(&above.stdout).to_string();
         let (start, end) = above
             .split_once(" -> ")
@@ -9271,10 +9277,17 @@ done
             "the highest pair must be hard/soft: {above}"
         );
         let (hard, soft) = (limits[0], limits[1]);
+        let target = GOLDEN_RLIMIT_NOFILE_SOFT.parse::<u64>().unwrap();
+        if hard < target {
+            // The host's hard limit is below the hosted value and cannot be
+            // raised without privilege, so there is no above-target pair to
+            // hold; the below-target case above still covers that host.
+            eprintln!("no above-target nofile pair on this host: {above}");
+            return;
+        }
         assert!(
-            hard >= GOLDEN_RLIMIT_NOFILE_SOFT.parse::<u64>().unwrap()
-                && soft >= GOLDEN_RLIMIT_NOFILE_SOFT.parse::<u64>().unwrap(),
-            "the host must be able to hold an at-or-above-target pair: {above}"
+            soft >= target,
+            "the soft limit must have been raised to the hard one: {above}"
         );
         assert_eq!(
             end, "65536/65536",
