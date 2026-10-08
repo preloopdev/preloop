@@ -23,11 +23,9 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
-- **Store-URL integration tests run in their own binary**: `PRELOOP_STORE_URL`
-  is process-wide and every `AppState::new` falls back to it, so the tests
-  that set it no longer share a `cargo test` binary with tests that open
-  state — a sibling used to open the mutating test's temporary database and
-  then fail with `unable to open database file` once it was deleted.
+- **Isolated test credentials and store URLs**: Store-URL integration tests run
+  in a separate test binary. Git LFS fixtures ignore ambient App and PAT
+  credentials, keeping no-credential cases deterministic.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
