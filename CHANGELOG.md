@@ -51,15 +51,14 @@ Releases before v0.27.0 predate the changelog.
   sized to the declared timeout a fork could otherwise hold a leased runner
   and a valid credential for as many years as it cared to name.
 
-- **A settled attempt's runtime token no longer reaches the snapshot Git
-  endpoint or reopens its live-log feed**: both now apply the liveness rule
-  the Results writes already did. The job credential is handed to workflow
-  code (`ACTIONS_RUNTIME_TOKEN`, the pinned checkout token) and outlives the
-  attempt by design, so before this a completed job could keep fetching the
-  run's snapshot and — worse — its live-log ingest socket stayed open, where
-  a frame reopens the closed feed by clearing the retained tail, letting a
-  finished job's log be wiped and rewritten. A retry streams under its own
-  live attempt's credential, so nothing legitimate is refused.
+- **A settled attempt's runtime token no longer mutates timeline/log records,
+  reaches the snapshot Git endpoint, or reopens its live-log feed**: these
+  surfaces now apply the liveness rule the Results writes already did. The
+  job credential is handed to workflow code and outlives the attempt by
+  design, so a completed job could otherwise keep rewriting its own step
+  records and annotations, fetching the run's snapshot, and reopening its
+  live-log ingest feed. A retry streams under its own live attempt's
+  credential.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
