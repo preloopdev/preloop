@@ -1113,3 +1113,149 @@ impl LiteBackend {
         })
     }
 }
+
+/// v1 artifact catalog + durable run-event snapshot: the read paths that
+/// keep the artifact endpoints and the SSE history alive across a restart,
+/// including state imported from a legacy store.
+impl LiteBackend {
+    /// The run's durable outbox events, `event_id` (commit) order.
+    pub(crate) async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        let run = codec::run_key(run_id);
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT payload FROM outbox_events WHERE run_id = ?1 ORDER BY event_id",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([run.as_str()], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db)?;
+            let mut events = Vec::with_capacity(rows.len());
+            for payload in rows {
+                // The outbox carries the run's NDJSON events plus rows that
+                // make no event claim; skip those rather than emit bad lines.
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    events.push(value);
+                }
+            }
+            Ok(events)
+        })
+    }
+
+    /// Finalized v1 artifacts, one run's or every run's, insertion order.
+    pub(crate) async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        let run = run_id.map(codec::run_key);
+        let rows = self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT public_id, run_id, name, storage_key, COALESCE(size_bytes, 0) \
+                     FROM artifacts \
+                     WHERE state = 'finalized' AND public_id IS NOT NULL \
+                       AND (?1 IS NULL OR run_id = ?1) \
+                     ORDER BY artifact_id",
+                )
+                .map_err(db)?;
+            stmt.query_map([run.as_deref()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)
+        })?;
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for (public_id, run, name, storage_key, size_bytes) in rows {
+            artifacts.push(ArtifactCatalogRow {
+                public_id,
+                run_id: codec::run_id(&run),
+                name,
+                storage_key,
+                size_bytes,
+            });
+        }
+        Ok(artifacts)
+    }
+
+    /// One finalized v1 artifact row by its public id, served by the unique
+    /// `artifacts_public_id` index (the catalog-wide scan is never needed to
+    /// answer a single id).
+    pub(crate) async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        let id = public_id.to_owned();
+        let row = self.read(move |tx| {
+            tx.prepare_cached(
+                "SELECT public_id, run_id, name, storage_key, COALESCE(size_bytes, 0) \
+                 FROM artifacts \
+                 WHERE state = 'finalized' AND public_id = ?1",
+            )
+            .map_err(db)?
+            .query_row([&id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .optional()
+            .map_err(db)
+        })?;
+        Ok(row.map(
+            |(public_id, run, name, storage_key, size_bytes)| ArtifactCatalogRow {
+                public_id,
+                run_id: codec::run_id(&run),
+                name,
+                storage_key,
+                size_bytes,
+            },
+        ))
+    }
+
+    /// Upsert a finalized v1 artifact row (native uploads and imports).
+    pub(crate) async fn put_artifact_catalog(
+        &self,
+        row: NewArtifactRow,
+    ) -> Result<(), ControlError> {
+        let run = codec::run_key(row.run_id);
+        let now = now_us();
+        self.write(move |tx| {
+            tx.prepare_cached(
+                "INSERT INTO artifacts (namespace_id, run_id, job_backend_id, name, state, \
+                     size_bytes, storage_key, public_id, created_at, finalized_at) \
+                 VALUES ('default', ?1, '', ?2, 'finalized', ?3, ?4, ?5, ?6, ?6) \
+                 ON CONFLICT (run_id, job_backend_id, name) DO UPDATE SET \
+                     size_bytes = excluded.size_bytes, \
+                     storage_key = excluded.storage_key, \
+                     public_id = excluded.public_id, \
+                     finalized_at = excluded.finalized_at",
+            )
+            .map_err(db)?
+            .execute(params![
+                run,
+                row.name,
+                row.size_bytes,
+                row.storage_key,
+                row.public_id,
+                now
+            ])
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+}

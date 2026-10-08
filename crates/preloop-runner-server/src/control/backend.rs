@@ -508,6 +508,31 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Queue pressure snapshot for status/metrics.
     async fn queue_stats(&self) -> Result<QueueStats, ControlError>;
 
+    /// Durable run events from the outbox in `event_id` (commit) order: the
+    /// initial snapshot for `GET /api/v1/runs/:id/events`, including events
+    /// imported from a legacy store, so the feed survives a restart.
+    async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError>;
+
+    /// Finalized v1 artifact catalog rows (one run's, or every run's, in
+    /// insertion order). `storage_key` is the path holding the bytes.
+    async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError>;
+
+    /// One finalized v1 artifact row by its public id: the indexed lookup the
+    /// GET path uses. An id lookup must not read the whole catalog.
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError>;
+
+    /// Upsert a finalized v1 artifact row (native uploads and imports).
+    async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError>;
+
     // ── Live log recovery ─────────────────────────────────────────────
 
     /// Allocate a plan-local log id and create its empty durable row.
@@ -3176,6 +3201,43 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.oidc_grant(plan_id, agent_job_id).await,
             Self::Postgres(b) => b.oidc_grant(plan_id, agent_job_id).await,
+        }
+    }
+
+    async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_event_snapshot(run_id).await,
+            Self::Postgres(b) => b.run_event_snapshot(run_id).await,
+        }
+    }
+
+    async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.artifact_catalog(run_id).await,
+            Self::Postgres(b) => b.artifact_catalog(run_id).await,
+        }
+    }
+
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.artifact_by_public_id(public_id).await,
+            Self::Postgres(b) => b.artifact_by_public_id(public_id).await,
+        }
+    }
+
+    async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.put_artifact_catalog(row).await,
+            Self::Postgres(b) => b.put_artifact_catalog(row).await,
         }
     }
 }

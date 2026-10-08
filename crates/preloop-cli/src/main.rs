@@ -752,7 +752,8 @@ enum Command {
     Server(server_install::ServerArgs),
 
     /// Manage the control database schema: initialize a fresh store, apply
-    /// pending migrations, and report migration state.
+    /// pending migrations, report migration state — and the one-time import
+    /// of a legacy v11 `preloop.db`.
     ///
     /// `preloop serve` never migrates: a missing, older or newer control
     /// schema refuses at boot and names `preloop store migrate` as the fix.
@@ -1099,7 +1100,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => github_setup::cmd_doctor(args).await,
         Command::Secret(args) => github_setup::cmd_secret(args).await,
         Command::Server(args) => server_install::run(args),
-        // Schema administration must never bootstrap (or migrate) the engine.
+        // Schema administration and the legacy import are explicit and
+        // offline; never bootstrap (or migrate) the engine for them.
         Command::Store(args) => store::run(args).await,
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.

@@ -241,6 +241,27 @@ impl ControlBackend for LiteBackend {
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
         self.queue_stats().await
     }
+    async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        self.run_event_snapshot(run_id).await
+    }
+    async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        self.artifact_catalog(run_id).await
+    }
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        self.artifact_by_public_id(public_id).await
+    }
+    async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError> {
+        self.put_artifact_catalog(row).await
+    }
     async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
         self.create_log(plan_id).await
     }

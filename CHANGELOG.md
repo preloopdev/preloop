@@ -335,6 +335,33 @@ Releases before v0.27.0 predate the changelog.
   populated baseline fixtures and an executable parity test against
   `schema.sql` keep upgrades lossless. Brand-new local installs still
   initialize on first `preloop run`/`init`/`server install`.
+- **`preloop store import-legacy` imports a released v11 `preloop.db` into a
+  fresh control SQLite database.** The source is opened read-only at `PRAGMA
+  user_version = 11` and hashed before and after; runs, queued jobs (secrets
+  move to the SecretProvider run tier and are stripped from the stored message
+  templates), attempts, steps, log bytes, counters, runners, sessions,
+  webhooks, check ids, and the durable metadata snapshot are written in one
+  transaction into `<target>.importing`, verified (`PRAGMA
+  foreign_key_check`, row counts, schema version), then published atomically
+  (never overwriting an existing target) — a failure leaves no target and a
+  retry is safe. Claimed-but-unfinished attempts, session bindings, and live
+  concurrency gates refuse by default; `--active=requeue|cancel` drains them
+  explicitly. The legacy event log is carried into the outbox (ids and order
+  preserved), per-attempt message frames are verified against the imported
+  templates (reconstructing them for terminal jobs), the finalized artifact
+  registry — legacy v1 `artifact_records` and `artifact_v2_registry.json` —
+  moves into `artifacts`, and buffered timeline events move into the outbox.
+  Both uploads and imports land in that durable catalog, and the v1 artifact
+  GET/list endpoints serve from it: a restart (or a process that never saw
+  the upload) keeps serving, an imported artifact is served instead of
+  vanishing with the legacy process, and one id is one row by the unique
+  `artifacts_public_id` index — never a scan of the whole catalog.
+  Anything not carried into a table is written to
+  `<state-dir>/legacy-import-archive.json`; only node-local state that
+  cannot be carried (queued broker frames, in-flight artifact/cache uploads,
+  pool provisioning marks) refuses the import, and only provably unreachable
+  tombstones/ephemeral tokens are reported as skipped. `preloop serve` still
+  never migrates a database on its own.
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and
@@ -373,6 +400,24 @@ Releases before v0.27.0 predate the changelog.
   scope. Secret masking still covers the entire scope server-side.
 
 ### Fixed
+
+- `preloop store import-legacy` no longer refuses a legacy store whose only
+  "active" work is stale. A claimed-but-unfinished attempt whose job (per the
+  run record) or whole run is already terminal is imported settled as
+  history — the job's terminal result (or `cancelled` when the job recorded
+  none), `finished_at` set, no runner/session binding, no `job_leases` row,
+  never `ready`/`claimed` — and the settlement is counted in the report
+  (`N stale claim(s) on already-finished jobs were settled as history`).
+  Session bindings that point only at such attempts are dropped the same way,
+  and runtime concurrency gates whose holder runs are terminal or already
+  evicted (a stopped legacy process can never release them) are released as
+  history with their counts reported. Claims and gates on non-terminal runs
+  still refuse by default, and `--active=requeue` / `--active=cancel` are
+  unchanged. A finished attempt no longer writes a `job_leases` row: a lease
+  is live scheduling state, not history. Legacy unscoped log metadata
+  (`job:<agent_job_id>`, `step:<step_id>`, written before Results identifiers
+  were canonicalized) is now attributed to the attempt it names instead of
+  being reported as unmapped.
 
 - A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
   provisioning removed the guest's small tmpfs `/tmp`, which left it on the
