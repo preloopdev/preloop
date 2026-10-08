@@ -3111,7 +3111,10 @@ async fn process_delivery_payload_with_lease(
                 debug_on_failure: false,
                 push: None,
                 push_tree: None,
-                no_merge: false,
+                // Webhook pull-request payloads already identify GitHub's
+                // merge/head tree; never rebuild a local merge from the
+                // server workspace (which may intentionally have no origin).
+                no_merge: effective.event == "pull_request",
                 prebuilt_merge: None,
                 git_bundle_id: None,
             };
