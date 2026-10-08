@@ -1679,21 +1679,16 @@ pub async fn resolve_pr_changed_files_at(
 /// out the production budget.
 #[derive(Debug, Clone)]
 pub struct FreshMergePoll {
-    /// Total wall-clock budget for the wait. GitHub normally surfaces the
-    /// merge within a few seconds of the push; once the budget is spent the
-    /// delivery builds its own merge instead of waiting longer.
+    /// Maximum time to wait before building the merge locally.
     pub budget: Duration,
-    /// Sleep between probes. Measured behaviour: a push's own merge becomes
-    /// visible +2.5–4.8 s after the push, and an intermediate merge stays
-    /// the pointer for only ~2 s, so the cadence has to stay well under that.
+    /// Delay between GitHub API probes.
     pub poll_interval: Duration,
 }
 
 impl Default for FreshMergePoll {
     fn default() -> Self {
         Self {
-            // Short by design: this wait holds a webhook worker, kept
-            // abortable through the delivery's lease.
+            // Keep the wait bounded and abortable with the delivery lease.
             budget: Duration::from_secs(30),
             poll_interval: Duration::from_secs(2),
         }
@@ -1828,12 +1823,9 @@ enum MergeParentage {
     /// The commit is the test merge of the payload head into the API's
     /// current base tip.
     Current,
-    /// The commit is the test merge of the payload head, but not into the
-    /// base tip the API reports: GitHub froze it against an older base.
-    /// Measured behaviour says GitHub does not rebuild a merge when only the
-    /// base moves — its own run for that push used exactly this commit — so
-    /// it is accepted, with the mismatch logged.
-    StaleBase { base_sha: String },
+    /// The merge has the payload head but a different first parent. It is
+    /// still accepted, and the observed parent is logged.
+    StaleBase { merge_parent: Option<String> },
     /// The commit is not a merge of the payload head at all: the API pointer
     /// still names a previous head's merge.
     OtherHead,
@@ -1894,7 +1886,7 @@ async fn merge_parentage(
         Ok(MergeParentage::Current)
     } else {
         Ok(MergeParentage::StaleBase {
-            base_sha: base.to_owned(),
+            merge_parent: first_parent.map(str::to_owned),
         })
     }
 }
@@ -1952,13 +1944,8 @@ enum MergeProbe {
 
 /// Ask GitHub where this delivery's pull-request runs check out.
 ///
-/// The webhook payload's `merge_commit_sha` is not trustworthy: GitHub
-/// computes the test merge asynchronously, so on `synchronize` (and often
-/// `opened`/`reopened`) it still names the *previous* head's merge, or is
-/// null. A run created from it checks out a tree the pull request no longer
-/// has. Only a merge commit whose first parent is the API's current base and
-/// whose second parent is the payload's head is accepted; everything else is
-/// settled by [`resolve_fresh_merge`], never by trusting the payload.
+/// The payload's merge sha can lag the push. Accept only a merge whose second
+/// parent is the payload head; log, but do not reject, a first-parent mismatch.
 async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget) -> MergeProbe {
     let api_base = github_api_base();
     let token = match crate::github_app::select_app_for_repo(shared, &target.repo).await {
@@ -2040,17 +2027,14 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
             Ok(MergeParentage::Current) => {
                 return MergeProbe::Resolved(FreshMergePlacement::Merge(merge.to_owned()));
             }
-            Ok(MergeParentage::StaleBase { base_sha }) => {
-                // GitHub froze this head's merge against an older base, and
-                // its own run for that push used the frozen commit; accepting
-                // it beats rejecting a merge GitHub will never rebuild.
+            Ok(MergeParentage::StaleBase { merge_parent }) => {
                 debug!(
                     repository = %target.repo,
                     pull_request = target.number,
                     merge_commit = %merge,
-                    merge_base = %base_sha,
+                    merge_parent = ?merge_parent,
                     api_base = %base,
-                    "GitHub's test merge is built against an older base than the API reports; accepting it"
+                    "GitHub's test merge has an older base parent; accepting it"
                 );
                 return MergeProbe::Resolved(FreshMergePlacement::Merge(merge.to_owned()));
             }
@@ -4422,12 +4406,9 @@ mod tests {
 
     // ── Fresh merge resolution ─────────────────────────────────────────
     //
-    // GitHub computes a PR's test merge asynchronously, so a webhook payload
-    // right after a push carries the *previous* head's merge sha (or null).
-    // These tests pin the contract: the payload sha is never trusted; only a
-    // merge commit whose second parent is the payload head is accepted; a
-    // conflicted PR creates no pull_request runs; and every unresolvable case
-    // falls back to the head ref.
+    // GitHub's merge sha can lag a push. Accepted merges pin the payload head
+    // as second parent; a matching-head conflict skips PR runs; fallback
+    // builds the engine's own merge.
 
     /// A workspace holding a single workflow, ready to be committed into a
     /// pull-request graph.
