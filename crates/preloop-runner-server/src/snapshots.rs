@@ -1690,7 +1690,7 @@ async fn create_workspace_snapshot_inner(
                 if let Err(error) =
                     run_git(&mut publish_base, "publish merge base ref").await
                 {
-                    warn!(%error, "failed to publish the fetched base tip in the snapshot");
+                    warn!(error = ?error, "failed to publish the fetched base tip in the snapshot");
                 }
                 Some(SnapshotMerge {
                     sha: merged.sha.clone(),
