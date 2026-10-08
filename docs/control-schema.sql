@@ -47,9 +47,8 @@ CREATE TABLE namespaces (
     -- suspended/deleted: neither (queued jobs stay queued, nothing starts).
     state                   text NOT NULL DEFAULT 'active' CHECK (state IN
                                 ('active','suspended','draining','deleted')),
-    -- UNUSED: `cell_generation` and `config_version` have no reader or
-    -- writer in any code; drop only with a migration (`UNUSED` in
-    -- control/schema_drift.rs).
+    -- Platform-owned: cell fencing and config push bookkeeping; the engine
+    -- neither reads nor writes these two.
     cell_generation         bigint NOT NULL DEFAULT 1,   -- bumped on cell move; fences stale writers
     config_version          bigint NOT NULL DEFAULT 0,   -- last platform push applied
     created_at              timestamptz NOT NULL DEFAULT now(),
@@ -62,9 +61,8 @@ CREATE TABLE namespaces (
 -- predicate (a capped claim locks this row first, so nodes cannot
 -- overshoot). Not yet read: max_job_timeout_minutes, priority_tier,
 -- run_history_retention_days.
--- RESERVED: not read by any code yet (planned: per-tenant job timeout cap,
--- ordering input, history retention window); see `RESERVED_UNUSED` in
--- control/schema_drift.rs.
+-- Those three are platform-owned: written by the hosted platform, not yet
+-- enforced by the engine.
 CREATE TABLE namespace_limits (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     max_queued_jobs         integer,
@@ -85,8 +83,8 @@ CREATE TABLE namespace_pool_limits (
 );
 
 -- Admission and job-build restrictions.
--- RESERVED: not read by any code yet (planned: hosted-tenant admission
--- policy); see `RESERVED_UNUSED` in control/schema_drift.rs.
+-- Platform-owned: the hosted platform writes per-tenant admission policy
+-- here; the engine does not read it yet.
 CREATE TABLE namespace_policies (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     fork_pr_policy          text NOT NULL DEFAULT 'untrusted' CHECK (fork_pr_policy IN
@@ -184,9 +182,6 @@ CREATE TABLE run_submissions (
     github_context          jsonb NOT NULL,
     workspace_snapshot      jsonb,
     snapshot_timing         jsonb,              -- duration_ms, object_count, pack_bytes
-    -- UNUSED: no reader or writer in any code; drop only with a migration
-    -- (`UNUSED` in control/schema_drift.rs).
-    secret_refs             jsonb NOT NULL DEFAULT '{}',
     -- Record-level per-job maps the table layout has no column for (jobs
     -- with no `jobs` row yet — a check run minted before its matrix leg
     -- materializes). Mirrors lite's `run_submissions.record_details`.
@@ -233,9 +228,6 @@ CREATE TABLE jobs (
     priority                integer NOT NULL DEFAULT 0,
     run_order               bigint NOT NULL DEFAULT 0,
     job_order               integer NOT NULL DEFAULT 0,
-    -- UNUSED: retry-backoff / delayed-start leftover; drop only with a
-    -- migration (`UNUSED` in control/schema_drift.rs).
-    not_before              timestamptz,
     enqueued_at             timestamptz,
     claimed_by_runner_id    bigint,
     claimed_at              timestamptz,
@@ -430,10 +422,6 @@ CREATE TABLE log_files (
     run_id                  uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     plan_id                 uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     log_id                  integer NOT NULL CHECK (log_id > 0),
-    -- UNUSED: log sizes live in the log-segment store, not here; drop only
-    -- with a migration (`UNUSED` in control/schema_drift.rs).
-    byte_count              bigint NOT NULL DEFAULT 0,
-    line_count              bigint NOT NULL DEFAULT 0,
     updated_at              timestamptz NOT NULL DEFAULT now(),
     UNIQUE (plan_id, log_id)
 );
@@ -455,7 +443,6 @@ CREATE TABLE runners (
     registered_at           timestamptz NOT NULL DEFAULT now(),
     last_seen_at            timestamptz
 );
-CREATE INDEX runners_labels ON runners USING gin (labels);
 
 CREATE TABLE runner_sessions (
     session_id              uuid PRIMARY KEY,
@@ -463,9 +450,6 @@ CREATE TABLE runner_sessions (
     protocol                text NOT NULL CHECK (protocol IN ('broker','azdo')),
     client_id               text,
     verified                boolean NOT NULL DEFAULT false,
-    -- UNUSED: wake routing is in-process (`control/wake.rs`); drop only with
-    -- a migration (`UNUSED` in control/schema_drift.rs).
-    engine_node_id          text,
     created_at              timestamptz NOT NULL DEFAULT now(),
     last_seen_at            timestamptz NOT NULL DEFAULT now()
 );
@@ -519,10 +503,6 @@ CREATE TABLE provision_requests (
     pool_key                text NOT NULL,
     labels                  jsonb NOT NULL,
     requested_at            timestamptz NOT NULL DEFAULT now(),
-    -- UNUSED: the provisioner queue has no lease protocol; drop only with a
-    -- migration (`UNUSED` in control/schema_drift.rs).
-    leased_until            timestamptz,
-    lease_owner             text,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
 );
@@ -686,9 +666,8 @@ CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_b
 
 -- ── Artifacts (replaces the artifact part of the `meta` blob) ────────
 -- Blobs live in object storage; upload state lives in the file-backed
--- ArtifactStore. These rows are RESERVED (planned as the shared artifact
--- index): the only production statement is the run-archive DELETE. See
--- `RESERVED_UNUSED` in control/schema_drift.rs.
+-- ArtifactStore. These rows are the catalog; the only statement today is
+-- the run-archive DELETE.
 --
 -- The Actions cache is deliberately NOT here: it is a bounded cache
 -- colocated with the runner hosts (preloop-cache CAS: key index ->
@@ -704,10 +683,6 @@ CREATE TABLE artifacts (
     size_bytes              bigint,
     digest                  text,
     storage_key             text NOT NULL,
-    -- UNUSED: `upload_token_hash` and `finalized_at` have no reader or
-    -- writer in any code; drop only with a migration (`UNUSED` in
-    -- control/schema_drift.rs).
-    upload_token_hash       bytea,
     created_at              timestamptz NOT NULL DEFAULT now(),
     finalized_at            timestamptz,
     expires_at              timestamptz,

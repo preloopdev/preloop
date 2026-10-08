@@ -1,5 +1,4 @@
-//! Schema-drift guard between the two copies of the control schema, plus the
-//! reserved/unused inventory the maintainers must keep honest.
+//! Schema-drift guard between the two copies of the control schema.
 //!
 //! `lite/schema.sql` is the SQLite translation of `pg/schema.sql` (the
 //! source of truth, mirrored into `docs/control-schema.sql`). Both must
@@ -26,7 +25,6 @@
 //! and to name every place the two backends disagree.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 
 /// The SQLite translation (see the file header for the type mapping).
 const LITE_SCHEMA: &str = include_str!("lite/schema.sql");
@@ -82,12 +80,6 @@ const DOCUMENTED_DIFFERENCES: &[(&str, &str)] = &[
         "index outbox_events_read: pg only",
         "the (txid, event_id) reader index; there is no txid column on SQLite (see above).",
     ),
-    // ── Indexes that need an engine feature SQLite has no equivalent of ─
-    (
-        "index runners_labels: pg only",
-        "GIN index over the `labels` jsonb (label -> runner search). SQLite has no GIN; lite \
-         matches labels in Rust (`runner_label_sets`) over the same JSON payload.",
-    ),
     // ── Columns and constraints that encode a deliberate behavioral split ─
     (
         "table job_messages column job_timeout_s: pg only",
@@ -120,144 +112,6 @@ const DOCUMENTED_DIFFERENCES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Schema objects kept although *no* code reads them yet — placeholders for
-/// features the maintainers intend to wire up. The test below greps the Rust
-/// sources so the day one of them starts being used, this list (and the
-/// matching `-- RESERVED:` comment in both schemas) must be revisited.
-const RESERVED_UNUSED: &[Kept] = &[
-    Kept {
-        what: "table namespace_policies",
-        why: "planned: hosted-tenant admission policy (fork-PR policy, token permission ceiling, \
-              OIDC audiences, local-execution policy)",
-        needles: &[("namespace_policies", None)],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column namespace_limits.max_job_timeout_minutes",
-        why: "planned: per-tenant job timeout cap, enforced at claim/acquire",
-        needles: &[("namespace_limits", Some("max_job_timeout_minutes"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column namespace_limits.priority_tier",
-        why: "planned: input to the tenant ordering policy (dispatch orders by priority, \
-              run_order, job_order today)",
-        needles: &[("namespace_limits", Some("priority_tier"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column namespace_limits.run_history_retention_days",
-        why: "planned: per-tenant history retention window",
-        needles: &[("namespace_limits", Some("run_history_retention_days"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "table artifacts",
-        why: "planned: shared artifact index (bytes live in the file-backed ArtifactStore). \
-              Today the only production statements are the run-archive `DELETE FROM artifacts`; \
-              the two test-only statements in retention.rs are listed as allowed mentions.",
-        needles: &[("artifacts", None)],
-        allowed_mentions: &[
-            "SELECT count(*) FROM artifacts WHERE run_id = ?1",
-            "INSERT INTO artifacts (namespace_id, run_id, job_backend_id, name",
-        ],
-    },
-];
-
-/// Schema objects with no reader and no writer anywhere in this crate. They
-/// are *not* dropped here: this branch has no migration runner, and a
-/// database created from this file refuses any other stamped version (see
-/// the module docs), so removing a column would strand existing databases.
-/// Drop them only in a migration-backed change; until then this list (and the
-/// `-- UNUSED:` comment at each site) is the inventory.
-const UNUSED: &[Kept] = &[
-    Kept {
-        what: "column namespaces.cell_generation",
-        why: "pg planned it to fence stale writers after a cell move; no code reads or writes it",
-        needles: &[("namespaces", Some("cell_generation"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column namespaces.config_version",
-        why: "pg planned it for platform config pushes; no code reads or writes it",
-        needles: &[("namespaces", Some("config_version"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column run_submissions.secret_refs",
-        why: "secret values are resolved at acquire and never stored; no code reads or writes the \
-              column (the secret-name list travels in `submission`)",
-        needles: &[("run_submissions", Some("secret_refs"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column jobs.not_before",
-        why: "retry-backoff / delayed-start leftover from the old scheduler; the queue orders by \
-              priority, run_order, job_order",
-        needles: &[("jobs", Some("not_before"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column provision_requests.lease_owner",
-        why: "the provisioner queue has no lease protocol; no code reads or writes it",
-        needles: &[("provision_requests", Some("lease_owner"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column provision_requests.leased_until",
-        why: "the provisioner queue has no lease protocol; no code reads or writes it",
-        needles: &[("provision_requests", Some("leased_until"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column runner_sessions.engine_node_id",
-        why: "long-poll wake routing is in-process (`control/wake.rs`), not persisted",
-        needles: &[("runner_sessions", Some("engine_node_id"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column log_files.byte_count",
-        why: "log sizes live in the log-segment store; the control table only allocates \
-              (plan_id, log_id)",
-        needles: &[("log_files", Some("byte_count"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column log_files.line_count",
-        why: "log sizes live in the log-segment store; the control table only allocates \
-              (plan_id, log_id)",
-        needles: &[("log_files", Some("line_count"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column artifacts.upload_token_hash",
-        why: "the file-backed ArtifactStore owns upload state; the control table is a delete-only \
-              index today",
-        needles: &[("artifacts", Some("upload_token_hash"))],
-        allowed_mentions: &[],
-    },
-    Kept {
-        what: "column artifacts.finalized_at",
-        why: "the file-backed ArtifactStore owns upload state; the control table is a delete-only \
-              index today",
-        needles: &[("artifacts", Some("finalized_at"))],
-        allowed_mentions: &[],
-    },
-];
-
-/// One kept-but-unused schema object and the evidence it is still unused.
-struct Kept {
-    /// Human description used in the failure message.
-    what: &'static str,
-    /// Why it is kept. Quoted in the failure message.
-    why: &'static str,
-    /// `(table, column)`: a column when set, a whole table otherwise.
-    needles: &'static [(&'static str, Option<&'static str>)],
-    /// Statement fragments that are known to mention the object and are
-    /// accepted (test-only helpers); every other match fails the test.
-    allowed_mentions: &'static [&'static str],
-}
-
 #[test]
 fn control_schema_differences_are_documented() {
     let differences = differences();
@@ -280,62 +134,6 @@ fn control_schema_differences_are_documented() {
         "the SQLite and Postgres control schemas drifted ({} difference(s)):\n{}",
         differences.len(),
         problems.join("\n")
-    );
-}
-
-#[test]
-fn reserved_and_unused_objects_stay_unreferenced() {
-    let sources = rust_sources();
-    let mut findings = Vec::new();
-    for kept in RESERVED_UNUSED.iter().chain(UNUSED) {
-        for (table, column) in kept.needles {
-            for (path, text) in &sources {
-                if path.ends_with("schema_drift.rs") {
-                    continue;
-                }
-                for statement in sql_mentions(text, table, *column) {
-                    if kept
-                        .allowed_mentions
-                        .iter()
-                        .any(|allowed| statement.contains(allowed))
-                    {
-                        continue;
-                    }
-                    findings.push(format!(
-                        "{} ({}): {statement}\n    in {}",
-                        kept.what,
-                        kept.why,
-                        path.display()
-                    ));
-                }
-            }
-        }
-    }
-    assert!(
-        findings.is_empty(),
-        "these schema objects are declared RESERVED/UNUSED but the code references them now:\n{}\n\
-         If this is a real use, remove the object from RESERVED_UNUSED/UNUSED in \
-         control/schema_drift.rs, delete its `-- RESERVED:`/`-- UNUSED:` comment in both schemas, \
-         and (for a wired-up feature) drop the `unused` claim from the PR.",
-        findings.join("\n")
-    );
-}
-
-/// The inventory grep must see a column used in a `DELETE` predicate: that is
-/// a real read of the column, and `DELETE` alone used to be invisible to it.
-/// A table-only `DELETE` stays invisible — the `artifacts` table is
-/// delete-only by design, so its cleanup statements are not uses.
-#[test]
-fn delete_predicates_count_as_column_uses() {
-    let delete = "DELETE FROM provision_requests WHERE lease_owner = ?1";
-    assert_eq!(
-        sql_mentions(delete, "provision_requests", Some("lease_owner")).len(),
-        1,
-        "a DELETE predicate reads the column"
-    );
-    assert!(
-        sql_mentions(delete, "provision_requests", None).is_empty(),
-        "a table-only DELETE is not a read"
     );
 }
 
@@ -600,72 +398,4 @@ fn find_word(haystack: &str, needle: &str) -> Option<usize> {
         }
     }
     None
-}
-
-// ── Source grep for the reserved/unused inventory ───────────────────────
-
-fn rust_sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                out.push((path, text));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
-    out
-}
-
-/// Every mention of `table` (or `table.column` when `column` is set) inside a
-/// SQL read/write statement. SQL is written across several Rust string lines,
-/// so any statement verb within 240 bytes before the mention counts as the
-/// same statement. `DROP` is deliberately not a verb, and a bare `DELETE` of
-/// a *table* is not a read (the `artifacts` table is delete-only by design),
-/// but `DELETE ... WHERE <column>` does read that column, so `DELETE` counts
-/// when the needle is a column.
-///
-/// The window only looks backwards, so a mention that puts the table name
-/// after the column (some `SELECT` shapes) can be missed — this guard is a
-/// prompt, not a proof.
-fn sql_mentions(text: &str, table: &str, column: Option<&str>) -> Vec<String> {
-    const VERBS: &[&str] = &["SELECT", "INSERT", "UPDATE", "JOIN"];
-    let needle = column.unwrap_or(table);
-    let mut mentions = Vec::new();
-    let mut from = 0;
-    while let Some(at) = find_word(&text[from..], needle) {
-        let at = from + at;
-        from = at + 1;
-        let start = char_window_start(text, at, 240);
-        let window = &text[start..at];
-        let delete_reads_a_column = column.is_some() && find_word(window, "DELETE").is_some();
-        if !delete_reads_a_column && !VERBS.iter().any(|verb| find_word(window, verb).is_some()) {
-            continue;
-        }
-        if column.is_some() && find_word(window, table).is_none() {
-            continue;
-        }
-        let line_start = text[..at].rfind('\n').map_or(0, |newline| newline + 1);
-        let line_end = text[at..].find('\n').map_or(text.len(), |end| at + end);
-        mentions.push(text[line_start..line_end].trim().to_owned());
-    }
-    mentions
-}
-
-/// Start of the `max_chars`-long window that ends at `at`, on a char
-/// boundary.
-fn char_window_start(text: &str, at: usize, max_chars: usize) -> usize {
-    text[..at]
-        .char_indices()
-        .rev()
-        .nth(max_chars)
-        .map_or(0, |(index, _)| index)
 }

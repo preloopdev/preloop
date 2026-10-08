@@ -14,21 +14,11 @@ Releases before v0.27.0 predate the changelog.
   Postgres (`control/pg/schema.sql`) control schemas aligned: same tables,
   column names, foreign keys and indexes, with every deliberate difference
   listed and reasoned in `control/schema_drift.rs` (partition children, the
-  xid8 outbox columns and their ordering index, the GIN label index, the
-  pg-only `job_messages.job_timeout_s`, the shared `timeline_id`, and the
+  xid8 outbox columns and their ordering index, the pg-only
+  `job_messages.job_timeout_s`, the shared `timeline_id`, and the
   `runner_sessions.runner_id` FK). The guard fails on an undocumented
   difference and on a stale entry, so aligning the backends shrinks the list
-  instead of letting it rot. The same module inventories the schema objects
-  kept without readers — `RESERVED` placeholders (`namespace_policies`, three
-  unread `namespace_limits` columns, `artifacts`) and `UNUSED` leftovers
-  (`namespaces.cell_generation`/`config_version`,
-  `run_submissions.secret_refs`, `jobs.not_before`,
-  `provision_requests.lease_owner`/`leased_until`,
-  `runner_sessions.engine_node_id`, `log_files.byte_count`/`line_count`,
-  `artifacts.upload_token_hash`/`finalized_at`) — and a grep test fails when
-  code starts using one, so the inventory cannot silently stale. Nothing is
-  dropped and no schema version is bumped: this branch has no migration
-  runner, so dropping a column would strand every existing control database.
+  instead of letting it rot.
 - Coverage for id and time storage on both backends: a run id and job
   round-trip in lowercase-canonical form, a sub-microsecond instant reads
   back as whole microseconds (nanosecond `bigint` stamps keep full
@@ -50,6 +40,18 @@ Releases before v0.27.0 predate the changelog.
   `jobs` -> `job_requests` cascade that the partial inflight index cannot.
   Both are fresh-database changes: an existing database keeps working
   unchanged, because a missing index is never an error.
+- The control schema no longer carries objects nothing uses:
+  `run_submissions.secret_refs`, `jobs.not_before`,
+  `provision_requests.lease_owner`/`leased_until`,
+  `runner_sessions.engine_node_id`, `log_files.byte_count`/`line_count`,
+  `artifacts.upload_token_hash` and Postgres's `runners_labels` GIN index
+  (label matching reads `runners.labels` in Rust and uses no operator a GIN
+  index serves). No code referenced any of them, so an existing control
+  database that still has the columns keeps working. The namespace
+  platform columns (`cell_generation`, `config_version`,
+  `namespace_limits.max_job_timeout_minutes`/`priority_tier`/
+  `run_history_retention_days`, `namespace_policies`) stay and are marked
+  platform-owned in the schema.
 
 ### Security
 
