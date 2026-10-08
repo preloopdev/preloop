@@ -9166,8 +9166,7 @@ done
         // status is the raise's, which is what makes a failed raise on a root
         // launch observable instead of silent.
         assert_eq!(
-            GUEST_NOFILE_ULIMIT,
-            "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536",
+            GUEST_NOFILE_ULIMIT, "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536",
             "the privileged form must stay strict"
         );
         assert!(
@@ -9431,10 +9430,7 @@ done
         switched.runner_uid = Some(1001);
 
         let mut scripts: Vec<(String, String)> = vec![
-            (
-                "guest_hostname_script".to_owned(),
-                guest_hostname_script(),
-            ),
+            ("guest_hostname_script".to_owned(), guest_hostname_script()),
             ("guest_sysctl_script".to_owned(), guest_sysctl_script()),
             (
                 "guest_hosted_runtime_init_script".to_owned(),
@@ -9472,7 +9468,10 @@ done
                 "as_runner_user (runner account)".to_owned(),
                 as_runner_user(&switched, &argv)[2].clone(),
             ),
-            ("run_as_root_or_sudo".to_owned(), run_as_root_or_sudo("true")),
+            (
+                "run_as_root_or_sudo".to_owned(),
+                run_as_root_or_sudo("true"),
+            ),
             (
                 "run_as_root_or_sudo_strict".to_owned(),
                 run_as_root_or_sudo_strict("true"),
