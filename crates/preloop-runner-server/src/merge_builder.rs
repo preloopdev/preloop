@@ -1144,10 +1144,12 @@ pub async fn attach_prebuilt_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn remote_auth_is_scoped_to_the_origin_port() {
         assert!(
-            auth_header_for_remote("https://github.com:8443/acme/repo.git", "token", None).is_none()
+            auth_header_for_remote("https://github.com:8443/acme/repo.git", "token", None)
+                .is_none()
         );
         assert!(
             auth_header_for_remote(

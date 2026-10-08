@@ -1244,7 +1244,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "triggering_actor": submission.actor
     });
 
-
     // Capture one immutable source per run before any job is queued. Local
     // submissions snapshot the caller's working tree; opt-in remote modes
     // fetch the webhook commit once for every job in this run.
