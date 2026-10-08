@@ -2,9 +2,9 @@
 //!
 //! A `check_suite.rerequested` delivery re-runs the suite's original run as
 //! a new attempt — this is the path GitHub's Checks-page "Re-run all jobs"
-//! button and the `…/check-suites/:id/rerequest` App API take. Kept in a
-//! new module (rather than `github.rs`'s delivery handler) so the check-run
-//! outbox rework can land beside it; the delivery handler only calls in.
+//! button and the `…/check-suites/:id/rerequest` App API take. The webhook
+//! delivery handler calls into [`process_check_suite_rerequest`] and then
+//! still feeds the delivery to the `check_suite` event adapter.
 
 use std::sync::Arc;
 

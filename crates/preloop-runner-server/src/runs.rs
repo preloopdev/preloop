@@ -3669,11 +3669,10 @@ pub async fn approve_job(
 /// A *fully archived* run (no live `runs`/`jobs` rows — the archiver moves
 /// settled runs out of the hot tables) cannot be reset in place: its
 /// scheduler rows (`job_specs`, `job_messages`, `job_needs`) are gone with
-/// the live row. A full re-run keeps lock-refactor's behavior — resubmit
-/// the recorded submission as a new run — while a partial mode is refused
-/// (`409`, GitHub-shaped: a re-run that cannot name its jobs cannot be
-/// carried out). See the PR notes: in-place re-runs of archived runs are a
-/// follow-up.
+/// the live row. A full re-run resubmits the recorded submission as a new
+/// run; a partial mode is refused (`409`, GitHub-shaped: a re-run that
+/// cannot name its jobs cannot be carried out). In-place re-runs of
+/// archived runs are not supported.
 pub(crate) async fn rerun_run_inner(
     shared: &Arc<SharedState>,
     run_id: RunId,
@@ -3930,12 +3929,12 @@ pub(crate) async fn rerun_run_inner(
     })
 }
 
-/// Re-run a fully archived run the way lock-refactor did: resubmit its
-/// recorded submission as a NEW run. The run-tier secrets survive the archive
-/// move (the submission's secret names still resolve), and the new run gets a
-/// fresh `run_id`/`run_number` with `run_attempt` 1 — GitHub's "same run id,
-/// new attempt" only applies while the run's scheduler rows are live. See the
-/// module-level PR notes for the follow-up that would rehydrate instead.
+/// Re-run a fully archived run: resubmit its recorded submission as a NEW
+/// run. The run-tier secrets survive the archive move (the submission's
+/// secret names still resolve), and the new run gets a fresh
+/// `run_id`/`run_number` with `run_attempt` 1 — GitHub's "same run id, new
+/// attempt" only applies while the run's scheduler rows are live. A rehydrate
+/// that re-runs an archived run in place is not supported.
 async fn archived_rerun(
     shared: &Arc<SharedState>,
     archived_run_id: RunId,

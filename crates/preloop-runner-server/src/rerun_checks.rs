@@ -1,5 +1,4 @@
-//! Check-run publication for re-run attempts (new module, kept separate
-//! from `github.rs` so the check-run outbox rework can land beside it).
+//! Check-run publication for re-run attempts.
 //!
 //! [`report_rerun_check_runs`] is the rerun analogue of
 //! [`crate::github::report_check_runs_for_run`]: it wakes the queued (and,
