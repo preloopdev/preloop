@@ -6958,6 +6958,11 @@ jobs:
             state: state.clone(),
             shutdown: CancellationToken::new(),
         });
+        state.environment_resolver.set_github_configured();
+        assert!(matches!(
+            state.environment_resolver.lookup_sync("owner/repo", "prod"),
+            crate::environment_resolver::EnvironmentLookup::Pending
+        ));
 
         let lookup = crate::github_app::candidate_apps_for_repo_inner(&shared, "owner/repo").await;
         assert!(
