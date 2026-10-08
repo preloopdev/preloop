@@ -1457,7 +1457,6 @@ async fn post_deployment_status(
     let mut body = serde_json::json!({
         "state": state,
         "log_url": run_details_url(run_id).unwrap_or_default(),
-        "auto_inactive": false,
     });
     if let Some(url) = environment_url {
         body["environment_url"] = serde_json::json!(url);
