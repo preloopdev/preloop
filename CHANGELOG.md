@@ -224,9 +224,20 @@ Releases before v0.27.0 predate the changelog.
   `jobs_ready_global` partial index (`queue_state = 'ready'`) carries that
   order, so the claim stays an index read instead of a sort of the whole
   ready queue (0.2 ms vs 28 ms at 20k ready jobs); `jobs_ready` is kept for
-  the per-pool quota predicates. Databases created before this change keep
-  working (the claim order is correct either way) and pick the index up with
-  the migration work in flight; a database created by this build has it.
+  the per-pool quota predicates. The index is added by migration
+  `V2026100507`; the claim order is correct without it, so a database that
+  has not migrated yet only loses the speedup.
+
+- **Runs are queued in arrival order on Postgres, and expanded jobs keep
+  their run's place.** Postgres ordered the queue by the workflow's run
+  number — a per-workflow counter — so run #3 of one workflow was claimed
+  before run #800 of another that arrived earlier. `run_order` is now the
+  run's submit time on both backends. Jobs a deferred matrix or a reusable
+  workflow expands into were inserted with `run_order = 0, job_order = 0`,
+  which put them ahead of every other run's ready jobs on both backends;
+  they now take their run's `run_order` and the placeholder's `job_order`.
+  Legs of one matrix share that `job_order`, so among themselves they fall
+  back to `job_id`.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

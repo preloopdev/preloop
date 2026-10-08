@@ -1422,6 +1422,17 @@ pub(super) fn namespace_of(tx: &Transaction<'_>, run_id: RunId) -> Result<String
         .map(|value: Option<String>| value.unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned()))
 }
 
+/// The run's submit time in microseconds (0 when the row is missing): the
+/// `run_order` every job of the run shares.
+pub(super) fn run_created_at_us(tx: &Transaction<'_>, run_id: RunId) -> Result<i64, ControlError> {
+    tx.prepare_cached("SELECT created_at FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| row.get(0))
+        .optional()
+        .map_err(db)
+        .map(|value: Option<i64>| value.unwrap_or(0))
+}
+
 /// Overlay a live-derived map onto the stored `record_details` map: stored
 /// keys with no live row pass through (record detail is broader than the
 /// scheduling table — a run_jobs entry may never have been dispatched),

@@ -3900,7 +3900,10 @@ fn submit_node(
         runs_on: job.runs_on.clone(),
         runner_group: job.runner_group.clone(),
         priority: 0,
-        run_order: record.run_number as i64,
+        // The run's submit time, like SQLite: arrival order across workflows.
+        // (The workflow run number is a per-workflow counter, not comparable
+        // between workflows.)
+        run_order: record.created_at.timestamp_micros(),
         job_order: position as i32,
         enqueued_at_us: None,
         claimed_by_runner_id: None,
@@ -6527,7 +6530,7 @@ impl PgBackend {
             }
             BuiltExpansion::Matrix { jobs } => {
                 let registered = self
-                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, &node_id, jobs)
                     .await?;
                 // The parent leaves the run's status map; its legs take over.
                 if let Some(node) = sweep.node_mut(run_id, &node_id) {
@@ -6550,7 +6553,7 @@ impl PgBackend {
                 reusable_calls,
             } => {
                 let registered = self
-                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, &caller_id, jobs)
                     .await?;
                 if let Some(node) = sweep.node_mut(run_id, &caller_id) {
                     node.status = ExecutionStatus::InProgress;
@@ -6591,6 +6594,7 @@ impl PgBackend {
         tx: &Transaction<'_>,
         sweep: &mut Sweep<'_>,
         run_id: RunId,
+        placeholder: &JobId,
         jobs: Vec<BuiltJob>,
     ) -> Result<usize, ControlError> {
         let platforms = Self::registered_platforms_on(tx).await?;
@@ -6614,6 +6618,19 @@ impl PgBackend {
             .map(|(k, v)| (k, v as i64))
             .collect();
         let now = now_us();
+        // Expanded jobs keep their run's place in the queue: the run's
+        // `run_order` and the placeholder's `job_order`. A literal 0/0 would
+        // sort them ahead of every other run's jobs.
+        let (run_order, job_order) = sweep
+            .graphs
+            .get(&run_id)
+            .map(|graph| {
+                graph.nodes.get(placeholder).map_or_else(
+                    || (graph.record.created_at.timestamp_micros(), 0),
+                    |node| (node.run_order, node.job_order),
+                )
+            })
+            .unwrap_or((0, 0));
         let mut registered = 0usize;
         for built in jobs {
             let BuiltJob {
@@ -6647,8 +6664,8 @@ impl PgBackend {
                 runs_on: plan.runs_on.clone(),
                 runner_group: plan.runner_group.clone(),
                 priority: 0,
-                run_order: 0,
-                job_order: 0,
+                run_order,
+                job_order,
                 enqueued_at_us: None,
                 claimed_by_runner_id: None,
                 claimed_at_us: None,

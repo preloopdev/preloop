@@ -4359,6 +4359,160 @@ pub(crate) mod suite {
         assert_eq!(claimed.queued.job_id, JobId("newer".to_owned()));
     }
 
+    /// Claim the next job as `runner` and return `(run, job, agent job id)`.
+    async fn claim_next(
+        backend: &dyn ControlBackend,
+        session_id: &str,
+        runner_id: i64,
+    ) -> (RunId, JobId, uuid::Uuid) {
+        let outcome = backend
+            .poll_session(poll_with_labels(session_id, runner_id, &["self-hosted"]))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a ready job must be claimed, got {outcome:?}");
+        };
+        (
+            claimed.queued.run_id,
+            claimed.queued.job_id,
+            claimed.request.agent_job_id,
+        )
+    }
+
+    async fn finish_job(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &JobId,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+    ) {
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: job_id.clone(),
+                agent_job_id: Some(agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_id),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Runs are ordered by when they arrived, not by their workflow's run
+    /// number. The run number is a per-workflow counter (run #800 of a busy
+    /// workflow versus run #3 of a quiet one), so comparing it across
+    /// workflows lets the quiet workflow jump the queue forever. The older
+    /// run, submitted second here with the larger run number, goes first.
+    pub(crate) async fn claim_orders_runs_by_arrival_not_run_number(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner_with_labels("r1", &["self-hosted"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let newer = RunId::new();
+        let older = RunId::new();
+        let mut newer_run = submit_run(newer, vec![submit_job(newer, "new-job", 1)]);
+        newer_run.record.run_number = 3;
+        newer_run.record.created_at = now;
+        backend.submit_run(newer_run).await.unwrap();
+        let mut older_run = submit_run(older, vec![submit_job(older, "old-job", 2)]);
+        older_run.record.run_number = 800;
+        older_run.record.created_at = now - chrono::Duration::hours(1);
+        backend.submit_run(older_run).await.unwrap();
+
+        let (run, job, agent) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            job,
+            JobId("old-job".to_owned()),
+            "the run that arrived first goes first, whatever its run number"
+        );
+        finish_job(backend, run, &job, agent, runner.runner.id).await;
+        let (_, job, _) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(job, JobId("new-job".to_owned()));
+    }
+
+    /// Jobs a deferred matrix expands into keep their run's place in the
+    /// queue. They used to be inserted with `run_order = 0, job_order = 0`,
+    /// which sorted them ahead of every other run's ready jobs: a newer run's
+    /// legs jumped the older run's job.
+    pub(crate) async fn expanded_jobs_keep_their_runs_place_in_the_queue(
+        backend: &dyn ControlBackend,
+    ) {
+        let runner = backend
+            .register_runner(register_runner_with_labels("r1", &["self-hosted"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let older = RunId::new();
+        let mut older_run = submit_run(older, vec![submit_job(older, "old-job", 1)]);
+        older_run.record.created_at = now - chrono::Duration::hours(1);
+        backend.submit_run(older_run).await.unwrap();
+
+        // The newer run: `gen` feeds a deferred matrix `fan`.
+        let newer = RunId::new();
+        let mut fan = submit_job(newer, "fan", 3);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut newer_run = submit_run(newer, vec![submit_job(newer, "gen", 2), fan]);
+        newer_run.record.created_at = now;
+        backend.submit_run(newer_run).await.unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: newer,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        built_matrix_leg(newer, "fan-1", "fan", 1, 2),
+                        built_matrix_leg(newer, "fan-2", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+
+        let (run, job, agent) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            job,
+            JobId("old-job".to_owned()),
+            "the older run's job goes before the newer run's expanded legs"
+        );
+        finish_job(backend, run, &job, agent, runner.runner.id).await;
+        let (run, job, agent) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            job,
+            JobId("fan-1".to_owned()),
+            "legs sharing the placeholder's job_order fall back to job_id"
+        );
+        finish_job(backend, run, &job, agent, runner.runner.id).await;
+        let (_, job, _) = claim_next(backend, &session.session_id, runner.runner.id).await;
+        assert_eq!(job, JobId("fan-2".to_owned()));
+    }
+
     /// Every ready-queue front read (`next_job_runs_on`: the submit and poll
     /// outcomes and `queue_stats`) reports the queue head in the same global
     /// order the claim takes, never the lexically first pool key's labels:
@@ -7076,6 +7230,22 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn claim_orders_runs_by_arrival_not_run_number() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claim_orders_runs_by_arrival_not_run_number(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn expanded_jobs_keep_their_runs_place_in_the_queue() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::expanded_jobs_keep_their_runs_place_in_the_queue(&backend).await;
+    }
+
+    #[tokio::test]
     async fn ready_front_reports_the_queue_head_across_label_sets() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -8514,6 +8684,18 @@ mod lite {
     #[tokio::test]
     async fn claim_takes_the_oldest_job_across_label_sets() {
         suite::claim_takes_the_oldest_job_across_label_sets(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn claim_orders_runs_by_arrival_not_run_number() {
+        suite::claim_orders_runs_by_arrival_not_run_number(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn expanded_jobs_keep_their_runs_place_in_the_queue() {
+        suite::expanded_jobs_keep_their_runs_place_in_the_queue(&LiteBackend::in_memory().unwrap())
             .await;
     }
 
