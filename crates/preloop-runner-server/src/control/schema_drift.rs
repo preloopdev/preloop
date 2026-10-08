@@ -238,6 +238,9 @@ fn diff_members(
 /// inline UNIQUE flags and foreign keys) and indexes. Comments and string
 /// literals never span a line in these files; `--` always starts a comment.
 fn parse(sql: &str) -> Schema {
+    // SQLite's own DDL dump double-quotes identifiers after `ALTER TABLE ..
+    // RENAME`; none of these files use double quotes for anything else.
+    let sql = sql.replace('"', "");
     let mut schema = Schema::default();
     let mut current: Option<(String, Table)> = None;
     let mut depth: i32 = 0;
@@ -249,7 +252,9 @@ fn parse(sql: &str) -> Schema {
         if current.is_some() {
             if depth == 1 && !trimmed.starts_with(')') {
                 let table = &mut current.as_mut().expect("checked above").1;
-                parse_table_body_line(trimmed, table);
+                for part in split_top_level(trimmed) {
+                    parse_table_body_line(part, table);
+                }
             }
             depth += paren_delta(trimmed);
             if depth <= 0 {
@@ -362,6 +367,33 @@ fn strip_comment(line: &str) -> &str {
         Some(at) => &line[..at],
         None => line,
     }
+}
+
+/// Split a table-body line at its top-level commas, so
+/// `a INTEGER, b TEXT,` yields `a INTEGER` and `b TEXT` while a comma inside
+/// parentheses (`CHECK (x IN ('a','b'))`, `FOREIGN KEY (a, b)`) stays put.
+/// SQLite's `ALTER TABLE .. ADD COLUMN` lists appended columns on one line.
+fn split_top_level(line: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (at, ch) in line.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&line[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&line[start..]);
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 fn paren_delta(line: &str) -> i32 {

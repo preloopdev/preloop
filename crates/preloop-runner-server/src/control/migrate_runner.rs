@@ -467,6 +467,16 @@ mod tests {
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            // Comments live in the stored DDL text but are not schema.
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.lines()
+                        .map(|line| line.split("--").next().unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .collect::<Vec<_>>();
             normalize(&rows.join("\n"))
         }
         let mut migrated = rusqlite::Connection::open_in_memory().unwrap();

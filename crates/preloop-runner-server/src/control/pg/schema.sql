@@ -434,6 +434,9 @@ CREATE TABLE log_files (
     run_id                  uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     plan_id                 uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     log_id                  integer NOT NULL CHECK (log_id > 0),
+    -- Filled by the legacy import for logs it carries over.
+    byte_count              bigint NOT NULL DEFAULT 0,
+    line_count              bigint NOT NULL DEFAULT 0,
     updated_at              timestamptz NOT NULL DEFAULT now(),
     UNIQUE (plan_id, log_id)
 );

@@ -368,6 +368,9 @@ CREATE TABLE log_files (
     run_id                  TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     plan_id                 TEXT NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     log_id                  INTEGER NOT NULL CHECK (log_id > 0),
+    -- Filled by the legacy import for logs it carries over.
+    byte_count              INTEGER NOT NULL DEFAULT 0,
+    line_count              INTEGER NOT NULL DEFAULT 0,
     updated_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     UNIQUE (plan_id, log_id)
 );
