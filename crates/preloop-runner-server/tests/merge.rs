@@ -98,9 +98,10 @@ impl MergeFixture {
         let base = git(&workspace, &["rev-parse", "main"]);
         git(&workspace, &["checkout", "-q", "feature"]);
         let head = git(&workspace, &["rev-parse", "HEAD"]);
+        let state_dir = temp.path().join("state");
         Self {
             temp,
-            state_dir: temp.path().join("state"),
+            state_dir,
             workspace,
             origin,
             head,
@@ -123,7 +124,7 @@ impl MergeFixture {
 
     async fn app(&self) -> (AppState, Router) {
         std::fs::create_dir_all(&self.state_dir).unwrap();
-        let state = AppState::new(self.state_dir.clone()).await.unwrap();
+        let mut state = AppState::new(self.state_dir.clone()).await.unwrap();
         state.local_workspace = Some(self.workspace.clone());
         let app = app(state.clone(), CancellationToken::new());
         (state, app)

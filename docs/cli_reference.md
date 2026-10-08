@@ -55,6 +55,7 @@ Submit a workflow and stream its events until terminal.
 | `--push` | After the run completes, push the tested commit and publish the result (pull request + check runs) |
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
 | `--pr-draft` | Create new pull requests as drafts (default true; `--pr-draft=false` opens them ready for review) |
+| `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it |
 
 Behavior notes:
 - **Pausing**: pausing is the SmolVM default in an interactive terminal so you
@@ -62,6 +63,18 @@ Behavior notes:
   Non-interactive runs (pipes, CI, `--detach`) never pause.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
+- **`pull_request` test merge**: like GitHub, a local `--event pull_request`
+  run tests the merge of the pull request's *current* base tip into the head
+  (the workspace `HEAD`, or the snapshot commit when the tree is dirty), not
+  the branch alone. The engine fetches the base branch from the workspace's
+  `origin`, so a base that moved since the branch was cut is picked up. The
+  run's `github.sha` is the merge commit and `github.ref` is
+  `refs/pull/<n>/merge`; the payload's `base.sha` is the fetched tip and
+  `head.sha` the merged head. A conflicted pull request fails the submission
+  with the conflicted files listed (GitHub runs no `pull_request` workflows on
+  a conflict), and an unfetchable base fails loudly — `--no-merge` tests the
+  branch alone in either case. `push` events are unaffected: they test the
+  commit itself.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
 - **Secret preflight**: before submitting, `preloop run` lists the secrets the
