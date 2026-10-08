@@ -2793,15 +2793,34 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
     .await
     .expect("cancel must finish uploading every annotation batch");
     let patches = patches.lock();
-    assert_eq!(patches.len(), 3);
-    let batch_sizes: Vec<usize> = patches
+    // The projection may send an earlier queued/in-progress status update
+    // before the terminal annotation batches. Assert the batching contract on
+    // annotated PATCHes, not the total number of check-run state updates.
+    let annotation_patches: Vec<&Value> = patches
+        .iter()
+        .filter(|body| {
+            body["output"]["annotations"]
+                .as_array()
+                .is_some_and(|annotations| !annotations.is_empty())
+        })
+        .collect();
+    assert_eq!(annotation_patches.len(), 3);
+    let batch_sizes: Vec<usize> = annotation_patches
         .iter()
         .map(|body| body["output"]["annotations"].as_array().unwrap().len())
         .collect();
     assert_eq!(batch_sizes, vec![50, 50, 20]);
-    assert!(patches[0].get("status").is_none());
-    assert_eq!(patches[2]["status"], "completed");
-    assert_eq!(patches[2]["conclusion"], "cancelled");
+    assert!(annotation_patches[0].get("status").is_none());
+    assert_eq!(annotation_patches[2]["status"], "completed");
+    assert_eq!(annotation_patches[2]["conclusion"], "cancelled");
+    assert_eq!(
+        patches
+            .iter()
+            .filter(|body| body["status"] == "completed")
+            .count(),
+        1,
+        "exactly one PATCH must complete the check run"
+    );
 }
 
 #[tokio::test]
