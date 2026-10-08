@@ -144,33 +144,55 @@ pub enum MergeOutcome {
 }
 
 /// Merge build failures.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum MergeError {
     /// A fetch failed: upstream unreachable, refused, or no matching ref.
     /// Transient by nature — a redelivery or retry may succeed.
-    #[error("could not fetch {refspec} from {url}: {message}")]
     Fetch {
         refspec: String,
         url: String,
         message: String,
     },
     /// The base branch does not exist at the remote.
-    #[error("base branch `{branch}` was not found at {url}")]
     BaseBranchMissing { branch: String, url: String },
     /// An input commit is not present where it must be.
-    #[error("commit {sha} is not present in {repository}")]
     MissingCommit { sha: String, repository: String },
     /// A `prebuilt_merge` submission named a mirror or commit that failed
     /// validation (bad path, wrong parents, wrong tree).
-    #[error("prebuilt merge is not valid: {0}")]
     InvalidPrebuilt(String),
     /// `git` itself failed.
-    #[error("git {operation} failed: {message}")]
     Git { operation: String, message: String },
     /// Filesystem failure while preparing a served repository.
-    #[error("{path}: {message}")]
     Io { path: String, message: String },
 }
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fetch {
+                refspec,
+                url,
+                message,
+            } => write!(formatter, "could not fetch {refspec} from {url}: {message}"),
+            Self::BaseBranchMissing { branch, url } => {
+                write!(formatter, "base branch `{branch}` was not found at {url}")
+            }
+            Self::MissingCommit { sha, repository } => {
+                write!(formatter, "commit {sha} is not present in {repository}")
+            }
+            Self::InvalidPrebuilt(message) => {
+                write!(formatter, "prebuilt merge is not valid: {message}")
+            }
+            Self::Git {
+                operation,
+                message,
+            } => write!(formatter, "git {operation} failed: {message}"),
+            Self::Io { path, message } => write!(formatter, "{path}: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for MergeError {}
 
 impl MergeError {
     /// Whether a retry (delivery redelivery, user re-run) may succeed.

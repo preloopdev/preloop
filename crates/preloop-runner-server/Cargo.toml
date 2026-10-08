@@ -19,7 +19,6 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
-thiserror.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
