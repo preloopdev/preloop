@@ -64,6 +64,26 @@ Releases before v0.27.0 predate the changelog.
   finished job's log be wiped and rewritten. A retry streams under its own
   live attempt's credential, so nothing legitimate is refused.
 
+- **Job containers can reach the engine again** (#F15, local mode): the engine
+  advertises itself to jobs at its loopback origin (the runner's in-guest
+  control bridge), which a container's network namespace resolves to the
+  container itself — so every `container:` job whose first step was a
+  redirected `actions/checkout`, plus anything using cache, artifacts or OIDC
+  from a container (`ACTIONS_*`), died with `connect ECONNREFUSED
+  127.0.0.1:<port>` (valkey's `debian:bookworm` and `almalinux:8` legs). The
+  runner now binds the same bridge on the job network's gateway (free port,
+  one job per VM) and rewrites the engine origin in every environment a
+  container process receives — `docker exec` for run steps and node actions,
+  `docker run` for `docker://` actions, and the workflow-declared env of the
+  job and service containers themselves — the same layer where the official
+  runner rewrites container paths — and hands containers an injected
+  `NO_PROXY`/`no_proxy` list already carrying the container-facing address
+  (a list the workflow declares is extended in place; a host with no list
+  gets none). Hosted deployments, where the engine URL is routable and no
+  control bridge exists, are untouched. Host steps,
+  the runner itself, and the official runner's Docker command shape are
+  unchanged.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
