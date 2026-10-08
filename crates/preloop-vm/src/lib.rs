@@ -1932,18 +1932,26 @@ fn effective_preloop_home() -> Option<PathBuf> {
 }
 
 /// Directory SmolVM keeps per-machine data dirs under for the active registry
-/// configuration: `$SMOLVM_DATA_DIR/vms`, else the isolated Preloop home's
-/// platform cache layout. This is where golden and job-VM disks land, so it is
-/// the filesystem disk-space checks must measure.
+/// configuration. On macOS SmolVM derives it from `HOME`
+/// (`<isolated smolvm-home>/Library/Caches/smolvm/vms`) and ignores
+/// `SMOLVM_DATA_DIR` — see `smolvm_runtime_env`, which is why the isolated home
+/// is pushed unconditionally on that platform. Everywhere else
+/// `$SMOLVM_DATA_DIR/vms` wins over the isolated home's `smolvm/vms`.
+/// This is where golden and job-VM disks land, so it is the filesystem
+/// disk-space checks must measure.
+#[cfg(target_os = "macos")]
+pub fn machine_data_root() -> Option<PathBuf> {
+    Some(
+        effective_preloop_home()?.join("smolvm-home/Library/Caches/smolvm/vms"),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn machine_data_root() -> Option<PathBuf> {
     if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
         return Some(data_dir.join("vms"));
     }
-    let home = effective_preloop_home()?;
-    #[cfg(target_os = "macos")]
-    return Some(home.join("smolvm-home/Library/Caches/smolvm/vms"));
-    #[cfg(not(target_os = "macos"))]
-    return Some(home.join("smolvm/vms"));
+    effective_preloop_home().map(|home| home.join("smolvm/vms"))
 }
 
 /// Bytes available to an unprivileged writer on the filesystem holding
@@ -2364,19 +2372,21 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     let data_dir = explicit_data_dir
         .clone()
         .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
+    // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its registry
+    // from HOME. Keep each Preloop home isolated whether or not
+    // SMOLVM_DATA_DIR is set, so every engine finds its own machines under
+    // `<home>/smolvm-home` and never a foreign registry — `machine_data_root`
+    // resolves the same directory on that platform.
+    #[cfg(target_os = "macos")]
+    if let Some(preloop_home) = effective_preloop_home() {
+        env.push((
+            "HOME".to_owned(),
+            preloop_home.join("smolvm-home").into_os_string(),
+        ));
+    }
     if explicit_data_dir.is_none()
         && let Some(data_dir) = &data_dir
     {
-        // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
-        // registry from HOME. Keep each Preloop home isolated while still
-        // leaving an explicit operator registry untouched.
-        #[cfg(target_os = "macos")]
-        if let Some(preloop_home) = effective_preloop_home() {
-            env.push((
-                "HOME".to_owned(),
-                preloop_home.join("smolvm-home").into_os_string(),
-            ));
-        }
         env.push((
             "SMOLVM_DATA_DIR".to_owned(),
             data_dir.clone().into_os_string(),
@@ -2463,7 +2473,12 @@ fn runtime_dirs_to_create() -> Vec<PathBuf> {
         && let Some(home) = effective_preloop_home()
     {
         dirs.push(home.join("smolvm"));
-        #[cfg(target_os = "macos")]
+    }
+    // SmolVM derives its registry from HOME on macOS regardless of
+    // SMOLVM_DATA_DIR (see `smolvm_runtime_env`), so the isolated smolvm home
+    // must always exist.
+    #[cfg(target_os = "macos")]
+    if let Some(home) = effective_preloop_home() {
         dirs.push(home.join("smolvm-home"));
     }
     dirs
