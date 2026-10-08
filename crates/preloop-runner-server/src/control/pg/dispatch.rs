@@ -6273,7 +6273,8 @@ impl PgBackend {
         }
         // 4. Reusable caller fold, walking up nested callers.
         let mut current = job_id.clone();
-        while let Some(caller) = Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await? {
+        while let Some(caller) = Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await?
+        {
             current = caller.clone();
             outcome.folded_callers.push(caller);
         }
