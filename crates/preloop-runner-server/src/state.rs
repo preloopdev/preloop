@@ -2,11 +2,67 @@ use super::*;
 
 const LOCAL_JWT_LIFETIME: Duration = Duration::from_secs(2999);
 
+/// Slack on top of a job-scoped credential's window: setup and transport
+/// either side of the job.
+const JOB_CREDENTIAL_SLACK: Duration = Duration::from_secs(5 * 60);
+
+/// Six-hour GitHub job limit plus this server's four-hour pause-credit
+/// window, with [`JOB_CREDENTIAL_SLACK`] around both. The default window for a
+/// credential that has to stay usable for as long as one attempt can last.
+const JOB_CREDENTIAL_LIFETIME: Duration = Duration::from_secs((6 + 4) * 60 * 60 + 5 * 60);
+
 /// A debug credential is acquired before the first step and remains in use
 /// through both the six-hour GitHub job limit and this server's four-hour
 /// pause-credit window. Keep a small allowance for setup and transport around
 /// those two bounded intervals.
-pub const DEBUG_WORKER_TOKEN_LIFETIME: Duration = Duration::from_secs((6 + 4) * 60 * 60 + 5 * 60);
+pub const DEBUG_WORKER_TOKEN_LIFETIME: Duration = JOB_CREDENTIAL_LIFETIME;
+
+/// The default lifetime of a job-scoped runtime token: the `SystemVssConnection`
+/// `AccessToken` the job message carries, the credential workflow code sees as
+/// `ACTIONS_RUNTIME_TOKEN`, and what the pinned checkout steps and the origin
+/// rewrite embed.
+///
+/// The attempt gets one of these and cannot be issued another while it runs:
+/// the worker's renew/complete/report calls, the cache and artifact Twirp
+/// calls, the step and job log uploads, and the snapshot fetches all present
+/// it, and the only other credential a running worker can obtain on its own is
+/// the runner listen token, which the job-lifecycle routes refuse by design
+/// (`broker::authenticated_runner_id_for_job`). Its lifetime therefore has to
+/// cover the whole job, exactly like [`DEBUG_WORKER_TOKEN_LIFETIME`] — and the
+/// job may ask for more than the default; see [`runtime_token_lifetime`].
+///
+/// Minted at the generic local-JWT lifetime it lasted 2999s, and a job that
+/// outlived that silently stopped renewing its lease (every later `renewjob`
+/// answered 401, then 403 once the worker fell back to a listen token) and was
+/// failed by the reaper while it was still running.
+pub const RUNTIME_TOKEN_LIFETIME: Duration = JOB_CREDENTIAL_LIFETIME;
+
+/// Lifetime for the runtime token of a job whose `timeout-minutes` resolved to
+/// `job_timeout_seconds` — the delivered message's `jobTimeout`.
+///
+/// [`RUNTIME_TOKEN_LIFETIME`] is the floor: GitHub's default job timeout is
+/// 360 minutes, and the same six hours plus the four-hour pause credit is what
+/// a job that declares nothing may spend. A workflow can declare more —
+/// `timeout-minutes` is validated to 1..=360 for a *step*, but any value is
+/// accepted for a *job* — so the token grows with the declared timeout instead
+/// of expiring inside a job the server is still willing to run, up to the same
+/// server ceiling the reaper and the delivered message are clamped to
+/// ([`preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS`], GitHub's own
+/// five-day maximum). A fork cannot mint an arbitrarily long credential: a
+/// `timeout-minutes` past the ceiling is worth exactly the ceiling here, and
+/// the job it would have retained runner capacity for is clamped to the same
+/// point.
+pub fn runtime_token_lifetime(job_timeout_seconds: Option<i64>) -> Duration {
+    let declared = job_timeout_seconds
+        .map(preloop_gha_parser::job_builder::clamp_job_timeout_seconds)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default();
+    let declared = declared
+        .saturating_add(crate::debug_sessions::MAX_PAUSE_CREDIT)
+        .saturating_add(JOB_CREDENTIAL_SLACK);
+    JOB_CREDENTIAL_LIFETIME.max(declared)
+}
 
 impl AppState {
     pub fn local_jwt(&self, claims: serde_json::Value) -> Result<String, ApiError> {
@@ -227,11 +283,40 @@ impl AppState {
         (subject_job == scope_job).then_some(subject_job)
     }
 
+    /// Mint the credential an attempt presents on every job-scoped route: the
+    /// `SystemVssConnection` `AccessToken` the job message carries, the value
+    /// exported to steps as `ACTIONS_RUNTIME_TOKEN`, and what the pinned
+    /// checkout steps embed.
+    ///
+    /// The default-window mint, for callers that do not hold the job message:
+    /// the submission-time snapshot pinning (which the claim re-mints) and
+    /// tests. Callers that do hold it pass the job's declared
+    /// `timeout-minutes` to [`Self::mint_runtime_token_for_job`].
     pub fn mint_runtime_token(&self, plan_id: &str, job_id: &uuid::Uuid) -> String {
-        self.local_jwt(json!({
-            "sub": format!("preloop-job-{job_id}"),
-            "scp": format!("Actions.Results:{plan_id}:{job_id}"),
-        }))
+        self.mint_runtime_token_for_job(plan_id, job_id, None)
+    }
+
+    /// Mint the runtime token for an attempt whose message is at hand, sized to
+    /// the job's own timeout: `job_timeout_seconds` is the message's
+    /// `jobTimeout` (its `timeout-minutes` in seconds), and a job that asked
+    /// for longer than the default window gets a token that outlives it
+    /// ([`runtime_token_lifetime`]).
+    ///
+    /// Minted once per attempt — nothing re-mints it while the job runs — so
+    /// the lifetime chosen here is the lifetime the attempt lives with.
+    pub fn mint_runtime_token_for_job(
+        &self,
+        plan_id: &str,
+        job_id: &uuid::Uuid,
+        job_timeout_seconds: Option<i64>,
+    ) -> String {
+        self.local_jwt_with_lifetime(
+            json!({
+                "sub": format!("preloop-job-{job_id}"),
+                "scp": format!("Actions.Results:{plan_id}:{job_id}"),
+            }),
+            runtime_token_lifetime(job_timeout_seconds),
+        )
         .expect("fixed local JWT claims must serialize")
     }
 
@@ -1751,7 +1836,7 @@ pub fn mint_runtime_token(plan_id: &str, job_id: &uuid::Uuid) -> String {
         "iss": "https://preloop.local",
         "iat": now,
         "nbf": now,
-        "exp": now + 2999,
+        "exp": now + RUNTIME_TOKEN_LIFETIME.as_secs(),
         "sub": format!("preloop-job-{job_id}"),
         "scp": format!("Actions.Results:{plan_id}:{job_id}"),
     });
@@ -2088,6 +2173,107 @@ mod tests {
             AppState::results_job_from_payload(&payload),
             Some(("plan".to_owned(), job))
         );
+    }
+
+    /// A job runtime token is presented by every job-scoped route — lease
+    /// renewal, completion, step and job log uploads, cache and artifact
+    /// Twirp, the pinned checkout steps — and the attempt can never be handed
+    /// a replacement, so its lifetime must cover the whole attempt. At the
+    /// generic local-JWT lifetime (2999s) it expired ~50 minutes into a job:
+    /// every later `renewjob` failed, the lease went stale, and the reaper
+    /// failed the job while it was still running.
+    #[tokio::test]
+    async fn runtime_token_outlives_the_six_hour_job_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let token = state.mint_runtime_token("plan-a", &job);
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a freshly minted runtime token must verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, RUNTIME_TOKEN_LIFETIME.as_secs());
+        // The default window is the floor, and GitHub's own maximum job
+        // timeout (360 minutes) fits inside it.
+        assert_eq!(exp - iat, runtime_token_lifetime(None).as_secs());
+        assert_eq!(exp - iat, runtime_token_lifetime(Some(360 * 60)).as_secs());
+        assert!(
+            exp - iat >= 6 * 60 * 60,
+            "a runtime token must outlive the six-hour GitHub job limit"
+        );
+        assert_eq!(state.job_uuid_from_token(&token), Some(job));
+    }
+
+    /// A workflow may declare a job `timeout-minutes` above the six-hour
+    /// default — the parser caps *step* timeouts at 1..=360 but accepts any
+    /// job value, and the reaper honours it — so the one credential the
+    /// attempt can ever present has to grow with the declared timeout, or the
+    /// job outlives its token and loses its lease mid-run.
+    #[tokio::test]
+    async fn runtime_token_grows_with_a_declared_longer_job_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let declared = 20 * 60 * 60;
+        let lifetime = runtime_token_lifetime(Some(declared));
+        assert!(
+            lifetime > RUNTIME_TOKEN_LIFETIME,
+            "a declared timeout above the default must extend the token"
+        );
+        assert!(
+            lifetime.as_secs() >= declared as u64 + 4 * 60 * 60,
+            "the token must outlive the declared job timeout plus the pause credit"
+        );
+        let token = state.mint_runtime_token_for_job("plan-long", &job, Some(declared));
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a longer-lived runtime token must still verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, lifetime.as_secs());
+    }
+
+    /// The runtime token grows with the declared job timeout *up to a server
+    /// ceiling*: a fork's `timeout-minutes` is untrusted input (the parser
+    /// accepts any number for a job), and an unbounded token is an unbounded
+    /// credential for runner capacity. The ceiling is GitHub's own five-day
+    /// maximum, the same value the delivered `jobTimeout` and the reaper's
+    /// deadline are clamped to, so a declaration past it buys nothing.
+    #[tokio::test]
+    async fn runtime_token_lifetime_is_capped_at_the_github_maximum() {
+        use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+        let ceiling = Duration::from_secs(MAX_JOB_TIMEOUT_SECONDS as u64)
+            + crate::debug_sessions::MAX_PAUSE_CREDIT
+            + JOB_CREDENTIAL_SLACK;
+        // Exactly the maximum is honoured in full.
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS)),
+            ceiling
+        );
+        // One second past it, an hour past it, and an absurd declaration all
+        // stop at the same ceiling.
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS + 1)),
+            ceiling
+        );
+        assert_eq!(
+            runtime_token_lifetime(Some(MAX_JOB_TIMEOUT_SECONDS * 24)),
+            ceiling
+        );
+        assert_eq!(runtime_token_lifetime(Some(i64::MAX)), ceiling);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job = uuid::Uuid::new_v4();
+        let token = state.mint_runtime_token_for_job("plan-fork", &job, Some(i64::MAX));
+        let claims = state
+            .verify_local_jwt_claims(&token)
+            .expect("a capped runtime token must still verify");
+        let exp = claims["exp"].as_u64().expect("exp is minted");
+        let iat = claims["iat"].as_u64().expect("iat is minted");
+        assert_eq!(exp - iat, ceiling.as_secs());
     }
 }
 

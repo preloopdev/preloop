@@ -3598,8 +3598,8 @@ pub fn redirect_primary_checkout(
 /// already-redirected steps are untouched.
 ///
 /// Rewritten ids are appended to `preloop_snapshot_token_steps` — the list
-/// the broker re-mints at claim — because the pinned credential is a
-/// ~50-minute JWT and a queued job outlives it; an expired token turns the
+/// the broker re-mints at claim — because the pinned credential is minted at
+/// submission and a queued job can outlive it; an expired token turns the
 /// relay into a 401 the step can never recover from.
 pub fn reroute_forge_checkouts(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
@@ -4100,6 +4100,19 @@ async fn authorize_snapshot_token(
     if !belongs_to_run {
         return Err(ApiError::forbidden(
             "snapshot Git token does not belong to this run",
+        ));
+    }
+    // The credential is spent with its attempt. This token is exported to
+    // workflow code as `ACTIONS_RUNTIME_TOKEN` and pinned into checkout steps,
+    // and the snapshot is otherwise reachable only by the jobs that hold one —
+    // so a completed (or purged) job's token must not keep fetching the run's
+    // snapshot for the rest of its lifetime. Liveness follows the request
+    // record, exactly like the Results writes (`auth::job_is_live`): an
+    // attempt stays live through a debug session, whose retry replays the
+    // checkout with a freshly minted token from `debug_sessions::poll_verdict`.
+    if !crate::auth::job_is_live(state, identity.job_id).await? {
+        return Err(ApiError::forbidden(
+            "snapshot Git token belongs to a completed job",
         ));
     }
     let run = state

@@ -2087,13 +2087,12 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
         ids
     };
 
-    let token = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"),
-            Value::Null,
-        )
-        .await;
+    let oidc_uri = format!(
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"
+    );
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let token =
+        request_json_with_bearer(&app, Method::GET, &oidc_uri, Value::Null, &runtime_token).await;
     let jwt = token["value"].as_str().unwrap();
     let parts: Vec<&str> = jwt.split('.').collect();
     assert_eq!(parts.len(), 3);
@@ -2140,6 +2139,22 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 
     // Verify the OIDC keypair is persisted.
     assert!(temp.path().join("oidc-key.json").exists());
+    request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/_apis/v1/plans/{plan_id}/events"),
+        json!({
+            "jobId": agent_job_id.to_string(),
+            "result": "succeeded"
+        }),
+        &runtime_token,
+    )
+    .await;
+    assert_eq!(
+        status_with_bearer(&app, &runtime_token, Method::GET, &oidc_uri, Value::Null).await,
+        StatusCode::FORBIDDEN,
+        "a settled job token must not mint fresh OIDC credentials"
+    );
 }
 
 #[tokio::test]
@@ -3050,6 +3065,76 @@ async fn timeline_read_surfaces_control_db_failures() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "a failed timeline read must not be answered as an empty timeline"
     );
+}
+/// A job's reporting credential remains valid only while its attempt is live.
+/// Timeline reads remain available after settlement; writes do not.
+#[tokio::test]
+async fn settled_job_token_cannot_mutate_timeline_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    let (_request_id, agent_job_id, timeline_id) = state
+        .test_db_mutate(move |tx| {
+            tx.request_key_for(run_id, &job_id)
+                .unwrap()
+                .expect("submitted request")
+        })
+        .await;
+    let plan_id = agent_job_id.to_string();
+    let token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let timeline_url = format!("/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records");
+    let patch = || {
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(&timeline_url)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"count":0,"value":[]}"#))
+            .unwrap()
+    };
+
+    let live = app.clone().oneshot(patch()).await.unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+
+    let completed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/plans/{plan_id}/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jobId": agent_job_id.to_string(),
+                        "result": "succeeded"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+
+    let settled = app.clone().oneshot(patch()).await.unwrap();
+    assert_eq!(settled.status(), StatusCode::FORBIDDEN);
+
+    let read = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&timeline_url)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
 }
 
 /// A timeline PATCH that the control DB rejects must not answer 200

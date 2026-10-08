@@ -182,7 +182,7 @@ pub async fn patch_timeline_records_org(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    crate::timeline_logs::authorize_reporting_callback(
+    crate::timeline_logs::authorize_live_reporting_callback(
         &shared,
         &headers,
         &plan_id,
@@ -227,8 +227,10 @@ pub async fn create_log_org(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
-        .await?;
+    crate::timeline_logs::authorize_live_reporting_callback(
+        &shared, &headers, &plan_id, None, None,
+    )
+    .await?;
     create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
@@ -238,8 +240,10 @@ pub async fn append_log_org(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
-        .await?;
+    crate::timeline_logs::authorize_live_reporting_callback(
+        &shared, &headers, &plan_id, None, None,
+    )
+    .await?;
     Ok(append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await)
 }
 
@@ -257,7 +261,7 @@ pub async fn console_log_org(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    crate::timeline_logs::authorize_reporting_callback(
+    crate::timeline_logs::authorize_live_reporting_callback(
         &shared,
         &headers,
         &plan_id,

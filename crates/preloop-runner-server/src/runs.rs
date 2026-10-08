@@ -2523,9 +2523,11 @@ pub(crate) fn build_job_artifacts(
     agent_msg.request_id = request_id;
 
     // Mint tokens outside the lock (HMAC computation).
-    let runtime_token = shared
-        .state
-        .mint_runtime_token(&agent_msg.plan.plan_id, &agent_msg.job_id);
+    let runtime_token = shared.state.mint_runtime_token_for_job(
+        &agent_msg.plan.plan_id,
+        &agent_msg.job_id,
+        agent_msg.job_timeout,
+    );
 
     if let Some(snapshot) = workspace_snapshot {
         let redirected =

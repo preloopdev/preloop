@@ -2497,6 +2497,120 @@ async fn live_log_websocket_cross_job_attempt_preserves_history() {
     server.abort();
 }
 
+/// A settled attempt's credential is spent, exactly like the Results writes it
+/// already is (`auth::require_live_results_job`): reads of its retained feed
+/// stay available, but it must not open the *ingest* feed again. A frame on a
+/// closed key reopens it and clears the retained tail
+/// (`record_live_log_wrapper`), so a replayed credential could wipe a
+/// completed job's history and forge lines into it. The attempt's own
+/// credential is used, and it streams while the attempt is live, so this
+/// isolates liveness from ownership.
+#[tokio::test]
+async fn live_log_websocket_rejects_a_settled_jobs_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // While the attempt is live its own credential streams, as the runner does.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_a}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let payload = json!({
+        "stepId": "step-1",
+        "startLine": 1,
+        "count": 1,
+        "value": ["before-completion"]
+    });
+    futures::SinkExt::send(
+        &mut ws,
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_a) {
+                    if job_lines.lock().await.lines.len() == 1 {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(ws);
+
+    // Settle the attempt — what `completejob` (or the reaper) does.
+    let request_id = {
+        let job_id = JobId(logical_a);
+        state
+            .test_db_mutate(move |tx| {
+                tx.request_key_for(run_id, &job_id)
+                    .unwrap()
+                    .expect("the dispatched attempt")
+                    .0
+            })
+            .await
+    };
+    state
+        .test_db_mutate(move |tx| {
+            tx.update_request(request_id, None, None, Some("success"), None)
+                .unwrap();
+        })
+        .await;
+
+    let url = format!("ws://{addr}/ws/live-logs/{agent_a}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        result.is_err(),
+        "a settled attempt's credential must not ingest live logs"
+    );
+
+    // The retained tail is exactly as the live attempt left it: not reopened
+    // and not cleared.
+    let inner = state.inner.lock().await;
+    let job_lines = inner
+        .live_log_lines
+        .get(&agent_a)
+        .expect("the settled job's history must survive");
+    let wrappers = job_lines.lock().await;
+    assert_eq!(wrappers.lines.len(), 1);
+    assert_eq!(wrappers.lines[0].value, vec!["before-completion"]);
+
+    server.abort();
+}
+
 /// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. A job may read its own feed.
 #[tokio::test]

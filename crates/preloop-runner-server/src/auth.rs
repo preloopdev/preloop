@@ -71,6 +71,33 @@ pub fn authorize_reporting_request(
     }
 }
 
+/// [`authorize_reporting_request`] plus the liveness rule: the caller must own
+/// the target *and* the attempt must still be live.
+///
+/// A settled attempt's runtime credential is spent — the rule the Results
+/// writes ([`require_live_results_job`]), the cache and artifact writes, and
+/// the live-log ingest all apply — so it must not keep mutating the run's
+/// records (timeline records, logs, console logs) after the attempt has
+/// settled. The credential is handed to workflow code and outlives the
+/// attempt, so without this a finished job could rewrite its own step records
+/// and annotations for the rest of the token's lifetime. Reads stay available,
+/// and the system identity bypasses exactly as it does everywhere else.
+pub async fn authorize_live_reporting_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    authorize_reporting_request(state, headers, request)?;
+    if system_bearer_authorized(state, headers) {
+        return Ok(());
+    }
+    let Some(record) = request else {
+        // Unresolvable targets were refused above for a non-system caller.
+        return Ok(());
+    };
+    require_live_job(state, record.agent_job_id).await
+}
+
 pub async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,

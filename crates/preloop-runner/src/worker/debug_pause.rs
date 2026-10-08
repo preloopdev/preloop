@@ -100,9 +100,10 @@ pub struct Decision {
     pub retry_from_step: Option<usize>,
     /// Fresh snapshot checkout credential supplied with a retry verdict.
     ///
-    /// The pinned token in the job message expires ~50 minutes after
-    /// submission; a retry replays the step with that stale value unless the
-    /// worker swaps it for this one.
+    /// The pinned token in the job message is minted at claim and only lives
+    /// for the job-credential window (the six-hour job limit plus the pause
+    /// allowance); a retry that replays the step after that replays the stale
+    /// value unless the worker swaps it for this one.
     pub snapshot_token: Option<String>,
     /// Fresh `http.<snapshot>.extraheader` value supplied with a retry
     /// verdict, for jobs whose job env carries a snapshot origin rewrite.

@@ -193,7 +193,12 @@ impl PgBackend {
                         .duration_since(started_at)
                         .unwrap_or_default()
                         .saturating_sub(paused_s);
-                    let job_timeout = request.job_timeout_s.unwrap_or(21600).max(0) as u64;
+                    // The same ceiling the message's `jobTimeout` was clamped
+                    // to at build: a stored template (or an older row) that
+                    // declares more must not keep the lease alive past it.
+                    let job_timeout = preloop_gha_parser::job_builder::effective_job_timeout_seconds(
+                        request.job_timeout_s,
+                    ) as u64;
                     if elapsed >= std::time::Duration::from_secs(job_timeout) {
                         // Conditional: only the first sweep flags the attempt.
                         let flagged = tx
