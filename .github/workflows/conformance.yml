@@ -46,10 +46,9 @@ jobs:
       - name: Name the diverging scenarios
         if: failure()
         # `run.sh` prints only "conformance failed for N scenario(s)". The
-        # scenario names live in conformance-fail.toml, which previously was
-        # not uploaded either — so a red build could not be diagnosed at all
-        # without re-running the replay locally. Echo them into the log, which
-        # outlives the ephemeral runner VM.
+        # scenario names live in conformance-fail.toml, which is not on stdout
+        # either, so echo them into the log, which outlives the ephemeral
+        # runner VM.
         run: |
           if [ -f .runner-watch/conformance-fail.toml ]; then
             echo "::group::Diverging scenarios"

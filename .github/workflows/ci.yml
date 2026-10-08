@@ -98,8 +98,8 @@ jobs:
     env:
       # 4 GiB runner guests OOM (SIGKILL) when too many rustc/linker jobs run
       # at once — the preloop-runner-server lib test is the largest unit and
-      # was killed on shard 1 while the other three passed. 6 jobs was tuned
-      # for a bigger box; 4 keeps parallel peak memory inside the guest.
+      # is the first to go. 6 jobs was tuned for a bigger box; 4 keeps
+      # parallel peak memory inside the guest.
       CARGO_BUILD_JOBS: "4"
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
@@ -239,7 +239,7 @@ jobs:
           free -m 2>/dev/null | head -3 || true
           echo "::endgroup::"
       # The preloop-runner-server integration tests were split out of the lib
-      # into separate tests/*.rs crates (the single ~27k-line unit OOMed the
+      # into separate tests/*.rs crates (the single large unit did not fit the
       # 4 GiB guest). They need the `test-support` feature for the deterministic
       # hooks, so they run under `cargo test` here — nextest can't scope a
       # feature to one package in a --workspace run. Partition by test-file
