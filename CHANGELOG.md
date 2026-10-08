@@ -31,6 +31,12 @@ Releases before v0.27.0 predate the changelog.
   unexpected` to production runners.
 
 ### Fixed
+- **A file-backed guest script splices with its trailing newline removed**:
+  the root-or-sudo wrapper inlines the script as `then {script}; else …`, so a
+  script ending in a newline left that `;` alone on a line and dash rejected
+  the whole command (`Syntax error: ";" unexpected`). Trailing whitespace means
+  nothing to the shell, so the wrapper now trims it for every caller.
+
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
