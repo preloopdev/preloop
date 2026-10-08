@@ -6962,7 +6962,7 @@ jobs:
         let lookup = crate::github_app::candidate_apps_for_repo_inner(&shared, "owner/repo").await;
         assert!(
             matches!(lookup, Err(crate::github_app::AppLookupError::Transient(_))),
-            "a 5xx installation lookup is transient, not 'not installed': {lookup:?}"
+            "a 5xx installation lookup is transient, not a definitive miss"
         );
 
         let error = state
@@ -6987,8 +6987,8 @@ jobs:
         *fail.lock() = false;
         let lookup = crate::github_app::candidate_apps_for_repo_inner(&shared, "owner/repo").await;
         assert!(
-            matches!(lookup, Ok(ref candidates) if candidates.is_empty()),
-            "no App is installed on the owner: {lookup:?}"
+            matches!(&lookup, Ok(candidates) if candidates.is_empty()),
+            "the repository owner has no App installation"
         );
     }
 
