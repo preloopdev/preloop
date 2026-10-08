@@ -197,7 +197,7 @@ CREATE TABLE jobs (
 );
 CREATE INDEX jobs_ready ON jobs(pool_key, namespace_id, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
--- global ready order: the reads that carry no pool filter (`next_ready_labels`,
+-- global ready order: the front/depth gauges (`next_ready_labels`,
 -- `queue_stats`, the reaper's ready scans; the LIMIT-less ones append the
 -- run_id, job_id tie-breakers) sort by priority DESC, run_order, job_order.
 -- The pool_key leading column above cannot serve them, so without this index

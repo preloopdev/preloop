@@ -5307,6 +5307,57 @@ pub(crate) mod suite {
         assert!(!drained.queue_nonempty);
         assert!(drained.next_runs_on.is_empty());
     }
+
+    /// The front gauge reads the queue order, never the pool key: a newer run
+    /// whose label set sorts first as text (`["",["self-hosted","zzz"]]` <
+    /// `["",["self-hosted"]]`) must not displace the older run's job at the
+    /// front while that job is still ready.
+    pub(crate) async fn front_labels_follow_queue_order_not_pool_key(
+        backend: &dyn ControlBackend,
+    ) {
+        let older = RunId::new();
+        let mut first = submit_run(
+            older,
+            vec![submit_job_on(older, "build", 1, &["self-hosted"])],
+        );
+        first.record.webhook_delivery_id = Some("front-delivery".to_owned());
+        let outcome = backend.submit_run(first).await.unwrap();
+        assert_eq!(
+            outcome.next_runs_on,
+            vec!["self-hosted".to_owned()],
+            "the only ready job is the front"
+        );
+
+        // A newer run whose two-label set sorts before the older run's — the
+        // pool-key order — but sits later in the queue order.
+        let newer = RunId::new();
+        let outcome = backend
+            .submit_run(submit_run(
+                newer,
+                vec![submit_job_on(newer, "build", 1, &["self-hosted", "zzz"])],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.next_runs_on,
+            vec!["self-hosted".to_owned()],
+            "the front is the queue order, not the pool key"
+        );
+
+        // A redelivery of the older run's webhook reports the same front.
+        let mut replay = submit_run(
+            RunId::new(),
+            vec![submit_job_on(RunId::new(), "build", 2, &["self-hosted"])],
+        );
+        replay.record.webhook_delivery_id = Some("front-delivery".to_owned());
+        let outcome = backend.submit_run(replay).await.unwrap();
+        assert!(outcome.existing.is_some(), "the delivery replays");
+        assert_eq!(
+            outcome.next_runs_on,
+            vec!["self-hosted".to_owned()],
+            "a replayed delivery reports the queue-order front"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -6492,6 +6543,14 @@ mod pg {
         };
         suite::queue_gauges_report_the_global_front(&backend).await;
     }
+
+    #[tokio::test]
+    async fn front_labels_follow_queue_order_not_pool_key() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::front_labels_follow_queue_order_not_pool_key(&backend).await;
+    }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
@@ -7591,6 +7650,12 @@ mod lite {
     #[tokio::test]
     async fn queue_gauges_report_the_global_front() {
         suite::queue_gauges_report_the_global_front(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn front_labels_follow_queue_order_not_pool_key() {
+        suite::front_labels_follow_queue_order_not_pool_key(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     /// The global gauge reads (`next_ready_labels`, `queue_stats`) must read

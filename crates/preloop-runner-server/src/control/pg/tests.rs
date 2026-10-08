@@ -1531,10 +1531,10 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
 
 // ── queue gauge plans ───────────────────────────────────────────────────
 
-/// The global gauge reads (`queue_stats`, the cancel path's front gauge,
-/// `rebuild_dispatch_intent`, the reaper's ready scans) must be index-fed by
-/// `jobs_ready_global` — no Sort node — on a populated ready queue; the
-/// claim-order reads keep using `jobs_ready`.
+/// The global gauge reads (`ready_front_labels` for every command outcome,
+/// `queue_stats`, the cancel path's front gauge, the reaper's ready scans)
+/// must be index-fed by `jobs_ready_global` — no Sort node — on a populated
+/// ready queue; the claim-order reads keep using `jobs_ready`.
 #[tokio::test]
 async fn queue_gauge_plans_are_index_fed() {
     let Some((_pg, url)) = fresh_database_opt().await else {

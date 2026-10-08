@@ -267,9 +267,9 @@ CREATE TABLE jobs (
 -- forces a sort of the whole ready queue on every call.
 CREATE INDEX jobs_ready ON jobs(pool_key, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
--- global gauge order: the queue-depth/front reads that carry no pool filter
--- (`queue_gauges`, `queue_stats`, the cancel path) sort by priority DESC,
--- run_order, job_order (the cancel/status reads append the run_id, job_id
+-- global gauge order: the queue-depth/front reads (`next_runs_on` for every
+-- command outcome, `queue_stats`, the cancel path) sort by priority DESC,
+-- run_order, job_order (the LIMIT-less ones append the run_id, job_id
 -- tie-breakers); the pool_key leading column above cannot serve them, so
 -- without this index every call sorts the whole ready set.
 CREATE INDEX jobs_ready_global ON jobs(priority DESC, run_order, job_order, run_id, job_id)

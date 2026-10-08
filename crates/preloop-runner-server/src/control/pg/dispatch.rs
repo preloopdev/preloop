@@ -4588,6 +4588,12 @@ impl PgBackend {
     }
 
     /// `runs-on` labels of the ready-queue front, for `next_job_runs_on`.
+    ///
+    /// The front is the queue order (`priority DESC, run_order, job_order`,
+    /// tie-broken by the row identity) — the same front the lite backend's
+    /// `next_ready_labels` reports for the same commands, served by the
+    /// `jobs_ready_global` partial index. A pool key is label-set text: it
+    /// must never decide which front a gauge reports.
     pub(super) async fn ready_front_labels(&self) -> Result<Vec<String>, ControlError> {
         Self::ready_front_labels_on(&*self.reader().await?).await
     }
@@ -4599,7 +4605,7 @@ impl PgBackend {
         let row = client
             .query_opt(
                 "SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
-                 ORDER BY pool_key, priority DESC, run_order, job_order LIMIT 1",
+                 ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
                 &[],
             )
             .await
