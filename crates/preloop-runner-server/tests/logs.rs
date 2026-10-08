@@ -3061,23 +3061,14 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let job_id = JobId("build".to_owned());
-    let (request_id, agent_job_id, timeline_id) = state
+    let (_request_id, agent_job_id, timeline_id) = state
         .test_db_mutate(move |tx| {
             tx.request_key_for(run_id, &job_id)
                 .unwrap()
                 .expect("submitted request")
         })
         .await;
-    let plan_id = state
-        .test_db_mutate(move |tx| {
-            tx.0.query_row(
-                "SELECT plan_id FROM job_requests WHERE request_id = ?1",
-                [request_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap()
-        })
-        .await;
+    let plan_id = agent_job_id.to_string();
     let token = state.mint_runtime_token(&plan_id, &agent_job_id);
     let timeline_url = format!("/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records");
     let patch = || {
@@ -3093,12 +3084,26 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
     let live = app.clone().oneshot(patch()).await.unwrap();
     assert_eq!(live.status(), StatusCode::OK);
 
-    state
-        .test_db_mutate(move |tx| {
-            tx.update_request(request_id, None, None, Some("success"), None)
-                .unwrap();
-        })
-        .await;
+    let completed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/plans/{plan_id}/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jobId": agent_job_id.to_string(),
+                        "result": "succeeded"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
 
     let settled = app.clone().oneshot(patch()).await.unwrap();
     assert_eq!(settled.status(), StatusCode::FORBIDDEN);
