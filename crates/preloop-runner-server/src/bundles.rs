@@ -41,7 +41,9 @@ pub async fn upload_bundle(
     let verified = git_command(&["bundle", "verify", temp.to_str().unwrap()]).await;
     if let Err(error) = verified {
         let _ = tokio::fs::remove_file(&temp).await;
-        return Err(ApiError::bad_request(format!("invalid git bundle: {error}")));
+        return Err(ApiError::bad_request(format!(
+            "invalid git bundle: {error}"
+        )));
     }
     tokio::fs::rename(&temp, &path)
         .await
@@ -63,10 +65,14 @@ pub async fn materialize_bundle(
     let root = shared.state.state_dir.join("bundles");
     let bundle = root.join(format!("{id}.bundle"));
     if !bundle.is_file() {
-        return Err(ApiError::bad_request("git bundle has expired or was not uploaded"));
+        return Err(ApiError::bad_request(
+            "git bundle has expired or was not uploaded",
+        ));
     }
     if !is_hex_commit(commit_sha) {
-        return Err(ApiError::bad_request("bundle submission has an invalid commit SHA"));
+        return Err(ApiError::bad_request(
+            "bundle submission has an invalid commit SHA",
+        ));
     }
     let bare = root.join(format!("{id}.git"));
     if !bare.is_dir() {
@@ -81,31 +87,33 @@ pub async fn materialize_bundle(
     }
     let workspace = root.join(format!("{id}.workspace"));
     if !workspace.is_dir() {
-        tokio::fs::create_dir_all(&workspace).await.map_err(|error| {
-            ApiError::internal(format!("failed to create bundle workspace: {error}"))
-        })?;
-        git_command_in(
-            &workspace,
-            &["init", "-q", "-b", "preloop-submit"],
-        )
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to initialize bundle workspace: {error}")))?;
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("failed to create bundle workspace: {error}"))
+            })?;
+        git_command_in(&workspace, &["init", "-q", "-b", "preloop-submit"])
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("failed to initialize bundle workspace: {error}"))
+            })?;
         git_command_in(
             &workspace,
             &["remote", "add", "origin", bare.to_str().unwrap()],
         )
         .await
-        .map_err(|error| ApiError::internal(format!("failed to configure bundle origin: {error}")))?;
+        .map_err(|error| {
+            ApiError::internal(format!("failed to configure bundle origin: {error}"))
+        })?;
         git_command_in(&workspace, &["fetch", "-q", "origin"])
             .await
             .map_err(|error| ApiError::bad_request(format!("cannot unpack git bundle: {error}")))?;
     }
-    git_command_in(
-        &workspace,
-        &["checkout", "-q", "--detach", commit_sha],
-    )
-    .await
-    .map_err(|error| ApiError::bad_request(format!("bundle does not contain submitted commit: {error}")))?;
+    git_command_in(&workspace, &["checkout", "-q", "--detach", commit_sha])
+        .await
+        .map_err(|error| {
+            ApiError::bad_request(format!("bundle does not contain submitted commit: {error}"))
+        })?;
     Ok(workspace)
 }
 

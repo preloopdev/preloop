@@ -3092,8 +3092,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
     if let Some(commit) = submit_commit.as_ref() {
-        let bundle_id =
-            upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await?;
+        let bundle_id = upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await?;
         submission.git_bundle_id = Some(bundle_id);
         let _ = std::fs::remove_file(&commit.bundle_path);
     }
@@ -3679,7 +3678,9 @@ fn create_submit_commit(
             String::from_utf8_lossy(&tree_output.stderr).trim()
         );
     }
-    let tree = String::from_utf8_lossy(&tree_output.stdout).trim().to_owned();
+    let tree = String::from_utf8_lossy(&tree_output.stdout)
+        .trim()
+        .to_owned();
     let branch = git_ref
         .strip_prefix("refs/heads/")
         .unwrap_or(git_ref)
@@ -3694,7 +3695,12 @@ fn create_submit_commit(
         let path = std::env::temp_dir().join(format!("preloop-message-{}", std::process::id()));
         std::fs::write(&path, &message).context("write prefilled submit message")?;
         let status = std::process::Command::new("sh")
-            .args(["-c", &format!("{editor} \"$1\""), "preloop", &path.to_string_lossy()])
+            .args([
+                "-c",
+                &format!("{editor} \"$1\""),
+                "preloop",
+                &path.to_string_lossy(),
+            ])
             .status()
             .context("run $EDITOR for submit commit")?;
         if !status.success() {
@@ -3814,7 +3820,6 @@ async fn upload_git_bundle(
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("bundle upload response omitted bundle_id"))
 }
-
 
 /// Decide, after CI on a dirty tree, whether to materialize the tested tree,
 /// push it, and open a PR. Precedence: explicit `--create-pr` flag >
@@ -3947,7 +3952,6 @@ fn git_config_user_email() -> Option<String> {
     let email = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!email.is_empty()).then_some(email)
 }
-
 
 async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
     let client = build_client();
