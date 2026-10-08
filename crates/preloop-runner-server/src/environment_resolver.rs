@@ -91,12 +91,6 @@ enum RulesSource {
 
 struct ResolvedEntry {
     rules: Arc<EnvironmentRules>,
-    /// Whether the environment exists where its rules came from. `false`
-    /// only for a GitHub-sourced repository whose environment GitHub answered
-    /// 404 for (a credential that can read the repository's Actions surface,
-    /// so the 404 means "never created"). TOML-sourced entries are `true`:
-    /// the operator's config is the whole story there.
-    exists: bool,
     fetched_at: Instant,
     /// Last time a lookup or resolve touched the key (eviction clock).
     last_used: parking_lot::Mutex<Instant>,
@@ -257,76 +251,12 @@ impl EnvironmentResolver {
         repository: &str,
         environment: &str,
     ) -> anyhow::Result<Arc<EnvironmentRules>> {
-        self.resolve_entry_at(api_base, shared, repository, environment)
-            .await
-            .map(|(rules, _)| rules)
-    }
-
-    /// Whether a job naming `environment` may receive the operator's
-    /// stored environment-tier secrets (`[env_secrets]`).
-    ///
-    /// GitHub stores environment secrets *in* the environment, so a job whose
-    /// environment does not exist on GitHub gets none there. Preloop holds
-    /// the values itself (GitHub's API never returns secret values), keyed by
-    /// name; without this check a stored secret would reach any job that
-    /// names the environment even though GitHub knows no such environment
-    /// (and so applies no protection rules to it). For a GitHub-sourced
-    /// repository the answer is "the environment exists on GitHub"; for a
-    /// TOML-sourced one the operator's config is authoritative (`true`).
-    ///
-    /// A cached answer is reused regardless of its rules TTL — existence is
-    /// not what the TTL protects — and a miss resolves (fetch errors
-    /// propagate: the caller must not guess).
-    pub async fn environment_secrets_allowed(
-        &self,
-        shared: &crate::state::SharedState,
-        repository: &str,
-        environment: &str,
-    ) -> anyhow::Result<bool> {
-        self.environment_secrets_allowed_at(
-            &crate::github::github_api_base(),
-            shared,
-            repository,
-            environment,
-        )
-        .await
-    }
-
-    /// [`environment_secrets_allowed`] against an explicit API base (tests).
-    pub async fn environment_secrets_allowed_at(
-        &self,
-        api_base: &str,
-        shared: &crate::state::SharedState,
-        repository: &str,
-        environment: &str,
-    ) -> anyhow::Result<bool> {
-        let key = (repository.to_owned(), environment.to_owned());
-        if let Some(exists) = self.entries.read().get(&key).map(|entry| {
-            entry.touch();
-            entry.exists
-        }) {
-            return Ok(exists);
-        }
-        self.resolve_entry_at(api_base, shared, repository, environment)
-            .await
-            .map(|(_, exists)| exists)
-    }
-
-    /// Resolve one key to `(rules, exists)`, fetching when the cached entry
-    /// is missing or past [`RULES_TTL`].
-    async fn resolve_entry_at(
-        &self,
-        api_base: &str,
-        shared: &crate::state::SharedState,
-        repository: &str,
-        environment: &str,
-    ) -> anyhow::Result<(Arc<EnvironmentRules>, bool)> {
         let key = (repository.to_owned(), environment.to_owned());
         if let Some(entry) = self.entries.read().get(&key)
             && entry.fetched_at.elapsed() <= RULES_TTL
         {
             entry.touch();
-            return Ok((entry.rules.clone(), entry.exists));
+            return Ok(entry.rules.clone());
         }
         // Collapse concurrent resolutions for the same environment.
         let gate = {
@@ -339,7 +269,7 @@ impl EnvironmentResolver {
         {
             entry.touch();
             self.pending.lock().remove(&key);
-            return Ok((entry.rules.clone(), entry.exists));
+            return Ok(entry.rules.clone());
         }
 
         // A lookup that failed without a definitive "no App is installed"
@@ -364,13 +294,7 @@ impl EnvironmentResolver {
         // `github.pat`) — the same credential `AppState` hands the rest of
         // the server, so a config-file-only PAT covers resolution too.
         let pat = shared.state.static_github_pat();
-        // `Some(rules)` for an environment GitHub has; `None` for a 404 the
-        // credential could disambiguate (never created, so unprotected).
-        let into_entry = |fetched: Option<EnvironmentRules>| match fetched {
-            Some(rules) => (Arc::new(rules), true),
-            None => (Arc::new(EnvironmentRules::default()), false),
-        };
-        let result: anyhow::Result<(Arc<EnvironmentRules>, bool)> = if !candidates.is_empty() {
+        let result: anyhow::Result<Arc<EnvironmentRules>> = if !candidates.is_empty() {
             self.github_configured.store(true, Ordering::Release);
             // Every installed candidate mints the same scoped token for the
             // repository, so try each in turn (the push path does the same):
@@ -387,7 +311,7 @@ impl EnvironmentResolver {
                 };
                 match fetched {
                     Ok(fetched_rules) => {
-                        rules = Some(into_entry(fetched_rules));
+                        rules = Some(Arc::new(fetched_rules));
                         break;
                     }
                     Err(error) => last_error = Some(error),
@@ -410,7 +334,7 @@ impl EnvironmentResolver {
             self.github_configured.store(true, Ordering::Release);
             let rules = fetch_environment_rules(api_base, &token, repository, environment)
                 .await
-                .map(into_entry);
+                .map(Arc::new);
             if rules.is_ok() {
                 self.repo_sources
                     .write()
@@ -423,24 +347,20 @@ impl EnvironmentResolver {
             self.repo_sources
                 .write()
                 .insert(repository.to_owned(), RulesSource::Toml);
-            Ok((
-                self.toml_rules(repository, environment).unwrap_or_default(),
-                true,
-            ))
+            Ok(self.toml_rules(repository, environment).unwrap_or_default())
         };
         match result {
-            Ok((rules, exists)) => {
+            Ok(rules) => {
                 self.entries.write().insert(
                     key.clone(),
                     ResolvedEntry {
                         rules: rules.clone(),
-                        exists,
                         fetched_at: Instant::now(),
                         last_used: parking_lot::Mutex::new(Instant::now()),
                     },
                 );
                 self.pending.lock().remove(&key);
-                Ok((rules, exists))
+                Ok(rules)
             }
             Err(error) => {
                 // A resolved-but-stale entry keeps its last-known rules; a
@@ -661,40 +581,6 @@ async fn actions_readable(api_base: &str, token: &str, repository: &str) -> bool
     }
 }
 
-/// Drop the environment tier from a job's secret scope when the environment
-/// does not exist on GitHub ([`EnvironmentResolver::environment_secrets_allowed`]),
-/// so the template fill injects repository/global/run secrets only. Called
-/// on the acquire paths, right before `message_template::fill_template`.
-/// A resolution failure propagates: delivering the job with a guessed scope
-/// would either leak the tier or silently strip secrets a real environment
-/// holds.
-pub(crate) async fn restrict_environment_secret_scope(
-    shared: &crate::state::SharedState,
-    repository: &str,
-    message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
-) -> anyhow::Result<()> {
-    let Some(spec) = message.preloop_secret_spec.as_mut() else {
-        return Ok(());
-    };
-    let Some(environment) = spec.environment.clone() else {
-        return Ok(());
-    };
-    if !shared
-        .state
-        .environment_resolver
-        .environment_secrets_allowed(shared, repository, &environment)
-        .await?
-    {
-        tracing::warn!(
-            repository,
-            environment = %environment,
-            "environment does not exist on GitHub; its stored environment secrets are withheld"
-        );
-        spec.environment = None;
-    }
-    Ok(())
-}
-
 /// Fetch and map an environment's full protection rule set.
 ///
 /// Three reads: the environment record (protection rules + branch-policy
@@ -702,16 +588,12 @@ pub(crate) async fn restrict_environment_secret_scope(
 /// `custom_branch_policies` is set — GitHub 404s the endpoint otherwise),
 /// and the enabled custom deployment protection rules. `protected_branches`
 /// mode expands to the repo's protected-branch names, matched exactly.
-///
-/// `Ok(None)`: the environment does not exist on GitHub (a 404 the
-/// credential's readable Actions surface disambiguates) — no rules apply,
-/// and it holds no environment secrets on GitHub either.
 async fn fetch_environment_rules(
     api_base: &str,
     token: &str,
     repository: &str,
     environment: &str,
-) -> anyhow::Result<Option<EnvironmentRules>> {
+) -> anyhow::Result<EnvironmentRules> {
     let encoded_env = url_path_segment(environment);
     let env_path = format!("/repos/{repository}/environments/{encoded_env}");
     let Some(env_json) = github_get(api_base, token, &env_path).await? else {
@@ -728,7 +610,7 @@ async fn fetch_environment_rules(
              {repository}'s Actions surface: the 404 may be an authorization \
              failure, so the environment rules stay unresolved (fail closed)"
         );
-        return Ok(None);
+        return Ok(EnvironmentRules::default());
     };
 
     let mut rules = EnvironmentRules {
@@ -833,7 +715,7 @@ async fn fetch_environment_rules(
             })
             .unwrap_or_default();
     }
-    Ok(Some(rules))
+    Ok(rules)
 }
 
 /// One `required_reviewers` reviewer entry → our identity form.
@@ -994,6 +876,8 @@ mod tests {
     /// by these tests.
     struct StubApi {
         base: String,
+        /// `GET /repos/owner/repo/environments/prod` requests served.
+        env_hits: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StubApi {
@@ -1014,6 +898,8 @@ mod tests {
             protection_rules: Value,
             actions_readable: bool,
         ) -> Self {
+            let env_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hits = env_hits.clone();
             let stub = Router::new()
                 .route(
                     "/repos/owner/repo/environments/prod/deployment-branch-policies",
@@ -1033,6 +919,7 @@ mod tests {
                     "/repos/owner/repo/environments/prod",
                     get(move || {
                         let env = env_json.clone();
+                        hits.fetch_add(1, Ordering::SeqCst);
                         async move {
                             if env.is_null() {
                                 return Err(axum::http::StatusCode::NOT_FOUND);
@@ -1062,7 +949,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
-            Self { base }
+            Self { base, env_hits }
         }
     }
 
@@ -1605,49 +1492,33 @@ mod tests {
         ));
     }
 
-    /// Stored environment secrets follow GitHub's model: an environment
-    /// GitHub has never created holds none there, so preloop withholds the
-    /// environment tier; an environment that exists keeps it.
+    /// The reaper's refresh pass must not refetch an expired environment no
+    /// job is looking up: before the fix every expired key was refetched on
+    /// every tick, forever.
     #[tokio::test]
-    async fn environment_secrets_require_the_environment_on_github() {
-        let missing = StubApi::serve(Value::Null, json!({}), json!({})).await;
-        let _env = pat_env(&missing.base).await;
+    async fn refresh_pass_skips_expired_environments_nothing_uses() {
+        let stub = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
+        let _env = pat_env(&stub.base).await;
         let shared = shared().await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
-        assert!(
-            !resolver
-                .environment_secrets_allowed_at(&missing.base, &shared, "owner/repo", "prod")
-                .await
-                .unwrap(),
-            "an environment GitHub 404s must not release stored environment secrets"
-        );
+        resolver
+            .resolve_at(&stub.base, &shared, "owner/repo", "prod")
+            .await
+            .unwrap();
+        assert_eq!(stub.env_hits.load(Ordering::SeqCst), 1);
 
-        let present = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
-        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
-        resolver.set_github_configured();
-        assert!(
-            resolver
-                .environment_secrets_allowed_at(&present.base, &shared, "owner/repo", "prod")
-                .await
-                .unwrap(),
-            "an existing (even unprotected) environment keeps its secrets"
-        );
-    }
-
-    /// With no GitHub credential the operator's config is authoritative:
-    /// stored environment secrets apply to the named environment.
-    #[tokio::test]
-    async fn toml_sourced_environment_keeps_its_secrets() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _unset = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-        let shared = shared().await;
-        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
-        assert!(
-            resolver
-                .environment_secrets_allowed_at("http://127.0.0.1:9", &shared, "owner/repo", "prod")
-                .await
-                .unwrap()
+        resolver
+            .entries
+            .write()
+            .get_mut(&("owner/repo".to_owned(), "prod".to_owned()))
+            .unwrap()
+            .fetched_at = Instant::now().checked_sub(RULES_TTL * 2).unwrap();
+        resolver.refresh_stale(&shared).await;
+        assert_eq!(
+            stub.env_hits.load(Ordering::SeqCst),
+            1,
+            "an expired environment nothing looks up must not be refetched"
         );
     }
 }

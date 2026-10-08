@@ -99,13 +99,6 @@ Releases before v0.27.0 predate the changelog.
 
 ### Security
 
-- **Stored environment secrets require the environment on GitHub**: for a
-  repository a GitHub credential covers, `[env_secrets]` values for an
-  environment are delivered only when that environment exists on GitHub
-  (where an environment that was never created holds no secrets). Before,
-  any non-fork job that named the environment received them, with no
-  protection rules applied because GitHub knew no such environment.
-  Repositories without a GitHub credential are unchanged.
 - **The environment-rule cache is bounded to environments in use**: cached
   rules were never evicted and every expired entry was refetched each reaper
   tick, so a fork PR with a matrix of made-up environment names could pin
