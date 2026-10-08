@@ -25,7 +25,13 @@ Releases before v0.27.0 predate the changelog.
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
-  variable instead of expanding it directly into shell code.
+  variable instead of expanding it directly into shell code. The weekly rewrite
+  of the file's composed runtime keys now hands each value to `awk` as one
+  argument, so no probed value can reach a `sed` pattern, and it keeps the
+  guest-side `$(ulimit …)` reads in the best-effort messages literal instead of
+  baking the machine that ran the workflow into the file. The bump PR it opens
+  arrives without CI, because GitHub starts no workflow runs for events the
+  workflow's own token creates; the PR body says how to run the checks.
 
 - **A push to a pull request no longer piles up golden bakes**:
   `official-golden.yml` now runs under a per-PR concurrency group with
@@ -62,9 +68,12 @@ Releases before v0.27.0 predate the changelog.
   exposes does not take. The write list is built from the keys the guest
   kernel actually exposes and that differ from the hosted values, so a kernel
   missing one key still gets every other key instead of aborting the apply (a
-  missing key makes both `sysctl -w` and a direct `/proc/sys` write fail). No
-  golden rebake is required; keys a guest kernel does not expose are skipped,
-  as the hosted image's own sysctl lines for unknown keys are.
+  missing key makes both `sysctl -w` and a direct `/proc/sys` write fail). The
+  values are the `golden_sysctl_*` keys in `official-image.toml`, so the
+  scheduled drift update moves what the guest init applies together with the
+  expectation it is checked against. No golden rebake is required; keys a
+  guest kernel does not expose are skipped, as the hosted image's own sysctl
+  lines for unknown keys are.
   `vm.overcommit_memory` is deliberately left at `0` —
   a probe job on a real GitHub-hosted runner (image `20260927.320.1`, kernel
   `6.17.0-1022-azure`) reads back `0` there too, so Valkey's overcommit
@@ -83,8 +92,9 @@ Releases before v0.27.0 predate the changelog.
   validated as a hostname (`[A-Za-z0-9._-]`) and matched as a string, so it is
   never interpolated into a shell or `sed` program, and every answer the
   resolver returns — not just one of them — must be an address of this machine.
-  A launch that keeps the exec channel's identity says on stderr when it could
-  not raise the descriptor hard limit instead of skipping it silently. Resolving is not enough on its own: an AgentENV guest
+  The resolution check runs on `getent`, present in the golden and in every
+  Ubuntu base: a machine without it fails provisioning with that reason rather
+  than reporting an apply that never verified anything. Resolving is not enough on its own: an AgentENV guest
   booted with a hosts file mapping its name to an address it did **not** own
   (`10.1.0.59 runnervm…` while its interfaces carried `169.254.0.21`), and a
   check that only asks whether the name resolves passed there while every
@@ -101,10 +111,13 @@ Releases before v0.27.0 predate the changelog.
   AgentENV), below what suites that raise their own soft limit ask for
   (valkey's test suite requests 10032) and enough to make the runner die with
   `EPERM` on `setrlimit`. The runner wrapper (before it drops privileges) and
-  the container-engine launch now raise the pair next to the stack raise; a
-  launch that keeps the exec channel's identity raises it best-effort, since a
-  hard limit can only be raised by root. The earlier 524288 hard limit here was
-  a guess at what GitHub's runner service inherits — the probe shows 65536.
+  the container-engine launch now raise the pair next to the stack raise, with
+  the strict form: a raise they ran for that fails ends the launch instead of
+  handing the job a limit it was not meant to have. A launch that keeps the
+  exec channel's identity raises both pairs best-effort, since a hard limit can
+  only be raised by root, and says on stderr which limit stayed. The earlier
+  524288 hard limit here was a guess at what GitHub's runner service inherits —
+  the probe shows 65536.
 
 - **A guest step's environment no longer carries the terminal the exec channel
   booted with**: a hosted step has no `TERM` (or `COLORTERM`) in its
@@ -137,7 +150,11 @@ Releases before v0.27.0 predate the changelog.
   the raise), the container engine's own start, and the golden's preload
   daemon, whose live chain a fork inherits as its container engine. A chain
   inherited from a golden baked before this fix is re-raised in place, so
-  containers do not keep the half-sized stack either.
+  containers do not keep the half-sized stack either. Those raises are strict
+  where the launch runs as root or through passwordless sudo: a guest that
+  cannot reach the hosted pair ends the launch instead of handing the workload
+  half of GitHub's stack, while the launch that keeps the exec channel's
+  identity raises best-effort and reports the limit it had to keep.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest

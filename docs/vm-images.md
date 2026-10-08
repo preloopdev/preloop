@@ -541,13 +541,15 @@ launch raise both pairs explicitly, and the values are the image's — a probe
 of a real hosted runner (image `20260927.320.1`, kernel `6.17.0-1022-azure`)
 reads back `Max stack size 16777216 / unlimited` and `Max open files
 65536 / 65536` in a step, a `container:` job and an ad-hoc `docker run`
-alike. Without the stack raise the runner chain keeps the VM init's 8192 KiB
-and deep-recursion tests that pass on GitHub overflow the C stack — a
-`SIGSEGV`/exit 139 where Python's `RecursionError` is expected. Without the
-descriptor raise a job keeps the exec channel's defaults (1024 soft / 4096
-hard on AgentENV), below what suites that raise their own soft limit ask for
-(valkey's test suite requests 10032), and the runner dies with `EPERM` on
-`setrlimit`.
+alike. Those privileged launch sites use the strict forms, which end the
+launch when a raise they ran for fails: a workload never starts on limits it
+was not meant to have. Without the stack raise the runner chain keeps the VM
+init's 8192 KiB and deep-recursion tests that pass on GitHub overflow the C
+stack — a `SIGSEGV`/exit 139 where Python's `RecursionError` is expected.
+Without the descriptor raise a job keeps the exec channel's defaults (1024
+soft / 4096 hard on AgentENV), below what suites that raise their own soft
+limit ask for (valkey's test suite requests 10032), and the runner dies with
+`EPERM` on `setrlimit`.
 
 The raise is applied per launch, wherever a workload starts:
 
@@ -555,8 +557,8 @@ The raise is applied per launch, wherever a workload starts:
   with `runner_user` set it drops privileges after the raise, and unset or
   `root` launches are wrapped in a shell that raises and then `exec`s the
   same argv, so the exec channel's identity is untouched (those launches
-  raise the descriptor pair best-effort: a hard limit can only be raised by
-  root);
+  raise both pairs best-effort: a hard limit can only be raised by root, so
+  they keep what they inherited and say on stderr which limit stayed);
 - the container engine, because a container's processes inherit the limits
   of the chain that spawns them: the preload daemon baked into the golden
   (the engine a fork inherits) starts with the raise, a per-runner engine
@@ -611,7 +613,10 @@ address of *this* machine — loopback or a local-interface address, which is
 what a hosted runner's own entry does (GitHub's `/etc/hosts` maps `runnervm…`
 to the VM's interface address) — and replaces a foreign mapping with the
 bake's `127.0.0.1 <host>` convention (the stale line is removed, not shadowed:
-a resolver answers a name with its first match).
+a resolver answers a name with its first match). The check runs on `getent`,
+which the golden and every Ubuntu base carry; a machine without it fails
+provisioning with that reason instead of reporting an apply that never
+verified anything.
 
 **Step environment.** A hosted step's environment has no `TERM` and no
 `COLORTERM`; the `dumb` a bash step sees is bash's own default for an unset

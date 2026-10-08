@@ -786,25 +786,34 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
         })
         .expect("runner run command");
     // This pool runs `runner_user: None`, so the launch is the pass-through
-    // wrapper: `sh -c '<stack raise>; exec "$@"' sh <argv…>`. The original
+    // wrapper: `sh -c '<limits>; exec "$@"' sh <argv…>`. The original
     // argv follows the four wrapper elements untouched — that is the point of
     // the `$@` form, so nothing here is re-quoted.
     assert_eq!(run[0], "sh");
     assert_eq!(run[1], "-c");
-    assert_eq!(
-        run[2],
-        "ulimit -Hs unlimited; ulimit -Ss 16384; \
-          ulimit -Hn 65536 2>/dev/null; \
-          ulimit -Sn 65536 2>/dev/null || true; \
-          ulimit -Hn 65536 2>/dev/null || \
-          echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2; \
-          exec \"$@\""
-    );
+    assert_pass_through_limits_wrapper(&run[2]);
     assert_eq!(run[3], "sh");
     assert_eq!(
         &run[4..4 + expected_prefix.len()],
         expected_prefix.as_slice()
     );
+}
+
+/// The wrapper a `runner_user`-less launch runs: it carries the hosted limits,
+/// reports on stderr the ones it could not raise rather than failing the
+/// launch, and leaves the original argv to `$@`.
+///
+/// The exact sentence each raise prints is pinned by the orchestrator's own
+/// unit tests; what matters here is that the pool wraps a real launch with the
+/// hosted values and does not re-quote the argv it wraps.
+fn assert_pass_through_limits_wrapper(wrapper: &str) {
+    assert!(wrapper.contains("ulimit -Ss 16384"), "{wrapper}");
+    assert!(wrapper.contains("ulimit -Sn 65536"), "{wrapper}");
+    assert!(
+        !wrapper.contains("|| exit 1"),
+        "the pass-through launch must start even when it cannot raise a limit: {wrapper}"
+    );
+    assert!(wrapper.ends_with("exec \"$@\""), "{wrapper}");
 }
 
 /// Control-socket routing and failure-marker debugging are independent knobs.
@@ -859,22 +868,12 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
 
         // The prefix is everything before the runner executable itself.
         // `runner_user: None`, so the launch is the pass-through wrapper
-        // (`sh -c '<stack raise>; exec "$@"' sh`) and the original argv — env
+        // (`sh -c '<limits>; exec "$@"' sh`) and the original argv — env
         // entries included — follows it untouched.
-        assert_eq!(
-            &configure[..4],
-            [
-                "sh",
-                "-c",
-                "ulimit -Hs unlimited; ulimit -Ss 16384; \
-                  ulimit -Hn 65536 2>/dev/null; \
-                  ulimit -Sn 65536 2>/dev/null || true; \
-                  ulimit -Hn 65536 2>/dev/null || \
-                  echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2; \
-                  exec \"$@\"",
-                "sh"
-            ]
-        );
+        assert_eq!(configure[0], "sh");
+        assert_eq!(configure[1], "-c");
+        assert_pass_through_limits_wrapper(&configure[2]);
+        assert_eq!(configure[3], "sh");
         let prefix: Vec<&str> = configure[4..]
             .iter()
             .take_while(|arg| !arg.ends_with(&config.runner_binary_name))

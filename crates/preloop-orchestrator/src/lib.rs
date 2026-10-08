@@ -1798,13 +1798,23 @@ const RUNNER_ROOT: &str = "/home/runner";
 ///
 /// Soft is the hosted value; hard stays `unlimited` as the image sets it, so a
 /// step that raises its own soft limit keeps working. Raising a hard limit
-/// needs root (CAP_SYS_RESOURCE), and every launch site that applies this
-/// pair runs as root: the runner wrapper (switched or not), the container
-/// engine's own start, and the golden-side preload daemon that forks inherit.
-/// A chain already running keeps the limits it was born with, so
+/// needs root (CAP_SYS_RESOURCE), and a launch that applies this pair for a
+/// workload runs as root or through passwordless sudo: the switched runner
+/// wrapper, the container engine's own start, and the golden-side preload
+/// daemon that forks inherit. A raise that fails there ends the launch, so a
+/// workload never comes up on a stack it was not meant to have. A chain
+/// already running keeps the limits it was born with, so
 /// [`docker_start_command`] re-raises an inherited one rather than trusting
 /// it.
 const GUEST_STACK_ULIMIT: &str = GOLDEN_STACK_ULIMIT_RAISE;
+
+/// [`GUEST_STACK_ULIMIT`] for the launches that keep the exec channel's
+/// identity and therefore cannot assume root: re-setting a hard limit needs
+/// no privilege only while it does not move, so a guest that inherited a
+/// finite hard stack keeps what it has — saying so on stderr — instead of
+/// failing the launch. The privileged launch sites use the strict form above
+/// and fail loudly.
+const GUEST_STACK_ULIMIT_BEST_EFFORT: &str = GOLDEN_STACK_ULIMIT_RAISE_BEST_EFFORT;
 
 /// The file-descriptor limit GitHub's hosted images give every runner.
 ///
@@ -1823,7 +1833,9 @@ const GUEST_STACK_ULIMIT: &str = GOLDEN_STACK_ULIMIT_RAISE;
 /// Applied next to [`GUEST_STACK_ULIMIT`] on the same launch sites: the runner
 /// wrapper raises before it drops privileges (raising a hard limit needs
 /// root), and the container engine raises so its containers inherit the pair.
-/// A site that may run unprivileged gets
+/// Only the order-independent first hard raise may be refused there; a soft or
+/// pinning raise that fails ends the launch instead of leaving the workload on
+/// a pair it was not meant to have. A site that may run unprivileged gets
 /// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`] instead.
 const GUEST_NOFILE_ULIMIT: &str = GOLDEN_NOFILE_ULIMIT_RAISE;
 
@@ -2218,10 +2230,21 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
 /// the probe proves is `0` on GitHub-hosted runners too — the kernel default
 /// the guest already has. Valkey's overcommit warning is therefore fidelity,
 /// not a gap: it appears on both sides.
+///
+/// Each value is the matching `golden_sysctl_*` key in `official-image.toml`,
+/// compiled in by `build.rs`, so the scheduled drift update moves the applied
+/// value with the expectation; `guest_runtime_values_come_from_official_image_toml`
+/// fails if a pair and its key disagree.
 pub const GITHUB_GUEST_SYSCTLS: &[(&str, &str)] = &[
-    ("vm.max_map_count", "262144"),
-    ("fs.inotify.max_user_watches", "655360"),
-    ("fs.inotify.max_user_instances", "1280"),
+    ("vm.max_map_count", GOLDEN_SYSCTL_VM_MAX_MAP_COUNT),
+    (
+        "fs.inotify.max_user_watches",
+        GOLDEN_SYSCTL_FS_INOTIFY_MAX_USER_WATCHES,
+    ),
+    (
+        "fs.inotify.max_user_instances",
+        GOLDEN_SYSCTL_FS_INOTIFY_MAX_USER_INSTANCES,
+    ),
 ];
 
 /// Bring a machine's sysctls in line with GitHub's hosted image.
@@ -2351,6 +2374,12 @@ pub fn guest_hostname_script() -> String {
 /// answer left anywhere in the list still lets a consumer pick it. awk
 /// compares fields as strings, so no hostname byte is ever part of a program.
 ///
+/// The check is required, not best-effort: a machine without `getent` (the
+/// resolver lookup this runs on, present in the golden and in every Ubuntu
+/// base) cannot show that its name resolves where it must, so it fails
+/// provisioning with that reason instead of reporting an apply that never
+/// happened.
+///
 /// No `#` comments inside the generated shell text: the statements are joined
 /// with `;` and `\` continuations into one physical line, where a comment
 /// would swallow whatever follows it on the line. The rationale lives here;
@@ -2359,7 +2388,10 @@ pub fn guest_hostname_script() -> String {
 fn guest_hostname_script_at(hosts: &str) -> String {
     let hosts = shell_quote(hosts);
     format!(
-        "command -v getent >/dev/null 2>&1 || exit 0; \
+        "command -v getent >/dev/null 2>&1 || { \
+           echo 'getent is missing; the machine name cannot be checked against a local address' >&2; \
+           exit 1; \
+         }; \
          host=$(hostname 2>/dev/null || uname -n); \
          [ -n \"$host\" ] || exit 0; \
          case \"$host\" in \
@@ -2682,6 +2714,12 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// mount with EINVAL), `vfs` is forced only when fuse is unavailable too —
 /// otherwise fuse-overlayfs auto-detects and works.
 ///
+/// The launch keeps its exit status ([`run_as_root_or_sudo_strict`]): the
+/// raises and the readiness loop all end the script nonzero when they fail,
+/// and a refused passwordless sudo on the image-user branch has to reach the
+/// caller's warning rather than be swallowed — a daemon that never came up
+/// otherwise looks like a start that succeeded.
+///
 /// No `#` comments inside the generated shell text: the statements are joined
 /// with `;` and `\` continuations into one physical line, so a comment would
 /// swallow the code that follows it (the hostname-script bug fixed in
@@ -2691,7 +2729,7 @@ fn docker_start_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        run_as_root_or_sudo(&format!(
+        run_as_root_or_sudo_strict(&format!(
             "{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT}; \
              command -v dockerd >/dev/null 2>&1 || exit 0; \
              raise_engine_chain() {{ \
@@ -6874,17 +6912,17 @@ fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
 /// mis-quoted argument cannot corrupt a step command, and the exec records
 /// the pool's tests read still carry the original argv.
 ///
-/// The stack pair only needs the soft limit raised towards the existing hard
-/// one, which needs no privileges, so it works whether the exec landed on root
-/// or on the image user. The descriptor pair cannot promise that — raising a
-/// hard limit needs root — so it uses [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]: a
-/// root exec reaches the hosted 65536, and an image-user exec keeps whatever
-/// hard limit it inherited rather than failing the launch.
+/// Neither half can assume root here: raising a hard limit needs it, so the
+/// launch keeps whatever it inherited — with a line on stderr saying which
+/// limit stayed — rather than failing ([`GUEST_STACK_ULIMIT_BEST_EFFORT`],
+/// [`GUEST_NOFILE_ULIMIT_BEST_EFFORT`]). A root exec reaches the hosted pairs.
 fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
     let mut wrapped = vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        format!("{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
+        format!(
+            "{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""
+        ),
         "sh".to_owned(),
     ];
     wrapped.extend_from_slice(argv);
@@ -8343,6 +8381,11 @@ done
             "the hostname must be validated before anything uses it: {script}"
         );
         assert!(
+            script.contains("getent is missing"),
+            "a machine without the resolver lookup must fail provisioning, not skip \
+             the check: {script}"
+        );
+        assert!(
             script.contains("awk -v host=\"$host\""),
             "the name must be matched as a string, never interpolated into a program: {script}"
         );
@@ -8366,6 +8409,42 @@ done
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The resolution check runs on `getent`, so a guest that does not have it
+    /// cannot show that the machine's own name points where it must. That is a
+    /// provisioning failure with the reason, not a silent skip: the hosts file
+    /// is left alone and the machine never reaches a job with an unverified
+    /// name.
+    #[cfg(unix)]
+    #[test]
+    fn guest_hostname_script_fails_without_getent() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+
+        // A PATH with no `getent` anywhere in it.
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &guest_hostname_script_at(hosts.to_str().unwrap())])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "a machine without getent must fail provisioning"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("getent is missing"),
+            "the failure must name the missing lookup: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            "127.0.0.1 localhost\n",
+            "nothing may be rewritten when the result cannot be checked"
+        );
     }
 
     /// The fork's `/etc/hosts` carries the bake's entries but never the name
@@ -8709,6 +8788,10 @@ done
 
         // The raises are the composed keys, and those agree with the values.
         assert_eq!(GUEST_STACK_ULIMIT, cfg("golden_stack_ulimit_raise"));
+        assert_eq!(
+            GUEST_STACK_ULIMIT_BEST_EFFORT,
+            cfg("golden_stack_ulimit_raise_best_effort")
+        );
         assert_eq!(GUEST_NOFILE_ULIMIT, cfg("golden_nofile_ulimit_raise"));
         assert_eq!(
             GUEST_NOFILE_ULIMIT_BEST_EFFORT,
@@ -8717,21 +8800,33 @@ done
         assert_eq!(
             GUEST_STACK_ULIMIT,
             format!(
-                "ulimit -Hs {}; ulimit -Ss {}",
+                "ulimit -Hs {} || exit 1; ulimit -Ss {} || exit 1",
                 cfg("golden_rlimit_stack_hard"),
                 cfg("golden_rlimit_stack_soft_kib")
             ),
-            "golden_stack_ulimit_raise must compose golden_rlimit_stack_*"
+            "golden_stack_ulimit_raise must compose golden_rlimit_stack_* and fail loudly"
+        );
+        assert_eq!(
+            GUEST_STACK_ULIMIT_BEST_EFFORT,
+            format!(
+                "ulimit -Hs {hard} 2>/dev/null || true; ulimit -Ss {soft} 2>/dev/null || \
+                 echo preloop: RLIMIT_STACK stays $(ulimit -Ss)KiB soft / $(ulimit -Hs) hard - \
+                 raising it needs root and this launch keeps the exec channel identity >&2",
+                hard = cfg("golden_rlimit_stack_hard"),
+                soft = cfg("golden_rlimit_stack_soft_kib")
+            ),
+            "golden_stack_ulimit_raise_best_effort must compose golden_rlimit_stack_*"
         );
         assert_eq!(
             GUEST_NOFILE_ULIMIT,
             format!(
-                "ulimit -Hn {hard} 2>/dev/null; ulimit -Sn {soft}; ulimit -Hn {hard}",
+                "ulimit -Hn {hard} 2>/dev/null || true; ulimit -Sn {soft} || exit 1; \
+                 ulimit -Hn {hard} || exit 1",
                 hard = cfg("golden_rlimit_nofile_hard"),
                 soft = cfg("golden_rlimit_nofile_soft")
             ),
             "golden_nofile_ulimit_raise must compose golden_rlimit_nofile_* in the \
-             order-independent hard-soft-hard form"
+             order-independent hard-soft-hard form and fail loudly after the first raise"
         );
         assert_eq!(
             GUEST_NOFILE_ULIMIT_BEST_EFFORT,
@@ -8745,9 +8840,31 @@ done
             ),
             "golden_nofile_ulimit_raise_best_effort must compose golden_rlimit_nofile_*"
         );
-        assert!(
-            !GUEST_NOFILE_ULIMIT.contains("|| true"),
+        // The strict forms may ignore only the first hard raise, which the
+        // order-independent sequence expects to be refused; everything they
+        // must actually apply ends the launch instead.
+        assert_eq!(
+            GUEST_NOFILE_ULIMIT.matches("|| exit 1").count(),
+            2,
             "{GUEST_NOFILE_ULIMIT}"
+        );
+        assert!(
+            GUEST_NOFILE_ULIMIT.starts_with(
+                &format!(
+                    "ulimit -Hn {} 2>/dev/null || true; ",
+                    cfg("golden_rlimit_nofile_hard")
+                )
+            ),
+            "only the first hard raise is allowed to be ignored: {GUEST_NOFILE_ULIMIT}"
+        );
+        assert_eq!(
+            GUEST_STACK_ULIMIT.matches("|| exit 1").count(),
+            2,
+            "{GUEST_STACK_ULIMIT}"
+        );
+        assert!(
+            GUEST_STACK_ULIMIT_BEST_EFFORT.contains("RLIMIT_STACK stays"),
+            "the fallback must say what it could not raise, not swallow it"
         );
         assert!(
             GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("RLIMIT_NOFILE hard limit stays"),
@@ -8780,7 +8897,10 @@ done
             "golden_nofile_prlimit must compose the descriptor pair"
         );
 
-        // The sysctls are the file's golden_sysctl_* values.
+        // The applied sysctls are the file's `golden_sysctl_*` values: a
+        // scheduled update that moves a key moves what the init applies with
+        // it. The baseline those keys must hold is pinned independently in
+        // `tests/golden_fidelity.rs` (`guest_sysctls_match_the_hosted_image`).
         for (key, value) in GITHUB_GUEST_SYSCTLS {
             let config_key = format!("golden_sysctl_{}", key.replace('.', "_"));
             assert_eq!(
@@ -8933,13 +9053,13 @@ done
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            all.contains("ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536"),
+            all.contains(GUEST_NOFILE_ULIMIT),
             "the runner and every step it spawns must run on the hosted descriptor \
              limit (GitHub-hosted: Max open files 65536/65536), not the exec \
              channel's 1024/4096: {all}"
         );
         assert!(
-            all.contains("ulimit -Hs unlimited; ulimit -Ss 16384"),
+            all.contains(GUEST_STACK_ULIMIT),
             "the runner and every step it spawns must run on the hosted stack \
              size, not the VM init's half of it: {all}"
         );
@@ -8968,11 +9088,17 @@ done
         assert_eq!(command[0], "sh");
         assert_eq!(command[1], "-c");
         let script = &command[2];
-        // `run_as_root_or_sudo` splices the launch inline for the root branch
-        // and base64'd for the image-user branch; both carry the same script,
-        // so the inline copy is the one to order-check.
+        // The strict root-or-sudo wrapper splices the launch inline for the
+        // root branch and base64'd for the image-user branch; both carry the
+        // same script, so the inline copy is the one to order-check. It keeps
+        // the status of what it runs, so a refused sudo cannot look like a
+        // daemon that started.
+        assert!(
+            script.contains("base64 -d | sudo -n sh; fi"),
+            "the image-user branch must preserve the failure status: {script}"
+        );
         let raise = script
-            .find("ulimit -Hs unlimited; ulimit -Ss 16384")
+            .find(GUEST_STACK_ULIMIT)
             .unwrap_or_else(|| {
                 panic!("the container engine must start with the hosted stack limit: {script}")
             });
@@ -8980,7 +9106,7 @@ done
         // descriptor pair GitHub-hosted containers carry (65536/65536) has to
         // be raised here too, in the same launch.
         let nofile = script
-            .find("ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536")
+            .find(GUEST_NOFILE_ULIMIT)
             .unwrap_or_else(|| {
                 panic!("the container engine must start on the hosted descriptor limit: {script}")
             });
@@ -9059,10 +9185,10 @@ done
         assert_eq!(command[1], "-c");
         let script = &command[2];
         let raise = script
-            .find("ulimit -Hs unlimited; ulimit -Ss 16384")
+            .find(GUEST_STACK_ULIMIT)
             .unwrap_or_else(|| panic!("the preloaded engine must be raised: {script}"));
         let nofile = script
-            .find("ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536")
+            .find(GUEST_NOFILE_ULIMIT)
             .unwrap_or_else(|| {
                 panic!("the preloaded engine must carry the hosted descriptor limit: {script}")
             });
@@ -9077,11 +9203,11 @@ done
     }
 
     /// A `runner_user`-less (or `root`) launch keeps the exec channel's
-    /// identity, so it must not assume it can raise a hard limit. Pin both
-    /// halves of that: the wrapper adds the hosted stack pair and the
-    /// best-effort descriptor pair without re-quoting the argv it wraps, and
-    /// the best-effort pair survives a low inherited hard limit where the
-    /// strict form the privileged sites use fails.
+    /// identity, so it must not assume it can raise a hard limit — neither
+    /// pair's. Pin both halves of that: the wrapper adds the two best-effort
+    /// pairs without re-quoting the argv it wraps, and those survive an
+    /// inherited hard limit below the hosted one, where the strict forms the
+    /// privileged sites use fail the launch instead.
     #[test]
     fn pass_through_launch_adds_the_hosted_limits_without_switching_accounts() {
         let config = test_config(false);
@@ -9093,10 +9219,19 @@ done
         let wrapped = as_runner_user(&config, &argv);
         assert_eq!(wrapped[0], "sh");
         assert_eq!(wrapped[1], "-c");
-        assert!(wrapped[2].contains(GUEST_STACK_ULIMIT), "{}", wrapped[2]);
+        assert!(
+            wrapped[2].contains(GUEST_STACK_ULIMIT_BEST_EFFORT),
+            "{}",
+            wrapped[2]
+        );
         assert!(
             wrapped[2].contains(GUEST_NOFILE_ULIMIT_BEST_EFFORT),
             "{}",
+            wrapped[2]
+        );
+        assert!(
+            !wrapped[2].contains("|| exit 1"),
+            "the pass-through launch must not fail on a limit it cannot raise: {}",
             wrapped[2]
         );
         assert!(wrapped[2].contains("exec \"$@\""), "{}", wrapped[2]);
@@ -9162,17 +9297,78 @@ done
                 "a root exec must reach the hosted pair"
             );
         }
-        // The strict form the privileged sites use has no fallback: its exit
-        // status is the raise's, which is what makes a failed raise on a root
-        // launch observable instead of silent.
+        // The strict form the privileged sites use has no fallback past its
+        // first hard raise: the raises it must apply end the launch, which is
+        // what makes a failed raise observable instead of silent.
         assert_eq!(
-            GUEST_NOFILE_ULIMIT, "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536; ulimit -Hn 65536",
+            GUEST_NOFILE_ULIMIT,
+            format!(
+                "ulimit -Hn {hard} 2>/dev/null || true; ulimit -Sn {soft} || exit 1; \
+                 ulimit -Hn {hard} || exit 1",
+                hard = GOLDEN_RLIMIT_NOFILE_HARD,
+                soft = GOLDEN_RLIMIT_NOFILE_SOFT
+            ),
             "the privileged form must stay strict"
         );
         assert!(
             GUEST_NOFILE_ULIMIT_BEST_EFFORT.contains("|| true"),
             "the fallback must swallow only the raise's failure"
         );
+    }
+
+    /// The stack pair's best-effort form exists for the same reason the
+    /// descriptor one does: re-setting a hard limit needs no privilege only
+    /// while it does not move, so a launch that keeps the exec channel's
+    /// identity and inherits a finite hard stack must still start — with a
+    /// line saying which limit stayed — where the strict form the privileged
+    /// sites use ends the launch.
+    #[cfg(unix)]
+    #[test]
+    fn pass_through_stack_raise_is_best_effort() {
+        let run = |limits: &str| {
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        // A finite hard stack under a soft limit it can hold:
+                        // the pair a hardened base can hand a launch.
+                        "ulimit -Ss 8192; ulimit -Hs 8192; \
+                         start=\"$(ulimit -Ss)/$(ulimit -Hs)\"; {limits}; \
+                         printf '%s -> %s/%s' \"$start\" \"$(ulimit -Ss)\" \"$(ulimit -Hs)\""
+                    ),
+                ])
+                .output()
+                .unwrap()
+        };
+        let best_effort = run(GUEST_STACK_ULIMIT_BEST_EFFORT);
+        assert!(
+            best_effort.status.success(),
+            "a launch that cannot raise the hard stack must still start: {}",
+            String::from_utf8_lossy(&best_effort.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&best_effort.stderr);
+        assert!(
+            stderr.is_empty() || stderr.contains("RLIMIT_STACK stays"),
+            "the fallback must either reach the hosted pair silently or say what it \
+             could not raise: {stderr}"
+        );
+        // Either the raise took (root, or a platform that permits raising the
+        // hard stack) or the launch kept what it inherited — never a third
+        // state, and never a failure.
+        let pair = String::from_utf8_lossy(&best_effort.stdout).to_string();
+        let (start, end) = pair
+            .split_once(" -> ")
+            .unwrap_or_else(|| panic!("the inherited pair must be readable: {pair}"));
+        assert!(
+            end == "16384/unlimited" || end == start,
+            "the best-effort stack must be the hosted one or the inherited one, got {pair:?}"
+        );
+        if end == start {
+            assert!(
+                stderr.contains("RLIMIT_STACK stays"),
+                "keeping the inherited stack must be reported: {pair:?} {stderr}"
+            );
+        }
     }
 
     /// The strict nofile raise must reach the hosted 65536/65536 from both
@@ -9207,7 +9403,8 @@ done
             })
             .expect("a POSIX shell must be available");
         // Set up the inherited pair, record it, run the raise, record the
-        // result: `start -> end`, hard/soft.
+        // result: `start -> end`, hard/soft. A raise the strict form ends the
+        // launch on leaves no line behind — the exit status is the signal.
         let run = |setup: &str| {
             std::process::Command::new(shell)
                 .args([
@@ -9224,24 +9421,29 @@ done
         let root = String::from_utf8_lossy(&uid.stdout).trim() == "0";
 
         // (soft 1024, hard 4096): the pair AgentENV's exec channel hands a
-        // job. Only root can raise the hard limit; an unprivileged strict
-        // raise cannot move either limit and must leave the pair alone.
+        // job. Only root can raise the hard limit, so an unprivileged strict
+        // raise must end the launch rather than leave the pair below the
+        // hosted one.
         let below = run("ulimit -Sn 1024; ulimit -Hn 4096");
-        let below = String::from_utf8_lossy(&below.stdout).to_string();
-        let (start, end) = below
-            .split_once(" -> ")
-            .unwrap_or_else(|| panic!("the low pair must be settable: {below}"));
-        assert_eq!(start, "4096/1024", "{below}");
+        let below_out = String::from_utf8_lossy(&below.stdout).to_string();
         if root {
+            let (start, end) = below_out
+                .split_once(" -> ")
+                .unwrap_or_else(|| panic!("the low pair must be settable: {below_out}"));
+            assert_eq!(start, "4096/1024", "{below_out}");
             assert_eq!(
                 end, "65536/65536",
-                "a privileged launch must reach the hosted pair from below: {below}"
+                "a privileged launch must reach the hosted pair from below: {below_out}"
             );
         } else {
-            assert_eq!(
-                end, "4096/1024",
-                "an unprivileged launch cannot raise the hard limit and must keep \
-                 what it inherited: {below}"
+            assert!(
+                !below.status.success(),
+                "an unprivileged launch that cannot raise the hard limit must fail \
+                 the strict form, not continue below the hosted pair: {below_out}"
+            );
+            assert!(
+                !below_out.contains(" -> "),
+                "the launch must end before it reports a pair it never reached: {below_out}"
             );
         }
 
@@ -9250,22 +9452,28 @@ done
         // limit above the target, under a hard limit at or above it). The hard
         // is capped at the hosted 1048576 when the host reports `unlimited`
         // (macOS) or higher; a Linux runner's inherited 524288 works as-is.
+        // Both limits only come down here, so no privilege is needed.
         let above = run(
             "H=$(ulimit -Hn); case \"$H\" in unlimited|*[!0-9]*) H=1048576 ;; esac; \
              if [ \"$H\" -gt 1048576 ]; then H=1048576; fi; \
              ulimit -Hn \"$H\" 2>/dev/null; ulimit -Sn \"$H\"; ulimit -Hn \"$H\"",
         );
-        let above = String::from_utf8_lossy(&above.stdout).to_string();
-        let (start, end) = above
+        assert!(
+            above.status.success(),
+            "coming down from a higher pair must not fail the launch: {}",
+            String::from_utf8_lossy(&above.stderr)
+        );
+        let above_out = String::from_utf8_lossy(&above.stdout).to_string();
+        let (start, end) = above_out
             .split_once(" -> ")
-            .unwrap_or_else(|| panic!("the high pair must be settable: {above}"));
+            .unwrap_or_else(|| panic!("the high pair must be settable: {above_out}"));
         let start_pair = |value: &str| {
             value
                 .split('/')
                 .map(|part| match part {
                     "unlimited" => u64::MAX,
                     other => other.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("the highest pair must read back as limits: {above}")
+                        panic!("the highest pair must read back as limits: {above_out}")
                     }),
                 })
                 .collect::<Vec<_>>()
@@ -9273,7 +9481,7 @@ done
         let limits = start_pair(start);
         assert!(
             limits.len() == 2,
-            "the highest pair must be hard/soft: {above}"
+            "the highest pair must be hard/soft: {above_out}"
         );
         let (hard, soft) = (limits[0], limits[1]);
         let target = GOLDEN_RLIMIT_NOFILE_SOFT.parse::<u64>().unwrap();
@@ -9281,16 +9489,16 @@ done
             // The host's hard limit is below the hosted value and cannot be
             // raised without privilege, so there is no above-target pair to
             // hold; the below-target case above still covers that host.
-            eprintln!("no above-target nofile pair on this host: {above}");
+            eprintln!("no above-target nofile pair on this host: {above_out}");
             return;
         }
         assert!(
             soft >= target,
-            "the soft limit must have been raised to the hard one: {above}"
+            "the soft limit must have been raised to the hard one: {above_out}"
         );
         assert_eq!(
             end, "65536/65536",
-            "a pair above the target must come down to the hosted one: {above}"
+            "a pair above the target must come down to the hosted one: {above_out}"
         );
     }
 
@@ -9356,8 +9564,11 @@ done
             assert_eq!(wrapped[1], "-c", "{user:?}");
             assert_eq!(
                 wrapped[2],
-                format!("{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; exec \"$@\""),
-                "the pass-through launch must run on the hosted limits: {user:?}"
+                format!(
+                    "{GUEST_STACK_ULIMIT_BEST_EFFORT}; {GUEST_NOFILE_ULIMIT_BEST_EFFORT}; \
+                     exec \"$@\""
+                ),
+                "the pass-through launch must run on the hosted limits best-effort: {user:?}"
             );
             // The original argv travels as the shell's positional parameters,
             // so nothing is re-quoted and the launch is untouched.

@@ -93,6 +93,15 @@ jobs:
           cfg() {
             awk -F'"' -v k="^$1 = " '$0 ~ k { print $2; exit }' official-image.toml
           }
+          # Rewrite one flat `key = "value"` line in place. The value arrives as
+          # an argument, so neither sed metacharacters nor `&` in a probed value
+          # can reach a pattern, and nothing in it is expanded by this shell.
+          set_key() {
+            awk -v key="$1" -v value="$2" \
+              'index($0, key " = ") == 1 { print key " = \"" value "\""; next } { print }' \
+              official-image.toml > official-image.toml.next
+            mv official-image.toml.next official-image.toml
+          }
           changed=0
           for artifact in golden-runtime-*.txt; do
             while IFS='=' read -r key value; do
@@ -104,7 +113,7 @@ jobs:
               fi
               if [ "$pinned" != "$value" ]; then
                 echo "$key drifted: $pinned -> $value (from $artifact)"
-                sed -i "s|^${key} = \".*\"$|${key} = \"${value}\"|" official-image.toml
+                set_key "$key" "$value"
                 changed=1
               fi
             done < "$artifact"
@@ -114,13 +123,52 @@ jobs:
             exit 0
           fi
           # The composed keys the init uses must follow the primitive ones, or
-          # guest_runtime_values_come_from_official_image_toml fails in CI.
-          sed -i "s|^golden_stack_ulimit_raise = \".*\"$|golden_stack_ulimit_raise = \"ulimit -Hs $(cfg golden_rlimit_stack_hard); ulimit -Ss $(cfg golden_rlimit_stack_soft_kib)\"|" official-image.toml
-          sed -i "s|^golden_nofile_ulimit_raise = \".*\"$|golden_nofile_ulimit_raise = \"ulimit -Hn $(cfg golden_rlimit_nofile_hard) 2>/dev/null; ulimit -Sn $(cfg golden_rlimit_nofile_soft); ulimit -Hn $(cfg golden_rlimit_nofile_hard)\"|" official-image.toml
-          sed -i "s|^golden_nofile_ulimit_raise_best_effort = \".*\"$|golden_nofile_ulimit_raise_best_effort = \"ulimit -Hn $(cfg golden_rlimit_nofile_hard) 2>/dev/null; ulimit -Sn $(cfg golden_rlimit_nofile_soft) 2>/dev/null \\|\\| true; ulimit -Hn $(cfg golden_rlimit_nofile_hard) 2>/dev/null \\|\\| echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2\"|" official-image.toml
-          sed -i "s|^golden_stack_soft_bytes = \".*\"$|golden_stack_soft_bytes = \"$(( $(cfg golden_rlimit_stack_soft_kib) * 1024 ))\"|" official-image.toml
-          sed -i "s|^golden_stack_prlimit = \".*\"$|golden_stack_prlimit = \"$(cfg golden_stack_soft_bytes):$(cfg golden_rlimit_stack_hard)\"|" official-image.toml
-          sed -i "s|^golden_nofile_prlimit = \".*\"$|golden_nofile_prlimit = \"$(cfg golden_rlimit_nofile_soft):$(cfg golden_rlimit_nofile_hard)\"|" official-image.toml
+          # guest_runtime_values_come_from_official_image_toml fails in CI. The
+          # guest-side command substitutions in the best-effort messages are
+          # single-quoted so this job cannot expand them into its own values.
+          stack_hard="$(cfg golden_rlimit_stack_hard)"
+          stack_soft="$(cfg golden_rlimit_stack_soft_kib)"
+          nofile_hard="$(cfg golden_rlimit_nofile_hard)"
+          nofile_soft="$(cfg golden_rlimit_nofile_soft)"
+          set_key golden_stack_ulimit_raise \
+            "ulimit -Hs ${stack_hard} || exit 1; ulimit -Ss ${stack_soft} || exit 1"
+          set_key golden_stack_ulimit_raise_best_effort \
+            "ulimit -Hs ${stack_hard} 2>/dev/null || true; ulimit -Ss ${stack_soft} 2>/dev/null || echo preloop: RLIMIT_STACK stays "'$(ulimit -Ss)'"KiB soft / "'$(ulimit -Hs)'" hard - raising it needs root and this launch keeps the exec channel identity >&2"
+          set_key golden_nofile_ulimit_raise \
+            "ulimit -Hn ${nofile_hard} 2>/dev/null || true; ulimit -Sn ${nofile_soft} || exit 1; ulimit -Hn ${nofile_hard} || exit 1"
+          set_key golden_nofile_ulimit_raise_best_effort \
+            "ulimit -Hn ${nofile_hard} 2>/dev/null; ulimit -Sn ${nofile_soft} 2>/dev/null || true; ulimit -Hn ${nofile_hard} 2>/dev/null || echo preloop: RLIMIT_NOFILE hard limit stays "'$(ulimit -Hn)'" - raising it needs root and this launch keeps the exec channel identity >&2"
+          set_key golden_stack_soft_bytes \
+            "$(( $(cfg golden_rlimit_stack_soft_kib) * 1024 ))"
+          set_key golden_stack_prlimit \
+            "$(cfg golden_stack_soft_bytes):$(cfg golden_rlimit_stack_hard)"
+          set_key golden_nofile_prlimit \
+            "$(cfg golden_rlimit_nofile_soft):$(cfg golden_rlimit_nofile_hard)"
+          # A bump PR arrives without CI (the workflow token starts no runs), so
+          # the two ways this job can silently ship a wrong key are checked
+          # here: the strict forms must keep failing on a raise they ran for,
+          # and the best-effort messages must keep the guest-side substitution
+          # that reads the limit inside the guest instead of this runner's.
+          for key in golden_stack_ulimit_raise golden_nofile_ulimit_raise; do
+            case "$(cfg "$key")" in
+              *'|| exit 1')
+                ;;
+              *)
+                echo "::error::$key must end with the strict raise"
+                exit 1
+                ;;
+            esac
+          done
+          for key in golden_stack_ulimit_raise_best_effort golden_nofile_ulimit_raise_best_effort; do
+            case "$(cfg "$key")" in
+              *'$(ulimit -'*)
+                ;;
+              *)
+                echo "::error::$key must read the limit inside the guest"
+                exit 1
+                ;;
+            esac
+          done
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # The checkout keeps `persist-credentials: false`; authenticate the
@@ -132,6 +180,9 @@ jobs:
           git diff --cached --stat
           git commit -m "chore(golden): update the golden runtime values from a hosted-runner probe"
           git push -u origin "$BRANCH"
+          # A branch pushed with the workflow's own token does not start
+          # `pull_request` workflows, so this PR arrives without CI; a
+          # maintainer can close and reopen it to run the checks.
           gh pr create --base main --head "$BRANCH" \
             --title "chore(golden): update the golden runtime values from a hosted-runner probe" \
-            --body "The weekly probe of real GitHub-hosted \`ubuntu-24.04\` and \`ubuntu-24.04-arm\` runners found a golden runtime value that no longer matches \`official-image.toml\`. Merging updates the file the guest init, the parity fixture and the CI job all derive from; the diff above is the reviewable record of what GitHub changed."
+            --body "The weekly probe of real GitHub-hosted \`ubuntu-24.04\` and \`ubuntu-24.04-arm\` runners found a golden runtime value that no longer matches \`official-image.toml\`. Merging updates the file the guest init, the parity fixture and the CI job all derive from; the diff above is the reviewable record of what GitHub changed. This PR was opened by the workflow's own token, and GitHub starts no workflow runs for events that token creates: close and reopen it (or push a commit) to run CI, or point the workflow at a GitHub App or PAT."
