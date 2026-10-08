@@ -1331,21 +1331,35 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     // Completing `a` releases `g1` and re-parks `aw`.
     complete("a").await;
 
-    let hold: Option<i32> = node
+    let hold: Option<(String, Option<String>)> = node
         .writer()
         .await
         .unwrap()
         .query_opt(
-            "SELECT 1 FROM concurrency_holds \
+            "SELECT holder_kind, holder_job_id FROM concurrency_holds \
              WHERE repository='owner/repo' AND group_name='g1'",
             &[],
         )
         .await
         .unwrap()
-        .map(|row| row.get(0));
+        .map(|row| (row.get(0), row.get(1)));
+    let cohort: Vec<(String, String)> = node
+        .writer()
+        .await
+        .unwrap()
+        .query(
+            "SELECT job_id, status || '/' || queue_state FROM jobs \
+             WHERE run_id=$1::text::uuid AND base_id='m' ORDER BY job_order",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
     assert!(
         hold.is_none(),
-        "a re-parked waiter must not leave the finished holder's row behind"
+        "a re-parked waiter must not leave the finished holder's row behind; hold={hold:?}, cohort={cohort:?}"
     );
     let reparked: Option<i64> = node
         .writer()
@@ -1821,6 +1835,7 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
     node.submit_run(submit_run(run_id, vec![build, leg0, leg1, leg2]))
         .await
         .unwrap();
+    let runner = node.register_runner(register_runner("fail-fast")).await.unwrap();
 
     let mut client = node.writer().await.unwrap();
     let tx = client.transaction().await.unwrap();
@@ -1849,9 +1864,9 @@ async fn cancel_fail_fast_siblings_cancels_legs() {
     for leg in ["build-1", "build-2"] {
         tx.execute(
             "INSERT INTO job_assignments (run_id, job_id, runner_id) \
-             VALUES ($1::text::uuid, $2, 1) \
+             VALUES ($1::text::uuid, $2, $3) \
              ON CONFLICT (run_id, job_id) DO NOTHING",
-            &[&run, &leg],
+            &[&run, &leg, &runner.runner.id],
         )
         .await
         .unwrap();
