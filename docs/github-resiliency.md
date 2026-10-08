@@ -19,8 +19,8 @@ Target production shape (assumed throughout):
 
 - a hosted control plane on its own domain, behind a load balancer;
 - **≥2 stateless engine replicas** sharing **HA Postgres**;
-- Tailscale Funnel / the macstudio dev host are where failures were *observed*,
-  not the deployment we design for.
+- the single-host dev deployment where the failures were *observed* is not the
+  shape we design for; it must not be assumed anywhere below.
 
 Non-goals (explicitly deferred): multi-region active-active ingest, an edge
 relay/queue in front of the LB, replacing Postgres with a message bus (§8).
@@ -30,27 +30,27 @@ relay/queue in front of the LB, replacing Postgres with a message bus (§8).
 | Property | Reality |
 |---|---|
 | Webhook delivery | **At most once.** A non-2xx, a >10 s response, or an unreachable host is final; GitHub never retries by itself. Only the App's delivery history (3 days) can be redelivered, via UI or `POST /app/hook/deliveries/{id}/attempts`. |
-| `githubstatus.com` | Can be green through a real partial failure (2026-10-07: API 500s for ~11 min, status green). It is not a detection source. |
+| `githubstatus.com` | Can be green through a real partial failure (observed: 11 min of API 500s with status green). It is not a detection source. |
 | API vs git vs webhooks | Independent failure domains: REST 500s while `git push` works; webhook delivery fine while `POST /git/blobs` 500s. |
 | `refs/pull/N/merge` | **Mutable.** GitHub recomputes it when the base or head moves; the old merge commit becomes unreachable. `pull_request.merge_commit_sha` in a payload is a point-in-time value. |
 | Rate limits | Per-installation REST budgets with primary limits and secondary (`retry-after`) throttles; `git` protocol is separate. |
 | App auth | App JWT (10 min) → installation token (1 h). Minting is its own failure domain. |
-| Event volume | Mostly self-inflicted: an App with `checks: write` is auto-subscribed to `check_run`/`check_suite` and receives an echo of **every check run it creates**. Observed prod load: 500–1000 deliveries/h, mostly `check_run`. |
+| Event volume | Mostly self-inflicted: an App with `checks: write` is auto-subscribed to `check_run`/`check_suite` and receives an echo of **every check run it creates**. Load is dominated by those echoes (hundreds to ~1000 deliveries/h on a busy installation), not by user activity. |
 
 ## 3. Where the current design breaks
 
-Observed in production on 2026-10-07 (GitHub incident ~15:06–15:17Z; app
-tokens, check-runs, review-thread mutations and `POST /git/blobs` all 500;
-REST ref writes kept working).
+Observed in production during a GitHub API failure (app tokens, check-runs,
+review-thread mutations and `POST /git/blobs` returned 500; REST ref writes
+kept working).
 
 ### 3.1 Failure shapes
 
 1. **Processing failures are lost forever.** The durable worker retries a
    transient failure 6 times in ~2 min, then dead-letters the row
    (`WEBHOOK_MAX_ATTEMPTS = 6`, ladder `[1,1,5,15,30]s` — `github.rs:1677`,
-   `:1693-1699`; dead letter at `:2426-2430`, `:2607-2630`). Nine deliveries
-   died that way — pushes, creates, deletes, an `issue_comment` — with errors
-   like `failed to resolve webhook workflow ref SHA: GitHub returned 500` and
+   `:1693-1699`; dead letter at `:2426-2430`, `:2607-2630`). Deliveries died
+   that way (pushes, creates, deletes, an `issue_comment`) with errors like
+   `failed to resolve webhook workflow ref SHA: GitHub returned 500` and
    `Failed to fetch workflows at event commit: 500`. The watchdog only repairs
    GUIDs **missing** from the local table; a row that exists and is `failed`
    counts as *present* (`webhook_watchdog.rs:364-375`), so it is never
@@ -65,8 +65,8 @@ REST ref writes kept working).
    (`:49`, `:172-176`) a truncated pass credits nothing and persists only
    `scan_cursor` (`:425-434`); on completion the cursor resets to page 1 and
    the next poll re-walks from the top. Every walk is therefore a full crawl
-   from the top whose length grows with the watermark depth. Observed:
-   watermark 04:49Z while the clock read 15:23Z — **10.5 h behind**.
+   from the top whose length grows with the watermark depth. Observed: the
+   watermark **10.5 h behind** the clock.
 3. **Refused redeliveries wait on that crawl.** `repair_delivery`
    (`webhook_watchdog.rs:452-556`) is only reachable from the examined-item
    loop (`:383-387`), so a redelivery GitHub refused (500 → attempt 1 recorded)
@@ -74,7 +74,7 @@ REST ref writes kept working).
    is still newer than the watermark, older than the grace boundary, and past
    its per-GUID backoff. In the >`max_pages` case that is the crawl cadence;
    in the ≤`max_pages` case the watermark moves past the item and the open
-   repair row (`webhook_repairs_pending: 1`) persists forever.
+   repair row (`webhook_repairs_pending`, stuck open) persists forever.
 4. **Ingest returns 500 on a slow store.** `handle_github_webhook` commits the
    delivery row with an 8 s / 2-attempt budget and otherwise returns 500 —
    `Failed to commit webhook delivery row — returning 500; redelivery is
@@ -182,11 +182,14 @@ Changes from today:
   §4.6), then unlinks. Spool depth > 0 is an alert (`events_spool_depth`).
   Durability boundary: the spool survives a process restart on the same host,
   **not** host loss — that is the reconciler's job.
-- **Retain the GUID-presence contract.** Every verified delivery gets a row,
-  even when it will be filtered (e.g. a `check_run` created echo): the row
-  lands in a terminal `ignored`/`done` state with a reason. The watchdog's
-  "no local row ⇒ missing" join (`webhook_watchdog.rs:354-375`) depends on
-  this; a filtered-but-absent delivery would otherwise be redelivered forever.
+- **Retain the GUID-presence contract, per delivery.** Every verified delivery
+  gets a `delivery_guid`-keyed **receipt** row (`event_deliveries`, §4.4) even
+  when it is filtered (e.g. a `check_run` created echo) *and* even when it
+  collapses into an event that another source already queued. The event then
+  carries the terminal `ignored`/`done`/`failed` state with a reason. The
+  watchdog's "no local row ⇒ missing" join (`webhook_watchdog.rs:354-375`)
+  depends on this; a filtered-but-absent delivery would otherwise be
+  redelivered forever.
 
 ### 4.4 The `events` table
 
@@ -200,7 +203,7 @@ events (
   source          text not null,        -- push | webhook | reconciler | watchdog | schedule
   kind            text not null,        -- push | pull_request | issue_comment | check_run | ...
   dedupe_key      text not null,        -- canonical identity, see §4.6
-  delivery_guid   text,                 -- x-github-delivery; null for synthesized
+  delivery_guid   text,                 -- the delivery that created this row, others are receipts
   installation_id bigint,
   repository      text not null,
   git_ref         text,
@@ -240,6 +243,31 @@ events (
   #370, **not on main**) replaces that with refinery migrations; deliverable 1
   is written for main's convention and rebased onto #372's if it lands first.
 
+**Delivery receipts.** The queue row is per *fact*; a delivery is per *attempt
+to tell us about it*. Collapsing deliveries into one `events` row (a GitHub
+redelivery, a webhook arriving after a synthesized event) would otherwise
+destroy the GUID the watchdog joins on, so receipts are their own table:
+
+```sql
+event_deliveries (
+  delivery_guid text primary key,     -- x-github-delivery
+  event_id      uuid not null references events(event_id),
+  app_id        text not null,
+  received_at   timestamptz not null default now(),
+  state         text not null,        -- received | done | ignored (the event holds done/failed)
+  reason        text                  -- filter or duplicate reason, for the operator
+)
+```
+
+Every verified delivery inserts its own receipt — including the ones that add
+no queue row. Two deliveries for the same fact have two distinct GUIDs and
+both receipts exist, so the watchdog never sees a "missing" GUID it would
+redeliver until the attempt cap turns into a permanent false finding. Presence
+means "a receipt exists"; the **event's** state decides what happens next
+(`done`/`ignored` nothing, `failed` requeued from the retained payload —
+§4.9 item 2), and the reason records why a delivery that changed nothing was
+dropped. Retention matches the event's (30 days).
+
 **Exactly-once effects, honestly.** Claiming the event and creating runs
 cannot literally be one transaction — processing performs GitHub reads in
 between, and holding a DB transaction across network I/O is a deadlock
@@ -253,6 +281,7 @@ commit:  ONE transaction
            ledger upsert        (§4.6)
            outbox rows          (check runs, PR writes)
            event → done         (fenced on lease_token)
+           receipts → done      (done | ignored, same fence)
 ```
 
 Retry after a crash is safe because `runs` keeps its unique index on
@@ -263,7 +292,9 @@ idempotency the webhook path already relies on (`control/lite/submit.rs:20-22`,
 transaction.
 
 `runs.webhook_delivery_id` becomes `runs.event_id` (same uniqueness). The
-watchdog join reads `events.delivery_guid`.
+watchdog join reads `event_deliveries.delivery_guid` for presence and then the
+event's `state` — a `failed` event is repaired from the retained payload, not
+by asking GitHub again (§4.9 item 2).
 
 ### 4.5 Retry by error class
 
@@ -299,7 +330,7 @@ Three layers, each with a different job:
 
 | Layer | Key | Purpose |
 |---|---|---|
-| Delivery | `delivery_guid` (PK-ish) | absorb GitHub redeliveries of the same payload |
+| Delivery | `delivery_guid` (PK) | one receipt row per delivery (§4.4); absorbs GitHub redeliveries of the same payload |
 | Event | `(kind, dedupe_key)` unique | collapse webhook / pushed / synthesized events for the same GitHub fact |
 | Run | `(event_id, workflow_path)` unique | a replayed event never creates a second run for the same workflow |
 
@@ -308,7 +339,7 @@ Canonical keys:
 | Kind | `dedupe_key` | Notes |
 |---|---|---|
 | `push` | `repository + "\0" + ref + "\0" + head_sha` | `after` for webhooks; ledger head for synthesized; the pushed commit for native `preloop push` |
-| `pull_request` | `repository + "\0" + pr_number + "\0" + head_sha + "\0" + action` | action is part of the key: `types: [opened]` must not be satisfied by a `synchronize` |
+| `pull_request` | `repository + "\0" + pr_number + "\0" + head_sha + "\0" + base_sha + "\0" + action` | the tested fact is the pair: `action` keeps `types: [opened]` from being satisfied by a `synchronize`, and `base_sha` keeps a base-only move (§4.8) from collapsing into the event that already ran for the old base |
 | `check_run` / `check_suite` | delivery GUID | re-requests are per-delivery; never synthesized |
 | `issue_comment`, `issues`, `release`, … | delivery GUID | watchlist replay only (they cannot be rebuilt faithfully) |
 | `workflow_dispatch` / `repository_dispatch` | `repository + "\0" + event + "\0" + payload digest` | dedupe a double-submitted dispatch |
@@ -329,15 +360,21 @@ processed_heads (
   git_ref     text not null,
   sha         text not null,
   kind        text not null,       -- push | pull_request
+  base_sha    text not null default '',  -- PR base tip that was tested; '' for push
+  merge_sha   text,                -- locally computed merge commit that was tested (§4.7)
   run_ids     uuid[] not null default '{}',
   processed_at timestamptz not null default now(),
-  primary key (repository, git_ref, sha, kind)
+  primary key (repository, git_ref, sha, kind, base_sha)
 )
 ```
 
 Ledger rows are written in the same transaction as the run(s) they caused.
 Retention is independent of run archival (a run may be archived at 90 days;
 the ledger keeps 180) so a post-archival reconcile does not re-fire old heads.
+For `kind = pull_request` the row records the base tip along with the head,
+because the tested commit is a function of both (§4.7): a head that is already
+in the ledger under a different base is *not* processed, and a base-only move
+writes its own row.
 
 **`preloop push` is a first-class source.** A native submission writes a
 `source = push` event with the canonical push key; when GitHub later delivers
@@ -357,31 +394,49 @@ order becomes:
 | Event SHA | payload → **local mirror** → REST `commits/{ref}` | payload → local workspace → REST (`github.rs:1524-1589`) |
 | Workflow YAML at a SHA | **local mirror** → REST contents → git protocol | local workspace → REST contents (`github.rs:1318-1500`) |
 | PR changed files (`paths:` filters) | **local mirror diff** (`git diff --name-only base..head`) → REST | REST only (`github.rs:1581-1662`) |
-| PR merge commit | **computed locally** with `git merge-tree` → REST `pulls/{n}` | payload `merge_commit_sha`, never re-resolved |
+| PR merge commit | **computed locally** with `git merge-tree` → REST `pulls/{n}` (recorded as `merge_source`) | payload `merge_commit_sha`, never re-resolved |
 | Installation tokens (server-side reads) | cached per `(app, repo, scope-set)`, refreshed at half-life | minted per call (`github_app.rs:806-885`) |
 
 The **local mirror** is new: one bare repo per `(installation, repository)`
-under `<state_dir>/mirrors/`, updated by the reconciler's fetch (§4.9) with
+under `<state_dir>/mirrors/`, updated by the reconciler's fetch (§4.8) with
 `+refs/heads/*`, `+refs/tags/*`, and the PR heads of open PRs. It is *not* the
 existing run-scoped checkout cache (`snapshots.rs:738-895`, depth-1, default
 off) — workflow fetch and changed-files need real history, and the mirror is
-what makes processing work while the REST API is down.
+what makes processing work while the REST API is down. It is also the only
+place a locally computed merge commit exists, so it is the checkout source for
+those runs.
 
 **PR merge (fixes F2).** For a `pull_request` event:
 
 1. resolve `base.sha` and `head.sha` in the mirror;
 2. `git merge-tree --write-tree base head` (Git ≥ 2.38) → tree, then
-   `git commit-tree` with committer date pinned to `head`'s commit date, so
-   the same pair always yields the same merge commit SHA;
+   `git commit-tree` with a fixed committer identity and the committer date
+   pinned to `head`'s commit date, so the same pair always yields the same
+   merge commit SHA;
 3. `github.sha` = that merge commit, `github.ref` = `refs/pull/N/merge`
    (unchanged wire shape), `status_check_sha` = head (unchanged);
 4. on conflict, do **not** fabricate: GitHub's `refs/pull/N/merge` does not
    exist for conflicted PRs either, and the run fails the same way it does
-   today. Record `merge_conflict` on the run for visibility.
+   today. Record `merge_conflict` on the run for visibility;
+5. **the job checks out from preloop, never from the live ref.** A merge we
+   computed exists only in the mirror, and GitHub's `refs/pull/N/merge` is a
+   different commit object even for an identical tree, so a job that fetched
+   the ref by name would either fail or test a tree other than the recorded
+   SHA. The merge is materialized into the run's checkout source (the snapshot
+   the job already fetches — `redirect_primary_checkout`, `runs.rs:2540`;
+   `snapshots.rs:738-895`) with `github.ref` kept as the wire-compatible
+   `refs/pull/N/merge` name. `checkout_cache.mode = Off` must therefore not
+   reach this path: an unredirected job fetches the live mutable ref, which is
+   the F2 mismatch again. Invariant: a run's `sha` must resolve in the checkout
+   source the job actually uses, and a job that cannot resolve it fails loudly
+   instead of testing a different tree.
 
 This removes the stale-merge class of bug rather than polling around it
 (coordinate with open PR #409, which polls for a fresh merge SHA — this
-replaces that mechanism).
+replaces that mechanism). The REST fallback (mirror cannot answer) records
+`merge_source = github`; that SHA comes from the mutable ref, so the
+resolve-before-test check in step 5 is what keeps the tested tree equal to the
+recorded commit — the local path is the one that removes the dependency.
 
 **Token caching scope.** The current no-cache rule exists for *job* tokens:
 their scope follows the job's `permissions:` block and revocation must bite
@@ -398,12 +453,21 @@ Per installed repository, one `git ls-remote` (no REST rate-limit cost):
 ```
 refs/heads/*        → compare tip against processed_heads(kind=push)
 refs/tags/*         → same (tag pushes trigger workflows)
-refs/pull/*/head    → compare against processed_heads(kind=pull_request)
+refs/pull/*/head    → compare the (head, base tip) pair against
+                      processed_heads(kind=pull_request, base_sha)
 ```
+
+A PR's base can move while `refs/pull/N/head` stands still, and a base-branch
+push delivers no `pull_request` event (GitHub recomputes the merge ref without
+announcing it); the merge we test is a function of both ends (§4.7), so
+comparing heads alone would leave an open PR running against a stale merge
+whenever the PR's own webhook is lost. The base tips are in this same
+`ls-remote` output, so the pair costs no extra call.
 
 Algorithm, per repo, in one pass:
 
-1. If the tip is already in the ledger → nothing to do.
+1. If the fact is already in the ledger — for a PR, the head *and* the base
+   tip it was tested with — → nothing to do.
 2. If not, and the last event for that ref is younger than the **grace**
    period (default 3 min) → skip; the webhook is probably still in flight.
 3. Else synthesize:
@@ -418,8 +482,11 @@ Algorithm, per repo, in one pass:
      `reconciler_deferred` gauge, and the event is synthesized on the first
      pass after the API returns.
    - Action inference for PR synthesis: no processed head for the PR at all →
-     `opened`; a previously processed head exists → `synchronize`. That keeps
-     `types: [opened]` workflows working when the `opened` delivery was lost.
+     `opened`; a previously processed head exists → `synchronize` (which is
+     also what a base-only move synthesizes, D4). The new event supersedes the
+     previous live run for that head, so the check runs keep describing one
+     tested merge. That keeps `types: [opened]` workflows working when the
+     `opened` delivery was lost.
 4. Write the synthesized event into `events` with `source = reconciler` and
    the canonical key, then let the normal processor run it.
 
@@ -437,15 +504,25 @@ important new signal, because it converts "silent CI dark" into an alarm.
 Deliverable 6, orthogonal to open PR #408 (which changes the first-poll
 baseline):
 
-1. **Watermark progress per page, not per pass.** Persist
-   `(scan_cursor, newest_examined)` after every page and credit the monotonic
-   max of examined items durably. A long walk then advances the watermark as
-   it goes and never restarts from the top on a truncated pass
-   (`webhook_watchdog.rs:321`, `:407-434`).
+1. **Keep the page cursor and the credit separate; never credit across an
+   unexamined gap.** Persist `(scan_cursor, crawl_top)` after every page: the
+   cursor says where to resume, `crawl_top` is the newest item examined by the
+   *chain* that started at page 1, carried across passes. The watermark still
+   advances only when the walk proves contiguity (it reached the previous
+   watermark, or history is exhausted — `webhook_watchdog.rs:407-408`), and it
+   advances to `crawl_top` instead of today's pass-local `newest_examined`
+   (`:321`, `:351`), which is what makes a resumed crawl re-walk from the top.
+   Racing the watermark forward per page is worse than slow: the watermark
+   means "everything newer than this is accounted for", so a mid-walk credit
+   marks the range between the credit and the resume cursor as accounted for
+   while it was never examined, and those deliveries are then skipped forever.
+   Advancing less than the examined range costs a re-walk; advancing more
+   loses events.
 2. **`failed` rows are not "present".** Split the presence check into
    `state = 'failed'` → repair *locally* (requeue from the retained payload;
-   the payload is in the row), versus no row at all → request redelivery from
-   GitHub. A locally-held payload must never be spent on a redelivery request.
+   the payload is in the row), versus no receipt at all → request redelivery
+   from GitHub. A locally-held payload must never be spent on a redelivery
+   request.
 3. **Refused redeliveries retry on their own schedule.** Sweep open
    `webhook_redeliveries` rows independently of the history walk, with the
    existing backoff ladder (`webhook_watchdog.rs:184-194`); the crawl is not a
@@ -456,7 +533,9 @@ baseline):
    (§3.1 shape 3).
 5. **Page budget adapts**: when a pass is still truncated at `max_pages`,
    raise the page budget for the next pass (bounded), so catch-up after an
-   outage is not throttled to 500 items per 5 minutes.
+   outage is not throttled to 500 items per 5 minutes. With item 1 that raise
+   is what shortens the walk; it never licenses crediting past what the walk
+   covered contiguously.
 
 ### 4.10 GitHub writes: outbox + repair
 
@@ -517,7 +596,7 @@ status snapshot gains conditions `events_dead_letter`, `events_spool_backlog`,
 | **Replica dies with unimported spool** | `events_spool_depth` on the dead host is invisible | — | reconciler re-derives the facts from git; exact-payload-only events (`issue_comment`) are lost until the watchdog replays them | rare; detection is the watchdog |
 | **Token minting down** | breaker observes mint calls | events park as `Outage` instead of burning attempts | automatic | none |
 | **Check-run write lost / check deleted on GitHub** | repair sweep | preloop UI is source of truth; desired state retained | sweep re-writes | checks converge |
-| **Stale/moving `refs/pull/N/merge`** | n/a (removed) | merge computed locally from pinned base+head | — | CI tests the intended merge |
+| **Stale/moving `refs/pull/N/merge`** | n/a (removed) | merge computed locally from pinned base+head and checked out from the run snapshot, never the live ref (§4.7) | new base tip ⇒ new run (§4.8) | CI tests the intended merge |
 | **Clock skew between replicas** | `available_at`/grace comparisons | grace windows widen by the skew; leases unaffected (DB time is authoritative) | use DB `now()` for all queue times | none |
 
 ## 6. Rollout
@@ -530,10 +609,10 @@ reachable through the existing client).
 | PR | Deliverable | Cutover shape |
 |---|---|---|
 | **0** | This document | none |
-| **1** | `events` table, error classes, `available_at`, priority, `LISTEN/NOTIFY` wake, ingest spool, ingest without GitHub calls | Generalize `webhook_deliveries` in place; delete the old columns/paths in the same PR (no shim). Shadow-compare counts in tests, not production. |
-| **2** | Processed-heads ledger, `preloop push` as an event source, cross-source dedupe, `runs.event_id` | Ledger written in the run transaction; `already_published` stays for the dirty-tree case. |
-| **3** | `ls-remote` reconciler, mirror fetch, leader lease, synthesized push events; PR synthesis fail-closed | Feature flag `PRELOOP_RECONCILER` (default off until 2 is in), then on; `reconciler_synthesized_total` becomes the page. |
-| **4** | Local merge commit (`merge-tree`) replacing payload merge SHA | Coordinate with PR #409 — that PR's polling is superseded; land whichever is cleaner and close the other. |
+| **1** | `events` table + delivery receipts, error classes, `available_at`, priority, `LISTEN/NOTIFY` wake, ingest spool, ingest without GitHub calls | Generalize `webhook_deliveries` into `events` + `event_deliveries` in place; delete the old columns/paths in the same PR (no shim). Shadow-compare counts in tests, not production. |
+| **2** | Processed-heads ledger (PR rows carry the tested base tip), `preloop push` as an event source, cross-source dedupe, `runs.event_id` | Ledger written in the run transaction; `already_published` stays for the dirty-tree case. |
+| **3** | `ls-remote` reconciler, mirror fetch, leader lease, synthesized push events; PR synthesis fail-closed; base-tip comparison | Feature flag `PRELOOP_RECONCILER` (default off until 2 is in), then on; `reconciler_synthesized_total` becomes the page. |
+| **4** | Local merge commit (`merge-tree`) replacing payload merge SHA, served to jobs from the run snapshot instead of the live ref | Coordinate with PR #409 — that PR's polling is superseded; land whichever is cleaner and close the other. |
 | **5** | GitHub-write outbox generalization + check-state repair sweep | Extends `check_run_updates`' proven pattern; no behavior change while healthy. |
 | **6** | Watchdog fixes (§4.9) | Orthogonal to PR #408 (first-poll baseline); keep changes in the cursor/credit and repair-sweep functions, not the poll bootstrap. |
 
@@ -554,7 +633,7 @@ stub-server test infrastructure). Build/test on macstudio only.
 | D3 | Issue-comment/review polling | Add a per-repo `on:` registry (the trigger summary is already parsed at intake and discarded, `runs.rs:984-999`) so polling runs only for repos whose workflows subscribe; poll only while webhook lag for the App is elevated | proposed |
 | D4 | Reconciler PR action inference | `opened` when the PR has no processed head; `synchronize` otherwise | proposed |
 | D5 | Dead-letter budget | 72 h for webhook-sourced, supersede-or-7-days for synthesized | proposed |
-| D6 | `events` retention | 30 days (matches today's payload retention), ledger 180 days, independent of run archival | proposed |
+| D6 | `events` retention | 30 days (matches today's payload retention; receipts expire with their event), ledger 180 days, independent of run archival | proposed |
 | D7 | Conflict PRs | Do not fabricate a merge; behave as GitHub does (`refs/pull/N/merge` absent) and mark the run | proposed |
 
 ## 8. Alternatives considered

@@ -12,10 +12,11 @@ Releases before v0.27.0 predate the changelog.
 ### Added
 
 - **`docs/github-resiliency.md`** — the design for surviving an unreliable
-  GitHub: a source-agnostic `events` queue with retry by error class and an
-  ingest spool, a processed-heads ledger that dedupes webhook / `preloop push`
-  / reconciler events for the same commit, an `ls-remote` reconciler as the
-  correctness net, a local merge-commit fallback for `refs/pull/N/merge`, a
+  GitHub: a source-agnostic `events` queue with per-delivery receipts, retry
+  by error class and an ingest spool, a processed-heads ledger (head *and*
+  base tip) that dedupes webhook / `preloop push` / reconciler events for the
+  same commit, an `ls-remote` reconciler as the correctness net, a locally
+  computed merge commit that jobs check out from the engine snapshot, a
   GitHub-write outbox with check-state repair, and the delivery-watchdog
   watermark fixes. No behavior change yet — deliverables land one PR at a
   time.
