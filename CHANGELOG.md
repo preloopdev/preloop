@@ -619,12 +619,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
-- **Breaking (control database):** `run_history` and `job_history` now carry
-  `run_attempt` in their primary keys, so a re-run's per-attempt snapshots
-  coexist in history. The control schema version is now SQLite `4` and
-  PostgreSQL `5`; a database stamped with an older version is refused at
-  startup and must be recreated (the schema is applied fresh, there is no
-  in-place migration).
+- **Control database:** `run_history` and `job_history` now include
+  `run_attempt` in their primary keys, so in-place re-runs keep each
+  attempt's snapshot without collisions. The change is carried by the
+  forward-only refinery migration `V2026100503__rerun_history_attempt_keys`
+  (existing rows are backfilled as attempt 1 in one transaction); `preloop
+  serve` verifies the migration ledger and `preloop store migrate` applies
+  pending migrations.
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and

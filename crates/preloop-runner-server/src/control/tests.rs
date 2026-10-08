@@ -6530,6 +6530,8 @@ pub(crate) mod suite {
             loaded.fork_approval_requested_at_unix_nanos,
             Some(nanos),
             "nanosecond-typed stamps must keep full precision"
+        );
+    }
     /// A completed run reruns as a new attempt on the same `run_id`: the
     /// archived attempt is snapshots-only, `run_attempt` increments, every
     /// selected job row resets to queued with a fresh request, and the run
@@ -8460,6 +8462,7 @@ mod pg {
                 .is_empty(),
             "no decision is recorded against a job the sweep already failed"
         );
+    }
     #[tokio::test]
     async fn rerun_all_resets_jobs_and_bumps_attempt() {
         let Some((_pg, backend)) = backend().await else {
