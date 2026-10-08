@@ -439,7 +439,6 @@ async fn hosted_bundle_submission_merges_the_uploaded_dirty_commit() {
     );
 }
 
-
 /// The shared builder contract: fetch + merge + serve, deterministic, and the
 /// `prebuilt_merge` record is validated before anything is served.
 #[tokio::test]
