@@ -788,6 +788,8 @@ async fn cron_loop(
             debug_on_failure: false,
             push: None,
             push_tree: None,
+            no_merge: false,
+            prebuilt_merge: None,
         };
         let (run_id, error) = match submit_run_inner(&shared, submission).await {
             Ok(accepted) => {

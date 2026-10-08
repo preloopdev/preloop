@@ -3111,6 +3111,8 @@ async fn process_delivery_payload_with_lease(
                 debug_on_failure: false,
                 push: None,
                 push_tree: None,
+                no_merge: false,
+                prebuilt_merge: None,
             };
 
             // The dedup gate decides whether a run may be submitted at all.

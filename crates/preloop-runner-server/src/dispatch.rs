@@ -529,6 +529,8 @@ fn submission_from_effective(
         debug_on_failure: false,
         push: None,
         push_tree: None,
+        no_merge: false,
+        prebuilt_merge: None,
     }
 }
 

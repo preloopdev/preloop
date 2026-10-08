@@ -26,6 +26,7 @@
 use super::*;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use tokio::process::Command;
 
 /// Fixed identity for self-built merge commits. A fixed name and date keep
 /// the merge sha deterministic for the same parents, so replays and
@@ -811,6 +812,30 @@ pub async fn webhook_merge_source(
         fetch_url: Some(format!("{server_url}/{repository}.git")),
         token: crate::snapshots::forge_read_token(shared, repository).await,
         forge_host,
+    })
+}
+
+/// Build the submission's `prebuilt_merge` record for a merge that was built
+/// in `mirror`.
+///
+/// The record is what a run's `submit_run_inner` needs to serve the merge
+/// from the engine: the commit, its tree and parents, and the mirror's
+/// state-directory-relative path. `None` when `mirror` is not under the
+/// state directory (nothing could serve it).
+pub fn prebuilt_merge_record(
+    shared: &SharedState,
+    mirror: &Path,
+    merge: &MergedMerge,
+    pull_request_number: Option<u64>,
+) -> Option<preloop_gha_protocol::PrebuiltMerge> {
+    let relative = mirror.strip_prefix(&shared.state.state_dir).ok()?;
+    Some(preloop_gha_protocol::PrebuiltMerge {
+        sha: merge.sha.clone(),
+        tree: merge.tree.clone(),
+        base_sha: merge.base_sha.clone(),
+        head_sha: merge.head_sha.clone(),
+        mirror_repository: relative.to_string_lossy().to_string(),
+        pull_request_number,
     })
 }
 
