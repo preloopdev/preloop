@@ -474,7 +474,11 @@ impl AppState {
 /// a live connection. The knob defaults are the boot defaults.
 ///
 /// A free function rather than a hook method: it needs no [`AppState`], and
-/// its whole point is the selection [`AppState::new`] would have done.
+/// its whole point is the selection [`AppState::new`] would have done in
+/// production. It is also the only test-build caller whose `None` still
+/// reaches `Backend::open`'s environment fallback: `AppState::new_with_store`
+/// pins `None` to the state-dir default so a test mutating the variable
+/// cannot redirect an unrelated `AppState`.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn test_open_backend(
     store_url: Option<&str>,
@@ -1130,12 +1134,30 @@ impl AppState {
     ///
     /// `store_url` takes precedence over the `PRELOOP_STORE_URL` environment
     /// variable; `None` falls back to the environment, then to SQLite at
-    /// `<state_dir>/preloop.db`.
+    /// `<state_dir>/preloop.db`. Test builds skip the environment read: one
+    /// process env shared across parallel tests cannot select a store
+    /// deterministically.
     pub async fn new_with_store(
         state_dir: PathBuf,
         config_path: PathBuf,
         store_url: Option<&str>,
     ) -> anyhow::Result<Self> {
+        // Test binaries share one process env: a sibling test mutating
+        // `PRELOOP_STORE_URL` must not silently retarget a state built for a
+        // temp dir, so in test builds `None` means the state-dir default.
+        // (`Backend::open` keeps the production env fallback; the
+        // `PRELOOP_STORE_URL` selection contract is covered through
+        // `test_open_backend`.)
+        #[cfg(any(test, feature = "test-support"))]
+        let store_url = Some(store_url.map_or_else(
+            || format!("sqlite://{}", state_dir.join("preloop.db").display()),
+            str::to_owned,
+        ));
+        // Back to `Option<&str>` so the production call site below is
+        // identical in every build — and `as_deref` never appears where the
+        // parameter is already `Option<&str>` (clippy::needless-option-as-deref).
+        #[cfg(any(test, feature = "test-support"))]
+        let store_url = store_url.as_deref();
         let cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
