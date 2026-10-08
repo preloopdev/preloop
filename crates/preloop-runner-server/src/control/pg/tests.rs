@@ -1365,6 +1365,83 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     );
 }
 
+/// The last terminal JobSet member releases the shared concurrency hold.
+#[tokio::test]
+async fn targeted_settle_releases_completed_jobset_hold() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(
+        run,
+        vec![
+            submit_job(run, "a", 1),
+            submit_job(run, "b", 2),
+            submit_job(run, "pending", 3),
+        ],
+    ))
+    .await
+    .unwrap();
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let ids = serde_json::json!(["a", "b"]).to_string();
+    let jobset_id: i64 = tx
+        .query_one(
+            "INSERT INTO jobsets (run_id, job_ids, state) \
+             VALUES ($1::text::uuid, $2::text::jsonb, 'ready') RETURNING jobset_id",
+            &[&run.0.to_string(), &ids],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    tx.execute(
+        "INSERT INTO concurrency_holds \
+         (namespace_id, repository, group_name, display_name, holder_kind, \
+          holder_run_id, holder_jobset_id) \
+         VALUES ('ns', 'owner/repo', 'shared', 'shared', 'jobset', $1::text::uuid, $2)",
+        &[&run.0.to_string(), &jobset_id],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE jobs SET status='in_progress', queue_state='claimed' \
+         WHERE run_id=$1::text::uuid AND job_id IN ('a','b')",
+        &[&run.0.to_string()],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    for (job, is_last) in [("a", false), ("b", true)] {
+        node.complete_job(JobCompletionInput {
+            run_id: run,
+            job_id: JobId(job.to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: BTreeMap::new(),
+            runner_id: None,
+        })
+        .await
+        .unwrap();
+        let hold: Option<i32> = node
+            .writer()
+            .await
+            .unwrap()
+            .query_opt(
+                "SELECT 1 FROM concurrency_holds WHERE group_name='shared'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
+        assert_eq!(
+            hold.is_some(),
+            !is_last,
+            "the shared hold remains only while a JobSet member is non-terminal"
+        );
+    }
+}
+
 /// A promotion that writes the promoted run's rows must take that run's row
 /// lock before any group-row lock: the reverse order deadlocked (40P01)
 /// against a command on the promoted run and clobbered its rows with a stale

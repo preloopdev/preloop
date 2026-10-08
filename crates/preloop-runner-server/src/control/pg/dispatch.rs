@@ -1398,13 +1398,21 @@ pub(super) async fn release_concurrency_for_job(
     // the bookkeeping that created it.
     let rows = tx
         .query(
-            "SELECT namespace_id, repository, group_name, holder_kind, \
-             holder_run_id::text, holder_job_id, holder_jobset_id \
-             FROM concurrency_holds \
-             WHERE holder_run_id=$1::text::uuid \
-             UNION SELECT namespace_id, repository, group_name, holder_kind, \
-             holder_run_id::text, holder_job_id, holder_jobset_id \
-             FROM concurrency_waits WHERE holder_run_id=$1::text::uuid",
+            "SELECT presence.namespace_id, presence.repository, presence.group_name, \
+                    presence.holder_kind, presence.holder_run_id::text, \
+                    presence.holder_job_id, presence.holder_jobset_id, \
+                    jobsets.job_ids::text \
+             FROM ( \
+                 SELECT namespace_id, repository, group_name, holder_kind, \
+                        holder_run_id, holder_job_id, holder_jobset_id \
+                 FROM concurrency_holds \
+                 WHERE holder_run_id=$1::text::uuid \
+                 UNION \
+                 SELECT namespace_id, repository, group_name, holder_kind, \
+                        holder_run_id, holder_job_id, holder_jobset_id \
+                 FROM concurrency_waits WHERE holder_run_id=$1::text::uuid \
+             ) presence \
+             LEFT JOIN jobsets ON jobsets.jobset_id=presence.holder_jobset_id",
             &[&run_id.0.to_string()],
         )
         .await
@@ -1412,10 +1420,11 @@ pub(super) async fn release_concurrency_for_job(
     for row in rows {
         let namespace: String = row.get(0);
         let key = (row.get::<_, String>(1), row.get::<_, String>(2));
-        let Some(holder) = holder_of(
+        let Some(holder) = concurrency::holder_from_row(
             row.get(3),
             row.get::<_, String>(4).as_str(),
             row.get::<_, Option<String>>(5).as_deref(),
+            row.get::<_, Option<String>>(7).as_deref().unwrap_or("[]"),
         ) else {
             continue;
         };
@@ -5761,8 +5770,9 @@ impl<'a> Sweep<'a> {
         };
         let replayed = prior.is_terminal() && prior != ExecutionStatus::Cancelled;
         let effective = match (prior, reported) {
-            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
-            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
+            (ExecutionStatus::Cancelled, status) if status.is_terminal() => {
+                ExecutionStatus::Cancelled
+            }
             _ if replayed => prior,
             _ => reported,
         };
@@ -6253,20 +6263,10 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
-        // The job's own hold goes with it. This deliberately does not go
-        // through `release_concurrency_for_job`: that path promotes the
-        // group's oldest waiter, which re-parks under a max-parallel cohort
-        // and leaves the finished holder's row behind (the pinned case in
-        // `max_parallel_repark_keeps_fifo_slot_and_releases_group`). Only the
-        // job's own rows are dropped — a run-level (workflow) hold belongs to
-        // `release_concurrency_for_run`, which promotes the parked run.
-        tx.execute(
-            "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
-             AND holder_job_id=$2",
-            &[&run, &job_id.0],
-        )
-        .await
-        .map_err(db)?;
+        // Release this job's hold or wait row, and a JobSet hold if this was
+        // its final terminal member. Promotion also handles max-parallel
+        // re-parking without leaving the completed holder behind.
+        release_concurrency_for_job(self, tx, run_id, job_id).await?;
         // 3. Fail-fast siblings of a failed matrix leg.
         if effective == ExecutionStatus::Failure {
             outcome.cancelled_siblings =
