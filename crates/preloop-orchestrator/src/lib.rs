@@ -2338,6 +2338,48 @@ fn base_install_commands() -> Vec<Vec<String>> {
     .collect()
 }
 
+/// Shell snippet: `raise_engine_chain`, which re-raises the stack limit of a
+/// container-engine chain that is already running in the guest.
+///
+/// A fork inherits its golden's live daemon chain — dockerd, and the
+/// containerd that spawns every container's shim. A container runs on the
+/// limits of the chain that spawned it, and a golden baked before the raise
+/// existed started that chain on the VM init's 8192 KiB: a running process
+/// keeps the limits it was born with, so a raise applied to the launch's own
+/// shell cannot reach it, and container steps would keep half of GitHub's
+/// stack. `prlimit` reaches a process a child shell's `ulimit` cannot, and the
+/// chain is re-raised in place rather than restarted, because a restart inside
+/// a fork leaves the half-torn-down containerd socket [`preload_images`]
+/// warns about.
+///
+/// Both columns of `/proc/$pid/limits` are read, because either half of the
+/// hosted pair can be missing: a finite hard limit blocks a later soft-limit
+/// raise, and a soft limit under 16384 KiB is half of GitHub's. A chain
+/// already at or above the hosted pair keeps its own values — the raise never
+/// lowers a soft limit.
+const RAISE_ENGINE_CHAIN: &str = "raise_engine_process() { \
+  pid=$1; soft=$2; hard=$3; \
+  case \"$soft\" in ''|*[!0-9]*) return 0 ;; esac; \
+  if [ \"$soft\" -lt 16777216 ]; then \
+    target=16777216; \
+  else \
+    case \"$hard\" in ''|*[!0-9]*) return 0 ;; esac; \
+    target=$soft; \
+  fi; \
+  prlimit --pid \"$pid\" --stack=\"$target:unlimited\" 2>/dev/null; \
+  return 0; \
+}; \
+raise_engine_chain() { \
+  for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
+    soft=; hard=; \
+    while read -r w1 w2 w3 s h u; do \
+      [ \"$w1/$w2/$w3\" = \"Max/stack/size\" ] && { soft=$s; hard=$h; break; }; \
+    done 2>/dev/null < \"/proc/$pid/limits\"; \
+    raise_engine_process \"$pid\" \"$soft\" \"$hard\"; \
+  done; \
+  return 0; \
+};";
+
 /// Start the container engine, if one is installed.
 ///
 /// Runs per machine rather than in the golden: a daemon captured mid-flight by
@@ -2359,7 +2401,7 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// chain running so forks never restart it — carries whatever limits it was
 /// started with, so the command re-raises that live chain (dockerd and
 /// containerd) before exiting, covering goldens baked before the raise
-/// existed.
+/// existed: see [`RAISE_ENGINE_CHAIN`].
 ///
 /// Readiness is `docker info` rather than `pgrep dockerd`, because a forked VM
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
@@ -2382,31 +2424,9 @@ fn docker_start_command() -> Vec<String> {
         run_as_root_or_sudo(&format!(
             "{GUEST_STACK_ULIMIT}; \
              command -v dockerd >/dev/null 2>&1 || exit 0; \
-             # A fork inherits its golden's live daemon chain — dockerd, and
-             # the containerd that spawns each container's shim. A container
-             # runs on the limits of that chain, and a golden baked before the
-             # stack raise started it on the VM init's 8192 KiB: a running
-             # process keeps the limits it was born with, so the raise this
-             # script applies to itself cannot reach the inherited chain, and
-             # container steps would keep half of GitHub's stack. Raise the
-             # live chain in place — prlimit reaches a process a child shell's
-             # ulimit cannot, and restarting the chain inside a fork leaves
-             # the half-torn-down containerd socket the preload comment warns
-             # about. Only a chain still below the hosted soft limit is
-             # touched, so a daemon (custom base) already at or above it keeps
-             # its own. Raising a hard limit needs root, which both launch
-             # branches run as.
-             raise_engine_chain() {{ \
-               for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
-                 soft=; \
-                 while read -r word1 word2 word3 value _rest; do \
-                   [ \"$word1/$word2/$word3\" = \"Max/stack/size\" ] && {{ soft=$value; break; }}; \
-                 done 2>/dev/null < \"/proc/$pid/limits\"; \
-                 case \"$soft\" in ''|*[!0-9]*) continue ;; esac; \
-                 [ \"$soft\" -lt 16777216 ] && prlimit --pid \"$pid\" --stack=16777216:unlimited 2>/dev/null; \
-               done; \
-               return 0; \
-             }}; \
+             # A fork inherits its golden's live engine chain, which keeps the
+             # limits it was born with: raise it in place before trusting it.
+             {RAISE_ENGINE_CHAIN} \
              docker info >/dev/null 2>&1 && {{ raise_engine_chain; exit 0; }}; \
              rm -f /var/run/docker.pid; \
              mkdir -p {DOCKER_DATA_ROOT}; \
@@ -7811,14 +7831,30 @@ chmod +x "$dest/bin/node"
             });
         assert!(guard < inherited_exit, "{script}");
         // prlimit speaks raw bytes; 16777216 is the hosted 16384 KiB soft
-        // limit, with the hard limit left unlimited as the image sets it.
+        // limit, with the hard limit left unlimited as the image sets it. The
+        // target keeps a soft limit that is already above the hosted value,
+        // so the raise can never lower one.
         assert!(
-            script.contains("--stack=16777216:unlimited"),
+            script.contains("prlimit --pid \"$pid\" --stack=\"$target:unlimited\""),
             "the live chain must be raised to the hosted stack: {script}"
         );
         assert!(
-            script.contains("\"/proc/$pid/limits\""),
-            "the raise must only touch a chain still below the hosted limit: {script}"
+            script.contains("if [ \"$soft\" -lt 16777216 ]; then target=16777216;"),
+            "a chain under the hosted soft limit must be raised to it: {script}"
+        );
+        // Both columns are read: a chain whose soft limit already matches but
+        // whose hard limit is finite still cannot grow later, so it is raised
+        // too, while `unlimited` hard on both sides is left alone.
+        assert!(
+            script.contains(
+                "while read -r w1 w2 w3 s h u; do [ \"$w1/$w2/$w3\" = \"Max/stack/size\" ] \
+                 && { soft=$s; hard=$h; break; }; done 2>/dev/null < \"/proc/$pid/limits\";"
+            ),
+            "both the soft and the hard stack limit must be read: {script}"
+        );
+        assert!(
+            script.contains("else case \"$hard\" in ''|*[!0-9]*) return 0 ;; esac; target=$soft;"),
+            "a finite hard limit must be raised without lowering the soft one: {script}"
         );
         // Containerd spawns every container shim, so its limits — not only
         // dockerd's — are what a container process inherits.
@@ -7832,6 +7868,117 @@ chmod +x "$dest/bin/node"
             2,
             "{script}"
         );
+    }
+
+    /// Run [`RAISE_ENGINE_CHAIN`]'s per-process raise over one `(soft, hard)`
+    /// pair exactly as `/proc/<pid>/limits` reports it — bytes, or
+    /// `unlimited` — and return the `prlimit` calls it made.
+    ///
+    /// `prlimit` is stubbed so the decision is observable without the
+    /// privileges the real call needs (the guest's raise runs as root).
+    fn engine_raise_call(soft: &str, hard: &str) -> Vec<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("calls");
+        let harness = temp.path().join("harness.sh");
+        std::fs::write(
+            &harness,
+            format!(
+                "prlimit() {{ echo \"$*\" >> '{calls}'; }}\n\
+                 {RAISE_ENGINE_CHAIN}\n\
+                 raise_engine_process 4242 '{soft}' '{hard}'\n",
+                calls = calls.display(),
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("sh")
+            .arg(&harness)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The re-raise decision, executed rather than text-matched: an inherited
+    /// chain is raised to whichever half of the hosted pair it is missing.
+    #[test]
+    fn inherited_engine_chain_raise_targets_the_missing_half_of_the_hosted_pair() {
+        // The VM init's half-sized stack, which is what any engine chain a
+        // golden baked before the raise started carries.
+        assert_eq!(
+            engine_raise_call("8388608", "unlimited"),
+            ["--pid 4242 --stack=16777216:unlimited"]
+        );
+        // A finite hard limit is raised even when the soft limit already
+        // matches the hosted value, otherwise nothing inside the container can
+        // ever grow its own soft limit the way it can on GitHub.
+        assert_eq!(
+            engine_raise_call("16777216", "16777216"),
+            ["--pid 4242 --stack=16777216:unlimited"]
+        );
+        // A soft limit above the hosted value is kept — the raise never lowers
+        // one — while the finite hard limit still becomes unlimited.
+        assert_eq!(
+            engine_raise_call("33554432", "33554432"),
+            ["--pid 4242 --stack=33554432:unlimited"]
+        );
+        // Already the hosted pair, or a row that says nothing usable: no call.
+        assert!(engine_raise_call("16777216", "unlimited").is_empty());
+        assert!(engine_raise_call("unlimited", "unlimited").is_empty());
+        assert!(engine_raise_call("", "").is_empty());
+    }
+
+    /// The `/proc/<pid>/limits` parse itself, against a real kernel table: the
+    /// chain is pointed at the harness shell (its `pgrep` stubbed) whose stack
+    /// the harness lowered first, and must raise what it read back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_engine_chain_reads_a_real_proc_limits_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = temp.path().join("calls");
+        let harness = temp.path().join("harness.sh");
+        std::fs::write(
+            &harness,
+            format!(
+                "TARGET=$$\n\
+                 pgrep() {{ case \"$*\" in *dockerd*) echo \"$TARGET\" ;; *) return 1 ;; esac; }}\n\
+                 prlimit() {{ echo \"$*\" >> '{calls}'; }}\n\
+                 {RAISE_ENGINE_CHAIN}\n\
+                 echo \"soft=$(ulimit -Ss)\" >> '{calls}'\n\
+                 raise_engine_chain\n",
+                calls = calls.display(),
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("ulimit -Ss 8192; exec sh '{}'", harness.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(calls.contains("soft=8192"), "the parse target: {calls}");
+        let raised: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.starts_with("--pid "))
+            .collect();
+        assert!(!raised.is_empty(), "nothing was raised: {calls}");
+        // Every pid the chain reaches — the harness, plus a real dockerd's
+        // pidfile when the guest has one — is raised to the hosted stack.
+        for call in raised {
+            assert!(call.ends_with("--stack=16777216:unlimited"), "{calls}");
+        }
     }
 
     /// The preload daemon is the engine a fork inherits, so the golden must

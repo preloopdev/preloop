@@ -552,7 +552,8 @@ The raise is applied per launch, wherever a workload starts:
   of the chain that spawns them: the preload daemon baked into the golden
   (the engine a fork inherits) starts with the raise, a per-runner engine
   start applies it, and an engine chain inherited from a golden baked before
-  this existed is re-raised in place with `prlimit`, since a running process
+  this existed is re-raised in place with `prlimit` — both halves of the pair,
+  so a finite hard limit becomes `unlimited` too — since a running process
   keeps the limits it was born with.
 
 `fixtures/workflows/guest-stack-limit.yml` is the guest-level check:

@@ -25,23 +25,18 @@ Releases before v0.27.0 predate the changelog.
 
 - **Guest job workloads run on GitHub's stack size again**: the hosted
   `ubuntu-24.04` image doubles the kernel's 8192 KiB process stack
-  (`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
-  writes `DefaultLimitSTACK=16M:infinity` into `/etc/systemd/system.conf` and
-  `* soft stack 16384` into `/etc/security/limits.conf`), and a hosted step
-  inherits it from the `actions.runner.*` service. The guest boots straight
-  into the job workload, so neither the image's systemd units nor a PAM
-  session ever applies those files: the runner chain kept the VM init's
-  8192 KiB, half of GitHub's. pydantic's deep-recursion serializer tests —
-  which walk Python's recursion limit through pydantic-core's Rust frames and
-  assert a `RecursionError` — died with a stack-overflow `SIGSEGV` (exit 139)
-  on that half-sized stack while the same commit passed on GitHub. Every
-  guest launch that hosts a workload now raises the limit to the hosted
-  16384 KiB soft / `unlimited` hard: the runner wrapper (including the
-  `runner_user`-unset and `root` launches, which keep their account and gain
-  the raise), the container engine's own start, and the golden's preload
-  daemon, whose live chain a fork inherits as its container engine. A chain
-  inherited from a golden baked before this fix is re-raised in place, so
-  containers do not keep the half-sized stack either.
+  (`DefaultLimitSTACK=16M:infinity` in `/etc/systemd/system.conf`, `* soft
+  stack 16384` in `/etc/security/limits.conf`), and a hosted step inherits it
+  from the `actions.runner.*` service. The guest boots straight into the job
+  workload, so neither file is ever applied and the runner chain kept the VM
+  init's 8192 KiB, half of GitHub's — where pydantic's deep-recursion
+  serializer tests died with a stack-overflow `SIGSEGV` (exit 139) instead of
+  the `RecursionError` they assert. Every guest launch that hosts a workload
+  now raises the hosted 16384 KiB soft / `unlimited` hard pair: the runner
+  wrapper (the `runner_user`-unset and `root` launches keep their account and
+  gain the raise), the container engine's own start, and the golden's preload
+  daemon. A chain a fork inherits from a golden baked before the fix is
+  re-raised in place, both halves of the pair included.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
