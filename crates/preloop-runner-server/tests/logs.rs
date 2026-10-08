@@ -3115,6 +3115,7 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
         .await
         .unwrap();
     assert_eq!(read.status(), StatusCode::OK);
+}
 
 /// A timeline PATCH that the control DB rejects must not answer 200
 /// with `count: 0`: the runner would believe its records were persisted.
