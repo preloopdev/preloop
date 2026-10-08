@@ -6773,12 +6773,14 @@ jobs:
         // GitHub rejects the PATCH (422) when it is sent as one.
         let announce_calls = requests.lock().clone();
         assert!(
-            announce_calls.iter().any(|request| request.contains("check-runs/99")
-                && request.contains("\"status\":\"completed\"")
-                && request.contains("\"conclusion\":\"action_required\"")
-                && request.contains("\"actions\"")
-                && request.contains("\"identifier\":\"approve\"")
-                && request.contains("\"identifier\":\"reject\"")),
+            announce_calls
+                .iter()
+                .any(|request| request.contains("check-runs/99")
+                    && request.contains("\"status\":\"completed\"")
+                    && request.contains("\"conclusion\":\"action_required\"")
+                    && request.contains("\"actions\"")
+                    && request.contains("\"identifier\":\"approve\"")
+                    && request.contains("\"identifier\":\"reject\"")),
             "the announce PATCHes a completed action_required check run with the \
              Approve/Reject actions: {announce_calls:?}"
         );

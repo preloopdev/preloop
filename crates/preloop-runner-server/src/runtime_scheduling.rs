@@ -1276,11 +1276,10 @@ mod environment_gate_tests {
     #[test]
     fn matrix_expression_environment_gates_on_the_resolved_name() {
         let mut job = gate_job("${{ matrix.env }}");
-        job.message.actions_environment =
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: "prod".to_owned(),
-                url: None,
-            });
+        job.message.actions_environment = Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: "prod".to_owned(),
+            url: None,
+        });
         let rules = rules_for(crate::config::EnvironmentRules {
             required_reviewers: 1,
             ..Default::default()
@@ -1308,18 +1307,12 @@ mod environment_gate_tests {
     #[test]
     fn unresolved_deferred_environment_name_holds() {
         let mut job = gate_job("${{ needs.setup.outputs.env }}");
-        job.message.actions_environment =
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: "${{ needs.setup.outputs.env }}".to_owned(),
-                url: None,
-            });
-        let outcome = check_environment_gates(
-            &no_rules(),
-            "owner/repo",
-            "refs/heads/main",
-            &mut job,
-            NOW,
-        );
+        job.message.actions_environment = Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: "${{ needs.setup.outputs.env }}".to_owned(),
+            url: None,
+        });
+        let outcome =
+            check_environment_gates(&no_rules(), "owner/repo", "refs/heads/main", &mut job, NOW);
         assert_eq!(
             outcome,
             EnvironmentGateOutcome::Wait,
@@ -1334,11 +1327,10 @@ mod environment_gate_tests {
     #[test]
     fn gate_stamp_tracks_the_resolved_name() {
         let mut job = gate_job("${{ needs.setup.outputs.env }}");
-        job.message.actions_environment =
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: "${{ needs.setup.outputs.env }}".to_owned(),
-                url: None,
-            });
+        job.message.actions_environment = Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: "${{ needs.setup.outputs.env }}".to_owned(),
+            url: None,
+        });
         let rules = rules_for(crate::config::EnvironmentRules {
             required_reviewers: 1,
             ..Default::default()
@@ -1354,11 +1346,10 @@ mod environment_gate_tests {
 
         // The needs complete and the promotion sweep re-evaluates the real
         // name: the stamp must follow it.
-        job.message.actions_environment =
-            Some(preloop_gha_protocol::azdo::ActionsEnvironment {
-                name: "prod".to_owned(),
-                url: None,
-            });
+        job.message.actions_environment = Some(preloop_gha_protocol::azdo::ActionsEnvironment {
+            name: "prod".to_owned(),
+            url: None,
+        });
         let outcome =
             check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW);
         assert_eq!(outcome, EnvironmentGateOutcome::Wait);

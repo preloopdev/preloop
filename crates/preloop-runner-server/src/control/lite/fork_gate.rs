@@ -287,10 +287,7 @@ fn resolve_environment_parts(
         .and_then(crate::runtime_scheduling::resolved_environment_name_of)
         .map(str::to_owned);
     let environment = message_name
-        .or_else(|| {
-            gate.as_ref()
-                .and_then(|gate| gate.environment_name.clone())
-        })
+        .or_else(|| gate.as_ref().and_then(|gate| gate.environment_name.clone()))
         .or_else(|| {
             spec.as_ref().and_then(|value| {
                 crate::runtime_scheduling::environment_gate_name_of(Some(value)).map(str::to_owned)
@@ -483,10 +480,7 @@ fn release_parked_jobs(
             .as_deref()
             .and_then(crate::runtime_scheduling::resolved_environment_name_of)
             .map(str::to_owned)
-            .or_else(|| {
-                gate.as_ref()
-                    .and_then(|gate| gate.environment_name.clone())
-            })
+            .or_else(|| gate.as_ref().and_then(|gate| gate.environment_name.clone()))
             .or_else(|| {
                 crate::runtime_scheduling::environment_gate_name_of(
                     spec.as_ref().and_then(|spec| spec.environment.as_ref()),

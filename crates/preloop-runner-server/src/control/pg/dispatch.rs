@@ -6937,10 +6937,7 @@ async fn release_parked_nodes(
             .as_deref()
             .and_then(crate::runtime_scheduling::resolved_environment_name_of)
             .map(str::to_owned)
-            .or_else(|| {
-                gate.as_ref()
-                    .and_then(|gate| gate.environment_name.clone())
-            })
+            .or_else(|| gate.as_ref().and_then(|gate| gate.environment_name.clone()))
             .or_else(|| {
                 crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
                     .map(str::to_owned)
