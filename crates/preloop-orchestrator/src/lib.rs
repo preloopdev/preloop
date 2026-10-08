@@ -6838,6 +6838,13 @@ fn run_as_root_or_sudo_strict(script: &str) -> String {
 
 fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
     use base64::Engine as _;
+    // The script is spliced inline as `then {script}; else …`, so a trailing
+    // newline would leave that `;` alone on a line and dash would reject the
+    // whole command (`Syntax error: ";" unexpected`). Scripts that live in a
+    // file (`scripts/docker-start.sh`) end in a newline by convention, and
+    // trailing whitespace means nothing to the shell, so drop it here instead
+    // of asking every file-backed script to remember.
+    let script = script.trim_end();
     let b64 = base64::engine::general_purpose::STANDARD.encode(script);
     let fallback = if best_effort {
         "sudo -n sh 2>/dev/null || true"
@@ -9126,10 +9133,12 @@ done
             "the nofile raise must only touch a chain still below the hosted limit: {script}"
         );
         // A fresh daemon can still adopt a surviving containerd from the
-        // golden, so both start retries raise the chain too.
+        // golden, so both start retries raise the chain too. The pattern
+        // stops at `fi`: what follows it is a newline now that the script
+        // lives in a file, and the separator is not what this pins.
         assert_eq!(
             script
-                .matches("then raise_engine_chain || exit 1; exit 0; fi;")
+                .matches("then raise_engine_chain || exit 1; exit 0; fi")
                 .count(),
             2,
             "{script}"
@@ -9602,7 +9611,7 @@ done
         switched.runner_user = Some("runner".to_owned());
         switched.runner_uid = Some(1001);
 
-        let mut scripts: Vec<(String, String)> = vec![
+        let scripts: Vec<(String, String)> = vec![
             ("guest_hostname_script".to_owned(), guest_hostname_script()),
             ("guest_sysctl_script".to_owned(), guest_sysctl_script()),
             (
@@ -9792,6 +9801,27 @@ done
         if sudo_usable {
             assert!(run(run_as_root_or_sudo_strict("exit 0")).status.success());
         }
+    }
+
+    /// A script ending in a newline must still splice into the wrapper.
+    ///
+    /// The inline form is `then {script}; else …`: with an un-trimmed trailing
+    /// newline the `;` lands alone on a line and dash rejects the whole
+    /// command (`Syntax error: ";" unexpected`), which is how the file-backed
+    /// `scripts/docker-start.sh` first reached a guest. The best-effort form
+    /// exits 0 whatever the script does, so a parse failure is the only way
+    /// this can fail.
+    #[test]
+    fn sudo_wrapper_tolerates_a_trailing_newline() {
+        let script = run_as_root_or_sudo("exit 7\n");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh must run");
+        assert!(
+            output.status.success(),
+            "a trailing newline broke the splice: {script}"
+        );
     }
 
     #[test]
