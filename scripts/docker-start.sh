@@ -80,4 +80,6 @@ if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi
 rm -rf @@DOCKER_DATA_ROOT@@/*
 if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi
 echo 'dockerd failed to start after data-root reset' >&2
+echo 'last 20 lines of /var/log/dockerd.log:' >&2
+tail -n 20 /var/log/dockerd.log >&2 || true
 exit 1

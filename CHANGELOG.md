@@ -31,6 +31,14 @@ Releases before v0.27.0 predate the changelog.
   unexpected` to production runners.
 
 ### Fixed
+- **A failed container-engine start now reports why**: after both start
+  attempts fail, the bootstrap tails the last lines of `/var/log/dockerd.log`
+  into stderr. The provider turns a non-zero guest exit into an error carrying
+  that stderr, so the engine's `background container engine start failed`
+  warning now shows the daemon's own reason (measured: `failed to start
+  containerd: exec: "containerd": executable file not found in $PATH`) instead
+  of only the script's exit line — the daemon's log itself dies with the VM.
+
 - **A file-backed guest script splices with its trailing newline removed**:
   the root-or-sudo wrapper inlines the script as `then {script}; else …`, so a
   script ending in a newline left that `;` alone on a line and dash rejected
