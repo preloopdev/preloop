@@ -2668,18 +2668,19 @@ pub(crate) fn build_job_artifacts(
         {
             agent_msg.preloop_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
-        // Local-workspace runs test code the forge has never seen, so anything
-        // hardcoding github.com has to be rewritten or the job fails fetching
-        // its own sha. A cached remote checkout is the opposite case: the
-        // commit exists upstream, the cache holds only that commit, and
-        // rewriting the origin would break every legitimate fetch of anything
-        // else.
+        // Local workspaces and self-built merges contain engine-only commits.
+        // Redirect custom Git fetches for those sources to the served snapshot;
+        // cached remote checkouts keep fetching from their upstream.
         let repository = normalized_github
             .get("repository")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
-        if let (Some(repository), crate::snapshots::SnapshotSource::LocalWorkspace) =
-            (repository, snapshot.source)
+        if let Some(repository) = repository
+            && matches!(
+                snapshot.source,
+                crate::snapshots::SnapshotSource::LocalWorkspace
+                    | crate::snapshots::SnapshotSource::SelfBuiltMerge
+            )
         {
             let credentials = base64::engine::general_purpose::STANDARD
                 .encode(format!("x-access-token:{runtime_token}"));

@@ -336,12 +336,9 @@ fn resolve_self_repository(
 /// The snapshot to read a `$/` tree from, when the run tests a local
 /// workspace and the workflow lives in the run's own repository.
 ///
-/// The engine sends `preloopSnapshotOriginRewrite` only for local-workspace
-/// snapshots: their `workflow_sha` may be unpushed, and even a pushed one
-/// lacks the uncommitted edits the run tests. `preloopSnapshotCommit` is the
-/// immutable commit the primary checkout was redirected to. A workflow from
-/// another repository (remote reusable workflow) is not in the snapshot and
-/// takes the forge path.
+/// The engine sends `preloopSnapshotOriginRewrite` for local workspace and
+/// self-built merge snapshots, whose commits may not exist on the forge.
+/// Remote reusable workflows are outside the snapshot and use the forge.
 fn local_snapshot_origin(
     job_message: &serde_json::Value,
     owner: &str,
