@@ -13,7 +13,11 @@ on:
   pull_request:
     paths:
       - "crates/preloop-runner-server/**"
+      - "crates/preloop-cli/src/store.rs"
+      - "migrations/**"
+      - "fixtures/control-migrations/**"
       - "docs/control-schema.sql"
+      - "docs/control-migrations.md"
       - ".github/workflows/control-plane.yml"
   workflow_dispatch:
 
@@ -30,6 +34,9 @@ jobs:
       CARGO_BUILD_JOBS: "6"
       RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      # The migration suite must exercise PostgreSQL in every leg; a missing
+      # server is a failure here, not a skip.
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -74,9 +81,8 @@ jobs:
         run: |
           # dtolnay/rust-toolchain exports CARGO_TERM_COLOR=always, which
           # nextest honors even when piped: every line then begins with an
-          # ANSI escape and the anchored grep below matched nothing ("zero
-          # tests" on all three jobs). --color never makes the output
-          # parseable regardless of the ambient environment.
+          # ANSI escape and the anchored grep below would match nothing.
+          # --color never overrides the ambient environment.
           #
           # The list exit status is checked on its own so a real failure of
           # `nextest list` is reported as such instead of as a zero count.
@@ -90,6 +96,25 @@ jobs:
             exit 1
           fi
           echo "control: $count test(s) found"
+      - name: Verify migration tests matched (SQLite + PostgreSQL)
+        run: |
+          # The refinery migration gate must exist and must include the
+          # Postgres arm in every matrix leg (zero migration tests or a
+          # missing Postgres test fails the job, not just the run).
+          if ! cargo nextest list --color never -p preloop-runner-server -E 'test(/^control::migrate_runner/)' > "$RUNNER_TEMP/migration-list.txt"; then
+            echo "ERROR: cargo nextest list exited non-zero" >&2
+            exit 1
+          fi
+          count=$(grep -c '^preloop-runner-server control::migrate_runner' "$RUNNER_TEMP/migration-list.txt" || true)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: nextest filter 'test(/^control::migrate_runner/)' matched zero tests" >&2
+            exit 1
+          fi
+          if ! grep -q 'control::migrate_runner::tests::postgres_migrations' "$RUNNER_TEMP/migration-list.txt"; then
+            echo "ERROR: the Postgres migration test is missing from the test list" >&2
+            exit 1
+          fi
+          echo "control migrations: $count test(s) found (postgres included)"
       - name: Control tests (SQLite + PostgreSQL)
         # --no-tests=fail also fails the run itself (exit 4) if the filter
         # ever selects nothing, independent of list output format.

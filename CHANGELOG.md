@@ -8,8 +8,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- Environment protection rules now come from GitHub. When a GitHub App (or
+  `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
+  `environment:` are read from the repository's environments API —
+  deployment branch policies (including `protected_branches` expansion via
+  the protected-branch list), `wait_timer`, `required_reviewers` with
+  `prevent_self_review` (teams expanded via the org members API), and
+  custom deployment protection rules (which fail the job closed: their
+  callback contract cannot be impersonated). Rules are cached for 60
+  seconds and refreshed by the reaper. `[environment_rules]` TOML remains
+  the source for repositories no credential covers, and for local mode.
+- Reviewer approvals arrive as `check_run.requested_action` webhooks: the
+  held job's check run completes with an `action_required` conclusion and
+  Approve/Reject buttons, the deployment status is `pending`, and an
+  authorized click releases the job or rejects it (the job fails, matching
+  GitHub). The check run returns to `in_progress` after approval. Approvals,
+  rejections, and the native admin override are recorded in a durable
+  `environment_approvals` table that outlives the run and its archival.
+- Every `environment:` job now gets a GitHub Deployment whose statuses
+  track the job: `pending` while reviewers deliberate, `queued` on
+  approval, `in_progress` at job start, `success`/`failure` at conclusion.
+  `environment.url` is evaluated by the runner at job completion (so
+  `steps.<id>.outputs` works) and reported over the completion protocol;
+  the evaluated value rides on the deployment statuses.
+- The App manifest requests `actions: read` and `deployments: write` (check
+  runs already needed `checks: write`) so the environment surfaces work
+  without a second install.
+- A schema-drift guard keeps the SQLite (`control/lite/schema.sql`) and
+  Postgres (`control/pg/schema.sql`) control schemas aligned: same tables,
+  column names, foreign keys and indexes, with every deliberate difference
+  listed and reasoned in `control/schema_drift.rs` (partition children, the
+  xid8 outbox columns and their ordering index, the pg-only
+  `job_messages.job_timeout_s`, the shared `timeline_id`, and the
+  `runner_sessions.runner_id` FK). The guard fails on an undocumented
+  difference and on a stale entry, so aligning the backends shrinks the list
+  instead of letting it rot.
+- Coverage for id and time storage on both backends: a run id and job
+  round-trip in lowercase-canonical form, a sub-microsecond instant reads
+  back as whole microseconds (nanosecond `bigint` stamps keep full
+  precision), SQLite accepts several attempts of one job sharing a
+  `timeline_id` (the deliberate pg-`UNIQUE` divergence) and its
+  `job_requests_timeline_cascade` trigger prunes the shared timeline with the
+  last request.
+
+### Changed
+
+- **Breaking:** the `[environments]` config table is removed. GitHub
+  accepts any `environment:` name and auto-creates it unprotected, so an
+  unknown name is no longer rejected (no more 403 at submit) and gating is
+  decided by the environment's rules. A config file with a non-empty
+  `[environments]` table now fails to load with an error naming the removed
+  table. Environment secrets stay keyed by name under `[env_secrets]`.
+- **Breaking:** the control-store schema version bumped (SQLite 4 → 5,
+  Postgres 5 → 6) for the `environment_approvals` table and the job's
+  environment-gate columns. There are no migrations: existing dev databases
+  are refused at boot and must be recreated.
+- Environment deployment statuses use the hydrated environment name, and
+  server-side completion handling drops secret-bearing `environment.url`
+  values even when a client did not mask them.
+- Environment rules that cannot be fetched hold the job fail-closed
+  (a resolver `Pending` state) instead of proceeding unprotected; a job
+  not approved within 24 hours fails closed.
+- Environment names are evaluated before protection lookup. Jobs whose names
+  depend on unfinished `needs` outputs remain held until the name resolves.
+- SQLite's `jobs_ready` key is now `(pool_key, priority DESC, run_order,
+  job_order)` — exactly the claim / ready-queue `ORDER BY`, the key Postgres
+  already carries. `namespace_id` sat between the pool key and the priority,
+  so SQLite sorted the last three ORDER BY terms on every poll; the claim
+  query now reads the ready front in index order (`EXPLAIN QUERY PLAN` goes
+  from `USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY` to no sort). SQLite
+  also gains `job_requests_attempts (run_id, job_id, request_id DESC)`, the
+  same index Postgres has, which serves the latest-attempt lookups and the
+  `jobs` -> `job_requests` cascade that the partial inflight index cannot.
+  Both are fresh-database changes: an existing database keeps working
+  unchanged, because a missing index is never an error.
+- The control schema no longer carries objects nothing uses:
+  `run_submissions.secret_refs`, `jobs.not_before`,
+  `provision_requests.lease_owner`/`leased_until`,
+  `runner_sessions.engine_node_id`, `log_files.byte_count`/`line_count`,
+  `artifacts.upload_token_hash` and Postgres's `runners_labels` GIN index
+  (label matching reads `runners.labels` in Rust and uses no operator a GIN
+  index serves). No code referenced any of them, so an existing control
+  database that still has the columns keeps working. The namespace
+  platform columns (`cell_generation`, `config_version`,
+  `namespace_limits.max_job_timeout_minutes`/`priority_tier`/
+  `run_history_retention_days`, `namespace_policies`) stay and are marked
+  platform-owned in the schema.
 
 ### Security
+
+- **The environment-rule cache is bounded to environments in use**: cached
+  rules were never evicted and every expired entry was refetched each reaper
+  tick, so a fork PR with a matrix of made-up environment names could pin
+  memory and spend the App's GitHub API budget (shared with check-run
+  reporting) indefinitely. Only keys a lookup re-requests are refreshed, and
+  keys idle for 10 minutes are evicted.
+
+- **A system install initializes the control database as the `preloop`
+  service account, never as root**: the store lives in the state tree the
+  install chowns to the service, so a root-owned create, write or chmod
+  there could be aimed anywhere the account can place a symlink — a dangling
+  `state/preloop.db` link had root create and chmod a file of the attacker's
+  choosing. The installer now prepares the store after the ownership
+  transfer, dropped to the service account, and the brand-new preparation
+  refuses a symlinked database path (and, for a privileged caller, a parent
+  directory that is not exclusively its own) instead of following it.
 
 - **The static GitHub PAT no longer crosses the network over plain HTTP**:
   action resolution and action tarball downloads attached the PAT to any
@@ -46,6 +151,97 @@ Releases before v0.27.0 predate the changelog.
   control bridge exists, are untouched. Host steps,
   the runner itself, and the official runner's Docker command shape are
   unchanged.
+- **Environment-gate denials record one failure, not two**: the Postgres
+  promotion paths pushed a settled job into the sweep's failure list after
+  `settle_node` had already recorded it, so an environment gate denied on the
+  promotion sweep (and an unsatisfiable `runs-on` resolved at promotion, and
+  a failed deferred expansion) counted twice — duplicate `JobStatus` events
+  and check-run reports, and an inflated `PromoteOutcome::failed`.
+  `settle_node` is the single recorder again.
+
+- **Environment approvals serialize with the promotion sweep** (Postgres):
+  `record_environment_approval` now takes the run lock (`FOR NO KEY UPDATE`)
+  before reading the gate and locks the job row (`FOR UPDATE OF j`), so an
+  approval racing a sweep that is concluding the job can no longer commit a
+  decision built from the stale `pending` snapshot, and the approval's
+  whole-blob gate write cannot erase a concurrent announce stamp.
+
+- **Environment resolution and reviewer-team expansion use the configured
+  PAT**: the resolver read only `PRELOOP_GITHUB_TOKEN`, so a PAT-only setup
+  whose credential lives in the config file (`github.pat`) resolved rules
+  through the empty TOML fallback and failed every team-reviewer check
+  closed. Both paths now read `AppState::static_github_pat()`, the same
+  credential source the rest of the server uses.
+
+- **Environment protection follow-ups:** GitHub team reviewers without an
+  inline organization now resolve against the repository owner, and an empty
+  protected-branch set follows GitHub's all-branches deployment semantics.
+- **Removed environment protection releases armed jobs:** deleting reviewers,
+  timers, branch policy, and custom rules on GitHub no longer leaves a job
+  held behind stale gate state.
+- **Deferred environment names fail or hydrate deterministically:** jobs no
+  longer wait forever after a `${{ needs.* }}` name cannot be resolved.
+- **Environment policy pagination fails closed:** truncated protected-branch,
+  branch-policy, and team-member lists remain unresolved instead of being
+  treated as complete.
+- **Manifest-created GitHub Apps subscribe to `check_run`**: without it
+  GitHub never delivered `check_run.requested_action`, so environment
+  Approve/Reject clicks on `action_required` check runs went unheard.
+- **Environment deployment/review tokens carry `checks: write`**: the
+  minted installation token asked only for `deployments: write` +
+  `contents: read`, so the `action_required` Approve/Reject check-run
+  PATCHes were rejected by GitHub.
+- **Deployment and review reporting fall back to the config-file PAT**:
+  `resolve_repo_token` consulted only `PRELOOP_GITHUB_TOKEN`, so a PAT in
+  `github.pat` got no deployment statuses or review buttons (and could send
+  an empty bearer). It now reads `AppState::static_github_pat()`.
+- **Environment gates stay announced-retryable until every GitHub surface
+  lands**: a gate scanned before its check run id was persisted, or whose
+  deployment create failed, was stamped `announced` and never retried —
+  permanently losing the Approve/Reject buttons or the `pending` status.
+- **A late `in_progress` deployment status no longer revives a finished
+  deployment**: the asynchronous post now fences on the persisted job state.
+- **Skipped `environment:` jobs no longer mint phantom deployments**:
+  concluding a job that never ran (and whose gate never engaged) created a
+  deployment plus a `failure` status; GitHub creates none for skipped jobs.
+- **`check_run.requested_action` must name the held job's repository**: a
+  delivery whose `repository.full_name` mismatched (or was missing) the
+  gated job's repository could record an environment review for it; it is
+  ignored now.
+- **The scheduler claims the oldest ready job again, whatever its `runs-on`
+  labels.** The ready queue was read in pool-key order (the key is a
+  canonical label-set string), and pool keys sort as text: every runner
+  matching both `["preloop-cpane","self-hosted"]` and `["self-hosted"]` took
+  the lexically earlier key's jobs first, so a label set whose key sorted
+  later starved behind the other's — on the production cell 91
+  `preloop-cpane` jobs all started while 15 `self-hosted` jobs (one an hour
+  older, the required "Runner light conformance" check) never did. The claim
+  batch, the ready-queue front gauges and the reaper's ready scans now read
+  one global queue order — `priority DESC, run_order, job_order`, with
+  `run_id, job_id` as tie-breakers — on both backends; the pool key groups
+  equal label sets for pruning and never ranks them. A runner's own fresh
+  bindings are read before the paged queue, so a first window of older
+  unassigned jobs can no longer take a runner off the job the control plane
+  bound to it: the binding is exclusive and expires after 120s, and the
+  four-tier preference puts it above every unassigned candidate wherever in
+  the queue it sits. A new
+  `jobs_ready_global` partial index (`queue_state = 'ready'`) carries that
+  order, so the claim stays an index read instead of a sort of the whole
+  ready queue (0.2 ms vs 28 ms at 20k ready jobs); `jobs_ready` is kept for
+  the per-pool quota predicates. The index is added by migration
+  `V2026100507`; the claim order is correct without it, so a database that
+  has not migrated yet only loses the speedup.
+
+- **Runs are queued in arrival order on Postgres, and expanded jobs keep
+  their run's place.** Postgres ordered the queue by the workflow's run
+  number — a per-workflow counter — so run #3 of one workflow was claimed
+  before run #800 of another that arrived earlier. `run_order` is now the
+  run's submit time on both backends. Jobs a deferred matrix or a reusable
+  workflow expands into were inserted with `run_order = 0, job_order = 0`,
+  which put them ahead of every other run's ready jobs on both backends;
+  they now take their run's `run_order` and the placeholder's `job_order`.
+  Legs of one matrix share that `job_order`, so among themselves they fall
+  back to `job_id`.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
@@ -172,6 +368,45 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- Control-database schema is now versioned and migratable: refinery 0.10 runs
+  the forward-only migration sets in `migrations/{sqlite,postgres}` (rerun
+  history attempt keys, environment deployments/review audit, fork-approval
+  sweep index), the ledger `refinery_schema_history` is the sole version
+  authority, and `preloop store migrate|status` is the explicit
+  initialize/upgrade path. `preloop serve` never migrates: a missing, older,
+  newer or divergent schema refuses with the recovery command, and a legacy
+  store refuses with `preloop store import-legacy`. SQLite migrations take a
+  consistent pre-migration backup (`VACUUM INTO`) as the rollback path;
+  populated baseline fixtures and an executable parity test against
+  `schema.sql` keep upgrades lossless. Brand-new local installs still
+  initialize on first `preloop run`/`init`/`server install`.
+- **`preloop store import-legacy` imports a released v11 `preloop.db` into a
+  fresh control SQLite database.** The source is opened read-only at `PRAGMA
+  user_version = 11` and hashed before and after; runs, queued jobs (secrets
+  move to the SecretProvider run tier and are stripped from the stored message
+  templates), attempts, steps, log bytes, counters, runners, sessions,
+  webhooks, check ids, and the durable metadata snapshot are written in one
+  transaction into `<target>.importing`, verified (`PRAGMA
+  foreign_key_check`, row counts, schema version), then published atomically
+  (never overwriting an existing target) — a failure leaves no target and a
+  retry is safe. Claimed-but-unfinished attempts, session bindings, and live
+  concurrency gates refuse by default; `--active=requeue|cancel` drains them
+  explicitly. The legacy event log is carried into the outbox (ids and order
+  preserved), per-attempt message frames are verified against the imported
+  templates (reconstructing them for terminal jobs), the finalized artifact
+  registry — legacy v1 `artifact_records` and `artifact_v2_registry.json` —
+  moves into `artifacts`, and buffered timeline events move into the outbox.
+  Both uploads and imports land in that durable catalog, and the v1 artifact
+  GET/list endpoints serve from it: a restart (or a process that never saw
+  the upload) keeps serving, an imported artifact is served instead of
+  vanishing with the legacy process, and one id is one row by the unique
+  `artifacts_public_id` index — never a scan of the whole catalog.
+  Anything not carried into a table is written to
+  `<state-dir>/legacy-import-archive.json`; only node-local state that
+  cannot be carried (queued broker frames, in-flight artifact/cache uploads,
+  pool provisioning marks) refuses the import, and only provably unreachable
+  tombstones/ephemeral tokens are reported as skipped. `preloop serve` still
+  never migrates a database on its own.
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and
@@ -210,6 +445,24 @@ Releases before v0.27.0 predate the changelog.
   scope. Secret masking still covers the entire scope server-side.
 
 ### Fixed
+
+- `preloop store import-legacy` no longer refuses a legacy store whose only
+  "active" work is stale. A claimed-but-unfinished attempt whose job (per the
+  run record) or whole run is already terminal is imported settled as
+  history — the job's terminal result (or `cancelled` when the job recorded
+  none), `finished_at` set, no runner/session binding, no `job_leases` row,
+  never `ready`/`claimed` — and the settlement is counted in the report
+  (`N stale claim(s) on already-finished jobs were settled as history`).
+  Session bindings that point only at such attempts are dropped the same way,
+  and runtime concurrency gates whose holder runs are terminal or already
+  evicted (a stopped legacy process can never release them) are released as
+  history with their counts reported. Claims and gates on non-terminal runs
+  still refuse by default, and `--active=requeue` / `--active=cancel` are
+  unchanged. A finished attempt no longer writes a `job_leases` row: a lease
+  is live scheduling state, not history. Legacy unscoped log metadata
+  (`job:<agent_job_id>`, `step:<step_id>`, written before Results identifiers
+  were canonicalized) is now attributed to the attempt it names instead of
+  being reported as unmapped.
 
 - A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
   provisioning removed the guest's small tmpfs `/tmp`, which left it on the
