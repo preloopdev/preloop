@@ -130,6 +130,15 @@ async fn render_session_message(
             .await
             .map_err(ApiError::from)?;
         let mut msg = ctx.message;
+        crate::environment_resolver::restrict_environment_secret_scope(
+            shared,
+            &ctx.repository,
+            &mut msg,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("resolve environment secret scope: {error:#}"))
+        })?;
         // The stored message is a secret-free template: resolve secrets back
         // in from the SecretProvider, then fill the token slots — the AzDO
         // path has no App-mint, so the PAT (or the job-scoped runtime token

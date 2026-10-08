@@ -849,6 +849,13 @@ pub async fn broker_acquire_job(
     let mut message = ctx.message;
     let github_token_request = ctx.token_request;
     let id_token_granted = ctx.id_token_granted;
+    crate::environment_resolver::restrict_environment_secret_scope(
+        &shared,
+        &ctx.repository,
+        &mut message,
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("resolve environment secret scope: {error:#}")))?;
     // The stored message is a secret-free template: fill `variables` (plus
     // value-derived mask hints) from the SecretProvider scoped to the run,
     // then serialize — the filled message is never written back.
