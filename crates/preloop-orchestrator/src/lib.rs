@@ -2388,10 +2388,10 @@ pub fn guest_hostname_script() -> String {
 fn guest_hostname_script_at(hosts: &str) -> String {
     let hosts = shell_quote(hosts);
     format!(
-        "command -v getent >/dev/null 2>&1 || { \
+        "command -v getent >/dev/null 2>&1 || {{ \
            echo 'getent is missing; the machine name cannot be checked against a local address' >&2; \
            exit 1; \
-         }; \
+         }}; \
          host=$(hostname 2>/dev/null || uname -n); \
          [ -n \"$host\" ] || exit 0; \
          case \"$host\" in \
