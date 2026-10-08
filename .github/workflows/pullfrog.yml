@@ -153,8 +153,21 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # The action's external-token path: use the job token for git and the
-          # GitHub API instead of trading an OIDC token at Pullfrog's server.
-          # That exchange only trusts GitHub's own OIDC issuer, so on preloop
-          # it failed every run with "Token verification failed".
-          GH_TOKEN: ${{ github.token }}
+          # The action's external-token path: use this credential for git and
+          # the GitHub API instead of trading an OIDC token at Pullfrog's
+          # server. That exchange only trusts GitHub's own OIDC issuer, so on
+          # preloop it failed every run with "Token verification failed".
+          #
+          # LOAD-BEARING — it must also carry `pull-requests: write`, or the
+          # review POST (pulls.createReview) is a 403: a run with a read-only
+          # token still exits with the review unposted. `github.token` is a
+          # GitHub App installation token and the engine clamps it to what
+          # that installation actually grants (the preloop-dev App grants
+          # `pull_requests: read`, and the engine warns "the GitHub App
+          # installation does not grant [pull_requests: write]"). Either
+          #   * grant the App installation `pull-requests: write` (and
+          #     `contents: write` to let reviews push fixes), which makes the
+          #     `github.token` fallback below sufficient, or
+          #   * store a token that carries the scope as PULLFROG_GH_TOKEN in
+          #     the engine's secret store — it wins here when present.
+          GH_TOKEN: ${{ secrets.PULLFROG_GH_TOKEN || github.token }}
