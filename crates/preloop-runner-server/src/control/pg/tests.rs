@@ -1348,8 +1348,11 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         .await
         .unwrap()
         .query(
-            "SELECT job_id, status || '/' || queue_state FROM jobs \
-             WHERE run_id=$1::text::uuid AND base_id='m' ORDER BY job_order",
+            "SELECT j.job_id, j.status || '/' || j.queue_state || '/' || \
+                    COALESCE(s.max_parallel::text, 'null') \
+             FROM jobs j LEFT JOIN job_specs s \
+               ON s.run_id=j.run_id AND s.job_id=j.job_id \
+             WHERE j.run_id=$1::text::uuid AND j.base_id='m' ORDER BY j.job_order",
             &[&run.0.to_string()],
         )
         .await
