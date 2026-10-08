@@ -289,7 +289,10 @@ Retry after a crash is safe because `runs` keeps its unique index on
 transition makes a stale worker unable to finalize. That is the same
 idempotency the webhook path already relies on (`control/lite/submit.rs:20-22`,
 `control/pg/dispatch.rs:3948-3952`); the ledger and outbox simply join the
-transaction.
+transaction. Lease loss before that commit writes nothing at all — runs,
+ledger, outbox rows, receipts and the event transition are one fenced unit —
+and anything already committed belongs to the outbox sender, so a reclaim can
+neither double-run nor double-write GitHub.
 
 `runs.webhook_delivery_id` becomes `runs.event_id` (same uniqueness). The
 watchdog join reads `event_deliveries.delivery_guid` for presence and then the
@@ -346,8 +349,11 @@ Canonical keys:
 | `schedule` | `repository + "\0" + workflow + "\0" + cron bucket` | unchanged semantics |
 
 Cross-source collapse is therefore exact where a canonical key exists, and
-GUID-scoped where it does not. Two consequences worth stating:
+GUID-scoped where it does not. Three consequences worth stating:
 
+- **Grace is latency, not correctness.** A real webhook that lands after its
+  synthesized twin finds the event by canonical key, adds its receipt and
+  nothing else — the race is decided by the unique index, never by timing.
 - **A `failed` event is revived only by a genuine re-delivery** (same GUID) or
   by a reconciler synthesis after the grace period — a plain duplicate is a
   no-op. That matches today's `ON CONFLICT … WHERE state = 'failed'`
@@ -472,15 +478,23 @@ Algorithm, per repo, in one pass:
    period (default 3 min) → skip; the webhook is probably still in flight.
 3. Else synthesize:
    - **branch/tag push**: payload rebuilt fully from git — `after` = tip,
-     `before` = the ledger's last processed head for the ref (or the tip's
-     first parent for a never-seen ref), `head_commit` from `git cat-file`,
-     changed files from the mirror diff (for `paths:` filters). No API needed.
+     `before` = the ledger's last processed head for the ref (for a never-seen
+     ref, the merge-base with the default-branch tip, so the batch is the
+     branch's added commits rather than the tip alone), `commits[]` rebuilt
+     over `before..after` from `git log` (the adapter's `[skip ci]` test reads
+     every commit in the batch), `head_commit` from `git cat-file`, changed
+     files from the mirror diff (for `paths:` filters), and
+     `repository.default_branch` from the local repository record — the
+     adapter falls back to `main`, which would silently change trust tier and
+     skip semantics for any other default branch. No API needed.
    - **pull request**: needs PR metadata (number is in the ref, but base ref,
      draft state and fork status are not). **Fail closed**: fetch the PR from
-     REST; while the API is down, record the head movement in the ledger as
-     *seen, not processed* and defer — detection still shows up in the
-     `reconciler_deferred` gauge, and the event is synthesized on the first
-     pass after the API returns.
+     REST; while the API is down, record the head movement as *seen, not
+     processed* — the `reconciler_deferred` gauge plus a backoff, never a
+     `processed_heads` row — and synthesize on the first pass after the API
+     returns. Only a ledger row written with its run decides processing, so a
+     deferral can neither suppress the repair later nor read as a processed
+     head.
    - Action inference for PR synthesis: no processed head for the PR at all →
      `opened`; a previously processed head exists → `synchronize` (which is
      also what a base-only move synthesizes, D4). The new event supersedes the
