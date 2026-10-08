@@ -227,8 +227,10 @@ pub async fn create_log_org(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::timeline_logs::authorize_live_reporting_callback(&shared, &headers, &plan_id, None, None)
-        .await?;
+    crate::timeline_logs::authorize_live_reporting_callback(
+        &shared, &headers, &plan_id, None, None,
+    )
+    .await?;
     create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
@@ -238,8 +240,10 @@ pub async fn append_log_org(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    crate::timeline_logs::authorize_live_reporting_callback(&shared, &headers, &plan_id, None, None)
-        .await?;
+    crate::timeline_logs::authorize_live_reporting_callback(
+        &shared, &headers, &plan_id, None, None,
+    )
+    .await?;
     Ok(append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await)
 }
 

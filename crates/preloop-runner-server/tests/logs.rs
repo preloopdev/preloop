@@ -3079,9 +3079,7 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
         })
         .await;
     let token = state.mint_runtime_token(&plan_id, &agent_job_id);
-    let timeline_url = format!(
-        "/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records"
-    );
+    let timeline_url = format!("/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records");
     let patch = || {
         Request::builder()
             .method(Method::PATCH)
@@ -3117,8 +3115,6 @@ async fn settled_job_token_cannot_mutate_timeline_records() {
         .await
         .unwrap();
     assert_eq!(read.status(), StatusCode::OK);
-}
-
 
 /// A timeline PATCH that the control DB rejects must not answer 200
 /// with `count: 0`: the runner would believe its records were persisted.
