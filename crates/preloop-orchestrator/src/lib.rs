@@ -8496,17 +8496,8 @@ done
                 runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
             ),
             (
-                "runner_ownership_reconcile_script".to_owned(),
-                runner_ownership_reconcile_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
-            ),
-            ("base_install_script".to_owned(), base_install_script()),
-            (
                 "docker_start_command".to_owned(),
                 docker_start_command()[2].clone(),
-            ),
-            (
-                "apt_lists_refresh_command".to_owned(),
-                apt_lists_refresh_command()[2].clone(),
             ),
             (
                 "preload_images_command".to_owned(),
@@ -8538,20 +8529,14 @@ done
                 run_as_root_or_sudo_strict("true"),
             ),
         ];
-        // Toolchain provisioning for the layers a job can ask for: every
-        // `sh -c` install command and every post-install verify predicate.
-        for layer in [
-            crate::environment::ToolchainLayer::Node("22".to_owned()),
-            crate::environment::ToolchainLayer::Rust("stable".to_owned()),
-            crate::environment::ToolchainLayer::Go("1.24".to_owned()),
-        ] {
-            for (index, command) in layer.install_commands().into_iter().enumerate() {
-                if command[0] == "sh" {
-                    scripts.push((format!("{layer} install[{index}]"), command[2].clone()));
-                }
-            }
-            scripts.push((format!("{layer} verify"), layer.verify_command()));
-        }
+        // The curated-bake scripts this list used to carry
+        // (`base_install_script`, `runner_ownership_reconcile_script`,
+        // `apt_lists_refresh_command`, the toolchain install/verify commands)
+        // exist only on this branch's lineage: the main lineage replaces them
+        // with the golden-contract scripts, so listing them here would break
+        // the test build on a merged tree. Add that lineage's
+        // `golden_contract_script` / `golden_ownership_script` /
+        // `golden_glibc_check_script` here when the merge happens.
 
         for (name, script) in &scripts {
             let output = std::process::Command::new(shell)
