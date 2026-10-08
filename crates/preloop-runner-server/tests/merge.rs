@@ -296,6 +296,27 @@ async fn unreachable_upstream_fails_clearly() {
     );
 }
 
+/// A local pull-request merge requires an origin; `--no-merge` is the named
+/// escape hatch when the workspace is intentionally offline.
+#[tokio::test]
+async fn originless_pull_request_names_no_merge_escape() {
+    let fixture = MergeFixture::clean();
+    git(&fixture.workspace, &["remote", "remove", "origin"]);
+    let (state, app) = fixture.app().await;
+    let (status, body) = request_json_status(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        fixture.submission(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("no `origin` remote"), "error: {message}");
+    assert!(message.contains("--no-merge"), "error: {message}");
+    assert!(state.test_tx().await.runs.is_empty());
+}
+
 /// `--no-merge` keeps today's behaviour: the branch alone, no merge record.
 #[tokio::test]
 async fn no_merge_tests_the_branch_alone() {

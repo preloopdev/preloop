@@ -4453,6 +4453,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         let workspace = temp.path().join("workspace");
+        let origin = temp.path().join("origin.git");
         std::fs::create_dir_all(&workspace).unwrap();
         git_in(&workspace, &["init", "-q", "-b", "main"]);
         git_in(&workspace, &["config", "user.email", "test@example.com"]);
@@ -4460,9 +4461,24 @@ mod tests {
         std::fs::write(workspace.join("file.txt"), "one\n").unwrap();
         git_in(&workspace, &["add", "file.txt"]);
         git_in(&workspace, &["commit", "-qm", "initial"]);
-        let workspace_head = String::from_utf8(git_in(&workspace, &["rev-parse", "HEAD"])).unwrap();
-        // Dirty the tree: the uncommitted change must show up in the
-        // head..base diff, which it cannot when head is the workspace HEAD.
+        git_in(
+            &workspace,
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
+        );
+        git_in(
+            &workspace,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&workspace, &["push", "-q", "origin", "main"]);
+        git_in(&workspace, &["push", "-q", "origin", "feature"]);
+        git_in(&workspace, &["checkout", "-q", "main"]);
+        std::fs::write(workspace.join("base-only.txt"), "base\n").unwrap();
+        git_in(&workspace, &["add", "base-only.txt"]);
+        git_in(&workspace, &["commit", "-qm", "base moved"]);
+        git_in(&workspace, &["push", "-q", "origin", "main"]);
+        git_in(&workspace, &["checkout", "-q", "feature"]);
+        // Dirty the tree: the uncommitted change must be carried by the
+        // synthetic head commit that the merge builder consumes.
         std::fs::write(workspace.join("file.txt"), "two (uncommitted)\n").unwrap();
 
         let mut state = AppState::new(state_dir.clone()).await.unwrap();
@@ -4498,41 +4514,31 @@ mod tests {
         let head_sha = pr["head"]["sha"].as_str().unwrap().to_owned();
         let base_sha = pr["base"]["sha"].as_str().unwrap().to_owned();
 
+        let merge = snapshot
+            .merge
+            .as_ref()
+            .expect("default local pull_request runs build a merge");
         assert_eq!(
-            head_sha, snapshot.commit_sha,
-            "PR head must be the snapshot commit carrying the dirty tree"
-        );
-        assert_ne!(
-            head_sha,
-            snapshot.head_sha.as_deref().unwrap(),
-            "PR head must not be the real workspace HEAD"
-        );
-        assert_ne!(
-            head_sha,
-            workspace_head.trim(),
-            "head must not be the workspace HEAD"
+            head_sha, merge.head_sha,
+            "PR head must be the dirty snapshot commit carried into the merge"
         );
         assert_eq!(
-            base_sha,
-            snapshot.before_sha.as_deref().unwrap(),
-            "PR base must be the base the dirty tree is measured against"
+            base_sha, merge.base_sha,
+            "PR base must be the fetched current base tip"
         );
-        assert_ne!(
-            base_sha, head_sha,
-            "a dirty tree must diff against its base"
+        assert_eq!(
+            run.github["sha"],
+            serde_json::json!(merge.sha),
+            "github.sha must identify the two-parent merge commit"
         );
-
-        // Both endpoints resolve inside the snapshot store, and the diff names
-        // exactly the uncommitted change.
         let snapshot_repository = state_dir.join(&snapshot.repository);
-        let changed = git_in(
-            &snapshot_repository,
-            &["diff", "--name-only", &base_sha, &head_sha],
-        );
         assert_eq!(
-            String::from_utf8(changed).unwrap().trim(),
-            "file.txt",
-            "changed-file actions must see the dirty tree's changes"
+            git_in(
+                &snapshot_repository,
+                &["log", "--format=%P", "-1", &merge.sha]
+            ),
+            format!("{} {}\n", merge.base_sha, merge.head_sha),
+            "the checked-out merge must have fetched base first and dirty head second"
         );
     }
 
