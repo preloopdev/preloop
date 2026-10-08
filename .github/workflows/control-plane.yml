@@ -81,9 +81,8 @@ jobs:
         run: |
           # dtolnay/rust-toolchain exports CARGO_TERM_COLOR=always, which
           # nextest honors even when piped: every line then begins with an
-          # ANSI escape and the anchored grep below matched nothing ("zero
-          # tests" on all three jobs). --color never makes the output
-          # parseable regardless of the ambient environment.
+          # ANSI escape and the anchored grep below would match nothing.
+          # --color never overrides the ambient environment.
           #
           # The list exit status is checked on its own so a real failure of
           # `nextest list` is reported as such instead of as a zero count.
