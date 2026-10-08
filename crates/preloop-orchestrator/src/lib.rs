@@ -2058,6 +2058,37 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Traversal and predicate shared by the ownership walk and its probe, so the
+/// set the probe reports cannot drift from the set the apply repairs. `root`
+/// is a shell word.
+///
+/// The trailing `/.` is load-bearing: `find` does not follow a symlink handed
+/// to it as its starting point (the `-P` default) and an *adopted* rust home
+/// is a symlink into the runner's `$HOME`, so walking the link alone inspects
+/// one inode and skips the whole target tree — the probe would report work
+/// while the apply repaired nothing. `-xdev` keeps the walk out of the
+/// read-only externals mount under the runner home, where a `chown` would
+/// abort the apply.
+fn ownership_scan(root: &str, uid: u32) -> String {
+    format!("find {root}/. -xdev ! -uid {uid}")
+}
+
+/// Repair half of [`ownership_scan`], over one tree.
+///
+/// Never a recursive `chown`: the guest root is overlayfs, so a recursive
+/// chown copies every file it visits out of the packed lower layer into the
+/// per-VM upper even when the owner already matches (1.22 GB once for the
+/// runner home). `-h` keeps `chown`'s default no-symlink-traversal behavior,
+/// and the owner is the only predicate: the official images deliberately leave
+/// some runner-owned files in another group (`/home/runner/.docker` is
+/// `runner:docker`), and the official runner leaves that group in place.
+fn ownership_walk(root: &str, uid: u32) -> String {
+    format!(
+        "{} -exec chown -h {uid}:{uid} {{}} +",
+        ownership_scan(root, uid)
+    )
+}
+
 /// Guest script that hands the runner account ownership of every path a job
 /// writes, without touching the image's privilege policy.
 ///
@@ -2097,19 +2128,15 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
     );
     // The privileged half, applied only after `needs=1`. `set -e` makes every
     // required operation fail the script: this is the ownership jobs depend
-    // on, so a partial apply must not report success. Like the per-exec
-    // provisioning, the walk matches on the owner alone and touches only the
-    // inodes that need it; a recursive chown would copy the whole tree into
-    // the VM's overlay upper, and a group predicate would re-group files the
-    // official images deliberately leave in another group (the runner home's
-    // `runner:docker`).
+    // on, so a partial apply must not report success. The walk is the one
+    // [`ownership_walk`] renders for the per-exec provisioning, over the same
+    // roots the probe above inspects.
+    let rust_home_walk = ownership_walk("\"$d\"", uid);
     let apply = format!(
         "set -e; \
          {adopt_homes}; \
          for d in /usr/local/rustup /usr/local/cargo; do \
-           if [ -e \"$d\" ]; then \
-             find \"$d\" -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} +; \
-           fi; \
+           if [ -e \"$d\" ]; then {rust_home_walk}; fi; \
          done; \
          if [ -d /opt/hostedtoolcache ]; then \
            [ \"$(stat -c %a /opt/hostedtoolcache)\" = \"777\" ] || chmod -R 777 /opt/hostedtoolcache; \
@@ -2127,13 +2154,17 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
         "if [ ! -f /usr/local/rustup/settings.toml ] && [ -f {home}/.rustup/settings.toml ]; then needs=1; fi; \
          if [ ! -d /usr/local/cargo/bin ] && [ -d {home}/.cargo/bin ]; then needs=1; fi"
     );
+    // The detection half of the same walk: the entry's own owner first (which
+    // `stat -L` resolves, so an adopted symlink home is inspected through the
+    // link), then the first mismatched descendant.
+    let rust_home_probe = format!("{} -print -quit", ownership_scan("\"$d\"", uid));
     format!(
         "needs=0; \
          {adopt_needs}; \
          for d in /usr/local/rustup /usr/local/cargo; do \
            if [ -e \"$d\" ]; then \
              if [ \"$(stat -L -c %u \"$d\" 2>/dev/null)\" != \"{uid}\" ]; then needs=1; \
-             elif find \"$d/.\" ! -uid {uid} -print -quit 2>/dev/null | grep -q .; then needs=1; fi; \
+             elif {rust_home_probe} 2>/dev/null | grep -q .; then needs=1; fi; \
            fi; \
          done; \
          if [ -d /opt/hostedtoolcache ]; then \
@@ -6476,23 +6507,13 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // `name_to_handle_at`, so fanotify FID watchers (TypeScript's fswatch,
     // 126 tests) failed with "operation not supported". GitHub-hosted
     // runners keep `/tmp` on ext4; the bind mount matches that.
-    // Ownership is reconciled by walking to the inodes whose *owner* is
-    // actually wrong, never by a recursive `chown`. The guest root is
-    // overlayfs: a recursive chown copies every file it visits out of the
-    // packed lower layer into the per-VM upper, even when the owner already
-    // matches — measured on a throwaway VM booted from the campaign golden,
-    // one `chown -R /home/runner` spent 304 s and copied 1.22 GB (12,631
-    // overlay entries) into the per-VM upper to re-group two inodes. The
-    // predicate is the owner alone: GitHub's own images ship
-    // `/home/runner/.docker` and its `config.json` as `runner:docker`
-    // (verified on hosted `ubuntu-24.04-arm` and `ubuntu-24.04`, both
-    // `mismatch-count=2` under a uid-or-gid predicate), and the official
-    // runner leaves that group in place, so a file the runner already owns
-    // must keep whatever group it has.
-    // `chown -h` on the matched paths preserves `chown -R`'s default
-    // no-symlink-traversal semantics. `-xdev` keeps the walk out of the
-    // read-only externals mount some bases carry under the runner home; on the
-    // packed-golden shape it visits the same entries as an unfiltered walk.
+    // Ownership is reconciled by the shared walk to the inodes whose owner is
+    // actually wrong — see [`ownership_walk`] — never by a recursive `chown`
+    // and never by the group: the official images ship runner-owned files in
+    // another group and the official runner leaves that group in place.
+    let home_walk = ownership_walk(RUNNER_ROOT, uid);
+    let rustup_walk = ownership_walk("/usr/local/rustup", uid);
+    let cargo_walk = ownership_walk("/usr/local/cargo", uid);
     let provisioning = format!(
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
@@ -6501,10 +6522,10 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
            || true; \
          chmod 0440 /etc/sudoers.d/preloop-{user} 2>/dev/null || true; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         find /home/runner -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null || true; \
+         {home_walk} 2>/dev/null || true; \
          chown {uid}:{uid} /run/user/{uid} 2>/dev/null || true; \
-         if [ -d /usr/local/rustup ]; then find /usr/local/rustup -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null; fi; \
-         if [ -d /usr/local/cargo ]; then find /usr/local/cargo -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null; fi; \
+         if [ -d /usr/local/rustup ]; then {rustup_walk} 2>/dev/null; fi; \
+         if [ -d /usr/local/cargo ]; then {cargo_walk} 2>/dev/null; fi; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -7591,7 +7612,7 @@ chmod +x "$dest/bin/node"
         // A runner-owned root with root-owned descendants passes a top-level
         // `stat` and then skips the ownership fix; the probe must descend.
         assert!(
-            script.contains("find \"$d/.\" ! -uid 1001 -print -quit"),
+            script.contains("\"$d\"/. -xdev ! -uid 1001 -print -quit"),
             "the ownership probe must be recursive: {script}"
         );
         // ...but the apply itself must not be: a recursive chown copies every
@@ -7605,14 +7626,19 @@ chmod +x "$dest/bin/node"
             !decoded.contains("chown -R"),
             "the reconcile apply must not recurse: {decoded}"
         );
+        // Probe and apply must be the same walk over the same root: `/usr/local`
+        // rustup is a symlink into the runner home once adopted, and `find` does
+        // not follow a symlink handed to it as its starting point, so a walk
+        // without the trailing `/.` would leave the probe reporting work the
+        // apply never does.
+        assert!(
+            decoded.contains("\"$d\"/. -xdev ! -uid 1001 -exec chown -h 1001:1001 {} +"),
+            "the reconcile apply must walk through an adopted symlink home: {decoded}"
+        );
         // A file the runner already owns keeps whatever group it has. GitHub's
         // own images ship `/home/runner/.docker` as `runner:docker`, and the
         // official runner leaves it alone — only the owner identifies an inode
         // the guest has to adopt.
-        assert!(
-            decoded.contains("find \"$d\" -xdev ! -user 1001 -exec chown -h 1001:1001 {} +"),
-            "the reconcile apply must match on the owner alone: {decoded}"
-        );
         assert!(
             !decoded.contains("! -group 1001"),
             "a runner-owned file in another group must be left alone: {decoded}"
@@ -7620,6 +7646,135 @@ chmod +x "$dest/bin/node"
         assert!(
             script.contains("stat -L -c %u"),
             "the probe must dereference an adopted symlink home: {script}"
+        );
+    }
+
+    /// Execute an ownership walk with a stub `chown` on `PATH` and return the
+    /// argv of every invocation. No privileges needed: the walk does the
+    /// selecting, the stub records it, and nothing changes owner.
+    fn walk_with_stub_chown(root: &std::path::Path, uid: u32) -> Vec<String> {
+        let stub = tempfile::tempdir().unwrap();
+        let log = stub.path().join("chown.log");
+        let shim = stub.path().join("chown");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let walk = ownership_walk(&format!("'{}'", root.display()), uid);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let status = Command::new("sh")
+            .args(["-c", &walk])
+            .env("PATH", format!("{}:{path}", stub.path().display()))
+            .status()
+            .unwrap();
+        assert!(status.success(), "the walk must run: {walk}");
+        std::fs::read_to_string(&log)
+            .map(|log| log.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn current_uid() -> u32 {
+        let out = Command::new("id").arg("-u").output().unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A group the test user may `chgrp` into, for the fixture that has to keep
+    /// one. `None` on a host where the user has only its primary group.
+    fn alternate_gid(primary: u32) -> Option<u32> {
+        let out = Command::new("id").arg("-G").output().unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .filter_map(|gid| gid.parse::<u32>().ok())
+            .find(|gid| *gid != primary)
+    }
+
+    /// The walk is executed, not pattern-matched: the stub `chown` records
+    /// what the walk hands it, so these assertions are about the inodes the
+    /// command selects on a real tree — an adopted rust home, a symlink that
+    /// leaves it, an inode the runner already owns — instead of about the text
+    /// of the command. The owner change itself needs `CAP_CHOWN`, so the
+    /// privileged half stays covered by the guest smoke.
+    #[test]
+    fn ownership_walk_selects_only_the_mismatched_inodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        let rustup = fixture.join("home/runner/.rustup");
+        let toolchain = rustup.join("toolchains/stable/bin");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        std::fs::write(rustup.join("settings.toml"), b"settings").unwrap();
+        std::fs::write(toolchain.join("rustc"), b"rustc").unwrap();
+        // An inode the runner already owns, moved into another group when the
+        // host has one to move it into: the walk must leave it alone either
+        // way, which is what keeps `runner:docker` files intact on the official
+        // images.
+        let kept = rustup.join("kept-group");
+        std::fs::write(&kept, b"kept").unwrap();
+        if let Some(gid) = alternate_gid(current_uid()) {
+            let status = Command::new("chgrp")
+                .arg(gid.to_string())
+                .arg(&kept)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "could not move the fixture into group {gid}"
+            );
+        }
+        // A symlink out of the tree the walk must not follow.
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("far"), b"far").unwrap();
+        std::os::unix::fs::symlink(&outside, rustup.join("leaving")).unwrap();
+        // The adopted-home shape: `/usr/local/rustup` is a symlink into the
+        // runner home, exactly what `adopt_homes` creates.
+        std::fs::create_dir_all(fixture.join("usr/local")).unwrap();
+        let adopted = fixture.join("usr/local/rustup");
+        std::os::unix::fs::symlink(&rustup, &adopted).unwrap();
+
+        // A uid that owns nothing in the fixture: every inode is a mismatch.
+        let stranger = if current_uid() == 1001 { 1002 } else { 1001 };
+        let lines = walk_with_stub_chown(&adopted, stranger);
+        assert!(!lines.is_empty(), "the walk must hand mismatches to chown");
+        let mut walked = Vec::new();
+        for line in &lines {
+            let mut args = line.split_whitespace();
+            assert_eq!(
+                args.next(),
+                Some("-h"),
+                "chown must not follow symlinks: {line}"
+            );
+            assert_eq!(args.next(), Some(format!("{stranger}:{stranger}").as_str()));
+            walked.extend(args.map(str::to_owned));
+        }
+        assert!(
+            walked
+                .iter()
+                .any(|p| p.ends_with("toolchains/stable/bin/rustc")),
+            "the walk must descend an adopted symlink home, got {walked:?}"
+        );
+        assert!(
+            walked.iter().any(|p| p.ends_with("usr/local/rustup/.")),
+            "the walk must hand the entry itself to chown, got {walked:?}"
+        );
+        assert!(
+            walked.iter().all(|p| !p.contains("outside")),
+            "a symlink out of the tree must not be followed, got {walked:?}"
+        );
+
+        // Same walk with the runner's own uid as the predicate: every inode in
+        // the fixture is already correct, including the one in another group,
+        // so there is nothing to hand over.
+        let clean = walk_with_stub_chown(&adopted, current_uid());
+        assert!(
+            clean.is_empty(),
+            "owner-correct inodes must be left alone, got {clean:?}"
         );
     }
 
@@ -7665,13 +7820,20 @@ chmod +x "$dest/bin/node"
             !script.contains("chown -R"),
             "no recursive chown may stay in the per-exec provisioning: {script}"
         );
+        // The same walk over every root it owns, and over `/.`: an adopted rust
+        // home is a symlink into the runner home, and `find` skips a symlink it
+        // was handed as its starting point.
+        for root in ["/home/runner", "/usr/local/rustup", "/usr/local/cargo"] {
+            assert!(
+                script.contains(&format!(
+                    "find {root}/. -xdev ! -uid 1001 -exec chown -h 1001:1001 {{}} +"
+                )),
+                "the walk must descend {root} through its own root: {script}"
+            );
+        }
         // Owner-only, like the reconcile apply: hosted `ubuntu-24.04-arm` and
         // `ubuntu-24.04` both ship `/home/runner/.docker` as `runner:docker`,
         // and a runner-owned file must keep its group.
-        assert!(
-            script.contains("find /home/runner -xdev ! -user 1001 -exec chown -h 1001:1001 {} +"),
-            "the home walk must match on the owner alone: {script}"
-        );
         assert!(
             !script.contains("! -group 1001"),
             "a runner-owned file in another group must be left alone: {script}"
