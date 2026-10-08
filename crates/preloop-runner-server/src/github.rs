@@ -2527,18 +2527,23 @@ async fn process_check_run_rerequest(
         }
     }
 
-    let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
-        .await
-        .map_err(|error| {
-            error!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                ?error,
-                "failed to resubmit check_run rerequest"
-            );
-            error.into_response().status()
-        })?;
+    let accepted = crate::rerun_run_with_mode(
+        shared,
+        run_id,
+        crate::control::types::RerunMode::Job(job_id.clone()),
+        Some((job_id.clone(), check_run_id)),
+    )
+    .await
+    .map_err(|error| {
+        error!(
+            %run_id,
+            %job_id,
+            check_run_id,
+            ?error,
+            "failed to resubmit check_run rerequest"
+        );
+        error.into_response().status()
+    })?;
     info!(
         %run_id,
         rerun_run_id = %accepted.run_id,
@@ -3377,6 +3382,26 @@ async fn process_delivery_payload_with_lease(
         }
     }
 
+    if delivery.event == "check_suite" {
+        // A rerequest re-runs the suite's run in place; the delivery still
+        // falls through to the `check_suite` adapter below so
+        // `on: check_suite` workflows see it.
+        let rerequest = tokio::select! {
+            _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+            result = crate::rerequest::process_check_suite_rerequest(shared, &payload_val) => result,
+        };
+        match rerequest {
+            Ok(()) => {}
+            Err(status) if status.is_server_error() => {
+                return WebhookOutcome::TransientError(format!(
+                    "check suite rerequest failed with status {status}"
+                ));
+            }
+            Err(status) => {
+                info!(%status, "check suite rerequest ignored");
+            }
+        }
+    }
     let adapter = match crate::events::adapter_for(&delivery.event) {
         Some(a) => a,
         None => {
@@ -5552,7 +5577,96 @@ jobs:
         assert_eq!(status, StatusCode::OK);
         assert_ne!(body.0, serde_json::json!([]), "clean sender must resubmit");
         let runs = shared.state.test_tx().await.runs;
-        assert_eq!(runs.len(), 2, "clean sender's rerequest must create a run");
+        assert_eq!(
+            runs.len(),
+            1,
+            "a clean sender's rerequest re-runs the run in place"
+        );
+        let run = runs.values().next().unwrap();
+        assert_eq!(run.run_attempt, 2, "the rerequest starts attempt 2");
+        assert!(
+            !run.status.is_terminal(),
+            "attempt 2 is live, got {:?}",
+            run.status
+        );
+        assert_eq!(
+            run.job_check_run_ids.get(&JobId("build".to_owned())),
+            Some(&12345),
+            "the new attempt keeps reporting through the requested check run"
+        );
+    }
+
+    fn check_suite_payload(action: &str, sender: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": action,
+            "check_suite": {
+                "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            },
+            "repository": {"full_name": "owner/repo"},
+            "sender": {"login": sender},
+        })
+    }
+
+    /// A `check_suite.rerequested` delivery re-runs the suite's terminal run
+    /// in place — same run id, attempt 2 — not as a new run.
+    #[tokio::test]
+    async fn check_suite_rerequest_reruns_the_suite_run_in_place() {
+        let (_temp, shared) = rerequest_fixture().await;
+        assert_eq!(shared.state.test_tx().await.runs.len(), 1);
+        crate::rerequest::process_check_suite_rerequest(
+            &shared,
+            &check_suite_payload("rerequested", "alice"),
+        )
+        .await
+        .unwrap();
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 1, "the suite rerequest must not mint a run");
+        let run = runs.values().next().unwrap();
+        assert_eq!(run.run_attempt, 2, "the suite rerequest starts attempt 2");
+        assert!(
+            !run.status.is_terminal(),
+            "attempt 2 is live, got {:?}",
+            run.status
+        );
+    }
+
+    /// A non-`rerequested` suite action is not a re-run trigger.
+    #[tokio::test]
+    async fn check_suite_completed_does_not_rerun() {
+        let (_temp, shared) = rerequest_fixture().await;
+        crate::rerequest::process_check_suite_rerequest(
+            &shared,
+            &check_suite_payload("completed", "alice"),
+        )
+        .await
+        .unwrap();
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs.values().next().unwrap().run_attempt,
+            1,
+            "a completed suite delivery leaves the run alone"
+        );
+    }
+
+    /// A suite rerequest from a denied actor is ignored like the check-run
+    /// path: execution protection applies to both.
+    #[tokio::test]
+    async fn check_suite_rerequest_denies_blocked_sender() {
+        let (_temp, shared) = rerequest_fixture().await;
+        crate::rerequest::process_check_suite_rerequest(
+            &shared,
+            &check_suite_payload("rerequested", "mallory"),
+        )
+        .await
+        .unwrap();
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs.values().next().unwrap().run_attempt,
+            1,
+            "a blocked sender must not restart the run"
+        );
     }
 
     /// Seed one plain run, reported or not. `submit_run_inner` never mints

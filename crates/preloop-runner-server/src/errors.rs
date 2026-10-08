@@ -85,6 +85,43 @@ fn response_error_message(body: &[u8], status: StatusCode) -> String {
     }
 }
 
+/// GitHub-compatible error envelope for the `/repos/...` dispatch surface.
+///
+/// github.com's errors carry `message` (plus `documentation_url`), and `gh`
+/// reads that key; preloop's historical `error` key stays alongside it so
+/// existing clients keep working. Path-scoped like
+/// [`protocol_error_envelope`], and a no-op for non-error responses.
+pub async fn github_error_envelope(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    if !path.starts_with("/repos/") {
+        return response;
+    }
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let mut headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let message = response_error_message(&body, status);
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    let payload = json!({
+        "message": message,
+        "error": message,
+        "documentation_url": "https://docs.github.com/rest/actions/workflow-runs",
+    });
+    let mut output = Response::new(Body::from(payload.to_string()));
+    *output.status_mut() = status;
+    *output.headers_mut() = headers;
+    output
+}
+
 fn azdo_error_payload(status: StatusCode, message: &str) -> Value {
     let type_key = match status {
         StatusCode::UNAUTHORIZED => "UnauthorizedRequestException",

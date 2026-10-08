@@ -1459,3 +1459,384 @@ fn sign_test_jwt(app_id: &str, key: &rsa::RsaPrivateKey, iat: u64, exp: u64) -> 
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
     )
 }
+
+// ─── Endpoints: re-run / cancel shims ──────────────────────────────────────
+
+/// The synthetic numeric id `dispatch` exposes for runs and jobs: SHA-256
+/// truncated to 8 LE bytes (kept in sync with `dispatch::stable_id`).
+fn stable_id(value: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Dispatch one run through the compat surface and complete its `build` job
+/// through the internal test API; returns the new run id.
+async fn dispatched_completed_run(state: &AppState, app: &Router, job_status: &str) -> String {
+    let before: std::collections::BTreeSet<String> = recorded_runs(state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (code, body) = post_json(
+        app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "dispatch failed: {body}");
+    let run_id = recorded_runs(state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| !before.contains(id))
+        .expect("dispatch created a run");
+    let (code, body) = post_json(
+        app,
+        "/internal/test/jobs/complete",
+        &json!({"run_id": run_id, "job_id": "build", "status": job_status, "outputs": {}})
+            .to_string(),
+        Some(TEST_API_TOKEN),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "job completion failed: {body}");
+    run_id
+}
+
+async fn run_by_id(state: &AppState, run_id: &str) -> crate::models::RunRecord {
+    recorded_runs(state)
+        .await
+        .into_iter()
+        .find(|(id, _)| id == run_id)
+        .map(|(_, run)| run)
+        .expect("run must exist")
+}
+
+/// POST without an Authorization header.
+async fn post_no_auth(app: &Router, uri: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn rerun_shim_starts_a_new_attempt_in_place() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let runs = recorded_runs(&state).await;
+    assert_eq!(runs.len(), 1, "the shim re-runs the same run");
+    let run = run_by_id(&state, &run_id).await;
+    assert_eq!(run.run_attempt, 2);
+    assert!(
+        !run.status.is_terminal(),
+        "attempt 2 is live, got {:?}",
+        run.status
+    );
+}
+
+#[tokio::test]
+async fn rerun_shim_refuses_a_live_run_with_409() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let before: std::collections::BTreeSet<String> = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (code, _) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let run_id = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| !before.contains(id))
+        .expect("dispatch created a run");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_failed_shim_reruns_failed_jobs_and_409s_on_clean_runs() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+
+    // A clean run has nothing failed: 409 with the GitHub-shaped message.
+    let clean_id = dispatched_completed_run(&state, &app, "success").await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{clean_id}/rerun-failed-jobs"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no failed"),
+        "the 409 must be GitHub-shaped: {body}"
+    );
+    assert_eq!(run_by_id(&state, &clean_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_job_shim_accepts_preloop_and_numeric_job_ids() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+
+    // The raw preloop job id.
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/jobs/build/rerun",
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+
+    // The synthetic numeric id, on a second run (numeric ids are unique per
+    // run, so the newest-terminal-run lookup is unambiguous).
+    let second_id = dispatched_completed_run(&state, &app, "failure").await;
+    let numeric = stable_id(&format!("{second_id}:build"));
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/jobs/{numeric}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    assert_eq!(run_by_id(&state, &second_id).await.run_attempt, 2);
+
+    // An unknown job is 404.
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/jobs/ghost/rerun",
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ghost"),
+        "the 404 must be GitHub-shaped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rerun_shim_of_an_archived_run_409s_partial_modes_and_resubmits_all() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    // Push the settled run past the grace and archive it.
+    let parsed: preloop_gha_protocol::RunId = run_id.parse().unwrap();
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(parsed, old).unwrap();
+        })
+        .await;
+    assert!(state.test_archive_finished_runs_once().await >= 1);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("archived"),
+        "the 409 must name the archive: {body}"
+    );
+
+    // `all` resubmits the recorded submission as a new run.
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let runs = recorded_runs(&state).await;
+    assert_eq!(
+        runs.len(),
+        1,
+        "the archived original is not live; only the new run is"
+    );
+    assert_ne!(runs[0].0, run_id, "the archived full re-run is a new run");
+    assert_eq!(runs[0].1.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn cancel_shim_is_202_live_and_409_terminal() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let before: std::collections::BTreeSet<String> = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (code, _) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let run_id = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| !before.contains(id))
+        .expect("dispatch created a run");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
+    assert!(run_by_id(&state, &run_id).await.status.is_terminal());
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("completed"),
+        "the 409 must be GitHub-shaped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rerun_shim_rejects_a_malformed_debug_flag_with_422() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        r#"{"enable_debug_logging": "yes"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("enable_debug_logging"),
+        "the 422 must name the field: {body}"
+    );
+    assert_eq!(
+        run_by_id(&state, &run_id).await.run_attempt,
+        1,
+        "a rejected body must not restart the run"
+    );
+}
+
+#[tokio::test]
+async fn rerun_shims_require_dispatch_auth() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let uris = [
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "/repos/octocat/repo/actions/jobs/build/rerun".to_owned(),
+    ];
+    for uri in &uris {
+        let (status, body) = post_no_auth(&app, uri).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+        assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+    }
+}
+
+#[tokio::test]
+async fn rerun_shims_reject_a_token_without_actions_write_with_403() {
+    let (state, app, _key, _temp) =
+        dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    record_ledger_token(
+        &state,
+        "ghs_read_only_rerun_token",
+        "octocat/repo",
+        &[("contents", "read")],
+    );
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    for uri in [
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "/repos/octocat/repo/actions/jobs/build/rerun".to_owned(),
+    ] {
+        let (status, body) = post_json(&app, &uri, "{}", Some("ghs_read_only_rerun_token")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+    }
+}
