@@ -23,42 +23,11 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
-- A job's runtime token — `ACTIONS_RUNTIME_TOKEN`, the `SystemVssConnection`
-  `AccessToken` in the job message, and what the pinned checkout steps embed —
-  now lives for the whole attempt instead of 2999 seconds. It is minted once
-  per attempt and cannot be replaced while the job runs: the worker's
-  `renewjob`/`completejob`, its step and job log uploads, and the cache and
-  artifact Twirp calls all present it, and the job-lifecycle routes refuse the
-  only credential a worker can re-acquire on its own. A job that outlived the
-  old lifetime stopped renewing its lease, and the reaper failed it while the
-  step was still running — tearing the machine down and dropping the
-  in-progress step's output from the run log. The lifetime now matches the
-  debug-worker credential's (six-hour GitHub job limit plus the four-hour
-  pause-credit window), grown by the job's own declared `timeout-minutes` and
-  capped at GitHub's maximum job timeout (five days on self-hosted runners;
-  hosted runners are cut off at six hours). The reaper also logs an
-  expired-lease settlement with the run, job, request, last renewal instant,
-  and the window it applied: this failure mode has no runner-side report to
-  explain it, and the log said nothing at all before.
+- Job runtime tokens remain valid for the effective job timeout plus pause allowance and slack, capped at GitHub's five-day self-hosted maximum.
 
-- **A job's `timeout-minutes` is capped by the server at GitHub's own
-  maximum**: five days on self-hosted runners, the point GitHub's service
-  cancels a job regardless of what the workflow declared. The value is
-  clamped in all three places the server consumes it — the `jobTimeout` the
-  runner is handed, the lifetime of the job's runtime token, and the reaper's
-  cancellation deadline. Only *step* timeouts are range-checked
-  (1..=360); a job's is accepted as any number, so with the runtime token
-  sized to the declared timeout a fork could otherwise hold a leased runner
-  and a valid credential for as many years as it cared to name.
+- The server applies the same timeout cap to the runner message, token lifetime, and reaper deadline.
 
-- **A settled attempt's runtime token no longer mutates timeline/log records,
-  reaches the snapshot Git endpoint, or reopens its live-log feed**: these
-  surfaces now apply the liveness rule the Results writes already did. The
-  job credential is handed to workflow code and outlives the attempt by
-  design, so a completed job could otherwise keep rewriting its own step
-  records and annotations, fetching the run's snapshot, and reopening its
-  live-log ingest feed. A retry streams under its own live attempt's
-  credential.
+- Settled attempts cannot use job tokens to write Results, cache/artifact, snapshot, timeline/log, or live-log data. Retained-data reads and completion reporting remain available; retries use fresh attempt credentials.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest
