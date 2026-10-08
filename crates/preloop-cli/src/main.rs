@@ -3859,7 +3859,6 @@ fn offer_branch_move(commit: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-
 /// Decide, after CI on a dirty tree, whether to materialize the tested tree,
 /// push it, and open a PR. Precedence: explicit `--create-pr` flag >
 /// head-commit labels (`[pr]` / `[draft]` / `[no-pr]`) > interactive prompt >
