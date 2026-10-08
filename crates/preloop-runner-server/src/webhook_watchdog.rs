@@ -37,6 +37,11 @@
 //!   repair row would sit open (and the webhook stay missing) forever.
 //! * The watermark **never advances on a failed poll**, so an error cannot
 //!   silently skip a range of history.
+//! * An **attempt is claimed before the request**: the attempt count and the
+//!   last-attempt clock move in one conditional store write that only
+//!   succeeds if the row still looks like the pass's read. Two watchdogs
+//!   overlapping (a restart, a second server on the store) cannot both ask
+//!   GitHub to redeliver the same delivery, nor charge it twice.
 //! * Nothing is redelivered while the local store is unhealthy — replaying a
 //!   payload into a broken store loses it a second time, and burns one of
 //!   the finite redelivery opportunities doing it.
@@ -606,6 +611,10 @@ async fn retry_open_repairs(
 
 /// Ask GitHub to attempt one delivery again, subject to per-GUID backoff and
 /// the attempt cap. Returns whether an attempt was actually requested.
+///
+/// The attempt is claimed in the store before the request goes out, so a
+/// pass that loses the claim (another watchdog got there first, or the
+/// delivery landed and its row was closed) sends nothing.
 async fn repair_delivery(
     shared: &Arc<SharedState>,
     app: &GitHubAppCredentials,
@@ -614,51 +623,75 @@ async fn repair_delivery(
     jwt: &str,
 ) -> anyhow::Result<bool> {
     let now = now_us();
-    let existing = shared
+    let observed = shared
         .state
         .backend
         .load_webhook_redelivery(target.guid)
-        .await?;
-    let mut record = existing.unwrap_or(WebhookRedeliveryRecord {
-        delivery_guid: target.guid.to_owned(),
+        .await?
+        .unwrap_or(WebhookRedeliveryRecord {
+            delivery_guid: target.guid.to_owned(),
+            github_delivery_id: target.delivery_id,
+            app_id: app.app_id.clone(),
+            reason: target.reason,
+            attempts: 0,
+            first_seen_at_us: now,
+            last_attempt_at_us: None,
+            resolved_at_us: None,
+            last_error: None,
+        });
+    // This pass's view of the row, with the reason and delivery id the
+    // history scan just read: the claim persists both.
+    let candidate = WebhookRedeliveryRecord {
         github_delivery_id: target.delivery_id,
-        app_id: app.app_id.clone(),
         reason: target.reason,
-        attempts: 0,
-        first_seen_at_us: now,
-        last_attempt_at_us: None,
-        resolved_at_us: None,
-        last_error: None,
-    });
-    if record.resolved_at_us.is_some() {
-        // Reopened: the delivery is missing again (restore, prune, replay).
-        record.resolved_at_us = None;
-    }
-    record.reason = target.reason;
-    record.github_delivery_id = target.delivery_id;
+        ..observed.clone()
+    };
 
-    if record.attempts >= max_attempts() {
+    if observed.attempts >= max_attempts() {
         // Kept open on purpose. A GUID we could never get back is a standing
         // finding for an operator, not something to forget.
         let message = format!(
             "redelivery cap of {} attempts reached; repair the ingress and replay manually",
             max_attempts()
         );
-        if record.last_error.as_deref() != Some(message.as_str()) {
-            record.last_error = Some(message);
+        if observed.last_error.as_deref() != Some(message.as_str()) {
+            let mut capped = candidate.clone();
+            capped.last_error = Some(message);
             shared
                 .state
                 .backend
-                .upsert_webhook_redelivery(&record)
+                .upsert_webhook_redelivery(&capped)
                 .await?;
         }
         return Ok(false);
     }
-    if let Some(last_attempt) = record.last_attempt_at_us
-        && now - last_attempt < redelivery_backoff_us(record.attempts)
+    if let Some(last_attempt) = observed.last_attempt_at_us
+        && now - last_attempt < redelivery_backoff_us(observed.attempts)
     {
         return Ok(false);
     }
+
+    // The attempt is taken *before* the request, in one conditional store
+    // write. A row that moved since the read above — another watchdog
+    // claiming the same delivery during a restart overlap, or the scan path
+    // closing a delivery that just landed — fails the compare, and this pass
+    // sends nothing: exactly one request and one charged attempt per
+    // delivery, whoever wins. A row the caller read as resolved reopens here
+    // (the claim writes `resolved_at = NULL`): the delivery is missing again
+    // after a restore, a prune or a replay.
+    let Some(claimed) = shared
+        .state
+        .backend
+        .claim_webhook_redelivery(&candidate, now)
+        .await?
+    else {
+        tracing::debug!(
+            guid = %target.guid,
+            "webhook repair claimed elsewhere; leaving this attempt to the claim"
+        );
+        return Ok(false);
+    };
+    let mut record = claimed;
 
     let url = format!(
         "{}/app/hook/deliveries/{}/attempts",
@@ -677,11 +710,11 @@ async fn repair_delivery(
     )
     .await;
 
-    record.attempts = record.attempts.saturating_add(1);
-    record.last_attempt_at_us = Some(now);
+    // The claim already charged this attempt, moved the last-attempt clock
+    // and cleared the previous attempt's error, so a request that went
+    // through has nothing left to record; only a failure writes.
     let requested = match response {
         Ok(response) if response.status().is_success() => {
-            record.last_error = None;
             tracing::warn!(
                 guid = %target.guid,
                 delivery_id = target.delivery_id,
@@ -691,7 +724,7 @@ async fn repair_delivery(
                 throttled = target.throttled,
                 "requested GitHub webhook redelivery"
             );
-            true
+            return Ok(true);
         }
         Ok(response) => {
             let status = response.status();

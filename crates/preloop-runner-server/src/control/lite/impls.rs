@@ -732,6 +732,13 @@ impl ControlBackend for LiteBackend {
         self.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
             .await
     }
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        self.claim_webhook_redelivery(observed, claimed_at_us).await
+    }
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,

@@ -759,6 +759,66 @@ impl PgBackend {
             .collect()
     }
 
+    /// Take one redelivery attempt for a repair row, or report that someone
+    /// else already did.
+    ///
+    /// Statement: `INSERT .. ON CONFLICT (delivery_guid) DO UPDATE SET
+    /// attempts = r.attempts + 1, .. WHERE r.attempts = $7 AND r.resolved_at
+    /// IS NOT DISTINCT FROM $8 RETURNING ..`.
+    ///
+    /// The `WHERE` is the compare of a compare-and-swap over the row the
+    /// caller read: an attempt committed since that read (another watchdog,
+    /// a restart overlap, a second server) no longer matches, so the update
+    /// is skipped, nothing is returned, and the caller sends no request. The
+    /// charge and the last-attempt clock move in the same statement, so a
+    /// claimed attempt is exactly one request. Under `READ COMMITTED` the
+    /// conflict path re-checks the condition against the row's latest
+    /// committed version, which is what makes the race safe.
+    pub(super) async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        let client = self.writer().await?;
+        let sql = format!(
+            "INSERT INTO webhook_redeliveries AS r (delivery_guid, github_delivery_id, app_id, \
+             reason, attempts, first_seen_at, last_attempt_at, resolved_at, last_error) \
+             VALUES ($1, $2, $3, $4, 1, {}, {}, NULL, NULL) \
+             ON CONFLICT (delivery_guid) DO UPDATE SET \
+             github_delivery_id = EXCLUDED.github_delivery_id, \
+             app_id = EXCLUDED.app_id, reason = EXCLUDED.reason, \
+             attempts = r.attempts + 1, last_attempt_at = EXCLUDED.last_attempt_at, \
+             resolved_at = NULL, last_error = NULL \
+             WHERE r.attempts = $7 AND r.resolved_at IS NOT DISTINCT FROM {} \
+             RETURNING {REDELIVERY_COLUMNS}",
+            // The two timestamps are microseconds on the wire, so the
+            // comparison against `resolved_at` needs the same epoch
+            // conversion the other timestamp columns use.
+            ts!("$5"),
+            ts!("$6"),
+            ts!("$8")
+        );
+        client
+            .query_opt(
+                &sql,
+                &[
+                    &observed.delivery_guid,
+                    &observed.github_delivery_id,
+                    &observed.app_id,
+                    &observed.reason.as_str(),
+                    &observed.first_seen_at_us,
+                    &claimed_at_us,
+                    &(observed.attempts.min(i32::MAX as u32) as i32),
+                    &observed.resolved_at_us,
+                ],
+            )
+            .await
+            .map_err(db)?
+            .as_ref()
+            .map(redelivery_from_row)
+            .transpose()
+    }
+
     /// Mark a repair row resolved (first resolution wins).
     ///
     /// Statement: `UPDATE webhook_redeliveries SET resolved_at = $2 WHERE

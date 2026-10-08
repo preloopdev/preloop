@@ -1755,6 +1755,126 @@ pub(crate) mod suite {
         );
     }
 
+    /// A redelivery attempt is claimed, not assumed: the claim moves the
+    /// attempt count and the last-attempt clock only while the row still
+    /// matches what the caller read. A claimant that lost the compare sends
+    /// nothing, so two watchdogs — a restart overlap, or two nodes on one
+    /// store — can neither request the same redelivery twice nor charge it
+    /// twice, and a delivery that landed since the read stays closed.
+    pub(crate) async fn claiming_a_repair_charges_one_attempt(backend: &dyn ControlBackend) {
+        use crate::models::{WebhookRedeliveryRecord, WebhookRepairReason};
+        let open = WebhookRedeliveryRecord {
+            delivery_guid: "claim-open".to_owned(),
+            github_delivery_id: 11,
+            app_id: "424".to_owned(),
+            reason: WebhookRepairReason::RemoteFailure,
+            attempts: 0,
+            first_seen_at_us: 100,
+            last_attempt_at_us: None,
+            resolved_at_us: None,
+            last_error: Some("redelivery request failed: 500".to_owned()),
+        };
+
+        // A row that does not exist yet is created by the claim itself.
+        let claimed = backend
+            .claim_webhook_redelivery(&open, 1_000)
+            .await
+            .unwrap()
+            .expect("the first claim of a missing row takes the attempt");
+        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.last_attempt_at_us, Some(1_000));
+        assert_eq!(claimed.first_seen_at_us, 100);
+        assert_eq!(
+            claimed.last_error, None,
+            "a claim clears the previous attempt's error"
+        );
+
+        // The same read claimed again: the attempt committed since then no
+        // longer matches it, so the second claimant is told to send nothing.
+        assert!(
+            backend
+                .claim_webhook_redelivery(&open, 2_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "an attempt committed since the read must fail the compare"
+        );
+        let stored = backend
+            .load_webhook_redelivery("claim-open")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempts, 1, "only the winner charged an attempt");
+        assert_eq!(stored.last_attempt_at_us, Some(1_000));
+
+        // A refreshed read claims the next attempt.
+        assert_eq!(
+            backend
+                .claim_webhook_redelivery(&stored, 3_000)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            2
+        );
+
+        // A close since the read loses the compare: the pass must not
+        // resurrect a repair whose delivery has landed.
+        backend
+            .resolve_webhook_redelivery("claim-open", 4_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .claim_webhook_redelivery(&stored, 5_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "a resolution committed since the read must fail the compare"
+        );
+        let closed = backend
+            .load_webhook_redelivery("claim-open")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.resolved_at_us, Some(4_000), "the close stands");
+
+        // A read that saw the closure reopens it, charging under that state.
+        let reopened = backend
+            .claim_webhook_redelivery(&closed, 6_000)
+            .await
+            .unwrap()
+            .expect("a resolved row reopens under the resolution the caller read");
+        assert_eq!(reopened.resolved_at_us, None);
+        assert_eq!(reopened.attempts, 3);
+
+        // Two claimants that read the same row: exactly one request.
+        let contender = backend
+            .load_webhook_redelivery("claim-open")
+            .await
+            .unwrap()
+            .unwrap();
+        let (first, second) = tokio::join!(
+            backend.claim_webhook_redelivery(&contender, 7_000),
+            backend.claim_webhook_redelivery(&contender, 7_001),
+        );
+        assert_eq!(
+            usize::from(first.unwrap().is_some()) + usize::from(second.unwrap().is_some()),
+            1,
+            "one repair, one claimed attempt"
+        );
+        assert_eq!(
+            backend
+                .load_webhook_redelivery("claim-open")
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            4,
+            "the losing claimant charged nothing"
+        );
+    }
+
     pub(crate) async fn run_record_round_trips_through_tables(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         // The normalized schema reconstructs the run from the submitted job
@@ -6122,6 +6242,67 @@ mod pg {
         suite::retryable_redeliveries_are_scoped_capped_and_ordered(&backend).await;
     }
 
+    #[tokio::test]
+    async fn claiming_a_repair_charges_one_attempt() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::claiming_a_repair_charges_one_attempt(&backend).await;
+    }
+
+    /// Two engine nodes on one database must never both ask GitHub to
+    /// redeliver the same delivery: of the two watchdogs that read the same
+    /// open repair, exactly one takes the attempt.
+    #[tokio::test]
+    async fn concurrent_repair_claims_across_nodes_take_one_attempt() {
+        use crate::models::{WebhookRedeliveryRecord, WebhookRepairReason};
+        let Some((_pg, node_a, node_b)) = backend_pair().await else {
+            return skip_no_postgres();
+        };
+        node_a
+            .upsert_webhook_redelivery(&WebhookRedeliveryRecord {
+                delivery_guid: "guid-two-nodes".to_owned(),
+                github_delivery_id: 11,
+                app_id: "424".to_owned(),
+                reason: WebhookRepairReason::RemoteFailure,
+                attempts: 0,
+                first_seen_at_us: 100,
+                last_attempt_at_us: None,
+                resolved_at_us: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        // Both nodes read the row before either claims it: two watchdogs
+        // polling the same store at the same moment.
+        let read_a = node_a
+            .load_webhook_redelivery("guid-two-nodes")
+            .await
+            .unwrap()
+            .unwrap();
+        let read_b = node_b
+            .load_webhook_redelivery("guid-two-nodes")
+            .await
+            .unwrap()
+            .unwrap();
+        let (claimed_a, claimed_b) = tokio::join!(
+            node_a.claim_webhook_redelivery(&read_a, 1_000),
+            node_b.claim_webhook_redelivery(&read_b, 1_000),
+        );
+        assert_eq!(
+            usize::from(claimed_a.unwrap().is_some()) + usize::from(claimed_b.unwrap().is_some()),
+            1,
+            "exactly one node may take the attempt"
+        );
+        let stored = node_a
+            .load_webhook_redelivery("guid-two-nodes")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempts, 1, "the losing node charged nothing");
+        assert_eq!(stored.last_attempt_at_us, Some(1_000));
+    }
+
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
         // Distinct `run_number` per submit: the agreed schema keys
         // `runs_number` on (namespace, repo, path, number, attempt), so
@@ -6930,6 +7111,11 @@ mod lite {
             &LiteBackend::in_memory().unwrap(),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn claiming_a_repair_charges_one_attempt() {
+        suite::claiming_a_repair_charges_one_attempt(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

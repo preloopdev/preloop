@@ -760,6 +760,58 @@ impl LiteBackend {
         })
     }
 
+    /// Take one redelivery attempt for a repair row, or report that someone
+    /// else already did.
+    ///
+    /// The `WHERE` on the conflict path is the compare of a compare-and-swap
+    /// over the row the caller read: an attempt committed since that read
+    /// (another watchdog, a restart overlap, a second server on the store)
+    /// no longer matches, so the update is skipped, nothing is returned, and
+    /// the caller sends no request. The charge and the last-attempt clock
+    /// move in the same statement, so a claimed attempt is exactly one
+    /// request. `IS` is null-safe equality, so an open row (`resolved_at`
+    /// NULL) matches a NULL `resolved_at` and a closed row only reopens
+    /// under the resolution the caller read.
+    pub(crate) async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        self.write(|tx| {
+            tx.query_row(
+                &format!(
+                    "INSERT INTO webhook_redeliveries (delivery_guid, github_delivery_id, app_id, \
+                     reason, attempts, first_seen_at, last_attempt_at, resolved_at, last_error) \
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, NULL) \
+                     ON CONFLICT (delivery_guid) DO UPDATE SET \
+                     github_delivery_id = excluded.github_delivery_id, \
+                     app_id = excluded.app_id, reason = excluded.reason, \
+                     attempts = webhook_redeliveries.attempts + 1, \
+                     last_attempt_at = excluded.last_attempt_at, \
+                     resolved_at = NULL, last_error = NULL \
+                     WHERE webhook_redeliveries.attempts = ?7 \
+                     AND webhook_redeliveries.resolved_at IS ?8 \
+                     RETURNING {REDELIVERY_COLUMNS}"
+                ),
+                params![
+                    observed.delivery_guid,
+                    observed.github_delivery_id,
+                    observed.app_id,
+                    observed.reason.as_str(),
+                    observed.first_seen_at_us,
+                    claimed_at_us,
+                    observed.attempts as i64,
+                    observed.resolved_at_us,
+                ],
+                redelivery_row,
+            )
+            .optional()
+            .map_err(db)?
+            .map(finish_redelivery)
+            .transpose()
+        })
+    }
+
     /// Close an open repair; `false` when unknown or already resolved.
     pub(crate) async fn resolve_webhook_redelivery(
         &self,

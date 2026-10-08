@@ -67,6 +67,11 @@ Invariants worth keeping:
   poll would fail anyway.
 - Per-GUID backoff (0, 5m, 15m, 1h, 6h) with a cap; a GUID that hits the cap
   stays **open** as a standing finding rather than disappearing.
+- An attempt is **claimed before the request**: the attempt count and the
+  last-attempt clock move in one conditional store write that only succeeds
+  while the row still looks like the pass's read. Two watchdogs overlapping —
+  a restart, or a second server on the same store — can therefore neither ask
+  GitHub to redeliver the same delivery twice nor charge it twice.
 
 ## Layer 2 — outage circuit breaker
 

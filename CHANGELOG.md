@@ -47,14 +47,14 @@ Releases before v0.27.0 predate the changelog.
   delivery watchdog treated every delivery in GitHub's history as a phantom
   ack when the store had no watchdog cursor, and asked GitHub to redeliver
   all of them. After a store cutover this re-ran CI for merged PRs and
-  superseded pushes — 2,435 redeliveries and hundreds of runs on one host —
-  and the replays queued ahead of live webhooks in the inbox. A store's
-  first poll now adopts the history before it (the watermark starts at the
-  grace boundary, drawn and persisted at the first attempt, so a history
-  outage right after startup cannot swallow the deliveries that failed while
-  polling was down); later passes repair phantom acks and edge failures as
-  before, and a restored snapshot keeps its cursor and still repairs
-  everything since. Recover a known gap by redelivering it from GitHub.
+  superseded pushes, and the replays queued ahead of live webhooks in the
+  inbox. A store's first poll now adopts the history before it (the
+  watermark starts at the grace boundary, drawn and persisted at the first
+  attempt, so a history outage right after startup cannot swallow the
+  deliveries that failed while polling was down); later passes repair
+  phantom acks and edge failures as before, and a restored snapshot keeps
+  its cursor and still repairs everything since. Recover a known gap by
+  redelivering it from GitHub.
 
 - **Judged-missing webhooks are no longer stranded below the watchdog
   watermark**: the watermark advances past everything a pass examines, so a
@@ -67,7 +67,10 @@ Releases before v0.27.0 predate the changelog.
   backoff and attempt cap as the scan, so untracked history is still never
   replayed. The retry scan reads this App's rows that are still below the
   attempt cap, so another App's backlog — or rows at the cap — cannot fill
-  the bounded window and starve newer repairs out of it.
+  the bounded window and starve newer repairs out of it. An attempt is
+  claimed before the request, in one conditional store write, so two
+  watchdogs overlapping a restart cannot both request or both charge the
+  same delivery.
 
 - **The conformance campaign survives a second run against the same
   Postgres database**: `conformance-5repos.sh` wiped the campaign home,
