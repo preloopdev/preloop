@@ -27,7 +27,7 @@ Releases before v0.27.0 predate the changelog.
 
 - The server applies the same timeout cap to the runner message, token lifetime, and reaper deadline.
 
-- Settled attempts cannot use job tokens to write Results, cache/artifact, snapshot, timeline/log, or live-log data. Retained-data reads and completion reporting remain available; retries use fresh attempt credentials.
+- Settled attempts cannot use job tokens to write Results, cache/artifact, snapshot, timeline/log, or live-log data, or mint OIDC credentials. Retained-data reads and completion reporting remain available; retries use fresh attempt credentials.
 
 - **Job containers can reach the engine again** (#F15, local mode): the engine
   advertises itself to jobs at its loopback origin (the runner's in-guest

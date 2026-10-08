@@ -2087,13 +2087,18 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
         ids
     };
 
-    let token = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"),
-            Value::Null,
-        )
-        .await;
+    let oidc_uri = format!(
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"
+    );
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let token = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &oidc_uri,
+        Value::Null,
+        &runtime_token,
+    )
+    .await;
     let jwt = token["value"].as_str().unwrap();
     let parts: Vec<&str> = jwt.split('.').collect();
     assert_eq!(parts.len(), 3);
@@ -2140,6 +2145,22 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 
     // Verify the OIDC keypair is persisted.
     assert!(temp.path().join("oidc-key.json").exists());
+    request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/_apis/v1/plans/{plan_id}/events"),
+        json!({
+            "jobId": agent_job_id.to_string(),
+            "result": "succeeded"
+        }),
+        &runtime_token,
+    )
+    .await;
+    assert_eq!(
+        status_with_bearer(&app, &runtime_token, Method::GET, &oidc_uri, Value::Null).await,
+        StatusCode::FORBIDDEN,
+        "a settled job token must not mint fresh OIDC credentials"
+    );
 }
 
 #[tokio::test]
