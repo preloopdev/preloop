@@ -1244,41 +1244,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "triggering_actor": submission.actor
     });
 
-    let run_name = workflow.run_name.as_deref().map(|raw| {
-        let inputs = if submission.dispatch_inputs.is_empty() {
-            &submission.inputs
-        } else {
-            &submission.dispatch_inputs
-        };
-        evaluate_run_name(raw, &github, inputs, &submission.vars)
-    });
-
-    // Evaluate workflow-level concurrency before locking (pure).
-    let workflow_concurrency = workflow.concurrency.clone();
-    let mut empty_workflow_concurrency_group = false;
-    let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
-        let eval_ctx = concurrency::ConcurrencyContext {
-            scope: concurrency::ConcurrencyScope::Workflow,
-            github: &github,
-            vars: &submission.vars,
-            inputs: &submission.inputs,
-            matrix: None,
-            strategy: None,
-            needs: None,
-        };
-        let (group, cancel, queue) =
-            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
-                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
-            })?;
-        if group.trim().is_empty() {
-            empty_workflow_concurrency_group = true;
-            None
-        } else {
-            Some((group, cancel, queue, raw.clone()))
-        }
-    } else {
-        None
-    };
 
     // Capture one immutable source per run before any job is queued. Local
     // submissions snapshot the caller's working tree; opt-in remote modes
@@ -1399,6 +1364,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         if !submission.payload.is_object() {
             submission.payload = serde_json::json!({});
         }
+        let pull_request_base_ref = pull_request_base_branch(&submission);
         if let Some(payload) = submission.payload.as_object_mut() {
             let (owner, name) = submission
                 .repository
@@ -1478,24 +1444,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     }),
                 );
             } else if submission.event == "pull_request" {
-                // Same synthetic-push shape for PR-family events: the head
-                // commit the runner checks out is the snapshot commit
-                // (`commit_sha` — the synthetic commit that carries the
-                // dirty tree), and `base.sha` is the base its changes are
-                // measured against (the workspace HEAD when the tree is
-                // dirty, HEAD^ when clean — see `WorkspaceSnapshot::before_sha`).
-                // Changed-file actions (`dorny/paths-filter`,
-                // `tj-actions/changed-files`) diff these two SHAs; without
-                // the refresh they would diff the caller-supplied head
-                // against itself and see nothing, and pointing `head.sha` at
-                // the real workspace HEAD diffed it against an identical
-                // tree (and a sha absent from the snapshot store).
-                //
-                // When the run tests a self-built merge, GitHub's own shape
-                // applies instead: `base.sha` is the current base tip the
-                // merge was built against and `head.sha` the head that was
-                // merged, so changed-file actions keep diffing the user's
-                // changes against the base.
                 let (base_sha, head_sha) = match &snapshot.merge {
                     Some(merge) => (merge.base_sha.clone(), merge.head_sha.clone()),
                     None => (
@@ -1505,45 +1453,97 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                         snapshot.commit_sha.clone(),
                     ),
                 };
-                if let Some(pr) = payload
-                    .get_mut("pull_request")
-                    .and_then(|v| v.as_object_mut())
-                {
-                    if let Some(base) = pr.get_mut("base").and_then(|v| v.as_object_mut()) {
-                        base.insert("sha".to_owned(), serde_json::json!(base_sha));
+                let pull_request = payload
+                    .entry("pull_request")
+                    .or_insert_with(|| serde_json::json!({}));
+                if !pull_request.is_object() {
+                    *pull_request = serde_json::json!({});
+                }
+                if let Some(pull_request) = pull_request.as_object_mut() {
+                    {
+                        let base = pull_request
+                            .entry("base")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if !base.is_object() {
+                            *base = serde_json::json!({});
+                        }
+                        if let Some(base) = base.as_object_mut() {
+                            if let Some(base_ref) = pull_request_base_ref.as_ref() {
+                                base.entry("ref")
+                                    .or_insert_with(|| serde_json::json!(base_ref));
+                            }
+                            base.insert("sha".to_owned(), serde_json::json!(base_sha));
+                        }
                     }
-                    if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
+                    let head = pull_request
+                        .entry("head")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if !head.is_object() {
+                        *head = serde_json::json!({});
+                    }
+                    if let Some(head) = head.as_object_mut() {
                         head.insert("sha".to_owned(), serde_json::json!(head_sha));
                     }
                 }
             }
         }
-        // The github context was built before the snapshot existed; refresh
-        // the pieces that now describe the local tree.
-        //
-        // Without a merge, `github.sha` is the workspace's real HEAD commit,
-        // not the synthetic snapshot commit: the snapshot commit exists only
-        // in this engine's store, so a workflow step that fetches
-        // `${{ github.sha }}` from the real remote (custom checkouts) would
-        // be answered "not our ref". The workspace HEAD is the identity the
-        // run is really based on. `sha` feeds every job's `job.workflow_sha`
-        // (what `$/` resolves against), so it moves too.
-        //
-        // With a merge, `github.sha` is the merge commit — exactly like
-        // GitHub's `refs/pull/<n>/merge` — and the run's checkout fetches it
-        // from the engine's snapshot repository, which serves it.
-        sha = match &snapshot.merge {
-            Some(merge) => merge.sha.clone(),
-            None => snapshot
-                .head_sha
-                .clone()
-                .unwrap_or_else(|| snapshot.commit_sha.clone()),
-        };
+    }
+    if let Some(snapshot) = &workspace_snapshot
+        && (snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace
+            || snapshot.merge.is_some())
+    {
+        sha = snapshot
+            .merge
+            .as_ref()
+            .map(|merge| merge.sha.clone())
+            .unwrap_or_else(|| {
+                snapshot
+                    .head_sha
+                    .clone()
+                    .unwrap_or_else(|| snapshot.commit_sha.clone())
+            });
         if let Some(object) = github.as_object_mut() {
-            object.insert("event".to_owned(), submission.payload.clone());
+            if snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace {
+                object.insert("event".to_owned(), submission.payload.clone());
+            }
             object.insert("sha".to_owned(), serde_json::json!(sha));
         }
     }
+    let run_name = workflow.run_name.as_deref().map(|raw| {
+        let inputs = if submission.dispatch_inputs.is_empty() {
+            &submission.inputs
+        } else {
+            &submission.dispatch_inputs
+        };
+        evaluate_run_name(raw, &github, inputs, &submission.vars)
+    });
+
+    // Evaluate workflow-level concurrency before locking (pure).
+    let workflow_concurrency = workflow.concurrency.clone();
+    let mut empty_workflow_concurrency_group = false;
+    let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
+        let eval_ctx = concurrency::ConcurrencyContext {
+            scope: concurrency::ConcurrencyScope::Workflow,
+            github: &github,
+            vars: &submission.vars,
+            inputs: &submission.inputs,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let (group, cancel, queue) =
+            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
+                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
+            })?;
+        if group.trim().is_empty() {
+            empty_workflow_concurrency_group = true;
+            None
+        } else {
+            Some((group, cancel, queue, raw.clone()))
+        }
+    } else {
+        None
+    };
 
     // PATs are static and the token is minted at acquire. GitHub App
     // installation tokens are likewise minted later, when the broker

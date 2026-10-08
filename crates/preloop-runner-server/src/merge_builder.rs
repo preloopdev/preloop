@@ -9,16 +9,8 @@
 //! in the engine, so any run on it is served to its jobs from the engine
 //! ([`attach_merge`] / [`attach_prebuilt_merge`]), never from the forge.
 //!
-//! Three flows share this module:
-//!
-//! 1. local `--event pull_request` runs (`create_workspace_snapshot` builds the
-//!    merge into the run's snapshot repository before it is published);
-//! 2. hosted submits whose CLI already created the tested commit C
-//!    (`WorkflowSubmission::prebuilt_merge` carries it through
-//!    [`attach_prebuilt_merge`]);
-//! 3. webhook `pull_request` deliveries when GitHub's own merge cannot be
-//!    verified in time (the delivery worker builds one and attaches it the
-//!    same way).
+//! Local `pull_request` runs and webhook deliveries build merges here. A
+//! prebuilt merge record is validated before its engine-only commit is served.
 //!
 //! Merge inputs are validated, never trusted: a prebuilt merge must exist in
 //! the named mirror with exactly the claimed parents and tree.
@@ -183,10 +175,9 @@ impl std::fmt::Display for MergeError {
             Self::InvalidPrebuilt(message) => {
                 write!(formatter, "prebuilt merge is not valid: {message}")
             }
-            Self::Git {
-                operation,
-                message,
-            } => write!(formatter, "git {operation} failed: {message}"),
+            Self::Git { operation, message } => {
+                write!(formatter, "git {operation} failed: {message}")
+            }
             Self::Io { path, message } => write!(formatter, "{path}: {message}"),
         }
     }
@@ -290,23 +281,29 @@ fn auth_header_for_remote(
     if scheme != "https" {
         return None;
     }
-    // Strip userinfo (`https://user:pass@host/...`) before extracting the
-    // host; the port separator must not truncate it either.
+    // Strip userinfo before extracting the authority. Keep an explicit port
+    // in the credential key so Git cannot send the token to another service
+    // on the same host.
     let authority = rest.rsplit('@').next().unwrap_or(rest);
-    let host = authority.split(['/', ':']).next().unwrap_or("");
+    let authority = authority.split('/').next().unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
     if host.is_empty() {
         return None;
     }
-    let allowed = host == "github.com"
-        || forge_host.is_some_and(|configured| configured.eq_ignore_ascii_case(host));
-    if !allowed {
+    let port = authority.split_once(':').map(|(_, port)| port);
+    let github = host == "github.com" && port.is_none_or(|port| port == "443");
+    let configured = forge_host.is_some_and(|configured| {
+        (configured.eq_ignore_ascii_case(host) && port.is_none())
+            || configured.eq_ignore_ascii_case(authority)
+    });
+    if !github && !configured {
         return None;
     }
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD
         .encode(format!("x-access-token:{token}").as_bytes());
     Some((
-        format!("http.{scheme}://{host}/.extraheader"),
+        format!("http.{scheme}://{authority}/.extraheader"),
         format!("AUTHORIZATION: basic {encoded}"),
     ))
 }
@@ -1147,6 +1144,27 @@ pub async fn attach_prebuilt_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_auth_is_scoped_to_the_origin_port() {
+        assert!(
+            auth_header_for_remote("https://github.com:8443/acme/repo.git", "token", None).is_none()
+        );
+        assert!(
+            auth_header_for_remote(
+                "https://ghe.example:9443/acme/repo.git",
+                "token",
+                Some("ghe.example"),
+            )
+            .is_none()
+        );
+        let (key, _) = auth_header_for_remote(
+            "https://ghe.example:9443/acme/repo.git",
+            "token",
+            Some("ghe.example:9443"),
+        )
+        .expect("explicitly configured origin");
+        assert_eq!(key, "http.https://ghe.example:9443/.extraheader");
+    }
 
     fn parse(bytes: &[u8]) -> Option<(String, Vec<String>)> {
         parse_merge_tree_output(bytes)

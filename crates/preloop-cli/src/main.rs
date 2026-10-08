@@ -2859,10 +2859,9 @@ fn strip_branch_prefix(raw: &str) -> &str {
 
 /// Branch a `pull_request` run should be filtered against.
 ///
-/// GitHub applies `on.pull_request.branches` to the PR's *target* branch, not
-/// the head branch. Without this a local PR run filters on the checked-out
-/// branch and a workflow gated to `branches: [main]` never matches. Only
-/// derived when the payload does not already carry a base ref.
+/// GitHub applies `on.pull_request.branches` to the PR's target branch. When
+/// no target is supplied, use the remote's advertised default branch rather
+/// than the checked-out branch's tracking ref.
 fn default_local_filter_branch(
     event: &str,
     base: Option<&str>,
@@ -2879,18 +2878,32 @@ fn default_local_filter_branch(
     {
         return None;
     }
-    // An explicit `--base` is the user's stated PR target and names the branch
-    // filters apply to whether or not the ref exists locally — shallow clones
-    // and un-fetched bases are normal. Only the fallback needs a real ref,
-    // because it has nothing else to go on.
-    let base = match base {
-        Some(base) => base.to_owned(),
-        None => resolve_local_diff_base(None)?,
-    };
-    // Filters are written against branch names (`main`), not remote-qualified
-    // refs (`origin/main`), but branches can contain slashes (`feature/auth`).
+    let base = base.map(str::to_owned).or_else(local_default_branch)?;
     let name = strip_branch_prefix(&base).to_owned();
     (!name.is_empty()).then_some(name)
+}
+
+fn local_default_branch() -> Option<String> {
+    for remote in git_remotes() {
+        let output = std::process::Command::new("git")
+            .args([
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !branch.is_empty() {
+                return Some(branch);
+            }
+        }
+    }
+    None
 }
 
 fn collect_local_reusable_workflows(
