@@ -185,15 +185,6 @@ CREATE TABLE jobs (
     outputs                 TEXT,
     annotations             TEXT,
     check_run_id            INTEGER,
-    -- GitHub deployment id for jobs with `environment:` (created when the
-    -- run reports checks; deployment statuses update on gate decisions and
-    -- job completion). `NULL` for unreported or environment-less jobs.
-    deployment_id           INTEGER,
-    -- The job's `environment.url`, evaluated by the runner after its steps
-    -- and reported in the completion (`completejob` `environmentUrl`). The
-    -- server posts it as the deployment status's `environment_url`; `NULL`
-    -- until a completion reports one (or for environment-less jobs).
-    environment_url         TEXT,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
@@ -204,6 +195,12 @@ CREATE TABLE jobs (
     concurrency_acquired_at INTEGER,
     started_at              INTEGER,
     completed_at            INTEGER, deployment_id INTEGER, environment_url TEXT,
+    -- `deployment_id`: GitHub deployment id for jobs with `environment:`
+    -- (created when the run reports checks; deployment statuses update on
+    -- gate decisions and job completion); NULL for unreported or
+    -- environment-less jobs. `environment_url`: the runner-evaluated
+    -- `environment.url` from the completion. Both are listed last because
+    -- migration 0504 adds them with `ALTER TABLE .. ADD COLUMN`.
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED

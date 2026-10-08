@@ -38,7 +38,6 @@ mod webhooks;
 use super::types::ControlError;
 use tokio_postgres::{Client, NoTls};
 
-
 /// Writer connections per node (`PRELOOP_PG_WRITERS`, default 16).
 const WRITERS_ENV: &str = "PRELOOP_PG_WRITERS";
 /// Reader connections per node (`PRELOOP_PG_READERS`, default 16).
