@@ -1442,6 +1442,52 @@ async fn targeted_settle_releases_completed_jobset_hold() {
     }
 }
 
+/// A late skipped report cannot replace a job's earlier cancellation.
+#[tokio::test]
+async fn late_skipped_completion_preserves_cancellation() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(
+        run,
+        vec![submit_job(run, "cancelled", 1), submit_job(run, "pending", 2)],
+    ))
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    client
+        .execute(
+            "UPDATE jobs SET status='cancelled', queue_state='none' \
+             WHERE run_id=$1::text::uuid AND job_id='cancelled'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
+    drop(client);
+
+    node.complete_job(JobCompletionInput {
+        run_id: run,
+        job_id: JobId("cancelled".to_owned()),
+        agent_job_id: None,
+        status: ExecutionStatus::Skipped,
+        outputs: BTreeMap::new(),
+        runner_id: None,
+    })
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    let status: String = client
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='cancelled'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "cancelled");
+}
+
 /// A promotion that writes the promoted run's rows must take that run's row
 /// lock before any group-row lock: the reverse order deadlocked (40P01)
 /// against a command on the promoted run and clobbered its rows with a stale
