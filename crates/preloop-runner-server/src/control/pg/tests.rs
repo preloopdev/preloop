@@ -1273,20 +1273,21 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     };
     let run = RunId::new();
     // Cohort `m` (max-parallel 2): `a` holds gate `g1`, `aw` waits behind it,
-    // `bb` takes the free `g2`; `t1`/`t2` only drive promotion sweeps.
+    // `bb` takes `g2`, and `cc` fills the other slot.
     let mut submit = submit_run(
         run,
         vec![
             submit_job(run, "a", 1),
             submit_job(run, "aw", 2),
             submit_job(run, "bb", 3),
-            submit_job(run, "t1", 4),
-            submit_job(run, "t2", 5),
+            submit_job(run, "cc", 4),
+            submit_job(run, "t1", 5),
+            submit_job(run, "t2", 6),
         ],
     );
     for job in &mut submit.jobs {
         match job.queued.job_id.0.as_str() {
-            "a" | "aw" | "bb" => {
+            "a" | "aw" | "bb" | "cc" => {
                 job.queued.base_id = "m".to_owned();
                 job.queued.max_parallel = Some(2);
             }
@@ -1326,8 +1327,18 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         .await
         .unwrap()
         .get(0);
-    // Fill the cohort cap with `bb` so `aw`'s promotion finds it saturated.
+    // Fill both slots so `aw`'s promotion finds the cohort saturated.
     complete("t2").await;
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id IN ('bb','cc')",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
     // Completing `a` releases `g1` and re-parks `aw`.
     complete("a").await;
 
