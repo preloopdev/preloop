@@ -1019,10 +1019,15 @@ async fn slot_never_holds_two_vms_at_once() {
         match event {
             Event::Create(name) if name.starts_with(&slot_prefix) => {
                 created += 1;
+                // The live set, not the name: a slot that forked its
+                // successor before deleting its predecessor would create two
+                // *different* machines, and a name-uniqueness check alone
+                // would pass.
                 assert!(
-                    live.insert(name.clone()),
-                    "{name} was forked while {live:?} was still alive: {events:?}"
+                    live.is_empty(),
+                    "{name} was created while the slot still held {live:?}: {events:?}"
                 );
+                live.insert(name.clone());
             }
             Event::Delete(name) => {
                 live.remove(name);
