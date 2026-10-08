@@ -531,6 +531,7 @@ fn submission_from_effective(
         push_tree: None,
         no_merge: false,
         prebuilt_merge: None,
+        git_bundle_id: None,
     }
 }
 

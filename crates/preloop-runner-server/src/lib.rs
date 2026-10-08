@@ -90,6 +90,7 @@ pub mod bundles;
 pub mod merge_builder;
 pub mod recording;
 pub mod snapshots;
+use snapshots::*;
 use recording::*;
 pub mod state;
 use state::*;

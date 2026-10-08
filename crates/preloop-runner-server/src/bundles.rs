@@ -1,4 +1,4 @@
-use crate::{ApiError, SharedState};
+use crate::ApiError;
 use axum::{Json, extract::State};
 use bytes::Bytes;
 use serde::Serialize;

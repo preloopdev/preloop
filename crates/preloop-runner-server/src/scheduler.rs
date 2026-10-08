@@ -790,6 +790,7 @@ async fn cron_loop(
             push_tree: None,
             no_merge: false,
             prebuilt_merge: None,
+            git_bundle_id: None,
         };
         let (run_id, error) = match submit_run_inner(&shared, submission).await {
             Ok(accepted) => {
