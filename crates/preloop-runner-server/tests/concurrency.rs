@@ -1486,6 +1486,36 @@ async fn store_url_env_selects_the_control_backend() {
     );
 }
 
+/// Regression: test builds never let the ambient `PRELOOP_STORE_URL` reach
+/// [`AppState`]. The env-mutating tests above serialize on
+/// `GITHUB_ENV_LOCK`, but every other test in this binary opens an `AppState`
+/// while that variable may point at a sibling's temp database — deleted with
+/// the tempdir (a `unable to open database file` panic) or still live (a
+/// foreign store hijacking the assertions). `AppState::new_with_store` pins
+/// `None` to the state-dir default in test builds; production keeps the env
+/// fallback, which `test_open_backend` still exercises.
+#[tokio::test]
+async fn app_state_ignores_ambient_store_url_in_test_builds() {
+    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let env_db = dir.path().join("from-env.db");
+    let _env = crate::state::TestEnvVar::set(
+        crate::store::STORE_URL_ENV,
+        format!("sqlite://{}", env_db.display()),
+    );
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    AppState::new(state_dir.clone()).await.unwrap();
+    assert!(
+        state_dir.join("preloop.db").exists(),
+        "a test-build AppState must use <state_dir>/preloop.db"
+    );
+    assert!(
+        !env_db.exists(),
+        "a test-build AppState must not consult the ambient PRELOOP_STORE_URL"
+    );
+}
+
 /// Explicit URL wins over the environment — the precedence the merge base had.
 #[tokio::test]
 async fn explicit_store_url_wins_over_env() {
@@ -1517,9 +1547,10 @@ async fn explicit_store_url_wins_over_env() {
 /// bogus relative path.
 #[tokio::test]
 async fn store_url_parsing_matches_the_label_path() {
-    // The whitespace case falls back to `PRELOOP_STORE_URL`, so this test has
-    // to serialize with the other env-mutating tests and pin the variable
-    // unset — otherwise a sibling's temp database leaks in and is gone.
+    // The whitespace case falls back to `PRELOOP_STORE_URL` inside
+    // `Backend::open`, so this test has to serialize with the other
+    // env-mutating tests and pin the variable unset — otherwise a sibling's
+    // temp database leaks in and is gone.
     let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
     let dir = tempfile::tempdir().unwrap();
