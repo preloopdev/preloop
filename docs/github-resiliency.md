@@ -1,7 +1,10 @@
 # GitHub resiliency
 
 Status: **design — PR 0, no code yet.** Written against `public/main` @
-`4831f828`. Line anchors are approximate once the code moves.
+`4831f828`. Line anchors are approximate once the code moves; file anchors are
+relative to `crates/preloop-runner-server/src/` (so `control/lite/schema.sql`
+means `src/control/lite/schema.sql`) unless they name another path.
+Load-bearing anchors were re-checked against `public/main` @ `8bab45db`.
 
 Related: [webhook-resilience.md](./webhook-resilience.md) (today's repair
 layers), [github-app-webhook.md](./github-app-webhook.md) (intake and App
@@ -239,9 +242,11 @@ events (
 - Migrations: main's convention is `control/{lite,pg}/schema.sql` +
   `SCHEMA_VERSION` bump (lite `4`, pg `5` at `control/lite/mod.rs:52`,
   `control/pg/mod.rs:43`) with `docs/control-schema.sql` byte-identical to the
-  PG schema (enforced at `control/tests.rs:7545-7549`). PR #372 (stacked on
-  #370, **not on main**) replaces that with refinery migrations; deliverable 1
-  is written for main's convention and rebased onto #372's if it lands first.
+  PG schema (enforced at `control/tests.rs:7532-7549`). PR #370 has landed
+  (embedded refinery is on main); PR #372 (still open) is the migration cutover
+  that replaces the `schema.sql` convention with refinery migrations.
+  Deliverable 1 is written for main's convention and rebased onto #372's if it
+  lands first.
 
 **Delivery receipts.** The queue row is per *fact*; a delivery is per *attempt
 to tell us about it*. Collapsing deliveries into one `events` row (a GitHub
