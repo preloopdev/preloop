@@ -1841,7 +1841,7 @@ impl PgBackend {
                 &format!(
                     "SELECT j.run_id::text, j.job_id, r.repository, j.environment_gate::text, \
                             j.check_run_id, j.deployment_id, \
-                            s.environment::text, m.message_template::text \
+                            s.environment::text, m.message_template::text, r.reports_check_runs \
                      FROM jobs j \
                      JOIN runs r ON r.run_id = j.run_id \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
@@ -1919,6 +1919,7 @@ impl PgBackend {
                 environment_url,
                 check_run_id: row.get::<_, Option<i64>>(4).map(|id| id as u64),
                 deployment_id: row.get::<_, Option<i64>>(5).map(|id| id as u64),
+                reports_check_runs: row.get::<_, Option<bool>>(8).unwrap_or(false),
             });
         }
         Ok(out)

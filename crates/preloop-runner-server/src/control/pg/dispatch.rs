@@ -6760,7 +6760,10 @@ impl PgBackend {
             .query_opt(
                 "SELECT r.repository, r.head_sha, j.environment_gate::text, \
                         j.check_run_id, j.deployment_id, j.environment_url, \
-                        s.environment::text, m.message_template::text \
+                        s.environment::text, m.message_template::text, j.status, \
+                        EXISTS(SELECT 1 FROM job_requests q \
+                               WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                                 AND q.started_at IS NOT NULL) \
                  FROM jobs j \
                  JOIN runs r ON r.run_id = j.run_id \
                  LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
@@ -6844,6 +6847,13 @@ impl PgBackend {
             environment_url,
             check_run_id: row.get::<_, Option<i64>>(3).map(|id| id as u64),
             deployment_id: row.get::<_, Option<i64>>(4).map(|id| id as u64),
+            job_status: crate::control::types::status_parse(row.get::<_, String>(8).as_str()),
+            deployment_started: row.get::<_, Option<bool>>(9).unwrap_or(false)
+                || gate.as_ref().is_some_and(|gate| {
+                    gate.approval_requested_at_unix_nanos.is_some()
+                        || !gate.approvals.is_empty()
+                        || gate.rejected_by.is_some()
+                }),
         }))
     }
 }

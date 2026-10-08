@@ -202,7 +202,7 @@ async fn resolve_repo_token(
             }
         }
     }
-    let fallback = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
+    let fallback = shared.state.static_github_pat();
     if fallback.is_none() && app_creds.is_some() {
         record_check_reporting(shared, false);
     }
@@ -1237,25 +1237,58 @@ pub async fn report_check_run_in_progress(
 
     // Environment side-channel: the deployment flips to `in_progress` once
     // the job actually starts executing (GitHub's DeploymentStatus states).
-    if let Some(row) = environment_deployment_row(shared, run_id, job_id).await
-        && let Some(token) = resolve_environment_token(shared, &row.repository).await
-        && let Some(deployment_id) =
-            ensure_environment_deployment(shared, run_id, job_id, &row).await
-        && let Err(error) = post_deployment_status(
-            shared,
-            &token,
-            &row.repository,
-            run_id,
-            deployment_id,
-            "in_progress",
-            row.environment_url.as_deref(),
-        )
-        .await
+    // This post is asynchronous — a fast job can already be concluded by the
+    // time it runs, and a late `in_progress` after the terminal status leaves
+    // GitHub showing a finished deployment as running. Fence on the persisted
+    // job state at read time and again right before posting (the terminal
+    // commit may land while the token mints).
+    let Some(row) = environment_deployment_row(shared, run_id, job_id).await else {
+        return;
+    };
+    if row.job_status.is_terminal() {
+        return;
+    }
+    let Some(token) = resolve_environment_token(shared, &row.repository).await else {
+        return;
+    };
+    let Some(deployment_id) = ensure_environment_deployment(shared, run_id, job_id, &row).await
+    else {
+        return;
+    };
+    if environment_job_terminal(shared, run_id, job_id).await {
+        return;
+    }
+    if let Err(error) = post_deployment_status(
+        shared,
+        &token,
+        &row.repository,
+        run_id,
+        deployment_id,
+        "in_progress",
+        row.environment_url.as_deref(),
+    )
+    .await
     {
         tracing::warn!(
             %run_id, %job_id, %error,
             "deployment in_progress status failed"
         );
+    }
+}
+
+/// The fence [`report_check_run_in_progress`] re-checks before posting the
+/// asynchronous `in_progress` deployment status: the job's persisted status.
+/// An unreadable or missing row answers `true` — skipping a real `in_progress`
+/// costs one stale `queued` badge, while posting one over a concluded job
+/// leaves a finished deployment showing as running forever.
+async fn environment_job_terminal(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> bool {
+    match shared.state.backend.environment_gate(run_id, job_id).await {
+        Ok(Some(read)) => read.status.is_terminal(),
+        _ => true,
     }
 }
 
@@ -1353,13 +1386,17 @@ pub async fn report_check_run_completed(
 // `action_required` with Approve/Reject actions; each `requested_action`
 // webhook is one review decision.
 
-/// Token for the environment side-channels: rules reads + deployment
-/// writes. `deployments:write` is the gate; `contents:read` keeps private
-/// repositories' environment endpoints reachable.
+/// Token for the environment side-channels: rules reads, deployment writes
+/// and the check-run PATCHes the review surface needs. `deployments:write`
+/// is the gate; `checks:write` covers `patch_check_run_actions` (the
+/// `action_required` Approve/Reject surface lives on the check run);
+/// `contents:read` keeps private repositories' environment endpoints
+/// reachable.
 async fn resolve_environment_token(shared: &Arc<SharedState>, repo: &str) -> Option<String> {
     let mut permissions = std::collections::BTreeMap::new();
     permissions.insert("deployments".to_owned(), "write".to_owned());
     permissions.insert("contents".to_owned(), "read".to_owned());
+    permissions.insert("checks".to_owned(), "write".to_owned());
     resolve_repo_token(shared, repo, &permissions).await
 }
 
@@ -1570,7 +1607,14 @@ pub async fn announce_environment_gates(shared: &Arc<SharedState>, run: Option<R
         };
         // The check run PATCH and the deployment status are independent
         // surfaces: a job reporting no checks still gets its deployment row.
+        // But a reporting run whose check run id has not landed yet (the mint
+        // is a separate spawned task), and a deployment create that failed,
+        // are *expected* surfaces that are missing — leave the gate
+        // unannounced so the reaper sweep retries instead of dropping them.
         let mut announced = true;
+        if row.reports_check_runs && row.check_run_id.is_none() {
+            announced = false;
+        }
         if let Some(check_run_id) = row.check_run_id
             && let Err(error) = patch_check_run_actions(
                 shared,
@@ -1589,20 +1633,24 @@ pub async fn announce_environment_gates(shared: &Arc<SharedState>, run: Option<R
             tracing::warn!(run_id = %row.run_id, %error, "check run action_required patch failed");
             announced = false;
         }
-        if let Some(deployment_id) = deployment_id
-            && let Err(error) = post_deployment_status(
-                shared,
-                &token,
-                &row.repository,
-                row.run_id,
-                deployment_id,
-                "pending",
-                row.environment_url.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(run_id = %row.run_id, %error, "deployment pending status failed");
-            announced = false;
+        match deployment_id {
+            Some(deployment_id) => {
+                if let Err(error) = post_deployment_status(
+                    shared,
+                    &token,
+                    &row.repository,
+                    row.run_id,
+                    deployment_id,
+                    "pending",
+                    row.environment_url.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(run_id = %row.run_id, %error, "deployment pending status failed");
+                    announced = false;
+                }
+            }
+            None => announced = false,
         }
         if announced
             && let Err(error) = shared
@@ -1616,10 +1664,14 @@ pub async fn announce_environment_gates(shared: &Arc<SharedState>, run: Option<R
     }
 }
 
-/// Settle a gate's GitHub side-channel after a review decision or terminal
-/// conclusion: PATCH the check run off `action_required` and post the
-/// deployment's `queued`/`failure` status. `approved = true` releases the
-/// deployment; `false` fails it closed.
+/// Settle a gate's GitHub side-channel after a review *decision*: PATCH the
+/// check run off `action_required` and post the deployment's
+/// `queued`/`failure` status. Call only once the gate has a verdict —
+/// `approved` means "the gate released the deployment" (`true`) or "the
+/// gate rejected it" (`false`). An approval that was recorded but does not
+/// yet satisfy the required count is not a decision: GitHub keeps the
+/// review pending, and reporting one would show a rejection that never
+/// happened — callers must skip it.
 pub async fn report_environment_review(
     shared: &Arc<SharedState>,
     run_id: RunId,
@@ -1702,6 +1754,13 @@ pub async fn report_environment_concluded(
     let Some(row) = environment_deployment_row(shared, run_id, job_id).await else {
         return;
     };
+    // GitHub creates a Deployment only once the job starts or its gate enters
+    // review — a job skipped by `if:` (or otherwise concluded before either)
+    // has none. Never mint one at conclusion time for a job GitHub never
+    // tracked.
+    if row.deployment_id.is_none() && !row.deployment_started {
+        return;
+    }
     let Some(token) = resolve_environment_token(shared, &row.repository).await else {
         return;
     };
@@ -2543,6 +2602,25 @@ async fn process_check_run_requested_action(
         );
         return Ok(());
     };
+    // The held job's repository must match the payload's: a delivery naming a
+    // different repository never authorizes a review on this one. Missing or
+    // mismatched `repository.full_name` fails closed. GitHub repository names
+    // are case-insensitive, so compare case-insensitively.
+    let payload_repository = payload
+        .get("repository")
+        .and_then(|repo| repo.get("full_name"))
+        .and_then(Value::as_str);
+    if !payload_repository.is_some_and(|repo| repo.eq_ignore_ascii_case(&held.repository)) {
+        warn!(
+            run_id = %held.run_id,
+            job_id = %held.job_id.0,
+            held_repository = %held.repository,
+            ?payload_repository,
+            check_run_id,
+            "check_run requested_action names a different repository; ignored"
+        );
+        return Ok(());
+    }
     let sender = payload
         .get("sender")
         .and_then(|sender| sender.get("login"))
@@ -2613,15 +2691,22 @@ async fn process_check_run_requested_action(
                 satisfied,
                 "environment approval recorded via check_run requested_action"
             );
-            report_environment_review(
-                shared,
-                held.run_id,
-                &held.job_id,
-                satisfied,
-                Some(&sender),
-                None,
-            )
-            .await;
+            if satisfied {
+                report_environment_review(
+                    shared,
+                    held.run_id,
+                    &held.job_id,
+                    true,
+                    Some(&sender),
+                    None,
+                )
+                .await;
+            }
+            // An approval recorded but not yet satisfying the required count
+            // leaves the gate open on GitHub too: the check run stays
+            // `action_required` and the deployment `pending`, so there is no
+            // side-channel update to report. Reporting it would stamp the
+            // review as a rejection (and the deployment as `failure`).
         }
         crate::control::types::EnvironmentApprovalResult::Rejected => {
             info!(
@@ -3854,7 +3939,9 @@ async fn process_delivery_payload_with_lease(
 
 /// Webhook events the App-manifest flow asks GitHub to subscribe a new App to.
 ///
-/// Defaults to the minimal CI event set (`push`, `pull_request`). GitHub
+/// Defaults to the minimal CI event set (`push`, `pull_request`, `check_run`
+/// — the environment review buttons arrive as `check_run.requested_action`,
+/// and GitHub only delivers it to Apps subscribed to `check_run`). GitHub
 /// cannot change an App's event subscriptions through its API after creation,
 /// so operators who need additional triggers must add them manually in the
 /// App settings UI. Operators who want a different creation-time set can
@@ -3875,7 +3962,11 @@ pub fn manifest_default_events() -> Vec<String> {
             return events;
         }
     }
-    vec!["push".to_owned(), "pull_request".to_owned()]
+    vec![
+        "push".to_owned(),
+        "pull_request".to_owned(),
+        "check_run".to_owned(),
+    ]
 }
 
 /// Serve registration page for GitHub App Manifest flow.
@@ -4153,7 +4244,7 @@ mod tests {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
         let defaults = manifest_default_events();
-        assert_eq!(defaults, vec!["push", "pull_request"]);
+        assert_eq!(defaults, vec!["push", "pull_request", "check_run"]);
     }
 
     #[tokio::test]
@@ -4168,7 +4259,10 @@ mod tests {
 
         // A blank override falls back to the minimal default.
         unsafe { std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ") };
-        assert_eq!(manifest_default_events(), vec!["push", "pull_request"]);
+        assert_eq!(
+            manifest_default_events(),
+            vec!["push", "pull_request", "check_run"]
+        );
         unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
     }
 
@@ -6196,6 +6290,14 @@ jobs:
             axum::serve(listener, mock_app).await.unwrap();
         });
 
+        // The PAT and API base are part of `AppState` construction
+        // (`state.github_pat` snapshots `PRELOOP_GITHUB_TOKEN` — env wins,
+        // then the config file), so they must be set before `mint_fixture`.
+        let _api_url = crate::state::TestEnvVar::set(
+            "PRELOOP_GITHUB_API_URL",
+            format!("http://127.0.0.1:{port}"),
+        );
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "check-retry-token");
         let (_temp, shared, run_id) = mint_fixture(true, None).await;
         let job_id = JobId("build".to_owned());
         shared
@@ -7327,6 +7429,987 @@ jobs:
                 .unwrap(),
             Some(("blocked".to_owned(), "pending".to_owned())),
             "the job stays parked on the reviewer gate"
+        );
+    }
+
+    // ── Environment side-channel regressions ───────────────────────────
+
+    /// The environment side-channels PATCH check runs (the `action_required`
+    /// review surface) in addition to writing deployments, so the App token
+    /// they mint must ask for `checks: write` — not only `deployments:write`
+    /// and `contents:read`.
+    #[tokio::test]
+    async fn environment_token_requests_checks_write() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api, requests) = start_github_stub(|method, path, _body| {
+            if method == "GET" && path == "/app/installations/101" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"account": {"login": "owner"}}),
+                );
+            }
+            if path.contains("/access_tokens") {
+                return (
+                    201,
+                    vec![],
+                    serde_json::json!({"token": "ghs-env", "expires_at": "2099-01-01T00:00:00Z"}),
+                );
+            }
+            (404, vec![], serde_json::json!({"message": "not found"}))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        // No PAT: the App path must mint.
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "");
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut app = crate::github_app::GitHubAppCredentials::for_tests(
+            "424",
+            rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+            crate::github_app::MintFailurePolicy::LocalJwt,
+        );
+        app.installation_id = Some(101);
+        state.github_app = Some(app.clone());
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![app],
+            default_index: 0,
+        });
+        let shared = state.shared();
+
+        assert_eq!(
+            resolve_environment_token(&shared, "owner/repo")
+                .await
+                .as_deref(),
+            Some("ghs-env")
+        );
+        let mint = requests
+            .lock()
+            .iter()
+            .find(|(method, path, _)| method == "POST" && path.contains("/access_tokens"))
+            .map(|(_, _, body)| body.clone())
+            .expect("the side-channel mints an installation token");
+        let permissions = mint["permissions"].as_object().expect("permissions object");
+        assert_eq!(
+            permissions.get("checks").and_then(Value::as_str),
+            Some("write"),
+            "patch_check_run_actions needs checks:write: {mint}"
+        );
+        assert_eq!(
+            permissions.get("deployments").and_then(Value::as_str),
+            Some("write"),
+            "deployment create/statuses need deployments:write: {mint}"
+        );
+        assert_eq!(
+            permissions.get("contents").and_then(Value::as_str),
+            Some("read"),
+            "private environment reads need contents:read: {mint}"
+        );
+    }
+
+    /// A config-file PAT (`github.pat`, stored on `state.github_pat`) covers
+    /// the deployment/review side-channels exactly like
+    /// `PRELOOP_GITHUB_TOKEN`; an empty env value counts as unset, never as
+    /// an empty bearer.
+    #[tokio::test]
+    async fn repo_token_falls_back_to_config_pat() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "");
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_pat = Some(preloop_gha_protocol::SecretString::new(
+            "config_pat".to_owned(),
+        ));
+        let shared = state.shared();
+
+        assert_eq!(
+            resolve_environment_token(&shared, "owner/repo")
+                .await
+                .as_deref(),
+            Some("config_pat"),
+            "the config-file PAT answers when no App covers the repository"
+        );
+
+        let temp2 = tempfile::tempdir().unwrap();
+        let bare = AppState::new(temp2.path().to_path_buf()).await.unwrap();
+        let shared = bare.shared();
+        assert_eq!(
+            resolve_environment_token(&shared, "owner/repo").await,
+            None,
+            "an empty PRELOOP_GITHUB_TOKEN is unset, not an empty bearer"
+        );
+    }
+
+    /// Submit one `environment: prod` job and arm its required-reviewer gate:
+    /// rules resolve from `api_base` first so the sweep stamps the pending
+    /// approval. Returns the fixture + shared handle + ids, with the job
+    /// still held.
+    async fn held_environment_fixture(
+        temp: &tempfile::TempDir,
+        api_base: &str,
+    ) -> (WebhookFixture, std::sync::Arc<SharedState>, RunId, JobId) {
+        let fixture = WebhookFixture::new(temp).await;
+        let shared = fixture.state.shared();
+        fixture.state.environment_resolver.set_github_configured();
+        fixture
+            .state
+            .backend
+            .set_environment_resolver(fixture.state.environment_resolver.clone());
+        fixture
+            .state
+            .environment_resolver
+            .resolve_at(api_base, &shared, "owner/repo", "prod")
+            .await
+            .expect("environment rules resolve");
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = crate::control::tests::submit_run(
+            run_id,
+            vec![crate::control::tests::submit_job(run_id, "deploy", 1)],
+        );
+        submit.jobs[0].queued.environment = Some(serde_json::json!({
+            "name": "prod",
+            "url": "https://staging.example.com",
+        }));
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        fixture.state.backend.submit_run(submit).await.unwrap();
+        fixture
+            .state
+            .backend
+            .promote_ready_jobs(Some(run_id))
+            .await
+            .unwrap();
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("approval gate armed");
+        assert!(
+            gate.approval_requested_at_unix_nanos.is_some(),
+            "the required-reviewer gate must stamp the wait"
+        );
+        assert!(
+            !gate.approval_announced,
+            "the gate starts unannounced: the announce loop stamps it"
+        );
+        (fixture, shared, run_id, job_id)
+    }
+
+    /// The environment-rules endpoints the resolver reads for `prod`:
+    /// `octocat` is the only required reviewer.
+    fn environment_rules_routes() -> axum::Router {
+        use axum::routing::get;
+        axum::Router::new()
+            .route(
+                "/repos/owner/repo/environments/prod",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "protection_rules": [{
+                            "type": "required_reviewers",
+                            "prevent_self_review": false,
+                            "reviewers": [
+                                {"type": "User", "reviewer": {"login": "octocat"}},
+                            ],
+                        }],
+                    }))
+                }),
+            )
+            .route(
+                "/repos/owner/repo/environments/prod/deployment_protection_rules",
+                get(|| async {
+                    Json(serde_json::json!({"custom_deployment_protection_rules": []}))
+                }),
+            )
+    }
+
+    /// The announce sweep's expected surfaces: the check-run PATCH the moment
+    /// the run's check run id lands, and the deployment's `pending` status.
+    /// A gate scanned before its check run id is persisted (creation is a
+    /// separate spawned task) or whose deployment create failed must stay
+    /// unannounced so the reaper retries — stamping it would permanently drop
+    /// the Approve/Reject buttons or the pending status.
+    #[tokio::test]
+    async fn announce_retries_when_expected_surfaces_are_missing() {
+        use axum::routing::{patch, post};
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = environment_rules_routes()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            Json(serde_json::json!({"id": 555}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/check-runs/:id",
+                patch({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push(format!("check-runs/{id}:{body}"));
+                            Json(serde_json::json!({"id": id}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
+        // The run reports check runs, but the check-run creation task has not
+        // stamped the job's id yet — exactly the submit-time split between the
+        // check-run and announce tasks.
+        fixture
+            .state
+            .backend
+            .set_reports_check_runs(run_id, true)
+            .await
+            .unwrap();
+
+        crate::github::announce_environment_gates(&shared, Some(run_id)).await;
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("gate stays armed");
+        assert!(
+            !gate.approval_announced,
+            "a missing check run on a reporting run must not stamp announced"
+        );
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .all(|request| !request.contains("check-runs/")),
+            "no check-run PATCH without an id: {:?}",
+            requests.lock()
+        );
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .any(|request| request.contains("deployments/555/statuses")),
+            "the deployment surface is independent and still posted: {:?}",
+            requests.lock()
+        );
+
+        // The mint lands; the next sweep PATCHes the check run and stamps the
+        // gate.
+        fixture
+            .state
+            .backend
+            .set_job_check_run(run_id, &job_id, 99)
+            .await
+            .unwrap();
+        crate::github::announce_environment_gates(&shared, Some(run_id)).await;
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("gate stays armed");
+        assert!(
+            gate.approval_announced,
+            "the retry announces once the check run id exists"
+        );
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .any(|request| request.contains("check-runs/99")
+                    && request.contains("\"conclusion\":\"action_required\"")),
+            "the retry PATCHes the Approve/Reject surface: {:?}",
+            requests.lock()
+        );
+    }
+
+    /// Same retry contract for the deployment surface: a failed create leaves
+    /// the gate unannounced, and the next sweep creates it.
+    #[tokio::test]
+    async fn announce_retries_when_deployment_create_fails() {
+        use axum::routing::post;
+        let fail = std::sync::Arc::new(parking_lot::Mutex::new(true));
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = environment_rules_routes()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    let fail = fail.clone();
+                    move || {
+                        let seen = seen.clone();
+                        let fail = fail.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            if *fail.lock() {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({"message": "boom"})),
+                                );
+                            }
+                            (StatusCode::OK, Json(serde_json::json!({"id": 777})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
+
+        crate::github::announce_environment_gates(&shared, Some(run_id)).await;
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("gate stays armed");
+        assert!(
+            !gate.approval_announced,
+            "a failed deployment create must not stamp announced"
+        );
+        assert!(
+            requests
+                .lock()
+                .iter()
+                .all(|request| !request.contains("statuses")),
+            "no status posts without a deployment: {:?}",
+            requests.lock()
+        );
+
+        *fail.lock() = false;
+        crate::github::announce_environment_gates(&shared, Some(run_id)).await;
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("gate stays armed");
+        assert!(
+            gate.approval_announced,
+            "the retry creates the deployment and announces"
+        );
+        let requests = requests.lock().clone();
+        assert_eq!(
+            deployment_statuses(&requests, 777)
+                .iter()
+                .map(|(state, _)| state.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending"],
+            "the retried announce posts the pending status: {requests:?}"
+        );
+    }
+
+    /// The `in_progress` deployment status is asynchronous: a job that
+    /// finished before it lands must never be reported running again. The
+    /// persisted terminal state fences the post.
+    #[tokio::test]
+    async fn late_in_progress_report_never_overtakes_terminal() {
+        use axum::routing::post;
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = axum::Router::new()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            Json(serde_json::json!({"id": 42}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = crate::control::tests::submit_run(
+            run_id,
+            vec![crate::control::tests::submit_job(run_id, "deploy", 1)],
+        );
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        fixture_submit(&state, submit).await;
+
+        // Started, then terminal before the in_progress wake ran.
+        report_check_run_in_progress(&shared, run_id, &job_id).await;
+        state
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE jobs SET status = 'failure', queue_state = 'none' \
+                     WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run_id.to_string(), "deploy"],
+                )
+                .unwrap();
+                db.execute(
+                    "UPDATE job_requests SET started_at = 1, finished_at = 2 \
+                     WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run_id.to_string(), "deploy"],
+                )
+                .unwrap();
+            })
+            .await;
+        report_check_run_completed(
+            &shared,
+            run_id,
+            &job_id,
+            preloop_gha_protocol::ExecutionStatus::Failure,
+        )
+        .await;
+        report_check_run_in_progress(&shared, run_id, &job_id).await;
+
+        let requests = requests.lock().clone();
+        let statuses = deployment_statuses(&requests, 42);
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|(state, _)| state.as_str())
+                .collect::<Vec<_>>(),
+            vec!["in_progress", "failure"],
+            "the terminal status is the last word — no late in_progress: {requests:?}"
+        );
+    }
+
+    /// `submit_run` through `state` (a bare `AppState` instead of the webhook
+    /// fixture) — kept tiny so each test reads linearly.
+    async fn fixture_submit(state: &AppState, submit: crate::control::types::SubmitRun) {
+        state.backend.submit_run(submit).await.unwrap();
+    }
+
+    /// A job skipped by `if:` never reaches a runner, so GitHub creates no
+    /// Deployment for it. Concluding it must not mint one — nor post a
+    /// failure status for a deployment GitHub never made.
+    #[tokio::test]
+    async fn skipped_environment_job_creates_no_deployment() {
+        use axum::routing::post;
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = axum::Router::new()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            Json(serde_json::json!({"id": 42}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut job = crate::control::tests::submit_job(run_id, "deploy", 1);
+        job.queued.environment = Some(serde_json::json!("prod"));
+        job.initially_skipped = true;
+        let submit = crate::control::tests::submit_run(run_id, vec![job]);
+        fixture_submit(&state, submit).await;
+
+        report_check_run_completed(
+            &shared,
+            run_id,
+            &job_id,
+            preloop_gha_protocol::ExecutionStatus::Skipped,
+        )
+        .await;
+
+        {
+            let requests = requests.lock().clone();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.contains("deployments")),
+                "a skipped job never creates a deployment or posts a status: {requests:?}"
+            );
+        }
+
+        // Contrast: a job the runner actually started does carry a
+        // deployment — its conclusion posts `success` against it.
+        let run2 = RunId::new();
+        let job2 = JobId("deploy".to_owned());
+        let mut submit2 = crate::control::tests::submit_run(
+            run2,
+            vec![crate::control::tests::submit_job(run2, "deploy", 1)],
+        );
+        submit2.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        fixture_submit(&state, submit2).await;
+        state
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE job_requests SET started_at = 1 WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run2.to_string(), "deploy"],
+                )
+                .unwrap();
+            })
+            .await;
+        report_check_run_completed(
+            &shared,
+            run2,
+            &job2,
+            preloop_gha_protocol::ExecutionStatus::Success,
+        )
+        .await;
+        let requests = requests.lock().clone();
+        assert_eq!(
+            deployment_statuses(&requests, 42)
+                .iter()
+                .map(|(state, _)| state.as_str())
+                .collect::<Vec<_>>(),
+            vec!["success"],
+            "a job that ran reports its terminal status: {requests:?}"
+        );
+    }
+
+    /// A gate-engaged job that never dispatched (rejected by a reviewer)
+    /// still owns a GitHub deployment — GitHub creates it when the review
+    /// wait starts — so its conclusion posts `failure`, creating the
+    /// deployment on the spot when the announce path's create was lost.
+    #[tokio::test]
+    async fn rejected_environment_job_concludes_with_deployment() {
+        use axum::routing::post;
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = environment_rules_routes()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            Json(serde_json::json!({"id": 88}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
+        // No announce ran and no deployment is stamped: the rejection lands
+        // before any side-channel pass succeeded.
+        fixture
+            .state
+            .backend
+            .record_environment_approval(crate::control::types::EnvironmentApproval {
+                run_id,
+                job_id: job_id.clone(),
+                decision: crate::control::types::EnvironmentDecision::Reject,
+                actor: Some("octocat".to_owned()),
+                admin_override: false,
+                note: None,
+            })
+            .await
+            .unwrap();
+        report_check_run_completed(
+            &shared,
+            run_id,
+            &job_id,
+            preloop_gha_protocol::ExecutionStatus::Failure,
+        )
+        .await;
+
+        let requests = requests.lock().clone();
+        assert!(
+            requests.iter().any(|request| request == "deployments"),
+            "a gate-engaged job keeps its deployment even though it never ran: {requests:?}"
+        );
+        assert_eq!(
+            deployment_statuses(&requests, 88)
+                .iter()
+                .map(|(state, _)| state.as_str())
+                .collect::<Vec<_>>(),
+            vec!["failure"],
+            "the rejected job's deployment concludes failure: {requests:?}"
+        );
+    }
+
+    /// A `requested_action` whose `repository.full_name` names a different
+    /// repository than the held job's never authorizes a review — the gate
+    /// records nothing (fail closed). Matching is case-insensitive, matching
+    /// GitHub's repository-name semantics.
+    #[tokio::test]
+    async fn requested_action_must_match_the_held_jobs_repository() {
+        use axum::routing::{patch, post};
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = environment_rules_routes()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            Json(serde_json::json!({"id": 555}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/check-runs/:id",
+                patch({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push(format!("check-runs/{id}:{body}"));
+                            Json(serde_json::json!({"id": id}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
+        fixture
+            .state
+            .backend
+            .set_job_check_run(run_id, &job_id, 99)
+            .await
+            .unwrap();
+
+        // A foreign repository's click records nothing.
+        let foreign = serde_json::json!({
+            "action": "requested_action",
+            "requested_action": {"identifier": "approve"},
+            "check_run": {"id": 99},
+            "repository": {"full_name": "evil/repo"},
+            "sender": {"login": "octocat"},
+        });
+        process_check_run_requested_action(&shared, &foreign)
+            .await
+            .expect("the delivery answers Ok, it just ignores it");
+        let read = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists");
+        assert!(
+            read.gate.expect("gate stays armed").approvals.is_empty(),
+            "a delivery naming another repository records no approval"
+        );
+
+        // The same click under the right repository (case-insensitive) lands.
+        let ours = serde_json::json!({
+            "action": "requested_action",
+            "requested_action": {"identifier": "approve"},
+            "check_run": {"id": 99},
+            "repository": {"full_name": "OWNER/Repo"},
+            "sender": {"login": "octocat"},
+        });
+        process_check_run_requested_action(&shared, &ours)
+            .await
+            .expect("the matching delivery processes");
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("the approval recorded");
+        assert_eq!(gate.approvals.len(), 1);
+        assert_eq!(gate.approvals[0].actor.as_deref(), Some("octocat"));
+    }
+
+    /// A recorded approval that does not satisfy the required reviewer count
+    /// is not a decision: GitHub keeps the gate pending, so nothing may be
+    /// PATCHed or posted — reporting it would read as a rejection.
+    #[tokio::test]
+    async fn unsatisfied_approval_reports_nothing_to_github() {
+        use axum::routing::{patch, post};
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let stub = environment_rules_routes()
+            .route(
+                "/repos/owner/repo/deployments",
+                post({
+                    let seen = seen.clone();
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push("deployments".to_owned());
+                            Json(serde_json::json!({"id": 555}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/deployments/:id/statuses",
+                post({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .push(format!("deployments/{id}/statuses:{body}"));
+                            Json(serde_json::json!({"id": 1}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/owner/repo/check-runs/:id",
+                patch({
+                    let seen = seen.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<u64>,
+                          Json(body): Json<Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().push(format!("check-runs/{id}:{body}"));
+                            Json(serde_json::json!({"id": id}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
+        fixture
+            .state
+            .backend
+            .set_job_check_run(run_id, &job_id, 99)
+            .await
+            .unwrap();
+        // Raise the quorum past one approval (config validation caps
+        // `required_reviewers` at 1 today; the gate blob carries the stamped
+        // requirement so the reporting path stays honest when a quorum is
+        // possible).
+        fixture
+            .state
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE jobs SET environment_gate = \
+                         json_set(environment_gate, '$.approvals_required', 2) \
+                     WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run_id.to_string(), "deploy"],
+                )
+                .unwrap();
+            })
+            .await;
+
+        let payload = serde_json::json!({
+            "action": "requested_action",
+            "requested_action": {"identifier": "approve"},
+            "check_run": {"id": 99},
+            "repository": {"full_name": "owner/repo"},
+            "sender": {"login": "octocat"},
+        });
+        process_check_run_requested_action(&shared, &payload)
+            .await
+            .expect("the delivery processes");
+
+        let gate = fixture
+            .state
+            .backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("the approval recorded");
+        assert_eq!(gate.approvals.len(), 1);
+        assert!(
+            !fixture
+                .state
+                .backend
+                .pending_environment_approvals(Some(run_id))
+                .await
+                .unwrap()
+                .is_empty(),
+            "one of two approvals keeps the job gated"
+        );
+        let requests = requests.lock().clone();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("check-runs/") && !request.contains("deployments")),
+            "an unsatisfied approval touches no GitHub surface: {requests:?}"
         );
     }
 }

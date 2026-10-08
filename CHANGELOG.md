@@ -124,6 +124,30 @@ Releases before v0.27.0 predate the changelog.
 - **Environment policy pagination fails closed:** truncated protected-branch,
   branch-policy, and team-member lists remain unresolved instead of being
   treated as complete.
+- **Manifest-created GitHub Apps subscribe to `check_run`**: without it
+  GitHub never delivered `check_run.requested_action`, so environment
+  Approve/Reject clicks on `action_required` check runs went unheard.
+- **Environment deployment/review tokens carry `checks: write`**: the
+  minted installation token asked only for `deployments: write` +
+  `contents: read`, so the `action_required` Approve/Reject check-run
+  PATCHes were rejected by GitHub.
+- **Deployment and review reporting fall back to the config-file PAT**:
+  `resolve_repo_token` consulted only `PRELOOP_GITHUB_TOKEN`, so a PAT in
+  `github.pat` got no deployment statuses or review buttons (and could send
+  an empty bearer). It now reads `AppState::static_github_pat()`.
+- **Environment gates stay announced-retryable until every GitHub surface
+  lands**: a gate scanned before its check run id was persisted, or whose
+  deployment create failed, was stamped `announced` and never retried —
+  permanently losing the Approve/Reject buttons or the `pending` status.
+- **A late `in_progress` deployment status no longer revives a finished
+  deployment**: the asynchronous post now fences on the persisted job state.
+- **Skipped `environment:` jobs no longer mint phantom deployments**:
+  concluding a job that never ran (and whose gate never engaged) created a
+  deployment plus a `failure` status; GitHub creates none for skipped jobs.
+- **`check_run.requested_action` must name the held job's repository**: a
+  delivery whose `repository.full_name` mismatched (or was missing) the
+  gated job's repository could record an environment review for it; it is
+  ignored now.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

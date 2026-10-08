@@ -1107,6 +1107,12 @@ pub(crate) struct PendingEnvironmentApproval {
     pub(crate) check_run_id: Option<u64>,
     /// The job's GitHub deployment, when one was created.
     pub(crate) deployment_id: Option<u64>,
+    /// Whether the run reports GitHub check runs (`runs.reports_check_runs`).
+    /// The announce loop needs this: a `None` check_run_id on a reporting run
+    /// means the check run mint has not landed yet (separate spawned task),
+    /// so the gate must stay unannounced for the retry sweep, while a `None`
+    /// on a non-reporting run means no check run will ever exist.
+    pub(crate) reports_check_runs: bool,
 }
 
 /// Everything the GitHub environment side-channel needs for one job: the
@@ -1127,6 +1133,16 @@ pub(crate) struct EnvironmentDeploymentRow {
     pub(crate) check_run_id: Option<u64>,
     /// The job's GitHub deployment, when one was already created.
     pub(crate) deployment_id: Option<u64>,
+    /// The job's persisted status — read once more right before posting so a
+    /// terminal conclusion that landed during token mint suppresses the
+    /// asynchronous `in_progress` deployment status.
+    pub(crate) job_status: ExecutionStatus,
+    /// Whether anything happened GitHub would have created a Deployment for:
+    /// a runner claimed the job (`job_requests.started_at`), or the
+    /// environment gate engaged (a review was requested or recorded). A job
+    /// skipped by `if:` — or otherwise concluded before either — has no
+    /// GitHub deployment, so the terminal report must not create one.
+    pub(crate) deployment_started: bool,
 }
 
 /// One durable environment-review audit row (`environment_approvals`): who

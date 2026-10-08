@@ -157,7 +157,10 @@ impl LiteBackend {
                 .prepare_cached(
                     "SELECT r.repository, r.head_sha, j.environment_gate, \
                             j.check_run_id, j.deployment_id, j.environment_url, \
-                            s.environment, m.message_template \
+                            s.environment, m.message_template, j.status, \
+                            EXISTS(SELECT 1 FROM job_requests q \
+                                   WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                                     AND q.started_at IS NOT NULL) \
                      FROM jobs j \
                      JOIN runs r ON r.run_id = j.run_id \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
@@ -175,6 +178,8 @@ impl LiteBackend {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 })
                 .optional()
@@ -188,6 +193,8 @@ impl LiteBackend {
                 resolved_url,
                 spec_env,
                 template,
+                job_status,
+                job_started,
             )) = row
             else {
                 return Ok(None);
@@ -207,9 +214,27 @@ impl LiteBackend {
                 environment_url,
                 check_run_id: check_run_id.map(|id| id as u64),
                 deployment_id: deployment_id.map(|id| id as u64),
+                job_status: crate::control::types::status_parse(&job_status),
+                deployment_started: job_started != 0
+                    || environment_gate_engaged(gate_json.as_deref()),
             }))
         })
     }
+}
+
+/// Whether the armed gate blob shows the environment gate ever engaged
+/// GitHub's review surface — a required-reviewer wait was stamped, or a
+/// decision landed. GitHub creates a Deployment when a job waits on
+/// reviewers, so these jobs carry one even though no runner ever ran them;
+/// a job skipped by `if:` has neither marker and gets none.
+fn environment_gate_engaged(gate_json: Option<&str>) -> bool {
+    gate_json
+        .and_then(|json| serde_json::from_str::<EnvironmentGateState>(json).ok())
+        .is_some_and(|gate| {
+            gate.approval_requested_at_unix_nanos.is_some()
+                || !gate.approvals.is_empty()
+                || gate.rejected_by.is_some()
+        })
 }
 
 /// The environment name recorded on a job's stored runner message, when it
@@ -334,7 +359,7 @@ fn pending_environment_approvals_tx(
         .prepare_cached(&format!(
             "SELECT j.run_id, j.job_id, r.repository, j.environment_gate, \
                     j.check_run_id, j.deployment_id, \
-                    s.environment, m.message_template \
+                    s.environment, m.message_template, r.reports_check_runs \
              FROM jobs j \
              JOIN runs r ON r.run_id = j.run_id \
              LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
@@ -355,13 +380,23 @@ fn pending_environment_approvals_tx(
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })
         .map_err(db)?;
     let mut out = Vec::new();
     for row in rows {
-        let (run, job_id, repository, gate_json, check_run_id, deployment_id, spec_env, template) =
-            row.map_err(db)?;
+        let (
+            run,
+            job_id,
+            repository,
+            gate_json,
+            check_run_id,
+            deployment_id,
+            spec_env,
+            template,
+            reports_check_runs,
+        ) = row.map_err(db)?;
         let gate: EnvironmentGateState = serde_json::from_str(&gate_json).unwrap_or_default();
         // Only armed approval gates are reportable: the pending row exists
         // so the announce loop PATCHes the check run once, not every tick.
@@ -386,6 +421,7 @@ fn pending_environment_approvals_tx(
             environment_url,
             check_run_id: check_run_id.map(|id| id as u64),
             deployment_id: deployment_id.map(|id| id as u64),
+            reports_check_runs: reports_check_runs != 0,
         });
     }
     Ok(out)
