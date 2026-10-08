@@ -119,6 +119,14 @@ impl MergeFixture {
             "base_ref": "main",
             "filter_branch": "main",
             "no_merge": no_merge,
+            "payload": {
+                "number": 7,
+                "pull_request": {
+                    "number": 7,
+                    "base": { "ref": "main", "sha": "0".repeat(40) },
+                    "head": { "ref": "feature", "sha": self.head },
+                },
+            },
         })
     }
 
@@ -147,13 +155,16 @@ async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     let run = get_run_json(&app, &run_id).await;
 
-    let merge_sha = run["submission"]["sha"].as_str().unwrap().to_owned();
+    let merge_sha = run["workspace_snapshot"]["commit_sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_ne!(
         merge_sha, fixture.head,
         "the run must test the merge, not the branch tip"
     );
     assert_eq!(run["github"]["sha"], serde_json::json!(merge_sha));
-    assert_eq!(run["github"]["ref"], "refs/pull/1/merge");
+    assert_eq!(run["github"]["ref"], "refs/pull/7/merge");
     // GitHub's shape: base.sha is the CURRENT base tip, head.sha the head.
     assert_eq!(
         run["github"]["event"]["pull_request"]["base"]["sha"],
@@ -287,12 +298,11 @@ async fn no_merge_tests_the_branch_alone() {
     .await;
     let run = get_run_json(&app, accepted["run_id"].as_str().unwrap()).await;
     assert_eq!(
-        run["submission"]["sha"],
+        run["github"]["sha"],
         serde_json::json!(fixture.head),
         "--no-merge must test the branch tip"
     );
     assert!(run["workspace_snapshot"]["merge"].is_null());
-    assert_eq!(run["github"]["sha"], serde_json::json!(fixture.head));
 }
 
 /// `push` events test the commit itself; they never grow a merge.
@@ -307,9 +317,8 @@ async fn push_events_never_merge() {
     );
     let accepted = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
     let run = get_run_json(&app, accepted["run_id"].as_str().unwrap()).await;
-    assert_eq!(run["submission"]["sha"], serde_json::json!(fixture.head));
-    assert!(run["workspace_snapshot"]["merge"].is_null());
     assert_eq!(run["github"]["sha"], serde_json::json!(fixture.head));
+    assert!(run["workspace_snapshot"]["merge"].is_null());
 }
 
 /// The shared builder contract: fetch + merge + serve, deterministic, and the

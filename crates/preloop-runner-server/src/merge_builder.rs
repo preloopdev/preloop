@@ -890,14 +890,15 @@ async fn protect_mirror_for_run(
     mirror: &Path,
     merge_sha: &str,
 ) -> Option<String> {
-    let state_dir = &shared.state.state_dir;
-    let relative = mirror.strip_prefix(state_dir).ok()?;
+    let state_dir = tokio::fs::canonicalize(&shared.state.state_dir).await.ok()?;
+    let mirror = tokio::fs::canonicalize(mirror).await.ok()?;
+    let relative = mirror.strip_prefix(&state_dir).ok()?;
     if !mirror.starts_with(state_dir.join("checkout-cache")) {
         return None;
     }
     let output = Command::new("git")
         .arg("--git-dir")
-        .arg(mirror)
+        .arg(&mirror)
         .args([
             "update-ref",
             &format!("refs/preloop/runs/{run_id}"),
@@ -906,9 +907,7 @@ async fn protect_mirror_for_run(
         .output()
         .await;
     match output {
-        Ok(output) if output.status.success() => {
-            Some(relative.to_string_lossy().to_string())
-        }
+        Ok(output) if output.status.success() => Some(relative.to_string_lossy().to_string()),
         Ok(output) => {
             warn!(
                 %run_id,

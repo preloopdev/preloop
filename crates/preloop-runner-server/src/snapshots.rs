@@ -1713,6 +1713,12 @@ async fn create_workspace_snapshot_inner(
     } else {
         None
     };
+    // A merged run checks out the merge commit; `tree_sha` stays the head
+    // tree (what push-back materializes from), and `head_sha` stays the head.
+    let commit_sha = match &merge {
+        Some(merge) => merge.sha.clone(),
+        None => commit_sha,
+    };
 
     // Allow clients to fetch arbitrary commits that exist in the snapshot's
     // object store, not just advertised ref tips: workflows that deep-fetch a
