@@ -2200,16 +2200,14 @@ fn orphan_layer_store_mounts(
 /// that exited mid-teardown — leaves its `pack/layers-cs` sparseimage
 /// mounted: the mount outlives the process that made it, and `machine
 /// delete` can no longer reach a machine whose registry row is gone. The
-/// directory then cannot be removed (`Resource busy`), which breaks the
-/// documented way to reset a home, and the attached volume leaks until the
-/// host reboots.
+/// directory then cannot be removed (`Resource busy`), so the documented way
+/// to reset a home fails.
 ///
 /// Safe to call while the engine serves: a mount with a live hypervisor is
 /// skipped, and `hdiutil` refuses to detach a busy volume, so a running
-/// machine is never disturbed. The pool runs this at startup and shutdown;
-/// the CLI runs it on every engine exit. A mount that `hdiutil` refuses is
-/// left in place (its hypervisor may have started between the scan and the
-/// detach). No-op where the layer store is not a host mount.
+/// machine is never disturbed. A mount `hdiutil` refuses is left in place
+/// (its hypervisor may have started between the scan and the detach). No-op
+/// where the layer store is not a host mount.
 pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
     #[cfg(not(target_os = "macos"))]
     {

@@ -139,33 +139,29 @@ arrives while the golden is unpacking or a runner is booting does not hold
 the teardown behind them. Whatever a cut-short teardown leaves behind is
 reaped as the engine process exits, and again at the next engine start.
 
-Two host-level facts drive the reaping, and both are easy to misread as "the
-VM is gone":
+Two host-level facts make that reaping necessary, because both look like "the
+VM is gone" when it is not:
 
 * `_boot-vm` is *detached*: Preloop's `smolvm machine …` invocations exit
-  after a boot, and the hypervisor keeps running as a parentless process. It
-  is reached through the smolvm registry — by name, or not at all.
-* On macOS a packed machine's layer store is an APFS sparseimage mounted
-  inside the machine's data directory (`<data dir>/pack/layers-cs`) for the
-  life of the VM. `machine stop`/`delete` detach it; a hypervisor that died
-  for any other reason (crash purge, engine exiting mid-teardown) leaves it
-  attached. The mount point is inside the home, so the home cannot be removed
-  (`Resource busy`) and the attached volume leaks until the host reboots.
+  after a boot, and the hypervisor keeps running as a parentless process,
+  reachable only through the smolvm registry.
+* On macOS a packed machine's layer store is an APFS sparseimage mounted at
+  `<machine data dir>/pack/layers-cs` for the life of the VM. `machine
+  stop`/`delete` detach it; a hypervisor that died for any other reason leaves
+  it attached, and the mount point is inside the home, so the home cannot be
+  removed (`Resource busy`).
 
-Startup, shutdown, and process exit therefore run both halves of the same
-reap: SIGKILL the `_boot-vm` processes whose boot-config path is under this
-home's machine data root (`preloop_vm::purge_orphaned_vms`), then detach the
-layer mounts no live hypervisor claims
-(`preloop_vm::detach_orphaned_layer_mounts`). Ownership is decided by a
-parsed path, compared component-wise against the data root in both its
-configured and canonical spelling: a neighboring home whose path merely
-shares a prefix (`…/smolvm` vs `…/smolvm-vm-other`) is never matched. A mount
-belonging to a running machine is skipped, and `hdiutil` refuses a busy
-volume on its own, so the reap is safe to run while the engine serves — the
-pool does exactly that at the end of every teardown. If a home must be reset
-by hand after an engine was SIGKILLed, run those two steps before `rm -rf`
-(deleting the registry row first makes `machine stop` unable to reach the
-leaked VM).
+Startup, shutdown, and process exit therefore SIGKILL the `_boot-vm`
+processes whose boot-config path is under this home's machine data root
+(`preloop_vm::purge_orphaned_vms`), then detach the layer mounts no live
+hypervisor claims (`preloop_vm::detach_orphaned_layer_mounts`). Ownership is a
+parsed path compared component-wise against the data root, so a neighboring
+home whose path merely shares a prefix (`…/smolvm` vs `…/smolvm-vm-other`) is
+never matched; a mount belonging to a running machine is skipped, and
+`hdiutil` refuses a busy volume, so the reap is safe while the engine serves.
+To reset a home by hand after an engine was SIGKILLed, run those two steps
+before `rm -rf`: deleting the registry row first makes `machine stop` unable to
+reach the leaked VM.
 
 An AgentENV start that the pool cancels mid-flight does not strand its
 sandbox: the provider runs `aenv start` in a task that outlives the caller,

@@ -2017,10 +2017,9 @@ async fn cmd_engine(
             .is_err()
     {
         // The pool did not reach its own teardown inside the window (it can
-        // be stuck in a provider call that does not take the token). The
-        // exit guard stops whatever it left behind — but only once the task
-        // is actually gone: its slots must not be able to boot a VM after
-        // the guard's scan, or that VM is stranded on the host.
+        // be stuck in a provider call that does not take the token). Abort
+        // and join before the exit guard scans: a slot must not be able to
+        // boot a VM after the scan, or that VM is stranded on the host.
         pool_task.abort();
         let _ = pool_task.await;
     }
@@ -2037,11 +2036,9 @@ async fn cmd_engine(
 /// SmolVM's `_boot-vm` hypervisor is detached from the CLI that spawned it —
 /// it survives the parent by design — and each packed machine's
 /// `pack/layers-cs` APFS sparseimage stays mounted for the life of the VM. An
-/// engine that exits with a machine still running (a teardown cut short by
-/// the shutdown window, a slot that failed the pool, an error return) leaves
-/// a hypervisor and a mount nothing can reach: the next engine cannot adopt
-/// them, and the home cannot even be removed — `rm -rf` fails with
-/// `Resource busy` — until the host reboots.
+/// engine that exits with a machine still running leaves a hypervisor and a
+/// mount nothing can reach: the next engine cannot adopt them, and the home
+/// cannot be removed (`rm -rf` → `Resource busy`) until the host reboots.
 ///
 /// The pool runs its own teardown on every path it reaches; this is the
 /// backstop for the paths it does not. Both steps are safe against a live

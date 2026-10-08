@@ -25,26 +25,37 @@ Releases before v0.27.0 predate the changelog.
 
 - **Engine shutdown stops the VMs it owns and never leaves a layer image
   mounted**: a shutdown signal that arrived while the runner pool was still
-  preparing its golden (unpack or bake) or provisioning a runner never
-  reached the pool's teardown — those continuations did not observe the
-  cancellation token — so the CLI's bounded stop aborted the pool mid-flight
-  and exited with the microVM still running. SmolVM detaches `_boot-vm` from
-  the CLI that spawned it (it survives the parent by design), and a packed
-  machine's `pack/layers-cs` APFS image stays mounted for the life of the VM,
-  so the survivor kept holding its disk and made the Preloop home impossible
-  to remove (`rm -rf` → `Resource busy`) until the host rebooted. The pool now
-  observes the shutdown token at every preparation and provisioning await,
-  tears down on every exit path (slot failures included, and a failed
-  artifact build no longer leaves its builder booted), and startup and
-  shutdown reconciliation detach layer mounts whose hypervisor is gone. The
-  CLI now settles the pool — cancel, bounded wait, abort and join — before
-  its exit guard scans on *every* exit path (server return and error returns
-  included), so a slot cannot boot a VM after the scan. The reaper claims a
-  process only when its argv parses to a boot config under this home's
-  machine data root, compared component-wise, so a neighboring home whose
-  path merely shares a prefix (`…/smolvm` vs `…/smolvm-vm-other`) is never
-  touched; an AgentENV start cancelled mid-flight records or reaps its
-  server-assigned sandbox instead of leaving it to its TTL.
+  preparing its golden or provisioning a runner did not reach the pool's
+  teardown, so the CLI's bounded stop aborted the pool mid-flight and exited
+  with the microVM still running — and, on macOS, its `pack/layers-cs` APFS
+  image still mounted, which made the Preloop home impossible to remove
+  (`rm -rf` → `Resource busy`) until the host rebooted. The pool now observes
+  the shutdown token at every preparation and provisioning await and tears
+  down on every exit path (slot failures and a failed artifact build
+  included); startup, shutdown, and process exit reap orphaned `_boot-vm`
+  hypervisors and detach the layer mounts no live hypervisor claims, matching
+  this home's machine data root by path component so a neighboring home is
+  never touched; and an AgentENV start cancelled mid-flight records or
+  deletes the server-assigned sandbox instead of leaving it to its TTL.
+- **Job containers can reach the engine again** (#F15, local mode): the engine
+  advertises itself to jobs at its loopback origin (the runner's in-guest
+  control bridge), which a container's network namespace resolves to the
+  container itself — so every `container:` job whose first step was a
+  redirected `actions/checkout`, plus anything using cache, artifacts or OIDC
+  from a container (`ACTIONS_*`), died with `connect ECONNREFUSED
+  127.0.0.1:<port>` (valkey's `debian:bookworm` and `almalinux:8` legs). The
+  runner now binds the same bridge on the job network's gateway (free port,
+  one job per VM) and rewrites the engine origin in every environment a
+  container process receives — `docker exec` for run steps and node actions,
+  `docker run` for `docker://` actions, and the workflow-declared env of the
+  job and service containers themselves — the same layer where the official
+  runner rewrites container paths — and hands containers an injected
+  `NO_PROXY`/`no_proxy` list already carrying the container-facing address
+  (a list the workflow declares is extended in place; a host with no list
+  gets none). Hosted deployments, where the engine URL is routable and no
+  control bridge exists, are untouched. Host steps,
+  the runner itself, and the official runner's Docker command shape are
+  unchanged.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

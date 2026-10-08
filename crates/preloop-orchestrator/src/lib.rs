@@ -883,9 +883,9 @@ impl std::fmt::Debug for JobVmDiskReserve {
 /// The preparation phases — artifact download/build, golden unpack/bake,
 /// runner provisioning — run for minutes. Without this, a shutdown signal
 /// could not reach the pool's teardown until they finished, and the CLI's
-/// bounded stop would abort the whole pool mid-flight, leaving the machines
+/// bounded stop would abort the whole pool mid-flight, stranding the machines
 /// those phases had already created (and, on macOS, their mounted layer
-/// images) behind for the next engine to reap.
+/// images).
 ///
 /// Dropping `step` is safe because every machine it may have created is
 /// deleted by the same teardown: it carries this pool's name prefix.
