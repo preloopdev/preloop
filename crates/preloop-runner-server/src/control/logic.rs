@@ -4,6 +4,7 @@
 //! plus the expansion-build machinery that produces [`BuiltExpansion`] for
 //! `apply_expansion`. Both backends call these so they cannot diverge.
 
+use crate::control::types::ControlError;
 use crate::models::{QueuedJob, RunRecord};
 use crate::state::JobSetGate;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, WorkflowSubmission};
@@ -430,6 +431,141 @@ pub(crate) struct NeedRow {
     pub(crate) job_id: JobId,
     pub(crate) status: ExecutionStatus,
     pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+}
+
+/// One `jobs` row as the re-run selector sees it.
+///
+/// `status` is the wire status string the backend stores (`timed_out` folds
+/// into the failure cohort — the `jobs` CHECK allows it even though
+/// `status_str` never writes it).
+#[derive(Debug, Clone)]
+pub(crate) struct RerunJobRow {
+    pub(crate) job_id: JobId,
+    /// `jobs.kind` (`job` / `matrix_parent` / `matrix_leg` /
+    /// `reusable_caller`).
+    pub(crate) kind: String,
+    pub(crate) base_id: String,
+    /// `jobs.parent_job_id` — matrix legs and reusable callee jobs carry
+    /// their parent's job id here.
+    pub(crate) parent_job_id: Option<String>,
+    pub(crate) status: String,
+    /// `job_needs` edges out of this job, in declared order.
+    pub(crate) needs: Vec<JobId>,
+}
+
+/// GitHub's three re-run modes resolved to the set of `jobs` rows the new
+/// attempt resets
+/// (<https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs>).
+///
+/// Seeds: `All` takes every matchable row; `Failed` takes
+/// `failure`/`cancelled`/`timed_out` rows; `Job(id)` resolves against
+/// `job_id`/`base_id` like `job_needs` matching (a matrix base id selects
+/// all its legs).
+///
+/// Fixpoint closure:
+/// - a job joins when a declared `needs:` edge lands on a member —
+///   dependents re-evaluate against the new attempt;
+/// - every callee child of a member `reusable_caller` joins, and the
+///   caller joins when any callee child is a member — GitHub re-runs a
+///   reusable call wholesale, and the child rows cannot be deleted
+///   (`job_requests`/`job_needs` FK edges), so the subtree resets in place
+///   and the caller re-enters `in_progress`;
+/// - a `matrix_parent` that already expanded is derived state — it is
+///   never a member (re-entering `blocked` would re-expand it and collide
+///   on its existing leg rows); its legs are selected individually.
+///
+/// `Err(NotFound)` when a `Job` mode names nothing, `Err(Conflict)` when
+/// `Failed` matches nothing — GitHub declines a failed-only re-run of a
+/// fully-green run.
+pub(crate) fn rerun_set(
+    mode: &crate::control::types::RerunMode,
+    jobs: &[RerunJobRow],
+) -> Result<std::collections::BTreeSet<JobId>, ControlError> {
+    use crate::control::types::RerunMode;
+    let has_children: HashSet<&str> = jobs
+        .iter()
+        .filter_map(|job| job.parent_job_id.as_deref())
+        .collect();
+    let kind_of: std::collections::BTreeMap<&str, &str> = jobs
+        .iter()
+        .map(|job| (job.job_id.0.as_str(), job.kind.as_str()))
+        .collect();
+    let dead_parent = |row: &RerunJobRow| {
+        row.kind == "matrix_parent" && has_children.contains(row.job_id.0.as_str())
+    };
+    // The selector's view excludes expanded matrix parents — the same rows
+    // `run_graph` drops for status purposes.
+    let matchable: Vec<&RerunJobRow> = jobs.iter().filter(|row| !dead_parent(row)).collect();
+    let matches = |row: &RerunJobRow, need: &JobId| row.job_id == *need || row.base_id == need.0;
+
+    let mut set: std::collections::BTreeSet<JobId> = std::collections::BTreeSet::new();
+    match mode {
+        RerunMode::All => {
+            set.extend(matchable.iter().map(|row| row.job_id.clone()));
+        }
+        RerunMode::Failed => {
+            for row in &matchable {
+                if matches!(row.status.as_str(), "failure" | "cancelled" | "timed_out") {
+                    set.insert(row.job_id.clone());
+                }
+            }
+            if set.is_empty() {
+                return Err(ControlError::Conflict(
+                    "run has no failed or cancelled jobs to re-run".to_owned(),
+                ));
+            }
+        }
+        RerunMode::Job(id) => {
+            let seeds: Vec<JobId> = matchable
+                .iter()
+                .filter(|row| matches(row, id))
+                .map(|row| row.job_id.clone())
+                .collect();
+            if seeds.is_empty() {
+                return Err(ControlError::NotFound(format!(
+                    "no job matching `{id}` in this run"
+                )));
+            }
+            set.extend(seeds);
+        }
+    }
+
+    // Fixpoint closure: a job joins when a declared need landed in the set
+    // (downstream dependent), or when it is the parent of a member (callers
+    // re-enter `in_progress` while their subtree re-runs).
+    loop {
+        let mut added = false;
+        for row in &matchable {
+            if set.contains(&row.job_id) {
+                continue;
+            }
+            let is_dependent = row.needs.iter().any(|need| {
+                jobs.iter()
+                    .filter(|candidate| matches(candidate, need))
+                    .any(|candidate| set.contains(&candidate.job_id))
+            });
+            // A callee child of a member caller joins (the subtree resets
+            // wholesale), and a caller joins when any child does so it can
+            // return to `in_progress` and pull its subtree in.
+            let parent_is_member_caller = row.parent_job_id.as_deref().is_some_and(|parent| {
+                kind_of.get(parent) == Some(&"reusable_caller")
+                    && set.contains(&JobId(parent.to_owned()))
+            });
+            let is_caller_of_member = row.kind == "reusable_caller"
+                && jobs.iter().any(|child| {
+                    child.parent_job_id.as_deref() == Some(row.job_id.0.as_str())
+                        && set.contains(&child.job_id)
+                });
+            if is_dependent || parent_is_member_caller || is_caller_of_member {
+                set.insert(row.job_id.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    Ok(set)
 }
 
 /// Decision after all direct needs are inspected.

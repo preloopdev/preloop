@@ -1194,7 +1194,11 @@ impl PgBackend {
     pub(super) async fn archive_finished_runs(
         &self,
         limit: usize,
+        rerun_hold: Option<std::time::Duration>,
     ) -> Result<Vec<RunId>, ControlError> {
+        let hold_us: Option<i64> = rerun_hold
+            .map(|hold| i64::try_from(hold.as_micros()).unwrap_or(i64::MAX))
+            .filter(|hold| *hold > 0);
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         let limit = codec::limit(limit);
@@ -1207,8 +1211,13 @@ impl PgBackend {
                                  WHERE p.run_id = r.run_id \
                                    AND (p.status = 'pending' \
                                         OR p.updated_at > now() - interval '3 days')) \
+                 AND ($2::bigint IS NULL \
+                      OR r.completed_at <= now() - ($2::bigint * interval '1 microsecond') \
+                      OR NOT EXISTS (SELECT 1 FROM jobs j \
+                                     WHERE j.run_id = r.run_id \
+                                       AND j.status IN ('failure','cancelled','timed_out'))) \
                  ORDER BY r.completed_at, r.run_id LIMIT $1 FOR UPDATE OF r SKIP LOCKED",
-                &[&limit],
+                &[&limit, &hold_us],
             )
             .await
             .map_err(db)?;
@@ -1332,12 +1341,16 @@ impl PgBackend {
                                              AND (q.result IS NULL OR q.session_id IS NOT NULL)) \
                          UNION ALL \
                          SELECT h.run_id, COALESCE(h.completed_at, h.created_at) \
-                         FROM run_history h) expired \
+                         FROM run_history h \
+                         WHERE h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                                WHERE run_id = h.run_id) \
+                           AND NOT EXISTS (SELECT 1 FROM runs live \
+                                           WHERE live.run_id = h.run_id)) expired \
                      GROUP BY run_id \
-                     HAVING MIN(finished_at) < ",
+                     HAVING MAX(finished_at) < ",
                     ts!("$1"),
                     " \
-                     ORDER BY MIN(finished_at), run_id \
+                     ORDER BY MAX(finished_at), run_id \
                      LIMIT $2"
                 ),
                 &[&cutoff_us, &limit],

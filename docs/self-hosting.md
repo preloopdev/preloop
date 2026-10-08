@@ -239,6 +239,7 @@ forever.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PRELOOP_RETENTION_DAYS` | `90` | Days a finished run (plus its checks, statuses, artifacts, and logs) is kept. `0` disables cleanup |
+| `PRELOOP_RERUN_WINDOW_DAYS` | `30` | How long a completed run with at least one failed/cancelled/timed-out job stays in the live control tables so it can be re-run in place (`github.run_attempt` increments on the same run). `0` disables the hold and archives every settled run on the 60-second policy. Retention still wins: a held run past `PRELOOP_RETENTION_DAYS` is deleted. |
 
 The same key lives at the top level of the config file as `retention_days`;
 the environment wins. Only runs that have finished are ever deleted — a
