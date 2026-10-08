@@ -4465,6 +4465,7 @@ mod tests {
             &workspace,
             &["init", "-q", "--bare", origin.to_str().unwrap()],
         );
+        git_in(&workspace, &["checkout", "-q", "-b", "feature"]);
         git_in(
             &workspace,
             &["remote", "add", "origin", origin.to_str().unwrap()],
