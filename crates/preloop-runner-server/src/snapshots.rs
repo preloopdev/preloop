@@ -36,6 +36,9 @@ pub enum SnapshotSource {
     LocalWorkspace,
     RemoteRunScoped,
     RemoteRepository,
+    /// A self-built pull-request test merge (the commit exists only in the
+    /// engine). Served from a per-run repository; released with the run.
+    SelfBuiltMerge,
 }
 
 /// Security namespace for remote Git objects. `tenant_id` is deliberately
@@ -106,6 +109,37 @@ pub struct WorkspaceSnapshot {
     /// on-demand fetching fails closed instead of trying anonymous access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_private: Option<bool>,
+    /// The self-built pull-request test merge this run checks out, when it
+    /// tests a merge rather than the head commit itself. [`Self::commit_sha`]
+    /// is then the merge commit; [`Self::head_sha`] stays the pull request's
+    /// head, and the payload's `base.sha`/`head.sha` are labelled from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<SnapshotMerge>,
+}
+
+/// The self-built pull-request test merge a run checks out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMerge {
+    /// The two-parent merge commit (equals [`WorkspaceSnapshot::commit_sha`]).
+    pub sha: String,
+    /// First parent: the base tip the merge was built against.
+    pub base_sha: String,
+    /// Second parent: the pull request's head commit.
+    pub head_sha: String,
+    /// State-directory-relative path of the mirror the served repository
+    /// alternates to, when that mirror is prunable (a checkout-cache
+    /// repository). The run's ownership ref there is dropped at release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_repository: Option<String>,
+}
+
+impl WorkspaceSnapshot {
+    /// Whether this snapshot captured uncommitted edits: its tree differs
+    /// from the workspace `HEAD`'s tree, which is exactly the case where
+    /// `before_sha` (the diff base) is the workspace `HEAD` itself.
+    pub fn captures_dirty_tree(&self) -> bool {
+        self.head_sha.is_some() && self.before_sha.as_deref() == self.head_sha.as_deref()
+    }
 }
 
 /// Parse a GitHub `owner/repo` slug from a git remote URL.
@@ -330,6 +364,7 @@ pub async fn create_workspace_snapshot(
     run_id: RunId,
     shared: Option<&SharedState>,
     github_pat: Option<&str>,
+    merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
 ) -> Result<WorkspaceSnapshot, ApiError> {
     let started = std::time::Instant::now();
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
@@ -377,6 +412,20 @@ pub async fn create_workspace_snapshot(
     // creation. Best-effort: a missing remote or unresolvable slug leaves
     // the snapshot without upstream coordinates and LFS on-demand fetching
     // stays disabled, as before.
+    //
+    // The merge path needs the workspace's `origin` URL to fetch the current
+    // base tip from, and the configured forge host so the engine credential
+    // rides only to the operator's own forge. Resolved before the join so
+    // the snapshot future receives them by value.
+    let (origin_url, forge_host) = if merge.is_some() {
+        let forge_host = shared
+            .map(|shared| shared.state.github_urls.server_url.clone())
+            .and_then(|url| reqwest::Url::parse(&url).ok())
+            .and_then(|url| url.host_str().map(str::to_owned));
+        (workspace_origin_url(&workspace).await, forge_host)
+    } else {
+        (None, None)
+    };
     let (result, upstream) = tokio::join!(
         create_workspace_snapshot_inner(
             state_dir,
@@ -386,6 +435,9 @@ pub async fn create_workspace_snapshot(
             &final_repository,
             run_id,
             github_pat,
+            merge,
+            origin_url.as_deref(),
+            forge_host.as_deref(),
         ),
         detect_workspace_upstream(&workspace, shared, github_pat),
     );
@@ -405,6 +457,7 @@ pub async fn create_workspace_snapshot(
         head_sha,
         default_branch,
         before_sha,
+        merge,
     } = result?;
     let timing = match snapshot_repo_timing(&final_repository) {
         Ok(mut stats) => {
@@ -443,7 +496,24 @@ pub async fn create_workspace_snapshot(
         upstream_repository: upstream.as_ref().map(|(slug, _, _)| slug.clone()),
         upstream_repository_id: upstream.as_ref().and_then(|(_, id, _)| *id),
         upstream_private: upstream.as_ref().and_then(|(_, _, private)| *private),
+        merge,
     })
+}
+
+/// `remote.origin.url` of the workspace, when it has one.
+async fn workspace_origin_url(workspace: &FsPath) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Forge credential for one cacheable repository. The token crosses only the
@@ -924,6 +994,7 @@ pub async fn create_remote_checkout_snapshot(
             .and_then(serde_json::Value::as_u64)
             .filter(|id| *id > 0),
         upstream_private: Some(repository_private),
+        merge: None,
     }))
 }
 
@@ -990,6 +1061,9 @@ async fn create_workspace_snapshot_inner(
     final_repository: &FsPath,
     run_id: RunId,
     github_pat: Option<&str>,
+    merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
+    origin_url: Option<&str>,
+    forge_host: Option<&str>,
 ) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
     // from the workspace, so pay for both spawns at once. Every millisecond
@@ -1551,6 +1625,112 @@ async fn create_workspace_snapshot_inner(
         }
     }
 
+    // A local `pull_request` run tests the merge of the CURRENT base tip into
+    // the head — the workspace HEAD, or the synthetic snapshot commit when the
+    // tree is dirty — exactly like GitHub's `refs/pull/<n>/merge`. The base tip
+    // is fetched from the workspace's origin into the shared object cache this
+    // repository alternates to, and the merge commit is written here, so the
+    // run's jobs fetch it from the engine. `push` events are untouched: they
+    // test the commit itself, never a merge.
+    let merge = if let Some(local) = merge {
+        let Some(origin_url) = origin_url else {
+            return Err(ApiError::bad_request(format!(
+                "cannot build the pull-request test merge: the workspace has no `origin` \
+                 remote to fetch the base branch `{}` from. Add an origin remote, or re-run \
+                 with --no-merge to test the branch alone.",
+                local.base_branch
+            )));
+        };
+        let mirror = cached_objects
+            .parent()
+            .ok_or_else(|| ApiError::internal("snapshot object cache has no parent"))?
+            .to_path_buf();
+        let head = if Some(tree.as_str()) != source_tree.as_deref() {
+            // Dirty tree: the synthetic snapshot commit carries the edits and
+            // is the head GitHub would see pushed.
+            crate::merge_builder::MergeHead::Commit(commit_sha.clone())
+        } else {
+            let head = source_head.clone().ok_or_else(|| {
+                ApiError::bad_request(
+                    "cannot build the pull-request test merge: the workspace has no commits \
+                     (unborn HEAD). Commit your changes, or re-run with --no-merge.",
+                )
+            })?;
+            crate::merge_builder::MergeHead::Commit(head)
+        };
+        if Some(tree.as_str()) != source_tree.as_deref() {
+            // The dirty snapshot commit is engine-created and intentionally
+            // is not on origin. Import its objects into the merge mirror
+            // before the shared builder resolves the head; only the base is
+            // fetched from the forge.
+            let mut import = Command::new("git");
+            import
+                .env("GIT_DIR", &mirror)
+                .args(["fetch", "--no-tags"])
+                .arg(staging_repository.as_os_str())
+                .arg(&commit_sha);
+            run_git(&mut import, "import dirty snapshot into merge mirror").await?;
+        }
+        let source = crate::merge_builder::MergeSource {
+            mirror,
+            fetch_url: Some(origin_url.to_owned()),
+            token: github_pat.map(str::to_owned),
+            forge_host: forge_host.map(str::to_owned),
+        };
+        let request = crate::merge_builder::MergeRequest {
+            repository: local.repository.clone(),
+            pull_request_number: local.pull_request_number,
+            base_branch: local.base_branch.clone(),
+            head,
+        };
+        match crate::merge_builder::build_merge(&source, &request, staging_repository).await {
+            Ok(crate::merge_builder::MergeOutcome::Merged(merged)) => {
+                // Changed-file actions resolve their diff base from the base
+                // branch ref; publish the fetched tip so `origin/<base>` is
+                // the base this merge was actually built against, not the
+                // workspace's possibly-stale local ref.
+                let mut publish_base = snapshot_git_command(
+                    workspace,
+                    staging_repository,
+                    staging_index,
+                    &cached_objects,
+                );
+                publish_base.args([
+                    "update-ref",
+                    &format!("refs/heads/{}", local.base_branch),
+                    &merged.base_sha,
+                ]);
+                if let Err(error) = run_git(&mut publish_base, "publish merge base ref").await {
+                    warn!(error = ?error, "failed to publish the fetched base tip in the snapshot");
+                }
+                Some(SnapshotMerge {
+                    sha: merged.sha.clone(),
+                    base_sha: merged.base_sha.clone(),
+                    head_sha: merged.head_sha.clone(),
+                    mirror_repository: None,
+                })
+            }
+            Ok(crate::merge_builder::MergeOutcome::Conflict { paths, .. }) => {
+                return Err(ApiError::conflict(format!(
+                    "the pull request has merge conflicts with `{}`: {}. GitHub does not run \
+                     pull_request workflows on a conflicted pull request; resolve the \
+                     conflicts, or re-run with --no-merge to test the branch alone.",
+                    local.base_branch,
+                    paths.join(", ")
+                )));
+            }
+            Err(error) => return Err(error.into_api_error()),
+        }
+    } else {
+        None
+    };
+    // A merged run checks out the merge commit; `tree_sha` stays the head
+    // tree (what push-back materializes from), and `head_sha` stays the head.
+    let commit_sha = match &merge {
+        Some(merge) => merge.sha.clone(),
+        None => commit_sha,
+    };
+
     // Allow clients to fetch arbitrary commits that exist in the snapshot's
     // object store, not just advertised ref tips: workflows that deep-fetch a
     // concrete SHA (`git fetch origin <sha>`, `fetch-depth: 0` checkouts of a
@@ -1609,6 +1789,7 @@ async fn create_workspace_snapshot_inner(
         head_sha: source_head,
         default_branch,
         before_sha,
+        merge,
     })
 }
 
@@ -1620,6 +1801,9 @@ struct SnapshotResult {
     head_sha: Option<String>,
     default_branch: Option<String>,
     before_sha: Option<String>,
+    /// The self-built test merge written into this repository, when the run
+    /// tests a merge rather than the head commit.
+    merge: Option<SnapshotMerge>,
 }
 
 /// What one `git rev-parse` tells us about the source workspace.
@@ -2554,7 +2738,7 @@ async fn deepen_object_cache_from_remote(
 /// `https://user:token@github.com/owner/repo` becomes
 /// `https://github.com/owner/repo`. Schemeless (SSH) remotes carry no
 /// userinfo and are returned untouched.
-fn sanitize_remote_url(remote_url: &str) -> String {
+pub(crate) fn sanitize_remote_url(remote_url: &str) -> String {
     let Some((scheme, rest)) = remote_url.split_once("://") else {
         return remote_url.to_owned();
     };
@@ -2590,6 +2774,21 @@ fn scoped_fetch_auth_header(upstream_url: &str, token: &str) -> Option<(String, 
         format!("http.{scheme}://{host}/.extraHeader"),
         format!("Authorization: basic {encoded}"),
     ))
+}
+
+/// The engine's read credential for one repository: a contents-read App
+/// installation token first, then the static PAT. `None` means anonymous
+/// access (a public repository, or no credential configured at all).
+pub(crate) async fn forge_read_token(shared: &SharedState, repository: &str) -> Option<String> {
+    if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        if let Ok(token) =
+            crate::github_app::get_or_mint_token(&app, repository, &permissions).await
+        {
+            return Some(token);
+        }
+    }
+    shared.state.static_github_pat()
 }
 
 /// Extra-header config that authenticates a deepen fetch against the engine's
@@ -2842,11 +3041,32 @@ pub async fn release_remote_checkout_snapshot(
     run_id: RunId,
 ) {
     let Some(relative) = snapshot.storage_repository.as_deref() else {
+        // A self-built merge's served repository is the run's own
+        // `snapshots/<run_id>` (deleted with the run snapshot), but the
+        // mirror it alternates to is prunable: drop this run's ownership ref
+        // there so the size sweep may reclaim the mirror once no run needs it.
+        if let Some(merge) = &snapshot.merge
+            && snapshot.source == SnapshotSource::SelfBuiltMerge
+            && let Some(mirror) = merge.mirror_repository.as_deref()
+        {
+            let repository = state_dir.join(mirror);
+            let mut delete = Command::new("git");
+            delete
+                .arg("--git-dir")
+                .arg(&repository)
+                .arg("update-ref")
+                .arg("-d")
+                .arg(format!("refs/preloop/runs/{run_id}"));
+            if let Err(error) = run_git(&mut delete, "release merge mirror run ref").await {
+                debug!(%run_id, error = ?error, "Failed to drop merge mirror run ref");
+            }
+        }
         return;
     };
     let repository = state_dir.join(relative);
     match snapshot.source {
         SnapshotSource::LocalWorkspace => {}
+        SnapshotSource::SelfBuiltMerge => {}
         SnapshotSource::RemoteRunScoped => {
             let marker = repository.join(RELEASED_MARKER);
             if let Err(error) = tokio::fs::write(&marker, crate::store::now_us().to_string()).await

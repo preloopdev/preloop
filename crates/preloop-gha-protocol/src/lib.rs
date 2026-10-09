@@ -203,6 +203,35 @@ pub struct PushRequest {
     pub dirty: bool,
 }
 
+/// A self-built pull-request test merge the engine must check out for a run.
+///
+/// GitHub computes a pull request's test merge asynchronously and this engine
+/// cannot wait for it, so the merge is built locally: `sha` is a two-parent
+/// merge commit (first parent the base tip, second the pull request head)
+/// that exists only in the engine's mirror. Jobs therefore fetch from the
+/// engine, never the forge. The engine validates that the mirror belongs to
+/// the named repository and that the commit has the claimed parents and tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrebuiltMerge {
+    /// The two-parent merge commit the run tests.
+    pub sha: String,
+    /// The merge commit's tree.
+    pub tree: String,
+    /// First parent: the base tip the merge was built against.
+    pub base_sha: String,
+    /// Second parent: the pull request's head commit.
+    pub head_sha: String,
+    /// Repository whose cache mirror contains this merge.
+    pub repository: String,
+    /// State-directory-relative path of the bare mirror holding the merge and
+    /// its parents (for example `checkout-cache/repositories/<key>.git`).
+    pub mirror_repository: String,
+    /// Pull request number, when known; labels `refs/pull/<n>/merge` in the
+    /// served repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_number: Option<u64>,
+}
+
 /// Complete workflow request submitted to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
@@ -333,6 +362,18 @@ pub struct WorkflowSubmission {
     /// commit it did not test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_tree: Option<String>,
+    /// Test the branch alone instead of the merge of the pull request's
+    /// current base tip into it. Only meaningful for `pull_request` events
+    /// (the CLI's `--no-merge`): the escape hatch when the base branch cannot
+    /// be fetched.
+    #[serde(default)]
+    pub no_merge: bool,
+    /// A self-built pull-request test merge the run must check out. Set when
+    /// the merge commit exists only in the engine (see [`PrebuiltMerge`]);
+    /// the engine serves it to the run's jobs regardless of checkout-cache
+    /// configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prebuilt_merge: Option<PrebuiltMerge>,
 }
 
 impl WorkflowSubmission {
