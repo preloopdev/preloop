@@ -2512,9 +2512,10 @@ async fn pat_only_config_supplies_job_github_token() {
 }
 
 /// A PAT whose OAuth scopes cannot be introspected must not be embedded.
-/// The job keeps the job-scoped runtime token, so a step that needs GitHub
-/// fails at the point of use instead of running with authority nobody could
-/// bound, and the wire variable discloses the withholding.
+/// The job is then left with *no* GitHub credential at all — the token surface
+/// stays empty rather than falling back to the job-scoped runtime token, which
+/// is an engine credential and only ever sent a dead credential to
+/// github.com — and the wire variable discloses the withholding.
 #[tokio::test]
 async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -2554,19 +2555,32 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     let run_id = accepted.run_id.to_string();
 
     // The stored message is a secret-free template, so the token surface these
-    // assertions want is the *acquired* message: `acquirejob` mints the job's
-    // credential (runtime token when the PAT is withheld).
+    // assertions want is the *acquired* message: `acquirejob` resolves the
+    // job's credential (none at all when the PAT is withheld).
     let tx = state.test_tx().await;
     let message = queued_message_for(&tx, &run_id);
     let app = app(state.clone(), CancellationToken::new());
     let acquired = acquire_queued_job(&app, "unverifiable-pat-runner").await;
-    // Minted tokens carry a random `jti`, so compare claims rather than bytes:
-    // the wire variable must be a valid local JWT scoped to this job.
-    let wire_token = wire_variable(&acquired, "system.github.token")
-        .expect("the job message carries a GitHub token variable");
+    for name in ["system.github.token", "github_token"] {
+        let wire = wire_variable(&acquired, name);
+        assert!(
+            wire.is_none_or(str::is_empty),
+            "a withheld PAT must leave {name} empty — the job-scoped runtime \
+             token is not a GitHub credential ({wire:?})"
+        );
+        assert_ne!(wire, Some("github_pat_unverifiable_scopes"));
+    }
+    assert!(
+        github_context_token(&acquired).is_none_or(|token| token.is_empty()),
+        "the github context token must stay empty when the PAT is withheld"
+    );
+    // The engine's own credential still reaches the job — through the pinned
+    // snapshot steps and the `SystemVssConnection` endpoint, where it belongs.
+    let endpoint_token = service_endpoint_token(&acquired)
+        .expect("the claimed job carries its SystemVssConnection access token");
     let claims = state
-        .verify_local_jwt_claims(wire_token)
-        .expect("an unverifiable PAT is withheld in favour of a job-scoped runtime token");
+        .verify_local_jwt_claims(&endpoint_token)
+        .expect("the endpoint access token is the job-scoped runtime token");
     assert_eq!(
         claims.get("sub").and_then(|value| value.as_str()),
         Some(format!("preloop-job-{}", message.job_id).as_str())
@@ -2581,16 +2595,67 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
             .as_str()
         )
     );
-    assert_ne!(
-        wire_variable(&acquired, "system.github.token"),
-        Some("github_pat_unverifiable_scopes"),
-        "the PAT must never reach a job whose bounds could not be verified"
-    );
     let authority = wire_variable(&acquired, "system.github.token.pat_scopes")
         .expect("the withheld state is published for the runner to print");
     assert!(
         authority.contains("withheld"),
         "the wire variable must disclose the withheld PAT, got: {authority}"
+    );
+}
+
+/// A tokenless engine — no GitHub App, no static PAT, the exact configuration
+/// the five-repo conformance campaigns run (`PRELOOP_SKIP_GH_TOKEN=1`) — must
+/// hand jobs an *empty* `GITHUB_TOKEN` surface, like the official runner when
+/// its message carries no `system.github.token` variable.
+///
+/// The job-scoped runtime token authenticates to this engine (snapshot
+/// fetches, the anonymous forge relay, run-service calls); presenting it as
+/// `github.token`/`GITHUB_TOKEN`/`secrets.GITHUB_TOKEN` made every step that
+/// reads one send a dead credential to github.com — maturin-action's
+/// `getInput('token') || process.env.GITHUB_TOKEN` and zizmor's online audits
+/// both failed with `Bad credentials` — and leaked a control-plane credential
+/// into whatever third party a workflow pointed at.
+#[tokio::test]
+async fn tokenless_engine_leaves_the_github_token_surface_empty() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let temp = tempfile::tempdir().unwrap();
+    // An explicit config with no `[github]` section: no PAT, no App.
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "runner_name_prefix = \"tokenless\"\n").unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert!(state.github_app.is_none(), "no App is configured");
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    let acquired = acquire_queued_job(&app, "tokenless-runner").await;
+
+    for name in ["system.github.token", "github_token"] {
+        let wire = wire_variable(&acquired, name);
+        assert!(
+            wire.is_none_or(str::is_empty),
+            "a tokenless engine must not invent a GITHUB_TOKEN for the job, \
+             got {name}={wire:?}"
+        );
+    }
+    assert!(
+        github_context_token(&acquired).is_none_or(|token| token.is_empty()),
+        "`${{ github.token }}` must resolve empty so action input defaults \
+         (maturin-action's `token`, checkout's `token`) stay anonymous"
+    );
+    // The runtime token keeps travelling where the engine needs it: the
+    // `SystemVssConnection` endpoint the worker authenticates its reporting
+    // calls with (and, for checkouts, the pinned snapshot step inputs).
+    assert!(
+        service_endpoint_token(&acquired).is_some(),
+        "the runtime token still reaches the job through the service endpoint"
     );
 }
 

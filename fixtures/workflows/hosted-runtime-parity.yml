@@ -1,0 +1,72 @@
+name: Hosted runtime parity
+on: push
+
+# GitHub-hosted runners boot with systemd/cloud-init and run the runner as a
+# systemd service, so the image's `/etc/sysctl.*`, `/etc/security/limits.conf`
+# and hostname setup all apply before a step runs. A preloop guest enters the
+# job workload through the VM's exec channel instead — the smolvm guest's PID 1
+# is `/run/smolvm/init`, with no systemd at all, and an AgentENV job arrives
+# via `aenv exec` off `envd`, outside systemd and PAM — so the image's files
+# are present but never applied. This is the guest-level check that preloop
+# applies them itself: the per-guest hosted runtime init plus the per-launch
+# process limits.
+#
+#   preloop run -f fixtures/workflows/hosted-runtime-parity.yml
+#
+# The assertions live in `fixtures/hosted-runtime-probe.sh`, the single source
+# of truth shared with the `hosted-runtime-parity` CI job, so the two cannot
+# drift. Each one prints the expected GitHub-hosted value and fails with the
+# observed one. A step, an ad-hoc `docker run` and a `container:` job are all
+# checked: a container's processes inherit the *engine's* limits rather than
+# the runner's, and the kernel values are shared. The ad-hoc `docker run` is
+# also the one place a hosted runner carries none of CI/GITHUB_ACTIONS, because
+# nothing injects them into a container the workflow starts itself.
+#
+# `--recursion` adds the deep-recursion probes: pydantic's shape
+# (`test_recursive_call`, which walks Python's recursion limit through
+# pydantic-core's Rust frames and expects a `RecursionError`; at the kernel's
+# 8192 KiB stack it dies with a stack-overflow SIGSEGV instead) and a C probe
+# that needs ~10 MiB of native frames. That is what showed the gap on a real
+# workload, and it needs gcc + pip, so the CI job leaves it off.
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      # The assertions and their expected values live in the repository, so
+      # every job here checks the tree out first — the same shape as the
+      # `hosted-runtime-parity` CI job. A backend that seeds the workspace
+      # from the submission's files would find them either way; one that
+      # delivers the run's checkout instead (AgentENV) would otherwise fail
+      # on a missing file before asserting anything.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: hosted runtime values in a step
+        run: sh fixtures/hosted-runtime-probe.sh --recursion
+
+      - name: the same values inside an ad-hoc container
+        run: |
+          docker run --rm -v "$PWD:/ws" -w /ws ubuntu:24.04 \
+            sh fixtures/hosted-runtime-probe.sh --adhoc
+
+  container-job:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    steps:
+      # `ubuntu:24.04` ships no git. A hosted run's checkout still works
+      # because `actions/checkout` can fall back to the REST archive for the
+      # real repository, but a preloop run tests an immutable *local* snapshot
+      # that exists only behind the engine's git endpoint — the archive API
+      # cannot serve it — so the in-container checkout needs git on PATH.
+      - name: git for the in-container checkout
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: hosted runtime values in a container job
+        run: sh fixtures/hosted-runtime-probe.sh

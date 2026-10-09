@@ -520,6 +520,123 @@ user contract, docker, git); leave what they must declare anyway to job-time
 installs. New parity targets belong in `versions.toml` with a comment
 naming the official image version they were taken from.
 
+### Process limits (raised per launch, not baked)
+
+`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
+doubles the kernel's 8192 KiB process stack for hosted runners — the image
+comment reads "Double stack size from default 8192KB" — and raises the file
+descriptor limit:
+
+| Limit           | Hosted value                                                    | Where the image sets it                                             |
+| --------------- | --------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `RLIMIT_STACK`  | **16 MiB soft, `unlimited` hard** (soft 16384 KiB)               | `DefaultLimitSTACK=16M:infinity` in `/etc/systemd/system.conf` and `* soft stack 16384` in `/etc/security/limits.conf` |
+| `RLIMIT_NOFILE` | **65536 soft/hard** (`DefaultLimitNOFILE=65536`)                 | `DefaultLimitNOFILE=65536` in `/etc/systemd/system.conf` and `* soft/hard nofile 65536` in `/etc/security/limits.conf` |
+
+A hosted step inherits them from the `actions.runner.*` service, and a
+container step inherits them from the `dockerd` service. The guest boots
+straight into the job workload, so neither the image's systemd units nor a
+PAM session ever reads those files: the guest runner wrapper
+([`GUEST_STACK_ULIMIT`], [`GUEST_NOFILE_ULIMIT`]) and the container-engine
+launch raise both pairs explicitly, and the values are the image's — a probe
+of a real hosted runner (image `20260927.320.1`, kernel `6.17.0-1022-azure`)
+reads back `Max stack size 16777216 / unlimited` and `Max open files
+65536 / 65536` in a step, a `container:` job and an ad-hoc `docker run`
+alike. Those privileged launch sites use the strict forms, which end the
+launch when a raise they ran for fails: a workload never starts on limits it
+was not meant to have. Without the stack raise the runner chain keeps the VM
+init's 8192 KiB and deep-recursion tests that pass on GitHub overflow the C
+stack — a `SIGSEGV`/exit 139 where Python's `RecursionError` is expected.
+Without the descriptor raise a job keeps the exec channel's defaults (1024
+soft / 4096 hard on AgentENV), below what suites that raise their own soft
+limit ask for (valkey's test suite requests 10032), and the runner dies with
+`EPERM` on `setrlimit`.
+
+The raise is applied per launch, wherever a workload starts:
+
+- the runner wrapper, for the runner process and every step it spawns —
+  with `runner_user` set it drops privileges after the raise, and unset or
+  `root` launches are wrapped in a shell that raises and then `exec`s the
+  same argv, so the exec channel's identity is untouched (those launches
+  raise both pairs best-effort: a hard limit can only be raised by root, so
+  they keep what they inherited and say on stderr which limit stayed);
+- the container engine, because a container's processes inherit the limits
+  of the chain that spawns them: the preload daemon baked into the golden
+  (the engine a fork inherits) starts with the raise, a per-runner engine
+  start applies it, and an engine chain inherited from a golden baked before
+  this existed is re-raised in place with `prlimit`, since a running process
+  keeps the limits it was born with.
+
+### Hosted runtime init (applied per machine, not baked)
+
+The other half of what a hosted VM's own init does — the parts that are not
+per-process — is applied once per machine by `guest_hosted_runtime_init_script()`
+on the same post-boot exec path as the runner-ownership reconciliation,
+before the runner registers. It is idempotent (a machine already at the
+hosted values pays one exec round trip and no writes), escalates through the
+runner account's passwordless sudo when the exec lands on the image user, and
+fails provisioning rather than leaving a machine half converted.
+
+**Kernel limits.** The hosted `ubuntu-24.04` image writes three sysctls into
+`/etc/sysctl.conf` at build time (`actions/runner-images`
+`images/ubuntu/scripts/build/configure-environment.sh`), and a probe job on a
+hosted runner reads them back from `/proc/sys` (image `20260927.320.1` x64 /
+`20260927.135.1` arm64, kernel `6.17.0-1022-azure`):
+
+| Sysctl | Hosted value | Why it matters |
+| ------ | ------------ | -------------- |
+| `vm.max_map_count` | **262144** | mmap-heavy workloads: Redis/Valkey's test suites, Elasticsearch-style tooling |
+| `fs.inotify.max_user_watches` | **655360** | file watchers in bundlers, test runners, `kind` |
+| `fs.inotify.max_user_instances` | **1280** | same; the kernel default (128) breaks tooling that opens many watchers |
+
+Preloop's guest boots straight into the job workload — no init runs
+`/etc/sysctl.d` or `/etc/sysctl.conf` — so an image-level sysctl file would
+never take effect and jobs saw raw kernel defaults (`vm.max_map_count` 65530,
+inotify watches 64372, instances 128, read back from a live job VM on the
+campaign golden, kernel 6.12.95 aarch64). The init applies the hosted values
+per machine, and writes only the keys the guest kernel exposes *and* that
+differ: a kernel missing one hosted key still gets every other key instead of
+aborting the apply (a missing key makes both `sysctl -w` and a direct
+`/proc/sys` write fail), exactly as the hosted image's `/etc/sysctl.conf`
+lines for unknown keys are inert there. A write the kernel exposes but does
+not take fails provisioning.
+
+**Hostname.** The curated bake writes the *golden's* name into `/etc/hosts`,
+but every fork boots under a new name, so the machine's own name resolved
+nowhere and `sudo` printed `sudo: unable to resolve host <name>` on every
+invocation — 25 such lines in a single Valkey job, where a hosted-runner log
+has none. Resolving is not enough: an AgentENV guest booted with a hosts file
+mapping its name to an address it did not own (`10.1.0.59 runnervm…` while
+its interfaces carried `169.254.0.21`), and a check that only asks whether
+the name resolves passed there while every consumer of the name got an
+unreachable address. The init therefore requires the name to resolve to an
+address of *this* machine — loopback or a local-interface address, which is
+what a hosted runner's own entry does (GitHub's `/etc/hosts` maps `runnervm…`
+to the VM's interface address) — and replaces a foreign mapping with the
+bake's `127.0.0.1 <host>` convention (the stale line is removed, not shadowed:
+a resolver answers a name with its first match). The check runs on `getent`,
+which the golden and every Ubuntu base carry; a machine without it fails
+provisioning with that reason instead of reporting an apply that never
+verified anything.
+
+**Step environment.** A hosted step's environment has no `TERM` and no
+`COLORTERM`; the `dumb` a bash step sees is bash's own default for an unset
+`TERM` (`bash/variables.c`: `set_if_not ("TERM", "dumb")`), which a hosted
+probe prints too. The guest's exec channel inherits `TERM` from the VM's init
+(`TERM=linux`), which reached every job's environment through the runner, so
+the runner drops `TERM`/`COLORTERM` it did not receive from the workflow.
+
+`fixtures/workflows/hosted-runtime-parity.yml` is the guest-level check:
+
+```sh
+preloop run -f fixtures/workflows/hosted-runtime-parity.yml
+```
+
+It asserts every value above — the limits, the sysctls, the hostname's
+locality, the environment keys — in a step, in a `container:` job and in an
+ad-hoc `docker run`, and runs the deep-recursion probe pydantic's own
+`test_recursive_call` shape uses (a `RecursionError` inside 16384 KiB where
+8192 KiB dies with `SIGSEGV`).
+
 ## Runtime knobs
 
 

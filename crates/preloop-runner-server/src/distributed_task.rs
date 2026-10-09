@@ -166,48 +166,42 @@ async fn render_session_message(
             ctx.id_token_granted.unwrap_or(false),
         )
         .fork_restricted;
-        let runtime = shared
-            .state
-            .mint_runtime_token(&msg.plan.plan_id, &msg.job_id);
-        let token = if fork_restricted {
-            runtime
-        } else {
+        // No App installation token here either: only a verified static PAT is
+        // a real GitHub credential. Without one the job's token surface stays
+        // empty — never the job-scoped runtime token, which is an engine
+        // credential (`broker_acquire_job` documents the full reasoning).
+        if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // The PAT is embedded only when its OAuth scopes are verified
             // (fresh cache, or re-introspected here: the job may have queued
             // past the cache TTL); unverifiable authority stays withheld and
-            // the job keeps the runtime token.
-            match shared.state.static_github_pat() {
-                Some(pat) => match crate::runs::verified_pat_scopes(&pat).await {
-                    Some(scopes) => {
-                        msg.variables.insert(
-                            "system.github.token.pat_scopes".to_owned(),
-                            preloop_gha_protocol::azdo::VariableValue::new(
-                                crate::runs::pat_scopes_wire_value(&scopes),
-                            ),
-                        );
-                        pat
-                    }
-                    None => {
-                        msg.variables.insert(
-                            "system.github.token.pat_scopes".to_owned(),
-                            preloop_gha_protocol::azdo::VariableValue::new(
-                                crate::runs::PAT_WITHHELD_WIRE_VALUE,
-                            ),
-                        );
-                        runtime
-                    }
-                },
-                None => runtime,
+            // the job keeps an empty token surface.
+            match crate::runs::verified_pat_scopes(&pat).await {
+                Some(scopes) => {
+                    msg.variables.insert(
+                        "system.github.token.pat_scopes".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            crate::runs::pat_scopes_wire_value(&scopes),
+                        ),
+                    );
+                    crate::broker::apply_minted_token_to_message(
+                        &mut msg,
+                        &crate::broker::MintedGitHubToken {
+                            token: pat,
+                            effective_permissions: None,
+                        },
+                        false,
+                    );
+                }
+                None => {
+                    msg.variables.insert(
+                        "system.github.token.pat_scopes".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            crate::runs::PAT_WITHHELD_WIRE_VALUE,
+                        ),
+                    );
+                }
             }
-        };
-        crate::broker::apply_minted_token_to_message(
-            &mut msg,
-            &crate::broker::MintedGitHubToken {
-                token,
-                effective_permissions: None,
-            },
-            false,
-        );
+        }
         // The pinned snapshot checkout token and the origin-rewrite header
         // are minted at submission and blanked in the stored template; this
         // path delivers the message directly, so it must re-mint both from a
