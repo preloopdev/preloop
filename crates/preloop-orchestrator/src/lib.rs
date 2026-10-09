@@ -2873,9 +2873,9 @@ fn docker_start_command() -> Vec<String> {
              if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi; \
              echo 'dockerd failed to start after data-root reset' >&2; \
              exit 1"
-    )
+        )),
+    ]
 }
-
 
 #[cfg(test)]
 mod docker_daemon_tests {
