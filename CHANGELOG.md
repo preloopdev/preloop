@@ -61,6 +61,24 @@ Releases before v0.27.0 predate the changelog.
   the sentinel itself is not an image — and an unconfigured pool no longer
   fails to start there.
 
+- **Leftovers of earlier releases are cleaned up at startup.** Packed-golden
+  payloads keyed on the retired stock Ubuntu bases
+  (`preloop-[mirror.gcr.io-library-]ubuntu-{24.04,22.04}[-sha256-…]-<arch>-<fingerprint>`)
+  live under a stem this release no longer produces, so no fingerprint
+  rotation would ever reach them; the startup sweep now removes them. Goldens
+  prepared per `runs-on` environment (`<prefix>-golden-<fingerprint12>`) keep
+  their fingerprint record, which exempted them from the stale-machine
+  cleanup; one that neither the official golden nor the configured image
+  resolves to is now deleted with its record.
+
+- **Apt indices are baked into the golden.** The runner-image dump ships with
+  `/var/lib/apt/lists` wiped, and a workflow's `sudo apt-get install <pkg>`
+  with no `apt-get update` first (uv's musl cell) fails with `E: Unable to
+  locate package`. The golden contract now refreshes the indices at build, and
+  an unpacked pack that has none is refreshed once before it is frozen, so
+  forks inherit them. Also fixes `golden_contract_script("root", …)`, which
+  rendered `; ;` and did not parse as `sh`.
+
 - **The guest runner inherits the image's environment.** It is launched
   through a shell that sources `/etc/environment`, so the PATH a step sees is
   the image's own — the tools a hosted image preinstalls keep resolving —

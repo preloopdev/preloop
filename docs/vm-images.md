@@ -81,6 +81,13 @@ is, plus the GitHub-runner machinery — and nothing else:
    guest and every dynamically linked binary — the runner included — resolves
    through the guest's glibc loader; an image without one (musl-only, scratch)
    fails the bake, naming what was missing.
+6. **Apt package indices**: `apt-get update` at build time (best-effort, bounded
+   to five minutes, skipped on an image without apt), so a step's
+   `sudo apt-get install <pkg>` resolves with no `apt-get update` first, as on
+   a hosted runner. The runner-image dump ships with its lists wiped; the
+   official golden gets them from this step when it is baked, and an
+   already-published pack that lacks them is refreshed once when it is
+   unpacked, before it is frozen — never per fork.
 
 No packages, no toolchains, no PATH or environment overrides. A missing `bash`,
 `git`, or `docker` fails the step that needs it, exactly as on a GitHub-hosted
@@ -128,7 +135,8 @@ base_image`) and refuses when nothing is configured. An OCI reference (digest
 pinned for reproducibility) or a local `.smolmachine`/archive path both work.
 - `--output`: destination for the packed golden.
 - The bake applies the runner contract (see "What the golden contains") and
-  writes `/etc/preloop-bake.json`; it installs nothing else.
+  writes `/etc/preloop-bake.json`; it installs no packages (it refreshes apt's
+  indices and nothing else).
 - Release publication first seeds both architecture assets from the newest
   complete release, so a newly tagged engine never points at missing goldens.
   Every GitHub release then triggers `release-golden.yml`; release notes do not

@@ -2312,7 +2312,8 @@ pub fn golden_glibc_check_script() -> &'static str {
 /// GitHub-runner machinery only — the account jobs run as (with its home,
 /// `_work` and passwordless sudo), the ownership of the paths they write, the
 /// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
-/// `/etc/environment`, and the glibc requirement above. No packages, no
+/// `/etc/environment`, the glibc requirement above, and the image's apt package
+/// indices ([`golden_apt_lists_script`]). No packages, no
 /// toolchains, no PATH or environment overrides: on a hosted runner a missing
 /// `bash`, `git` or `docker` fails the step that needs it, and the same is true
 /// here.
@@ -2325,20 +2326,89 @@ pub fn golden_contract_script(user: &str, uid: u32) -> String {
     // `as_runner_user` runs the runner unchanged for it. The account steps must
     // skip then: creating and chowning a `root` account (and moving its home
     // to `/home/root`) would leave the image in a state nothing runs as.
-    let account = if user == "root" {
-        String::new()
-    } else {
-        runner_account_script(user, uid)
-    };
-    let ownership = if user == "root" {
-        String::new()
-    } else {
-        golden_ownership_script(uid)
-    };
+    // Steps are joined rather than formatted into fixed slots: an empty slot
+    // renders `; ;`, which `sh` rejects, and the root contract hit exactly that.
+    let mut steps = vec!["set -e".to_owned(), golden_glibc_check_script().to_owned()];
+    if user != "root" {
+        steps.push(runner_account_script(user, uid));
+        steps.push(golden_ownership_script(uid));
+    }
+    steps.push(golden_apt_lists_script());
+    steps.join("; ")
+}
+
+/// Refresh apt's package indices, best-effort and bounded.
+///
+/// Hosted images keep populated lists, so real workflows run
+/// `sudo apt-get install <pkg>` with no `apt-get update` first (uv's musl cell
+/// installs `musl-tools` that way). The runner-image dump ships with its lists
+/// wiped, so a golden without this step fails those steps with
+/// `E: Unable to locate package`.
+///
+/// A failed refresh (offline bake host, held lock) warns and carries on: the
+/// golden is still correct, and [`restore_apt_lists_script`] covers a pack
+/// that shipped without lists. No `#` comments in the text: the statements are
+/// joined into one physical line.
+fn golden_apt_update_command() -> &'static str {
+    "limit=; command -v timeout >/dev/null 2>&1 && limit='timeout 300'; \
+     $limit apt-get -o DPkg::Lock::Timeout=10 update -qq \
+       || echo 'preloop: apt-get update failed; this golden ships without apt package indices' >&2"
+}
+
+/// The contract step that bakes fresh apt indices into a golden.
+///
+/// Unconditional, unlike [`restore_apt_lists_script`]: a rebuilt golden should
+/// carry the indices of its bake day, not whatever an older image shipped. An
+/// image without apt skips it.
+pub fn golden_apt_lists_script() -> String {
     format!(
-        "set -e; {glibc}; {account}; {ownership}",
-        glibc = golden_glibc_check_script(),
+        "if command -v apt-get >/dev/null 2>&1; then {}; fi",
+        golden_apt_update_command()
     )
+}
+
+/// Restore apt's indices when the golden has none, a no-op when it has them.
+///
+/// For a published pack baked before the contract carried
+/// [`golden_apt_lists_script`]: it is unpacked, not baked here, so nothing else
+/// would populate its lists. `lists` is the directory apt keeps them in.
+fn restore_apt_lists_script_at(lists: &str) -> String {
+    format!(
+        "if command -v apt-get >/dev/null 2>&1 \
+         && [ -z \"$(find {lists} -name '*_Packages*' -print -quit 2>/dev/null)\" ]; then {update}; fi",
+        lists = shell_quote(lists),
+        update = golden_apt_update_command(),
+    )
+}
+
+fn restore_apt_lists_script() -> String {
+    restore_apt_lists_script_at("/var/lib/apt/lists")
+}
+
+/// Restore apt's indices in a freshly unpacked golden, before it is frozen.
+///
+/// Done once per golden, not per fork: a fork's own writes never reach its
+/// siblings, so a per-fork refresh would repay the download on every job. Never
+/// fatal; a golden without indices still runs jobs that do not `apt-get
+/// install` blind.
+async fn restore_apt_lists<P: VmProvider>(provider: &P, golden: &MachineName) {
+    let script = run_as_root_or_sudo(&restore_apt_lists_script());
+    match provider
+        .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
+        .await
+    {
+        Ok(output) if output.exit_code == 0 => {}
+        Ok(output) => warn!(
+            machine = golden.as_str(),
+            exit = output.exit_code,
+            "apt index restore failed; workflow `apt-get install` steps may not resolve"
+        ),
+        Err(error) => warn!(
+            machine = golden.as_str(),
+            %error,
+            "apt index restore could not run; workflow `apt-get install` steps may not resolve"
+        ),
+    }
 }
 
 /// Start the container engine, if one is installed.
@@ -3556,6 +3626,12 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     // failed install leaves a reusable base that is adoptable on later
     // restarts (amd64 arch added, loader missing).
     prepare_rosetta_multiarch(provider.as_ref(), golden, true).await?;
+    // The published pack ships with apt's indices wiped (the runner-image dump
+    // does), and `sudo apt-get install <pkg>` with no `apt-get update` first is
+    // how real workflows install system packages. On Apple Silicon the
+    // multiarch step above already refreshed them; elsewhere nothing else
+    // would. Before the freeze, so every fork inherits them.
+    restore_apt_lists(provider.as_ref(), golden).await;
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -4297,29 +4373,60 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
     }
 
-    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+    /// Delete every machine this pool owns that the startup adoption path
+    /// cannot reuse.
+    ///
+    /// A golden fork base recorded by a previous engine run is not stale: its
+    /// machine directory plus the fingerprint record are exactly what adoption
+    /// needs. Deleting it here forced a full rebake on every restart (#293);
+    /// the prepare path rebuilds it anyway when the fingerprint no longer
+    /// matches.
+    ///
+    /// The exception is a golden no environment can resolve to any more
+    /// ([`retired_golden`]): the curated per-`runs-on` goldens of earlier
+    /// releases. Their records would otherwise protect them forever, since
+    /// nothing prepares them again.
+    async fn remove_stale_runner_machines(&self) -> Result<(), OrchestratorError> {
         for name in self.provider.list().await? {
-            if name
+            if !name
                 .as_str()
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
-                // A golden fork base recorded by a previous engine run is not
-                // stale: its machine directory plus the fingerprint record are
-                // exactly what the startup adoption path needs. Deleting it
-                // here forced a full rebake on every restart (#293); the
-                // prepare path rebuilds it anyway when the fingerprint no
-                // longer matches.
-                if golden_record_path(&self.config, &name).is_some_and(|path| path.is_file()) {
-                    continue;
-                }
+                continue;
+            }
+            let retired = retired_golden(&self.config, &name);
+            if !retired
+                && golden_record_path(&self.config, &name).is_some_and(|path| path.is_file())
+            {
+                continue;
+            }
+            if !retired {
                 notify_runner_gone(&self.config, &name).await;
-                vm_telemetry_deregister(&self.config, &name);
-                if let Err(error) = self.provider.delete(&name).await {
+            }
+            vm_telemetry_deregister(&self.config, &name);
+            match self.provider.delete(&name).await {
+                // The record goes only with the machine: a failed delete keeps
+                // it, so the next start retries instead of forgetting a golden
+                // that still holds its storage.
+                Ok(()) if retired => {
+                    remove_golden_record(&self.config, &name);
+                    info!(
+                        machine = name.as_str(),
+                        "removed a golden no pool environment resolves to any more"
+                    );
+                }
+                Ok(()) => {}
+                Err(error) => {
                     record_slot_failure(&self.config, "stale_cleanup");
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+        self.remove_stale_runner_machines().await?;
         // A crashed server orphans its detached `_boot-vm` hypervisor
         // processes; when the data dir was cleaned out from under them the
         // smolvm DB no longer knows the machines, so the deletes above
@@ -4402,7 +4509,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                         && suffix[1..].chars().all(|c| c.is_ascii_hexdigit())
                 })
             }) && path != current_payload;
-            if !stale_tmp && !stale_payload {
+            // Payloads under a stem this pool no longer produces: the stock
+            // Ubuntu bases are not golden sources any more, so no later
+            // fingerprint rotation would ever reach them.
+            let retired_payload = is_retired_stock_payload(&name) && path != current_payload;
+            if !stale_tmp && !stale_payload && !retired_payload {
                 continue;
             }
             match std::fs::remove_file(&path) {
@@ -5866,6 +5977,83 @@ fn managed_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
 /// packed artifact for the default environment.
 fn plain_packed_golden_name(config: &RunnerPoolConfig) -> String {
     format!("{}-golden", config.name_prefix)
+}
+
+/// Whether `golden` is a per-environment fork base no environment resolves to
+/// any more.
+///
+/// A pool resolves a job to exactly two bases: the official golden or its
+/// configured image (`EnvironmentSpec::base_for_labels`). A suffixed golden
+/// (`{prefix}-golden-{fingerprint12}`) whose suffix is neither base's
+/// fingerprint was prepared for an environment that no longer exists — the
+/// stock Ubuntu environments of earlier releases, or an image since replaced —
+/// and nothing will ever prepare or adopt it again. The plain golden is never
+/// retired here: `prepare_fork_base` replaces it in place.
+fn retired_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
+    let prefix = plain_packed_golden_name(config);
+    let Some(suffix) = golden
+        .as_str()
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    if suffix.len() != 12 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    ![
+        crate::environment::OFFICIAL_GOLDEN,
+        config.base_image.as_str(),
+    ]
+    .iter()
+    .any(|base| {
+        EnvironmentSpec::for_base((*base).to_owned())
+            .fingerprint
+            .starts_with(suffix)
+    })
+}
+
+/// Whether a file name is a packed-golden payload of a retired stock Ubuntu
+/// stem: `preloop-[mirror.gcr.io-library-]ubuntu-{24.04,22.04}[-sha256-<64
+/// hex>]-<arch>-<64 hex>`.
+///
+/// Earlier releases keyed the payload on the stock base they baked from; the
+/// stem is the base reference with `/`, `:` and `@` turned into `-`
+/// (`artifact_stem`). The architecture and both digests must match, so a
+/// hand-named file or another image's payload is never taken for one.
+fn is_retired_stock_payload(name: &str) -> bool {
+    let is_hex = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_hexdigit());
+    let Some(rest) = name.strip_prefix("preloop-") else {
+        return false;
+    };
+    let Some(split) = rest.len().checked_sub(65) else {
+        return false;
+    };
+    if !rest.is_char_boundary(split) {
+        return false;
+    }
+    let (stem, fingerprint) = rest.split_at(split);
+    if !fingerprint.starts_with('-') || fingerprint[1..].len() != 64 || !is_hex(&fingerprint[1..]) {
+        return false;
+    }
+    let stem = stem.strip_prefix("mirror.gcr.io-library-").unwrap_or(stem);
+    let Some(after_release) = stem
+        .strip_prefix("ubuntu-24.04")
+        .or_else(|| stem.strip_prefix("ubuntu-22.04"))
+    else {
+        return false;
+    };
+    let arch = match after_release.strip_prefix("-sha256-") {
+        Some(tail) => match tail.split_once('-') {
+            Some((digest, arch)) if digest.len() == 64 && is_hex(digest) => arch,
+            _ => return false,
+        },
+        None => match after_release.strip_prefix('-') {
+            Some(arch) => arch,
+            None => return false,
+        },
+    };
+    matches!(arch, "x86_64" | "aarch64")
 }
 
 /// Best-effort VM telemetry: register a just-created or forked machine.
@@ -9272,15 +9460,19 @@ done
                 "run_as_root_or_sudo_strict".to_owned(),
                 run_as_root_or_sudo_strict("true"),
             ),
+            (
+                "golden_contract_script".to_owned(),
+                golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+            ),
+            (
+                "golden_contract_script (root)".to_owned(),
+                golden_contract_script("root", DEFAULT_RUNNER_UID),
+            ),
+            (
+                "restore_apt_lists_script".to_owned(),
+                restore_apt_lists_script(),
+            ),
         ];
-        // The curated-bake scripts this list used to carry
-        // (`base_install_script`, `runner_ownership_reconcile_script`,
-        // `apt_lists_refresh_command`, the toolchain install/verify commands)
-        // exist only on this branch's lineage: the main lineage replaces them
-        // with the golden-contract scripts, so listing them here would break
-        // the test build on a merged tree. Add that lineage's
-        // `golden_contract_script` / `golden_ownership_script` /
-        // `golden_glibc_check_script` here when the merge happens.
 
         for (name, script) in &scripts {
             let output = std::process::Command::new(shell)
@@ -9953,7 +10145,12 @@ done
         }
 
         async fn list(&self) -> Result<Vec<MachineName>, VmError> {
-            Ok(Vec::new())
+            self.machines
+                .lock()
+                .await
+                .keys()
+                .map(|name| MachineName::new(name.clone()))
+                .collect::<Result<Vec<_>, _>>()
         }
 
         async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
@@ -11176,6 +11373,190 @@ done
         assert!(goldens.is_dir(), "goldens/ record dir survives");
     }
 
+    /// Earlier releases keyed the payload on the stock Ubuntu base they baked
+    /// from. No fingerprint rotation under the current stem reaches those
+    /// files, so the sweep names them itself — and only them: another image's
+    /// payload, a hand-named file and an unknown architecture stay.
+    #[tokio::test]
+    async fn sweep_stale_artifacts_removes_payloads_of_retired_stock_stems() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-preloop-official-golden-aarch64");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(
+            Arc::new(TestProvider::new(false, false, false, false, false)),
+            config.clone(),
+        )
+        .expect("pool config validates");
+
+        let current = config.artifact_payload();
+        std::fs::write(&current, b"current").unwrap();
+        let retired = [
+            format!(
+                "preloop-mirror.gcr.io-library-ubuntu-24.04-sha256-{:064x}-aarch64-{:064x}",
+                1, 2
+            ),
+            format!("preloop-ubuntu-24.04-aarch64-{:064x}", 3),
+            format!("preloop-ubuntu-22.04-sha256-{:064x}-x86_64-{:064x}", 4, 5),
+        ];
+        let kept = [
+            format!(
+                "preloop-ghcr.io-acme-runner-images-ubuntu24-aarch64-{:064x}",
+                6
+            ),
+            "preloop-ubuntu-24.04-aarch64-notes.txt".to_owned(),
+            format!("preloop-ubuntu-24.04-armv7-{:064x}", 7),
+            format!("preloop-ubuntu-20.04-aarch64-{:064x}", 8),
+        ];
+        for name in retired.iter().chain(kept.iter()) {
+            std::fs::write(vms.join(name), b"payload").unwrap();
+        }
+
+        pool.sweep_stale_artifacts().await;
+
+        assert!(current.is_file(), "current payload survives");
+        for name in &retired {
+            assert!(!vms.join(name).exists(), "{name} is swept");
+        }
+        for name in &kept {
+            assert!(vms.join(name).is_file(), "{name} survives");
+        }
+    }
+
+    /// A suffixed golden record protects its machine from the startup cleanup
+    /// so adoption can reuse it — but only while some environment can still
+    /// resolve to that golden. The per-`runs-on` goldens of earlier releases
+    /// are recorded too and nothing prepares them again, so they must go, with
+    /// their records; the plain golden and the goldens of the two current
+    /// environments stay.
+    #[tokio::test]
+    async fn startup_cleanup_removes_goldens_no_environment_resolves_to() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-image-aarch64");
+        config.base_image = "ghcr.io/acme/runner-images:custom".to_owned();
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let pool =
+            RunnerPool::new(provider.clone(), config.clone()).expect("pool config validates");
+
+        let prefix = plain_packed_golden_name(&config);
+        let official =
+            EnvironmentSpec::for_base(crate::environment::OFFICIAL_GOLDEN.to_owned()).fingerprint;
+        let configured = EnvironmentSpec::for_base(config.base_image.clone()).fingerprint;
+        let plain = prefix.clone();
+        let official_golden = format!("{prefix}-{}", &official[..12]);
+        let configured_golden = format!("{prefix}-{}", &configured[..12]);
+        let retired_golden = format!("{prefix}-aaaaaaaaaaaa");
+        for name in [
+            &plain,
+            &official_golden,
+            &configured_golden,
+            &retired_golden,
+        ] {
+            let name = MachineName::new(name.clone()).unwrap();
+            provider
+                .create(&MachineSpec {
+                    name: name.clone(),
+                    image: "ubuntu".to_owned(),
+                    cpus: 1,
+                    memory_mib: 512,
+                    storage_gib: 1,
+                    overlay_gib: Some(1),
+                    network: NetworkPolicy::PublicOnly,
+                    volumes: Vec::new(),
+                    sockets: Vec::new(),
+                    dns: None,
+                    rosetta: false,
+                })
+                .await
+                .unwrap();
+            write_golden_record(&config, &name, "fp");
+        }
+
+        pool.remove_stale_runner_machines().await.unwrap();
+
+        let left: Vec<String> = provider
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        for kept in [&plain, &official_golden, &configured_golden] {
+            assert!(left.contains(kept), "{kept} is still reachable: {left:?}");
+            let name = MachineName::new(kept.clone()).unwrap();
+            assert!(
+                golden_record_path(&config, &name).unwrap().is_file(),
+                "{kept} keeps its record"
+            );
+        }
+        assert!(
+            !left.contains(&retired_golden),
+            "an unreachable golden is deleted: {left:?}"
+        );
+        let name = MachineName::new(retired_golden).unwrap();
+        assert!(
+            !golden_record_path(&config, &name).unwrap().exists(),
+            "its record goes with it"
+        );
+    }
+
+    /// The restore must not touch a golden that already has indices (it would
+    /// repay a download for nothing) and must refresh one that has none. Run
+    /// against a stub `apt-get` so only the decision is under test.
+    #[cfg(unix)]
+    #[test]
+    fn restore_apt_lists_refreshes_only_a_golden_without_indices() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = temp.path().join("apt-called");
+        let stub = bin.join("apt-get");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |lists: &Path| {
+            let script = restore_apt_lists_script_at(lists.to_str().unwrap());
+            let path = format!("{}:/usr/bin:/bin", bin.display());
+            let status = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("PATH", path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "the restore never fails the golden");
+        };
+
+        let empty = temp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        run(&empty);
+        let called = std::fs::read_to_string(&marker).expect("an empty lists dir is refreshed");
+        assert!(called.contains("update"), "{called}");
+
+        std::fs::remove_file(&marker).unwrap();
+        let populated = temp.path().join("populated");
+        std::fs::create_dir_all(&populated).unwrap();
+        std::fs::write(
+            populated.join("archive.ubuntu.com_ubuntu_dists_noble_main_binary-amd64_Packages"),
+            b"x",
+        )
+        .unwrap();
+        run(&populated);
+        assert!(!marker.exists(), "a golden with indices is left alone");
+    }
+
     /// A `.tmp-golden-*` staging file with a fresh companion lock must survive
     /// the startup sweep, so concurrent pools sharing the artifact directory
     /// cannot delete each other's in-flight bakes or downloads. A stale lock
@@ -11345,8 +11726,8 @@ done
 
         let events = provider.events().await;
         assert!(
-            !events.iter().any(|event| event.contains("apt-get")),
-            "a configured image must never receive a package bake: {events:?}"
+            !events.iter().any(|event| event.contains("apt-get install")),
+            "a configured image must never receive a package install: {events:?}"
         );
         // The contract travels base64-encoded inside the root-or-sudo wrapper,
         // which is what makes it work whether the exec lands as root or as an
