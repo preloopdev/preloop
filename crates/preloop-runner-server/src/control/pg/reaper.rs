@@ -50,7 +50,7 @@ impl PgBackend {
             active,
             paused,
             pool_preparing,
-            warm_window_open,
+            booted_at,
             pool_labels,
             first_seen,
         } = sweep;
@@ -82,19 +82,14 @@ impl PgBackend {
                     + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
                 // No durable first-seen column: the mark
                 // lives in the caller's memory (`ReapSweep::first_seen`);
-                // unmarked rows fall back to the enqueue instant.
+                // unmarked rows fall back to the enqueue instant or boot.
                 first_seen: first_seen.get(&(job.run_id, job.job_id.clone())).copied(),
                 any_runner_matches: runner_labels.iter().any(|labels| {
                     crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                 }),
             };
-            let verdict = starvation_verdict(
-                &candidate,
-                now,
-                pool_preparing,
-                warm_window_open,
-                &pool_labels,
-            );
+            let verdict =
+                starvation_verdict(&candidate, now, pool_preparing, booted_at, &pool_labels);
             let (reason, unschedulable) = match verdict {
                 StarvationVerdict::ClearMark | StarvationVerdict::Mark { .. } => continue,
                 StarvationVerdict::Starve { reason, grace } => {

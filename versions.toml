@@ -23,7 +23,7 @@ smolvm_min_version = "1.18.1"
 # GitHub-hosted KVM to gate the merge. Deliberately separate from
 # smolvm_min_version: goldens track the last *verified* release, the runtime
 # floor rarely moves.
-smolvm_golden_version = "1.22.1"
+smolvm_golden_version = "1.22.2"
 
 # Image inputs for the runner golden. The official golden is baked from the
 # per-architecture OCI references in official-image.toml (the dump of the

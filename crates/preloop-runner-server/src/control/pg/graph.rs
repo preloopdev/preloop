@@ -49,6 +49,7 @@ pub(super) struct Node {
     pub(crate) outputs: Option<serde_json::Value>,
     pub(crate) annotations: Option<serde_json::Value>,
     pub(crate) check_run_id: Option<i64>,
+    pub(crate) request_id: Option<i64>,
     pub(crate) created_at_us: i64,
     pub(crate) deps_ready_at_us: Option<i64>,
     pub(crate) concurrency_wait_at_us: Option<i64>,
@@ -412,7 +413,7 @@ impl PgBackend {
                      s.continue_on_error, s.id_token_granted, s.oidc_environment, \
                      s.oidc_job_workflow_ref, s.oidc_job_workflow_sha, \
                      m.condition_context::text, m.secret_names::text, \
-                     j.environment_gate::text \
+                     j.environment_gate::text, j.request_id \
                      FROM jobs j \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
                      LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
@@ -477,6 +478,7 @@ impl PgBackend {
                     .transpose()
                     .map_err(ControlError::backend)?,
                 check_run_id: row.get(15),
+                request_id: row.get(44),
                 created_at_us: row.get::<_, Option<i64>>(16).unwrap_or(0),
                 deps_ready_at_us: row.get(17),
                 concurrency_wait_at_us: row.get(18),

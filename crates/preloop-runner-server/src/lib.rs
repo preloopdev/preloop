@@ -40,6 +40,7 @@ pub mod execution_protection_api;
 use execution_protection_api::*;
 mod message_template;
 pub mod remote_workflows;
+mod rerun_checks;
 pub mod reusable_workflows;
 pub mod runs;
 pub mod secret_provider;

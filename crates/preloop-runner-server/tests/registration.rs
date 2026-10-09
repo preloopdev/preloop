@@ -1874,7 +1874,9 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 #[tokio::test]
 async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // Up past the grace window: an unknown age measures from boot, not now.
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -1895,7 +1897,7 @@ async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window(
     let inner = state.test_tx().await;
     assert!(
         inner.ready().next().is_none(),
-        "a restored job with unknown age must not receive a fresh starvation grace window"
+        "a restored job with unknown age must not receive a grace window beyond boot"
     );
     assert_eq!(
         inner.runs.get(&run_id).unwrap().status,
@@ -2294,9 +2296,11 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         let app = app(state.clone(), CancellationToken::new());
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        // Queued for longer than the absolute ceiling before the restart:
+        // the restart killed the pool's runners, so that time must not count.
         state
             .test_db_mutate(|tx| {
-                let cutoff = crate::store::now_us() - 700_000_000;
+                let cutoff = crate::store::now_us() - 7_200_000_000;
                 tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
                     .unwrap();
             })
@@ -2381,7 +2385,8 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
 #[tokio::test]
 async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2443,7 +2448,8 @@ async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
 #[tokio::test]
 async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2536,7 +2542,8 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
 #[tokio::test]
 async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {

@@ -100,6 +100,10 @@ struct RunArgs {
     renew_secs: u64,
     #[arg(long, default_value_t = 0.03)]
     failure_rate: f64,
+    /// Fraction of completed failed runs to re-run with the native rerun API.
+    /// This is Postgres-only: candidates are read from the control database.
+    #[arg(long, default_value_t = 0.0)]
+    rerun_fraction: f64,
     /// Postgres URL for stats sampling.
     #[arg(long)]
     pg_url: Option<String>,
@@ -182,6 +186,20 @@ async fn run(args: RunArgs) -> Result<()> {
         failure_rate: args.failure_rate,
     };
     let mut fleet = Vec::new();
+    let rerun_task = args
+        .pg_url
+        .as_ref()
+        .filter(|_| args.rerun_fraction > 0.0)
+        .map(|pg_url| {
+            tokio::spawn(rerun_loop(
+                pg_url.clone(),
+                args.servers.clone(),
+                args.system_token.clone(),
+                metrics.clone(),
+                (args.runs_per_sec * args.rerun_fraction).max(0.01),
+                fleet_end,
+            ))
+        });
     for i in 0..args.runners {
         let runner = runner::Runner {
             http: http.clone(),
@@ -287,7 +305,7 @@ async fn run(args: RunArgs) -> Result<()> {
     loop {
         let submitted = metrics.counter("jobs.submitted");
         let done = metrics.counter("job.completed");
-        if done >= submitted || Instant::now() >= fleet_end {
+        if (args.rerun_fraction <= 0.0 && done >= submitted) || Instant::now() >= fleet_end {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -297,6 +315,9 @@ async fn run(args: RunArgs) -> Result<()> {
         let s = metrics.counter("jobs.submitted");
         s.saturating_sub(metrics.counter("job.completed"))
     });
+    if let Some(handle) = rerun_task {
+        handle.abort();
+    }
     for handle in fleet {
         handle.abort();
     }
@@ -310,7 +331,7 @@ async fn run(args: RunArgs) -> Result<()> {
         "runs_per_sec": args.runs_per_sec,
         "bursts": args.bursts,
         "webhook_fraction": args.webhook_fraction,
-        "repos": args.repos,
+        "rerun_fraction": args.rerun_fraction,
         "duration_secs": args.duration_secs,
         "runners": args.runners,
         "job_median_ms": args.job_median_ms,
@@ -332,6 +353,83 @@ async fn run(args: RunArgs) -> Result<()> {
     println!("latency_ms: {}", summary["latency_ms"]);
     println!("drain_secs: {drain_secs:.1}");
     Ok(())
+}
+
+/// Drive completed failed runs through the native rerun endpoint at an
+/// open-loop rate while submissions and runners continue in the main task.
+async fn rerun_loop(
+    pg_url: String,
+    servers: Vec<String>,
+    system_token: String,
+    metrics: Arc<Metrics>,
+    rate: f64,
+    deadline: Instant,
+) {
+    let http = match reqwest::Client::builder()
+        .pool_max_idle_per_host(256)
+        .timeout(Duration::from_secs(60))
+        .build()
+    {
+        Ok(http) => http,
+        Err(error) => {
+            eprintln!("[load] rerun client: {error}");
+            return;
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut sequence = 0_u64;
+    let mut next = Instant::now();
+    while Instant::now() < deadline {
+        let gap = {
+            let mut rng = rand::thread_rng();
+            exponential_gap(&mut rng, rate)
+        };
+        next += Duration::from_secs_f64(gap);
+        if let Some(wait) = next.checked_duration_since(Instant::now()) {
+            tokio::time::sleep(wait).await;
+        }
+        let candidates = db::rerun_candidates(&pg_url, 64).await;
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| !seen.contains(&candidate.run_id))
+        else {
+            metrics.incr("rerun.no_candidate");
+            continue;
+        };
+        seen.insert(candidate.run_id.clone());
+        sequence += 1;
+        let (mode, body) = match sequence % 3 {
+            0 => ("all", serde_json::json!({"mode": "all"})),
+            1 => ("failed", serde_json::json!({"mode": "failed"})),
+            _ => (
+                "job",
+                serde_json::json!({"mode": "job", "job_id": candidate.failed_job_id}),
+            ),
+        };
+        let server = &servers[sequence as usize % servers.len()];
+        let intended = next;
+        match http
+            .post(format!("{server}/api/v1/runs/{}/rerun", candidate.run_id))
+            .bearer_auth(&system_token)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                metrics.latency("rerun_request", intended);
+                metrics.incr("rerun.accepted");
+                metrics.incr(&format!("rerun.mode.{mode}"));
+            }
+            Ok(response) => {
+                metrics.latency("rerun_request", intended);
+                metrics.incr(&format!("rerun.status_{}", response.status().as_u16()));
+            }
+            Err(_) => {
+                metrics.latency("rerun_request", intended);
+                metrics.incr("rerun.transport_error");
+            }
+        }
+    }
 }
 
 use rand::SeedableRng;

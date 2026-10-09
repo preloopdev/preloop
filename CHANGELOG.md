@@ -107,6 +107,12 @@ Releases before v0.27.0 predate the changelog.
   `PRELOOP_GOLDEN_SHA256`. The engine's own release assets keep the previous
   tolerated-with-a-warning behavior.
 ### Added
+- In-place reruns now persist `jobs.request_id` and copy it into
+  per-attempt `job_history`, preserving log/step/artifact resolution for
+  carried-forward and newly minted executions on both control backends.
+  Rerun context updates `github.triggering_actor` while retaining the
+  original `github.actor`; migration `V2026100508__job_request_links` carries
+  the nullable columns forward.
 
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
@@ -247,6 +253,14 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Fixed
+- **A restart no longer fails the queued backlog as starved**: the starvation
+  sweep measured every queued job from its ready-enqueue instant, so jobs
+  queued for more than an hour before an engine restart failed with
+  `none appeared within 3600s` seconds after boot — before the restarted
+  pool had registered a single runner (221 jobs on one deploy). Both the
+  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
+  whichever is later, so a restart gives the backlog the same window a newly
+  queued job gets.
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
@@ -688,6 +702,29 @@ Releases before v0.27.0 predate the changelog.
   pool provisioning marks) refuses the import, and only provably unreachable
   tombstones/ephemeral tokens are reported as skipped. `preloop serve` still
   never migrates a database on its own.
+- Workflow runs can be re-run in place as a new attempt: the same run id
+  with `github.run_attempt` incremented and the previous attempt kept in
+  history, exactly like GitHub's "Re-run jobs". Three modes match GitHub's
+  buttons: all jobs, failed/cancelled jobs plus their dependents, and one
+  job plus its dependents (`POST /api/v1/runs/:id/rerun` with
+  `{"mode":"all|failed|job","job_id":…}`, or the new
+  `preloop rerun <run-id> [--failed|--job <id>]`). Re-run jobs re-arm
+  `environment:` protection gates and re-acquire workflow/job concurrency
+  groups; jobs outside the selection keep their results and outputs, so
+  dependents see the carried-forward `needs` context. A run the archiver
+  already moved to history can only be re-run in full, which starts a new
+  run (previous behavior).
+- `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0` disables) keeps completed runs
+  that have a failed/cancelled/timed-out job in the live control tables so
+  they stay re-runnable in place; everything else still archives within a
+  minute of completion, and retention (`PRELOOP_RETENTION_DAYS`) still wins.
+  The volume cost is one live run row plus its jobs and attempts per failed
+  run for up to the window — small next to the run's own artifacts and logs,
+  and the knob trades it for keeping "Re-run failed jobs" working long after
+  the 60-second archive grace.
+
+### Changed
+
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and

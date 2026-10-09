@@ -18,6 +18,7 @@ Usage: preloop <COMMAND>
 | `status` | Show active and recent runs |
 | `logs` | Show run logs (defaults to the most recent run) |
 | `cancel` | Cancel the current run |
+| `rerun` | Re-run a completed run: all jobs, failed jobs, or one job |
 | `secret` | Manage the local secret store |
 | `setup` | Configure GitHub credentials (App or fine-grained PAT) |
 | `doctor` | Verify the GitHub credential configuration |
@@ -169,6 +170,27 @@ preloop logs -f --job test            # tail it live
 ## `preloop cancel [RUN_ID]`
 
 Cancel a run. `RUN_ID` defaults to the most recent active run.
+
+## `preloop rerun [RUN_ID] [--failed | --job <JOB_ID>]`
+
+Re-run a completed run. `RUN_ID` defaults to the most recent completed run.
+Without flags every job resets as a new attempt on the same run
+(`github.run_attempt` increments; the previous attempt stays in history).
+`--failed` resets failed/cancelled jobs and the jobs that depend on them —
+succeeded jobs keep their results and outputs for the new attempt.
+`--job <JOB_ID>` resets one job (the id `preloop status <RUN_ID>` shows) and
+its dependents.
+
+A run the archiver already moved to history can only be re-run in full, as a
+new run; `--failed`/`--job` report a conflict. `PRELOOP_RERUN_WINDOW_DAYS`
+(see `self-hosting.md`) controls how long a failed run stays re-runnable in
+place.
+
+```bash
+preloop rerun                       # newest completed run, all jobs
+preloop rerun 4e1c… --failed        # just the failed jobs (and dependents)
+preloop rerun 4e1c… --job test      # one job (and its dependents)
+```
 
 ## `preloop-runner-client approve <RUN_ID> <JOB_ID> [--note <NOTE>]`
 

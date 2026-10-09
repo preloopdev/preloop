@@ -237,7 +237,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         // raise `provisioning`, not `preparing`, so treat an in-flight
         // provision as preparing or those boots would go unprotected here.
         || pool_status.provisioning > 0;
-    let started_at = shared.state.started_at;
+    // Wall-clock boot instant, to compare with stored enqueue instants
+    // (`started_at` is monotonic).
+    let booted_at = now
+        .checked_sub(shared.state.started_at.elapsed())
+        .unwrap_or(std::time::UNIX_EPOCH);
 
     // ── Active attempts + the ready queue (from `inputs`) ────────────────
     let queued_jobs = inputs.ready.clone();
@@ -284,9 +288,10 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 .runner_labels
                 .iter()
                 .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
-            // An unmarked job measures from its enqueue instant (an unknown
-            // age — `enqueued_at` 0 after a restore — is not granted a fresh
-            // window); the verdict's `Mark` carries the instant to keep.
+            // An unmarked job measures from its enqueue instant or this
+            // node's boot, whichever is later (an unknown age — `enqueued_at`
+            // 0 after a restore — measures from boot); the verdict's `Mark`
+            // carries the instant to keep.
             let candidate = crate::control::logic::StarvationCandidate {
                 runs_on: &job.runs_on,
                 enqueued_at: std::time::UNIX_EPOCH
@@ -298,7 +303,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 &candidate,
                 now,
                 pool_preparing,
-                started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+                booted_at,
                 &pool_status.labels,
             ) {
                 crate::control::logic::StarvationVerdict::ClearMark => {
@@ -368,7 +373,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             active: inputs.active.clone(),
             paused: paused_credits,
             pool_preparing,
-            warm_window_open: started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            booted_at,
             pool_labels: pool_status.labels.clone(),
             first_seen,
         };
@@ -713,10 +718,35 @@ pub(crate) async fn prune_outbox_once(shared: &SharedState, older_than: Duration
 /// Drain one archive pass: move settled runs to history in batches until a
 /// short batch or an error, and return how many runs moved. Split out so a
 /// test can drive a pass deterministically instead of racing the interval.
+///
+/// Runs a re-run can still use (completed with a failed/cancelled/timed-out
+/// job) are held live for `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0`
+/// disables) so `rerun_run` can reset them in place; everything else archives
+/// on the 60-second policy.
 pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
+    // Resolved once: the value is static for the process's lifetime and the
+    // 5s pass must not re-parse (or re-warn about) an env var.
+    static RERUN_HOLD: std::sync::LazyLock<Option<std::time::Duration>> =
+        std::sync::LazyLock::new(|| match crate::config::rerun_window_days() {
+            Ok(0) => None,
+            Ok(days) => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "invalid PRELOOP_RERUN_WINDOW_DAYS; disabling the in-place rerun hold"
+                );
+                None
+            }
+        });
+    let rerun_hold = *RERUN_HOLD;
     let mut archived_total = 0;
     loop {
-        match shared.state.backend.archive_finished_runs(32).await {
+        match shared
+            .state
+            .backend
+            .archive_finished_runs(32, rerun_hold)
+            .await
+        {
             Ok(archived) => {
                 archived_total += archived.len();
                 // Run-tier secrets are NOT dropped here. Archiving only moves

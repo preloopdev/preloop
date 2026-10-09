@@ -218,7 +218,7 @@ impl LiteBackend {
                 active,
                 paused,
                 pool_preparing,
-                warm_window_open,
+                booted_at,
                 pool_labels,
                 first_seen,
             } = sweep;
@@ -246,7 +246,7 @@ impl LiteBackend {
                     &candidate,
                     now,
                     pool_preparing,
-                    warm_window_open,
+                    booted_at,
                     &pool_labels,
                 );
                 let (reason, unschedulable) = match verdict {

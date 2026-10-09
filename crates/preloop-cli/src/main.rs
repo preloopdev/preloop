@@ -724,6 +724,16 @@ enum Command {
     /// Cancel the current run.
     Cancel(CancelArgs),
 
+    /// Re-run a completed workflow run.
+    ///
+    /// Default re-runs every job as a new attempt on the same run (GitHub's
+    /// "Re-run all jobs": `github.run_attempt` increments, the previous
+    /// attempt stays in history). `--failed` re-runs failed/cancelled jobs
+    /// and their dependents; `--job` re-runs one job and its dependents.
+    /// A run the archiver already moved to history can only be re-run in
+    /// full, as a new run.
+    Rerun(RerunArgs),
+
     /// Manage the local secret store.
     Secret(github_setup::SecretArgs),
 
@@ -1044,6 +1054,21 @@ struct CancelArgs {
 }
 
 #[derive(Debug, Parser)]
+struct RerunArgs {
+    /// Run ID. Defaults to the most recent completed run.
+    run_id: Option<String>,
+
+    /// Re-run only failed/cancelled jobs and the jobs that depend on them.
+    #[arg(long, conflicts_with = "job")]
+    failed: bool,
+
+    /// Re-run one job (the id `preloop status <run-id>` shows) and the jobs
+    /// that depend on it.
+    #[arg(long, value_name = "JOB_ID")]
+    job: Option<String>,
+}
+
+#[derive(Debug, Parser)]
 struct ShellArgs {
     /// Run reference (e.g. "last-failed"). Defaults to last failed run.
     run_ref: Option<String>,
@@ -1115,6 +1140,7 @@ async fn main() -> anyhow::Result<()> {
                     Command::Status(args) => cmd_status(args).await,
                     Command::Logs(args) => cmd_logs(args).await,
                     Command::Cancel(args) => cmd_cancel(args).await,
+                    Command::Rerun(args) => cmd_rerun(args).await,
                     Command::Shell(args) => cmd_shell(args).await,
                     Command::Debug(args) => {
                         debug_session::run(args, build_client(), server_url(), api_token()).await
@@ -4744,6 +4770,46 @@ async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cmd_rerun(args: RerunArgs) -> anyhow::Result<()> {
+    let client = build_client();
+    let url = server_url();
+    let run_id = match args.run_id {
+        Some(id) => id,
+        None => latest_run_id(&client, &url, Some("completed"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no completed runs found"))?,
+    };
+    let body = if args.failed {
+        serde_json::json!({ "mode": "failed" })
+    } else if let Some(job_id) = &args.job {
+        serde_json::json!({ "mode": "job", "job_id": job_id })
+    } else {
+        serde_json::json!({ "mode": "all" })
+    };
+    let mut request = client
+        .post(format!("{url}/api/v1/runs/{run_id}/rerun"))
+        .json(&body);
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+    let accepted: serde_json::Value = response.json().await?;
+    let new_run = accepted["run_id"].as_str().unwrap_or(run_id.as_str());
+    let queued = accepted["queued_jobs"].as_u64().unwrap_or(0);
+    if new_run == run_id {
+        println!("Run {run_id} re-queued ({queued} jobs).");
+    } else {
+        // The run was archived; a full re-run starts a new run.
+        println!("Archived run {run_id} re-queued as new run {new_run} ({queued} jobs).");
+    }
+    Ok(())
+}
+
 async fn latest_run_id(
     client: &reqwest::Client,
     url: &str,
@@ -6223,6 +6289,41 @@ mod tests {
             panic!("expected Cancel");
         };
         assert_eq!(args.run_id.as_deref(), Some("run-42"));
+    }
+
+    #[test]
+    fn rerun_parses_modes() {
+        let cli = parse(&["rerun"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert!(args.run_id.is_none() && !args.failed && args.job.is_none());
+
+        let cli = parse(&["rerun", "run-42"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert_eq!(args.run_id.as_deref(), Some("run-42"));
+
+        let cli = parse(&["rerun", "run-42", "--failed"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert!(args.failed);
+
+        let cli = parse(&["rerun", "run-42", "--job", "build"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert_eq!(args.job.as_deref(), Some("build"));
+
+        // `--failed` and `--job` select different modes; clap refuses both.
+        assert!(parse(&["rerun", "run-42", "--failed", "--job", "build"]).is_err());
+    }
+
+    #[test]
+    fn rerun_rejects_conflicting_flags() {
+        assert!(parse(&["rerun", "--failed", "--job", "build"]).is_err());
     }
 
     #[test]
