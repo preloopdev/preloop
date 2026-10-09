@@ -29,11 +29,13 @@ work=$(mktemp -d /tmp/preloop-load.XXXX)
 mkdir -p "$out"
 psql=${PSQL:-psql}
 
-cargo build --manifest-path "$root/Cargo.toml" --profile "$PROFILE" \
-  -p preloop-runner-server --bin preloop-server >&2
-cargo build --manifest-path "$root/Cargo.toml" --profile "$PROFILE" -p preloop-control-load >&2
-bindir="$root/target/$PROFILE"
-[ "$PROFILE" = dev ] && bindir="$root/target/debug"
+	cargo build --manifest-path "$root/Cargo.toml" --profile "$PROFILE" \
+	  -p preloop-runner-server --bin preloop-server >&2
+	cargo build --manifest-path "$root/Cargo.toml" --profile "$PROFILE" -p preloop-control-load >&2
+	cargo build --manifest-path "$root/Cargo.toml" --profile "$PROFILE" -p preloop-cli --bin preloop >&2
+target_root=${CARGO_TARGET_DIR:-"$root/target"}
+bindir="$target_root/$PROFILE"
+[ "$PROFILE" = dev ] && bindir="$target_root/debug"
 
 for i in $(seq 0 $((NODES - 1))); do
   if lsof -nP -iTCP:$((BASE_PORT + i)) -sTCP:LISTEN >/dev/null 2>&1; then
@@ -45,6 +47,7 @@ done
 db="preloop_load_$(date +%s)"
 "$psql" "$PG_ADMIN_URL" -qc "CREATE DATABASE $db"
 db_url="${PG_ADMIN_URL%/*}/$db"
+PRELOOP_STORE_URL="$db_url" "$bindir/preloop" store migrate --store "$db_url" --no-backup >&2
 engine_db_url="$db_url"
 
 pids=()
