@@ -237,7 +237,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         // raise `provisioning`, not `preparing`, so treat an in-flight
         // provision as preparing or those boots would go unprotected here.
         || pool_status.provisioning > 0;
-    let started_at = shared.state.started_at;
+    // Wall-clock boot instant, to compare with stored enqueue instants
+    // (`started_at` is monotonic).
+    let booted_at = now
+        .checked_sub(shared.state.started_at.elapsed())
+        .unwrap_or(std::time::UNIX_EPOCH);
 
     // ── Active attempts + the ready queue (from `inputs`) ────────────────
     let queued_jobs = inputs.ready.clone();
@@ -284,9 +288,10 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 .runner_labels
                 .iter()
                 .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
-            // An unmarked job measures from its enqueue instant (an unknown
-            // age — `enqueued_at` 0 after a restore — is not granted a fresh
-            // window); the verdict's `Mark` carries the instant to keep.
+            // An unmarked job measures from its enqueue instant or this
+            // node's boot, whichever is later (an unknown age — `enqueued_at`
+            // 0 after a restore — measures from boot); the verdict's `Mark`
+            // carries the instant to keep.
             let candidate = crate::control::logic::StarvationCandidate {
                 runs_on: &job.runs_on,
                 enqueued_at: std::time::UNIX_EPOCH
@@ -298,7 +303,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 &candidate,
                 now,
                 pool_preparing,
-                started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+                booted_at,
                 &pool_status.labels,
             ) {
                 crate::control::logic::StarvationVerdict::ClearMark => {
@@ -368,7 +373,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             active: inputs.active.clone(),
             paused: paused_credits,
             pool_preparing,
-            warm_window_open: started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            booted_at,
             pool_labels: pool_status.labels.clone(),
             first_seen,
         };

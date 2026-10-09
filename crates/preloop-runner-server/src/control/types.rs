@@ -997,14 +997,16 @@ pub(crate) struct ReapSweep {
     pub(crate) paused: std::collections::BTreeMap<i64, std::time::Duration>,
     /// A co-hosted pool is preparing/provisioning a runner.
     pub(crate) pool_preparing: bool,
-    /// This process started less than `MAX_QUEUED_GRACE` ago.
-    pub(crate) warm_window_open: bool,
+    /// When this node's process started: starvation clocks never start
+    /// before it (`logic::starvation_verdict`).
+    pub(crate) booted_at: std::time::SystemTime,
     /// Labels the co-hosted pool advertises; empty when it published none.
     pub(crate) pool_labels: Vec<String>,
     /// Node-local starvation marks: the instant this node's
     /// reaper first saw each unmatched ready job. Backends feed
     /// `first_seen.get(&(run, job))` to `logic::starvation_verdict`; they
-    /// never persist marks. A missing entry falls back to `enqueued_at`.
+    /// never persist marks. A missing entry falls back to `enqueued_at` or
+    /// `booted_at`, whichever is later.
     pub(crate) first_seen: std::collections::BTreeMap<(RunId, JobId), std::time::SystemTime>,
 }
 

@@ -69,10 +69,11 @@ pub(crate) fn run_priority(event: &str) -> i32 {
 
 /// How long an unmatched ready job may wait for a matching runner.
 pub(crate) const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
-/// Absolute backstop, measured from ready-enqueue, on how long a job whose
-/// labels the pool can satisfy — or whose runner a preparing pool may still
-/// provide — waits for a matching runner. One hour covers a full golden
-/// rebuild plus several failed provision rounds.
+/// Absolute backstop on how long a job whose labels the pool can satisfy —
+/// or whose runner a preparing pool may still provide — waits for a matching
+/// runner. Measured from ready-enqueue or this node's boot, whichever is
+/// later. One hour covers a full golden rebuild plus several failed
+/// provision rounds.
 pub(crate) const MAX_QUEUED_GRACE: Duration = Duration::from_secs(3600);
 
 /// Ready-job inputs for starvation evaluation.
@@ -196,14 +197,18 @@ pub(crate) fn concludes_at_submit(
 
 /// Decide starvation using the production 120/3600 second grace rules.
 ///
-/// Ages are measured on this node's clock; an enqueue instant another node
-/// stamped slightly in the future counts as age zero rather than as expired.
-/// `enqueued_at == UNIX_EPOCH` means the enqueue instant is unknown.
+/// Every clock starts at ready-enqueue or `booted_at` (this node's start),
+/// whichever is later: a restart kills the co-hosted pool's runners, so time
+/// a job spent queued before it says nothing about whether the restarted
+/// pool can serve it. `enqueued_at == UNIX_EPOCH` (instant unknown) measures
+/// from boot. Ages are measured on this node's clock; an instant another
+/// node stamped slightly in the future counts as age zero rather than as
+/// expired.
 pub(crate) fn starvation_verdict(
     job: &StarvationCandidate<'_>,
     now: SystemTime,
     pool_preparing: bool,
-    warm_window_open: bool,
+    booted_at: SystemTime,
     pool_labels: &[String],
 ) -> StarvationVerdict {
     // Non-Linux jobs can only run on a registered host; keep them queued
@@ -211,9 +216,8 @@ pub(crate) fn starvation_verdict(
     if job.any_runner_matches || needs_external_host(job.runs_on) {
         return StarvationVerdict::ClearMark;
     }
-    let enqueue_age = (job.enqueued_at != SystemTime::UNIX_EPOCH)
-        .then(|| now.duration_since(job.enqueued_at).unwrap_or_default());
-    let within_ceiling = enqueue_age.is_some_and(|age| age < MAX_QUEUED_GRACE);
+    let waiting_since = job.enqueued_at.max(booted_at);
+    let within_ceiling = now.duration_since(waiting_since).unwrap_or_default() < MAX_QUEUED_GRACE;
     // A job the pool's advertised labels can satisfy is exempt from the short
     // grace — its runner appears once the pool warms — so only the backstop
     // applies; one they can never satisfy fails fast instead of starving.
@@ -226,16 +230,14 @@ pub(crate) fn starvation_verdict(
         }
     }
     let grace = if pool_preparing {
-        // A known enqueue instant is protected until the ceiling; a restored
-        // job whose instant was lost gets this process's warm window only.
-        if within_ceiling || (enqueue_age.is_none() && warm_window_open) {
+        if within_ceiling {
             // Provisioning time does not consume the short grace. Re-stamp
             // at every protected tick so a retry gap starts a fresh window.
             return StarvationVerdict::Mark { first_seen: now };
         }
         MAX_QUEUED_GRACE
     } else {
-        let first_seen = job.first_seen.unwrap_or(job.enqueued_at);
+        let first_seen = job.first_seen.unwrap_or(waiting_since);
         if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
             return StarvationVerdict::Mark { first_seen };
         }
@@ -1080,6 +1082,9 @@ mod decision_tests {
         assert_eq!(counts, (1, 2, 4));
     }
 
+    /// A node that booted long before any job under test was enqueued.
+    const LONG_UP: SystemTime = SystemTime::UNIX_EPOCH;
+
     fn starvation_candidate<'a>(
         runs_on: &'a [String],
         enqueued_ago: Duration,
@@ -1101,13 +1106,13 @@ mod decision_tests {
         let mut job = starvation_candidate(&linux, Duration::from_secs(10_000), None, now);
         job.any_runner_matches = true;
         assert_eq!(
-            starvation_verdict(&job, now, false, false, &[]),
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
             StarvationVerdict::ClearMark
         );
         let mac = labels(&["macOS-14"]);
         let job = starvation_candidate(&mac, Duration::from_secs(10_000), None, now);
         assert_eq!(
-            starvation_verdict(&job, now, false, false, &[]),
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
             StarvationVerdict::ClearMark
         );
     }
@@ -1123,14 +1128,14 @@ mod decision_tests {
             now,
         );
         assert_eq!(
-            starvation_verdict(&job, now, false, false, &[]),
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
             StarvationVerdict::Mark {
                 first_seen: now - Duration::from_secs(30)
             }
         );
         let job = starvation_candidate(&linux, Duration::from_secs(121), None, now);
         let StarvationVerdict::Starve { reason, grace } =
-            starvation_verdict(&job, now, false, false, &[])
+            starvation_verdict(&job, now, false, LONG_UP, &[])
         else {
             panic!("an unmatched job past the grace window must starve");
         };
@@ -1145,31 +1150,56 @@ mod decision_tests {
         // Protected ticks re-stamp the observation clock.
         let young = starvation_candidate(&linux, Duration::from_secs(3599), None, now);
         assert_eq!(
-            starvation_verdict(&young, now, true, false, &[]),
+            starvation_verdict(&young, now, true, LONG_UP, &[]),
             StarvationVerdict::Mark { first_seen: now }
         );
-        // The ceiling holds even inside this process's warm window: a known
-        // enqueue instant past it starves.
         let old = starvation_candidate(&linux, MAX_QUEUED_GRACE, None, now);
-        for warm_window_open in [false, true] {
-            assert!(matches!(
-                starvation_verdict(&old, now, true, warm_window_open, &[]),
-                StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
-            ));
-        }
-        // A restored job whose enqueue instant was lost gets the warm window
-        // only.
+        assert!(matches!(
+            starvation_verdict(&old, now, true, LONG_UP, &[]),
+            StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
+        ));
+    }
+
+    /// A restart kills the co-hosted pool's runners, so the backlog it finds
+    /// must not be failed on time it spent queued before boot.
+    #[test]
+    fn restart_restarts_every_starvation_clock() {
+        let now = SystemTime::now();
+        let booted_at = now - Duration::from_secs(10);
+        let linux = labels(&["self-hosted", "linux"]);
+        let pool = labels(&["self-hosted", "linux", "x64"]);
+        let backlog = starvation_candidate(&linux, Duration::from_secs(7_200), None, now);
         let unknown = StarvationCandidate {
             enqueued_at: SystemTime::UNIX_EPOCH,
-            ..starvation_candidate(&linux, Duration::ZERO, None, now)
+            ..backlog.clone()
         };
-        assert_eq!(
-            starvation_verdict(&unknown, now, true, true, &[]),
-            StarvationVerdict::Mark { first_seen: now }
-        );
+        for job in [&backlog, &unknown] {
+            // Pool advertising matching labels, preparing, or neither.
+            assert_eq!(
+                starvation_verdict(job, now, false, booted_at, &pool),
+                StarvationVerdict::ClearMark
+            );
+            assert_eq!(
+                starvation_verdict(job, now, true, booted_at, &[]),
+                StarvationVerdict::Mark { first_seen: now }
+            );
+            assert_eq!(
+                starvation_verdict(job, now, false, booted_at, &[]),
+                StarvationVerdict::Mark {
+                    first_seen: booted_at
+                }
+            );
+        }
+        // The windows still close, measured from boot.
+        let later = booted_at + MAX_QUEUED_GRACE;
         assert!(matches!(
-            starvation_verdict(&unknown, now, true, false, &[]),
-            StarvationVerdict::Starve { .. }
+            starvation_verdict(&backlog, later, true, booted_at, &pool),
+            StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
+        ));
+        let later = booted_at + QUEUED_JOB_GRACE;
+        assert!(matches!(
+            starvation_verdict(&unknown, later, false, booted_at, &[]),
+            StarvationVerdict::Starve { grace, .. } if grace == QUEUED_JOB_GRACE
         ));
     }
 
@@ -1180,7 +1210,7 @@ mod decision_tests {
         let gpu = labels(&["self-hosted", "gpu"]);
         let fresh_gpu = starvation_candidate(&gpu, Duration::from_secs(1), None, now);
         let StarvationVerdict::Unschedulable { reason } =
-            starvation_verdict(&fresh_gpu, now, true, true, &pool)
+            starvation_verdict(&fresh_gpu, now, true, LONG_UP, &pool)
         else {
             panic!("labels the pool can never satisfy must fail fast");
         };
@@ -1189,19 +1219,19 @@ mod decision_tests {
         let mac = labels(&["macos-14"]);
         let mac_job = starvation_candidate(&mac, Duration::from_secs(1), None, now);
         assert_eq!(
-            starvation_verdict(&mac_job, now, false, false, &pool),
+            starvation_verdict(&mac_job, now, false, LONG_UP, &pool),
             StarvationVerdict::ClearMark
         );
         // A job the pool can satisfy skips the short grace until the ceiling.
         let linux = labels(&["self-hosted", "linux"]);
         let waiting = starvation_candidate(&linux, Duration::from_secs(600), None, now);
         assert_eq!(
-            starvation_verdict(&waiting, now, false, false, &pool),
+            starvation_verdict(&waiting, now, false, LONG_UP, &pool),
             StarvationVerdict::ClearMark
         );
         let stuck = starvation_candidate(&linux, MAX_QUEUED_GRACE, None, now);
         assert!(matches!(
-            starvation_verdict(&stuck, now, false, false, &pool),
+            starvation_verdict(&stuck, now, false, LONG_UP, &pool),
             StarvationVerdict::Starve { .. }
         ));
     }
@@ -1310,11 +1340,11 @@ mod decision_tests {
             ..starvation_candidate(&linux, Duration::ZERO, None, now)
         };
         assert!(matches!(
-            starvation_verdict(&ahead, now, false, false, &[]),
+            starvation_verdict(&ahead, now, false, LONG_UP, &[]),
             StarvationVerdict::Mark { .. }
         ));
         assert_eq!(
-            starvation_verdict(&ahead, now, true, false, &[]),
+            starvation_verdict(&ahead, now, true, LONG_UP, &[]),
             StarvationVerdict::Mark { first_seen: now }
         );
     }

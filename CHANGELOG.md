@@ -149,6 +149,14 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Fixed
+- **A restart no longer fails the queued backlog as starved**: the starvation
+  sweep measured every queued job from its ready-enqueue instant, so jobs
+  queued for more than an hour before an engine restart failed with
+  `none appeared within 3600s` seconds after boot — before the restarted
+  pool had registered a single runner (221 jobs on one deploy). Both the
+  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
+  whichever is later, so a restart gives the backlog the same window a newly
+  queued job gets.
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment

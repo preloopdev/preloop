@@ -1544,7 +1544,7 @@ pub(crate) mod suite {
                 active: Vec::new(),
                 paused: BTreeMap::new(),
                 pool_preparing: false,
-                warm_window_open: false,
+                booted_at: std::time::UNIX_EPOCH,
                 pool_labels: Vec::new(),
                 first_seen: BTreeMap::new(),
             })
@@ -5718,7 +5718,7 @@ pub(crate) mod suite {
             active: inputs.active,
             paused: BTreeMap::new(),
             pool_preparing: false,
-            warm_window_open: false,
+            booted_at: std::time::UNIX_EPOCH,
             pool_labels: Vec::new(),
             first_seen: BTreeMap::new(),
         }
@@ -6067,7 +6067,7 @@ pub(crate) mod suite {
                 active: inputs.active,
                 paused: Default::default(),
                 pool_preparing: false,
-                warm_window_open: false,
+                booted_at: std::time::UNIX_EPOCH,
                 pool_labels: Vec::new(),
                 first_seen: Default::default(),
             })
@@ -6121,7 +6121,7 @@ pub(crate) mod suite {
                 active: inputs.active,
                 paused: Default::default(),
                 pool_preparing: false,
-                warm_window_open: false,
+                booted_at: std::time::UNIX_EPOCH,
                 pool_labels: Vec::new(),
                 first_seen: Default::default(),
             })
@@ -8690,7 +8690,7 @@ mod lite {
                 active: inputs.active,
                 paused: Default::default(),
                 pool_preparing: false,
-                warm_window_open: false,
+                booted_at: std::time::UNIX_EPOCH,
                 pool_labels: Vec::new(),
                 first_seen: Default::default(),
             })
