@@ -48,12 +48,30 @@ test-properties-full:
     PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet
     PROPTEST_CASES=10000 cargo test --locked -p preloop-runner-server --quiet -- --ignored
 
+# Control-database migration gate (refinery over migrations/{sqlite,postgres}):
+# fresh init, populated-baseline upgrade, refusal/rollback and adoption, on
+# SQLite always and on PostgreSQL when PRELOOP_TEST_POSTGRES_URL names a
+# server (the control-plane workflow sets it in every matrix leg). Set
+# PRELOOP_TEST_REQUIRE_POSTGRES=1 to make a missing server a failure instead
+# of a skip.
+test-control-migrations:
+    cargo test --locked -p preloop-runner-server --quiet control::migrate_runner
+
+# Apply pending control-database migrations (creates a fresh store). Run
+# before `just serve` on a new PRELOOP_HOME; `just serve` does it for you.
+store-migrate:
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" cargo run -p preloop-cli -- store migrate
+
+store-status:
+    PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" cargo run -p preloop-cli -- store status
+
 # Security linter for GitHub Actions workflows
 zizmor:
     uvx zizmor .github/workflows/
 
 test-ci: fmt-check clippy zizmor
     PROPTEST_CASES=8 cargo test --locked --workspace --quiet
+    just test-control-migrations
     just conform
     @echo CI: all checks passed
 
@@ -96,10 +114,10 @@ bench-preloop-quick:
 # Local runner-client commands discover the persisted token in this same
 # engine home. Set PRELOOP_SYSTEM_TOKEN explicitly for a different server.
 
-serve:
+serve: store-migrate
     PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
 
-serve-dev:
+serve-dev: store-migrate
     PRELOOP_HOME="${PRELOOP_HOME:-$PWD/.preloop}" PRELOOP_LOCAL_WORKSPACE="${PRELOOP_LOCAL_WORKSPACE:-$PWD}" cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090 --enable-test-api --test-api-token dev-token
 
 #submit

@@ -38,13 +38,6 @@ mod webhooks;
 use super::types::ControlError;
 use tokio_postgres::{Client, NoTls};
 
-/// The schema this build creates and accepts. Greenfield v1: there are no
-/// migrations, a database at any other version is refused.
-pub(crate) const SCHEMA_VERSION: &str = "5";
-
-/// The agreed schema plus `schema_meta`.
-const SCHEMA_SQL: &str = include_str!("schema.sql");
-
 /// Writer connections per node (`PRELOOP_PG_WRITERS`, default 16).
 const WRITERS_ENV: &str = "PRELOOP_PG_WRITERS";
 /// Reader connections per node (`PRELOOP_PG_READERS`, default 16).
@@ -52,10 +45,6 @@ const READERS_ENV: &str = "PRELOOP_PG_READERS";
 const DEFAULT_POOL_SIZE: usize = 16;
 /// How long a command waits for a pooled connection before failing.
 const CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How often a booting node re-checks schema setup after losing the
-/// creation race to another node.
-const SCHEMA_SETUP_ATTEMPTS: usize = 5;
 
 /// Pool size from `var`, clamped to at least one connection. Size the pools
 /// so every node's `writers + readers + 1` (wake listener) fits
@@ -169,10 +158,12 @@ pub(crate) struct PgBackend {
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
-    /// Operator environment protection rules (`[environment_rules]`), applied
-    /// after open from the real server config. Empty until then — no rules
-    /// means every environment gate proceeds, the pre-rules behavior.
-    environment_rules: parking_lot::RwLock<std::sync::Arc<crate::config::EnvironmentRulesMap>>,
+    /// Environment protection rules resolver (TOML fallback + GitHub
+    /// environments API). `EnvironmentResolver::local(empty)` until
+    /// bootstrap installs the shared one — every gate proceeds, the
+    /// pre-rules behavior.
+    environment_resolver:
+        parking_lot::RwLock<std::sync::Arc<crate::environment_resolver::EnvironmentResolver>>,
     /// The co-hosted runner pool's shared status handle; its advertised
     /// labels decide whether a `runs-on` is satisfiable at submit and
     /// promotion. Detached (no labels) until bootstrap hands it over.
@@ -213,9 +204,11 @@ impl PgBackend {
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
                 runner_liveness_timeout.as_nanos() as u64,
             ),
-            environment_rules: parking_lot::RwLock::new(std::sync::Arc::new(
-                crate::config::EnvironmentRulesMap::new(),
-            )),
+            environment_resolver: parking_lot::RwLock::new(
+                crate::environment_resolver::EnvironmentResolver::local(
+                    crate::config::EnvironmentRulesMap::new(),
+                ),
+            ),
             pool_status: parking_lot::RwLock::new(Default::default()),
             released_bindings: std::sync::atomic::AtomicU64::new(0),
             wakes: wake_listener.wakes,
@@ -256,18 +249,20 @@ impl PgBackend {
             .store(runner_liveness_timeout.as_nanos() as u64, Release);
     }
 
-    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
-    /// Empty rules preserve the pre-rules behavior: every gate proceeds.
-    pub(crate) fn set_environment_rules(
+    /// Install the shared environment-rules resolver once bootstrap builds
+    /// it. The default resolves nothing: every gate proceeds.
+    pub(crate) fn set_environment_resolver(
         &self,
-        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     ) {
-        *self.environment_rules.write() = rules;
+        *self.environment_resolver.write() = resolver;
     }
 
-    /// The live environment protection rules (an `Arc` clone, cheap).
-    pub(super) fn environment_rules(&self) -> std::sync::Arc<crate::config::EnvironmentRulesMap> {
-        self.environment_rules.read().clone()
+    /// The live environment-rules resolver (an `Arc` clone, cheap).
+    pub(crate) fn environment_resolver(
+        &self,
+    ) -> std::sync::Arc<crate::environment_resolver::EnvironmentResolver> {
+        self.environment_resolver.read().clone()
     }
 
     /// Share the runner pool's status handle (bootstrap / `AppState`).
@@ -296,90 +291,48 @@ pub(super) fn db(error: tokio_postgres::Error) -> ControlError {
     ControlError::backend(error)
 }
 
-/// Create the v1 schema on a fresh database, or verify an existing one.
+/// Create the control schema on a brand-new database (test-support only).
 ///
-/// Nodes may boot against one database at once. Setup is one transaction
-/// that starts with a strict `CREATE SCHEMA control` (no `IF NOT EXISTS`):
-/// the first node creates everything atomically; a racing node blocks on
-/// that catalog row, fails with `duplicate_schema` once the winner commits,
-/// and re-reads `schema_meta`. A `control` schema without a readable
-/// `schema_version` (the pre-rewrite layout, a half-created schema) is
-/// refused rather than adopted.
-///
-/// Statements: `SELECT value FROM control.schema_meta WHERE key =
-/// 'schema_version'`; else `BEGIN; CREATE SCHEMA control; <schema.sql>;
-/// INSERT INTO schema_meta ('schema_version', '1'); INSERT INTO namespaces
-/// ('default'); COMMIT`.
-async fn ensure_schema(client: &mut Client) -> Result<(), ControlError> {
-    for _ in 0..SCHEMA_SETUP_ATTEMPTS {
-        if let Some(version) = stored_schema_version(client).await? {
-            if version != SCHEMA_VERSION {
-                return Err(ControlError::backend(anyhow::anyhow!(
-                    "control schema has version {version}; this build supports only \
-                     {SCHEMA_VERSION}. Recreate the database."
-                )));
-            }
-            return Ok(());
-        }
-        let tx = client.transaction().await.map_err(db)?;
-        let created = async {
-            tx.batch_execute("CREATE SCHEMA control").await?;
-            tx.batch_execute(SCHEMA_SQL).await?;
-            tx.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', $1)",
-                &[&SCHEMA_VERSION.as_bytes()],
-            )
-            .await?;
-            tx.execute(
-                "INSERT INTO namespaces (namespace_id) VALUES ($1)",
-                &[&super::types::DEFAULT_NAMESPACE],
-            )
-            .await?;
-            Ok::<_, tokio_postgres::Error>(())
-        }
-        .await;
-        match created {
-            Ok(()) => {
-                tx.commit().await.map_err(db)?;
-                return Ok(());
-            }
-            Err(error)
-                if error.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_SCHEMA)
-                    || error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) =>
-            {
-                // Lost the race (or the schema predates this layout); the
-                // next iteration reads what the winner committed.
-                drop(tx);
-                continue;
-            }
-            Err(error) => return Err(db(error)),
-        }
-    }
-    Err(ControlError::backend(anyhow::anyhow!(
-        "a `control` schema exists without a v1 `schema_meta` version; this build \
-         supports only schema version {SCHEMA_VERSION}. Recreate the database."
-    )))
+/// The embedded runner holds the setup advisory lock and applies the
+/// migrations (the baseline creates the schema, its tables and the ledger in
+/// one transaction), so two booting test-support nodes serialize instead of
+/// racing. Production creation goes through `preloop store migrate`, never
+/// through a server.
+#[cfg(any(test, feature = "test-support"))]
+async fn create_control_schema(client: &mut Client) -> Result<(), ControlError> {
+    super::migrate_runner::initialize_empty_postgres(client)
+        .await
+        .map_err(ControlError::backend)
 }
 
-/// `schema_meta.schema_version`, or `None` when the table (or row) does not
-/// exist yet.
-async fn stored_schema_version(client: &Client) -> Result<Option<String>, ControlError> {
-    let exists: bool = client
-        .query_one("SELECT to_regclass('control.schema_meta') IS NOT NULL", &[])
+/// Verify the database is exactly this build's control schema, or — only for
+/// test-support — create it on a brand-new database.
+///
+/// A serving process never creates, migrates or adopts: the ledger is the
+/// sole version authority, and a missing ledger (uninitialized database,
+/// legacy `public` store, pre-ledger `control` schema) or an
+/// older/newer/divergent applied set refuses with the recovery command
+/// (`preloop store migrate`, see `docs/control-migrations.md`).
+async fn ensure_schema(client: &mut Client) -> Result<(), ControlError> {
+    let ledger = super::migrations::postgres_ledger(client)
         .await
-        .map_err(db)?
-        .get(0);
-    if !exists {
-        return Ok(None);
+        .map_err(ControlError::backend)?;
+    if let super::migrations::Ledger::Empty = ledger {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            create_control_schema(client).await?;
+            let ledger = super::migrations::postgres_ledger(client)
+                .await
+                .map_err(ControlError::backend)?;
+            return super::migrations::check_ledger(ledger)
+                .map_err(super::migrations::backend_error);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        return Err(super::migrations::backend_error(
+            super::migrations::refusal(super::migrations::Ledger::Empty),
+        ));
     }
-    let row = client
-        .query_opt(
-            "SELECT value FROM control.schema_meta WHERE key = 'schema_version'",
-            &[],
-        )
-        .await
-        .map_err(db)?;
-    Ok(row.map(|row| String::from_utf8_lossy(row.get::<_, &[u8]>(0)).into_owned()))
+    super::migrations::check_ledger(ledger).map_err(super::migrations::backend_error)
 }
 
 /// Open one connection, spawn its driver task, resolve unqualified names to

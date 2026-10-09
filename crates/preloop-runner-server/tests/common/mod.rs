@@ -438,6 +438,7 @@ pub async fn complete_job(state: &AppState, run_id: RunId, job_id: &str, status:
             outputs: Default::default(),
             annotations: Vec::new(),
             step_results: Vec::new(),
+            environment_url: None,
         },
     )
     .await
