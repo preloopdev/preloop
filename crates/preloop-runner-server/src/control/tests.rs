@@ -6879,6 +6879,13 @@ pub(crate) mod suite {
             .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
             .await
             .unwrap();
+        complete_single_job(backend, run_id, status).await;
+    }
+    async fn complete_single_job(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        status: ExecutionStatus,
+    ) {
         backend
             .complete_job(crate::control::backend::JobCompletionInput {
                 run_id,
@@ -6965,7 +6972,7 @@ pub(crate) mod suite {
         assert_eq!(outcome.run_attempt, 2);
         assert_eq!(
             backend.job_queue_state(run_id, &job_id).await.unwrap(),
-            Some(("held".to_owned(), "pending".to_owned())),
+            Some(("blocked".to_owned(), "pending".to_owned())),
             "the re-armed gate parks the re-run job"
         );
         let armed = backend
@@ -7069,7 +7076,7 @@ pub(crate) mod suite {
                 .unwrap()
                 .map(|(queue_state, _)| queue_state)
                 .as_deref(),
-            Some("held"),
+            Some("blocked"),
             "the rerun's job waits on the workflow gate"
         );
 
@@ -7166,7 +7173,7 @@ pub(crate) mod suite {
                 .job_queue_state(run_x, &JobId("deploy".to_owned()))
                 .await
                 .unwrap(),
-            Some(("held".to_owned(), "pending".to_owned())),
+            Some(("blocked".to_owned(), "pending".to_owned())),
             "the re-run parks on the job gate"
         );
 
@@ -7213,7 +7220,7 @@ pub(crate) mod suite {
             .await
             .unwrap();
         assert_eq!(outcome.run_attempt, 2);
-        settle_single_job(backend, run_id, ExecutionStatus::Success).await;
+        complete_single_job(backend, run_id, ExecutionStatus::Success).await;
         assert_eq!(backend.run_record(run_id).await.unwrap().run_attempt, 2);
 
         // Past the 60-second grace with the hold disabled: the archiver

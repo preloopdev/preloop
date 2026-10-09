@@ -391,9 +391,11 @@ pub(crate) struct RerunJobTemplate {
 }
 
 /// `rerun_run` input: the run to re-execute plus the admission inputs the
-/// handler re-evaluated outside the transaction. GitHub re-runs the same
-/// workflow snapshot, so job specs, needs edges and stored messages are
-/// reused; what changes is the attempt identity.
+/// handler re-evaluated outside the transaction. The backend's installed
+/// environment resolver supplies current environment protection rules inside
+/// the transaction. GitHub re-runs the same workflow snapshot, so job specs,
+/// needs edges and stored messages are reused; what changes is the attempt
+/// identity.
 #[derive(Debug)]
 pub(crate) struct RerunRun {
     pub(crate) run_id: RunId,
