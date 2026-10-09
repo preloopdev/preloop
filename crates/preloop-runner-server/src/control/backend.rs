@@ -1166,6 +1166,30 @@ pub(crate) trait ControlBackend: Send + Sync {
         &self,
         limit: usize,
     ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Unresolved repairs of one App that still have attempts left, in
+    /// retry order (see the storage implementations). App-scoped and capped
+    /// in SQL: another App's backlog, or rows already at the cap, can never
+    /// fill the retry window and starve this App's repairs.
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Atomically take one redelivery attempt for a repair row.
+    ///
+    /// Succeeds only when the stored row still looks exactly like `observed`
+    /// — same attempt count, same resolution state — and charges the attempt
+    /// and the last-attempt clock in the same statement, returning the
+    /// claimed row. A second claimant (a watchdog overlapping a restart, a
+    /// second server on the store) reads a row that no longer matches what it
+    /// read, gets `None`, and must not send the request: the winner's attempt
+    /// already covers the delivery.
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError>;
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,
@@ -3105,6 +3129,33 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.open_webhook_redeliveries(limit).await,
             Self::Postgres(b) => b.open_webhook_redeliveries(limit).await,
+        }
+    }
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+        }
+    }
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.claim_webhook_redelivery(observed, claimed_at_us).await,
+            Self::Postgres(b) => b.claim_webhook_redelivery(observed, claimed_at_us).await,
         }
     }
     async fn resolve_webhook_redelivery(

@@ -152,11 +152,66 @@ file_size() {
   stat -f %z "$1" 2>/dev/null || stat -c %s "$1"
 }
 
+# A killed engine can leave its microVMs running and, on macOS, their image
+# layer volumes mounted inside the home; either makes the wipe fail with
+# "Resource busy". Engines that tear down on exit leave nothing to do here.
+release_campaign_home() {
+  local real pid mount_point
+  real="$(cd "$CAMPAIGN_HOME" 2>/dev/null && pwd -P || printf '%s' "$CAMPAIGN_HOME")"
+  # Match the hypervisor's argv (`_boot-vm <path inside the home>`), never a
+  # mere substring: a shell whose script mentions both would match too.
+  for pid in $(ps -axo pid=,command= | awk -v a="$CAMPAIGN_HOME/" -v b="$real/" '
+    { for (i = 2; i < NF; i++) if ($i == "_boot-vm" && (index($(i + 1), a) == 1 || index($(i + 1), b) == 1)) { print $1; break } }'); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  command -v hdiutil >/dev/null 2>&1 || return 0
+  mount | sed -n 's|^.* on \(.*\) (.*$|\1|p' \
+    | { grep -F -e "$CAMPAIGN_HOME/" -e "$real/" || true; } \
+    | while IFS= read -r mount_point; do
+        hdiutil detach -force "$mount_point" >/dev/null 2>&1 || true
+      done
+}
+
 prepare_golden_home() {
   # Dedicated temp home: a crashed run leaves VM disks (tens of GiB) that
   # crowd out the next golden unpack. The golden artifact itself lives
-  # outside this home (~/.config/preloop/vms), so a clean slate is safe.
-  rm -rf "$CAMPAIGN_HOME"
+  # outside this home (~/.config/preloop/vms), so a clean slate is safe —
+  # except for the node key: the required Postgres store outlives this wipe
+  # and the engine refuses a database created under a different key.
+  local saved_key="" real_home
+  if [ -f "$CAMPAIGN_HOME/state/hmac-key.bin" ]; then
+    # The wipe below removes CAMPAIGN_HOME, so the saved copy must live
+    # outside it. `mktemp` without a template honours TMPDIR, which may point
+    # inside the very home being wiped; create the copy beside the home
+    # instead, and verify that location with symlinks resolved — the same
+    # view the wipe has.
+    real_home="$(cd "$CAMPAIGN_HOME" 2>/dev/null && pwd -P || printf '%s' "$CAMPAIGN_HOME")"
+    saved_key="$(mktemp "$(dirname "$real_home")/preloop-hmac-key.XXXXXX")"
+    case "$(cd "$(dirname "$saved_key")" && pwd -P)/$(basename "$saved_key")" in
+      "$real_home"/*)
+        rm -f "$saved_key"
+        fail "temporary key copy $saved_key would be removed with $CAMPAIGN_HOME"
+        ;;
+    esac
+    # Never `cp -p` here: carrying a permissive source mode onto the restored
+    # key would hand the HMAC signing key to anyone who can read the campaign
+    # home. The saved copy is forced private, and `mv` keeps that mode.
+    cp "$CAMPAIGN_HOME/state/hmac-key.bin" "$saved_key"
+    chmod 600 "$saved_key"
+  fi
+  release_campaign_home
+  if ! rm -rf "$CAMPAIGN_HOME"; then
+    # Put the key back before giving up, or the next run mints a new one.
+    if [ -n "$saved_key" ]; then
+      mkdir -p "$CAMPAIGN_HOME/state"
+      mv "$saved_key" "$CAMPAIGN_HOME/state/hmac-key.bin"
+    fi
+    fail "cannot wipe $CAMPAIGN_HOME"
+  fi
+  if [ -n "$saved_key" ]; then
+    mkdir -p "$CAMPAIGN_HOME/state"
+    mv "$saved_key" "$CAMPAIGN_HOME/state/hmac-key.bin"
+  fi
   if [ "${PRELOOP_GOLDEN_SOURCE:-}" = ghcr ]; then
     # Fresh download into the empty campaign home: nothing is linked, so the
     # engine fetches the packed golden from the per-arch OCI reference.
@@ -371,6 +426,16 @@ wait_run() {
   printf '%s\n' timeout
 }
 
+# A rejected submission is this target's verdict, not the campaign's: record
+# it and let the remaining targets run.
+submission_rejected() {
+  local target="$1" target_dir="$2" output="$3"
+  printf '%s\n' "$output" | tee "$target_dir/submit.txt"
+  printf '%s\n' submission-rejected >"$target_dir/status.txt"
+  echo "=== [$target] final status: submission-rejected ==="
+  FAILED_TARGETS="${FAILED_TARGETS}${target}=submission-rejected\n"
+}
+
 run_target() {
   local target="$1" workflow_filter="${2:-}"
   local cfg slug url branch workflow event git_ref ws_dir target_dir submit run_id final_status
@@ -405,12 +470,12 @@ EOF
       submit="$("$CLIENT_BIN" --server "http://127.0.0.1:$PORT" submit \
         -W "$ws_dir/$workflow" --workspace-root "$ws_dir" --repository "$repo_slug" \
         --git-ref "$git_ref" --event "$event" --payload "$target_dir/event.json" 2>&1)" || {
-          printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
-          fail "[$target] workflow submission failed"
+          submission_rejected "$target" "$target_dir" "$submit"
+          return 0
         }
     else
-      printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
-      fail "[$target] workflow submission failed"
+      submission_rejected "$target" "$target_dir" "$submit"
+      return 0
     fi
   fi
   printf '%s\n' "$submit" | tee "$target_dir/submit.txt"
@@ -421,6 +486,9 @@ EOF
   # `set -e`: a transient server hiccup after the run concluded would abort
   # the whole run and lose the recorded result.
   run_snapshot "$run_id" "$target_dir/run.json" || true
+  # Job logs live in the campaign server's store, which the next run wipes.
+  PRELOOP_URL="http://127.0.0.1:$PORT" PRELOOP_TOKEN="$PRELOOP_SYSTEM_TOKEN" \
+    "$SERVER_BIN" logs "$run_id" >"$target_dir/logs.txt" 2>&1 || true
   printf '%s\n' "$final_status" >"$target_dir/status.txt" || true
   echo "=== [$target] final status: $final_status ==="
   case "$final_status" in
