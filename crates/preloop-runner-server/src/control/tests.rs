@@ -572,8 +572,12 @@ pub(crate) mod suite {
             .await
             .unwrap();
 
+        // The workflow builder leaves `requestId` as a 0 placeholder; the
+        // backend allocates the real id inside its transaction.
+        let mut build = submit_job(run_id, "build", 1);
+        build.queued.message.request_id = 0;
         let outcome = backend
-            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .submit_run(submit_run(run_id, vec![build]))
             .await
             .unwrap();
         assert_eq!(outcome.run_id, run_id);
@@ -603,6 +607,9 @@ pub(crate) mod suite {
 
         let ctx = backend.acquire_context(1).await.unwrap();
         assert_eq!(ctx.request.request_id, 1);
+        // The runner renews and finishes the request named in the message it
+        // receives, so the stored template must carry the allocated id.
+        assert_eq!(ctx.message.request_id, 1);
         assert_eq!(ctx.repository, "owner/repo");
 
         let done = backend

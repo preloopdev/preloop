@@ -4527,6 +4527,7 @@ impl PgBackend {
                 )
                 .await?;
                 node.request_id = Some(request_id);
+                message.request_id = request_id;
                 message.job_id = request.agent_job_id;
             }
             // Skipped nodes carry a placeholder message and mint nothing —
