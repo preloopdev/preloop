@@ -1438,6 +1438,20 @@ impl Session {
                 if !self.json {
                     println!("starting the engine in the foreground (Ctrl-C to stop)");
                 }
+                // Brand-new installs: initialize the control database so the
+                // first foreground serve works with no extra step. An
+                // existing database is never upgraded here — `preloop store
+                // migrate` is the explicit path.
+                let state_dir = crate::preloop_home().join("state");
+                std::fs::create_dir_all(&state_dir)?;
+                if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)?
+                    && !self.json
+                {
+                    println!(
+                        "initialized the control database at {}",
+                        state_dir.join("preloop.db").display()
+                    );
+                }
                 crate::cmd_engine(crate::ServeArgs::default(), observability).await
             }
             RunMode::Service => {

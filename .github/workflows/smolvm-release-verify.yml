@@ -250,8 +250,8 @@ jobs:
           # This runner is root, but preloop.service runs as an unprivileged
           # user, so smolvm's per-VM uid drop is inactive in production. Match
           # that here: as root the drop is on by default and squashes packed
-          # ownership (see docs/internal/workflows.md), which is an upstream
-          # defect, not a property of the release under test.
+          # ownership, which is an upstream defect, not a property of the
+          # release under test.
           export SMOLVM_VM_UID_DROP=off
           smolvm machine create --name "$CLONE_NAME" --from "${PACK}.smolmachine"
           smolvm machine start --name "$CLONE_NAME"
@@ -282,8 +282,7 @@ jobs:
           # through a count-1 idmapped mount, so any non-zero uid surfaces as the
           # overflow uid. Blocking on it would gate our bumps on an upstream fix
           # we do not ship; losing the signal entirely would let it regress
-          # silently if preloop ever runs privileged. See
-          # docs/internal/workflows.md.
+          # silently if preloop ever runs privileged.
           BASE_NAME="preloop-uiddrop-base-$(date +%s)"
           CLONE_NAME="${BASE_NAME}-clone"
           WORK="$(mktemp -d "${TMPDIR:-/tmp}/preloop-uiddrop.XXXXXX")"

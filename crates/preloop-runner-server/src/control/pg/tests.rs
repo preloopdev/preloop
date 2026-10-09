@@ -1528,3 +1528,73 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
         "nothing past the last bookmark: {after:?}"
     );
 }
+
+// ── claim-order plans ───────────────────────────────────────────────────
+
+/// The claim and front-gauge reads share ONE global queue order
+/// (`priority DESC, run_order, job_order`, tie-broken by `run_id, job_id`),
+/// and `jobs_ready_global` carries exactly that order, so the reads are
+/// index-fed instead of sorting the whole ready set. Without it a claim on a
+/// 20k-job ready queue costs 28 ms of seq scan + sort per poll (0.24 ms
+/// with it). The definition is pinned to the one the index/migration PR
+/// ships: one index for this order, never a second one under another name.
+#[tokio::test]
+async fn claim_order_is_served_by_the_global_ready_index() {
+    let Some((_pg, url)) = fresh_database_opt().await else {
+        return skip_no_postgres();
+    };
+    let node = connect(&url).await;
+    let run_id = RunId::new();
+    node.submit_run(submit_run(
+        run_id,
+        (0..64)
+            .map(|i| submit_job(run_id, &format!("job-{i:03}"), i as i64))
+            .collect(),
+    ))
+    .await
+    .unwrap();
+    let client = node.reader().await.unwrap();
+    client.batch_execute("ANALYZE jobs").await.unwrap();
+
+    let definition: String = client
+        .query_one(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'jobs' \
+             AND indexname = 'jobs_ready_global'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    for key in [
+        "btree (priority DESC, run_order, job_order, run_id, job_id)",
+        "WHERE (queue_state = 'ready'::text)",
+    ] {
+        assert!(
+            definition.contains(key),
+            "jobs_ready_global must keep the agreed definition, got {definition}"
+        );
+    }
+
+    // The ready-queue front (`ready_front_labels`, `queue_stats`) is the
+    // head of that order: one index read, no sort of the ready set.
+    let plan: String = client
+        .query(
+            "EXPLAIN SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
+             ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Index Scan using jobs_ready_global"),
+        "the front read must use the global index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Sort"),
+        "the front read must not sort:\n{plan}"
+    );
+}

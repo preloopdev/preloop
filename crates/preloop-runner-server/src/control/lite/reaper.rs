@@ -719,12 +719,14 @@ impl LiteBackend {
                     inputs.oldest_ready_job_id = Some(job_id);
                 }
             }
-            // Ready jobs' requirements, in queue order.
+            // Ready jobs' requirements, in the shared global queue order
+            // (never the pool key's text order: it groups equal label sets,
+            // it does not rank them).
             {
                 let mut stmt = tx
                     .prepare_cached(
                         "SELECT runs_on, runner_group FROM jobs WHERE queue_state = 'ready' \
-                         ORDER BY pool_key, priority DESC, run_order, job_order",
+                         ORDER BY priority DESC, run_order, job_order, run_id, job_id",
                     )
                     .map_err(db)?;
                 let rows = stmt

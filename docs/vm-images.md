@@ -149,7 +149,7 @@ pinned for reproducibility) or a local `.smolmachine`/archive path both work.
   that cannot complete fails the job: there is no local bake and nothing else
   to fall back to.
 - The OCI goldens the engine downloads by default are baked out-of-band —
-  aarch64 on the `macstudio` host, x86_64 on the `cpane` host — and published
+  aarch64 on an Apple Silicon host, x86_64 on a Linux KVM host — and published
   to GHCR as `preloop-<arch>-smolvm-golden`, digest-pinned in the engine and
   overridable with `PRELOOP_GOLDEN_OCI_REF`. On a host whose guest unpacks
   layers slower than GHCR's ~5-minute signed blob URLs allow, pull the pinned

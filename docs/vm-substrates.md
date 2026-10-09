@@ -121,7 +121,7 @@ with `/bin/true` and, when it does not answer, runs `aenv resume --timeout`
 before `guest_shell_command`/`guest_exec_command` proceed. The engine-side
 watcher does the same when a debug-session marker appears, so both the
 interactive CLI and the orchestrator can reach a parked sandbox
-(measured: resume 0.09 s + first exec 0.05 s on `cpane`).
+(measured on the Linux host: resume 0.09 s + first exec 0.05 s).
 
 Every AgentENV sandbox has a deadline (upstream default 300 s). A CI job
 outliving it would be killed mid-run, so each running sandbox gets a keepalive

@@ -315,8 +315,8 @@ jobs:
       # key to distribute. This complements the detached RSA signature the
       # signing step writes (`<asset>.sig`, verified by `preloop update` against
       # its pinned public key). Seeded goldens ride this step; a golden baked
-      # by its own host (cpane for x86_64, macstudio for aarch64) is attested by
-      # that host when it uploads.
+      # by its own host (x86_64 on the Linux host, aarch64 on the Apple
+      # Silicon host) is attested by that host when it uploads.
       - name: Attest release artifacts (build provenance)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:

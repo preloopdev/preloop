@@ -46,6 +46,7 @@ rsa.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 tokio-postgres.workspace = true
+refinery.workspace = true
 postgres_rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
@@ -137,6 +138,11 @@ required-features = ["test-support"]
 [[test]]
 name = "runner_deprecations"
 path = "tests/runner_deprecations.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "store_env"
+path = "tests/store_env.rs"
 required-features = ["test-support"]
 
 [dev-dependencies]

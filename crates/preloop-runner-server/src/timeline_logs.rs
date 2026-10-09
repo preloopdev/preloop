@@ -520,6 +520,24 @@ pub async fn console_log(
     StatusCode::OK
 }
 
+/// The resolved URL out of an `actionsEnvironment.url` member.
+///
+/// The value is a plain string when this server's runner raised the event
+/// (it reports the evaluated value), but the member is a TemplateToken on the
+/// official wire shape — take a resolved `lit` too, and never a raw `expr`.
+fn resolved_environment_url(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("lit")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|url| !url.is_empty())
+}
+
 /// POST finish job — runner reports final result + outputs.
 pub async fn finish_job(
     State(shared): State<Arc<SharedState>>,
@@ -583,6 +601,14 @@ pub async fn finish_job(
             outputs,
             annotations: Vec::new(),
             step_results: Vec::new(),
+            // The runner raised the event with the evaluated environment URL
+            // (`JobCompletedEvent.ActionsEnvironment`), the legacy path's
+            // twin of `CompleteJobRequest.environmentUrl`.
+            environment_url: event
+                .actions_environment
+                .as_ref()
+                .and_then(|environment| environment.url.as_ref())
+                .and_then(resolved_environment_url),
         })
     } else {
         None
@@ -795,6 +821,9 @@ pub async fn finish_job_plan(
             outputs,
             annotations: Vec::new(),
             step_results: Vec::new(),
+            environment_url: event
+                .pointer("/actionsEnvironment/url")
+                .and_then(resolved_environment_url),
         })
     } else {
         warn!(plan_id, "finish_job_plan: could not resolve run/job");
