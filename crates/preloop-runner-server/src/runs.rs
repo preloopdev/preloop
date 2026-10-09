@@ -1289,6 +1289,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .map(std::path::Path::new)
         .or(shared.state.local_workspace.as_deref());
     let workspace_snapshot = if let Some(workspace) = local_workspace {
+        // The snapshot is a local submission's only copy of the tested tree:
+        // the synthetic commit exists nowhere else, so there is no other
+        // checkout to fall back to. Failing here reports the real reason (a
+        // full disk, a publish that could not be completed) to the person who
+        // submitted, instead of queueing jobs that can only die in setup.
         match create_workspace_snapshot(
             &shared.state.state_dir,
             workspace,
@@ -1300,15 +1305,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
-                warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
-                None
+                error!(
+                    %run_id,
+                    workspace = %workspace.display(),
+                    message = error.message(),
+                    "Refusing local submission: workspace snapshot could not be created"
+                );
+                return Err(error);
             }
         }
     } else {
         match create_remote_checkout_snapshot(shared, &submission, run_id, &sha).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                warn!(%run_id, error = ?error, "Failed to populate remote checkout cache — falling back to normal checkout");
+                // The commit exists upstream, so jobs can still check out
+                // directly — degraded, never broken. Reported at error level
+                // because it is a full forge fetch per job, not a cache hit.
+                error!(%run_id, error = ?error, "Failed to populate remote checkout cache — jobs will fetch from the forge");
                 None
             }
         }

@@ -19,6 +19,23 @@ use tokio_util::io::ReaderStream;
 const SNAPSHOT_REF: &str = "refs/heads/snapshot";
 const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
+/// Subdirectory of `state/snapshots/` holding in-flight snapshot repositories.
+///
+/// A snapshot is published with `rename(2)`, which the kernel refuses across
+/// filesystems (`EXDEV`). Staging under the state directory makes staging and
+/// destination one device by construction; staging in `std::env::temp_dir()`
+/// did not — on the common production layout (`/tmp` a tmpfs, state on
+/// LVM/ext4) every publish failed and the snapshot the run was supposed to
+/// test was never created.
+const SNAPSHOT_STAGING_DIR: &str = ".staging";
+
+/// How long a staging heartbeat may be stale before the startup sweep treats
+/// its entry as abandoned. Snapshot capture is seconds to minutes even for
+/// large repositories; a heartbeat keeps long captures safe while the process
+/// is alive, and an old heartbeat means the owner died between staging and
+/// publish.
+const SNAPSHOT_STAGING_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// TTL for cached GitHub repository metadata (numeric ID + visibility).
 /// Repo metadata changes rarely; five minutes bounds staleness for renames
 /// while keeping repeated local submissions off the network.
@@ -317,6 +334,14 @@ async fn detect_workspace_upstream(
     Some((slug, repository_id, private))
 }
 
+/// Staging root for one snapshot, under the destination directory tree so the
+/// publish is always a same-filesystem [`tokio::fs::rename`].
+fn snapshot_staging_root(snapshots_dir: &FsPath, run_id: RunId) -> PathBuf {
+    snapshots_dir
+        .join(SNAPSHOT_STAGING_DIR)
+        .join(format!("{run_id}-{}", uuid::Uuid::new_v4()))
+}
+
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
 ///
 /// A private index and a temporary bare object database keep the user's index,
@@ -356,12 +381,11 @@ pub async fn create_workspace_snapshot(
         )));
     }
 
-    // Keep the staging repository outside the source worktree. Otherwise a
-    // state directory that is not ignored could recursively snapshot itself.
-    let staging_root = std::env::temp_dir().join(format!(
-        "preloop-workspace-snapshot-{run_id}-{}",
-        uuid::Uuid::new_v4()
-    ));
+    // Keep the staging repository outside the source worktree (a state
+    // directory that is not ignored could otherwise recursively snapshot
+    // itself) and on the destination's own filesystem, so the publish below
+    // is a device-local `rename(2)` rather than an `EXDEV` failure.
+    let staging_root = snapshot_staging_root(&snapshots_dir, run_id);
     let staging_repository = staging_root.join("repository.git");
     let staging_index = staging_root.join("index");
     tokio::fs::create_dir_all(&staging_root)
@@ -372,6 +396,29 @@ pub async fn create_workspace_snapshot(
                 staging_root.display()
             ))
         })?;
+    let heartbeat_path = staging_root.join(".heartbeat");
+    tokio::fs::write(&heartbeat_path, b"")
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to create snapshot staging heartbeat {}: {error}",
+                heartbeat_path.display()
+            ))
+        })?;
+    let heartbeat_staging_root = staging_root.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                tokio::fs::write(heartbeat_staging_root.join(".heartbeat"), b"").await
+            {
+                debug!(%error, "Snapshot staging heartbeat stopped");
+                break;
+            }
+        }
+    });
 
     // Detect the workspace's GitHub upstream concurrently with snapshot
     // creation. Best-effort: a missing remote or unresolvable slug leaves
@@ -384,11 +431,12 @@ pub async fn create_workspace_snapshot(
             &staging_repository,
             &staging_index,
             &final_repository,
-            run_id,
             github_pat,
         ),
         detect_workspace_upstream(&workspace, shared, github_pat),
     );
+    heartbeat.abort();
+    let _ = heartbeat.await;
     if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await
         && staging_root.exists()
     {
@@ -988,7 +1036,6 @@ async fn create_workspace_snapshot_inner(
     staging_repository: &FsPath,
     staging_index: &FsPath,
     final_repository: &FsPath,
-    run_id: RunId,
     github_pat: Option<&str>,
 ) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
@@ -1593,13 +1640,7 @@ async fn create_workspace_snapshot_inner(
     // `lfs: true` can download through the snapshot Git HTTP endpoint.
     copy_lfs_objects_into_snapshot(&common_dir, staging_repository).await?;
 
-    tokio::fs::rename(staging_repository, final_repository)
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "failed to publish snapshot repository for run {run_id}: {error}"
-            ))
-        })?;
+    publish_staged_repository(staging_repository, final_repository).await?;
     Ok(SnapshotResult {
         commit_sha,
         // The snapshot commit's tree — the exact staged dirty tree CI tests,
@@ -1610,6 +1651,159 @@ async fn create_workspace_snapshot_inner(
         default_branch,
         before_sha,
     })
+}
+
+/// Publish a staged snapshot repository at its final path.
+///
+/// The publish is a `rename(2)`: atomic, and the reason staging exists at all —
+/// a half-written repository must never be visible to a run. Callers stage
+/// under [`SNAPSHOT_STAGING_DIR`] so the rename stays on one device. A staging
+/// tree that landed elsewhere anyway (an operator bind-mount over the staging
+/// directory, a future caller) is copied into the destination directory and
+/// renamed from there, which keeps the atomicity while paying for a copy
+/// instead of failing every run.
+async fn publish_staged_repository(staging: &FsPath, destination: &FsPath) -> Result<(), ApiError> {
+    match rename_staged(staging, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            #[cfg(test)]
+            CROSS_DEVICE_PUBLISHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            warn!(
+                staging = %staging.display(),
+                destination = %destination.display(),
+                %error,
+                "Snapshot staging directory is on another filesystem; copying it into the state directory to publish"
+            );
+            let in_place = destination
+                .parent()
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "snapshot repository has no parent directory: {}",
+                        destination.display()
+                    ))
+                })?
+                .join(format!(".publish-{}", uuid::Uuid::new_v4()));
+            let source = staging.to_path_buf();
+            let staged = in_place.clone();
+            let copied = tokio::task::spawn_blocking(move || copy_dir_recursive(&source, &staged))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("snapshot publish copy task failed: {error}"))
+                })?;
+            if let Err(error) = copied {
+                let _ = tokio::fs::remove_dir_all(&in_place).await;
+                return Err(publish_failure(
+                    "copying the staging tree into the state directory",
+                    staging,
+                    destination,
+                    &error,
+                ));
+            }
+            match tokio::fs::rename(&in_place, destination).await {
+                Ok(()) => {
+                    // The staging tree sat on another device; removing it is
+                    // best-effort and cannot invalidate the published copy.
+                    if let Err(error) = tokio::fs::remove_dir_all(staging).await {
+                        warn!(
+                            staging = %staging.display(),
+                            %error,
+                            "Failed to remove the cross-filesystem snapshot staging directory"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_dir_all(&in_place).await;
+                    Err(publish_failure(
+                        "renaming the staged copy into place",
+                        staging,
+                        destination,
+                        &error,
+                    ))
+                }
+            }
+        }
+        Err(error) => Err(publish_failure("renaming", staging, destination, &error)),
+    }
+}
+
+/// Log a publish failure with both paths and the OS error, then hand the same
+/// detail to the caller.
+///
+/// A failed publish denies the run its only source of the tested tree, so it
+/// must never be reduced to a warning: the operator sees the OS error and the
+/// two paths here, and a local submission is refused with the message.
+fn publish_failure(
+    step: &str,
+    staging: &FsPath,
+    destination: &FsPath,
+    error: &std::io::Error,
+) -> ApiError {
+    error!(
+        staging = %staging.display(),
+        destination = %destination.display(),
+        %error,
+        "Failed to publish workspace snapshot repository"
+    );
+    ApiError::internal(format!(
+        "failed to publish workspace snapshot repository: {step} {} -> {} failed: {error}",
+        staging.display(),
+        destination.display()
+    ))
+}
+
+/// Publish rename with the test seam in front of it.
+async fn rename_staged(staging: &FsPath, destination: &FsPath) -> std::io::Result<()> {
+    if let Some(error) = injected_rename_failure(destination) {
+        return Err(error);
+    }
+    tokio::fs::rename(staging, destination).await
+}
+
+/// Publish renames still to answer with `EXDEV`, for one destination path.
+///
+/// Only a genuine cross-filesystem rename makes the kernel return `EXDEV`, and
+/// a host with a spare filesystem exercises the recovery for real (the tests
+/// mount a RAM disk on macOS and use `/dev/shm` where it exists). Where no
+/// second filesystem can be had, this reproduces the kernel's answer without
+/// one. Scoped to a destination path so a test cannot fail a rename another
+/// test is running, and counted down so the recovery's own rename — which
+/// targets that same path — still succeeds.
+#[cfg(test)]
+static INJECTED_RENAME_FAILURES: parking_lot::Mutex<Option<(PathBuf, usize)>> =
+    parking_lot::Mutex::new(None);
+
+/// Number of publishes that took the cross-device recovery, for tests.
+#[cfg(test)]
+static CROSS_DEVICE_PUBLISHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn inject_rename_failure(destination: &FsPath, count: usize) {
+    *INJECTED_RENAME_FAILURES.lock() = Some((destination.to_path_buf(), count));
+}
+
+#[cfg(test)]
+fn cross_device_publishes() -> usize {
+    CROSS_DEVICE_PUBLISHES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Take one injected failure for `destination`, if any are pending. Compiled
+/// out of production builds, which have no way to fake a device boundary.
+fn injected_rename_failure(destination: &FsPath) -> Option<std::io::Error> {
+    #[cfg(test)]
+    {
+        let mut pending = INJECTED_RENAME_FAILURES.lock();
+        if let Some((path, remaining)) = pending.as_mut()
+            && path == destination
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Some(std::io::Error::from_raw_os_error(libc::EXDEV));
+        }
+    }
+    let _ = destination;
+    None
 }
 
 /// The immutable snapshot commit plus the workspace facts needed to present
@@ -2715,8 +2909,14 @@ pub async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
 ///   exists in memory, are deleted now;
 /// - an unparseable or very young entry is left alone: a snapshot being
 ///   written right now must not be swept out from under its run.
+///
+/// Abandoned staging trees under [`SNAPSHOT_STAGING_DIR`] are collected in the
+/// same pass: the success and error paths both remove theirs, so anything left
+/// is a kill between staging and publish — a full repository copy nothing else
+/// ever revisits.
 pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
     let retention = std::time::Duration::from_secs(shared.state.snapshot_retention_seconds);
+    sweep_abandoned_snapshot_staging(&shared.state.state_dir.join("snapshots")).await;
     let runs: std::collections::BTreeMap<
         RunId,
         (ExecutionStatus, Option<chrono::DateTime<chrono::Utc>>),
@@ -2824,6 +3024,72 @@ pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
     }
     if swept > 0 || rearmed > 0 {
         info!(swept, rearmed, "Swept orphaned workspace snapshots");
+    }
+}
+
+/// Delete snapshot staging trees abandoned by an earlier engine.
+///
+/// [`create_workspace_snapshot`] removes its staging root on both the success
+/// and the observed-error path, so a surviving entry means the process was
+/// killed mid-capture. Nothing else enumerates this directory, and a staging
+/// tree is a full copy of a bare repository — left alone they accumulate at
+/// the size of the repositories being snapshotted.
+///
+/// The `.heartbeat` file is refreshed throughout each capture, so a live
+/// capture is spared even when child-file writes do not update the staging
+/// root's mtime. Entries without a heartbeat use the root mtime for backwards
+/// compatibility.
+async fn sweep_abandoned_snapshot_staging(snapshots_dir: &FsPath) {
+    let staging_root = snapshots_dir.join(SNAPSHOT_STAGING_DIR);
+    let mut entries = match tokio::fs::read_dir(&staging_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(
+                path = %staging_root.display(),
+                %error,
+                "Failed to list snapshot staging directories for startup sweep"
+            );
+            return;
+        }
+    };
+    let mut swept = 0usize;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    path = %staging_root.display(),
+                    %error,
+                    "Failed to read entry during snapshot staging sweep"
+                );
+                break;
+            }
+        };
+        let path = entry.path();
+        match snapshot_staging_age(&path).await {
+            Some(age) if age < SNAPSHOT_STAGING_GRACE => continue,
+            Some(_) => {}
+            // Unreadable metadata is not a reason to delete: the age is the
+            // only evidence the tree is abandoned.
+            None => continue,
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => swept += 1,
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "Failed to remove abandoned snapshot staging directory"
+            ),
+        }
+    }
+    if swept > 0 {
+        info!(
+            swept,
+            root = %staging_root.display(),
+            "Removed abandoned snapshot staging directories"
+        );
     }
 }
 
@@ -3001,6 +3267,13 @@ async fn entry_age(path: &FsPath) -> Option<std::time::Duration> {
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.elapsed().ok())
+}
+async fn snapshot_staging_age(path: &FsPath) -> Option<std::time::Duration> {
+    let heartbeat = path.join(".heartbeat");
+    match entry_age(&heartbeat).await {
+        Some(age) => Some(age),
+        None => entry_age(path).await,
+    }
 }
 
 async fn remove_cache_entry(path: &FsPath) {
@@ -6125,6 +6398,391 @@ mod snapshot_sweep_tests {
         assert!(
             !dir.exists(),
             "re-armed timer discards unreferenced snapshot"
+        );
+    }
+
+    /// A kill between staging a snapshot and publishing it leaves a full bare
+    /// repository under `state/snapshots/.staging` that nothing else ever
+    /// revisits: the publish removes its own staging root on every path it can
+    /// observe. The startup sweep is the only collector, and it must spare a
+    /// tree young enough to belong to a capture running right now (a second
+    /// engine process can share the state directory).
+    #[tokio::test]
+    async fn sweep_collects_abandoned_staging_and_spares_a_live_capture() {
+        let (_temp, shared) = fixture(60).await;
+        let staging_root = shared
+            .state
+            .state_dir
+            .join("snapshots")
+            .join(SNAPSHOT_STAGING_DIR);
+        let abandoned = staging_root.join(format!("{}-{}", RunId::new(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(abandoned.join("repository.git")).unwrap();
+        std::fs::write(
+            abandoned.join("repository.git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        let live = staging_root.join(format!("{}-{}", RunId::new(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(abandoned.join(".heartbeat"), b"").unwrap();
+        std::fs::write(live.join(".heartbeat"), b"").unwrap();
+        // Age the abandoned heartbeat past the grace window. The live root is
+        // intentionally stale too: its fresh heartbeat represents a capture
+        // that is still writing into repository.git.
+        let stale = filetime::FileTime::from_unix_time(
+            chrono::Utc::now().timestamp() - SNAPSHOT_STAGING_GRACE.as_secs() as i64 - 60,
+            0,
+        );
+        filetime::set_file_mtime(abandoned.join(".heartbeat"), stale).unwrap();
+        filetime::set_file_mtime(&live, stale).unwrap();
+
+        sweep_workspace_snapshots(&shared).await;
+
+        assert!(
+            !abandoned.exists(),
+            "an abandoned staging tree is collected at startup"
+        );
+        assert!(
+            live.is_dir(),
+            "a staging tree inside the grace window may still be a live capture"
+        );
+    }
+}
+
+/// Cross-filesystem publish coverage.
+///
+/// The bug these tests pin: the snapshot was staged in the process temp
+/// directory, so publishing it was a `rename(2)` across filesystems — which
+/// the kernel refuses with `EXDEV` whenever `/tmp` is not on the state
+/// directory's device (tmpfs `/tmp` over an LVM/ext4 state volume, the common
+/// production layout). The immutable snapshot was never created, and a local
+/// submission — whose synthetic commit exists nowhere else — fell back to a
+/// checkout of a commit no forge has.
+#[cfg(test)]
+mod snapshot_staging_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Directories that may sit on another device than the state directory,
+    /// cheapest first. Linux gives `/dev/shm` for free; macOS needs a RAM disk.
+    const OTHER_DEVICE_CANDIDATES: &[&str] = &["/dev/shm", "/run/shm"];
+
+    fn device_of(path: &FsPath) -> Option<u64> {
+        std::fs::metadata(path).ok().map(|metadata| metadata.dev())
+    }
+
+    /// Whether `path` is writable and on a different device from `reference`.
+    fn is_other_device(path: &FsPath, reference: &FsPath) -> bool {
+        let (Some(path_device), Some(reference_device)) = (device_of(path), device_of(reference))
+        else {
+            return false;
+        };
+        if path_device == reference_device {
+            return false;
+        }
+        // A read-only mount is not a usable staging root.
+        let probe = path.join(format!("preloop-device-probe-{}", uuid::Uuid::new_v4()));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a rename between the two directories really is cross-device, by
+    /// asking the kernel rather than trusting the fixture.
+    async fn is_cross_device_rename(from: &FsPath, to: &FsPath) -> bool {
+        let probe = from.join(format!("preloop-rename-probe-{}", uuid::Uuid::new_v4()));
+        let target = to.join(format!("preloop-rename-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&probe).unwrap();
+        match tokio::fs::rename(&probe, &target).await {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&target);
+                false
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&probe);
+                error.kind() == std::io::ErrorKind::CrossesDevices
+            }
+        }
+    }
+
+    /// A directory on a different filesystem from the state directory,
+    /// unmounted when it goes out of scope.
+    struct OtherFilesystem {
+        path: PathBuf,
+        /// Device node of a RAM disk to detach on drop; `None` for a
+        /// borrowed mount such as `/dev/shm`.
+        ram_disk: Option<String>,
+    }
+
+    impl OtherFilesystem {
+        fn create(reference: &FsPath, scratch: &FsPath) -> Option<Self> {
+            if let Some(path) = OTHER_DEVICE_CANDIDATES
+                .iter()
+                .map(FsPath::new)
+                .find(|candidate| is_other_device(candidate, reference))
+            {
+                return Some(Self {
+                    path: path.to_path_buf(),
+                    ram_disk: None,
+                });
+            }
+            ram_disk_other_filesystem(reference, scratch)
+        }
+    }
+
+    impl Drop for OtherFilesystem {
+        fn drop(&mut self) {
+            let Some(device) = self.ram_disk.take() else {
+                return;
+            };
+            let _ = std::process::Command::new("diskutil")
+                .args(["unmount", "force"])
+                .arg(&self.path)
+                .output();
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", &device])
+                .output();
+        }
+    }
+
+    /// macOS has no second device to borrow, so the test makes one: a RAM disk
+    /// is attachable, formattable and mountable by the invoking user — both
+    /// device nodes and `diskutil mount` work without root, which is what lets
+    /// CI and a developer's machine exercise a real cross-device rename.
+    #[cfg(target_os = "macos")]
+    fn ram_disk_other_filesystem(reference: &FsPath, scratch: &FsPath) -> Option<OtherFilesystem> {
+        // 1 GiB: the process temp dir points here for the duration of one test,
+        // so sibling tests sharing the test binary must not run out of space.
+        let attached = std::process::Command::new("hdiutil")
+            .args(["attach", "-nomount", "ram://2097152"])
+            .output()
+            .ok()?;
+        if !attached.status.success() {
+            return None;
+        }
+        let device = String::from_utf8_lossy(&attached.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)?;
+        let formatted = std::process::Command::new("newfs_hfs")
+            .args(["-v", "PRELOOP-SNAPSHOT-TEST", &device])
+            .output()
+            .ok()?;
+        if !formatted.status.success() {
+            detach_ram_disk(&device);
+            return None;
+        }
+        let mount_point = scratch.join("other-filesystem");
+        std::fs::create_dir_all(&mount_point).ok()?;
+        let mounted = std::process::Command::new("diskutil")
+            .args(["mount", "-mountPoint"])
+            .arg(&mount_point)
+            .arg(device.trim_start_matches("/dev/"))
+            .output()
+            .ok()?;
+        if !mounted.status.success() || !is_other_device(&mount_point, reference) {
+            let _ = std::process::Command::new("diskutil")
+                .args(["unmount", "force"])
+                .arg(&mount_point)
+                .output();
+            detach_ram_disk(&device);
+            return None;
+        }
+        Some(OtherFilesystem {
+            path: mount_point,
+            ram_disk: Some(device),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ram_disk_other_filesystem(
+        _reference: &FsPath,
+        _scratch: &FsPath,
+    ) -> Option<OtherFilesystem> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn detach_ram_disk(device: &str) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", device])
+            .output();
+    }
+
+    fn git_ok(directory: &FsPath, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A real worktree with one commit: the snapshot path shells out to `git`
+    /// for the clone, the commit and the ref publication.
+    fn init_workspace(path: &FsPath) {
+        std::fs::create_dir_all(path).unwrap();
+        git_ok(path, &["init", "-q", "-b", "main"]);
+        git_ok(path, &["config", "user.email", "staging@test.local"]);
+        git_ok(path, &["config", "user.name", "staging tests"]);
+        std::fs::write(path.join("README.md"), "snapshot staging\n").unwrap();
+        git_ok(path, &["add", "-A"]);
+        git_ok(path, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Enough of a bare repository for a publish to be worth checking.
+    fn write_bare_repository(path: &FsPath) {
+        std::fs::create_dir_all(path.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(path.join("objects/ab")).unwrap();
+        std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            path.join("refs/heads/main"),
+            format!("{}\n", "0".repeat(40)),
+        )
+        .unwrap();
+        std::fs::write(path.join("objects/ab/cdef"), b"object").unwrap();
+    }
+
+    fn staging_dir_entries(snapshots_dir: &FsPath) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(snapshots_dir.join(SNAPSHOT_STAGING_DIR))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The publish is a `rename(2)`. A staging tree on another filesystem makes
+    /// the kernel answer `EXDEV`, and the published repository must still
+    /// appear complete, with the staging tree gone and no partial copy left
+    /// under the destination's own staging directory.
+    #[tokio::test]
+    async fn cross_filesystem_staging_still_publishes_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshots_dir = temp.path().join("state").join("snapshots");
+        std::fs::create_dir_all(snapshots_dir.join(SNAPSHOT_STAGING_DIR)).unwrap();
+        let destination = snapshots_dir.join(RunId::new().to_string());
+
+        let other = OtherFilesystem::create(&snapshots_dir, temp.path());
+        let staging_dir_guard = other
+            .as_ref()
+            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
+        let staging = match &staging_dir_guard {
+            Some(staging_dir) => staging_dir.path().join("repository.git"),
+            // No second filesystem on this host: reproduce the kernel's answer
+            // for the cross-device rename the recovery exists for.
+            None => snapshots_dir
+                .join(SNAPSHOT_STAGING_DIR)
+                .join("repository.git"),
+        };
+        write_bare_repository(&staging);
+
+        let cross_device = match &other {
+            Some(other) => {
+                let cross_device = is_cross_device_rename(&other.path, &snapshots_dir).await;
+                assert!(
+                    cross_device,
+                    "the fixture must be a different device from the destination"
+                );
+                cross_device
+            }
+            None => {
+                inject_rename_failure(&destination, 1);
+                true
+            }
+        };
+        let publishes_before = cross_device_publishes();
+
+        publish_staged_repository(&staging, &destination)
+            .await
+            .expect("a staging tree on another filesystem must still publish");
+
+        assert!(
+            destination.join("HEAD").is_file(),
+            "the published repository is complete"
+        );
+        assert!(
+            destination.join("objects/ab/cdef").is_file(),
+            "the published repository carries the whole tree"
+        );
+        assert!(
+            !staging.exists(),
+            "the staging tree is gone after publishing"
+        );
+        assert_eq!(
+            staging_dir_entries(&snapshots_dir),
+            Vec::<String>::new(),
+            "no partial copy is left in the destination's staging directory"
+        );
+        if cross_device {
+            assert_eq!(
+                cross_device_publishes(),
+                publishes_before + 1,
+                "the publish took the cross-device recovery"
+            );
+        }
+    }
+
+    /// The bench that found this: the engine's `TMPDIR` on tmpfs, the state
+    /// directory on another device. Staging in the process temp directory made
+    /// the publish fail with `EXDEV`, the immutable snapshot was never created,
+    /// and the run fell back to a checkout of a commit no forge has.
+    #[tokio::test]
+    async fn snapshot_publishes_when_the_process_temp_dir_is_another_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let state_dir = temp.path().join("state");
+        init_workspace(&workspace);
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let other = OtherFilesystem::create(&state_dir, temp.path());
+        let tmpdir_guard = other
+            .as_ref()
+            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
+        let tmpdir = match &tmpdir_guard {
+            Some(tmpdir) => tmpdir.path().to_path_buf(),
+            // No second filesystem to point `TMPDIR` at: the publish below
+            // still runs, but only a host with a spare device can make the
+            // rename cross-device. The recovery itself is covered by
+            // `cross_filesystem_staging_still_publishes_atomically`.
+            None => temp.path().join("tmp"),
+        };
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _tmpdir = crate::state::TestEnvVar::set("TMPDIR", &tmpdir);
+
+        let run_id = RunId::new();
+        let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None)
+            .await
+            .expect("the snapshot must publish whatever TMPDIR points at");
+
+        let repository = state_dir.join(&snapshot.repository);
+        assert!(
+            repository.join("HEAD").is_file(),
+            "the immutable snapshot repository is published"
+        );
+        assert_eq!(
+            staging_dir_entries(&state_dir.join("snapshots")),
+            Vec::<String>::new(),
+            "publishing leaves no staging tree behind"
+        );
+        let staged_in_temp_dir: Vec<String> = std::fs::read_dir(&tmpdir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("preloop-workspace-snapshot"))
+            .collect();
+        assert!(
+            staged_in_temp_dir.is_empty(),
+            "snapshot staging does not live in the process temp dir: {staged_in_temp_dir:?}"
         );
     }
 }

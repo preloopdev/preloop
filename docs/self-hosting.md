@@ -506,8 +506,20 @@ Also worth knowing:
 | `state/github-app.json` | GitHub App private key and installation details |
 | `state/blobs/`, `state/replay/` | Step logs and job artifacts |
 | `state/cache/` | Actions cache entries |
+| `state/snapshots/` | Per-run immutable workspace snapshots; in-flight captures stage under `state/snapshots/.staging/` |
 | `vms/` | Golden images and per-machine state |
 | `engine.token` | Private fallback for the generated native API token when no OS credential service is available |
+
+Keep the whole state directory on one filesystem. Everything the engine
+publishes — workspace snapshots, blob uploads, caches — is staged inside the
+directory it is published to and moved into place with an atomic `rename(2)`,
+which the kernel refuses across mounts; a state directory split over several
+devices by a bind mount turns those publishes into hard failures (a local
+submission is refused outright, since the snapshot is its only copy of the
+tested tree). The process temp directory (`TMPDIR`, `/tmp`) is never used for
+staging, so the common Linux layout — a tmpfs `/tmp` next to an LVM/ext4 state
+volume — is fine. Snapshot staging trees abandoned by a killed engine are
+collected at startup.
 
 Back up at least the database and `github-app.json`. Losing the database strands
 any check run GitHub is still waiting on; losing the key means re-keying the App.
@@ -538,6 +550,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
 | Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
+| `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 
 ---
 
