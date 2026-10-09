@@ -146,7 +146,8 @@ SELECT 'rerun_history_runs', count(*) FROM (
 ) r;
 SELECT 'rerun_history_orphaned_requests', count(*) FROM job_history h
 WHERE h.request_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM attempt_history a WHERE a.request_id = h.request_id);
+  AND NOT EXISTS (SELECT 1 FROM attempt_history a WHERE a.request_id = h.request_id)
+  AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id);
 SELECT 'rerun_history_job_count_mismatches', count(*) FROM (
   WITH counts AS (
     SELECT run_id, run_attempt, count(*) AS jobs
