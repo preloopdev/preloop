@@ -853,7 +853,6 @@ async fn cache_v2_namespace_follows_the_job_token_not_the_request_body() {
 /// connection-refused instead of reaching api.github.com, where a fake PAT
 /// would 401 and fail the run. The scopes are then `Unverifiable`, so the PAT
 /// is withheld from jobs while the run itself still proceeds.
-
 /// A PAT-only deployment embeds the static PAT into job messages at build
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this
@@ -2519,13 +2518,12 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
         if let NdjsonEvent::RunStatus {
             run_id: id, status, ..
         } = event
+            && id == run_id
         {
-            if id == run_id {
-                if status.is_terminal() {
-                    saw_terminal_run_status = true;
-                } else {
-                    saw_non_terminal_run_status = true;
-                }
+            if status.is_terminal() {
+                saw_terminal_run_status = true;
+            } else {
+                saw_non_terminal_run_status = true;
             }
         }
     }
@@ -2598,13 +2596,12 @@ async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
         if let NdjsonEvent::RunStatus {
             run_id: id, status, ..
         } = event
+            && id == run_id
         {
-            if id == run_id {
-                if status.is_terminal() {
-                    saw_terminal_run_status = true;
-                } else {
-                    saw_non_terminal_run_status = true;
-                }
+            if status.is_terminal() {
+                saw_terminal_run_status = true;
+            } else {
+                saw_non_terminal_run_status = true;
             }
         }
     }
@@ -3007,7 +3004,6 @@ async fn debug_session_suspends_job_timeout() {
 }
 
 /// Status of a bearer-authenticated request, for asserting rejections.
-
 /// One job's debug-worker token must not reach another job's debug session.
 ///
 /// Token validity alone used to authorize every worker route, so any live job
@@ -3264,7 +3260,6 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
 }
 
 /// Open a debug session as a worker would, for exchange tests.
-
 /// The exchange that replaces the removed variable is as narrow as the
 /// credential it issues.
 ///
@@ -3801,8 +3796,8 @@ async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
 
         let queued = {
             let inner = state.test_tx().await;
-            let q = inner.ready().next().cloned().unwrap();
-            q
+
+            inner.ready().next().cloned().unwrap()
         };
         assert_eq!(
             queued.message.preloop_debug_run_id.as_deref() == Some(run_id.as_str()),

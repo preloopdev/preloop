@@ -1824,17 +1824,14 @@ fn label_matching_empty_job_matches_all() {
 // real queue/promotion state is driven through the explicitly gated test
 // completion API and compared with the documented outcome.
 // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
-
 /// Production path: build fails → test with default condition is skipped.
 /// Verifies the server's promote_ready_jobs correctly propagates failure.
-
 // Oracle: GitHub `needs` and status-function contracts, with worker-side
 // condition semantics pinned to actions/runner v2.335.1. These tests are
 // production-path checks: YAML is parsed and expanded by Preloop, then the
 // real queue/promotion state is driven through the explicitly gated test
 // completion API and compared with the documented outcome.
 // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
-
 /// Production path: build fails → test with default condition is skipped.
 /// Verifies the server's promote_ready_jobs correctly propagates failure.
 #[tokio::test]
@@ -2553,7 +2550,7 @@ async fn job_level_env_secret_is_filled_into_environment_variables() {
 }
 
 /// Extract the queued job message for a run, wherever it currently sits.
-
+///
 /// `preloop setup github --via pat` stores the credential as `github.pat` and
 /// configures no App. That PAT must reach jobs as their `GITHUB_TOKEN`:
 /// previously only `PRELOOP_GITHUB_TOKEN` was consulted, so setup reported

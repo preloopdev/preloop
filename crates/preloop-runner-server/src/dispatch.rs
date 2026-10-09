@@ -329,15 +329,30 @@ pub async fn list_actions_runs(
 
 /// Resolve a `{run_id}` path segment to a run UUID: preloop UUIDs parse
 /// directly; GitHub's numeric ids match `stable_id(run_id)` — the same id
-/// `list_actions_runs` emits — over the repo's runs.
+/// `list_actions_runs` emits — over the repo's runs. UUIDs are validated against the repository
+/// to prevent access to runs in other repositories.
 async fn resolve_run_ref(
     shared: &Arc<SharedState>,
     repository: &str,
     run_ref: &str,
 ) -> Result<crate::RunId, ApiError> {
+    // Try parsing as a UUID first and validate it belongs to this repository
     if let Ok(run_id) = run_ref.parse::<crate::RunId>() {
-        return Ok(run_id);
+        let runs = shared
+            .state
+            .backend
+            .runs_for_repository(repository)
+            .await
+            .map_err(ApiError::from)?;
+        if runs.iter().any(|run| run.run_id == run_id) {
+            return Ok(run_id);
+        }
+        // UUID is valid but doesn't belong to this repository
+        return Err(ApiError::from(crate::control::ControlError::NotFound(
+            format!("run {run_ref}"),
+        )));
     }
+    // Try parsing as a numeric stable_id
     let numeric: u64 = run_ref.parse().map_err(|_| {
         ApiError::from(crate::control::ControlError::NotFound(format!(
             "run {run_ref}"
@@ -359,22 +374,30 @@ async fn resolve_run_ref(
         })
 }
 
-/// Validate the optional re-run body GitHub accepts
-/// (`enable_debug_logging`/`enable_debugger` booleans). preloop has no
-/// per-re-run debug toggle, so the flags are accepted and ignored — but a
-/// wrong-typed field is `422`, matching github.com's request validation.
-fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
-    let Some(Json(body)) = body else {
-        return Ok(());
+/// Validate the optional re-run body GitHub accepts. Empty bodies use defaults;
+/// malformed JSON returns `422` (Unprocessable Entity).
+fn validate_rerun_body(body: Option<Bytes>) -> Result<Option<Value>, ApiError> {
+    let Some(bytes) = body else {
+        return Ok(None);
     };
-    if body.is_null() {
-        return Ok(());
+
+    if bytes.is_empty() {
+        return Ok(None);
     }
-    let Some(object) = body.as_object() else {
+
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::unprocessable("Invalid request: body must be valid JSON"))?;
+
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let Some(object) = value.as_object() else {
         return Err(ApiError::unprocessable(
             "Invalid request: the re-run body must be a JSON object",
         ));
     };
+
     for key in ["enable_debug_logging", "enable_debugger"] {
         if let Some(value) = object.get(key)
             && !value.is_boolean()
@@ -384,7 +407,8 @@ fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
             )));
         }
     }
-    Ok(())
+
+    Ok(Some(value))
 }
 
 /// POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun — GitHub's
@@ -394,14 +418,20 @@ pub async fn rerun_actions_run(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Option<Bytes>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    crate::runs::rerun_run_with_mode(&shared, run_id, crate::control::types::RerunMode::All, None)
-        .await?;
+    crate::runs::rerun_run_with_mode(
+        &shared,
+        run_id,
+        crate::control::types::RerunMode::All,
+        None,
+        Some(identity.actor.clone()),
+    )
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -413,7 +443,7 @@ pub async fn rerun_actions_run_failed(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Option<Bytes>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     validate_rerun_body(body)?;
@@ -424,6 +454,7 @@ pub async fn rerun_actions_run_failed(
         run_id,
         crate::control::types::RerunMode::Failed,
         None,
+        Some(identity.actor.clone()),
     )
     .await?;
     Ok(StatusCode::CREATED)
@@ -488,7 +519,7 @@ pub async fn rerun_actions_job(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, job_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Option<Bytes>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     validate_rerun_body(body)?;
@@ -499,6 +530,7 @@ pub async fn rerun_actions_job(
         run_id,
         crate::control::types::RerunMode::Job(job_id),
         None,
+        Some(identity.actor.clone()),
     )
     .await?;
     Ok(StatusCode::CREATED)
@@ -516,19 +548,24 @@ pub async fn cancel_actions_run(
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    let record = shared
-        .state
-        .backend
-        .run_record(run_id)
-        .await
-        .map_err(ApiError::from)?;
-    if record.status.is_terminal() {
-        return Err(ApiError::conflict(format!(
-            "run {run_ref} is already completed and cannot be cancelled"
-        )));
+    // github.com answers 202 only when this request cancelled a live run;
+    // an already-terminal run gets 409 "Cannot cancel a workflow run that
+    // is completed." The backend reports the locked transition's outcome,
+    // so a run that finished between the ref resolution and the cancel is
+    // a 409 here, not a stale 202. `resolve_run_ref` already proved the
+    // run belongs to this repository, so a `NotFound` from the cancel can
+    // only mean the archiver moved the (terminal) run mid-flight — also a
+    // 409 on github.com's terms.
+    match crate::runs::cancel_run_inner(&shared, run_id).await {
+        Ok((_, true)) => Ok(StatusCode::ACCEPTED),
+        Ok((_, false)) => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) if error.status() == StatusCode::NOT_FOUND => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) => Err(error),
     }
-    crate::runs::cancel_run_inner(&shared, run_id).await?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 /// Authorization for the workflow_dispatch POST

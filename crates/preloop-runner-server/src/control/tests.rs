@@ -1517,6 +1517,58 @@ pub(crate) mod suite {
         );
     }
 
+    /// The cancel result comes from the locked transition, not an earlier read
+    /// or the number of in-flight cancellation messages.
+    pub(crate) async fn cancel_outcome_tracks_locked_transition(backend: &dyn ControlBackend) {
+        let queued = RunId::new();
+        backend
+            .submit_run(submit_run(queued, vec![submit_job(queued, "build", 1)]))
+            .await
+            .unwrap();
+        let cancelled = backend.cancel_run(queued, None).await.unwrap();
+        assert!(cancelled.run_cancelled);
+        assert_eq!(
+            cancelled.cancellations, 0,
+            "queued jobs have no live runner"
+        );
+        assert_eq!(cancelled.record.unwrap().status, ExecutionStatus::Cancelled);
+        assert!(
+            !backend
+                .cancel_run(queued, None)
+                .await
+                .unwrap()
+                .run_cancelled
+        );
+
+        let completing = RunId::new();
+        backend
+            .submit_run(submit_run(
+                completing,
+                vec![submit_job(completing, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let resolved = backend.run_record(completing).await.unwrap();
+        assert!(!resolved.status.is_terminal());
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: completing,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let after_completion = backend.cancel_run(resolved.run_id, None).await.unwrap();
+        assert!(!after_completion.run_cancelled);
+        assert_eq!(
+            after_completion.record.unwrap().conclusion.as_deref(),
+            Some("success")
+        );
+    }
+
     /// A starved run is finalized without releasing its workflow-level
     /// concurrency hold (the trait doc: `reap_sweep` step 1 performs no
     /// concurrency release). A run parked behind the group stays held.
@@ -8082,6 +8134,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn cancel_outcome_tracks_locked_transition() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::cancel_outcome_tracks_locked_transition(&backend).await;
+    }
+
+    #[tokio::test]
     async fn starved_run_keeps_workflow_hold() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -9742,6 +9802,11 @@ mod lite {
     async fn cancel_of_terminal_run_preserves_conclusion() {
         suite::cancel_of_terminal_run_preserves_conclusion(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn cancel_outcome_tracks_locked_transition() {
+        suite::cancel_outcome_tracks_locked_transition(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

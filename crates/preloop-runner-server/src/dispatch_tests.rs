@@ -1840,3 +1840,239 @@ async fn rerun_shims_reject_a_token_without_actions_write_with_403() {
         assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
     }
 }
+
+#[tokio::test]
+async fn rerun_rejects_uuid_from_different_repository() {
+    // A run living under `octocat/repo` must not be reachable through a
+    // sibling repository's URL — the UUID would resolve cross-repo without
+    // the repository check.
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_failed_rejects_uuid_from_different_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun-failed-jobs");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn cancel_rejects_uuid_from_different_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/cancel");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+}
+
+/// The mirror image: a run owned by ANOTHER repository stays a 404 on the
+/// authorized repository's URL even though the caller (system token) covers
+/// both. This is the case the repository check exists for.
+#[tokio::test]
+async fn rerun_rejects_a_uuid_owned_by_another_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let shared = state.shared();
+    let accepted = crate::submit_run_inner(
+        &shared,
+        WorkflowSubmission {
+            workflow_yaml:
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                    .to_owned(),
+            event: "push".to_owned(),
+            repository: "victim/other".to_owned(),
+            sha: "f".repeat(40),
+            resolved_sha: Some("f".repeat(40)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shared
+        .state
+        .test_db_mutate(|db| db.set_run_status(accepted.run_id, "completed", Some("success")))
+        .await
+        .unwrap();
+
+    for suffix in ["rerun", "rerun-failed-jobs", "cancel"] {
+        let uri = format!(
+            "/repos/octocat/repo/actions/runs/{}/{suffix}",
+            accepted.run_id
+        );
+        let (status, body) = post_json(&app, &uri, "{}", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri}: another repo's run UUID must be a 404: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rerun_accepts_empty_body() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "empty body should be accepted: {body}"
+    );
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+}
+
+/// POST with a caller-chosen Content-Type (or none) and raw bytes.
+async fn post_raw(
+    app: &Router,
+    uri: &str,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(Method::POST).uri(uri).header(
+        header::AUTHORIZATION,
+        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+    );
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    let request = builder.body(Body::from(body.to_vec())).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Malformed JSON is a GitHub-shaped 422 (`message` + `documentation_url`)
+/// even without a JSON Content-Type — the body is invalid for every type.
+#[tokio::test]
+async fn rerun_rejects_malformed_json_with_422() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+
+    for content_type in [Some("application/json"), None, Some("text/plain")] {
+        let (status, body) = post_raw(&app, &uri, b"{invalid json}", content_type).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content-type {content_type:?}: {body}"
+        );
+        assert!(
+            body["message"].is_string(),
+            "the 422 must be GitHub-shaped: {body}"
+        );
+        assert!(
+            body["documentation_url"].is_string(),
+            "GitHub errors carry documentation_url: {body}"
+        );
+    }
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+/// A well-formed JSON body that is not an object is a 422; a JSON `null`
+/// body is accepted as empty (github.com treats it like no body).
+#[tokio::test]
+async fn rerun_rejects_non_object_json_and_accepts_null() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+
+    for bad in ["\"text\"", "[1,2]", "42"] {
+        let (status, body) = post_json(&app, &uri, bad, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{bad} must be a 422: {body}"
+        );
+    }
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+
+    let (status, body) = post_json(&app, &uri, "null", None).await;
+    assert_eq!(status, StatusCode::CREATED, "null body: {body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+}
+
+/// The REST rerun caller is the rerun's `github.triggering_actor` (the
+/// system bearer resolves to `preloop-system`) while the run's submission
+/// actor stays the dispatch caller's.
+#[tokio::test]
+async fn rerun_shim_stamps_the_callers_triggering_actor() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let actor_before = run_by_id(&state, &run_id).await.submission.actor.clone();
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let run = run_by_id(&state, &run_id).await;
+    assert_eq!(
+        run.github["triggering_actor"].as_str(),
+        Some("preloop-system"),
+        "the authenticated caller is the triggering actor: {}",
+        run.github
+    );
+    assert_eq!(
+        run.submission.actor, actor_before,
+        "the original actor is preserved for auth/history"
+    );
+}
+
+/// A run that archived between ref resolution and the cancel is answered
+/// like every terminal run: `409`, GitHub's "Cannot cancel a workflow run
+/// that is completed."
+#[tokio::test]
+async fn cancel_shim_409s_an_archived_run() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let parsed: preloop_gha_protocol::RunId = run_id.parse().unwrap();
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(parsed, old).unwrap();
+        })
+        .await;
+    assert!(state.test_archive_finished_runs_once().await >= 1);
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/cancel");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an archived run is terminal: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("completed"),
+        "the 409 must be GitHub-shaped: {body}"
+    );
+}

@@ -17,6 +17,7 @@ const KEY: &[u8] = b"legacy-import-test-key-32-bytes!";
 #[derive(Debug)]
 struct Imported {
     _dir: tempfile::TempDir,
+    #[allow(dead_code)]
     source: PathBuf,
     target: PathBuf,
     state_dir: PathBuf,

@@ -2044,8 +2044,8 @@ jobs:
     // Get the job ID and complete it.
     let job_id = {
         let inner = state.test_tx().await;
-        let id = inner.ready().next().unwrap().job_id.clone();
-        id
+
+        inner.ready().next().unwrap().job_id.clone()
     };
     complete_via_api(&app, accepted["run_id"].as_str().unwrap(), &job_id.0).await;
 

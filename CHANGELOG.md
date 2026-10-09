@@ -59,6 +59,27 @@ Releases before v0.27.0 predate the changelog.
   `job_requests_timeline_cascade` trigger prunes the shared timeline with the
   last request.
 
+
+### Fixed
+
+- GitHub rerun/cancel endpoints now validate that a provided run UUID
+  belongs to the specified repository, preventing cross-repository
+  access via token reuse. A request with a foreign UUID returns 404.
+- `POST .../actions/runs/{id}/cancel` returns 202 only when the request
+  actually cancelled a live run; an already-completed run answers 409,
+  matching github.com's "Cannot cancel a workflow run that is completed."
+- A `check_suite.rerequested` delivery now re-runs every terminal run whose
+  check runs reported on the suite's head SHA (matched on the reported
+  coordinate — `status_check_sha` for pull_request runs — not the checkout
+  `head_sha`), instead of restarting only the newest run at that SHA. A
+  suite naming an unregistered App id is ignored.
+- Rerun endpoints reject malformed JSON bodies and non-boolean
+  `enable_debug_logging`/`enable_debugger` with a GitHub-shaped 422
+  (`message` + `documentation_url`) instead of silently defaulting.
+- Rerun and rerequest webhook handlers now pass the webhook sender
+  (`sender.login`) as `triggering_actor` to preserve the user who
+  initiated the rerun, while the original submission's actor is
+  retained for authorization.
 ### Changed
 
 - Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
