@@ -197,6 +197,7 @@ impl PgBackend {
         let RerunRun {
             run_id,
             mode,
+            triggering_actor,
             workflow_concurrency,
             environment_rules: _environment_rules,
             templates,
@@ -204,6 +205,7 @@ impl PgBackend {
         let resolver = self.environment_resolver();
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
+        let started = std::time::Instant::now();
         let run = run_id.0.to_string();
 
         // ── The run row: identity, clocks, guards ──────────────────────────
@@ -308,7 +310,7 @@ impl PgBackend {
 
         // Bump `github.run_attempt` in the stored context: rebuilt templates
         // read it, and the gate contexts serve it.
-        let github = bump_run_attempt(&tx, &run, run_attempt).await?;
+        let github = bump_run_attempt(&tx, &run, run_attempt, triggering_actor.as_deref()).await?;
 
         // Check-run ids are per-attempt: a re-run mints fresh `check_run`s and
         // the old ids stay on the attempt-1 history rows. Drop the mapping for
@@ -355,6 +357,10 @@ impl PgBackend {
                     let concluded =
                         arrival_cancelled(&tx, &run, run_id, &set, &rows, run_attempt).await?;
                     tx.commit().await.map_err(db)?;
+                    crate::control::txn_stats::record(
+                        crate::control::txn_stats::RunRowOp::Rerun,
+                        started.elapsed(),
+                    );
                     drop(client);
                     return Ok(RerunOutcome {
                         run_id,
@@ -478,7 +484,7 @@ impl PgBackend {
                     node.status = ExecutionStatus::InProgress;
                     node.queue_state = QueueState::None;
                     node.outputs = None;
-                    node.completed_at_us = None;
+                    node.request_id = None;
                 }
                 sweep.mark(run_id, &job_id);
                 note_reset(&mut sweep, run_id, &job_id, ExecutionStatus::InProgress);
@@ -593,6 +599,7 @@ impl PgBackend {
                 node.outputs = None;
                 node.annotations = None;
                 node.check_run_id = None;
+                node.request_id = None;
                 node.enqueued_at_us = None;
                 node.claimed_by_runner_id = None;
                 node.claimed_at_us = None;
@@ -681,7 +688,7 @@ impl PgBackend {
             if expandable {
                 rerun_jobs.push((job_id, None));
             } else {
-                let agent_job_id = {
+                let (agent_job_id, request_id) = {
                     let graph = sweep.graphs.get(&run_id).expect("inserted above");
                     mint_attempt(
                         &tx,
@@ -692,6 +699,9 @@ impl PgBackend {
                     )
                     .await?
                 };
+                if let Some(node) = sweep.node_mut(run_id, &job_id) {
+                    node.request_id = Some(request_id);
+                }
                 rerun_jobs.push((job_id, Some(agent_job_id.to_string())));
             }
             queued += 1;
@@ -773,6 +783,10 @@ impl PgBackend {
         .await?;
         tx.commit().await.map_err(db)?;
         drop(client);
+        crate::control::txn_stats::record(
+            crate::control::txn_stats::RunRowOp::Rerun,
+            started.elapsed(),
+        );
 
         Ok(RerunOutcome {
             run_id,
@@ -880,11 +894,11 @@ async fn snapshot_attempt(
         "INSERT INTO job_history (run_id, run_created_at, run_attempt, job_id, \
              namespace_id, kind, parent_job_id, base_id, display_name, status, \
              pool_key, outputs, annotations, check_run_id, created_at, \
-             deps_ready_at, started_at, completed_at) \
+             deps_ready_at, started_at, completed_at, request_id) \
          SELECT j.run_id, r.created_at, $2, j.job_id, j.namespace_id, j.kind, \
              j.parent_job_id, j.base_id, COALESCE(s.display_name, j.job_id), \
              j.status, j.pool_key, j.outputs, j.annotations, j.check_run_id, \
-             j.created_at, j.deps_ready_at, j.started_at, j.completed_at \
+             j.created_at, j.deps_ready_at, j.started_at, j.completed_at, j.request_id \
          FROM jobs j JOIN runs r ON r.run_id = j.run_id \
          LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
          WHERE j.run_id = $1::text::uuid",
@@ -895,11 +909,13 @@ async fn snapshot_attempt(
     Ok(())
 }
 
-/// Rewrite `github.run_attempt` in the stored `run_submissions.github_context`.
+/// Rewrite `github.run_attempt` and, when supplied, `github.triggering_actor`
+/// in the stored `run_submissions.github_context`.
 async fn bump_run_attempt(
     tx: &Transaction<'_>,
     run: &str,
     run_attempt: i64,
+    triggering_actor: Option<&str>,
 ) -> Result<serde_json::Value, ControlError> {
     let json: Option<String> = tx
         .query_opt(
@@ -914,6 +930,9 @@ async fn bump_run_attempt(
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(object) = github.as_object_mut() {
         object.insert("run_attempt".to_owned(), serde_json::json!(run_attempt));
+        if let Some(actor) = triggering_actor {
+            object.insert("triggering_actor".to_owned(), serde_json::json!(actor));
+        }
     }
     tx.execute(
         "UPDATE run_submissions SET github_context = $2::text::jsonb \
@@ -1042,7 +1061,7 @@ async fn reset_concluded_sql(
 ) -> Result<(), ControlError> {
     tx.execute(
         "UPDATE jobs SET status = $3, queue_state = 'none', remaining_needs = 0, \
-             outputs = NULL, annotations = NULL, check_run_id = NULL, \
+             outputs = NULL, annotations = NULL, check_run_id = NULL, request_id = NULL, \
              enqueued_at = NULL, claimed_by_runner_id = NULL, claimed_at = NULL, \
              deps_ready_at = NULL, concurrency_wait_at = NULL, \
              concurrency_acquired_at = NULL, started_at = NULL, \
@@ -1066,6 +1085,7 @@ fn reset_concluded(sweep: &mut Sweep<'_>, run_id: RunId, job_id: &JobId, status:
         node.outputs = None;
         node.annotations = None;
         node.check_run_id = None;
+        node.request_id = None;
         node.enqueued_at_us = None;
         node.claimed_by_runner_id = None;
         node.claimed_at_us = None;
@@ -1279,7 +1299,7 @@ async fn mint_attempt(
     run_id: RunId,
     job_id: &JobId,
     token_request_override: Option<&Option<GitHubTokenRequest>>,
-) -> Result<uuid::Uuid, ControlError> {
+) -> Result<(uuid::Uuid, i64), ControlError> {
     // Read the agent_job_id the template patch (or rebuild) just wrote.
     let mut message = stored_job_message(tx, run_id, job_id)
         .await?
@@ -1341,7 +1361,7 @@ async fn mint_attempt(
     // (`submit_run` stamps it the same way).
     message.request_id = request_id;
     PgBackend::write_node_message(tx, run_id, job_id, &message).await?;
-    Ok(agent_job_id)
+    Ok((agent_job_id, request_id))
 }
 
 fn mode_name(mode: &RerunMode) -> &'static str {

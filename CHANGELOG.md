@@ -9,6 +9,12 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
 ### Added
+- In-place reruns now persist `jobs.request_id` and copy it into
+  per-attempt `job_history`, preserving log/step/artifact resolution for
+  carried-forward and newly minted executions on both control backends.
+  Rerun context updates `github.triggering_actor` while retaining the
+  original `github.actor`; migration `V2026100508__job_request_links` carries
+  the nullable columns forward.
 
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's

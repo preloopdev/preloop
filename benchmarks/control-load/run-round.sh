@@ -17,7 +17,7 @@ DRAIN=${DRAIN:-300}
 RUNNERS=${RUNNERS:-200}
 BURSTS=${BURSTS:-}
 WEBHOOK_FRACTION=${WEBHOOK_FRACTION:-0.5}
-JOB_MEDIAN_MS=${JOB_MEDIAN_MS:-4000}
+RERUN_FRACTION=${RERUN_FRACTION:-0}
 FAULTS=${FAULTS:-}
 KILL_NODE_AT=${KILL_NODE_AT:-}
 PROFILE=${PROFILE:-release}
@@ -122,7 +122,7 @@ servers_csv=$(IFS=,; echo "${servers[*]}")
   --servers "$servers_csv" --label "$LABEL" --out "$root/load-results" \
   --runs-per-sec "$RUNS_PER_SEC" --duration-secs "$DURATION" --drain-secs "$DRAIN" \
   --runners "$RUNNERS" --webhook-sha "$sha" --webhook-fraction "$WEBHOOK_FRACTION" \
-  --job-median-ms "$JOB_MEDIAN_MS" --pg-url "$db_url" ${burst_args[@]+"${burst_args[@]}"} \
+  --job-median-ms "$JOB_MEDIAN_MS" --rerun-fraction "$RERUN_FRACTION" --pg-url "$db_url" ${burst_args[@]+"${burst_args[@]}"} \
   2>"$out/harness.log" | tee "$out/stdout.txt"
 
 # Per-node transaction phase timing, captured before the nodes stop.
@@ -138,6 +138,26 @@ SELECT 'runs', count(*) FROM runs;
 SELECT 'jobs_by_status', status, count(*) FROM jobs GROUP BY status ORDER BY 2;
 SELECT 'inflight_requests', count(*) FROM job_requests WHERE result IS NULL;
 SELECT 'duplicate_inflight', count(*) FROM (SELECT run_id, job_id FROM job_requests WHERE result IS NULL GROUP BY 1,2 HAVING count(*) > 1) d;
+SELECT 'rerun_history_runs', count(*) FROM (
+  SELECT run_id FROM run_history GROUP BY run_id HAVING max(run_attempt) > 1
+) r;
+SELECT 'rerun_history_orphaned_requests', count(*) FROM job_history h
+WHERE h.request_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM attempt_history a WHERE a.request_id = h.request_id);
+SELECT 'rerun_history_job_count_mismatches', count(*) FROM (
+  WITH counts AS (
+    SELECT run_id, run_attempt, count(*) AS jobs
+    FROM job_history GROUP BY run_id, run_attempt
+  ), maxima AS (
+    SELECT run_id, max(jobs) AS jobs FROM counts GROUP BY run_id
+  )
+  SELECT c.run_id, c.run_attempt FROM counts c
+  JOIN maxima m USING (run_id) WHERE c.jobs <> m.jobs
+) mismatches;
+SELECT 'live_job_request_pointer_mismatches', count(*) FROM jobs j
+LEFT JOIN job_requests q ON q.request_id = j.request_id
+WHERE j.request_id IS NOT NULL
+  AND (q.request_id IS NULL OR q.run_id <> j.run_id OR q.job_id <> j.job_id);
 -- A runner that re-registers under the same name (after a timeout, like a
 -- reconfigured real runner) leaves a stale row for the liveness sweep; that
 -- is expected. The invariants: one name never runs two jobs at once, and an

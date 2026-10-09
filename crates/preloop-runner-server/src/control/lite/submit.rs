@@ -1064,6 +1064,10 @@ pub(super) fn insert_attempt(
     ])
     .map_err(db)?;
     let request_id = tx.last_insert_rowid();
+    tx.prepare_cached("UPDATE jobs SET request_id = ?3 WHERE run_id = ?1 AND job_id = ?2")
+        .map_err(db)?
+        .execute(params![codec::run_key(run_id), job_id.0, request_id])
+        .map_err(db)?;
     for (position, step) in step_manifest.into_iter().enumerate() {
         tx.prepare_cached(
             "INSERT INTO job_steps (agent_job_id, step_id, position, kind, \

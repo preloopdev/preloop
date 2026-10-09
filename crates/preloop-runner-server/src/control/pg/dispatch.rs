@@ -80,7 +80,7 @@ async fn flush_node(
             ", outputs=$14::text::jsonb, annotations=$15::text::jsonb, \
              check_run_id=$16, expand_generation=$17, \
              environment_gate=$18::text::jsonb, \
-             pool_key=$19, runs_on=$20::text::jsonb \
+             pool_key=$19, runs_on=$20::text::jsonb, request_id=$21 \
              WHERE run_id=$1::text::uuid AND job_id=$2"
         ),
         &[
@@ -104,6 +104,7 @@ async fn flush_node(
             &environment_gate_json,
             &node.pool_key,
             &serde_json::to_string(&node.runs_on).unwrap_or_else(|_| "[]".into()),
+            &node.request_id,
         ],
     )
     .await
@@ -443,6 +444,17 @@ pub(super) async fn insert_request_row(
         .map_err(db)?
         .get(0);
 
+    tx.execute(
+        "UPDATE jobs SET request_id = $3 \
+         WHERE run_id = $1::text::uuid AND job_id = $2",
+        &[
+            &request.run_id.0.to_string(),
+            &request.job_id.0,
+            &request_id,
+        ],
+    )
+    .await
+    .map_err(db)?;
     if let Some(token) = token {
         tx.execute(
             "INSERT INTO github_token_requests (request_id, repository, \
@@ -3920,6 +3932,7 @@ fn submit_node(
         outputs: None,
         annotations: None,
         check_run_id: record.job_check_run_ids.get(&job_id).map(|id| *id as i64),
+        request_id: None,
         created_at_us: now_us,
         deps_ready_at_us: job.needs.is_empty().then_some(now_us),
         concurrency_wait_at_us: None,
@@ -4513,7 +4526,7 @@ impl PgBackend {
                     &step_manifest,
                 )
                 .await?;
-                message.request_id = request_id;
+                node.request_id = Some(request_id);
                 message.job_id = request.agent_job_id;
             }
             // Skipped nodes carry a placeholder message and mint nothing —
@@ -6681,6 +6694,7 @@ impl PgBackend {
                 outputs: None,
                 annotations: None,
                 check_run_id: None,
+                request_id: None,
                 created_at_us: now,
                 deps_ready_at_us: plan.needs.is_empty().then_some(now),
                 concurrency_wait_at_us: None,
@@ -6753,6 +6767,7 @@ impl PgBackend {
                 &crate::models::StepRecord::manifest(&artifacts.agent_msg.steps),
             )
             .await?;
+            node.request_id = Some(request_id);
             artifacts.job_request.request_id = request_id;
             let mut message = message;
             message.request_id = request_id;

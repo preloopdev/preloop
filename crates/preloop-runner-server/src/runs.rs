@@ -3678,6 +3678,7 @@ pub(crate) async fn rerun_run_with_mode(
     run_id: RunId,
     mode: crate::control::types::RerunMode,
     reused_check_run: Option<(JobId, u64)>,
+    triggering_actor: Option<String>,
 ) -> Result<RunAccepted, ApiError> {
     let record = shared
         .state
@@ -3839,6 +3840,7 @@ pub(crate) async fn rerun_run_with_mode(
         .rerun_run(crate::control::types::RerunRun {
             run_id,
             mode: mode.clone(),
+            triggering_actor,
             workflow_concurrency,
             environment_rules: crate::config::EnvironmentRulesMap::default(),
             templates,

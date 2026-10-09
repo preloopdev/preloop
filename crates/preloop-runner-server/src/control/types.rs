@@ -398,6 +398,10 @@ pub(crate) struct RerunJobTemplate {
 pub(crate) struct RerunRun {
     pub(crate) run_id: RunId,
     pub(crate) mode: RerunMode,
+    /// User who requested this re-run. Native control-plane callers do not
+    /// carry a user identity and pass `None`; the stored triggering actor is
+    /// left unchanged in that case.
+    pub(crate) triggering_actor: Option<String>,
     /// Evaluated workflow-level concurrency as at submit (persisted in
     /// `run_submissions.record_details.workflow_concurrency`), re-acquired
     /// for the new attempt. `None` when the workflow declares none.
