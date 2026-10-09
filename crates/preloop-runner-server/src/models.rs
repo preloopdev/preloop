@@ -567,8 +567,9 @@ pub struct GitHubTokenRequest {
     /// A declared set must be minted verbatim or fail visibly; the implicit
     /// default may be narrowed to what the App installation actually grants.
     pub declared: bool,
-    /// Whether the job's trust tier restricts GitHub authority (fork PR or
-    /// fail-closed unknown event). Such jobs carry only the read-only fork
+    /// Whether the job's trust tier restricts GitHub authority (fork PR, or
+    /// the fail-closed `Untrusted` default for an unclassified event). Such
+    /// jobs carry only the read-only fork
     /// profile, and a mint failure never falls back to the broad
     /// `PRELOOP_GITHUB_TOKEN` PAT: the job keeps the local runtime token
     /// instead of receiving authority GitHub would not grant the fork.
