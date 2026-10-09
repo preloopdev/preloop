@@ -11,8 +11,8 @@ use super::timelines::{STEP_COLUMNS, step_from_row};
 use super::{PgBackend, db};
 use crate::control::backend::RequestKey;
 use crate::control::types::{
-    CallbackJob, ControlError, QueueStats, RunConcurrency, RunDispatchInfo, RunDispatchJob,
-    SubmissionFields, check_key_fingerprint,
+    ArtifactCatalogRow, CallbackJob, ControlError, NewArtifactRow, QueueStats, RunConcurrency,
+    RunDispatchInfo, RunDispatchJob, SubmissionFields, check_key_fingerprint,
 };
 use crate::models::{JobDetail, PushState, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
@@ -1867,4 +1867,123 @@ pub(super) async fn archived_record_tx(
         fork_approval_note: row.get(16),
         reports_check_runs: row.get::<_, Option<bool>>(17).unwrap_or(false),
     })
+}
+
+/// v1 artifact catalog + durable run-event snapshot (see the lite twin):
+/// the read paths that keep the artifact endpoints and the SSE history
+/// alive across a restart, including state imported from a legacy store.
+impl PgBackend {
+    /// The run's durable outbox events, `event_id` (commit) order.
+    pub(super) async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        let client = self.reader().await?;
+        let rows = client
+            .query(
+                "SELECT payload::text FROM outbox_events \
+                 WHERE run_id = $1::text::uuid ORDER BY event_id",
+                &[&run_id.to_string()],
+            )
+            .await
+            .map_err(db)?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            // The outbox carries the run's NDJSON events plus rows that make
+            // no event claim; skip those rather than emit bad lines.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(row.get::<_, &str>(0)) {
+                events.push(value);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Finalized v1 artifacts, one run's or every run's, insertion order.
+    pub(super) async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        let client = self.reader().await?;
+        let rows = client
+            .query(
+                "SELECT public_id, run_id::text, name, storage_key, COALESCE(size_bytes, 0) \
+                 FROM artifacts \
+                 WHERE state = 'finalized' AND public_id IS NOT NULL \
+                   AND ($1::text IS NULL OR run_id = $1::text::uuid) \
+                 ORDER BY artifact_id",
+                &[&run_id.map(|run| run.to_string())],
+            )
+            .await
+            .map_err(db)?;
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for row in rows {
+            artifacts.push(ArtifactCatalogRow {
+                public_id: row.get(0),
+                run_id: codec::run_id(row.get::<_, &str>(1))?,
+                name: row.get(2),
+                storage_key: row.get(3),
+                size_bytes: row.get(4),
+            });
+        }
+        Ok(artifacts)
+    }
+
+    /// One finalized v1 artifact row by its public id, served by the unique
+    /// `artifacts_public_id` index (the catalog-wide scan is never needed to
+    /// answer a single id).
+    pub(super) async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT public_id, run_id::text, name, storage_key, COALESCE(size_bytes, 0) \
+                 FROM artifacts \
+                 WHERE state = 'finalized' AND public_id = $1",
+                &[&public_id],
+            )
+            .await
+            .map_err(db)?;
+        row.map(|row| {
+            Ok(ArtifactCatalogRow {
+                public_id: row.get(0),
+                run_id: codec::run_id(row.get::<_, &str>(1))?,
+                name: row.get(2),
+                storage_key: row.get(3),
+                size_bytes: row.get(4),
+            })
+        })
+        .transpose()
+    }
+
+    /// Upsert a finalized v1 artifact row (native uploads and imports).
+    pub(super) async fn put_artifact_catalog(
+        &self,
+        row: NewArtifactRow,
+    ) -> Result<(), ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        tx.execute(
+            "INSERT INTO artifacts (namespace_id, run_id, job_backend_id, name, state, \
+                 size_bytes, storage_key, public_id) \
+             VALUES ('default', $1::text::uuid, '', $2, 'finalized', $3, $4, $5) \
+             ON CONFLICT (run_id, job_backend_id, name) DO UPDATE SET \
+                 size_bytes = excluded.size_bytes, \
+                 storage_key = excluded.storage_key, \
+                 public_id = excluded.public_id, \
+                 finalized_at = now()",
+            &[
+                &row.run_id.to_string(),
+                &row.name,
+                &row.size_bytes,
+                &row.storage_key,
+                &row.public_id,
+            ],
+        )
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
 }

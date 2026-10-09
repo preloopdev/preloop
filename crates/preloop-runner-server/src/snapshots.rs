@@ -5891,6 +5891,9 @@ mod remote_checkout_cache_tests {
         max_bytes: u64,
     ) -> Arc<SharedState> {
         let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        state.github_app = None;
+        state.github_apps = None;
+        state.github_pat = None;
         state.checkout_cache = crate::config::CheckoutCacheConfig {
             mode: crate::config::CheckoutCacheMode::RunScoped,
             max_bytes,
