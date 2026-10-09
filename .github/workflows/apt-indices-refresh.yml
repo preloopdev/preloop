@@ -1,10 +1,10 @@
 name: apt-indices-refresh
 
-# Weekly freshness reminder for golden apt indices. Pack production stamps each
-# bake (marker in the image, `apt_indices` in provenance.json); this job
-# compares the published pack's stamp against the versions.toml policy. When
-# stale, it opens a draft PR asking an operator to rebuild on a host with enough
-# disk. The schedule never dispatches the hosted golden bake.
+# Weekly freshness reminder for golden apt indices. Each bake stamps the pack
+# (marker in the image, `apt_indices` in provenance.json); this job compares
+# the published pack's stamp against the versions.toml policy. When stale, it
+# opens a draft PR asking for a rebuild on a host with enough disk. The
+# schedule never dispatches the hosted golden bake.
 on:
   schedule:
     # Monday 04:00 UTC: at most one reminder per week when indices exceed policy.

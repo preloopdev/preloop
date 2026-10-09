@@ -12,6 +12,7 @@ mod check_run_outbox;
 pub mod concurrency;
 pub mod config;
 pub mod credential_store;
+pub mod environment_resolver;
 pub mod errors;
 mod event_feed;
 pub mod events;
@@ -48,6 +49,10 @@ use runs::*;
 pub mod runtime_scheduling;
 use runtime_scheduling::*;
 pub mod control;
+// One-time legacy-store importer (`preloop store import-legacy`). The
+// implementation lives under the SQLite backend because it writes with the
+// backend's own row vocabulary; this re-export is its public surface.
+pub use control::lite::legacy_import;
 pub mod timeline_logs;
 use timeline_logs::*;
 mod live_log_segments;
@@ -97,6 +102,7 @@ pub mod models;
 use models::*;
 pub mod bootstrap;
 pub mod store;
+pub mod store_admin;
 pub mod store_pg;
 #[cfg(test)]
 #[allow(unused_imports)]
