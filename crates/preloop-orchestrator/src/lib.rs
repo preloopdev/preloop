@@ -9630,7 +9630,7 @@ done
         switched.runner_user = Some("runner".to_owned());
         switched.runner_uid = Some(1001);
 
-        let mut scripts: Vec<(String, String)> = vec![
+        let scripts: Vec<(String, String)> = vec![
             ("guest_hostname_script".to_owned(), guest_hostname_script()),
             ("guest_sysctl_script".to_owned(), guest_sysctl_script()),
             (
