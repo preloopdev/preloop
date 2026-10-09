@@ -1294,24 +1294,6 @@ async fn download_release_asset(
     available_space: AvailableSpace,
     require_checksum: bool,
 ) -> Result<bool, OrchestratorError> {
-    let probe = match client.get(url).send().await {
-        Ok(response) if response.status().is_success() => response,
-        Ok(response) => {
-            info!(
-                status = %response.status(),
-                url = %url,
-                "Pre-baked golden release asset unavailable; will build locally"
-            );
-            return Ok(false);
-        }
-        Err(error) => {
-            warn!(%error, url = %url, "Pre-baked golden release download failed; will build locally");
-            return Ok(false);
-        }
-    };
-    let total_bytes = probe.content_length();
-    ensure_golden_download_space(payload, total_bytes, available_space)?;
-
     // Fetch the companion checksum before committing bandwidth to the body.
     // A truncated or corrupted golden only fails much later, when a VM tries
     // to boot it, so a mismatch must be caught here. `PRELOOP_GOLDEN_SHA256`
@@ -1351,6 +1333,23 @@ async fn download_release_asset(
         }
         warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
     }
+    let probe = match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            info!(
+                status = %response.status(),
+                url = %url,
+                "Pre-baked golden release asset unavailable; will build locally"
+            );
+            return Ok(false);
+        }
+        Err(error) => {
+            warn!(%error, url = %url, "Pre-baked golden release download failed; will build locally");
+            return Ok(false);
+        }
+    };
+    let total_bytes = probe.content_length();
+    ensure_golden_download_space(payload, total_bytes, available_space)?;
 
     let partial = golden_partial_path(payload);
     let downloaded_bytes = {
@@ -7235,6 +7234,9 @@ chmod +x "$dest/bin/node"
         }
 
         // And the pool refuses it before touching machine state.
+        // `validate` also checks the registration-token environment; seed the
+        // fixture so this test stays focused on the account-name contract.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
         let mut config = test_config(false);
         config.runner_user = Some("runner;id".to_owned());
         let error = config
@@ -9529,9 +9531,10 @@ mod golden_download_tests {
         format!("http://{address}/golden")
     }
 
-    /// Answers the payload request, then one more connection with
-    /// `checksum_body` (the `.sha256` companion). Used to exercise the
-    /// checksum verification path.
+    /// Answers the payload and checksum requests in either order. Keeping the
+    /// responses path-directed lets the client fetch the sidecar before or
+    /// after probing the payload without coupling the fixture to connection
+    /// reuse details.
     async fn serve_with_checksum(
         payload_head: String,
         payload_body: Vec<u8>,
@@ -9540,21 +9543,23 @@ mod golden_download_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            for (head, body) in [
-                (payload_head, payload_body),
-                (
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        checksum_body.len()
-                    ),
-                    checksum_body,
-                ),
-            ] {
+            let checksum_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                checksum_body.len()
+            );
+            for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 1024];
-                let _ = socket.read(&mut request).await;
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let is_checksum =
+                    String::from_utf8_lossy(&request[..read]).contains("GET /golden.sha256 ");
+                let (head, body) = if is_checksum {
+                    (&checksum_head, &checksum_body)
+                } else {
+                    (&payload_head, &payload_body)
+                };
                 let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(&body).await;
+                let _ = socket.write_all(body).await;
                 let _ = socket.shutdown().await;
             }
         });
@@ -9578,9 +9583,15 @@ mod golden_download_tests {
         // Larger than any single chunk hyper will hand back, so the loop has to
         // append across iterations to reproduce the body.
         let body: Vec<u8> = (0..4_u32 * 1024 * 1024).map(|i| i as u8).collect();
-        let url = serve_once(
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(&body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = serve_with_checksum(
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
             body.clone(),
+            format!("{digest}  golden\n").into_bytes(),
         )
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
@@ -9601,9 +9612,10 @@ mod golden_download_tests {
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
         let expected_bytes = 512 * 1024;
-        let url = serve_once(
+        let url = serve_with_checksum(
             format!("HTTP/1.1 200 OK\r\nContent-Length: {expected_bytes}\r\n\r\n"),
             Vec::new(),
+            format!("{}  golden\n", "00".repeat(32)).into_bytes(),
         )
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
