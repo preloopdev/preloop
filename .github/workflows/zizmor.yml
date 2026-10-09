@@ -30,8 +30,7 @@ jobs:
       # zizmor checks that actions are SHA-pinned; this checks that the
       # `# <ref>` comment beside each SHA is true. Renovate reads that comment
       # to decide what the pin is, and silently skips any pin without one, so a
-      # missing or stale comment freezes the action with no signal. Eight pins
-      # were frozen this way before this check existed.
+      # missing or stale comment freezes the action with no signal.
       - name: Verify action pin comments match their SHAs
         env:
           GITHUB_TOKEN: ${{ github.token }}

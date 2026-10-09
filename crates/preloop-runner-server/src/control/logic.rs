@@ -45,6 +45,28 @@ fn uuid_v5(namespace: &uuid::Uuid, name: &str) -> uuid::Uuid {
     uuid::Builder::from_sha1_bytes(bytes).into_uuid()
 }
 
+/// Events a person triggers by hand: a comment (`@pullfrog review`) or a
+/// manual dispatch. Their jobs are claimed ahead of push/pull_request CI.
+pub(crate) const INTERACTIVE_EVENTS: [&str; 2] = ["issue_comment", "workflow_dispatch"];
+/// Ready-queue priority for jobs of an [`INTERACTIVE_EVENTS`] run.
+pub(crate) const INTERACTIVE_RUN_PRIORITY: i32 = 10;
+
+/// Ready-queue priority of a run's jobs (`jobs.priority`; claims order by
+/// `priority DESC, run_order, job_order`).
+///
+/// A comment-triggered job would otherwise wait behind every automatic
+/// push/pull_request job queued before it — on a busy pool, hours for a
+/// request a person is waiting on. GitHub-hosted Actions has no queue
+/// priority, so this only changes *when* a job starts, never what it does;
+/// running jobs are never preempted.
+pub(crate) fn run_priority(event: &str) -> i32 {
+    if INTERACTIVE_EVENTS.contains(&event) {
+        INTERACTIVE_RUN_PRIORITY
+    } else {
+        0
+    }
+}
+
 /// How long an unmatched ready job may wait for a matching runner.
 pub(crate) const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
 /// Absolute backstop, measured from ready-enqueue, on how long a job whose
@@ -1880,6 +1902,21 @@ pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<Executi
         }
     }
     statuses
+}
+
+/// `POST /repos/{o}/{r}/deployments` body for an environment job: the run's
+/// head sha as `ref` (GitHub deploys the commit the workflow ran against),
+/// `auto_merge` off (preloop never mutates the ref), `transient_environment`
+/// off. `environment_url` is deliberately absent — the create API ignores
+/// it; it rides on the deployment *status* rows instead.
+pub(crate) fn deployment_create_payload(environment: &str, head_sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ref": head_sha,
+        "environment": environment,
+        "auto_merge": false,
+        "transient_environment": false,
+        "required_contexts": [],
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────

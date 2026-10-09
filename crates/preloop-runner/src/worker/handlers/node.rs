@@ -432,6 +432,16 @@ pub async fn run_node_action(
             }
         }
         env.insert("HOME".to_string(), "/github/home".to_string());
+
+        // Engine URLs arrive addressed to the runner's loopback origin, which
+        // a container resolves to itself; rewrite them to this container's
+        // reachable origin. The step's INPUT_* variables are already in `env`,
+        // so a snapshot-redirected `actions/checkout` (github-server-url) is
+        // covered together with the ACTIONS_* endpoints.
+        if let Some(access) = ctx.job.container_engine.as_ref() {
+            access.translate_env(&mut env);
+        }
+
         let container_workdir =
             crate::worker::container_ops::translate_to_container_path(workspace, &host_work);
         let container_entry = crate::worker::container_ops::translate_to_container_path(

@@ -14,7 +14,7 @@
 //! implement the full reporting lifecycle.
 
 use super::action_preparation::prepare_remote_actions;
-use super::completion::{make_hook_step, report_completion};
+use super::completion::{evaluate_environment_url, make_hook_step, report_completion};
 use super::helpers::{extract_results_url, extract_service_endpoint, iso_now};
 use super::reporting::{flush_step_updates, upload_diagnostic_logs, upload_job_log};
 use super::server_queue::ServerQueue;
@@ -282,13 +282,31 @@ pub async fn run_job(
             FirstRenewOutcome::Abandoned => {
                 error!("Job {job_name} abandoned before first renewal — no steps run");
                 job_ctx.job_status = super::contexts::JobStatus::Failure;
-                report_completion(&job_message, "abandoned", &job_ctx, &[], via, Some(rpt)).await?;
+                report_completion(
+                    &job_message,
+                    "abandoned",
+                    &job_ctx,
+                    &[],
+                    via,
+                    Some(rpt),
+                    None,
+                )
+                .await?;
                 return Ok(());
             }
             FirstRenewOutcome::Cancelled => {
                 info!("Job {job_name} cancelled during first-renew gate — no steps run");
                 job_ctx.job_status = super::contexts::JobStatus::Cancelled;
-                report_completion(&job_message, "canceled", &job_ctx, &[], via, Some(rpt)).await?;
+                report_completion(
+                    &job_message,
+                    "canceled",
+                    &job_ctx,
+                    &[],
+                    via,
+                    Some(rpt),
+                    None,
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -315,6 +333,7 @@ pub async fn run_job(
                     &[],
                     via,
                     reporting.as_deref(),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -756,6 +775,26 @@ pub async fn run_job(
         });
     }
 
+    // `environment.url` is resolved after every step ran — it may read
+    // `steps.<id>.outputs` — and, like the official runner's FinalizeJob, a
+    // URL whose expression cannot be evaluated fails the job. A timed-out or
+    // abandoned job never reaches finalize, so it reports no URL.
+    let mut environment_url: Option<String> = None;
+    let job_result = if was_timeout || was_lease_lost {
+        job_result
+    } else {
+        match job_result {
+            Ok(conclusion) => match evaluate_environment_url(&job_message, &job_ctx) {
+                Ok(url) => {
+                    environment_url = url;
+                    Ok(conclusion)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    };
+
     let (result_str, conclusion) = if was_timeout {
         ("Failed".to_string(), "Failed".to_string())
     } else if was_lease_lost {
@@ -839,6 +878,7 @@ pub async fn run_job(
         &ordered_steps,
         via,
         reporting.as_deref(),
+        environment_url.as_deref(),
     )
     .await
     {

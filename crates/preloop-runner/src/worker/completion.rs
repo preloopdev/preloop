@@ -1,6 +1,6 @@
 //! Completejob payload construction and completion reporting.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use super::execution_types::Annotation;
@@ -207,6 +207,103 @@ pub(crate) fn runner_conclusion(conclusion: &str) -> &'static str {
         _ => "failed",
     }
 }
+
+/// Evaluate the job's `environment.url` after every step ran, mirroring the
+/// official runner.
+///
+/// `actionsEnvironment.url` ships in the job message as an unevaluated
+/// TemplateToken: a workflow may reference `steps.<id>.outputs.*`, which only
+/// exist once the step produced them, so the official runner resolves the
+/// token in `JobExtension.FinalizeJob` (with the full job context, `steps`
+/// included) and `JobRunner.CompleteJobAsync` reports the resulting string to
+/// the run service as `CompleteJobRequest.environmentUrl`. preloop reproduces
+/// that path: this function is called from the worker's completion flow, and
+/// the value rides `completejob` as `environmentUrl`.
+///
+/// Error semantics follow the same code: a token whose expression cannot be
+/// evaluated fails the job, and a value that would expose a secret is dropped
+/// with a warning. `Ok(None)` means "no environment URL to report" — the
+/// deployment status then carries no `environment_url`, as on GitHub.
+pub(crate) fn evaluate_environment_url(
+    job_message: &serde_json::Value,
+    job_ctx: &super::contexts::JobContext,
+) -> Result<Option<String>> {
+    let Some(url_token) = job_message
+        .get("actionsEnvironment")
+        .and_then(|env| env.get("url"))
+        .filter(|url| !url.is_null())
+    else {
+        return Ok(None);
+    };
+    // Token shapes (the parser's `template_token`): `{type:0, lit}` for a
+    // literal, `{type:3, expr}` for an expression or a `format(…)`-folded
+    // interpolation. A plain string is accepted too: a hydrated message may
+    // already carry the evaluated value.
+    let value = if let Some(raw) = url_token.as_str() {
+        raw.to_owned()
+    } else {
+        match url_token.get("type").and_then(serde_json::Value::as_u64) {
+            Some(0) => url_token
+                .get("lit")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            Some(3) => {
+                let expr = url_token
+                    .get("expr")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let wrapped = format!("${{{{ {expr} }}}}");
+                crate::worker::template::evaluate_template_strict(
+                    &wrapped,
+                    &job_ctx.build_expression_context(),
+                )
+                .with_context(|| {
+                    format!("failed to evaluate environment url expression `{expr}`")
+                })?
+            }
+            // An unknown token shape must never surface as the raw template.
+            _ => return Ok(None),
+        }
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if job_ctx
+        .masks
+        .iter()
+        .any(|mask| !mask.is_empty() && value.contains(mask.as_str()))
+    {
+        // Official `JobExtension.FinalizeJob`: a URL that would disclose a
+        // secret is skipped, never reported.
+        warn!("Skip setting environment url as it may contain secret");
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+/// Add the `actionsEnvironment` member to an AzDO-path `JobCompleted` event.
+///
+/// The official runner raises `JobCompletedEvent` carrying the job's
+/// `ActionsEnvironment` (name plus the evaluated `url`) on the non-run-service
+/// path; the server turns that member into the job's `environmentUrl`. Omitted
+/// for jobs without an environment URL — the member is optional on the wire.
+fn apply_azdo_actions_environment(
+    event: &mut serde_json::Value,
+    job_message: &serde_json::Value,
+    environment_url: Option<&str>,
+) {
+    let Some(url) = environment_url else {
+        return;
+    };
+    let name = job_message
+        .get("actionsEnvironment")
+        .and_then(|environment| environment.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    event["actionsEnvironment"] = serde_json::json!({ "name": name, "url": url });
+}
+
 /// Report job completion to the server.
 ///
 /// Full completejob body matching golden flow 25/41:
@@ -218,6 +315,7 @@ pub(crate) async fn report_completion(
     ordered_steps: &[Step],
     via: ProtocolPath,
     reporting: Option<&ReportingContext>,
+    environment_url: Option<&str>,
 ) -> Result<()> {
     let plan_id = job_message
         .get("plan")
@@ -333,7 +431,7 @@ pub(crate) async fn report_completion(
         telemetry.extend(rpt.connectivity_telemetry.lock().await.iter().cloned());
     }
 
-    let completion_body = serde_json::json!({
+    let mut completion_body = serde_json::json!({
         "planId": plan_id,
         "jobId": job_id,
         "conclusion": runner_conclusion(result),
@@ -343,6 +441,11 @@ pub(crate) async fn report_completion(
         "telemetry": telemetry,
         "billingOwnerId": billing_owner_id,
     });
+    // Official `CompleteJobRequest.EnvironmentUrl` (`EmitDefaultValue=false`):
+    // present only when the job declared an environment URL that resolved.
+    if let Some(url) = environment_url {
+        completion_body["environmentUrl"] = serde_json::json!(url);
+    }
 
     // Use reporting context if available, otherwise fall back to creating a new client
     if let Some(rpt) = reporting {
@@ -410,13 +513,14 @@ pub(crate) async fn report_completion(
                     "{}/_apis/v1/plans/{plan_id}/events",
                     rpt.run_service.base_url()
                 );
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "name": "JobCompleted",
                     "jobId": job_id,
                     "requestId": job_message.get("requestId").and_then(|v| v.as_i64()).unwrap_or(0),
                     "result": result.to_lowercase(),
                     "outputs": outputs,
                 });
+                apply_azdo_actions_environment(&mut event, job_message, environment_url);
                 info!("Reporting completion to {url}");
                 match rpt
                     .results
@@ -445,13 +549,14 @@ pub(crate) async fn report_completion(
             }
             ProtocolPath::Azdo => {
                 let url = format!("{service_url}/_apis/v1/plans/{plan_id}/events");
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "name": "JobCompleted",
                     "jobId": job_id,
                     "requestId": job_message.get("requestId").and_then(|v| v.as_i64()).unwrap_or(0),
                     "result": result.to_lowercase(),
                     "outputs": outputs,
                 });
+                apply_azdo_actions_environment(&mut event, job_message, environment_url);
                 info!("Reporting completion to {url}");
                 match http
                     .post_json_bearer::<serde_json::Value>(&url, &event, &access_token)
@@ -582,5 +687,116 @@ mod tests {
         assert_eq!(skipped["conclusion"], "skipped");
         assert!(skipped.get("action_name").is_none());
         assert!(skipped.get("type").is_none());
+    }
+
+    fn environment_job() -> super::super::contexts::JobContext {
+        super::super::contexts::JobContext::new(
+            "deploy".into(),
+            "deploy".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+    }
+
+    /// `environment.url` may read `steps.<id>.outputs` (the `actions/deploy-pages`
+    /// shape): the token is resolved after the steps ran, with the job's own
+    /// `steps` context — the value the server posts as the deployment status's
+    /// `environment_url`.
+    #[test]
+    fn environment_url_resolves_step_outputs() {
+        let mut job = environment_job();
+        job.steps.insert(
+            "deploy".into(),
+            super::super::contexts::StepResult {
+                outcome: "Success".into(),
+                conclusion: "Success".into(),
+                outputs: std::collections::HashMap::from([(
+                    "page_url".to_owned(),
+                    "https://example.test/".to_owned(),
+                )]),
+            },
+        );
+        let message = serde_json::json!({
+            "actionsEnvironment": {
+                "name": "github-pages",
+                "url": {"type": 3, "expr": "steps.deploy.outputs.page_url"},
+            }
+        });
+        assert_eq!(
+            evaluate_environment_url(&message, &job).unwrap().as_deref(),
+            Some("https://example.test/")
+        );
+    }
+
+    /// Literal tokens, an already-evaluated string, `null`, and no environment
+    /// at all: only a real value is reported, and a raw `${{ }}` template is
+    /// never returned.
+    #[test]
+    fn environment_url_reports_only_resolved_values() {
+        let job = environment_job();
+        let literal = serde_json::json!({
+            "actionsEnvironment": {"name": "prod", "url": {"type": 0, "lit": "https://x.test"}}
+        });
+        assert_eq!(
+            evaluate_environment_url(&literal, &job).unwrap().as_deref(),
+            Some("https://x.test")
+        );
+        let hydrated = serde_json::json!({
+            "actionsEnvironment": {"name": "prod", "url": "https://hydrated.test"}
+        });
+        assert_eq!(
+            evaluate_environment_url(&hydrated, &job)
+                .unwrap()
+                .as_deref(),
+            Some("https://hydrated.test")
+        );
+        assert!(
+            evaluate_environment_url(&serde_json::json!({}), &job)
+                .unwrap()
+                .is_none(),
+            "a job with no environment reports no url"
+        );
+        assert!(
+            evaluate_environment_url(
+                &serde_json::json!({"actionsEnvironment": {"name": "prod", "url": null}}),
+                &job
+            )
+            .unwrap()
+            .is_none(),
+            "an environment without a url reports none"
+        );
+    }
+
+    /// The official runner fails the job when the URL expression cannot be
+    /// evaluated (`JobExtension.FinalizeJob`); the caller folds this error into
+    /// the job result and no URL reaches the deployment.
+    #[test]
+    fn environment_url_fails_when_the_expression_cannot_evaluate() {
+        let job = environment_job();
+        let message = serde_json::json!({
+            "actionsEnvironment": {
+                "name": "prod",
+                "url": {"type": 3, "expr": "nosuchfunction('x')"},
+            }
+        });
+        assert!(evaluate_environment_url(&message, &job).is_err());
+    }
+
+    /// A URL that would disclose a secret is skipped, never reported — the
+    /// official runner's `MaskSecrets` guard.
+    #[test]
+    fn environment_url_skips_values_containing_secrets() {
+        let mut job = environment_job();
+        job.masks.insert("s3cret".to_owned());
+        let message = serde_json::json!({
+            "actionsEnvironment": {
+                "name": "prod",
+                "url": {"type": 0, "lit": "https://x.test/?token=s3cret"},
+            }
+        });
+        assert!(
+            evaluate_environment_url(&message, &job).unwrap().is_none(),
+            "a secret-bearing url must not be reported"
+        );
     }
 }

@@ -226,10 +226,23 @@ fn register_built_jobs(
     backend: &LiteBackend,
     run_id: RunId,
     namespace: &str,
+    placeholder: &JobId,
     jobs: Vec<BuiltJob>,
     callee_meta: &BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
 ) -> Result<usize, ControlError> {
     let platforms = jobs::registered_platforms(tx)?;
+    // Expanded jobs keep their run's place in the queue: the run's
+    // `run_order` and the placeholder's `job_order`. A literal 0/0 would sort
+    // them ahead of every other run's jobs.
+    let (run_order, job_order): (i64, i64) = tx
+        .prepare_cached("SELECT run_order, job_order FROM jobs WHERE run_id = ?1 AND job_id = ?2")
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id), placeholder.0], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()
+        .map_err(db)?
+        .unwrap_or_else(|| (jobs::run_created_at_us(tx, run_id).unwrap_or(0), 0));
     let mut registered = 0usize;
     // Matrix legs reference their base as `parent_job_id` — an FK target.
     // Materialize a `matrix_parent` row for any covered parent first (the
@@ -300,8 +313,8 @@ fn register_built_jobs(
             status,
             queue_state,
             plan.needs.len() as i32,
-            0,
-            0,
+            run_order,
+            job_order,
             &spec,
         )?;
         // A check run minted before this leg materialized lives in
@@ -577,7 +590,15 @@ impl LiteBackend {
                         .iter()
                         .map(|j| (j.plan.id.0.clone(), j.plan.name.clone()))
                         .collect();
-                    register_built_jobs(tx, self, run_id, &namespace, jobs, &BTreeMap::new())?;
+                    register_built_jobs(
+                        tx,
+                        self,
+                        run_id,
+                        &namespace,
+                        &node_id,
+                        jobs,
+                        &BTreeMap::new(),
+                    )?;
                     merge_expanded_job_names(tx, run_id, &names)?;
                     // The parent leaves the run's status map; its legs take
                     // over (`has_children` is derived: `run_graph` excludes
@@ -606,7 +627,15 @@ impl LiteBackend {
                         .iter()
                         .map(|j| (j.plan.id.0.clone(), j.plan.name.clone()))
                         .collect();
-                    register_built_jobs(tx, self, run_id, &namespace, jobs, &reusable_calls)?;
+                    register_built_jobs(
+                        tx,
+                        self,
+                        run_id,
+                        &namespace,
+                        &caller_id,
+                        jobs,
+                        &reusable_calls,
+                    )?;
                     merge_expanded_job_names(tx, run_id, &names)?;
                     // The caller is now executing inside its subtree: its
                     // row is `in_progress`/unqueued; the callee metadata and

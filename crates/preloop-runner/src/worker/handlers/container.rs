@@ -16,6 +16,10 @@ pub async fn run_docker_action(
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
     ctx.translate_container_path = true;
+    // Ensure the engine is reachable from this action container's network
+    // before its environment is built (in a host job it runs on the default
+    // bridge; in a container/service job it joins the job network).
+    crate::worker::container_ops::ensure_container_engine(ctx.job).await;
     let image = uses
         .strip_prefix("docker://")
         .context("invalid docker action reference")?;
@@ -36,6 +40,7 @@ pub async fn run_docker_action_from_manifest(
     ctx: &mut StepContext<'_>,
 ) -> Result<()> {
     ctx.translate_container_path = true;
+    crate::worker::container_ops::ensure_container_engine(ctx.job).await;
     let image = manifest
         .runs_image
         .as_deref()
@@ -164,7 +169,11 @@ fn build_docker_run_args(
     push_inherited_env_args(&mut docker_args, env);
 
     // Inject proxy env vars from host into container
-    super::super::container_ops::inject_proxy_env_for_docker(&mut docker_args, env);
+    super::super::container_ops::inject_proxy_env_for_docker(
+        &mut docker_args,
+        env,
+        ctx.job.container_engine.as_deref(),
+    );
 
     docker_args.push(image.to_string());
     docker_args.extend(entrypoint_args.iter().cloned());
@@ -233,6 +242,15 @@ fn container_action_env(
         for (key, value) in manifest_env {
             env.entry(key).or_insert(value);
         }
+    }
+
+    // The engine origin the job message advertises is the runner's loopback
+    // bridge, which a container resolves to itself; rewrite every embedded
+    // reference (ACTIONS_* endpoints, redirected checkouts' inputs) to the
+    // origin this container can reach. `ensure_container_engine` ran before
+    // this env was built, so the access is in place for host jobs too.
+    if let Some(access) = ctx.job.container_engine.as_ref() {
+        access.translate_env(&mut env);
     }
 
     Ok(env)
@@ -566,5 +584,72 @@ mod tests {
         .unwrap();
         assert!(!inputs.contains_key("__preloop_entry"));
         assert_eq!(inputs.get("real").map(String::as_str), Some("val"));
+    }
+
+    /// A `docker://` action container must not receive the engine's loopback
+    /// origin — its network namespace resolves that to the container itself.
+    /// The rewrite reaches the container because `docker run` takes these
+    /// values from the CLI's environment (`-e KEY`), so both the ACTIONS_*
+    /// endpoints and a redirected checkout's inputs must be rewritten here.
+    #[test]
+    fn container_action_env_rewrites_the_engine_origin_for_the_container() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.env.insert(
+            "ACTIONS_RUNTIME_URL".into(),
+            "http://127.0.0.1:9198/broker/7/".into(),
+        );
+        job.container_engine = Some(std::sync::Arc::new(
+            crate::worker::container_ops::ContainerEngineAccess::for_tests(
+                "http://127.0.0.1:9198",
+                "http://172.18.0.1:9198",
+            ),
+        ));
+        let ctx = test_step_context(&mut job);
+
+        let env = container_action_env(
+            &ctx,
+            &HashMap::from([(
+                "github-server-url".to_string(),
+                "http://127.0.0.1:9198".to_string(),
+            )]),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            env["ACTIONS_RUNTIME_URL"],
+            "http://172.18.0.1:9198/broker/7/"
+        );
+        assert_eq!(env["INPUT_GITHUB-SERVER-URL"], "http://172.18.0.1:9198");
+    }
+
+    /// Without container engine access (a runner whose origin is already
+    /// reachable, or one with no control bridge) nothing is rewritten.
+    #[test]
+    fn container_action_env_keeps_the_origin_without_an_access() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.env.insert(
+            "ACTIONS_RUNTIME_URL".into(),
+            "http://127.0.0.1:9198/broker/7/".into(),
+        );
+        let ctx = test_step_context(&mut job);
+
+        let env = container_action_env(&ctx, &HashMap::new(), None, None).unwrap();
+
+        assert_eq!(
+            env["ACTIONS_RUNTIME_URL"],
+            "http://127.0.0.1:9198/broker/7/"
+        );
     }
 }

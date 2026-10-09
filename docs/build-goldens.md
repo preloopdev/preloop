@@ -28,11 +28,11 @@ The official amd64 source is the digest-pinned entry in `official-image.toml`:
 ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795
 ```
 
-Use a host matching the guest architecture. For x86-64, cpane provides Linux,
-KVM, and sufficient disk. Keep at least the builder disk plus 20 GiB of pack
+Use a host matching the guest architecture. For x86-64, use a Linux host with
+KVM and sufficient disk. Keep at least the builder disk plus 20 GiB of pack
 staging free; the official recipe uses a 200 GiB builder.
 
-## Why cpane needs a host-side archive
+## Why x86-64 bakes need a host-side archive
 
 A guest pull uses four workers. Each worker streams one layer through:
 
@@ -45,7 +45,7 @@ GHCR's blob URL is short-lived (approximately five minutes). If extraction and
 virtual-disk writes slow a large layer past that lifetime, GHCR closes the
 stream. The symptoms are `unexpected EOF` or HTTP/2 `PROTOCOL_ERROR`.
 
-On cpane, pull the exact pinned image on the host first. This keeps the
+On that host, pull the exact pinned image first. This keeps the
 registry transfer fast and moves the unpacking deadline-free into the local
 bake:
 
@@ -88,8 +88,8 @@ truncate -s "${GOLDEN_GUEST_GIB}G" "$HOME/.smolvm/storage-template.ext4"
 truncate -s "${GOLDEN_GUEST_GIB}G" "$HOME/.smolvm/overlay-template.ext4"
 ```
 
-The verified cpane result was a mount time change from approximately 420 ms to
-0 ms, with no connect-retry exhaustion.
+On the x86-64 host this dropped mount time from approximately 420 ms to 0 ms,
+with no connect-retry exhaustion.
 
 ## Bake
 
@@ -122,7 +122,7 @@ payload.
 
 The orchestrator's pack path sets `SMOLVM_PACK_STAGING`, `TMPDIR`, and a 64 GiB
 file-transfer limit. Manual `smolvm pack create` commands MUST set equivalent
-staging variables; otherwise cpane's 15 GiB `/tmp` tmpfs can fail with
+staging variables; otherwise a tmpfs-backed `/tmp` can fail with
 `Disk quota exceeded` even when the root filesystem has free space.
 
 ## Publish
