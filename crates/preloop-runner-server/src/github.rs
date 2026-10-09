@@ -16,12 +16,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::events::EffectiveEvent;
 use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use crate::{
     ControlBackend, ExecutionStatus, SharedState, changed_paths_from_payload,
     submit_run_inner_with_webhook_delivery,
 };
-use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
+use preloop_gha_protocol::{
+    AnnotationLevel, JobId, NdjsonEvent, PrebuiltMerge, RunId, WorkflowSubmission,
+};
 
 /// Comma-separated workflow filenames or `.github/workflows/...` paths that
 /// GitHub, rather than Preloop, owns. This keeps release and artifact-publish
@@ -2152,6 +2155,660 @@ pub async fn resolve_pr_changed_files_at(
     .map(Some)
 }
 
+/// Bounded poll schedule for resolving a pull request's live test-merge
+/// commit through the GitHub API before a webhook delivery creates runs.
+///
+/// State rather than constants so tests can drive the poll without waiting
+/// out the production budget.
+#[derive(Debug, Clone)]
+pub struct FreshMergePoll {
+    /// Maximum time to wait before building the merge locally.
+    pub budget: Duration,
+    /// Delay between GitHub API probes.
+    pub poll_interval: Duration,
+}
+
+impl Default for FreshMergePoll {
+    fn default() -> Self {
+        Self {
+            // Keep the wait bounded and abortable with the delivery lease.
+            budget: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Where a `pull_request`/`pull_request_review` delivery's runs check out.
+#[derive(Debug)]
+enum FreshMergePlacement {
+    /// Keep the adapter's projection (not a GitHub-backed delivery, or the
+    /// payload carries nothing to resolve against).
+    Projected,
+    /// `refs/pull/{n}/merge` at GitHub's live test merge of the payload head.
+    Merge(String),
+    /// GitHub reports a merge conflict. The docs are explicit: workflows do
+    /// not run on pull_request activity for a conflicted pull request, so
+    /// this delivery creates no pull_request runs.
+    Conflict,
+    /// GitHub's own test merge was out of reach (head race, probe failure, or
+    /// the poll budget ran out). The runs check out `refs/pull/{n}/merge` at
+    /// a merge this engine built from the current base tip and the payload
+    /// head, served from the engine's mirror — GitHub does not have the
+    /// commit. Never the bare `refs/pull/{n}/head`: a run there tests a tree
+    /// the pull request does not have.
+    SelfMerge(Box<PrebuiltMerge>),
+}
+
+/// The pull request number a GitHub PR payload refers to.
+fn webhook_pull_request_number(payload: &Value) -> Option<u64> {
+    payload.get("number").and_then(Value::as_u64).or_else(|| {
+        payload
+            .get("pull_request")
+            .and_then(|pr| pr.get("number"))
+            .and_then(Value::as_u64)
+    })
+}
+
+/// Whether an effective event is one GitHub places on the PR merge ref.
+fn is_pull_request_run_event(event: &EffectiveEvent) -> bool {
+    matches!(event.event.as_str(), "pull_request" | "pull_request_review")
+}
+
+/// The fork-workflow kill switch: whether this event's run is dropped before
+/// any workflow is fetched or matched.
+fn fork_policy_skips(policy: &crate::config::ForkPolicyConfig, event: &EffectiveEvent) -> bool {
+    !policy.run_fork_workflows
+        && event.trust_tier == Some(crate::events::trust_tier::TrustTier::UntrustedForkPullRequest)
+}
+
+/// GitHub's live view of a pull request's merge state.
+#[derive(Debug, Deserialize)]
+struct PullRequestMergeState {
+    /// `null` (absent) while GitHub is still computing mergeability.
+    mergeable: Option<bool>,
+    /// The current test merge of the PR head into its base, when one exists.
+    merge_commit_sha: Option<String>,
+    /// The head GitHub used to compute `mergeable` and `merge_commit_sha`.
+    head: Option<PullRequestRef>,
+    /// The base tip GitHub used to compute `mergeable` and `merge_commit_sha`.
+    base: Option<PullRequestRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestRef {
+    sha: Option<String>,
+}
+
+/// Why a merge-state probe has not produced an answer yet.
+#[derive(Debug)]
+enum MergeProbeFailure {
+    /// Re-polling within the budget may answer differently.
+    Retry(String),
+    /// Re-polling cannot help (auth, scope, missing pull request).
+    Fatal(String),
+}
+
+impl MergeProbeFailure {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Retry(reason) | Self::Fatal(reason) => reason,
+        }
+    }
+}
+
+/// Classify a non-success GitHub status for the merge-state poll.
+///
+/// Everything but a client-side refusal is transient by nature. A 4xx (rate
+/// limiting aside) is the one answer a retry cannot change, and spending the
+/// whole budget on it would tax every delivery of a mis-scoped deployment.
+fn merge_probe_status(status: reqwest::StatusCode) -> MergeProbeFailure {
+    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        MergeProbeFailure::Fatal(format!("GitHub API returned {status}"))
+    } else {
+        MergeProbeFailure::Retry(format!("GitHub API returned {status}"))
+    }
+}
+
+/// `GET /repos/{repo}/pulls/{number}`.
+async fn fetch_pull_request_merge_state(
+    shared: &Arc<SharedState>,
+    api_base: &str,
+    token: &str,
+    repo: &str,
+    number: u64,
+) -> Result<PullRequestMergeState, MergeProbeFailure> {
+    let response = crate::github_breaker::send_observed(
+        &shared.state.github_breaker,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!(
+                "{}/repos/{repo}/pulls/{number}",
+                api_base.trim_end_matches('/')
+            ))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    .map_err(|error| MergeProbeFailure::Retry(format!("request failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(merge_probe_status(response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| MergeProbeFailure::Retry(format!("response was not JSON: {error}")))
+}
+
+/// How the merge commit GitHub offers lines up with this delivery's head and
+/// with the base tip the API currently reports.
+enum MergeParentage {
+    /// The commit is the test merge of the payload head into the API's
+    /// current base tip.
+    Current,
+    /// The merge has the payload head but a different first parent. It is
+    /// still accepted, and the observed parent is logged.
+    StaleBase { merge_parent: Option<String> },
+    /// The commit is not a merge of the payload head at all: the API pointer
+    /// still names a previous head's merge.
+    OtherHead,
+}
+
+/// Resolve how `merge_sha`'s parents line up with the payload `head` and the
+/// API's `base`.
+///
+/// Never accept a merge commit without checking its second parent: the
+/// pointer lags exactly one push through a rapid sequence, so a sha that is
+/// still the live pointer can belong to the previous head.
+async fn merge_parentage(
+    shared: &Arc<SharedState>,
+    api_base: &str,
+    token: &str,
+    repo: &str,
+    merge_sha: &str,
+    base: &str,
+    head: &str,
+) -> Result<MergeParentage, MergeProbeFailure> {
+    let response = crate::github_breaker::send_observed(
+        &shared.state.github_breaker,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!(
+                "{}/repos/{repo}/commits/{merge_sha}",
+                api_base.trim_end_matches('/')
+            ))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    .map_err(|error| MergeProbeFailure::Retry(format!("request failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(merge_probe_status(response.status()));
+    }
+    let commit: Value = response
+        .json()
+        .await
+        .map_err(|error| MergeProbeFailure::Retry(format!("response was not JSON: {error}")))?;
+    let parents = commit.get("parents").and_then(Value::as_array);
+    let first_parent = parents
+        .and_then(|parents| parents.first())
+        .and_then(|parent| parent.get("sha"))
+        .and_then(Value::as_str);
+    let second_parent = parents
+        .and_then(|parents| parents.get(1))
+        .and_then(|parent| parent.get("sha"))
+        .and_then(Value::as_str);
+    let Some(second_parent) = second_parent else {
+        return Ok(MergeParentage::OtherHead);
+    };
+    if !second_parent.eq_ignore_ascii_case(head) {
+        return Ok(MergeParentage::OtherHead);
+    }
+    if first_parent.is_some_and(|sha| sha.eq_ignore_ascii_case(base)) {
+        Ok(MergeParentage::Current)
+    } else {
+        Ok(MergeParentage::StaleBase {
+            merge_parent: first_parent.map(str::to_owned),
+        })
+    }
+}
+
+/// The pull request a delivery's merge-state resolution works on.
+#[derive(Debug, Clone)]
+struct FreshMergeTarget {
+    /// Repository full name (`owner/repo`).
+    repo: String,
+    /// Pull request number; names `refs/pull/{number}/merge` and `/head`.
+    number: u64,
+    /// The payload's head sha. Every accepted merge is a merge of exactly
+    /// this commit, and a merge this engine builds pins it as second parent.
+    head: String,
+    /// The payload's base branch (`pull_request.base.ref`).
+    base_branch: String,
+}
+
+impl FreshMergeTarget {
+    /// Read the target out of a webhook payload.
+    ///
+    /// `None` when the payload names no pull request (or no base branch to
+    /// merge into): the adapter's own projection stays in charge.
+    fn from_payload(payload: &Value) -> Option<Self> {
+        let repo = payload
+            .get("repository")
+            .and_then(|repository| repository.get("full_name"))
+            .and_then(Value::as_str)?;
+        let number = webhook_pull_request_number(payload)?;
+        let pull_request = payload.get("pull_request")?;
+        let head = pull_request.get("head")?.get("sha")?.as_str()?;
+        let base_branch = pull_request
+            .get("base")
+            .and_then(|base| base.get("ref"))
+            .and_then(Value::as_str)?;
+        Some(Self {
+            repo: repo.to_owned(),
+            number,
+            head: head.to_owned(),
+            base_branch: base_branch.to_owned(),
+        })
+    }
+}
+
+/// What one probe of GitHub's live merge state decided.
+enum MergeProbe {
+    /// A verifiable answer from GitHub.
+    Resolved(FreshMergePlacement),
+    /// No verifiable merge yet; a later probe may answer.
+    Waiting(String),
+    /// The probe could not answer, and re-probing will not change that (auth,
+    /// scope, missing pull request).
+    Unavailable(String),
+}
+
+/// Ask GitHub where this delivery's pull-request runs check out.
+///
+/// The payload's merge sha can lag the push. Accept only a merge whose second
+/// parent is the payload head; log, but do not reject, a first-parent mismatch.
+async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget) -> MergeProbe {
+    let api_base = github_api_base();
+    let token = match crate::github_app::select_app_for_repo(shared, &target.repo).await {
+        Some(app) => {
+            let permissions = BTreeMap::from([
+                ("contents".to_owned(), "read".to_owned()),
+                ("pull_requests".to_owned(), "read".to_owned()),
+            ]);
+            match crate::github_app::get_or_mint_token_at(
+                &api_base,
+                &app,
+                &target.repo,
+                &permissions,
+            )
+            .await
+            {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    return MergeProbe::Unavailable(format!(
+                        "failed to mint a pull-request read token: {error:#}"
+                    ));
+                }
+            }
+        }
+        // The same PAT ladder as the workflow inventory.
+        None => shared.state.static_github_pat(),
+    };
+    // No GitHub credentials at all (local-workspace development, native
+    // webhook replays): there is no API to ask, so the projection stands.
+    let Some(token) = token else {
+        return MergeProbe::Resolved(FreshMergePlacement::Projected);
+    };
+
+    let state = match fetch_pull_request_merge_state(
+        shared,
+        &api_base,
+        &token,
+        &target.repo,
+        target.number,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(MergeProbeFailure::Fatal(reason)) => return MergeProbe::Unavailable(reason),
+        Err(MergeProbeFailure::Retry(reason)) => return MergeProbe::Waiting(reason),
+    };
+    let api_head = state
+        .head
+        .as_ref()
+        .and_then(|reference| reference.sha.as_deref())
+        .map(str::to_owned);
+    let response_base = state
+        .base
+        .as_ref()
+        .and_then(|reference| reference.sha.as_deref())
+        .map(str::to_owned);
+
+    // A candidate merge is checked before anything the API says about the
+    // head: through a rapid push sequence the pointer can report a newer head
+    // while `merge_commit_sha` still names this delivery's own head's merge,
+    // which is exactly what this delivery wants.
+    if let Some(merge) = state.merge_commit_sha.as_deref() {
+        let Some(base) = response_base.as_deref() else {
+            return MergeProbe::Waiting(
+                "GitHub merge response omitted the pull request's base".to_owned(),
+            );
+        };
+        match merge_parentage(
+            shared,
+            &api_base,
+            &token,
+            &target.repo,
+            merge,
+            base,
+            &target.head,
+        )
+        .await
+        {
+            Ok(MergeParentage::Current) => {
+                return MergeProbe::Resolved(FreshMergePlacement::Merge(merge.to_owned()));
+            }
+            Ok(MergeParentage::StaleBase { merge_parent }) => {
+                debug!(
+                    repository = %target.repo,
+                    pull_request = target.number,
+                    merge_commit = %merge,
+                    merge_parent = ?merge_parent,
+                    api_base = %base,
+                    "GitHub's test merge has an older base parent; accepting it"
+                );
+                return MergeProbe::Resolved(FreshMergePlacement::Merge(merge.to_owned()));
+            }
+            Ok(MergeParentage::OtherHead) => {}
+            Err(MergeProbeFailure::Fatal(reason)) => return MergeProbe::Unavailable(reason),
+            Err(MergeProbeFailure::Retry(reason)) => return MergeProbe::Waiting(reason),
+        }
+    }
+    let Some(api_head) = api_head else {
+        return MergeProbe::Waiting(
+            "GitHub merge response omitted the pull request's head".to_owned(),
+        );
+    };
+    if !api_head.eq_ignore_ascii_case(&target.head) {
+        // The API's head is not this delivery's head. The pointer lags a push
+        // by a second or two, so this may simply be "not caught up yet", and
+        // only the budget can tell that apart from a superseded head whose
+        // merge GitHub will never surface. Keep polling; the timeout builds
+        // the engine's own merge when nothing appears.
+        return MergeProbe::Waiting(format!(
+            "the API reports head {api_head}, not this delivery's {}",
+            target.head
+        ));
+    }
+    if state.mergeable == Some(false) {
+        info!(
+            repository = %target.repo,
+            pull_request = target.number,
+            "pull request has a merge conflict; skipping pull_request runs for this delivery"
+        );
+        return MergeProbe::Resolved(FreshMergePlacement::Conflict);
+    }
+    match state.mergeable {
+        Some(true) => MergeProbe::Waiting(format!(
+            "the API's merge pointer does not (yet) name a merge of {}",
+            target.head
+        )),
+        other => MergeProbe::Waiting(format!("GitHub reports mergeable={other:?}")),
+    }
+}
+
+/// Why a delivery could not be placed on the pull request's merge.
+struct FreshMergeFailure {
+    reason: String,
+    /// True when retrying the delivery could still place it: the mirror fetch
+    /// failed. A head or base the mirror can never hold is permanent, and the
+    /// delivery is dead-lettered instead of retried.
+    transient: bool,
+}
+
+impl FreshMergeFailure {
+    fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            transient: true,
+        }
+    }
+
+    fn permanent(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            transient: false,
+        }
+    }
+}
+
+/// Resolve where this delivery's pull-request runs check out.
+///
+/// The first probe runs immediately, then re-probes every
+/// [`FreshMergePoll::poll_interval`] until the budget is spent — a bounded
+/// wait (tens of seconds) that stays inside the delivery's lease and is
+/// aborted with the processing task if the lease is lost. Every path that
+/// cannot use GitHub's merge ends at the engine's own merge of the current
+/// base tip and the payload head — never at the bare `refs/pull/{n}/head`,
+/// which is not the pull request's tree. `Err` means no placement could be
+/// produced at all; the delivery is retried or dead-lettered.
+async fn resolve_fresh_merge(
+    shared: &Arc<SharedState>,
+    target: &FreshMergeTarget,
+) -> Result<FreshMergePlacement, FreshMergeFailure> {
+    let poll = &shared.state.fresh_merge_poll;
+    let deadline = Instant::now() + poll.budget;
+    loop {
+        match probe_fresh_merge(shared, target).await {
+            MergeProbe::Resolved(placement) => return Ok(placement),
+            MergeProbe::Unavailable(reason) => {
+                warn!(
+                    repository = %target.repo,
+                    pull_request = target.number,
+                    reason = %reason,
+                    "pull request merge state is unavailable; building the test merge ourselves"
+                );
+                return self_merge(shared, target).await;
+            }
+            MergeProbe::Waiting(reason) => {
+                debug!(
+                    repository = %target.repo,
+                    pull_request = target.number,
+                    reason = %reason,
+                    "GitHub has not produced the pull request's test merge yet; re-polling"
+                );
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(poll.poll_interval.min(deadline - now)).await;
+    }
+    warn!(
+        repository = %target.repo,
+        pull_request = target.number,
+        budget_secs = poll.budget.as_secs(),
+        "GitHub did not surface the pull request's test merge within the budget; \
+         building the test merge ourselves"
+    );
+    self_merge(shared, target).await
+}
+
+/// Build this engine's own test merge of the payload head into the current
+/// base tip: the merge GitHub would have produced.
+///
+/// Used whenever GitHub's live merge cannot be used: its pointer moved past
+/// this delivery's head, the API failed, or the poll budget ran out. The
+/// engine's mirror holds the merge afterward, and the run is served from the
+/// engine — GitHub has no such commit. A conflict found here is treated
+/// exactly like GitHub's: no `pull_request` runs for this delivery.
+async fn self_merge(
+    shared: &Arc<SharedState>,
+    target: &FreshMergeTarget,
+) -> Result<FreshMergePlacement, FreshMergeFailure> {
+    let source = crate::merge_builder::webhook_merge_source(shared, &target.repo)
+        .await
+        .map_err(|error| {
+            FreshMergeFailure::transient(format!(
+                "cannot open the merge mirror for {}: {error}",
+                target.repo
+            ))
+        })?;
+    let request = crate::merge_builder::MergeRequest {
+        repository: target.repo.clone(),
+        pull_request_number: Some(target.number),
+        base_branch: target.base_branch.clone(),
+        // The payload head, pinned: `refs/pull/{n}/head` may already point at
+        // a newer commit, and this delivery must test the head it was sent.
+        head: crate::merge_builder::MergeHead::Commit(target.head.clone()),
+    };
+    match crate::merge_builder::build_merge(&source, &request, &source.mirror).await {
+        Ok(crate::merge_builder::MergeOutcome::Merged(merge)) => {
+            let Some(prebuilt) = crate::merge_builder::prebuilt_merge_record(
+                shared,
+                &source.mirror,
+                &merge,
+                Some(target.number),
+            ) else {
+                return Err(FreshMergeFailure::permanent(format!(
+                    "merge mirror {} is outside the state directory",
+                    source.mirror.display()
+                )));
+            };
+            Ok(FreshMergePlacement::SelfMerge(Box::new(prebuilt)))
+        }
+        Ok(crate::merge_builder::MergeOutcome::Conflict { paths, .. }) => {
+            info!(
+                repository = %target.repo,
+                pull_request = target.number,
+                conflicted_paths = paths.len(),
+                "the engine's own test merge conflicts; skipping pull_request runs for this delivery"
+            );
+            Ok(FreshMergePlacement::Conflict)
+        }
+        Err(error) => {
+            let reason = format!(
+                "failed to build a test merge of {} into {}: {error}",
+                target.head, target.base_branch
+            );
+            if error.is_transient() {
+                Err(FreshMergeFailure::transient(reason))
+            } else {
+                Err(FreshMergeFailure::permanent(reason))
+            }
+        }
+    }
+}
+
+/// A delivery's events after merge-state resolution, plus the engine-built
+/// merge their run submissions must carry when the placement is one.
+struct FreshenedEvents {
+    events: Vec<EffectiveEvent>,
+    /// Set when the pull-request events check out a merge this engine built.
+    self_merge: Option<PrebuiltMerge>,
+}
+
+/// Apply a resolved placement to a delivery's projected events.
+fn apply_fresh_merge_placement(
+    events: Vec<EffectiveEvent>,
+    placement: FreshMergePlacement,
+    number: u64,
+) -> FreshenedEvents {
+    let place = |mut event: EffectiveEvent, git_ref: String, sha: &str| {
+        event.git_ref = git_ref;
+        event.sha = Some(sha.to_owned());
+        event
+    };
+    let place_merge = |events: Vec<EffectiveEvent>, sha: &str| {
+        events
+            .into_iter()
+            .map(|event| {
+                if is_pull_request_run_event(&event) {
+                    place(event, format!("refs/pull/{number}/merge"), sha)
+                } else {
+                    event
+                }
+            })
+            .collect()
+    };
+    match placement {
+        FreshMergePlacement::Projected => FreshenedEvents {
+            events,
+            self_merge: None,
+        },
+        FreshMergePlacement::Conflict => FreshenedEvents {
+            events: events
+                .into_iter()
+                .filter(|event| !is_pull_request_run_event(event))
+                .collect(),
+            self_merge: None,
+        },
+        FreshMergePlacement::Merge(merge) => FreshenedEvents {
+            events: place_merge(events, &merge),
+            self_merge: None,
+        },
+        FreshMergePlacement::SelfMerge(merge) => FreshenedEvents {
+            events: place_merge(events, &merge.sha),
+            self_merge: Some(*merge),
+        },
+    }
+}
+
+/// Re-place a GitHub delivery's `pull_request`/`pull_request_review` events on
+/// the pull request's *current* test merge — GitHub's live one, or a merge
+/// this engine builds when GitHub's is out of reach.
+///
+/// Everything else — other events, deployments without GitHub credentials —
+/// passes through with the adapter's projection. `Err` means the delivery
+/// could not be placed at all (the engine's own test merge could not be
+/// built) and must be retried or dead-lettered.
+async fn freshen_pull_request_events(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+    payload: &Value,
+    events: Vec<EffectiveEvent>,
+) -> Result<FreshenedEvents, FreshMergeFailure> {
+    let untouched = || FreshenedEvents {
+        events: events.clone(),
+        self_merge: None,
+    };
+    if !matches!(
+        delivery.event.as_str(),
+        "pull_request" | "pull_request_review"
+    ) {
+        return Ok(untouched());
+    }
+    if !events
+        .iter()
+        .any(|event| !event.skip && is_pull_request_run_event(event))
+    {
+        return Ok(untouched());
+    }
+    // The fork-policy kill switch drops fork-pull-request events further down,
+    // after this probe. A delivery whose every pull-request event will be
+    // dropped must not spend GitHub API calls on a merge nothing will run.
+    if events
+        .iter()
+        .filter(|event| !event.skip && is_pull_request_run_event(event))
+        .all(|event| fork_policy_skips(&shared.state.fork_policy, event))
+    {
+        info!("fork workflows are disabled; skipping merge-state resolution for this delivery");
+        return Ok(untouched());
+    }
+    let Some(target) = FreshMergeTarget::from_payload(payload) else {
+        return Ok(untouched());
+    };
+    let placement = resolve_fresh_merge(shared, &target).await?;
+    Ok(apply_fresh_merge_placement(
+        events,
+        placement,
+        target.number,
+    ))
+}
+
 const WEBHOOK_ACK_BUDGET: Duration = Duration::from_secs(8);
 const WEBHOOK_ENQUEUE_ATTEMPTS: usize = 2;
 const WEBHOOK_LEASE_DURATION_SECS: u64 = 60;
@@ -3439,7 +4096,35 @@ async fn process_delivery_payload_with_lease(
     if live_events.iter().all(|effective| effective.skip) {
         return WebhookOutcome::Success;
     }
-    let effective_events = live_events;
+    // GitHub computes a pull request's test-merge commit asynchronously, so
+    // the payload's `merge_commit_sha` is often the previous merge or null.
+    // Resolve the live placement before anything else reads `sha`/`git_ref`
+    // (workflow inventory, changed-files filtering, run creation). A merge
+    // conflict means GitHub creates no pull_request runs for this delivery;
+    // an unresolvable placement fails the delivery for a retry.
+    let freshened =
+        match freshen_pull_request_events(shared, delivery, &payload_val, live_events).await {
+            Ok(freshened) => freshened,
+            // A placement that cannot be produced is fatal to this attempt: a
+            // transient cause (mirror fetch) retries the delivery, a
+            // permanent one (a head or base the mirror can never hold) is
+            // dead-lettered rather than retried into the same wall.
+            Err(failure) if failure.transient => {
+                return WebhookOutcome::TransientError(failure.reason);
+            }
+            Err(failure) => return WebhookOutcome::Unreportable(failure.reason),
+        };
+    // The run submissions' `prebuilt_merge`: set only when the pull-request
+    // events check out a merge this engine built.
+    let engine_built_merge = freshened.self_merge;
+    let effective_events = freshened.events;
+    if effective_events.is_empty() {
+        info!(
+            "Event {} produced no runnable events after merge-state resolution",
+            delivery.event
+        );
+        return WebhookOutcome::Success;
+    }
 
     let repo_full_name = match payload_val
         .get("repository")
@@ -3513,10 +4198,7 @@ async fn process_delivery_payload_with_lease(
         // pull-request workflows. Skips the event before any workflow is
         // fetched or matched. `pull_request_target` is unaffected — it runs
         // with base-repo trust (see execution protections for that knob).
-        if effective.trust_tier
-            == Some(crate::events::trust_tier::TrustTier::UntrustedForkPullRequest)
-            && !shared.state.fork_policy.run_fork_workflows
-        {
+        if fork_policy_skips(&shared.state.fork_policy, effective) {
             info!(
                 event = %effective.event,
                 "fork policy skipped fork pull-request event (run_fork_workflows = false)"
@@ -3573,12 +4255,23 @@ async fn process_delivery_payload_with_lease(
             },
         };
 
-        let workflows = match fetch_workflows(shared, &repo_full_name, &resolved_sha).await {
+        // A self-built merge does not exist on GitHub, so its workflow
+        // inventory is read at the pull request's head commit — the tree
+        // whose workflows a run on the merge executes.
+        let inventory_sha = match (&engine_built_merge, is_pull_request_run_event(effective)) {
+            (Some(_), true) => effective
+                .status_check_sha
+                .clone()
+                .unwrap_or_else(|| resolved_sha.clone()),
+            _ => resolved_sha.clone(),
+        };
+
+        let workflows = match fetch_workflows(shared, &repo_full_name, &inventory_sha).await {
             Ok(w) => w,
             Err(error) => {
                 error!(
                     event = %effective.event,
-                    sha = %resolved_sha,
+                    sha = %inventory_sha,
                     source_ref = %workflow_ref,
                     ?error,
                     "Failed to fetch workflows at the event commit"
@@ -3790,6 +4483,20 @@ async fn process_delivery_payload_with_lease(
                 debug_on_failure: false,
                 push: None,
                 push_tree: None,
+                // The delivery already decided this run's tree — GitHub's
+                // live merge, the engine's own merge, or the adapter's
+                // projection when there is no API to ask — so the submit
+                // path must not build a second merge from a local workspace:
+                // that merge would need an `origin` the workspace may not
+                // have, and would replace the resolved tree.
+                no_merge: effective.event == "pull_request",
+                // A run whose placement is the engine's own merge must be
+                // served from the engine: GitHub has no such commit.
+                prebuilt_merge: if is_pull_request_run_event(effective) {
+                    engine_built_merge.clone()
+                } else {
+                    None
+                },
             };
 
             // The dedup gate decides whether a run may be submitted at all.
@@ -4385,6 +5092,1265 @@ mod tests {
             self.state.webhook_retry_backoff = ladder;
             self
         }
+    }
+
+    // ── Fresh merge resolution ─────────────────────────────────────────
+    //
+    // GitHub's merge sha can lag a push. Accepted merges pin the payload head
+    // as second parent; a matching-head conflict skips PR runs; fallback
+    // builds the engine's own merge.
+
+    /// A workspace holding a single workflow, ready to be committed into a
+    /// pull-request graph.
+    fn pr_workspace(temp: &tempfile::TempDir, workflow: &str) -> std::path::PathBuf {
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(ws_dir.join(".github/workflows/ci.yml"), workflow).unwrap();
+        ws_dir
+    }
+
+    /// Build a pull-request-shaped git graph in `ws_dir`, returning
+    /// `(head, stale_merge, current_merge, current_base)`.
+    ///
+    /// `head` is the payload's `pull_request.head.sha`; `stale_merge` is the
+    /// previous head's test merge — exactly what the payload still carries on
+    /// `synchronize`; `current_merge` is the live merge of `head` into the
+    /// current base tip, and `current_base` is that first parent. All four
+    /// values are real commits so the local-workspace workflow inventory can
+    /// read them.
+    fn build_pull_request_graph(ws_dir: &std::path::Path) -> (String, String, String, String) {
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "github-tests@example.invalid"][..],
+            &["config", "user.name", "GitHub Tests"][..],
+        ] {
+            git_output(ws_dir, args);
+        }
+        git_output(ws_dir, &["add", "-A"]);
+        git_output(ws_dir, &["commit", "-qm", "base"]);
+        git_output(ws_dir, &["checkout", "-q", "-b", "feature"]);
+        git_output(ws_dir, &["commit", "-q", "--allow-empty", "-m", "head 1"]);
+        git_output(ws_dir, &["checkout", "-q", "main"]);
+        git_output(
+            ws_dir,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "previous test merge",
+                "feature",
+            ],
+        );
+        let stale_merge = git_output(ws_dir, &["rev-parse", "HEAD"]);
+        git_output(ws_dir, &["checkout", "-q", "feature"]);
+        git_output(ws_dir, &["commit", "-q", "--allow-empty", "-m", "head 2"]);
+        let head = git_output(ws_dir, &["rev-parse", "HEAD"]);
+        git_output(ws_dir, &["checkout", "-q", "main"]);
+        git_output(
+            ws_dir,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "current test merge",
+                "feature",
+            ],
+        );
+        let current_merge = git_output(ws_dir, &["rev-parse", "HEAD"]);
+        let current_base = git_output(ws_dir, &["rev-parse", "HEAD^1"]);
+        // `WebhookFixture` commits the workspace itself; leave it something to
+        // commit so that fixture step cannot fail on an empty tree.
+        std::fs::write(ws_dir.join(".fixture-marker"), "marker\n").unwrap();
+        (head, stale_merge, current_merge, current_base)
+    }
+
+    /// Publish the workspace's graph as the engine's own git upstream for
+    /// `owner/repo`, so a self-built merge fetches from it instead of GitHub.
+    ///
+    /// `webhook_merge_source` fetches `{server_url}/{owner}/{repo}.git` from
+    /// a live engine; here the server URL is the returned repository's
+    /// grandparent (`<state>/test-upstream`), a `file://` clone of the same
+    /// graph. Returns the bare repository's path.
+    fn publish_merge_upstream(state: &AppState, ws_dir: &std::path::Path) -> std::path::PathBuf {
+        let root = state.state_dir.join("test-upstream");
+        let upstream = root.join("owner/repo.git");
+        std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+        git_output(
+            ws_dir,
+            &["clone", "--bare", "-q", ".", upstream.to_str().unwrap()],
+        );
+        upstream
+    }
+
+    /// Point the engine at `upstream_root` (`file://`) as its git server.
+    fn serve_merges_from(state: &mut AppState, upstream_root: &std::path::Path) {
+        state.github_urls.server_url = format!("file://{}", upstream_root.display());
+    }
+
+    /// Assert `sha` exists in `mirror` and merges exactly `(base, head)`.
+    fn assert_engine_merge(mirror: &std::path::Path, sha: &str, base: &str, head: &str) {
+        let parents = git_output(mirror, &["log", "-1", "--format=%P", sha]);
+        assert_eq!(
+            parents,
+            format!("{base} {head}"),
+            "run sha {sha} must be the engine's merge of {head} into {base}"
+        );
+    }
+
+    /// The delivery mirror `webhook_merge_source` created for `owner/repo`.
+    fn merge_mirror(state: &AppState) -> std::path::PathBuf {
+        let root = state.state_dir.join("checkout-cache/repositories");
+        let mirrors: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("merge-"))
+            })
+            .collect();
+        assert_eq!(mirrors.len(), 1, "exactly one delivery merge mirror");
+        mirrors.into_iter().next().unwrap()
+    }
+
+    /// A `pull_request` webhook payload whose carried merge sha is the
+    /// previous head's test merge (what GitHub sends on `synchronize`).
+    fn stale_pull_request_payload(head: &str, stale_merge: &str, base_sha: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "action": "synchronize",
+            "number": 42,
+            "pull_request": {
+                "number": 42,
+                "head": { "ref": "feature", "sha": head, "repo": { "fork": false } },
+                "base": { "ref": "main", "sha": base_sha },
+                "merge_commit_sha": stale_merge,
+            },
+            "repository": { "full_name": "owner/repo", "default_branch": "main" },
+        }))
+        .unwrap()
+    }
+
+    /// The stub's pull-request-files answer: these fixtures declare no
+    /// `paths:` filters, so an empty list is always enough.
+    fn pr_files_answer() -> Value {
+        serde_json::json!([])
+    }
+
+    /// The payload's stale merge sha must be replaced by GitHub's live test
+    /// merge, and the stale sha must never be consulted.
+    #[tokio::test]
+    async fn stale_payload_merge_sha_is_replaced_with_the_live_test_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let merge_state = serde_json::json!({
+            "mergeable": true,
+            "merge_commit_sha": current_merge.clone(),
+            "head": { "sha": head.clone() },
+            "base": { "sha": current_base.clone() },
+        });
+        let merge_commit = serde_json::json!({
+            "sha": current_merge.clone(),
+            "parents": [{ "sha": current_base.clone() }, { "sha": head.clone() }],
+        });
+        let commits_path = format!("/repos/owner/repo/commits/{current_merge}");
+        let (api, requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (200, vec![], merge_state.clone());
+            }
+            if path == commits_path.as_str() {
+                return (200, vec![], merge_commit.clone());
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-stale-merge", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1, "exactly the pull_request run");
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(
+            run.submission.sha, current_merge,
+            "the run must check out GitHub's live test merge, not the payload's stale sha"
+        );
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(
+            run.submission.status_check_sha.as_deref(),
+            Some(head.as_str()),
+            "check runs still attach to the PR head"
+        );
+        drop(inner);
+        assert!(
+            !requests
+                .lock()
+                .iter()
+                .any(|(_, path, _)| path.contains(&stale_merge)),
+            "the stale payload merge sha must never be trusted — not even inspected"
+        );
+    }
+
+    /// A transient probe failure and GitHub's "still computing" answer are
+    /// both polled through, not treated as final.
+    #[tokio::test]
+    async fn mergeability_unknown_is_polled_until_the_test_merge_is_ready() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let merge_state = serde_json::json!({
+            "mergeable": true,
+            "merge_commit_sha": current_merge.clone(),
+            "head": { "sha": head.clone() },
+            "base": { "sha": current_base.clone() },
+        });
+        let merge_commit = serde_json::json!({
+            "sha": current_merge.clone(),
+            "parents": [{ "sha": current_base.clone() }, { "sha": head.clone() }],
+        });
+        let commits_path = format!("/repos/owner/repo/commits/{current_merge}");
+        let api_head = head.clone();
+        let api_base = current_base.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return match polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    // A transient 5xx must not decide anything…
+                    0 => (500, vec![], serde_json::json!({ "message": "boom" })),
+                    // …nor must GitHub's "still computing" answer.
+                    1 => (
+                        200,
+                        vec![],
+                        serde_json::json!({
+                            "mergeable": null,
+                            "merge_commit_sha": null,
+                            "head": { "sha": api_head.clone() },
+                            "base": { "sha": api_base.clone() },
+                        }),
+                    ),
+                    _ => (200, vec![], merge_state.clone()),
+                };
+            }
+            if path == commits_path.as_str() {
+                return (200, vec![], merge_commit.clone());
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(20),
+        };
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-poll", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the probe must be retried past the transient failure and the unknown state"
+        );
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        assert_eq!(
+            inner.runs.values().next().unwrap().submission.sha,
+            current_merge
+        );
+    }
+
+    /// GitHub creates no pull_request runs for a conflicted PR; the
+    /// pull_request_target projection still runs on the base.
+    #[tokio::test]
+    async fn conflicted_pull_request_creates_no_pr_runs_but_still_runs_target() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        std::fs::write(
+            ws_dir.join(".github/workflows/pre.yml"),
+            "on: pull_request_target\njobs:\n  base:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo base\n",
+        )
+        .unwrap();
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+        let api_head = head.clone();
+        let api_base = current_base.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": false,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": api_base.clone() },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-conflict", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "a conflicted PR creates no pull_request runs"
+        );
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(
+            run.submission.event, "pull_request_target",
+            "pull_request_target is unaffected by the conflict"
+        );
+        drop(inner);
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-conflict")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "skipping on a conflict is a completed delivery"
+        );
+    }
+    /// A pointer that moved to a newer head must not suppress the delivery
+    /// for the older head: GitHub will never build that head's merge, so the
+    /// engine builds merge(current base tip, payload head) itself and runs
+    /// it. Never the bare head ref, and never the newer head's tree.
+    #[tokio::test]
+    async fn head_race_builds_and_runs_the_engines_own_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        // GitHub's pointer moved on before this delivery landed: it reports a
+        // newer head and offers no merge this payload could use.
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let (api, requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": false,
+                        "merge_commit_sha": null,
+                        "head": { "sha": "newer-head" },
+                        "base": { "sha": "newer-base" },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(20),
+        };
+        // The engine fetches the current base tip from its own git upstream.
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-newer-conflict", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1, "the older payload head's run");
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.event, "pull_request");
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(
+            run.submission.status_check_sha.as_deref(),
+            Some(head.as_str()),
+            "check runs still attach to the PR head"
+        );
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_ne!(merge_sha, head, "never the bare head ref");
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "a head the API never offers a merge for is polled through the budget, not decided on first sight"
+        );
+        assert!(
+            !requests
+                .lock()
+                .iter()
+                .any(|(_, path, _)| path.contains("/commits/")),
+            "the API offers no merge of this head to verify"
+        );
+    }
+
+    /// A merge-state API that keeps failing cannot block the delivery: after
+    /// the bounded wait the engine builds and runs its own merge of the
+    /// current base tip and the payload head — never the stale payload sha,
+    /// never the bare head ref.
+    #[tokio::test]
+    async fn api_failure_within_the_budget_builds_and_runs_the_engines_own_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (500, vec![], serde_json::json!({ "message": "boom" }));
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // A persistent 5xx would trip the shared breaker; this test is about
+        // the resolver's own fallback, so keep the breaker out of the way.
+        fixture.state.github_breaker = Arc::new(crate::github_breaker::GithubBreaker::new(
+            crate::github_breaker::BreakerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        ));
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-probe-failure", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "the probe must be retried within the budget before falling back"
+        );
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(
+            run.submission.status_check_sha.as_deref(),
+            Some(head.as_str()),
+            "check runs still attach to the PR head"
+        );
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_ne!(merge_sha, stale_merge, "never the stale payload sha");
+        assert_ne!(merge_sha, head, "never the bare head ref");
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-probe-failure")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "the delivery settles once the engine's merge runs"
+        );
+    }
+
+    /// A merge commit that is not the merge of the payload head is never
+    /// used, even when the API still points at it (the push-race guard): the
+    /// delivery polls through the budget and the engine builds its own merge.
+    #[tokio::test]
+    async fn a_merge_commit_from_another_head_is_never_used() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+        // The previous head: the second parent of the merge the API offers.
+        let previous_head = git_output(&ws_dir, &["rev-parse", "feature~1"]);
+
+        let merge_state = serde_json::json!({
+            "mergeable": true,
+            "merge_commit_sha": stale_merge.clone(),
+            "head": { "sha": head.clone() },
+            "base": { "sha": current_base.clone() },
+        });
+        let merge_commit = serde_json::json!({
+            "sha": stale_merge.clone(),
+            "parents": [{ "sha": current_base.clone() }, { "sha": previous_head }],
+        });
+        let commits_path = format!("/repos/owner/repo/commits/{stale_merge}");
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (200, vec![], merge_state.clone());
+            }
+            if path == commits_path.as_str() {
+                return (200, vec![], merge_commit.clone());
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-other-head", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        let merge_sha = run.submission.sha.clone();
+        let git_ref = run.submission.git_ref.clone();
+        drop(inner);
+        assert_ne!(
+            merge_sha, stale_merge,
+            "a merge of another head must never be checked out"
+        );
+        assert_eq!(git_ref, "refs/pull/42/merge");
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+    }
+
+    /// GitHub freezes a head's test merge when the base moves (it does not
+    /// rebuild it) and its own run for that push used the frozen commit: a
+    /// first parent older than the API's base is logged, not rejected.
+    #[tokio::test]
+    async fn a_merge_against_an_older_base_is_accepted() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+        let merge_state = serde_json::json!({
+            "mergeable": true,
+            "merge_commit_sha": stale_merge.clone(),
+            "head": { "sha": head.clone() },
+            "base": { "sha": "new-base" },
+        });
+        let merge_commit = serde_json::json!({
+            "sha": stale_merge.clone(),
+            "parents": [{ "sha": current_base.clone() }, { "sha": head.clone() }],
+        });
+        let commits_path = format!("/repos/owner/repo/commits/{stale_merge}");
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (200, vec![], merge_state.clone());
+            }
+            if path == commits_path.as_str() {
+                return (200, vec![], merge_commit.clone());
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-obsolete-base", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(
+            run.submission.sha, stale_merge,
+            "GitHub's frozen merge of this head is what GitHub itself ran"
+        );
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        assert_eq!(
+            run.submission.status_check_sha.as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    /// The measured rapid-push race: the API reports a newer head while
+    /// `merge_commit_sha` still names *this* delivery's head's merge. The
+    /// candidate's parents are inspected first, so the valid merge is kept —
+    /// not discarded for a head race that no longer concerns this delivery.
+    #[tokio::test]
+    async fn head_race_keeps_this_heads_merge_when_the_pointer_still_names_it() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let merge_state = serde_json::json!({
+            "mergeable": null,
+            "merge_commit_sha": current_merge.clone(),
+            "head": { "sha": "newer-head" },
+            "base": { "sha": current_base.clone() },
+        });
+        let merge_commit = serde_json::json!({
+            "sha": current_merge.clone(),
+            "parents": [{ "sha": current_base.clone() }, { "sha": head.clone() }],
+        });
+        let commits_path = format!("/repos/owner/repo/commits/{current_merge}");
+        let (api, requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (200, vec![], merge_state.clone());
+            }
+            if path == commits_path.as_str() {
+                return (200, vec![], merge_commit.clone());
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-race-keep", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(
+            run.submission.sha, current_merge,
+            "this head's live merge is used even though the API's head already moved"
+        );
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        drop(inner);
+        assert_eq!(
+            requests
+                .lock()
+                .iter()
+                .filter(|(_, path, _)| path == "/repos/owner/repo/pulls/42")
+                .count(),
+            1,
+            "the first probe already knows the answer; nothing waits"
+        );
+    }
+
+    /// GitHub never surfaces the merge for this head: the budget expires and
+    /// the delivery runs on the engine's own merge of the current base tip.
+    #[tokio::test]
+    async fn budget_expiry_builds_and_runs_the_engines_own_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        // GitHub is mid-recompute for this very head: it names the head but
+        // has no merge to offer, forever.
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let api_head = head.clone();
+        let api_base = current_base.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": api_base.clone() },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-budget", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "the delivery polls before giving up on GitHub"
+        );
+        let inner = fixture.state.test_tx().await;
+        let runs = inner.runs.len();
+        drop(inner);
+        if runs != 1 {
+            let record = fixture
+                .state
+                .backend
+                .get_webhook_delivery("delivery-pr-budget")
+                .await
+                .unwrap()
+                .expect("delivery row must exist");
+            panic!(
+                "expected one run, got {runs}: delivery state={:?} last_error={:?}",
+                record.state, record.last_error
+            );
+        }
+        let inner = fixture.state.test_tx().await;
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-budget")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, WebhookDeliveryStatus::Done);
+    }
+
+    /// The engine's own merge can conflict. When it does, the delivery gets
+    /// GitHub's conflict treatment: no pull_request runs, while
+    /// pull_request_target still runs on the base.
+    #[tokio::test]
+    async fn engine_merge_conflict_skips_pull_request_runs() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        std::fs::write(
+            ws_dir.join(".github/workflows/pre.yml"),
+            "on: pull_request_target\njobs:\n  base:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo base\n",
+        )
+        .unwrap();
+        let (_head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+        // The head and the base tip both touch the same file: the engine's
+        // merge of the two conflicts.
+        git_output(&ws_dir, &["checkout", "-q", "feature"]);
+        std::fs::write(ws_dir.join("conflict.txt"), "feature side\n").unwrap();
+        git_output(&ws_dir, &["add", "-A"]);
+        git_output(&ws_dir, &["commit", "-qm", "feature side"]);
+        let head = git_output(&ws_dir, &["rev-parse", "HEAD"]);
+        git_output(&ws_dir, &["checkout", "-q", "main"]);
+        std::fs::write(ws_dir.join("conflict.txt"), "base side\n").unwrap();
+        git_output(&ws_dir, &["add", "-A"]);
+        git_output(&ws_dir, &["commit", "-qm", "base side"]);
+        // `WebhookFixture` commits the workspace itself; leave it something to
+        // commit so that fixture step cannot fail on an empty tree.
+        std::fs::write(ws_dir.join(".fixture-marker"), "marker\n").unwrap();
+
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": "some-base" },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(60),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-self-conflict", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "a conflicting engine merge creates no pull_request runs"
+        );
+        assert_eq!(
+            inner.runs.values().next().unwrap().submission.event,
+            "pull_request_target"
+        );
+        drop(inner);
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-self-conflict")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "the conflict gate is a completed delivery"
+        );
+    }
+
+    /// A permanent mirror failure (the payload's base branch does not exist)
+    /// dead-letters the delivery instead of retrying it into the same wall.
+    #[tokio::test]
+    async fn unfetchable_base_branch_dead_letters_the_delivery() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": "some-base" },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(60),
+            poll_interval: Duration::from_millis(20),
+        };
+        // An upstream with no `main` at all.
+        let root = fixture.state.state_dir.join("test-upstream");
+        let upstream = root.join("owner/repo.git");
+        std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+        git_output(
+            &ws_dir,
+            &["init", "--bare", "-q", upstream.to_str().unwrap()],
+        );
+        serve_merges_from(&mut fixture.state, &root);
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-no-base", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert!(
+            inner.runs.is_empty(),
+            "a merge that cannot be built never places a run"
+        );
+        drop(inner);
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-no-base")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Failed,
+            "a base the mirror can never hold dead-letters instead of retrying"
+        );
+    }
+
+    /// `pull_request_review` uses the same merge-ref placement and gets the
+    /// same fresh resolution.
+    #[tokio::test]
+    async fn pull_request_review_uses_the_live_test_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request_review\njobs:\n  review:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo reviewed\n",
+        );
+        let (head, stale_merge, current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let merge_state = serde_json::json!({
+            "mergeable": true,
+            "merge_commit_sha": current_merge.clone(),
+            "head": { "sha": head.clone() },
+            "base": { "sha": current_base.clone() },
+        });
+        let merge_commit = serde_json::json!({
+            "sha": current_merge.clone(),
+            "parents": [{ "sha": current_base.clone() }, { "sha": head.clone() }],
+        });
+        let commits_path = format!("/repos/owner/repo/commits/{current_merge}");
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (200, vec![], merge_state.clone());
+            }
+            if path == commits_path.as_str() {
+                return (200, vec![], merge_commit.clone());
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "action": "submitted",
+            "pull_request": {
+                "number": 42,
+                "head": { "ref": "feature", "sha": head, "repo": { "fork": false } },
+                "base": { "ref": "main", "sha": current_base },
+                "merge_commit_sha": stale_merge,
+            },
+            "review": { "state": "approved" },
+            "repository": { "full_name": "owner/repo", "default_branch": "main" },
+        }))
+        .unwrap();
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-review-stale-merge",
+                    Some("pull_request_review"),
+                    &payload
+                )
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.event, "pull_request_review");
+        assert_eq!(
+            run.submission.sha, current_merge,
+            "the review run must check out GitHub's live test merge"
+        );
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+    }
+
+    /// Without GitHub credentials (local-workspace development, native
+    /// webhook replays) there is no API to ask, so the adapter's projection
+    /// stands — the historical behavior stays available for non-GitHub use.
+    #[tokio::test]
+    async fn pull_request_delivery_without_github_credentials_keeps_the_payload_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+        let _no_api = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-no-creds", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1);
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.sha, stale_merge);
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+    }
+
+    /// With fork workflows disabled, a fork pull-request delivery creates no
+    /// pull_request runs — and must not spend a GitHub probe looking for a
+    /// merge nothing will run.
+    #[tokio::test]
+    async fn disabled_fork_workflows_skip_the_merge_state_poll() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        std::fs::write(
+            ws_dir.join(".github/workflows/pre.yml"),
+            "on: pull_request_target\njobs:\n  base:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo base\n",
+        )
+        .unwrap();
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        let (api, requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            // A probe landing here is the bug: no run can use the answer.
+            (
+                200,
+                vec![],
+                serde_json::json!({ "mergeable": true, "merge_commit_sha": null }),
+            )
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        fixture.state.fork_policy.run_fork_workflows = false;
+        // A regression would poll to this budget before failing; keep the
+        // failure fast.
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(200),
+            poll_interval: Duration::from_millis(20),
+        };
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "action": "synchronize",
+            "number": 42,
+            "pull_request": {
+                "number": 42,
+                "head": { "ref": "feature", "sha": head, "repo": { "fork": true } },
+                "base": { "ref": "main", "sha": current_base },
+                "merge_commit_sha": stale_merge,
+            },
+            "repository": { "full_name": "owner/repo", "default_branch": "main" },
+        }))
+        .unwrap();
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-fork-off", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert!(
+            inner
+                .runs
+                .values()
+                .all(|run| run.submission.event != "pull_request"),
+            "the fork policy still gates the fork pull_request run"
+        );
+        assert!(
+            inner
+                .runs
+                .values()
+                .any(|run| run.submission.event == "pull_request_target"),
+            "pull_request_target is unaffected by the fork policy"
+        );
+        drop(inner);
+        let probes: Vec<String> = requests
+            .lock()
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert!(
+            !probes.iter().any(|path| {
+                // The merge-state probe or its merge-commit verification; the
+                // changed-files lookup (`/pulls/42/files`) still runs for the
+                // pull_request_target event.
+                path == "/repos/owner/repo/pulls/42" || path.contains("/commits/")
+            }),
+            "a policy-skipped fork delivery must not probe the merge state at all: {probes:?}"
+        );
     }
 
     /// A delivery whose workflow inventory cannot be fetched fails internally

@@ -738,6 +738,11 @@ pub struct AppState {
     /// constant so tests can drive the retry path without sleeping through the
     /// real tiers.
     pub webhook_retry_backoff: Vec<std::time::Duration>,
+    /// Bounded poll schedule for resolving a pull request's live test-merge
+    /// commit before a GitHub webhook delivery creates pull_request runs.
+    /// State rather than constants so tests drive the poll without sleeping
+    /// through the production budget.
+    pub fresh_merge_poll: crate::github::FreshMergePoll,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -1478,6 +1483,7 @@ impl AppState {
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
+            fresh_merge_poll: crate::github::FreshMergePoll::default(),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),

@@ -10,6 +10,22 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **Self-built pull-request test merges**: a local `preloop run --event
+  pull_request` now tests the merge of the pull request's *current* base tip
+  into the workspace head (the synthetic snapshot commit when the tree is
+  dirty), exactly like GitHub's `refs/pull/<n>/merge`, instead of the branch
+  alone. The engine fetches the base branch from the workspace's `origin`,
+  builds the merge with `git merge-tree`/`git commit-tree`, and serves it to
+  the run's jobs from an engine-served snapshot repository (the commit exists
+  only here). `github.sha` is the merge commit, `github.ref` stays
+  `refs/pull/<n>/merge`, and the payload's `base.sha`/`head.sha` carry the
+  fetched base tip and the merged head, so changed-file actions keep diffing
+  the user's changes. A conflicted pull request fails the submission (409)
+  listing the conflicted files, exactly where GitHub refuses to run
+  `pull_request` workflows; an unreachable base fails loudly instead of
+  testing a different tree. `--no-merge` restores testing the branch alone,
+  and `push` events are unchanged (they test the commit itself). The server
+  also validates and serves prebuilt merges for other submission paths.
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
   `environment:` are read from the repository's environments API —
@@ -425,6 +441,13 @@ Releases before v0.27.0 predate the changelog.
   they now take their run's `run_order` and the placeholder's `job_order`.
   Legs of one matrix share that `job_order`, so among themselves they fall
   back to `job_id`.
+
+- **Fresh pull-request merge resolution**: Webhook-delivered `pull_request` and
+  `pull_request_review` runs poll for GitHub's live test merge and accept it
+  only when its second parent matches the payload head. If unavailable, the
+  engine builds a merge of the current base and pinned payload head and serves
+  it from its mirror; it never falls back to the bare pull-request head.
+  Conflicted pull requests do not start `pull_request` runs.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
