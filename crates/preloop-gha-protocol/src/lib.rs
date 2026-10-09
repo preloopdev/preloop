@@ -835,6 +835,18 @@ pub struct JobCompletion {
     /// worker (ForceFailJob) sends none, and the server reconciles instead.
     #[serde(default)]
     pub step_results: Vec<CompletionStepResult>,
+    /// The job's `environment.url`, evaluated by the runner after its steps
+    /// ran (official `CompleteJobRequest.environmentUrl`; the runner's
+    /// `JobRunner.CompleteJobAsync` reads it off `ActionsEnvironment.Url`
+    /// once `JobExtension.FinalizeJob` resolved it). `None` for jobs without
+    /// an environment URL, or when the expression did not resolve — the
+    /// deployment status then carries no `environment_url`, as on GitHub.
+    #[serde(
+        rename = "environmentUrl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub environment_url: Option<String>,
 }
 
 /// One entry of the `completejob` `stepResults` array.

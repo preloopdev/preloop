@@ -26,9 +26,9 @@
 CREATE SCHEMA IF NOT EXISTS control;
 SET search_path = control;
 
--- Cell-local boot invariants. `schema_version` is exactly 1 (greenfield;
--- other values are refused) and `key_fingerprint` fences nodes with
--- different cluster HMAC keys from sharing the same database.
+-- Cell-local boot invariants. `schema_version` stamps the build's schema
+-- (greenfield; other values are refused at open) and `key_fingerprint`
+-- fences nodes with different cluster HMAC keys from sharing the database.
 CREATE TABLE schema_meta (
     key                     text PRIMARY KEY,
     value                   bytea NOT NULL
@@ -48,6 +48,8 @@ CREATE TABLE namespaces (
     -- suspended/deleted: neither (queued jobs stay queued, nothing starts).
     state                   text NOT NULL DEFAULT 'active' CHECK (state IN
                                 ('active','suspended','draining','deleted')),
+    -- Platform-owned: cell fencing and config push bookkeeping; the engine
+    -- neither reads nor writes these two.
     cell_generation         bigint NOT NULL DEFAULT 1,   -- bumped on cell move; fences stale writers
     config_version          bigint NOT NULL DEFAULT 0,   -- last platform push applied
     created_at              timestamptz NOT NULL DEFAULT now(),
@@ -60,6 +62,8 @@ CREATE TABLE namespaces (
 -- predicate (a capped claim locks this row first, so nodes cannot
 -- overshoot). Not yet read: max_job_timeout_minutes, priority_tier,
 -- run_history_retention_days.
+-- Those three are platform-owned: written by the hosted platform, not yet
+-- enforced by the engine.
 CREATE TABLE namespace_limits (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     max_queued_jobs         integer,
@@ -80,6 +84,8 @@ CREATE TABLE namespace_pool_limits (
 );
 
 -- Admission and job-build restrictions.
+-- Platform-owned: the hosted platform writes per-tenant admission policy
+-- here; the engine does not read it yet.
 CREATE TABLE namespace_policies (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     fork_pr_policy          text NOT NULL DEFAULT 'untrusted' CHECK (fork_pr_policy IN
@@ -147,6 +153,8 @@ CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 -- archiver scan: terminal runs not yet moved to history
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
+-- fork-approval expiry sweep: runs held for approval whose hold window passed
+CREATE INDEX runs_fork_approval_sweep ON runs(fork_approval_requested_at) WHERE fork_approval_pending;
 
 -- `version` counts status/conclusion changes of the run (see `jobs_version`).
 CREATE FUNCTION bump_run_version() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -169,16 +177,14 @@ CREATE TABLE workflow_run_numbers (
     PRIMARY KEY (namespace_id, repository, workflow_path)
 );
 
--- The request a run was created from. No secret values: `secret_refs`
--- names which secrets (and scopes) the run may use; values are resolved
--- from the SecretProvider when a job is acquired, never stored here.
+-- The request a run was created from. No secret values are ever stored:
+-- secrets are resolved from the SecretProvider when a job is acquired.
 CREATE TABLE run_submissions (
     run_id                  uuid PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
     submission              jsonb NOT NULL,     -- WorkflowSubmission minus secrets
     github_context          jsonb NOT NULL,
     workspace_snapshot      jsonb,
     snapshot_timing         jsonb,              -- duration_ms, object_count, pack_bytes
-    secret_refs             jsonb NOT NULL DEFAULT '{}', -- name -> {scope, version}
     -- Record-level per-job maps the table layout has no column for (jobs
     -- with no `jobs` row yet — a check run minted before its matrix leg
     -- materializes). Mirrors lite's `run_submissions.record_details`.
@@ -225,7 +231,6 @@ CREATE TABLE jobs (
     priority                integer NOT NULL DEFAULT 0,
     run_order               bigint NOT NULL DEFAULT 0,
     job_order               integer NOT NULL DEFAULT 0,
-    not_before              timestamptz,
     enqueued_at             timestamptz,
     claimed_by_runner_id    bigint,
     claimed_at              timestamptz,
@@ -235,6 +240,15 @@ CREATE TABLE jobs (
     outputs                 jsonb,
     annotations             jsonb,
     check_run_id            bigint,
+    -- GitHub deployment id for jobs with `environment:` (created when the
+    -- run reports checks; deployment statuses update on gate decisions and
+    -- job completion). `NULL` for unreported or environment-less jobs.
+    deployment_id           bigint,
+    -- The job's `environment.url`, evaluated by the runner after its steps
+    -- and reported in the completion (`completejob` `environmentUrl`). The
+    -- server posts it as the deployment status's `environment_url`; `NULL`
+    -- until a completion reports one (or for environment-less jobs).
+    environment_url         text,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
@@ -250,11 +264,19 @@ CREATE TABLE jobs (
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 ) WITH (fillfactor = 80);
--- claim and ready-queue front: SELECT .. WHERE queue_state='ready' ORDER BY
--- pool_key, priority DESC, run_order, job_order. The key columns are exactly
--- the ORDER BY so the first rows are read in order; a column between the
--- pool key and the priority (this index used to carry `namespace_id` there)
--- forces a sort of the whole ready queue on every call.
+-- ready-queue scans: the claim batch (`dispatch::claim_one`), the front gauge
+-- (`ready_front_labels`, `queue_stats`) and the reaper's ready scans read the
+-- ready set in ONE global order — priority DESC, run_order, job_order, then
+-- the run_id, job_id tie-breakers that make the order total and keep OFFSET
+-- paging stable. The key columns are exactly that ORDER BY, so first rows are
+-- read in order and LIMIT/OFFSET stop early; without it every claim sorts the
+-- whole ready queue (28 ms for 20k ready jobs vs 0.2 ms here).
+CREATE INDEX jobs_ready_global ON jobs(priority DESC, run_order, job_order, run_id, job_id)
+    WHERE queue_state = 'ready';
+-- Label-set grouping for the per-pool quota predicates and the pool-status
+-- page. The key's leading column groups equal label sets; it never ranks
+-- them — the claim reads the global order above, and ordering by the pool
+-- key starves every label set whose key sorts after another's.
 CREATE INDEX jobs_ready ON jobs(pool_key, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
 CREATE INDEX jobs_pending_expansion ON jobs(enqueued_at) WHERE queue_state = 'pending_expansion';
@@ -414,12 +436,13 @@ CREATE TABLE timeline_records (
 
 -- Per-plan log ids fit the official runner's 32-bit TaskLog.Id and remain
 -- stable across nodes. The unique pair arbitrates concurrent allocations.
--- Content lives in file segments; this row tracks result-service counters.
+-- Content and sizes live in file segments; this row only allocates ids.
 CREATE TABLE log_files (
     log_key                 text PRIMARY KEY,
     run_id                  uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     plan_id                 uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     log_id                  integer NOT NULL CHECK (log_id > 0),
+    -- Filled by the legacy import for logs it carries over.
     byte_count              bigint NOT NULL DEFAULT 0,
     line_count              bigint NOT NULL DEFAULT 0,
     updated_at              timestamptz NOT NULL DEFAULT now(),
@@ -443,7 +466,6 @@ CREATE TABLE runners (
     registered_at           timestamptz NOT NULL DEFAULT now(),
     last_seen_at            timestamptz
 );
-CREATE INDEX runners_labels ON runners USING gin (labels);
 
 CREATE TABLE runner_sessions (
     session_id              uuid PRIMARY KEY,
@@ -451,7 +473,6 @@ CREATE TABLE runner_sessions (
     protocol                text NOT NULL CHECK (protocol IN ('broker','azdo')),
     client_id               text,
     verified                boolean NOT NULL DEFAULT false,
-    engine_node_id          text,               -- node holding the long-poll (wake routing)
     created_at              timestamptz NOT NULL DEFAULT now(),
     last_seen_at            timestamptz NOT NULL DEFAULT now()
 );
@@ -505,8 +526,6 @@ CREATE TABLE provision_requests (
     pool_key                text NOT NULL,
     labels                  jsonb NOT NULL,
     requested_at            timestamptz NOT NULL DEFAULT now(),
-    leased_until            timestamptz,
-    lease_owner             text,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
 );
@@ -668,9 +687,37 @@ CREATE TABLE check_run_updates (
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 
+-- ── Environment approvals (durable audit) ────────────────────────────
+-- One row per recorded environment review decision (approval or
+-- rejection), written in the same transaction that flips the gate, so a
+-- crash cannot separate the decision from its record. Deliberately NOT
+-- archived with the run and never deleted by retention: GitHub keeps an
+-- environment's review history after the run is gone, and this table is
+-- the only durable record of who released a gate. `run_id`/`job_id` carry
+-- no foreign key for exactly that reason — the run row they name may be
+-- deleted while the audit row must survive.
+CREATE TABLE environment_approvals (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    namespace_id    text NOT NULL,
+    run_id          uuid NOT NULL,
+    job_id          text NOT NULL,
+    repository      text NOT NULL,
+    environment     text NOT NULL,
+    decision        text NOT NULL CHECK (decision IN ('approved','rejected')),
+    -- GitHub login of the reviewing user; NULL for the operator's
+    -- system-token (admin) override, which carries no user identity.
+    actor           text,
+    admin_override  boolean NOT NULL DEFAULT false,
+    -- Reviewer comment, when one was supplied (native approve endpoint).
+    comment         text,
+    decided_at      timestamptz NOT NULL
+);
+CREATE INDEX environment_approvals_gate ON environment_approvals(run_id, job_id);
+
 -- ── Artifacts (replaces the artifact part of the `meta` blob) ────────
--- Blobs live in object storage; these rows are the shared index. Upload
--- tokens are stored as hashes, never raw.
+-- Blobs live in object storage; upload state lives in the file-backed
+-- ArtifactStore. These rows are the catalog; the only statement today is
+-- the run-archive DELETE.
 --
 -- The Actions cache is deliberately NOT here: it is a bounded cache
 -- colocated with the runner hosts (preloop-cache CAS: key index ->
@@ -686,15 +733,16 @@ CREATE TABLE artifacts (
     size_bytes              bigint,
     digest                  text,
     storage_key             text NOT NULL,
-    upload_token_hash       bytea,
     created_at              timestamptz NOT NULL DEFAULT now(),
     finalized_at            timestamptz,
     expires_at              timestamptz,
+    public_id               text,
     UNIQUE (run_id, job_backend_id, name)
 );
 CREATE INDEX artifacts_run ON artifacts(run_id);
 CREATE INDEX artifacts_expiry ON artifacts(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX artifacts_pending ON artifacts(created_at) WHERE state = 'pending';
+CREATE UNIQUE INDEX artifacts_public_id ON artifacts(public_id) WHERE public_id IS NOT NULL;
 
 -- ── History (terminal runs, partitioned by run creation, dropped by partition) ──
 CREATE TABLE run_history (
@@ -731,6 +779,7 @@ CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, 
 CREATE TABLE job_history (
     run_id                  uuid NOT NULL,
     run_created_at          timestamptz NOT NULL,
+    run_attempt             integer NOT NULL,
     job_id                  text NOT NULL,
     namespace_id            text NOT NULL,
     kind                    text NOT NULL,
