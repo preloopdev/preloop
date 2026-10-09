@@ -563,20 +563,23 @@ pub async fn cancel_actions_run(
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
 
-    // Attempt to cancel the run. If it's already terminal, the backend cancel
-    // will refuse and we return 409. If the run becomes terminal between
-    // our read and the locked cancel, the cancel may still succeed: in that
-    // case we return 202 to indicate cancellation was initiated.
+    // github.com answers 202 only when this request cancelled a live run;
+    // an already-terminal run gets 409 "Cannot cancel a workflow run that
+    // is completed." The backend reports the locked transition's outcome,
+    // so a run that finished between the ref resolution and the cancel is
+    // a 409 here, not a stale 202. `resolve_run_ref` already proved the
+    // run belongs to this repository, so a `NotFound` from the cancel can
+    // only mean the archiver moved the (terminal) run mid-flight — also a
+    // 409 on github.com's terms.
     match crate::runs::cancel_run_inner(&shared, run_id).await {
-        Ok(_) => Ok(StatusCode::ACCEPTED),
-        Err(error) => {
-            // If the run is terminal, return 409 Conflict
-            if error.kind() == crate::ApiErrorKind::Conflict {
-                return Err(error);
-            }
-            // Other errors propagate
-            Err(error)
-        }
+        Ok((_, true)) => Ok(StatusCode::ACCEPTED),
+        Ok((_, false)) => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) if error.status() == StatusCode::NOT_FOUND => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) => Err(error),
     }
 }
 

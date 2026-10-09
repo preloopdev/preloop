@@ -2116,7 +2116,6 @@ fn label_matching_empty_job_matches_all() {
 // real queue/promotion state is driven through the explicitly gated test
 // completion API and compared with the documented outcome.
 // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
-
 /// Production path: build fails → test with default condition is skipped.
 /// Verifies the server's promote_ready_jobs correctly propagates failure.
 // Oracle: GitHub `needs` and status-function contracts, with worker-side
