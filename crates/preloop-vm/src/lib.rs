@@ -1941,9 +1941,7 @@ fn effective_preloop_home() -> Option<PathBuf> {
 /// disk-space checks must measure.
 #[cfg(target_os = "macos")]
 pub fn machine_data_root() -> Option<PathBuf> {
-    Some(
-        effective_preloop_home()?.join("smolvm-home/Library/Caches/smolvm/vms"),
-    )
+    Some(effective_preloop_home()?.join("smolvm-home/Library/Caches/smolvm/vms"))
 }
 
 #[cfg(not(target_os = "macos"))]

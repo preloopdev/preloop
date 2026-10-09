@@ -7,9 +7,10 @@ use super::{PgBackend, db, lookups};
 use crate::control::backend::RegisterRunner;
 use crate::control::logic;
 use crate::control::types::{
-    AcquireContext, ControlError, EnvironmentApproval, EnvironmentApprovalOutcome,
-    EnvironmentApprovalResult, OpenRunnerSession, PurgeGuard, RunQueueClaimability, RunnerListing,
-    RunnerRow, SessionProtocol, SessionRow,
+    AcquireContext, ControlError, EnvironmentApproval, EnvironmentApprovalAudit,
+    EnvironmentApprovalOutcome, EnvironmentApprovalResult, EnvironmentDecision, OpenRunnerSession,
+    PendingEnvironmentApproval, PurgeGuard, RunQueueClaimability, RunnerListing, RunnerRow,
+    SessionProtocol, SessionRow,
 };
 use crate::models::{RunRecord, RunnerCapabilities};
 use crate::runtime_scheduling;
@@ -1240,11 +1241,11 @@ impl PgBackend {
             .await
             .map_err(db)?;
             tx.execute(
-                "INSERT INTO job_history (run_id, run_created_at, job_id, \
+                "INSERT INTO job_history (run_id, run_created_at, run_attempt, job_id, \
                  namespace_id, kind, parent_job_id, base_id, display_name, \
                  status, pool_key, outputs, annotations, check_run_id, created_at, \
                  deps_ready_at, started_at, completed_at) \
-                 SELECT j.run_id, r.created_at, j.job_id, j.namespace_id, j.kind, \
+                 SELECT j.run_id, r.created_at, r.run_attempt, j.job_id, j.namespace_id, j.kind, \
                  j.parent_job_id, j.base_id, \
                  COALESCE(s.display_name, j.job_id), j.status, j.pool_key, \
                  j.outputs, j.annotations, j.check_run_id, j.created_at, \
@@ -1618,115 +1619,472 @@ impl PgBackend {
         Ok(record)
     }
 
-    /// `record_environment_approval`: append one operator approval to a job
+    /// `record_environment_approval`: append one review decision to a job
     /// parked on its environment's required-reviewer gate, then re-run the
-    /// run's promotion pass so a satisfied gate releases the job.
+    /// run's promotion pass so a satisfied gate releases the job (or a
+    /// rejection fails it closed).
     ///
     /// A lapsed window records nothing: the promotion pass (run next)
     /// re-evaluates the same window and settles the job `Failure` — one
-    /// fail-closed decision over the durable rows.
+    /// fail-closed decision over the durable rows. A `Reject` records the
+    /// rejecting identity and lets the same pass conclude the job.
     pub(crate) async fn record_environment_approval(
         &self,
         approval: EnvironmentApproval,
     ) -> Result<EnvironmentApprovalOutcome, ControlError> {
-        let rules = self.environment_rules();
         let run_id = approval.run_id;
-        let job_id = approval.job_id;
+        let job_id = approval.job_id.clone();
+        let decision = approval.decision;
+        let actor = approval.actor.clone();
+        let admin_override = approval.admin_override;
         let note = approval.note.clone();
         let now = crate::models::now_unix_nanos();
         let result = {
             let mut client = self.writer().await?;
             let tx = client.transaction().await.map_err(db)?;
+            // Serialize with the promotion sweep: the sweep holds this same
+            // run lock (`FOR NO KEY UPDATE`) while it loads the graph and
+            // flushes gate rows, so a read taken outside it could hand the
+            // sweep a stale gate to overwrite — or record an approval against
+            // a row the sweep is already concluding. The job row lock
+            // (`FOR UPDATE OF j`) closes the narrower window against writers
+            // that only touch the job row (the announce stamp, a deployment
+            // id): the read-modify-write of `environment_gate` here replaces
+            // the whole JSON blob.
+            if !PgBackend::lock_run(&tx, run_id).await? {
+                return Err(ControlError::NotFound("job not found".to_owned()));
+            }
             let run_key = run_id.0.to_string();
-            let repository: String = tx
-                .query_opt(
-                    "SELECT repository FROM runs WHERE run_id = $1::text::uuid",
-                    &[&run_key],
-                )
-                .await
-                .map_err(db)?
-                .map(|row| row.get(0))
-                .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
             let row = tx
                 .query_opt(
-                    "SELECT j.status, j.environment_gate::text, s.environment::text \
-                     FROM jobs j \
-                     LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
-                     WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
+                    "SELECT j.status, j.environment_gate::text, r.namespace_id, r.repository \
+                     FROM jobs j JOIN runs r ON r.run_id = j.run_id \
+                     WHERE j.run_id = $1::text::uuid AND j.job_id = $2 FOR UPDATE OF j",
                     &[&run_key, &job_id.0],
                 )
                 .await
                 .map_err(db)?
                 .ok_or_else(|| ControlError::NotFound("job not found".to_owned()))?;
             let status = crate::control::types::status_parse(row.get::<_, String>(0).as_str());
-            let environment: Option<serde_json::Value> = row
-                .get::<_, Option<String>>(2)
-                .and_then(|json| from_json(&json).ok());
+            let namespace_id: String = row.get(2);
+            let repository: String = row.get(3);
             let result = if status.is_terminal() {
                 EnvironmentApprovalResult::AlreadyTerminal
-            } else if let Some(env_name) =
-                crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
-            {
-                let required = rules
-                    .get(&repository)
-                    .and_then(|envs| envs.get(env_name))
-                    .map(|rule| rule.required_reviewers)
-                    .unwrap_or(0);
+            } else {
                 let gate = row
                     .get::<_, Option<String>>(1)
                     .and_then(|json| from_json::<crate::models::EnvironmentGateState>(&json).ok());
                 match gate {
-                    Some(mut gate) if required > 0 => match gate.approval_requested_at_unix_nanos {
+                    Some(mut gate) => match gate.approval_requested_at_unix_nanos {
                         None => EnvironmentApprovalResult::NotAwaiting,
                         Some(requested_at) => {
+                            // The required count was stamped when the gate
+                            // armed — rules are deliberately not re-resolved
+                            // inside this transaction (a rule edit must not
+                            // move a waiting gate). Gates armed before the
+                            // stamp existed fall back to one: every prior
+                            // rule shape required exactly that.
+                            let required = gate.approvals_required.unwrap_or(1);
                             if now.saturating_sub(requested_at)
                                 > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
                             {
                                 EnvironmentApprovalResult::Expired
                             } else {
-                                gate.approvals_unix_nanos.push(now);
-                                let approvals = gate.approvals_unix_nanos.len();
-                                let satisfied = (approvals as u32) >= required;
-                                tx.execute(
-                                    "UPDATE jobs SET environment_gate = $3::text::jsonb \
-                                         WHERE run_id = $1::text::uuid AND job_id = $2",
-                                    &[&run_key, &job_id.0, &json(&gate)?],
-                                )
-                                .await
-                                .map_err(db)?;
-                                tracing::info!(
-                                    run_id = %run_id.0,
-                                    job_id = %job_id.0,
-                                    environment = env_name,
-                                    approvals,
-                                    required,
-                                    note = note.as_deref().unwrap_or_default(),
-                                    "environment approval recorded"
-                                );
-                                EnvironmentApprovalResult::Recorded {
-                                    approvals,
-                                    required,
-                                    satisfied,
+                                let env_name = gate.environment_name.clone().unwrap_or_default();
+                                match decision {
+                                    EnvironmentDecision::Approve => {
+                                        gate.approvals.push(
+                                            crate::models::EnvironmentApprovalRecord {
+                                                at_unix_nanos: now,
+                                                actor: actor.clone(),
+                                                admin_override,
+                                                note: note.clone(),
+                                            },
+                                        );
+                                        let approvals = gate.approvals.len();
+                                        let satisfied = (approvals as u32) >= required;
+                                        tx.execute(
+                                            "UPDATE jobs SET environment_gate = $3::text::jsonb \
+                                                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                                            &[&run_key, &job_id.0, &json(&gate)?],
+                                        )
+                                        .await
+                                        .map_err(db)?;
+                                        insert_environment_approval_audit(
+                                            &tx,
+                                            run_id,
+                                            &job_id,
+                                            &repository,
+                                            &namespace_id,
+                                            &env_name,
+                                            "approved",
+                                            actor.as_deref(),
+                                            admin_override,
+                                            note.as_deref(),
+                                            now,
+                                        )
+                                        .await?;
+                                        if admin_override {
+                                            tracing::warn!(
+                                                run_id = %run_id.0,
+                                                job_id = %job_id.0,
+                                                environment = env_name,
+                                                note = note.as_deref().unwrap_or_default(),
+                                                "environment approval recorded via admin \
+                                                 override (reviewer list bypassed)"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                run_id = %run_id.0,
+                                                job_id = %job_id.0,
+                                                environment = env_name,
+                                                actor = actor.as_deref().unwrap_or_default(),
+                                                approvals,
+                                                required,
+                                                note = note.as_deref().unwrap_or_default(),
+                                                "environment approval recorded"
+                                            );
+                                        }
+                                        EnvironmentApprovalResult::Recorded {
+                                            approvals,
+                                            required,
+                                            satisfied,
+                                        }
+                                    }
+                                    EnvironmentDecision::Reject => {
+                                        gate.rejected_by = actor.clone();
+                                        gate.rejected_at_unix_nanos = Some(now);
+                                        gate.rejected_note = note.clone();
+                                        tx.execute(
+                                            "UPDATE jobs SET environment_gate = $3::text::jsonb \
+                                                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                                            &[&run_key, &job_id.0, &json(&gate)?],
+                                        )
+                                        .await
+                                        .map_err(db)?;
+                                        insert_environment_approval_audit(
+                                            &tx,
+                                            run_id,
+                                            &job_id,
+                                            &repository,
+                                            &namespace_id,
+                                            &env_name,
+                                            "rejected",
+                                            actor.as_deref(),
+                                            admin_override,
+                                            note.as_deref(),
+                                            now,
+                                        )
+                                        .await?;
+                                        tracing::warn!(
+                                            run_id = %run_id.0,
+                                            job_id = %job_id.0,
+                                            environment = env_name,
+                                            actor = actor.as_deref().unwrap_or_default(),
+                                            admin_override,
+                                            note = note.as_deref().unwrap_or_default(),
+                                            "environment deployment rejected"
+                                        );
+                                        EnvironmentApprovalResult::Rejected
+                                    }
                                 }
                             }
                         }
                     },
-                    _ => EnvironmentApprovalResult::NotAwaiting,
+                    None => EnvironmentApprovalResult::NotAwaiting,
                 }
-            } else {
-                EnvironmentApprovalResult::NotAwaiting
             };
             tx.commit().await.map_err(db)?;
             result
         };
-        // Release or fail closed over the run's durable rows: a satisfied gate
-        // unparks the job, an expired window settles it Failure (and its
-        // dependents).
-        let promote = self.promote_ready_jobs(Some(run_id), &rules).await?;
+        // Release or fail closed over the run's durable rows: a satisfied
+        // gate unparks the job; a rejection or expired window settles it
+        // `Failure` (and its dependents).
+        let promote = self.promote_ready_jobs(Some(run_id)).await?;
         Ok(EnvironmentApprovalOutcome {
             result,
             next_runs_on: promote.next_runs_on,
             promoted: promote.promoted,
         })
     }
+
+    /// The jobs still parked on an armed required-reviewer gate — the
+    /// announce scan and the check-run webhook lookup read these. `run_id`
+    /// narrows to one run (submit path); `None` scans every run (the reaper
+    /// sweep).
+    pub(crate) async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        self.pending_environment_approvals_with_announced(run_id, false)
+            .await
+    }
+
+    async fn pending_environment_approvals_with_announced(
+        &self,
+        run_id: Option<RunId>,
+        include_announced: bool,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        let client = self.reader().await?;
+        let run_key: Option<String> = run_id.map(|run_id| run_id.0.to_string());
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = match &run_key {
+            Some(key) => vec![key],
+            None => Vec::new(),
+        };
+        let where_run = if run_key.is_some() {
+            "AND j.run_id = $1::text::uuid"
+        } else {
+            ""
+        };
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT j.run_id::text, j.job_id, r.repository, j.environment_gate::text, \
+                            j.check_run_id, j.deployment_id, \
+                            s.environment::text, m.message_template::text, r.reports_check_runs \
+                     FROM jobs j \
+                     JOIN runs r ON r.run_id = j.run_id \
+                     LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                     LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
+                     WHERE j.queue_state = 'held' AND j.status = 'pending' \
+                       AND j.environment_gate IS NOT NULL {where_run} \
+                     ORDER BY j.run_id, j.job_order"
+                ),
+                &params,
+            )
+            .await
+            .map_err(db)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let gate: Option<crate::models::EnvironmentGateState> = row
+                .get::<_, Option<String>>(3)
+                .and_then(|json| from_json(&json).ok());
+            let Some(gate) = gate else { continue };
+            // Only armed approval gates are reportable: the pending row
+            // exists so the announce loop PATCHes the check run once, not
+            // every tick.
+            if gate.approval_requested_at_unix_nanos.is_none()
+                || (!include_announced && gate.approval_announced)
+            {
+                continue;
+            }
+            let spec_env: Option<serde_json::Value> = row
+                .get::<_, Option<String>>(6)
+                .and_then(|json| from_json(&json).ok());
+            let template_env: Option<serde_json::Value> = row
+                .get::<_, Option<String>>(7)
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|message| {
+                    message
+                        .get("environment")
+                        .or_else(|| message.get("actionsEnvironment"))
+                        .cloned()
+                });
+            let environment_name = gate
+                .environment_name
+                .clone()
+                .or_else(|| {
+                    template_env
+                        .as_ref()
+                        .and_then(|env| env.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| {
+                    crate::runtime_scheduling::environment_gate_name_of(spec_env.as_ref())
+                        .map(str::to_owned)
+                });
+            // Only a statically known literal is reported before the job
+            // runs: the runner reports the evaluated `environment.url` with
+            // its completion (`jobs.environment_url`), which the deployment
+            // read prefers. A raw `${{ }}` template is never posted.
+            let environment_url = template_env
+                .as_ref()
+                .and_then(runtime_scheduling::environment_url_literal)
+                .map(str::to_owned)
+                .or_else(|| {
+                    spec_env
+                        .as_ref()
+                        .and_then(runtime_scheduling::environment_url_literal)
+                        .map(str::to_owned)
+                });
+            let Some(environment_name) = environment_name else {
+                continue;
+            };
+            out.push(PendingEnvironmentApproval {
+                run_id: codec::run_id(&row.get::<_, String>(0))?,
+                job_id: JobId(row.get::<_, String>(1)),
+                repository: row.get(2),
+                environment_name,
+                environment_url,
+                check_run_id: row.get::<_, Option<i64>>(4).map(|id| id as u64),
+                deployment_id: row.get::<_, Option<i64>>(5).map(|id| id as u64),
+                reports_check_runs: row.get::<_, Option<bool>>(8).unwrap_or(false),
+            });
+        }
+        Ok(out)
+    }
+
+    /// One held approval-gated job by its GitHub check run id — the
+    /// `check_run.requested_action` webhook's join key.
+    pub(crate) async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError> {
+        Ok(self
+            .pending_environment_approvals_with_announced(None, true)
+            .await?
+            .into_iter()
+            .find(|row| row.check_run_id == Some(check_run_id)))
+    }
+
+    /// Stamp `approval_announced` on the job's gate — the announce PATCH was
+    /// delivered (or the job reports no checks, so nothing would show).
+    /// In-place `jsonb_set`: approvals recorded concurrently are preserved.
+    pub(crate) async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        let client = self.writer().await?;
+        client
+            .execute(
+                "UPDATE jobs SET environment_gate = \
+                     jsonb_set(environment_gate, '{approval_announced}', 'true'::jsonb) \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                   AND environment_gate IS NOT NULL",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// The job's GitHub deployment id, when one was created for it.
+    pub(crate) async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT deployment_id FROM jobs \
+                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        Ok(row.and_then(|row| row.get::<_, Option<i64>>(0).map(|id| id as u64)))
+    }
+
+    /// Record the GitHub deployment id the reporting path created for the
+    /// job's `environment:`.
+    pub(crate) async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError> {
+        let client = self.writer().await?;
+        client
+            .execute(
+                "UPDATE jobs SET deployment_id = $3 \
+                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                &[&run_id.0.to_string(), &job_id.0, &(deployment_id as i64)],
+            )
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+}
+
+impl PgBackend {
+    /// `environment_approvals`: the durable review-decision audit rows for
+    /// one job, oldest first. Read straight from the audit table — it is not
+    /// archived with the run, so archived runs answer here too.
+    pub(crate) async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        let client = self.reader().await?;
+        let rows = client
+            .query(
+                "SELECT repository, environment, decision, actor, admin_override, comment, \
+                        (extract(epoch from decided_at) * 1000000)::int8 \
+                 FROM environment_approvals \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 ORDER BY id",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EnvironmentApprovalAudit {
+                run_id,
+                job_id: job_id.clone(),
+                repository: row.get(0),
+                environment: row.get(1),
+                decision: row.get(2),
+                actor: row.get(3),
+                admin_override: row.get(4),
+                comment: row.get(5),
+                decided_at_unix_nanos: row.get::<_, i64>(6) * 1000,
+            })
+            .collect())
+    }
+}
+
+/// Append one durable environment-review audit row
+/// (`environment_approvals`): who decided what on which environment, when,
+/// and with which comment. Called inside the decision's own transaction so
+/// the gate flip and its audit record commit together — a decision can never
+/// exist without its record, and vice versa.
+///
+/// The repository and namespace are read from the run row here rather than
+/// carried by the caller: the audit row is what survives the run, so it
+/// denormalizes the facts retention will delete. Run archival never touches
+/// this table (see the schema comment).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn insert_environment_approval_audit(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    repository: &str,
+    namespace_id: &str,
+    environment: &str,
+    decision: &str,
+    actor: Option<&str>,
+    admin_override: bool,
+    comment: Option<&str>,
+    decided_at_unix_nanos: i64,
+) -> Result<(), ControlError> {
+    let run_key = run_id.0.to_string();
+    let decided_at_us = decided_at_unix_nanos / 1000;
+    tx.execute(
+        &format!(
+            "INSERT INTO environment_approvals \
+             (namespace_id, run_id, job_id, repository, environment, decision, actor, \
+              admin_override, comment, decided_at) \
+             VALUES ($1, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, {})",
+            ts!("$10")
+        ),
+        &[
+            &namespace_id,
+            &run_key,
+            &job_id.0,
+            &repository,
+            &environment,
+            &decision,
+            &actor,
+            &admin_override,
+            &comment,
+            &decided_at_us,
+        ],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
 }

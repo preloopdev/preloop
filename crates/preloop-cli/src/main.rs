@@ -27,6 +27,7 @@ mod init;
 
 mod push;
 mod server_install;
+mod store;
 mod update;
 mod webhooks;
 
@@ -750,6 +751,16 @@ enum Command {
     /// them without touching PRELOOP_HOME data unless asked.
     Server(server_install::ServerArgs),
 
+    /// Manage the control database schema: initialize a fresh store, apply
+    /// pending migrations, report migration state — and the one-time import
+    /// of a legacy v11 `preloop.db`.
+    ///
+    /// `preloop serve` never migrates: a missing, older or newer control
+    /// schema refuses at boot and names `preloop store migrate` as the fix.
+    /// SQLite migrations take a consistent backup before changing anything
+    /// (refinery has no down; restore the backup to roll back).
+    Store(store::StoreArgs),
+
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
 
@@ -1089,6 +1100,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => github_setup::cmd_doctor(args).await,
         Command::Secret(args) => github_setup::cmd_secret(args).await,
         Command::Server(args) => server_install::run(args),
+        // Schema administration and the legacy import are explicit and
+        // offline; never bootstrap (or migrate) the engine for them.
+        Command::Store(args) => store::run(args).await,
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
@@ -1120,7 +1134,8 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Init(_)
                     | Command::Doctor(_)
                     | Command::Secret(_)
-                    | Command::Server(_) => {
+                    | Command::Server(_)
+                    | Command::Store(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },
@@ -1437,6 +1452,17 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&state_dir)?;
     set_private_directory_permissions(&preloop_dir)?;
+
+    // Brand-new local installs: initialize the control database here so
+    // first use stays zero-config. Anything that already exists is left
+    // untouched — the engine refuses a missing/older/newer schema and
+    // `preloop store migrate` is the explicit upgrade path (never implicit).
+    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
+        eprintln!(
+            "[preloop] initialized the local control database ({}), migrations applied",
+            state_dir.join("preloop.db").display()
+        );
+    }
 
     let store = preloop_runner_server::credential_store::store_from_env(&preloop_dir);
     let token = prepare_engine_token(
