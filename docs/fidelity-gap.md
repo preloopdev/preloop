@@ -373,6 +373,14 @@ local equivalents. They do not cause conformance failure:
 - Session `encryptionKey`: present in preloop, absent in some golden captures
 - `connectionData`: preloop response is smaller, lacks full hosted-service location metadata
 
+- Tokenless engines intentionally omit `github_token` and `system.github.token`
+  from `acquirejob`: the runtime JWT authenticates the engine, not GitHub, so
+  exposing it as `GITHUB_TOKEN` would send an engine credential to GitHub or a
+  third party. Production jobs with a GitHub App installation token or a
+  verified PAT still carry both fields. The conformance gate allows exactly
+  those two fields to be absent on `acquirejob`; any other field drop, or the
+  same fields on another endpoint, remains gated.
+
 ### 1a.4 Source-diff-only gaps not exercised by conformance replay
 
 These changes are tracked from upstream runner diffs but not yet exercised by any

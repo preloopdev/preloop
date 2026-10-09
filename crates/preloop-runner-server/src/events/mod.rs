@@ -146,6 +146,17 @@ pub fn all_event_names() -> &'static [&'static str] {
 /// Build `EffectiveEvent` vec for events that use the repository default
 /// branch as the ref and `payload.action` as the activity type.
 /// Mirrors MessageController.cs:6287 (* default case).
+///
+/// These events only trigger a workflow whose file exists on the default
+/// branch (GitHub: `issue_comment`, `issues`, `discussion`,
+/// `discussion_comment`, `label`, `milestone`, `watch`, `fork`, `member`,
+/// `public`, `gollum`, `page_build`, `repository_dispatch`), so the code
+/// being executed is the repository's own default-branch workflow no matter
+/// who fired the event — the payload is data, never code. That is the same
+/// authority posture as a push to the default branch
+/// ([`trust_tier::TrustTier::Trusted`]), and it matches github.com, which
+/// passes repository secrets to these runs and reserves the withheld-secret
+/// profile for workflows triggered by a pull request from a fork.
 pub fn make_default_branch_events(event_name: &str, payload: &Value) -> Vec<EffectiveEvent> {
     let default_branch = payload
         .get("repository")
@@ -164,7 +175,7 @@ pub fn make_default_branch_events(event_name: &str, payload: &Value) -> Vec<Effe
         sha: None,
         status_check_sha: None,
         activity_type,
-        trust_tier: Some(trust_tier::TrustTier::Untrusted),
+        trust_tier: Some(trust_tier::TrustTier::Trusted),
         skip: false,
         payload: payload.clone(),
         upstream_workflow_names: vec![],

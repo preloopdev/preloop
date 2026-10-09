@@ -96,7 +96,7 @@ The system is configured using the following environment variables:
 
 ### Security Best Practices
 
-- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: a static PAT cannot be narrowed per job, so it is embedded only when its classic OAuth scopes are introspected and don't exceed declared `permissions:`; a broader PAT refuses the run, and unverifiable bounds withhold the PAT (jobs keep the runtime token). A GitHub App mints least-privilege installation tokens per job.
+- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: a static PAT cannot be narrowed per job, so it is embedded only when its classic OAuth scopes are introspected and don't exceed declared `permissions:`; a broader PAT refuses the run, and unverifiable bounds withhold the PAT (the job then runs with no `GITHUB_TOKEN` at all). A GitHub App mints least-privilege installation tokens per job.
 - **Git-Ignore Credentials**: Never check `.env`, `*.pem`, or `*.key` files into Git. These files are excluded in the root `.gitignore`.
 - **Production Key Management**: In production, do not write private keys or secrets to plaintext files on the server disk. Instead:
   - Load them directly into memory at runtime using a Secrets Manager (e.g. HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secrets).
