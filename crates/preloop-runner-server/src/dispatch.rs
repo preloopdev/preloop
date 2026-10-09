@@ -374,22 +374,31 @@ async fn resolve_run_ref(
         })
 }
 
-/// Validate the optional re-run body GitHub accepts
-/// (`enable_debug_logging`/`enable_debugger` booleans). preloop has no
-/// per-re-run debug toggle, so the flags are accepted and ignored — but a
-/// wrong-typed field is `422`, matching github.com's request validation.
-fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
-    let Some(Json(body)) = body else {
-        return Ok(());
+/// Validate the optional re-run body GitHub accepts. Empty bodies use defaults;
+/// malformed JSON returns `422` (Unprocessable Entity).
+fn validate_rerun_body(body: Option<Bytes>) -> Result<Option<Value>, ApiError> {
+    let Some(bytes) = body else {
+        return Ok(None);
     };
-    if body.is_null() {
-        return Ok(());
+    
+    if bytes.is_empty() {
+        return Ok(None);
     }
-    let Some(object) = body.as_object() else {
+    
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        ApiError::unprocessable("Invalid request: body must be valid JSON")
+    })?;
+    
+    if value.is_null() {
+        return Ok(None);
+    }
+    
+    let Some(object) = value.as_object() else {
         return Err(ApiError::unprocessable(
             "Invalid request: the re-run body must be a JSON object",
         ));
     };
+    
     for key in ["enable_debug_logging", "enable_debugger"] {
         if let Some(value) = object.get(key)
             && !value.is_boolean()
@@ -399,7 +408,8 @@ fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
             )));
         }
     }
-    Ok(())
+    
+    Ok(Some(value))
 }
 
 /// POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun — GitHub's
@@ -409,7 +419,7 @@ pub async fn rerun_actions_run(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Option<Bytes>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     validate_rerun_body(body)?;
@@ -428,7 +438,7 @@ pub async fn rerun_actions_run_failed(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Option<Bytes>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     validate_rerun_body(body)?;
@@ -503,7 +513,7 @@ pub async fn rerun_actions_job(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, job_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Option<Bytes>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     validate_rerun_body(body)?;
@@ -531,19 +541,22 @@ pub async fn cancel_actions_run(
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    let record = shared
-        .state
-        .backend
-        .run_record(run_id)
-        .await
-        .map_err(ApiError::from)?;
-    if record.status.is_terminal() {
-        return Err(ApiError::conflict(format!(
-            "run {run_ref} is already completed and cannot be cancelled"
-        )));
+    
+    // Attempt to cancel the run. If it's already terminal, the backend cancel
+    // will refuse and we return 409. If the run becomes terminal between
+    // our read and the locked cancel, the cancel may still succeed: in that
+    // case we return 202 to indicate cancellation was initiated.
+    match crate::runs::cancel_run_inner(&shared, run_id).await {
+        Ok(_) => Ok(StatusCode::ACCEPTED),
+        Err(error) => {
+            // If the run is terminal, return 409 Conflict
+            if error.kind() == crate::ApiErrorKind::Conflict {
+                return Err(error);
+            }
+            // Other errors propagate
+            Err(error)
+        }
     }
-    crate::runs::cancel_run_inner(&shared, run_id).await?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 /// Authorization for the workflow_dispatch POST

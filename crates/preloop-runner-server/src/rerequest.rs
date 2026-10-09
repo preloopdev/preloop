@@ -59,6 +59,8 @@ pub(crate) async fn process_check_suite_rerequest(
         .runs_for_repository(repository)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Find all terminal runs at this SHA (currently takes newest)
+    // TODO: Rerun all terminal runs when multiple workflows share SHA
     runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
     let target = runs
         .iter()
