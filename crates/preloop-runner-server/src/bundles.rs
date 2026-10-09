@@ -102,6 +102,19 @@ pub async fn materialize_bundle(
         .await
         .map_err(|error| ApiError::bad_request(format!("cannot ingest git bundle: {error}")))?;
     }
+    // Bundle refs outside `refs/heads`/`refs/tags` are not retained by
+    // `git clone --bare`, even though their objects are present in the clone.
+    // Pin the caller's submitted commit under a local branch so the following
+    // workspace fetch transfers its tree as well as its commit.
+    git_command(&[
+        "--git-dir",
+        bare.to_str().unwrap(),
+        "update-ref",
+        "refs/heads/preloop-submit",
+        commit_sha,
+    ])
+    .await
+    .map_err(|error| ApiError::bad_request(format!("cannot retain submitted commit: {error}")))?;
     let workspace = root.join(format!("{id}.workspace"));
     if !workspace.is_dir() {
         tokio::fs::create_dir_all(&workspace)
