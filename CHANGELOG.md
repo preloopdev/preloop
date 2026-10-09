@@ -148,7 +148,18 @@ Releases before v0.27.0 predate the changelog.
   `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
   authenticated.
 
+### Changed
+- **The container-engine bootstrap is now maintained as a shell file** at
+  `scripts/docker-start.sh` and syntax-checked before it is sent to guests.
+
 ### Fixed
+- **Failed container-engine starts now include daemon diagnostics** by
+  forwarding the tail of `/var/log/dockerd.log` after both retries fail.
+
+- **Root/sudo guest-script wrapping now handles trailing whitespace**, so
+  file-backed scripts remain valid when inlined.
+
+
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment

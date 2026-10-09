@@ -2714,95 +2714,44 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// mount with EINVAL), `vfs` is forced only when fuse is unavailable too —
 /// otherwise fuse-overlayfs auto-detects and works.
 ///
-/// The launch keeps its exit status ([`run_as_root_or_sudo_strict`]): the
-/// raises and the readiness loop all end the script nonzero when they fail,
-/// and a refused passwordless sudo on the image-user branch has to reach the
-/// caller's warning rather than be swallowed — a daemon that never came up
-/// otherwise looks like a start that succeeded.
+/// The launch keeps its exit status via [`run_as_root_or_sudo_strict`], so
+/// failed limit raises, readiness, or passwordless-sudo setup reaches the caller.
 ///
-/// No `#` comments inside the generated shell text: the statements are joined
-/// with `;` and `\` continuations into one physical line, so a comment would
-/// swallow the code that follows it (the hostname-script bug fixed in
-/// `f0341dc3`). `every_generated_script_parses_as_posix_sh` renders this
-/// script and parses it with `sh -n`.
+/// The body lives in `scripts/docker-start.sh`, embedded and rendered with
+/// generated image values; its rendered form is parsed by
+/// `every_generated_script_parses_as_posix_sh`, while a placeholder test keeps
+/// unsubstituted tokens off guests.
 fn docker_start_command() -> Vec<String> {
     vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        run_as_root_or_sudo_strict(&format!(
-            "{GUEST_STACK_ULIMIT}; {GUEST_NOFILE_ULIMIT}; \
-             command -v dockerd >/dev/null 2>&1 || exit 0; \
-             raise_engine_chain() {{ \
-               raised=0; failed=0; \
-               for pid in $(cat /var/run/docker.pid 2>/dev/null) $(pgrep -x dockerd 2>/dev/null) $(pgrep -x containerd 2>/dev/null); do \
-                 stack=; nofile=; \
-                 while read -r word1 word2 word3 value _rest; do \
-                   [ \"$word1/$word2/$word3\" = \"Max/stack/size\" ] && stack=$value; \
-                   [ \"$word1/$word2/$word3\" = \"Max/open/files\" ] && nofile=$value; \
-                 done 2>/dev/null < \"/proc/$pid/limits\"; \
-                 case \"$stack\" in ''|*[!0-9]*) stack= ;; esac; \
-                 case \"$nofile\" in ''|*[!0-9]*) nofile= ;; esac; \
-                 if [ -n \"$stack\" ] && [ \"$stack\" -lt {GOLDEN_STACK_SOFT_BYTES} ]; then \
-                   raised=1; \
-                   prlimit --pid \"$pid\" --stack={GOLDEN_STACK_PRLIMIT} 2>/dev/null || failed=1; \
-                 fi; \
-                 if [ -n \"$nofile\" ] && [ \"$nofile\" -lt {GOLDEN_RLIMIT_NOFILE_SOFT} ]; then \
-                   raised=1; \
-                   prlimit --pid \"$pid\" --nofile={GOLDEN_NOFILE_PRLIMIT} 2>/dev/null || failed=1; \
-                 fi; \
-               done; \
-               if [ \"$failed\" -ne 0 ]; then \
-                 echo 'could not raise an inherited dockerd/containerd to the hosted process limits' >&2; \
-                 return 1; \
-               fi; \
-               [ \"$raised\" -eq 1 ] && echo 'raised the inherited engine chain to the hosted process limits'; \
-               return 0; \
-             }}; \
-             docker info >/dev/null 2>&1 && {{ raise_engine_chain || exit 1; exit 0; }}; \
-             rm -f /var/run/docker.pid; \
-             mkdir -p {DOCKER_DATA_ROOT}; \
-             modprobe overlay >/dev/null 2>&1 || true; \
-             modprobe fuse >/dev/null 2>&1 || true; \
-             if grep -q fuse /proc/filesystems; then \
-               [ -e /dev/fuse ] || mknod /dev/fuse c 10 229; \
-             fi; \
-             mkdir -p /tmp/.preloop-ovprobe; \
-             if mount -t overlay overlay -o lowerdir=/tmp:/usr /tmp/.preloop-ovprobe 2>/dev/null; then \
-               umount /tmp/.preloop-ovprobe 2>/dev/null || true; \
-               DRIVER=; \
-             else \
-               [ -e /dev/fuse ] || DRIVER=vfs; \
-             fi; \
-             rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
-             if [ -n \"$DRIVER\" ]; then \
-               printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
-             fi; \
-             start_dockerd() {{ \
-               rm -f /var/run/docker.pid; \
-               dockerd >/var/log/dockerd.log 2>&1 & \
-               DOCKERD_PID=$!; \
-               ready=0; \
-               for _ in $(seq 1 50); do \
-                 docker info >/dev/null 2>&1 && {{ ready=1; break; }}; \
-                 sleep 0.2; \
-               done; \
-               if [ \"$ready\" -eq 0 ]; then \
-                 kill \"$DOCKERD_PID\" 2>/dev/null || true; \
-                 for _ in $(seq 1 25); do \
-                   kill -0 \"$DOCKERD_PID\" 2>/dev/null || break; \
-                   sleep 0.2; \
-                 done; \
-                 return 1; \
-               fi; \
-               return 0; \
-             }}; \
-             if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi; \
-             rm -rf {DOCKER_DATA_ROOT}/*; \
-             if start_dockerd; then raise_engine_chain || exit 1; exit 0; fi; \
-             echo 'dockerd failed to start after data-root reset' >&2; \
-             exit 1"
-        )),
+        run_as_root_or_sudo_strict(&render_docker_start_script()),
     ]
+}
+
+/// The guest container-engine bootstrap, verbatim: see
+/// [`docker_start_command`] for what it does.
+const DOCKER_START_SCRIPT: &str = include_str!("../../../scripts/docker-start.sh");
+
+/// Substitute the `@@NAME@@` tokens with the pins `build.rs` compiles in from
+/// `official-image.toml`.
+///
+/// Not `format!`: the script is brace-heavy shell, and escaping every brace is
+/// the assembly this file exists to avoid.
+fn render_docker_start_script() -> String {
+    let mut script = DOCKER_START_SCRIPT.to_owned();
+    for (token, value) in [
+        ("@@GUEST_STACK_ULIMIT@@", GUEST_STACK_ULIMIT),
+        ("@@GUEST_NOFILE_ULIMIT@@", GUEST_NOFILE_ULIMIT),
+        ("@@DOCKER_DATA_ROOT@@", DOCKER_DATA_ROOT),
+        ("@@GOLDEN_STACK_SOFT_BYTES@@", GOLDEN_STACK_SOFT_BYTES),
+        ("@@GOLDEN_STACK_PRLIMIT@@", GOLDEN_STACK_PRLIMIT),
+        ("@@GOLDEN_RLIMIT_NOFILE_SOFT@@", GOLDEN_RLIMIT_NOFILE_SOFT),
+        ("@@GOLDEN_NOFILE_PRLIMIT@@", GOLDEN_NOFILE_PRLIMIT),
+    ] {
+        script = script.replace(token, value);
+    }
+    script
 }
 
 /// How long to wait for a freshly started guest to accept commands.
@@ -6889,6 +6838,13 @@ fn run_as_root_or_sudo_strict(script: &str) -> String {
 
 fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
     use base64::Engine as _;
+    // The script is spliced inline as `then {script}; else …`, so a trailing
+    // newline would leave that `;` alone on a line and dash would reject the
+    // whole command (`Syntax error: ";" unexpected`). Scripts that live in a
+    // file (`scripts/docker-start.sh`) end in a newline by convention, and
+    // trailing whitespace means nothing to the shell, so drop it here instead
+    // of asking every file-backed script to remember.
+    let script = script.trim_end();
     let b64 = base64::engine::general_purpose::STANDARD.encode(script);
     let fallback = if best_effort {
         "sudo -n sh 2>/dev/null || true"
@@ -9111,6 +9067,19 @@ done
         );
     }
 
+    /// A `@@NAME@@` token the renderer does not substitute is still valid
+    /// shell — `[ "$stack" -lt @@…@@ ]` parses — so a missed token would
+    /// reach a guest and fail there, reading as a container-engine bug on a
+    /// real workflow instead of as a broken render here.
+    #[test]
+    fn docker_start_script_renders_every_placeholder() {
+        let script = render_docker_start_script();
+        assert!(
+            !script.contains("@@"),
+            "an unsubstituted token would reach the guest: {script}"
+        );
+    }
+
     /// A fork inherits its golden's live daemon chain, and a running process
     /// keeps the limits it was born with. A golden baked before the raise
     /// would hand containers 8192 KiB no matter what the newly-started daemon
@@ -9156,10 +9125,12 @@ done
             "the nofile raise must only touch a chain still below the hosted limit: {script}"
         );
         // A fresh daemon can still adopt a surviving containerd from the
-        // golden, so both start retries raise the chain too.
+        // golden, so both start retries raise the chain too. The pattern
+        // stops at `fi`: what follows it is a newline now that the script
+        // lives in a file, and the separator is not what this pins.
         assert_eq!(
             script
-                .matches("then raise_engine_chain || exit 1; exit 0; fi;")
+                .matches("then raise_engine_chain || exit 1; exit 0; fi")
                 .count(),
             2,
             "{script}"
@@ -9820,6 +9791,27 @@ done
         if sudo_usable {
             assert!(run(run_as_root_or_sudo_strict("exit 0")).status.success());
         }
+    }
+
+    /// A script ending in a newline must still splice into the wrapper.
+    ///
+    /// The inline form is `then {script}; else …`: with an un-trimmed trailing
+    /// newline the `;` lands alone on a line and dash rejects the whole
+    /// command (`Syntax error: ";" unexpected`), which is how the file-backed
+    /// `scripts/docker-start.sh` first reached a guest. The best-effort form
+    /// exits 0 whatever the script does, so a parse failure is the only way
+    /// this can fail.
+    #[test]
+    fn sudo_wrapper_tolerates_a_trailing_newline() {
+        let script = run_as_root_or_sudo("exit 7\n");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh must run");
+        assert!(
+            output.status.success(),
+            "a trailing newline broke the splice: {script}"
+        );
     }
 
     #[test]
