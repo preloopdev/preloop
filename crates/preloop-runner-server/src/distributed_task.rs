@@ -337,6 +337,7 @@ pub async fn complete_job_compat(
             outputs: Default::default(),
             annotations: Vec::new(),
             step_results: Vec::new(),
+            environment_url: None,
         },
     )
     .await
@@ -524,6 +525,7 @@ pub async fn agent_request_patch(
                 outputs: Default::default(),
                 annotations: Vec::new(),
                 step_results: Vec::new(),
+                environment_url: None,
             }
         });
         if let Some(c) = completion {
@@ -648,17 +650,10 @@ pub fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
     }
 }
 
-/// Mask job-completion annotations before they are persisted or returned.
-/// Crash annotations (the official runner's worker-crash detail from
-/// `ForceFailJob`) embed worker stdout/stderr, which can contain secret
-/// values; the raw `JobCompletion` is the protocol boundary and is not safe
-/// to store or return as-is. Values come from the SecretProvider: every
-/// stored tier (over-masking another repository's value is harmless) plus
-/// this run's submission-supplied tier.
-pub(crate) fn mask_completion_annotations(
-    shared: &SharedState,
-    completion: &JobCompletion,
-) -> Result<Vec<serde_json::Value>, ApiError> {
+/// Every secret value a completion payload must not disclose, from the
+/// SecretProvider: every stored tier (over-masking another repository's
+/// value is harmless) plus this run's submission-supplied tier.
+fn completion_secret_values(shared: &SharedState, run_id: RunId) -> Result<Vec<String>, ApiError> {
     let provider = shared.state.secret_provider.as_ref();
     let provider_error = |error: anyhow::Error| {
         ApiError::internal(format!(
@@ -668,15 +663,51 @@ pub(crate) fn mask_completion_annotations(
     };
     let mut values = provider.resolve_all().map_err(provider_error)?;
     values.extend(preloop_gha_protocol::masking::expose_values(
-        provider
-            .run_tier(completion.run_id)
-            .map_err(provider_error)?
-            .values(),
+        provider.run_tier(run_id).map_err(provider_error)?.values(),
     ));
-    Ok(preloop_gha_protocol::mask_annotations(
-        completion.annotations.clone(),
-        values.iter().map(String::as_str),
-    ))
+    Ok(values)
+}
+
+/// Mask the secret-bearing fields of a job completion before they are
+/// persisted or returned. Crash annotations (the official runner's
+/// worker-crash detail from `ForceFailJob`) embed worker stdout/stderr, and
+/// `environment_url` may interpolate `steps.*.outputs`; the raw
+/// `JobCompletion` is the protocol boundary and is not safe to store or
+/// return as-is.
+///
+/// The URL follows the official runner's guard: `JobExtension.FinalizeJob`
+/// reports no URL at all when the evaluated value's masked form differs
+/// from the raw value ("Skip setting environment url as it may contain
+/// secret"). Runner-side masking covers only the secrets that runner saw —
+/// the official runner and other clients can report a URL carrying a secret
+/// they never loaded — so the same check runs here against every known
+/// value. A URL that would disclose one is dropped, never stored.
+fn mask_completion_payload(
+    shared: &SharedState,
+    completion: &mut JobCompletion,
+) -> Result<(), ApiError> {
+    let secrets = completion_secret_values(shared, completion.run_id)?;
+    completion.annotations = preloop_gha_protocol::mask_annotations(
+        std::mem::take(&mut completion.annotations),
+        secrets.iter().map(String::as_str),
+    );
+    if let Some(url) = completion.environment_url.take() {
+        let masked = preloop_gha_protocol::masking::mask_secrets(
+            &url,
+            secrets.iter().map(String::as_str),
+            &[],
+        );
+        if masked == url {
+            completion.environment_url = Some(url);
+        } else {
+            tracing::warn!(
+                run_id = %completion.run_id.0,
+                job_id = %completion.job_id.0,
+                "dropping environment url that would disclose a secret"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Map a `completejob` stepResult's status + conclusion to the run record's
@@ -749,7 +780,7 @@ pub(crate) async fn complete_job_settling(
             "job completion status must be terminal",
         ));
     }
-    completion.annotations = mask_completion_annotations(&shared, &completion)?;
+    mask_completion_payload(&shared, &mut completion)?;
     let outcome = shared
         .state
         .backend
@@ -1090,7 +1121,7 @@ jobs:
             Method::POST,
             "/api/v1/runs",
             json!({
-                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+                "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    environment: staging\n    steps:\n      - run: echo hi\n",
                 "event": "push",
                 "repository": "owner/repo"
             }),
@@ -1109,7 +1140,8 @@ jobs:
                 "outputs": {},
                 "annotations": [
                     {"message": "worker crashed: super-secret-value leaked", "level": "failure"}
-                ]
+                ],
+                "environmentUrl": "https://deploy.example/?token=super-secret-value"
             }),
         )
         .await;
@@ -1135,6 +1167,20 @@ jobs:
         assert!(
             !stored_message.contains("super-secret-value"),
             "persisted run must not carry the raw secret: {stored_message}"
+        );
+
+        let row = state
+            .backend
+            .environment_deployment(
+                run_id.parse().unwrap(),
+                &preloop_gha_protocol::JobId("build".into()),
+            )
+            .await
+            .unwrap()
+            .expect("environment completion must retain the deployment row");
+        assert_eq!(
+            row.environment_url, None,
+            "server must drop a completion URL containing a secret"
         );
     }
 

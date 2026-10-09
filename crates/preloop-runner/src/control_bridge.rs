@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -129,44 +130,10 @@ pub async fn spawn_from_env_lookup(
     var: impl Fn(&str) -> Option<String>,
     var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<ControlBridge> {
+    let settings = BridgeSettings::from_lookup(&var, &var_os)?;
     let origin = var(CONTROL_ORIGIN_ENV)?;
-    let socket = var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
-    let upstream_addr = var(CONTROL_UPSTREAM_ENV);
-    let upstream = match (socket, upstream_addr.as_deref()) {
-        #[cfg(unix)]
-        (Some(socket), _) => Upstream::Socket(socket),
-        #[cfg(not(unix))]
-        (Some(_), _) => {
-            // No Unix domain sockets on this platform; a control socket env
-            // cannot be honored. Prefer the TCP upstream when one is
-            // configured; otherwise no bridge at all.
-            match upstream_addr {
-                Some(addr) => {
-                    let addr = upstream_tcp_address(&addr)?;
-                    Upstream::Tcp(addr)
-                }
-                None => return None,
-            }
-        }
-        (None, Some(addr)) => {
-            let addr = upstream_tcp_address(addr)?;
-            Upstream::Tcp(addr)
-        }
-        (None, None) => return None,
-    };
     let address = loopback_address(&origin)?;
-    // Absurd values fall back to the default: 0 would refuse everything and
-    // anything above Semaphore::MAX_PERMITS would panic in the constructor.
-    let max_connections = var(BRIDGE_MAX_CONNECTIONS_ENV)
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
-    let idle_timeout = var(BRIDGE_IDLE_TIMEOUT_SECS_ENV)
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
-    match spawn(address, upstream, max_connections, idle_timeout).await {
+    match settings.spawn(address).await {
         Ok(bridge) => {
             info!(%address, "control-plane loopback bridge listening");
             Some(bridge)
@@ -177,6 +144,114 @@ pub async fn spawn_from_env_lookup(
             warn!(%address, %error, "control-plane loopback bridge unavailable");
             None
         }
+    }
+}
+
+/// Start a bridge on a *container-reachable* address, forwarding to the
+/// control-plane transport from the environment.
+///
+/// [`spawn_from_env`] serves the runner and host steps by binding the origin
+/// the job message advertises on the guest's loopback. A job container has its
+/// own network namespace, where that origin resolves to the container itself,
+/// so container steps need the same splice on an address their network can
+/// reach — the Docker network's gateway (see the runner's
+/// `container_ops::ContainerEngineAccess`). The listener is per job: it is
+/// bound after the job network exists and dropped with the job.
+///
+/// The bind address is a Docker bridge gateway: an address on the guest that
+/// exists only for that job's network, reachable from the job's own containers
+/// (which the job already runs) and from the guest itself — not a routable
+/// guest interface, unlike a wildcard bind. The blast radius stays exactly the
+/// one control-plane origin the runner is already authenticated against.
+///
+/// Callers pass port 0 and advertise [`ControlBridge::address`], so a port the
+/// workflow itself holds never blocks the bridge. Returns an error when no
+/// control transport is configured (the hosted deployment, where the engine
+/// URL is routable and no bridge exists; translation without a listener would
+/// only move a container's connection-refused to another address) or when the
+/// gateway address cannot be bound at all (the network is not up).
+pub async fn spawn_container_reachable(address: SocketAddr) -> Result<Option<ControlBridge>> {
+    spawn_container_reachable_lookup(
+        address,
+        |name| std::env::var(name).ok(),
+        |name| std::env::var_os(name),
+    )
+    .await
+}
+
+/// [`spawn_container_reachable`] with the environment reads behind `lookup`
+/// closures, for tests.
+async fn spawn_container_reachable_lookup(
+    address: SocketAddr,
+    var: impl Fn(&str) -> Option<String>,
+    var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<ControlBridge>> {
+    let settings = BridgeSettings::from_lookup(&var, &var_os)
+        .ok_or_else(|| anyhow::anyhow!("no control-plane transport is configured"))?;
+    let bridge = settings.spawn(address).await?;
+    info!(address = %bridge.address(), "control-plane bridge listening for containers");
+    Ok(Some(bridge))
+}
+
+/// The upstream transport and tuning a bridge listener runs with, resolved
+/// from the control-plane environment.
+struct BridgeSettings {
+    upstream: Upstream,
+    max_connections: usize,
+    idle_timeout: Duration,
+}
+
+impl BridgeSettings {
+    /// `None` when no control transport is configured (the normal
+    /// GitHub-hosted case) or a configured upstream cannot be parsed.
+    fn from_lookup(
+        var: &impl Fn(&str) -> Option<String>,
+        var_os: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Option<Self> {
+        let socket = var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
+        let upstream_addr = var(CONTROL_UPSTREAM_ENV);
+        let upstream = match (socket, upstream_addr.as_deref()) {
+            #[cfg(unix)]
+            (Some(socket), _) => Upstream::Socket(socket),
+            #[cfg(not(unix))]
+            (Some(_), _) => {
+                // No Unix domain sockets on this platform; a control socket env
+                // cannot be honored. Prefer the TCP upstream when one is
+                // configured; otherwise no bridge at all.
+                match upstream_addr {
+                    Some(addr) => Upstream::Tcp(upstream_tcp_address(&addr)?),
+                    None => return None,
+                }
+            }
+            (None, Some(addr)) => Upstream::Tcp(upstream_tcp_address(addr)?),
+            (None, None) => return None,
+        };
+        // Absurd values fall back to the default: 0 would refuse everything and
+        // anything above Semaphore::MAX_PERMITS would panic in the constructor.
+        let max_connections = var(BRIDGE_MAX_CONNECTIONS_ENV)
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+        let idle_timeout = var(BRIDGE_IDLE_TIMEOUT_SECS_ENV)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+        Some(Self {
+            upstream,
+            max_connections,
+            idle_timeout,
+        })
+    }
+
+    async fn spawn(&self, address: SocketAddr) -> std::io::Result<ControlBridge> {
+        spawn(
+            address,
+            self.upstream.clone(),
+            self.max_connections,
+            self.idle_timeout,
+        )
+        .await
     }
 }
 
@@ -584,5 +659,85 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"pong");
+    }
+
+    /// The container-facing bridge is what makes the engine reachable from a
+    /// job container's network namespace: it must serve the same control-plane
+    /// transport the loopback bridge does.
+    #[tokio::test]
+    async fn container_reachable_bridge_serves_the_configured_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"pong").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let vars = std::collections::HashMap::from([(
+            CONTROL_UPSTREAM_ENV,
+            format!("http://{upstream_addr}"),
+        )]);
+
+        let bridge = spawn_container_reachable_lookup(
+            "127.0.0.1:0".parse().unwrap(),
+            |name| vars.get(name).cloned(),
+            |name| vars.get(name).map(std::ffi::OsString::from),
+        )
+        .await
+        .expect("a configured transport must bind")
+        .expect("a fresh port is not already served");
+        let mut client = TcpStream::connect(bridge.address()).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"pong");
+    }
+
+    /// The container bridge takes any free port: a port the workflow already
+    /// holds (a published service port, a step's server) must not stop
+    /// container steps from reaching the engine.
+    #[tokio::test]
+    async fn container_reachable_bridge_takes_a_free_port() {
+        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held = holder.local_addr().unwrap();
+        let vars = std::collections::HashMap::from([(
+            CONTROL_UPSTREAM_ENV,
+            "http://127.0.0.1:1".to_string(),
+        )]);
+
+        let bridge = spawn_container_reachable_lookup(
+            "127.0.0.1:0".parse().unwrap(),
+            |name| vars.get(name).cloned(),
+            |name| vars.get(name).map(std::ffi::OsString::from),
+        )
+        .await
+        .unwrap()
+        .expect("a configured transport yields a bridge");
+
+        let bound = bridge.address();
+        assert_ne!(
+            bound.port(),
+            0,
+            "the advertised address names the bound port"
+        );
+        assert_ne!(bound, held, "{held} is held by another process");
+    }
+
+    /// No control transport means no bridge to point container steps at;
+    /// translation without a listener would only move the failure's address.
+    #[tokio::test]
+    async fn container_reachable_bridge_requires_a_configured_transport() {
+        let vars: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+
+        let result = spawn_container_reachable_lookup(
+            "127.0.0.1:0".parse().unwrap(),
+            |name| vars.get(name).cloned(),
+            |name| vars.get(name).map(std::ffi::OsString::from),
+        )
+        .await;
+
+        assert!(result.is_err(), "no transport must not bind a listener");
     }
 }

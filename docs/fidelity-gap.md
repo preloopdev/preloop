@@ -634,6 +634,74 @@ Every item below broke a real workflow step and was fixed in preloop:
   batches whose claimed sizes already exceed `max_bytes` are skipped the
   same way.
 
+### 1c.6 Container jobs could not reach the engine (fixed)
+
+**Local mode only.** This applies to the deployment where the runner reaches
+the engine through the mounted control bridge (the orchestrator sets
+`PRELOOP_CONTROL_ORIGIN` with `PRELOOP_CONTROL_SOCKET` or
+`PRELOOP_CONTROL_UPSTREAM`, `crates/preloop-orchestrator/src/lib.rs:2611-2636`).
+In the hosted mode there is no control transport, so
+`container_engine_access` returns `None` at the origin lookup
+(`crates/preloop-runner/src/worker/container_ops.rs:956`) and nothing below
+happens: a hosted engine advertises a routable URL and containers reach it
+directly, exactly as they reach `api.github.com` on GitHub. Each guest VM
+runs exactly one job (the pool registers runners with `--ephemeral`,
+`lib.rs:6284`), so the container-facing bridge is per job in a per-job VM.
+
+Every `container:` job whose first step was an `actions/checkout` the server
+had redirected (snapshot or forge relay) died in that step with
+`connect ECONNREFUSED 127.0.0.1:<port>` after three retries — valkey's
+`ci.yml` legs with `container: debian:bookworm` / `almalinux:8` (no `git` in
+either image, so checkout takes its REST-tarball fallback) failed ~20 s in.
+Host jobs in the same run succeeded.
+
+Root cause: the engine advertises itself to jobs at its loopback origin
+(`PRELOOP_CONTROL_ORIGIN`, e.g. `http://127.0.0.1:9198`), which inside the
+guest is the runner's control bridge. A job container has its own network
+namespace, where `127.0.0.1` is the container itself, so every engine URL a
+container step received — the redirected checkout's `github-server-url`
+input, `ACTIONS_RUNTIME_URL` / `ACTIONS_RESULTS_URL` / `ACTIONS_CACHE_URL` /
+`ACTIONS_ID_TOKEN_REQUEST_URL` (cache, artifacts, OIDC), and the
+`GIT_CONFIG_*` snapshot origin rewrites — was unreachable. GitHub-hosted
+runners hand containers `api.github.com`, which is reachable from anywhere;
+preloop's engine is not.
+
+Fix (runner-side, because only the guest knows a container-reachable
+address): when a job's network is created the runner resolves the network's
+**gateway** (`docker network inspect … .IPAM.Config`, taking the first IPv4
+`Gateway` and falling back to IPv6 only when there is no IPv4 one — the host
+end of a container's default route) and binds a control bridge there on a
+free port (`control_bridge::spawn_container_reachable` with port 0), then
+rewrites the advertised origin to `<scheme>://<gateway>:<bridge port>` (the
+advertised scheme is kept) in
+every environment a container process
+receives — `docker exec` env for run steps and node actions, `docker run` env
+for `docker://` action containers, and the workflow-declared env of the job and
+service containers themselves — in the same layer where the official
+runner rewrites container paths (`TranslateToContainerPath`). A `NO_PROXY`/
+`no_proxy` list the host environment declares also gains the container-facing
+address when it is injected into a container, since a bypass list naming the
+loopback origin no longer covers the rewritten address; a list the workflow
+declares gains it in place. A host with no bypass list keeps having none —
+the runner does not invent one.
+Host steps and the runner itself keep the loopback origin, and the official runner's Docker
+command shape is untouched (no `--add-host`, no custom subnets).
+
+Limits:
+
+- An `https` origin keeps its scheme, so the engine's certificate must cover
+  the container-facing address (the bridge splices TCP without terminating
+  TLS). A certificate issued for `127.0.0.1` is not valid for the gateway.
+- A workflow that forces another network with `container.options:
+  --network=…` points its steps at a gateway the runner did not bind; the
+  engine URLs then fail to connect exactly as before. Official-runner
+  semantics have no equivalent problem only because GitHub's URLs are public.
+- A runner started on the Docker host itself (no VM, no control bridge) gets
+  no translation: its `PRELOOP_CONTROL_ORIGIN` mode does not exist there, and
+  the engine's loopback listen address is not reachable from a Linux
+  container's namespace. Point such deployments at a host-reachable
+  `PRELOOP_RUNNER_URL`.
+
 ---
 
 ## 2. Upstream surface we must emulate
@@ -952,6 +1020,35 @@ callees are unchanged: `secrets: inherit` keeps the caller's whole scope,
 `secrets: {…}` maps resolve as before. Engine tokens
 (`secrets.GITHUB_TOKEN`, OIDC/runtime tokens) are minted per claim and
 never went through the stored set anyway.
+
+### 3d. Environment protection (GitHub-sourced rules)
+
+Environment rules come from the repository's environments API (branch
+policies, wait timer, required reviewers, `prevent_self_review`). Known gap
+against GitHub:
+
+**Custom deployment protection rules — job fails closed (deliberate).**
+GitHub drives these third-party Apps (Datadog, Honeycomb, New Relic, Sentry,
+ServiceNow, NodeSource, or an org's own App) by sending the
+`deployment_protection_rule` webhook once a *GitHub Actions* job reaches the
+environment; the App answers through
+`POST /repos/{o}/{r}/actions/runs/{run_id}/deployment_protection_rule`, which
+needs a GitHub Actions run id. Preloop jobs have none, and preloop cannot send
+the webhook itself (the App's webhook URL and signing secret belong to the
+App's owner). So an environment with any enabled custom rule fails the job
+(`runtime_scheduling::evaluate_environment_gate`, logged as `environment gate
+denied: custom deployment protection rules are enabled` with the App slugs).
+Nothing can override it, including the native `/approve` endpoint: the job is
+already terminal. Workaround: disable the rule on that environment. Prevalence
+(2026-10-08 survey of ~460 public repos: 265 deploying to
+`environment: production`, plus the 200 most-starred): 0 vendor Apps, 2
+homegrown Apps (`electron/electron`, `astral-sh/uv`). Private repos can only
+use custom rules on GitHub Enterprise, so the survey cannot see that usage.
+Options if demand appears: admin bypass gated on the environment's
+`can_admins_bypass`; per-vendor checks (Datadog's rule is "every monitor
+tagged `git_repo`/`git_env` is OK", reproducible through its monitor API);
+or dispatching a stand-in GitHub Actions job against the environment and
+mirroring its outcome.
 
 ---
 

@@ -45,6 +45,10 @@ pub struct JobContext {
     pub matchers: MatcherRegistry,
     /// Container state for job/service containers (Phase 2).
     pub container_state: Option<super::container_ops::ContainerState>,
+    /// Container → engine reachability for this job, created with the job
+    /// network and used to rewrite engine URLs handed to container steps.
+    /// See `container_ops::ContainerEngineAccess`.
+    pub container_engine: Option<Arc<super::container_ops::ContainerEngineAccess>>,
     /// Live log queue for WebSocket streaming (None when not connected).
     pub live_logs: Option<std::sync::Arc<crate::worker::live_logs::LiveLogQueue>>,
     /// Synthetic step IDs for "Set up job" and "Complete job" (generated in steps_runner, read in job_runner).
@@ -177,6 +181,7 @@ impl JobContext {
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
             container_state: None,
+            container_engine: None,
             live_logs: None,
             setup_step_id: None,
             complete_step_id: None,

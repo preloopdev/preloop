@@ -1039,13 +1039,33 @@ pub(crate) struct ReapSweepOutcome {
     pub(crate) starved: Vec<StarvedJob>,
 }
 
-/// `record_environment_approval` input: one operator approval for a job
-/// waiting on its environment's required-reviewer gate.
+/// The reviewer's decision on an environment approval gate (GitHub's
+/// "Review pending deployments" Approve / Reject pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentDecision {
+    /// Approve the pending deployment.
+    Approve,
+    /// Reject it — the gate fails closed and the job concludes `failure`,
+    /// matching GitHub's reviewer-rejection behavior.
+    Reject,
+}
+
+/// `record_environment_approval` input: one review decision for a job
+/// waiting on its environment's required-reviewer gate. `actor` is the
+/// GitHub login the check-run webhook carried (`sender.login`); `None` means
+/// the native operator endpoint, which has no user identities and is logged
+/// as an admin override (`admin_override`).
 #[derive(Debug, Clone)]
 pub(crate) struct EnvironmentApproval {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
-    /// Operator note recorded with the approval (audit trail).
+    /// Approve or reject.
+    pub(crate) decision: EnvironmentDecision,
+    /// Reviewer identity, when the decision arrived from GitHub.
+    pub(crate) actor: Option<String>,
+    /// The native admin override path bypassed reviewer authorization.
+    pub(crate) admin_override: bool,
+    /// Optional review comment (audit trail).
     pub(crate) note: Option<String>,
 }
 
@@ -1065,6 +1085,89 @@ pub(crate) enum EnvironmentApprovalResult {
         required: u32,
         satisfied: bool,
     },
+    /// A rejection was recorded; the promotion sweep fails the job closed.
+    Rejected,
+}
+
+/// A job parked on its environment's required-reviewer gate plus the GitHub
+/// side-channel facts the announce/approve paths need — the check run to
+/// offer Approve/Reject on and the deployment to stamp.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingEnvironmentApproval {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The post-hydration environment name the gate was armed against.
+    pub(crate) environment_name: String,
+    /// The job's `environment.url` when declared (deployment status field).
+    pub(crate) environment_url: Option<String>,
+    /// The job's GitHub check run, when the run reports checks.
+    pub(crate) check_run_id: Option<u64>,
+    /// The job's GitHub deployment, when one was created.
+    pub(crate) deployment_id: Option<u64>,
+    /// Whether the run reports GitHub check runs (`runs.reports_check_runs`).
+    /// The announce loop needs this: a `None` check_run_id on a reporting run
+    /// means the check run mint has not landed yet (separate spawned task),
+    /// so the gate must stay unannounced for the retry sweep, while a `None`
+    /// on a non-reporting run means no check run will ever exist.
+    pub(crate) reports_check_runs: bool,
+}
+
+/// Everything the GitHub environment side-channel needs for one job: the
+/// resolved environment name/url, the run's head sha (deployment `ref`), and
+/// the already-minted GitHub ids. Built on demand by `environment_deployment`
+/// — the check run / deployment / environment name live on different rows.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvironmentDeploymentRow {
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The run's head sha — the deployment's `ref`.
+    pub(crate) head_sha: String,
+    /// The post-hydration environment name (armed gate → message → spec).
+    pub(crate) environment: String,
+    /// The job's `environment.url`, when declared.
+    pub(crate) environment_url: Option<String>,
+    /// The job's GitHub check run, when the run reports checks.
+    pub(crate) check_run_id: Option<u64>,
+    /// The job's GitHub deployment, when one was already created.
+    pub(crate) deployment_id: Option<u64>,
+    /// The job's persisted status — read once more right before posting so a
+    /// terminal conclusion that landed during token mint suppresses the
+    /// asynchronous `in_progress` deployment status.
+    pub(crate) job_status: ExecutionStatus,
+    /// Whether anything happened GitHub would have created a Deployment for:
+    /// a runner claimed the job (`job_requests.started_at`), or the
+    /// environment gate engaged (a review was requested or recorded). A job
+    /// skipped by `if:` — or otherwise concluded before either — has no
+    /// GitHub deployment, so the terminal report must not create one.
+    pub(crate) deployment_started: bool,
+}
+
+/// One durable environment-review audit row (`environment_approvals`): who
+/// decided what on which environment, when, and with which comment. The row
+/// outlives the gate and the run — run archival never deletes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnvironmentApprovalAudit {
+    /// The run the decision belonged to (a plain key: the run row may be
+    /// archived while this audit row stays readable).
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The post-hydration environment name the gate was armed against.
+    pub(crate) environment: String,
+    /// `"approved"` or `"rejected"`.
+    pub(crate) decision: String,
+    /// GitHub login of the reviewing user; `None` for the operator's
+    /// system-token (admin) override, which carries no user identity.
+    pub(crate) actor: Option<String>,
+    /// The decision bypassed the reviewer list (native admin endpoint).
+    pub(crate) admin_override: bool,
+    /// Reviewer comment, when one was supplied.
+    pub(crate) comment: Option<String>,
+    /// When the decision was recorded (unix nanos).
+    pub(crate) decided_at_unix_nanos: i64,
 }
 
 /// `record_environment_approval` outcome plus the queue gauges the handler
@@ -1266,4 +1369,26 @@ pub(crate) struct OidcGrant {
     /// `id-token: write` was granted to the job (missing grant row = false).
     pub(crate) granted: bool,
     pub(crate) context: crate::state::OidcJobContext,
+}
+
+/// One finalized v1 artifact from the control catalog. `public_id` is the
+/// UUID the v1 API addresses artifacts by; `storage_key` is the file path
+/// holding the bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactCatalogRow {
+    pub(crate) public_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) name: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
+}
+
+/// A finalized v1 artifact row to persist when an upload completes.
+#[derive(Debug, Clone)]
+pub(crate) struct NewArtifactRow {
+    pub(crate) public_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) name: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
 }

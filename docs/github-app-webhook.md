@@ -272,7 +272,7 @@ The `--public-url` parameter supplied to `preloop serve` serves two distinct pur
 1. **In-VM Control Plane Endpoint**: Tells the ephemeral runner microVM inside SmolVM where to connect back to the control plane.
 2. **GitHub Check Run Links**: Forms the base URL for the `details_url` field sent to GitHub when registering check runs on PRs and commits (e.g. `https://preloop.preloop.dev/runs/<run_id>`).
 
-**Pitfall**: Setting `--public-url` to a local LAN IP (e.g. `http://192.168.1.221:9090`) during local testing will cause GitHub check runs to be registered with non-routable local IP links on GitHub PRs. Always keep `--public-url https://preloop.preloop.dev` in production deployments.
+**Pitfall**: Setting `--public-url` to a local LAN IP (e.g. `http://192.168.1.221:9090`) during local testing will cause GitHub check runs to be registered with non-routable local IP links on GitHub PRs. In production deployments, always set `--public-url` to your own public hostname.
 
 ### 8.2 Cloudflare Tunnel Configuration &amp; Error 1033
 
@@ -352,7 +352,7 @@ The bridge only binds when the advertised origin is a loopback address the guest
 
 Consequences:
 
-- With the production hostname, *everything* guests do — registration, long-poll, artifact uploads, checkout fetches — physically leaves the host, traverses Cloudflare, and returns through the tunnel. A tunnel outage therefore breaks *local* CI: observed as `530 / error code: 1033` from in-VM `connectionData` fetches and as `actions/upload-artifact` timeouts (`runner-light` failure during the 2026-07-30 tunnel transition).
+- With the production hostname, *everything* guests do — registration, long-poll, artifact uploads, checkout fetches — physically leaves the host, traverses Cloudflare, and returns through the tunnel. A tunnel outage therefore breaks *local* CI: observed as `530 / error code: 1033` from in-VM `connectionData` fetches and as `actions/upload-artifact` timeouts.
 - The hostname also has to keep resolving publicly; `preloop.preloop.dev` TLS and DNS are load-bearing for local jobs in this mode.
 
 #### Resolution: the runner-facing origin is split from the public URL
