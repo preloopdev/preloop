@@ -146,9 +146,7 @@ fn auto_pr_candidate(run: &crate::models::RunRecord) -> Option<(String, String, 
     }
     // Only durable webhook deliveries may trigger auto-PR. Trust-tier fields in
     // a native submission are user input and do not prove webhook provenance.
-    if run.webhook_delivery_id.is_none() {
-        return None;
-    }
+    run.webhook_delivery_id.as_ref()?;
     crate::events::trust_tier::tier_of(&run.submission)?;
     // Push-back runs are client-managed: `github_push.rs` owns their PR.
     if run.submission.push.is_some() {
