@@ -118,7 +118,9 @@ Releases before v0.27.0 predate the changelog.
   the official runner's value when its message carries no
   `system.github.token` variable: API clients go anonymous. The runtime token
   keeps travelling where the engine needs it — the pinned snapshot checkout
-  steps, the forge-relay reroutes and the `SystemVssConnection` endpoint.
+  steps, the forge-relay reroutes and the `SystemVssConnection` endpoint. The
+  acquirejob conformance gate permits exactly those two token fields to be
+  absent in tokenless captures while keeping all other response fields strict.
 - **The environment-rule cache is bounded to environments in use**: cached
   rules were never evicted and every expired entry was refetched each reaper
   tick, so a fork PR with a matrix of made-up environment names could pin
