@@ -1,7 +1,9 @@
 //! Delete event adapter.
 //!
 //! Reference: MessageController.cs:6287 (* default case)
-//! ref = default branch, activity = ref_type or action.
+//! ref = default branch, activity = ref_type or action. The triggered
+//! workflow file comes from the default branch, so the run carries default
+//! branch (`Trusted`) authority, exactly as on github.com.
 
 use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
@@ -34,7 +36,7 @@ impl EventAdapter for Adapter {
             sha: None,
             status_check_sha: None,
             activity_type,
-            trust_tier: Some(TrustTier::Untrusted),
+            trust_tier: Some(TrustTier::Trusted),
             skip: false,
             payload: payload.clone(),
             upstream_workflow_names: vec![],
