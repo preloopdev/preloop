@@ -1000,15 +1000,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     .unwrap();
 
     let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
-    // Local pull-request submissions now build GitHub's test merge, so this
-    // webhook fixture needs the same origin that a checked-out workspace has.
-    let origin = temp.path().join("origin.git");
-    git_fixture_command(&ws_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-    git_fixture_command(
-        &ws_dir,
-        &["remote", "add", "origin", origin.to_str().unwrap()],
-    );
-    git_fixture_command(&ws_dir, &["push", "-q", "origin", "main"]);
+    add_fixture_origin(temp.path(), &ws_dir);
 
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -1141,6 +1133,155 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
         wire_variable(&acquired, "system.github.token.permissions"),
         Some(r#"{"Checks":"write","Metadata":"read"}"#),
         "trusted jobs keep declared writes and implicit metadata"
+    );
+}
+
+/// End-to-end through the `issue_comment` webhook adapter: a comment runs the
+/// workflow file from the default branch, so the run keeps default-branch
+/// authority — stored secrets are part of the job's secret surface, the
+/// declared permissions survive, and the OIDC request URL is present.
+///
+/// Regression: the adapter stamped `Untrusted`, which silently emptied
+/// `secrets.*` (and read-clamped the token, and dropped OIDC) for every
+/// comment-triggered workflow — the `@pullfrog review` path, which is a
+/// first-class github.com use case and never needs a fork's code to run.
+#[tokio::test]
+async fn issue_comment_webhook_jobs_receive_stored_secrets() {
+    // Same serialization as the fork test above: the webhook path takes its
+    // mock GitHub branch only while no process-global credential is visible.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    // The step references the secret by name, like the pullfrog workflow's
+    // step `env:` does; the spec carries referenced names (a `uses:` step
+    // marks the job dynamic and carries the whole scope).
+    tokio::fs::write(
+        ws_dir.join(".github/workflows/test.yml"),
+        "on: issue_comment\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        env:\n          COMMENT_TRIGGER_TOKEN: ${{ secrets.COMMENT_TRIGGER_TOKEN }}\n",
+    )
+    .await
+    .unwrap();
+    commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    {
+        let mut secrets = state.secrets.write();
+        secrets.global.insert(
+            "COMMENT_TRIGGER_TOKEN".to_owned(),
+            "comment-trigger-value".to_owned(),
+        );
+        // Never referenced by the workflow: the spec must not name it.
+        secrets.global.insert(
+            "UNREFERENCED_TOKEN".to_owned(),
+            "unreferenced-value".to_owned(),
+        );
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "action": "created",
+        "comment": { "body": "@pullfrog review" },
+        "issue": { "number": 424, "pull_request": {} },
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main",
+        },
+        "sender": { "login": "alice" },
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let sig_hex = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "issue_comment")
+                .header("x-hub-signature-256", format!("sha256={sig_hex}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
+
+    let inner = state.test_tx().await;
+    let (_, run_record) = inner.runs.iter().next().unwrap();
+    assert_eq!(
+        run_record.submission.trust_tier.as_deref(),
+        Some("trusted"),
+        "a comment runs the default-branch workflow file and keeps its authority"
+    );
+    let run_id = run_record.run_id.to_string();
+    let message = queued_message_for(&inner, &run_id);
+    // The stored template names every secret in scope; the values are filled
+    // at acquire.
+    let spec = message
+        .preloop_secret_spec
+        .as_ref()
+        .expect("the stored template carries an explicit secret spec");
+    assert!(
+        spec.names.contains("COMMENT_TRIGGER_TOKEN"),
+        "issue_comment jobs must resolve stored secrets (spec: {spec:?})"
+    );
+    assert!(
+        !spec.names.contains("UNREFERENCED_TOKEN"),
+        "only names the workflow references are attached (spec: {spec:?})"
+    );
+    assert_eq!(
+        variable_value(&message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
+        "declared writes survive: the token is not read-clamped"
+    );
+    let endpoint = message
+        .resources
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.eq_ignore_ascii_case("SystemVssConnection"))
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        endpoint
+            .data
+            .get("GenerateIdTokenUrl")
+            .is_some_and(|url| !url.is_empty()),
+        "id-token: write yields an OIDC request URL for a default-branch run"
+    );
+    drop(inner);
+
+    let acquired = acquire_queued_job(&app, "issue-comment-runner").await;
+    assert_eq!(
+        wire_variable(&acquired, "COMMENT_TRIGGER_TOKEN"),
+        Some("comment-trigger-value"),
+        "the stored secret is filled into the claimed job message"
+    );
+    assert_eq!(
+        wire_variable(&acquired, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
+        "the claimed job keeps the declared permission set"
     );
 }
 

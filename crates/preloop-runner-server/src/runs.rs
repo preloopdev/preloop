@@ -2530,8 +2530,9 @@ pub(crate) fn build_job_artifacts(
     // stored secrets, the runner-visible `system.github.token.permissions`
     // variable, the GitHub App installation-token request, the OIDC grant,
     // and which external token (if any) the job may receive. Fork-restricted
-    // tiers (fork PRs, fail-closed unknown events) get GitHub's read-only
-    // fork profile no matter what the workflow declared.
+    // tiers (fork PRs, and the fail-closed `Untrusted` default for an
+    // unclassified event) get GitHub's read-only fork profile no matter what
+    // the workflow declared.
     let tier = crate::events::trust_tier::tier_of(submission);
     let policy = crate::events::trust_tier::job_authorization(
         tier,
