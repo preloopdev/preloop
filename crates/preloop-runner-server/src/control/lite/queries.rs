@@ -812,11 +812,11 @@ impl LiteBackend {
                     "INSERT INTO job_history (run_id, run_created_at, run_attempt, job_id, namespace_id, \
                          kind, parent_job_id, base_id, display_name, status, pool_key, outputs, \
                          annotations, check_run_id, created_at, deps_ready_at, started_at, \
-                         completed_at) \
+                         completed_at, request_id) \
                      SELECT j.run_id, r.created_at, r.run_attempt, j.job_id, j.namespace_id, j.kind, \
                          j.parent_job_id, j.base_id, COALESCE(s.display_name, j.job_id), \
                          j.status, j.pool_key, j.outputs, j.annotations, j.check_run_id, \
-                         j.created_at, j.deps_ready_at, j.started_at, j.completed_at \
+                         j.created_at, j.deps_ready_at, j.started_at, j.completed_at, j.request_id \
                      FROM jobs j JOIN runs r ON r.run_id = j.run_id \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
                      WHERE j.run_id = ?1",

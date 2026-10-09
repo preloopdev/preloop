@@ -201,6 +201,7 @@ CREATE TABLE jobs (
     -- environment-less jobs. `environment_url`: the runner-evaluated
     -- `environment.url` from the completion. Both are listed last because
     -- migration 0504 adds them with `ALTER TABLE .. ADD COLUMN`.
+    request_id              INTEGER,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
@@ -689,6 +690,7 @@ CREATE TABLE "job_history" (
     deps_ready_at           INTEGER,
     started_at              INTEGER,
     completed_at            INTEGER,
+    request_id              INTEGER,
     PRIMARY KEY (run_id, job_id, run_created_at, run_attempt)
 );
 

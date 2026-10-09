@@ -572,8 +572,12 @@ pub(crate) mod suite {
             .await
             .unwrap();
 
+        // The workflow builder leaves `requestId` as a 0 placeholder; the
+        // backend allocates the real id inside its transaction.
+        let mut build = submit_job(run_id, "build", 1);
+        build.queued.message.request_id = 0;
         let outcome = backend
-            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .submit_run(submit_run(run_id, vec![build]))
             .await
             .unwrap();
         assert_eq!(outcome.run_id, run_id);
@@ -603,6 +607,9 @@ pub(crate) mod suite {
 
         let ctx = backend.acquire_context(1).await.unwrap();
         assert_eq!(ctx.request.request_id, 1);
+        // The runner renews and finishes the request named in the message it
+        // receives, so the stored template must carry the allocated id.
+        assert_eq!(ctx.message.request_id, 1);
         assert_eq!(ctx.repository, "owner/repo");
 
         let done = backend
@@ -6578,6 +6585,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6625,6 +6633,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6639,6 +6648,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6699,6 +6709,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::Failed,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6769,6 +6780,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id: clean,
                 mode: RerunMode::Failed,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6816,6 +6828,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::Job(JobId("pick".to_owned())),
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6859,6 +6872,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::Job(JobId("ghost".to_owned())),
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -6975,6 +6989,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: rules(5),
                 templates: Vec::new(),
@@ -7073,6 +7088,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id: run_x,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: Some(workflow_concurrency("release", false)),
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -7175,6 +7191,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id: run_x,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -7228,6 +7245,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -7264,6 +7282,154 @@ pub(crate) mod suite {
             ExecutionStatus::Success
         );
     }
+    /// Failed reruns preserve the execution pointer for carried-forward jobs,
+    /// replace it for re-admitted jobs, and stamp the requesting actor without
+    /// changing the original `github.actor`.
+    pub(crate) async fn rerun_request_links_and_actor(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut submit = submit_run(
+            run_id,
+            vec![submit_job(run_id, "a", 1), submit_job(run_id, "b", 2)],
+        );
+        submit.record.github = serde_json::json!({
+            "actor": "original",
+            "triggering_actor": "original",
+            "run_attempt": 1
+        });
+        submit.record.submission = std::sync::Arc::new(preloop_gha_protocol::WorkflowSubmission {
+            actor: "original".to_owned(),
+            ..(*submit.record.submission).clone()
+        });
+        backend.submit_run(submit).await.unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("a".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("b".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let a_attempt_1 = backend
+            .request(RequestKey::Job(run_id, JobId("a".to_owned())))
+            .await
+            .unwrap()
+            .request_id;
+        let b_attempt_1 = backend
+            .request(RequestKey::Job(run_id, JobId("b".to_owned())))
+            .await
+            .unwrap()
+            .request_id;
+
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::Failed,
+                triggering_actor: Some("rerunner".to_owned()),
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 2);
+        let rerun_record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(rerun_record.github["actor"], "original");
+        assert_eq!(rerun_record.github["triggering_actor"], "rerunner");
+        assert_eq!(rerun_record.github["run_attempt"], 2);
+        let b_attempt_2 = backend
+            .request(RequestKey::Job(run_id, JobId("b".to_owned())))
+            .await
+            .unwrap()
+            .request_id;
+        assert_ne!(b_attempt_2, b_attempt_1);
+        assert_eq!(
+            backend
+                .request(RequestKey::Job(run_id, JobId("a".to_owned())))
+                .await
+                .unwrap()
+                .request_id,
+            a_attempt_1,
+            "carried-forward job keeps its original execution"
+        );
+
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("b".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 120 * 1_000_000)
+            .await
+            .unwrap();
+        backend.archive_finished_runs(32, None).await.unwrap();
+        assert_eq!(
+            backend.run_record(run_id).await.unwrap().run_attempt,
+            2,
+            "archived view is attempt 2"
+        );
+    }
+
+    /// A selected job whose condition is false on the new attempt concludes
+    /// without minting, so its live execution pointer is cleared.
+    pub(crate) async fn rerun_reset_concluded_clears_request(
+        backend: &dyn ControlBackend,
+    ) -> RunId {
+        let run_id = RunId::new();
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "skip", 1)]);
+        submit.jobs[0].queued.if_condition = Some("${{ github.run_attempt == 1 }}".to_owned());
+        submit.record.github = serde_json::json!({"run_attempt": 1});
+        backend.submit_run(submit).await.unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("skip".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::Failed,
+                triggering_actor: None,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .concluded
+                .iter()
+                .any(|(job, status, _)| job.0 == "skip" && *status == ExecutionStatus::Skipped)
+        );
+        assert!(outcome.rerun_jobs.is_empty());
+        run_id
+    }
 
     /// The in-place re-run hold: a completed run with a failed job stays in
     /// the live tables for the whole window (30 days by default) and is still
@@ -7294,6 +7460,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -7362,6 +7529,7 @@ pub(crate) mod suite {
             .rerun_run(RerunRun {
                 run_id,
                 mode: RerunMode::All,
+                triggering_actor: None,
                 workflow_concurrency: None,
                 environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
@@ -8480,7 +8648,6 @@ mod pg {
             "no decision is recorded against a job the sweep already failed"
         );
     }
-
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
         // Distinct `run_number` per submit: the agreed schema keys
         // `runs_number` on (namespace, repo, path, number, attempt), so
@@ -8969,6 +9136,70 @@ mod pg {
         };
         suite::rerun_then_archive_keeps_each_attempt(&backend).await;
     }
+    #[tokio::test]
+    async fn rerun_request_links_actor_and_history() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_request_links_and_actor(&backend).await;
+        let run_id = backend
+            .runs_for_repository("owner/repo")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run_attempt == 2)
+            .expect("rerun run")
+            .run_id;
+        let client = backend.writer().await.unwrap();
+        let rows = client
+            .query(
+                "SELECT run_attempt, job_id, request_id FROM job_history \
+                 WHERE run_id = $1::text::uuid ORDER BY run_attempt, job_id",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        let values: Vec<(i32, String, Option<i64>)> = rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let a1 = values
+            .iter()
+            .find(|(a, j, _)| *a == 1 && j == "a")
+            .unwrap()
+            .2;
+        let b1 = values
+            .iter()
+            .find(|(a, j, _)| *a == 1 && j == "b")
+            .unwrap()
+            .2;
+        let a2 = values
+            .iter()
+            .find(|(a, j, _)| *a == 2 && j == "a")
+            .unwrap()
+            .2;
+        let b2 = values
+            .iter()
+            .find(|(a, j, _)| *a == 2 && j == "b")
+            .unwrap()
+            .2;
+        assert!(a1.is_some() && b1.is_some());
+        assert_eq!(a2, a1);
+        assert!(b2.is_some() && b2 != b1);
+        drop(client);
+        let skipped = suite::rerun_reset_concluded_clears_request(&backend).await;
+        let client = backend.writer().await.unwrap();
+        let pointer: Option<i64> = client
+            .query_one(
+                "SELECT request_id FROM jobs WHERE run_id = $1::text::uuid AND job_id = 'skip'",
+                &[&skipped.0.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(pointer, None);
+    }
 
     #[tokio::test]
     async fn archiver_hold_keeps_failed_runs_rerunnable() {
@@ -9344,6 +9575,73 @@ mod lite {
     #[tokio::test]
     async fn rerun_then_archive_keeps_each_attempt() {
         suite::rerun_then_archive_keeps_each_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+    #[tokio::test]
+    async fn rerun_request_links_actor_and_history() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::rerun_request_links_and_actor(&backend).await;
+        let run_id = backend
+            .runs_for_repository("owner/repo")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run_attempt == 2)
+            .expect("rerun run")
+            .run_id;
+        let values = backend
+            .test_db_mutate(|db| {
+                let mut statement = db.0.prepare(
+                    "SELECT run_attempt, job_id, request_id FROM job_history \
+                     WHERE run_id = ?1 ORDER BY run_attempt, job_id",
+                )?;
+                statement
+                    .query_map([run_id.0.to_string()], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(values.len(), 4);
+        let a1 = values
+            .iter()
+            .find(|(a, j, _)| *a == 1 && j == "a")
+            .unwrap()
+            .2;
+        let b1 = values
+            .iter()
+            .find(|(a, j, _)| *a == 1 && j == "b")
+            .unwrap()
+            .2;
+        let a2 = values
+            .iter()
+            .find(|(a, j, _)| *a == 2 && j == "a")
+            .unwrap()
+            .2;
+        let b2 = values
+            .iter()
+            .find(|(a, j, _)| *a == 2 && j == "b")
+            .unwrap()
+            .2;
+        assert!(a1.is_some() && b1.is_some());
+        assert_eq!(a2, a1);
+        assert!(b2.is_some() && b2 != b1);
+        let skipped = suite::rerun_reset_concluded_clears_request(&backend).await;
+        let pointer = backend
+            .test_db_mutate(|db| {
+                db.0.query_row(
+                    "SELECT request_id FROM jobs WHERE run_id = ?1 AND job_id = 'skip'",
+                    [skipped.0.to_string()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(pointer, None);
     }
 
     #[tokio::test]

@@ -288,3 +288,52 @@ restarted 10 s later, 420 s drain): `inflight_requests = 0`, all 95 webhooks
 Open at 25/s on this machine (identical in e2–e4, so not caused by these
 changes): the webhook inbox falls behind (≈800 deliveries still `received`
 after the drain) and the submit p50 is several seconds.
+
+## Follow-up: rerun lifecycle (2026-10-09, #445)
+
+The rerun driver runs `POST /api/v1/runs/:id/rerun` concurrently with the
+normal submit/acquire/complete traffic. It reads completed failed-run
+candidates from Postgres, sends all/failed/job modes at an open-loop rate, and
+records rerun request latency. Both rounds used RELEASE, two nodes, 2
+submissions/s, 60 mocked runners, a 90-second submission window, 60-second
+drain, and 500 ms median mocked jobs. Absolute throughput is workstation
+capacity, not a production capacity claim.
+
+| Round | Workflows / jobs submitted | Reruns accepted | Jobs completed | Backlog | Rerun p50 / p95 / p99 ms | Submit p50 / p99 ms | Complete p50 / p99 ms | Acquire p50 / p99 ms | Rerun txn count / total / max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (`rerun_fraction=0`) | 245 / 585 | 0 | 584 | 1 | — / not captured / — | 225 / 448 | 14 / 101 | 3.8 / 29.2 | 0 / 0 / 0 |
+| rerun-heavy (`rerun_fraction=0.25`) | 264 / 849 | 24 (8 all, 8 failed, 8 job) | 1,037 | 0 | 79 / not captured / 716 | 210 / 741 | 14 / 191 | 4.8 / 18.6 | 24 / 1,627 ms / 460 ms |
+
+The harness emitted p50/p90/p99 (not p95) for this pair; the p95 column is
+intentionally marked **not captured**, rather than substituting p90. The
+rerun-heavy request sample had p90 527 ms and p99 716 ms.
+
+Postgres integrity after the rerun-heavy drain was clean after excluding
+history rows for runs still live at the sampling cutoff: duplicate in-flight
+requests 0, history job-count mismatches 0, live pointer mismatches 0,
+orphaned archived request pointers 0, names running twice 0, owner mismatches
+0, SQL errors 0, and deadlocks 0. The original raw round query counted 128
+“orphaned” pointers because 18 rerun runs still had live request rows not yet
+copied by the archiver; the corrected query distinguishes live runs and
+returns 0.
+
+### Bottleneck analysis and recommendations
+
+The rerun transaction is not a dominant throughput bottleneck at this load.
+The 24 successful rerun transactions took 1.627 s total across two nodes
+(67.8 ms mean; 460 ms maximum), while the normal run-row lock/flush totals
+were 7.823 s / 9.862 s in the rerun-heavy round. Reruns did increase submit
+p99 from 448 ms to 741 ms and complete p99 from 101 ms to 191 ms, but they
+also doubled completed jobs (584 → 1,037), so this is not a controlled
+single-variable latency comparison. The activity sampler observed brief
+`active:Lock` samples and zero deadlocks; there was no sustained global queue
+lock state. `pg_stat_statements` was unavailable to the harness connection,
+so statement-level rerun attribution is not available from these rounds.
+
+The transaction's snapshot INSERT…SELECT and per-job reset/mint work should be
+profiled with `pg_stat_statements` enabled in a follow-up, especially at
+higher rerun rates. Keep the direct `(run_id, job_id, request_id DESC)`
+request index (already present) and the pointer integrity query in the
+round harness. Repeat with p95 enabled and a larger 25/s round before making
+capacity claims. SQLite was not load-tested: this harness drives a shared
+Postgres control plane and has no SQLite server orchestration.

@@ -65,7 +65,17 @@ impl LiteBackend {
     /// the submit classification chain. `NotFound`/`Conflict` per the trait
     /// contract.
     pub(crate) async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError> {
-        self.write(move |tx| rerun_run_tx(tx, self, rerun))
+        self.write(move |tx| {
+            let started = std::time::Instant::now();
+            let result = rerun_run_tx(tx, self, rerun);
+            if result.is_ok() {
+                crate::control::txn_stats::record(
+                    crate::control::txn_stats::RunRowOp::Rerun,
+                    started.elapsed(),
+                );
+            }
+            result
+        })
     }
 
     /// `rerun_plan` (pg dispatch.rs): the mode-resolved selection and which
@@ -169,6 +179,7 @@ fn rerun_run_tx(
     let RerunRun {
         run_id,
         mode,
+        triggering_actor,
         workflow_concurrency,
         environment_rules: _environment_rules,
         templates,
@@ -264,7 +275,7 @@ fn rerun_run_tx(
 
     // Bump `github.run_attempt` in the stored context: rebuilt templates
     // read it, and `run_context` serves it to gate evaluation.
-    let github = bump_run_attempt(tx, &run, run_attempt)?;
+    let github = bump_run_attempt(tx, &run, run_attempt, triggering_actor.as_deref())?;
 
     // Check-run ids are per-attempt: a re-run mints fresh `check_run`s and
     // the old ids stay on the attempt-1 history rows. Drop the mapping for
@@ -399,7 +410,7 @@ fn rerun_run_tx(
         if caller_with_children {
             tx.prepare_cached(
                 "UPDATE jobs SET status = 'in_progress', queue_state = 'none', \
-                     outputs = NULL, completed_at = NULL \
+                     outputs = NULL, request_id = NULL, completed_at = NULL \
                  WHERE run_id = ?1 AND job_id = ?2",
             )
             .map_err(db)?
@@ -711,11 +722,11 @@ fn snapshot_attempt(
         "INSERT INTO job_history (run_id, run_created_at, run_attempt, job_id, \
              namespace_id, kind, parent_job_id, base_id, display_name, status, \
              pool_key, outputs, annotations, check_run_id, created_at, \
-             deps_ready_at, started_at, completed_at) \
+             deps_ready_at, started_at, completed_at, request_id) \
          SELECT j.run_id, r.created_at, ?3, j.job_id, j.namespace_id, j.kind, \
              j.parent_job_id, j.base_id, COALESCE(s.display_name, j.job_id), \
              j.status, j.pool_key, j.outputs, j.annotations, j.check_run_id, \
-             j.created_at, j.deps_ready_at, j.started_at, j.completed_at \
+             j.created_at, j.deps_ready_at, j.started_at, j.completed_at, j.request_id \
          FROM jobs j JOIN runs r ON r.run_id = j.run_id \
          LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
          WHERE j.run_id = ?1",
@@ -726,11 +737,13 @@ fn snapshot_attempt(
     Ok(())
 }
 
-/// Rewrite `github.run_attempt` in the stored `run_submissions.github_context`.
+/// Rewrite `github.run_attempt` and, when supplied, `github.triggering_actor`
+/// in the stored `run_submissions.github_context`.
 fn bump_run_attempt(
     tx: &Transaction<'_>,
     run: &str,
     run_attempt: i64,
+    triggering_actor: Option<&str>,
 ) -> Result<serde_json::Value, ControlError> {
     let json: Option<String> = tx
         .prepare_cached("SELECT github_context FROM run_submissions WHERE run_id = ?1")
@@ -743,6 +756,9 @@ fn bump_run_attempt(
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(object) = github.as_object_mut() {
         object.insert("run_attempt".to_owned(), serde_json::json!(run_attempt));
+        if let Some(actor) = triggering_actor {
+            object.insert("triggering_actor".to_owned(), serde_json::json!(actor));
+        }
     }
     tx.prepare_cached("UPDATE run_submissions SET github_context = ?2 WHERE run_id = ?1")
         .map_err(db)?
@@ -869,7 +885,7 @@ fn reset_job_row(
 ) -> Result<(), ControlError> {
     tx.prepare_cached(
         "UPDATE jobs SET status = ?3, queue_state = ?4, remaining_needs = ?5, \
-             outputs = NULL, annotations = NULL, check_run_id = NULL, \
+             outputs = NULL, annotations = NULL, check_run_id = NULL, request_id = NULL, \
              enqueued_at = NULL, claimed_by_runner_id = NULL, claimed_at = NULL, \
              deps_ready_at = NULL, concurrency_wait_at = NULL, \
              concurrency_acquired_at = NULL, started_at = NULL, completed_at = NULL, \
@@ -899,7 +915,7 @@ fn reset_concluded(
 ) -> Result<(), ControlError> {
     tx.prepare_cached(
         "UPDATE jobs SET status = ?3, queue_state = 'none', remaining_needs = 0, \
-             outputs = NULL, annotations = NULL, check_run_id = NULL, \
+             outputs = NULL, annotations = NULL, check_run_id = NULL, request_id = NULL, \
              enqueued_at = NULL, claimed_by_runner_id = NULL, claimed_at = NULL, \
              deps_ready_at = NULL, concurrency_wait_at = NULL, \
              concurrency_acquired_at = NULL, started_at = NULL, \
