@@ -7,10 +7,7 @@ mod keys;
 pub mod node_externals;
 pub mod oci;
 
-use crate::environment::{
-    APT_INDICES_MARKER_PATH, EnvironmentSpec, ToolchainLayer, curated_toolchains,
-    is_stock_base_image,
-};
+use crate::environment::{EnvironmentSpec, is_official_golden};
 use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -30,7 +27,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt as _;
@@ -41,21 +38,6 @@ use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
-/// Rust toolchain homes inside the guest.
-///
-/// rustup obeys `RUSTUP_HOME`/`CARGO_HOME` verbatim — no fallback to `$HOME`,
-/// no search for a writable candidate — so these fixed system addresses are a
-/// contract, not a hint. Every party MUST agree: the bake installs here
-/// (`ToolchainLayer::Rust`), `runner_account_script` chowns them to the runner
-/// uid, `guest_env_prefix` exports them, `guest_runner_path` puts
-/// `$CARGO_HOME/bin` on PATH, and `verify_toolchain_homes` refuses to register
-/// a runner whose golden disagrees. A `$HOME`-derived location instead would
-/// split root's copy from the runner's: `/root` is 0700, so the runner gets
-/// EACCES statting it, and a second writable home silently shadows the baked
-/// toolchain with a fresh `stable` download.
-const GUEST_RUSTUP_HOME: &str = "/usr/local/rustup";
-const GUEST_CARGO_HOME: &str = "/usr/local/cargo";
-
 const GUEST_FAILURE_MARKER: &str = "/home/runner/.preloop-job-failed";
 /// Written by the worker while a job is paused in a debug session and removed
 /// when the session closes. The pool probes it to release the slot's
@@ -518,8 +500,7 @@ fn default_golden_url(release_version: &str) -> String {
 ///
 /// The golden is only attached to releases that baked one, so an engine whose
 /// own release predates the artifact (or whose release has only the `.sig`
-/// sidecar) otherwise 404s and falls back to a local build even though a
-/// published golden exists.
+/// sidecar) otherwise 404s even though a published golden exists.
 fn latest_golden_url() -> String {
     format!(
         "https://github.com/preloopdev/preloop/releases/latest/download/preloop-ubuntu-24.04-{}",
@@ -1012,8 +993,9 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
 /// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects
 /// a custom host when one is available.
 ///
-/// An architecture with no published packed golden returns `None`; the
-/// engine then falls back to the release-asset path and a local bake.
+/// An architecture with no published packed golden returns `None`, and the
+/// engine then has no official golden for this host at all: the download
+/// fails and the caller reports it. There is no local bake to fall back to.
 fn default_golden_oci_ref() -> Option<&'static str> {
     match std::env::consts::ARCH {
         "aarch64" => Some(GOLDEN_OCI_REF_ARM64),
@@ -1034,10 +1016,9 @@ const GOLDEN_OCI_REF_X86_64: &str = "ghcr.io/preloopdev/preloop-x86_64-smolvm-go
 ///
 /// The packed golden runs to ~9.6 GB, so this budget is really a floor on
 /// link speed rather than a formality: finishing inside an hour needs ~21
-/// Mbps sustained. The original 10-minute budget demanded 128 Mbps, which
-/// an ordinary connection cannot serve — it killed the transfer around
-/// two-thirds through and fell back to a local bake that looked like the
-/// artifact was missing.
+/// Mbps sustained. The original 10-minute budget demanded 128 Mbps, which an
+/// ordinary connection cannot serve — it killed the transfer around two-thirds
+/// through, and the artifact then read as missing.
 const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Transfer attempts for one golden source before it is abandoned.
 ///
@@ -1176,8 +1157,55 @@ fn ensure_golden_download_space(
     })
 }
 
-fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
-    is_stock_base_image(base_image) || custom_golden_url
+/// The packed official golden this host will fetch, honouring
+/// `PRELOOP_GOLDEN_OCI_REF`.
+///
+/// Also the official environment's fingerprint input (see
+/// `EnvironmentSpec::from_base`): a newly published golden moves this
+/// reference, so the pool re-downloads instead of reusing the previous pack.
+pub(crate) fn official_golden_reference() -> String {
+    std::env::var("PRELOOP_GOLDEN_OCI_REF")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| default_golden_oci_ref().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The source the official golden would be fetched from on this host: the
+/// `PRELOOP_GOLDEN_URL` mirror when one is set, else
+/// [`official_golden_reference`].
+///
+/// Also the official environment's fingerprint input (see
+/// `EnvironmentSpec::from_base`): it decides both which pack lands at the
+/// payload path and whether a pack is fetched at all, so a mirror flip or a
+/// newly published golden must move the fingerprint — `ensure_golden_payload`
+/// returns immediately for an existing file and would otherwise serve the
+/// previous pack forever.
+pub(crate) fn official_golden_source() -> String {
+    golden_url_override().unwrap_or_else(|| format!("oci:{}", official_golden_reference()))
+}
+
+/// `PRELOOP_GOLDEN_URL` when it names a mirror. An exported-but-blank value
+/// behaves like an unset one, exactly as [`download_prebaked_golden_with_space`]
+/// resolves it.
+fn golden_url_override() -> Option<String> {
+    std::env::var("PRELOOP_GOLDEN_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// The official runner image a non-file-pack backend boots to build its
+/// golden in-guest, honouring neither `PRELOOP_GOLDEN_OCI_REF` nor
+/// `PRELOOP_GOLDEN_URL`: those name a *packed* artifact, which only a backend
+/// that restores packs can consume.
+///
+/// `None` on an architecture with no published runner image.
+pub(crate) fn official_boot_image() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(OFFICIAL_RUNNER_IMAGE_BASE_ARM64),
+        "x86_64" => Some(OFFICIAL_RUNNER_IMAGE_BASE_AMD64),
+        _ => None,
+    }
 }
 
 async fn download_prebaked_golden(
@@ -1234,13 +1262,21 @@ async fn download_prebaked_golden_with_space(
     } else {
         None
     };
+    let mirror = forced_url.is_some();
     for url in golden_url_candidates(release_version, resolved_tag.as_deref(), forced_url) {
         info!(
             url = %url,
             target = %payload.display(),
             "Downloading pre-baked golden from release asset (this may take several minutes)"
         );
-        if download_release_asset(&client, &url, payload, available_space).await? {
+        // A forced mirror's bytes become the golden *without* any other gate,
+        // so they must be verified: an operator pointing `PRELOOP_GOLDEN_URL`
+        // at a mirror is trusting that host, and an unverified payload turns a
+        // compromised mirror into every job's image. The published
+        // `linux-amd64`/`linux-arm64` assets we release ourselves are the only
+        // source allowed to skip verification (a missing sidecar there is an
+        // accident, and refusing would strand every host that updates first).
+        if download_release_asset(&client, &url, payload, available_space, mirror).await? {
             return Ok(true);
         }
     }
@@ -1256,7 +1292,47 @@ async fn download_release_asset(
     url: &str,
     payload: &Path,
     available_space: AvailableSpace,
+    require_checksum: bool,
 ) -> Result<bool, OrchestratorError> {
+    // Fetch the companion checksum before committing bandwidth to the body.
+    // A truncated or corrupted golden only fails much later, when a VM tries
+    // to boot it, so a mismatch must be caught here. `PRELOOP_GOLDEN_SHA256`
+    // pins the digest for hosts whose mirror publishes no sidecar (the
+    // exported-but-blank rule applies here too). Releases that do not publish
+    // a checksum are tolerated for our own assets with a warning — the
+    // download is still the best path when the alternative is a full local
+    // build — but a forced mirror must be verifiable, see the caller.
+    let pinned_sha256 = std::env::var("PRELOOP_GOLDEN_SHA256")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| parse_sha256_checksum(&value));
+    let expected_sha256 = match pinned_sha256 {
+        Some(sha256) => Some(sha256),
+        None => match tokio::time::timeout(
+            Duration::from_secs(15),
+            client.get(format!("{url}.sha256")).send(),
+        )
+        .await
+        {
+            Ok(Ok(res)) if res.status().is_success() => match res.text().await {
+                Ok(text) => parse_sha256_checksum(&text),
+                Err(_) => None,
+            },
+            _ => None,
+        },
+    };
+    if expected_sha256.is_none() {
+        if require_checksum {
+            warn!(
+                url = %url,
+                "PRELOOP_GOLDEN_URL is set but the mirror publishes no checksum: refusing an \
+                 unverified payload. Publish `<asset>.sha256` beside it, or pin the digest with \
+                 PRELOOP_GOLDEN_SHA256"
+            );
+            return Ok(false);
+        }
+        warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
+    }
     let probe = match client.get(url).send().await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
@@ -1274,27 +1350,6 @@ async fn download_release_asset(
     };
     let total_bytes = probe.content_length();
     ensure_golden_download_space(payload, total_bytes, available_space)?;
-
-    // Fetch the companion checksum before committing bandwidth to the body.
-    // A truncated or corrupted golden only fails much later, when a VM tries
-    // to boot it, so a mismatch must be caught here. Releases that do not
-    // publish a checksum are tolerated with a warning (the download is still
-    // the best path when the alternative is a full local build).
-    let expected_sha256 = match tokio::time::timeout(
-        Duration::from_secs(15),
-        client.get(format!("{url}.sha256")).send(),
-    )
-    .await
-    {
-        Ok(Ok(res)) if res.status().is_success() => match res.text().await {
-            Ok(text) => parse_sha256_checksum(&text),
-            Err(_) => None,
-        },
-        _ => None,
-    };
-    if expected_sha256.is_none() {
-        warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
-    }
 
     let partial = golden_partial_path(payload);
     let downloaded_bytes = {
@@ -1678,76 +1733,6 @@ fn parse_sha256_checksum(text: &str) -> Option<String> {
         None
     }
 }
-/// Packages common to Ubuntu 22.04 and 24.04 environment goldens.
-///
-/// Tracks the apt baseline of GitHub's hosted Ubuntu images. ABI-transition
-/// packages are selected separately: Jammy uses the original names while
-/// Noble renamed them with the `t64` suffix.
-const BASE_PACKAGES: &str = "\
-     git curl wget ca-certificates gnupg2 sudo openssh-client \
-     libnspr4 libnss3 libcairo2 libdbus-1-3 libdrm2 libgbm1 \
-     libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-     libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-     ruby ruby-rubygems perl cpanminus lsb-release fonts-noto-color-emoji \
-     haveged mediainfo p7zip-rar pollinate sshpass telnet tk xvfb zsync ftp \
-     sphinxsearch systemd-coredump libnss3-tools software-properties-common \
-     build-essential pkg-config libssl-dev make autoconf automake libtool m4 \
-     bison flex texinfo patchelf swig dpkg-dev fakeroot binutils lld \
-     libicu-dev libsqlite3-dev libyaml-dev \
-     python3 python3-pip python-is-python3 \
-     unzip zip xz-utils zstd bzip2 brotli lz4 pigz p7zip-full tar \
-     jq file tree shellcheck parallel time acl locales tzdata \
-     rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
-     sqlite3 rpm aria2 mercurial libcurl4-openssl-dev zlib1g-dev gettext \
-     libexpat1-dev";
-
-const BASE_PACKAGES_22_04: &str =
-    "libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libglib2.0-0 libasound2";
-const BASE_PACKAGES_24_04: &str = "\
-    libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
-    libcups2t64 libglib2.0-0t64 libasound2t64";
-
-/// Node.js baked into the base image, pinned (via `versions.toml`) to the
-/// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
-/// deliberately *not* installed: workflows written against hosted runners
-/// assume a modern Node on PATH, and the apt series floats with the archive.
-pub const BASE_NODE_VERSION: &str = crate::NODE_VERSION;
-
-/// Container engine, installed separately from [`BASE_PACKAGES`].
-///
-/// Installed from Docker's official apt repository (not Ubuntu's `docker.io`
-/// package): the runner needs parity with the `ubuntu-latest` container
-/// stack, and the official packages ship `dockerd`, the CLI, and the
-/// buildx/compose plugins as first-class artifacts.
-///
-/// Kept apart because it needs storage configuration the other packages do not
-/// — see [`DOCKER_DATA_ROOT`].
-/// Docker's apt repository supplies the service unit and runtime dependencies.
-/// Its retained package set floats, so the bake overlays the exact official
-/// image engine/CLI and plugin binaries afterward.
-fn docker_apt_packages() -> String {
-    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin".to_owned()
-}
-
-/// Compiler families preinstalled by GitHub's Ubuntu 24.04 image.
-///
-/// Clang includes the compiler, formatter, and tidy tools for each version.
-/// GNU C, C++, and Fortran are all present for 12, 13, and 14.
-fn compiler_apt_packages() -> String {
-    let mut packages = Vec::new();
-    for version in CLANG_VERSIONS.split_whitespace() {
-        for package in ["clang", "clang-format", "clang-tidy"] {
-            packages.push(format!("{package}-{version}"));
-        }
-    }
-    for version in GCC_VERSIONS.split_whitespace() {
-        for package in ["gcc", "g++", "gfortran"] {
-            packages.push(format!("{package}-{version}"));
-        }
-    }
-    packages.join(" ")
-}
-
 /// Where the container engine stores images and layers.
 ///
 /// Must be a real filesystem, not the guest's overlayfs root. containerd's
@@ -1764,7 +1749,6 @@ fn compiler_apt_packages() -> String {
 /// layer; the failure only shows up in a fork.
 const DOCKER_DATA_ROOT: &str = "/storage/docker";
 
-/// Standard loopback entries for `/etc/hosts`.
 /// Runner root inside the guest. Must match the `--runner-root` argument
 /// passed to configure at provision time.
 /// Lives under the runner user's home, matching the GitHub-hosted layout
@@ -1846,161 +1830,6 @@ const GUEST_NOFILE_ULIMIT: &str = GOLDEN_NOFILE_ULIMIT_RAISE;
 /// failing the launch with `EPERM` noise. The privileged launch sites use the
 /// strict form above and fail loudly.
 const GUEST_NOFILE_ULIMIT_BEST_EFFORT: &str = GOLDEN_NOFILE_ULIMIT_RAISE_BEST_EFFORT;
-
-/// Standard loopback entries for `/etc/hosts`.
-///
-/// The base image ships an **empty** `/etc/hosts`, and `nsswitch.conf` is
-/// `hosts: files dns` so `localhost` falls through to the upstream resolver
-/// and fails to resolve at all. Everything still works over `127.0.0.1`, which
-/// is why this hides so well.
-///
-/// It breaks a large share of real workflows: `services:` containers are
-/// reached at `localhost:<port>`, and most test suites connect to `localhost`
-/// by name. GitHub's runners resolve it, so a workflow that depends on it is
-/// correct — the gap is ours.
-const LOOPBACK_HOSTS: &str = "127.0.0.1 localhost\\n\
-                              ::1 localhost ip6-localhost ip6-loopback\\n\
-                              fe00::0 ip6-localnet\\n\
-                              ff00::0 ip6-mcastprefix\\n\
-                              ff02::1 ip6-allnodes\\n\
-                              ff02::2 ip6-allrouters\\n";
-
-/// The golden's apt baseline, every package version-pinned (versions.toml).
-/// Versions marked EXACT there match the official ubuntu-24.04 runner image.
-fn base_packages_pinned() -> String {
-    format!(
-        "git={APT_GIT} \
-        curl={APT_CURL} \
-        wget={APT_WGET} \
-        ca-certificates={APT_CA_CERTIFICATES} \
-        gnupg2={APT_GNUPG2} \
-        sudo={APT_SUDO} \
-        openssh-client={APT_OPENSSH_CLIENT} \
-        libnspr4={APT_LIBNSPR4} \
-        libnss3={APT_LIBNSS3} \
-        libatk1.0-0t64={APT_LIBATK1} \
-        libatk-bridge2.0-0t64={APT_LIBATK_BRIDGE} \
-        libatspi2.0-0t64={APT_LIBATSPI} \
-        libcairo2={APT_LIBCAIRO2} \
-        libcups2t64={APT_LIBCUPS2T64} \
-        libdbus-1-3={APT_LIBDBUS_1_3} \
-        libdrm2={APT_LIBDRM2} \
-        libgbm1={APT_LIBGBM1} \
-        libglib2.0-0t64={APT_LIBGLIB2} \
-        libpango-1.0-0={APT_LIBPANGO} \
-        libx11-6={APT_LIBX11_6} \
-        libxcb1={APT_LIBXCB1} \
-        libxcomposite1={APT_LIBXCOMPOSITE1} \
-        libxdamage1={APT_LIBXDAMAGE1} \
-        libxext6={APT_LIBXEXT6} \
-        libxfixes3={APT_LIBXFIXES3} \
-        libxkbcommon0={APT_LIBXKBCOMMON0} \
-        libxrandr2={APT_LIBXRANDR2} \
-        libasound2t64={APT_LIBASOUND2T64} \
-        ruby={APT_RUBY} \
-        ruby-rubygems={APT_RUBY_RUBYGEMS} \
-        perl={APT_PERL} \
-        cpanminus={APT_CPANMINUS} \
-        lsb-release={APT_LSB_RELEASE} \
-        fonts-noto-color-emoji={APT_FONTS_NOTO_COLOR_EMOJI} \
-        haveged={APT_HAVEGED} \
-        mediainfo={APT_MEDIAINFO} \
-        p7zip-rar={APT_P7ZIP_RAR} \
-        pollinate={APT_POLLINATE} \
-        sshpass={APT_SSHPASS} \
-        telnet={APT_TELNET} \
-        tk={APT_TK} \
-        xvfb={APT_XVFB} \
-        zsync={APT_ZSYNC} \
-        ftp={APT_FTP} \
-        sphinxsearch={APT_SPHINXSEARCH} \
-        systemd-coredump={APT_SYSTEMD_COREDUMP} \
-        libnss3-tools={APT_LIBNSS3_TOOLS} \
-        software-properties-common={APT_SOFTWARE_PROPERTIES_COMMON} \
-        build-essential={APT_BUILD_ESSENTIAL} \
-        pkg-config={APT_PKG_CONFIG} \
-        libssl-dev={APT_LIBSSL_DEV} \
-        make={APT_MAKE} \
-        autoconf={APT_AUTOCONF} \
-        automake={APT_AUTOMAKE} \
-        libtool={APT_LIBTOOL} \
-        m4={APT_M4} \
-        bison={APT_BISON} \
-        flex={APT_FLEX} \
-        texinfo={APT_TEXINFO} \
-        patchelf={APT_PATCHELF} \
-        swig={APT_SWIG} \
-        dpkg-dev={APT_DPKG_DEV} \
-        fakeroot={APT_FAKEROOT} \
-        binutils={APT_BINUTILS} \
-        lld={APT_LLD} \
-        libicu-dev={APT_LIBICU_DEV} \
-        libsqlite3-dev={APT_LIBSQLITE3_DEV} \
-        libyaml-dev={APT_LIBYAML_DEV} \
-        python3={APT_PYTHON3} \
-        python3-pip={APT_PYTHON3_PIP} \
-        python-is-python3={APT_PYTHON_IS_PYTHON3} \
-        unzip={APT_UNZIP} \
-        zip={APT_ZIP} \
-        xz-utils={APT_XZ_UTILS} \
-        zstd={APT_ZSTD} \
-        bzip2={APT_BZIP2} \
-        brotli={APT_BROTLI} \
-        lz4={APT_LZ4} \
-        pigz={APT_PIGZ} \
-        p7zip-full={APT_P7ZIP_FULL} \
-        tar={APT_TAR} \
-        jq={APT_JQ} \
-        file={APT_FILE} \
-        tree={APT_TREE} \
-        shellcheck={APT_SHELLCHECK} \
-        parallel={APT_PARALLEL} \
-        time={APT_TIME} \
-        acl={APT_ACL} \
-        locales={APT_LOCALES} \
-        tzdata={APT_TZDATA} \
-        rsync={APT_RSYNC} \
-        dnsutils={APT_DNSUTILS} \
-        iputils-ping={APT_IPUTILS_PING} \
-        net-tools={APT_NET_TOOLS} \
-        iproute2={APT_IPROUTE2} \
-        netcat-openbsd={APT_NETCAT_OPENBSD} \
-        sqlite3={APT_SQLITE3} \
-        rpm={APT_RPM} \
-        aria2={APT_ARIA2} \
-        mercurial={APT_MERCURIAL} \
-        libcurl4-openssl-dev={APT_LIBCURL4_OPENSSL_DEV} \
-        zlib1g-dev={APT_ZLIB1G_DEV} \
-        gettext={APT_GETTEXT} \
-        libexpat1-dev={APT_LIBEXPAT1_DEV}"
-    )
-}
-
-/// The golden image's package baseline. Exposed for the fidelity tests.
-pub fn base_packages() -> &'static str {
-    BASE_PACKAGES
-}
-
-/// The golden image's container engine baseline. Exposed for the fidelity
-/// tests.
-pub fn docker_packages() -> String {
-    docker_apt_packages()
-}
-
-/// The golden image's hosted compiler package baseline.
-pub fn compiler_packages() -> String {
-    compiler_apt_packages()
-}
-
-/// Where the container engine stores layers. Exposed for the fidelity tests.
-pub fn docker_data_root() -> &'static str {
-    DOCKER_DATA_ROOT
-}
-
-/// Loopback `/etc/hosts` contents. Exposed for the fidelity tests.
-pub fn loopback_hosts() -> &'static str {
-    LOOPBACK_HOSTS
-}
 
 fn node_externals_at(runner_root: &str) -> Vec<Vec<String>> {
     // Pinned SHA per runtime+platform, derived from versions.toml via build.rs.
@@ -2101,27 +1930,58 @@ pub const DEFAULT_RUNNER_USER: &str = "runner";
 /// Default UID for [`DEFAULT_RUNNER_USER`], matching the hosted image.
 pub const DEFAULT_RUNNER_UID: u32 = 1001;
 
+/// Whether `user` may be used as the runner account.
+///
+/// Deliberately narrow: the name reaches root-run guest scripts unquoted by
+/// design (it is a *name*, not data), so anything a Linux account name cannot
+/// contain is refused rather than escaped. `root` is allowed as the explicit
+/// "do not switch user" value; an empty name is not.
+pub fn is_valid_account_name(user: &str) -> bool {
+    if user == "root" {
+        return true;
+    }
+    let mut chars = user.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '_' | '-')
+    })
+}
+
 /// Create the unprivileged runner account and hand it every path a job writes.
 ///
-/// Part of [`base_install_script`] — and therefore of the environment
-/// fingerprint — on purpose. Run as a separate post-bake `exec`, a change here
-/// left the fingerprint untouched, so the pool adopted the previous golden and
-/// silently served jobs an account the new code no longer matched. Keep every
-/// step idempotent: the same script runs against an already-prepared rootfs.
+/// Part of [`golden_contract_script`] — and therefore of the environment
+/// fingerprint — on purpose. Applied per `exec` instead, a change here left the
+/// fingerprint untouched, so the pool adopted the previous golden and silently
+/// served jobs an account the new code no longer matched. Keep every step
+/// idempotent: the same script runs against an image that already has the
+/// account (the official golden's `runner`) and against one that does not.
 ///
-/// The Rust homes are the subtle ones. `ToolchainLayer::Rust` installs them as
-/// root at fixed system addresses (`/usr/local/rustup`, `/usr/local/cargo`)
-/// that `guest_env_prefix` exports to every user, so without this ownership
-/// the runner cannot write them and `rustup toolchain install` dies with
-/// `could not create home directory`.
+/// An account the image already carries is *reconciled* to `uid` rather than
+/// assumed to have it: the runtime drops privileges to the configured uid, so
+/// an image whose `runner` sits at another uid would otherwise run jobs as a
+/// uid that owns nothing in its own home. `usermod -u` also re-owns the
+/// account's files, and [`golden_ownership_script`] then covers the rest.
+///
+/// Ownership is *not* here: the walk over the runner home happens once, in
+/// [`golden_ownership_script`], because on overlayfs a recursive `chown`
+/// copies every file it touches into the per-VM upper layer.
 pub fn runner_account_script(user: &str, uid: u32) -> String {
     format!(
         "getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} -s /bin/bash {user} 2>/dev/null; \
+         if [ \"$(id -u {user} 2>/dev/null)\" != \"{uid}\" ]; then \
+           usermod -u {uid} {user} 2>/dev/null || \
+             printf 'preloop: could not move %s to uid %s; jobs run as that uid and may not own their home\\n' \
+               '{user}' '{uid}' >&2; \
+         fi; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
-         mkdir -p /run/user/{uid} /opt/hostedtoolcache /usr/local/rustup /usr/local/cargo; \
-         chown {uid}:{uid} /run/user/{uid} {root} 2>/dev/null; \
-         chown -R {uid}:{uid} /usr/local/rustup /usr/local/cargo 2>/dev/null; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/_work; \
+         chown {uid}:{uid} /run/user/{uid} {root} {root}/_work 2>/dev/null; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -2131,84 +1991,27 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
     )
 }
 
-/// Guest script that hands the runner account ownership of every path a job
-/// writes, without touching the image's privilege policy.
+/// Hand the runner account ownership of everything a job writes.
 ///
-/// Ownership only, deliberately: account creation, the `/etc/sudoers.d` rule,
-/// and docker-group membership stay in [`runner_account_script`], which the
-/// curated bake runs as part of building an image. Installing that policy on
-/// an image which never had it would hand blanket root — and the container
-/// daemon — to whatever a fork executes.
+/// One owner-only walk, run once at golden build — a fork inherits the result,
+/// so no per-VM walk exists at all. `find … ! -user uid -exec chown -h uid:uid
+/// {} +` touches only the inodes whose *owner* is wrong, for two reasons:
 ///
-/// The script first decides whether anything is actually wrong (`needs`), so
-/// an already-correct machine pays exactly one exec round trip. Only when work
-/// is needed does it escalate — directly when the exec landed on root, else
-/// through passwordless sudo — and an escalation that cannot run is reported
-/// as a failure rather than masked: a machine whose `RUSTUP_HOME` resolves to
-/// an unusable directory fails every rustup step at job time.
-pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
-    let home = format!("/home/{user}");
-    // The image's own toolchain homes. Official runner images install Rust
-    // under the runner's `$HOME` (`~/.rustup` with `settings.toml`, `~/.cargo`
-    // with the rustup shims) while preloop's contract exports
-    // `RUSTUP_HOME=/usr/local/rustup` to every user — rustup obeys that
-    // verbatim, so an image without those paths leaves `cargo` unable to
-    // resolve a toolchain at all: the shim reads an empty home and dies with
-    // `could not create home directory` (as the runner user) or `could not
-    // choose a version of cargo to run`. Point the contract at the image's
-    // home instead of refusing, which is what GitHub-hosted runners
-    // effectively have: one toolchain every user resolves identically.
-    let adopt_homes = format!(
-        "if [ ! -f /usr/local/rustup/settings.toml ] && [ -f {home}/.rustup/settings.toml ]; then \
-           rm -rf /usr/local/rustup; \
-           ln -s {home}/.rustup /usr/local/rustup; \
-         fi; \
-         if [ ! -d /usr/local/cargo/bin ] && [ -d {home}/.cargo/bin ]; then \
-           rm -rf /usr/local/cargo; \
-           ln -s {home}/.cargo /usr/local/cargo; \
-         fi"
-    );
-    // The privileged half, applied only after `needs=1`. `set -e` makes every
-    // required operation fail the script: this is the ownership jobs depend
-    // on, so a partial apply must not report success.
-    let apply = format!(
-        "set -e; \
-         {adopt_homes}; \
-         for d in /usr/local/rustup /usr/local/cargo; do \
-           if [ -e \"$d\" ]; then chown -R {uid}:{uid} \"$d\"; fi; \
-         done; \
-         if [ -d /opt/hostedtoolcache ]; then \
-           [ \"$(stat -c %a /opt/hostedtoolcache)\" = \"777\" ] || chmod -R 777 /opt/hostedtoolcache; \
-         fi; \
-         grep -q AGENT_TOOLSDIRECTORY /etc/environment || \
-           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
-         mkdir -p /run/user/{uid}; \
-         chown {uid}:{uid} /run/user/{uid}"
-    );
-    use base64::Engine as _;
-    let apply_b64 = base64::engine::general_purpose::STANDARD.encode(&apply);
-    // Same predicate as `adopt_homes`, expressed as a `needs` signal so the
-    // fast path does not skip a machine that still needs the link.
-    let adopt_needs = format!(
-        "if [ ! -f /usr/local/rustup/settings.toml ] && [ -f {home}/.rustup/settings.toml ]; then needs=1; fi; \
-         if [ ! -d /usr/local/cargo/bin ] && [ -d {home}/.cargo/bin ]; then needs=1; fi"
-    );
+/// * the guest root is overlayfs, where a recursive `chown` copies every file
+///   it visits out of the packed lower layer into the per-VM upper even when
+///   the owner already matches (measured: 304 s and 1.22 GB to re-group two
+///   inodes on the production golden's runner home);
+/// * a group predicate would re-group files the official images deliberately
+///   leave in another group — `/home/runner/.docker` is `runner:docker`, and
+///   the official runner leaves it alone.
+///
+/// `-h` preserves `chown -R`'s no-symlink-traversal default, and `-xdev` keeps
+/// the walk out of read-only mounts some images carry under the runner home.
+pub fn golden_ownership_script(uid: u32) -> String {
     format!(
-        "needs=0; \
-         {adopt_needs}; \
-         for d in /usr/local/rustup /usr/local/cargo; do \
-           if [ -e \"$d\" ]; then \
-             if [ \"$(stat -L -c %u \"$d\" 2>/dev/null)\" != \"{uid}\" ]; then needs=1; \
-             elif find \"$d/.\" ! -uid {uid} -print -quit 2>/dev/null | grep -q .; then needs=1; fi; \
-           fi; \
-         done; \
-         if [ -d /opt/hostedtoolcache ]; then \
-           [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || needs=1; \
-         fi; \
-         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || needs=1; \
-         if [ \"$needs\" = \"0\" ]; then echo 'runner ownership already reconciled'; exit 0; fi; \
-         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh; \
-         else printf %s '{apply_b64}' | base64 -d | sudo -n sh; fi"
+        "find {root} -xdev ! -user {uid} -exec chown -h {uid}:{uid} {{}} + 2>/dev/null; \
+         chown {uid}:{uid} /run/user/{uid} 2>/dev/null || true",
+        root = RUNNER_ROOT,
     )
 }
 
@@ -2484,174 +2287,128 @@ fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
 }
 
 /// The guest bootstrap script, one shell round trip.
+/// The one thing a golden build checks, and refuses an image over.
 ///
-/// Every `exec` is a host process spawn plus a vsock round trip, and this runs
-/// on the engine's start-up critical path. Exposed for the fidelity tests.
-pub fn base_install_script() -> String {
+/// smolvm boots a Linux guest and every dynamically linked binary a workflow
+/// runs — the runner included — resolves through the guest's glibc loader. An
+/// image without one (musl-only, scratch) cannot run a job at all, and the
+/// failure at job time is a wall of `exec: no such file` from steps that have
+/// nothing to do with the image. Fail the bake instead, naming what was
+/// missing.
+pub fn golden_glibc_check_script() -> &'static str {
+    "loader=0; \
+     for p in /lib64/ld-linux-*.so.* /lib/ld-linux-*.so.* /lib/*-linux-gnu*/ld-linux-*.so.*; do \
+       [ -e \"$p\" ] && { loader=1; break; }; \
+     done; \
+     [ \"$loader\" = \"1\" ] || { \
+       echo 'preloop: this image carries no glibc dynamic loader (looked for /lib64/ld-linux-*.so.*, /lib/ld-linux-*.so.*, /lib/*-linux-gnu*/ld-linux-*.so.*); a golden built from it could not run any dynamically linked binary' >&2; \
+       exit 1; \
+     }"
+}
+
+/// The complete golden contract for a configured image: the image is used
+/// exactly as it is, and this is everything Preloop adds.
+///
+/// GitHub-runner machinery only — the account jobs run as (with its home,
+/// `_work` and passwordless sudo), the ownership of the paths they write, the
+/// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
+/// `/etc/environment`, the glibc requirement above, and the image's apt package
+/// indices ([`golden_apt_lists_script`]). No packages, no
+/// toolchains, no PATH or environment overrides: on a hosted runner a missing
+/// `bash`, `git` or `docker` fails the step that needs it, and the same is true
+/// here.
+///
+/// The text is also the fingerprint input for configured images (see
+/// `EnvironmentSpec::from_base`), so editing a step rebuilds every golden baked
+/// from an image instead of adopting one the old contract produced.
+pub fn golden_contract_script(user: &str, uid: u32) -> String {
+    // `PRELOOP_RUNNER_USER=root` restores the old "run as root" behavior, and
+    // `as_runner_user` runs the runner unchanged for it. The account steps must
+    // skip then: creating and chowning a `root` account (and moving its home
+    // to `/home/root`) would leave the image in a state nothing runs as.
+    // Steps are joined rather than formatted into fixed slots: an empty slot
+    // renders `; ;`, which `sh` rejects, and the root contract hit exactly that.
+    let mut steps = vec!["set -e".to_owned(), golden_glibc_check_script().to_owned()];
+    if user != "root" {
+        steps.push(runner_account_script(user, uid));
+        steps.push(golden_ownership_script(uid));
+    }
+    steps.push(golden_apt_lists_script());
+    steps.join("; ")
+}
+
+/// Refresh apt's package indices, best-effort and bounded.
+///
+/// Hosted images keep populated lists, so real workflows run
+/// `sudo apt-get install <pkg>` with no `apt-get update` first (uv's musl cell
+/// installs `musl-tools` that way). The runner-image dump ships with its lists
+/// wiped, so a golden without this step fails those steps with
+/// `E: Unable to locate package`.
+///
+/// A failed refresh (offline bake host, held lock) warns and carries on: the
+/// golden is still correct, and [`restore_apt_lists_script`] covers a pack
+/// that shipped without lists. No `#` comments in the text: the statements are
+/// joined into one physical line.
+fn golden_apt_update_command() -> &'static str {
+    "limit=; command -v timeout >/dev/null 2>&1 && limit='timeout 300'; \
+     $limit apt-get -o DPkg::Lock::Timeout=10 update -qq \
+       || echo 'preloop: apt-get update failed; this golden ships without apt package indices' >&2"
+}
+
+/// The contract step that bakes fresh apt indices into a golden.
+///
+/// Unconditional, unlike [`restore_apt_lists_script`]: a rebuilt golden should
+/// carry the indices of its bake day, not whatever an older image shipped. An
+/// image without apt skips it.
+pub fn golden_apt_lists_script() -> String {
     format!(
-        "(find /usr/bin /usr/sbin /bin /sbin /etc -type f 2>/dev/null | \
-            while IFS= read -r f; do chown 0:0 \"$f\" 2>/dev/null; done) || true; \
-         chown 0:0 /etc/sudo.conf /etc/sudoers 2>/dev/null; \
-         for f in /etc/sudoers.d/*; do [ -f \"$f\" ] && chown 0:0 \"$f\" 2>/dev/null; done; \
-         chmod 0440 /etc/sudoers /etc/sudoers.d/* 2>/dev/null; \
-         (for b in sudo su mount umount passwd chsh chfn newgrp gpasswd expiry chage wall write pkexec ping fusermount fusermount3; do \
-            for p in /usr/bin/$b /bin/$b /usr/sbin/$b; do \
-              if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
-            done; \
-          done; \
-          for p in /usr/lib/openssh/ssh-keysign /usr/lib/dbus-1.0/dbus-daemon-launch-helper; do \
-            if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
-          done) && \
-         apt-get update -qq && \
-         . /etc/os-release && \
-         case \"$VERSION_ID\" in \
-           22.04) base_packages='{BASE_PACKAGES} {BASE_PACKAGES_22_04}' ;; \
-           *) base_packages='{BASE_PACKAGES} {BASE_PACKAGES_24_04}' ;; \
-         esac && \
-         (echo \"### install hosted apt baseline\" >&2 && \
-          if [ \"$VERSION_ID\" = 24.04 ] && \
-             DEBIAN_FRONTEND=noninteractive \
-             apt-get -s install -qq --no-install-recommends {base_packages_pinned} >/dev/null 2>&1; then \
-            DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends {base_packages_pinned}; \
-          else \
-            echo \"WARNING: exact hosted apt pins are unavailable; falling back to archive versions\" >&2; \
-            DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends $base_packages; \
-          fi) \
-         && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
-         printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \
-         printf 'APT::Get::Assume-Yes \"true\";\\n' > /etc/apt/apt.conf.d/90assumeyes && \
-         rm -f /usr/lib/python3*/EXTERNALLY-MANAGED && \
-         arch=$(uname -m); \
-         case \"$arch\" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) NODE_ARCH=x64 ;; esac; \
-         case \"$NODE_ARCH\" in \
-           x64) LFS_ARCH=amd64; DOCKER_STATIC_ARCH=x86_64; DOCKER_PLUGIN_ARCH=amd64; COMPOSE_ARCH=x86_64 ;; \
-           *) LFS_ARCH=arm64; DOCKER_STATIC_ARCH=aarch64; DOCKER_PLUGIN_ARCH=arm64; COMPOSE_ARCH=aarch64 ;; \
-         esac; \
-         (echo \"### install hosted compiler matrix\" >&2 && \
-          available_compiler_packages=''; \
-          compiler_matrix_complete=1; \
-          for package in {compiler_packages}; do \
-            if DEBIAN_FRONTEND=noninteractive \
-               apt-get -s install -qq --no-install-recommends \"$package\" >/dev/null 2>&1; then \
-              available_compiler_packages=\"$available_compiler_packages $package\"; \
-            else \
-              compiler_matrix_complete=0; \
-              echo \"compiler package unavailable: $package\" >&2; \
-            fi; \
-          done; \
-          if [ -n \"$available_compiler_packages\" ]; then \
-            DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends $available_compiler_packages || exit 1; \
-          fi; \
-          if [ \"$compiler_matrix_complete\" = 1 ]; then \
-            clang-16 --version | head -1 | grep -F '{CLANG_16_VERSION}' && \
-            clang-17 --version | head -1 | grep -F '{CLANG_17_VERSION}' && \
-            clang-18 --version | head -1 | grep -F '{CLANG_18_VERSION}' && \
-            test \"$(gcc-12 -dumpfullversion)\" = '{GCC_12_VERSION}' && \
-            test \"$(gcc-13 -dumpfullversion)\" = '{GCC_13_VERSION}' && \
-            test \"$(gcc-14 -dumpfullversion)\" = '{GCC_14_VERSION}' || exit 1; \
-          else \
-            echo \"WARNING: hosted compiler matrix is incomplete in this Ubuntu archive; adding the archive-default compiler toolchain\" >&2; \
-            DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends clang clang-format clang-tidy gcc g++ gfortran || exit 1; \
-          fi; \
-          for version in {CLANG_VERSIONS}; do \
-            if [ -x /usr/bin/clang++-$version ]; then \
-              update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-$version 100 || true; \
-            fi; \
-            if [ -x /usr/bin/clang-$version ]; then \
-              update-alternatives --install /usr/bin/clang clang /usr/bin/clang-$version 100 || true; \
-            fi; \
-            if [ -x /usr/bin/clang-format-$version ]; then \
-              update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-$version 100 || true; \
-            fi; \
-            if [ -x /usr/bin/clang-tidy-$version ]; then \
-              update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-$version 100 || true; \
-            fi; \
-            if [ -x /usr/bin/run-clang-tidy-$version ]; then \
-              update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/bin/run-clang-tidy-$version 100 || true; \
-            fi; \
-          done; \
-          for tool in clang clang++ clang-format clang-tidy run-clang-tidy; do \
-            if [ -x \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\" ]; then \
-              update-alternatives --set \"$tool\" \"/usr/bin/$tool-{CLANG_DEFAULT_VERSION}\" || exit 1; \
-            fi; \
-          done) && \
-         (echo \"### fetch system node v{BASE_NODE_VERSION}\" >&2 && \
-          curl -fsSL \"https://nodejs.org/dist/v{BASE_NODE_VERSION}/node-v{BASE_NODE_VERSION}-linux-$NODE_ARCH.tar.gz\" \
-            | tar -xz --strip-components=1 -C /usr/local) && \
-         (install -m 0755 -d /etc/apt/keyrings && \
-         (echo \"### fetch docker gpg\" >&2 && \
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
-          echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" > /etc/apt/sources.list.d/docker.list && \
-          apt-get update -qq && \
-          DEBIAN_FRONTEND=noninteractive \
-          apt-get install -y -qq {docker_packages} && \
-          (echo \"### install gh cli\" >&2 && \
-           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-           echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list && \
-          apt-get update -qq && \
-          DEBIAN_FRONTEND=noninteractive \
-           apt-get install -y -qq gh && \
-           gh --version | head -1) && \
-          echo \"### overlay docker v{DOCKER_VERSION}\" >&2 && \
-          rm -rf /tmp/docker-static && mkdir -p /tmp/docker-static && \
-          curl -fsSL \"https://download.docker.com/linux/static/stable/$DOCKER_STATIC_ARCH/docker-{DOCKER_VERSION}.tgz\" \
-            | tar -xz -C /tmp/docker-static && \
-          install -m 0755 /tmp/docker-static/docker/* /usr/local/bin/ && \
-          rm -rf /tmp/docker-static && \
-          install -m 0755 -d /usr/local/lib/docker/cli-plugins && \
-          curl -fsSL \"https://github.com/docker/buildx/releases/download/v{DOCKER_BUILDX_VERSION}/buildx-v{DOCKER_BUILDX_VERSION}.linux-$DOCKER_PLUGIN_ARCH\" \
-            -o /usr/local/lib/docker/cli-plugins/docker-buildx && \
-          curl -fsSL \"https://github.com/docker/compose/releases/download/v{DOCKER_COMPOSE_VERSION}/docker-compose-linux-$COMPOSE_ARCH\" \
-            -o /usr/local/lib/docker/cli-plugins/docker-compose && \
-          chmod 0755 /usr/local/lib/docker/cli-plugins/docker-buildx /usr/local/lib/docker/cli-plugins/docker-compose && \
-          docker --version | grep -F '{DOCKER_VERSION}' && \
-          dockerd --version | grep -F '{DOCKER_VERSION}' && \
-          docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
-          docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
-          mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json)) && \
-         (echo \"### fetch cargo-shear\" >&2 && \
-          curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
-         (echo \"### bake git v{GIT_VERSION}\" >&2 && \
-          apt-get install -y -qq --no-install-recommends libcurl4-openssl-dev zlib1g-dev gettext libexpat-dev && \
-          curl -fsSL https://github.com/git/git/archive/refs/tags/v{GIT_VERSION}.tar.gz | tar -xz -C /tmp && \
-          (cd /tmp/git-{GIT_VERSION} && make -s prefix=/usr all && make -s prefix=/usr install) && \
-          rm -rf /tmp/git-{GIT_VERSION} && \
-          echo \"### bake git-lfs v{GIT_LFS_VERSION}\" >&2 && \
-          curl -fsSL https://github.com/git-lfs/git-lfs/releases/download/v{GIT_LFS_VERSION}/git-lfs-linux-$LFS_ARCH-v{GIT_LFS_VERSION}.tar.gz | tar -xz -C /tmp && \
-          /tmp/git-lfs-{GIT_LFS_VERSION}/install.sh && rm -rf /tmp/git-lfs-{GIT_LFS_VERSION}) && \
-         (mkdir -p /usr/local/share && \
-          echo \"### bake nvm v{NVM_VERSION}\" >&2 && \
-          curl -fsSL https://github.com/nvm-sh/nvm/archive/refs/tags/v{NVM_VERSION}.tar.gz | tar -xz -C /usr/local/share && \
-          mv /usr/local/share/nvm-{NVM_VERSION} /usr/local/share/nvm && \
-          printf 'export NVM_DIR=/usr/local/share/nvm\\n[ -s \"$NVM_DIR/nvm.sh\" ] && \\. \"$NVM_DIR/nvm.sh\"\\n' > /etc/profile.d/nvm.sh) && \
-         echo \"### bake yarn v{YARN_VERSION}\" >&2 && \
-         npm install -g yarn@{YARN_VERSION} && \
-         install -d -m 0777 /opt/hostedtoolcache && \
-         printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment && \
-         (useradd -m -u 1000 -s /bin/bash ubuntu 2>/dev/null || true) && \
-         ({runner_account}) && \
-         apt-get clean && \
-         rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*",
-        runner_account = runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
-        docker_packages = docker_apt_packages(),
-        compiler_packages = compiler_apt_packages(),
-        base_packages_pinned = base_packages_pinned()
+        "if command -v apt-get >/dev/null 2>&1; then {}; fi",
+        golden_apt_update_command()
     )
 }
 
-fn base_install_commands() -> Vec<Vec<String>> {
-    [vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        base_install_script(),
-    ]]
-    .into_iter()
-    .collect()
+/// Restore apt's indices when the golden has none, a no-op when it has them.
+///
+/// For a published pack baked before the contract carried
+/// [`golden_apt_lists_script`]: it is unpacked, not baked here, so nothing else
+/// would populate its lists. `lists` is the directory apt keeps them in.
+fn restore_apt_lists_script_at(lists: &str) -> String {
+    format!(
+        "if command -v apt-get >/dev/null 2>&1 \
+         && [ -z \"$(find {lists} -name '*_Packages*' -print -quit 2>/dev/null)\" ]; then {update}; fi",
+        lists = shell_quote(lists),
+        update = golden_apt_update_command(),
+    )
+}
+
+fn restore_apt_lists_script() -> String {
+    restore_apt_lists_script_at("/var/lib/apt/lists")
+}
+
+/// Restore apt's indices in a freshly unpacked golden, before it is frozen.
+///
+/// Done once per golden, not per fork: a fork's own writes never reach its
+/// siblings, so a per-fork refresh would repay the download on every job. Never
+/// fatal; a golden without indices still runs jobs that do not `apt-get
+/// install` blind.
+async fn restore_apt_lists<P: VmProvider>(provider: &P, golden: &MachineName) {
+    let script = run_as_root_or_sudo(&restore_apt_lists_script());
+    match provider
+        .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
+        .await
+    {
+        Ok(output) if output.exit_code == 0 => {}
+        Ok(output) => warn!(
+            machine = golden.as_str(),
+            exit = output.exit_code,
+            "apt index restore failed; workflow `apt-get install` steps may not resolve"
+        ),
+        Err(error) => warn!(
+            machine = golden.as_str(),
+            %error,
+            "apt index restore could not run; workflow `apt-get install` steps may not resolve"
+        ),
+    }
 }
 
 /// Start the container engine, if one is installed.
@@ -2845,61 +2602,20 @@ async fn await_guest_ready<P: VmProvider>(
     }
 }
 
-/// Restore apt's package indices when the image shipped without them.
-///
-/// Hosted images keep populated lists, so real workflows run
-/// `sudo apt-get install <pkg>` with no `apt-get update` first (uv's musl cell
-/// installs `musl-tools` that way). Every pack published while the baseline
-/// script ended in `rm -rf /var/lib/apt/lists/*` boots without them, and each
-/// of those steps fails with `E: Unable to locate package`. Cheap to check,
-/// and a no-op on an image that has them.
-///
-/// Hard-bounded: a fork of a packed golden can inherit a held apt lock from the
-/// frozen image, and `apt-get update` then waits forever — which would block
-/// provisioning, not just the refresh. A missed refresh costs a workflow one
-/// `apt-get update`; a hung one costs the whole pool.
-fn apt_lists_refresh_command() -> Vec<String> {
-    vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        "[ -n \"$(find /var/lib/apt/lists -name '*_Packages*' -print -quit 2>/dev/null)\" ] \
-         || timeout 120 apt-get -o DPkg::Lock::Timeout=10 update -qq || true"
-            .to_owned(),
-    ]
-}
-
-async fn install_base_dependencies<P: VmProvider>(
-    provider: &P,
-    name: &MachineName,
-) -> Result<(), OrchestratorError> {
-    for command in base_install_commands() {
-        let output = provider.exec(name, &command).await?;
-        if output.exit_code != 0 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::Config(format!(
-                "base package install failed (exit {}): {}",
-                output.exit_code,
-                stderr.lines().last().unwrap_or("unknown error")
-            )));
-        }
-    }
-    // Node externals are no longer baked: they arrive via the read-only
-    // host mount (`ensure_host_externals` + `runner_volumes`), which keeps
-    // the golden pack and every machine image lean.
-    Ok(())
-}
-
 /// Where a baked golden records its provenance. Root-owned, so writing it
 /// needs the privileged hop — see [`write_bake_manifest`].
 const BAKE_MANIFEST_PATH: &str = "/etc/preloop-bake.json";
 
-/// Record what a golden actually baked, so provenance is inspectable
-/// instead of reconstructed.
-///
-/// The resolved versions are the point: channels (`stable`, `22`, `lts/*`,
-/// `go 1.24` minimums) resolve at bake time, and the manifest captures what
-/// they resolved to. `/etc/preloop-bake.json` in any fork answers "what is
-/// in this environment?" without re-deriving it.
+/// The `@sha256:…` digest of an image reference, when it pins one.
+fn source_digest(image_ref: &str) -> Option<&str> {
+    image_ref.split_once('@').map(|(_, digest)| digest)
+}
+
+/// Record what a golden baked, so provenance is inspectable instead of
+/// reconstructed: the image it came from (with its digest when the reference
+/// pins one), what the bake resolved at build time, and which Preloop built it.
+/// `/etc/preloop-bake.json` in any fork answers "what is in this environment?"
+/// without re-deriving it.
 async fn write_bake_manifest<P: VmProvider>(
     provider: &P,
     name: &MachineName,
@@ -2908,10 +2624,10 @@ async fn write_bake_manifest<P: VmProvider>(
     let probe = [
         "sh".to_owned(),
         "-c".to_owned(),
-        "for cmd in node npm python3 docker git rustc cargo go cargo-shear; do \
+        "for cmd in node npm python3 docker git rustc cargo go; do \
            printf '%s=%s\\n' \"$cmd\" \"$($cmd --version 2>/dev/null | head -n1 || echo missing)\"; \
          done; \
-         printf 'packages=%s\\n' \"$(dpkg-query -W -f={{Package}} | wc -l)\"; \
+         printf 'packages=%s\\n' \"$(dpkg-query -W -f={{Package}} 2>/dev/null | wc -l)\"; \
          printf 'built_at=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
             .to_owned(),
     ];
@@ -2924,12 +2640,15 @@ async fn write_bake_manifest<P: VmProvider>(
     }
     let manifest = serde_json::json!({
         "base": env_spec.base,
-        "toolchains": env_spec.toolchains,
+        // The digest part of the reference when it pins one; a floating tag or
+        // a local path has none, and saying so is honest.
+        "source_digest": source_digest(&env_spec.base),
+        "fingerprint": env_spec.fingerprint,
+        // What the image itself carries: a tool the image does not ship reads
+        // `missing`, exactly as it would at job time.
         "versions": versions,
-        "base_node": BASE_NODE_VERSION,
-        "cargo_shear": CARGO_SHEAR_VERSION,
-        // Derived from the same generated pins the install path uses, so a
-        // version bump can never install one version and record another.
+        // What the runner resolves through the bundle mount, from the same
+        // generated pins the externals materialization uses.
         "node_externals": [
             format!("node20 {NODE20_EXTERNALS_VERSION}"),
             format!("node24 {NODE24_EXTERNALS_VERSION}"),
@@ -2985,40 +2704,31 @@ async fn write_bake_manifest<P: VmProvider>(
     Ok(())
 }
 
-/// PATH the guest runner process exports to every step.
-/// Hosted images carry the toolchain bin directories on the runner's own PATH,
-/// which is what makes `cargo install`-style actions work: `taiki-e/install-action`
-/// drops `cargo-hack` in `$CARGO_HOME/bin` and the next step runs `cargo hack`.
-/// dtolnay/rust-toolchain only appends that directory to `$GITHUB_PATH` when it
-/// has to install rustup itself, so on an image that already has rustup — ours,
-/// and GitHub's — the directory is on PATH or the tool is simply unreachable.
+/// PATH the guest runner falls back to when the image declares none.
 ///
-/// The cargo bin dir is the fixed system address `/usr/local/cargo/bin`,
-/// matching the exported `CARGO_HOME` (see `guest_env_prefix`): it is
-/// identical for root and switched runners by construction. A per-user
-/// `$HOME/.cargo/bin` here would reintroduce the EACCES trap the homes fix
-/// removes — `/root` is 0700, so exporting `/root/.cargo/bin` to an
-/// unprivileged runner makes every tool lookup fail statting it
-/// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
-/// Absent directories cost nothing.
+/// GitHub's hosted images declare their PATH in `/etc/environment`, and the
+/// runner must see exactly that: the image's toolchains are where *it* put
+/// them, and a host-side static PATH cannot know them (the deleted curated
+/// bakes put Cargo and Go at fixed `/usr/local` addresses; the official image
+/// does not). [`guest_env_prefix`] therefore runs the runner through a shell
+/// that sources `/etc/environment` and only falls back to this list when the
+/// image carries no PATH of its own.
 pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
-    format!(
-        "{GUEST_CARGO_HOME}/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
-          /usr/sbin:/usr/bin:/sbin:/bin"
-    )
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
 }
 
-/// `env` prefix for guest runner invocations, empty when nothing needs setting.
+/// The `KEY=value` entries the runner is launched with: the variables the pool
+/// sets, with no launcher shell. [`guest_env_prefix`] adds the shell that
+/// sources the image's `/etc/environment` on top of these.
 ///
 /// Control-socket routing and failure-marker debugging are independent
 /// features: a pool can debug failed jobs without a mounted control socket and
 /// vice versa, so neither may gate the other.
-fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
-    let mut env = Vec::new();
-    env.push(format!("PATH={}", guest_runner_path(config)));
-    // The guest needs its own VM name so a debug session can tell a controller
-    // which machine to open a shell into. Nothing else in the guest knows it.
-    env.push(format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
+fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    let mut env = vec![
+        format!("PATH={}", guest_runner_path(config)),
+        format!("PRELOOP_MACHINE_NAME={}", name.as_str()),
+    ];
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
@@ -3044,21 +2754,38 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
         env.push(format!("PRELOOP_FAILURE_MARKER={GUEST_FAILURE_MARKER}"));
         env.push(format!("PRELOOP_PAUSE_MARKER={GUEST_PAUSE_MARKER}"));
     }
-    // Rust toolchain homes. rustup resolves toolchains under RUSTUP_HOME and
-    // shims under CARGO_HOME, both defaulting to the *calling* user's $HOME.
-    // The bake installs as root while job steps run as the unprivileged
-    // runner user, so a $HOME-derived location is invisible across that
-    // boundary (/root is 0700). The bake therefore installs to these fixed
-    // system addresses (see ToolchainLayer::Rust install_commands), and they
-    // are exported here so every user resolves the identical toolchain.
-    // Order is irrelevant (env entries are independent); they sit last so
-    // the historical PATH/MACHINE_NAME-first prefix is undisturbed.
-    env.push(format!("RUSTUP_HOME={GUEST_RUSTUP_HOME}"));
-    env.push(format!("CARGO_HOME={GUEST_CARGO_HOME}"));
-    if !env.is_empty() {
-        env.insert(0, "/usr/bin/env".to_owned());
-    }
     env
+}
+
+/// `env` prefix for guest runner invocations: the runner is launched through
+/// `sh -c` so the image's `/etc/environment` is sourced first.
+///
+/// `/etc/environment` is where a Linux image declares the PATH its toolchains
+/// live on, and `smolvm machine exec` starts the process without a login shell
+/// that would read it; a step calling a preinstalled tool would fail command
+/// lookup. Sourcing it *is* the hosted-runner parity fix, and an image without
+/// the file keeps [`guest_runner_path`]'s system default. The pool's own
+/// variables are re-asserted by `env` after the source, so a malformed
+/// `/etc/environment` cannot unset `HOME` or the control routing.
+fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    let env = guest_env_entries(config, name);
+    // `env` re-asserts every variable above *after* the image's environment is
+    // sourced, so a malformed `/etc/environment` cannot unset `HOME` or the
+    // control routing. It also resolves the program through the PATH the
+    // source may have replaced (a running process keeps the PATH it started
+    // with), which is exactly the heap the image declares.
+    let pairs = env
+        .iter()
+        .map(|entry| shell_quote(entry))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let launcher = format!(
+        "if [ -r /etc/environment ]; then . /etc/environment; fi; \
+         exec /usr/bin/env {pairs} \"$0\" \"$@\""
+    );
+    let mut argv = vec!["sh".to_owned(), "-c".to_owned(), launcher];
+    argv.extend(env);
+    argv
 }
 
 /// Local ephemeral-runner pool configuration.
@@ -3070,16 +2797,14 @@ pub struct RunnerPoolConfig {
     /// When enabled, a single "golden" VM boots once and each runner slot
     /// clones from it with CoW memory and disks.
     pub use_fork: bool,
-    /// Create runners from the prepared packed artifact instead of the base
-    /// OCI image. The caller must provide a SmolVM build that preserves
-    /// explicitly supplied socket mappings for packed-machine creation.
-    pub use_packed_artifact: bool,
     /// Prefix used for owned SmolVM names.
     pub name_prefix: String,
-    /// Base OCI image used for one-time tool installation.
+    /// Image the pool's golden is built from: [`OFFICIAL_GOLDEN`], or whatever
+    /// `PRELOOP_RUNNER_BASE_IMAGE`/`[golden] base_image` names. Configured
+    /// images are baked as-is plus the runner contract (see
+    /// [`golden_contract_script`]); the official golden is downloaded packed
+    /// and never built here.
     pub base_image: String,
-    /// Optional workspace path for environment detection from version files.
-    pub workspace: Option<PathBuf>,
     /// Host path stem for the reusable packed VM artifact.
     pub artifact_stem: PathBuf,
     /// Preloop release whose architecture-specific golden asset should be used.
@@ -3189,49 +2914,40 @@ pub struct RunnerPoolConfig {
     pub observability: Option<preloop_observability::Observability>,
 }
 
-/// Cache of environment-specific golden VMs.
-pub(crate) struct GoldenRegistry {
+/// The pool's prepared fork bases, keyed by environment fingerprint.
+///
+/// Normally one: the pool prepares the configured environment's golden at
+/// startup. A slot that resolves a *different* environment — a
+/// `runs-on: ubuntu-latest` job on a pool whose configured image is custom —
+/// memoizes its golden here instead of rebuilding it per job. Every golden is
+/// prepared the same way (`prepare_fork_base`): from the packed artifact
+/// on a file-pack backend, from the image itself where the backend keeps packs
+/// server-side.
+pub(crate) struct GoldenCache {
     goldens: RwLock<HashMap<String, MachineName>>,
-    /// Per-fingerprint construction locks. A single build_lock used to be
-    /// held across the whole bake, so one environment's golden build parked
-    /// every other slot on the mutex — silently, with no logs — freezing the
-    /// pool until a restart. Distinct fingerprints now build concurrently;
-    /// the same fingerprint is still serialized (the second caller would
-    /// otherwise delete the first's half-built VM, since
-    /// `prepare_golden_for_env` removes any existing machine of that name).
+    /// Per-fingerprint construction locks. A single build lock used to be held
+    /// across the whole bake, so one environment's golden build parked every
+    /// other slot on the mutex — silently, with no logs — freezing the pool
+    /// until a restart. Distinct fingerprints now build concurrently; the same
+    /// fingerprint is still serialized (the second caller would otherwise
+    /// delete the first's half-built VM, since `prepare_fork_base` removes
+    /// any existing machine of that name).
     build_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     name_prefix: String,
-    /// Set when the startup packed-golden import failed. In that case the
-    /// pool must create runners directly from their requested base image
-    /// rather than attempting a second environment-golden bake.
-    packed_unavailable: AtomicBool,
 }
 
-impl GoldenRegistry {
+impl GoldenCache {
     pub fn new(name_prefix: String) -> Self {
         Self {
             goldens: RwLock::new(HashMap::new()),
             build_locks: RwLock::new(HashMap::new()),
             name_prefix,
-            packed_unavailable: AtomicBool::new(false),
         }
     }
 
     /// Return the name prefix used for golden VM names.
     pub fn name_prefix(&self) -> &str {
         &self.name_prefix
-    }
-
-    /// Disable packed-golden and environment-golden preparation after the
-    /// startup packed import fails. Direct per-runner creation is the only
-    /// honest fallback: a second environment golden would repeat the same
-    /// disk-heavy unpack under a different name.
-    pub fn disable_packed(&self) {
-        self.packed_unavailable.store(true, Ordering::Release);
-    }
-
-    pub fn is_packed_disabled(&self) -> bool {
-        self.packed_unavailable.load(Ordering::Acquire)
     }
 
     /// Get existing golden or return None if not yet prepared.
@@ -3267,10 +2983,7 @@ impl GoldenRegistry {
         if let Some(golden) = self.get(fingerprint).await {
             return Ok(golden);
         }
-        info!(
-            fingerprint,
-            "building golden for environment; other environments proceed concurrently"
-        );
+        info!(fingerprint, "preparing the golden for this environment");
         let name = build.await?;
         self.insert(fingerprint.to_owned(), name.clone()).await;
         Ok(name)
@@ -3279,12 +2992,6 @@ impl GoldenRegistry {
     /// Register a prepared golden VM for a fingerprint.
     pub async fn insert(&self, fingerprint: String, name: MachineName) {
         self.goldens.write().await.insert(fingerprint, name);
-    }
-
-    /// Remove and return a golden VM entry.
-    #[allow(dead_code)]
-    pub async fn remove(&self, fingerprint: &str) -> Option<MachineName> {
-        self.goldens.write().await.remove(fingerprint)
     }
 
     /// Return all registered golden machine names.
@@ -3307,6 +3014,20 @@ impl RunnerPoolConfig {
             ));
         }
         MachineName::new(format!("{}-0", self.name_prefix))?;
+        if let Some(user) = &self.runner_user {
+            // The account name is interpolated into root-run guest scripts
+            // (`runner_account_script`, `as_runner_user`) and into the
+            // `sudoers.d` filename. Restrict it to what a Linux account name
+            // may be, so a configured value cannot smuggle shell syntax into
+            // a root shell (or escape the sudoers directory).
+            if !is_valid_account_name(user) {
+                return Err(OrchestratorError::Config(format!(
+                    "runner user `{user}` is not a valid account name: use a lowercase \
+                     letter or underscore followed by lowercase letters, digits, \
+                     underscores, or dashes (or `root`)"
+                )));
+            }
+        }
         if self.base_image.trim().is_empty()
             || self.server_url.trim().is_empty()
             || self.release_version.trim().is_empty()
@@ -3352,11 +3073,11 @@ impl RunnerPoolConfig {
 
     fn artifact_payload(&self) -> PathBuf {
         // The packed artifact is keyed by the resolved base image AND the
-        // environment fingerprint (toolchains + curated bake content). A
-        // stem-only key would let a golden keep the previous bake forever:
-        // bake-content changes (package pins, the ownership repair, new
-        // toolchains) must invalidate the pack or the fork base silently
-        // serves jobs the old toolchain.
+        // environment fingerprint (the published official reference, or the
+        // bake contract for a configured image). A stem-only key would let a
+        // golden keep the previous bake forever: a contract change or a newly
+        // published official golden must invalidate the pack, or the fork base
+        // silently serves jobs the old image.
         let fingerprint = EnvironmentSpec::for_base(self.base_image.clone()).fingerprint;
         let mut path = self.artifact_stem.clone().into_os_string();
         path.push(format!("-{fingerprint}"));
@@ -3527,12 +3248,23 @@ fn rosetta_multiarch_script() -> String {
     // failed apt step must surface as a nonzero exit. The lenient
     // `|| true` form would report success and bake a golden whose forks all
     // fail `test -f /lib64/ld-linux-x86-64.so.2` consumers.
+    //
+    // An image without apt cannot be given the amd64 runtime — the loader and
+    // its libraries only come from Debian/Ubuntu packages. That is not a bake
+    // failure for a *configured* image, which is used as-is: the operator opted
+    // into whatever it carries, and job VMs that need x86_64 translation are
+    // the price. Say so loudly and continue; an arm64 guest keeps the image's
+    // own arm64 runtime either way.
     run_as_root_or_sudo_strict(&format!(
         "set -e; \
          case \"$(uname -m)\" in \
            aarch64|arm64) ;; \
            *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
          esac; \
+         if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg >/dev/null 2>&1; then \
+           echo 'preloop: this image has no dpkg/apt, so the amd64 runtime for Rosetta x86_64 translation cannot be installed; x86_64 binaries will not run in jobs' >&2; \
+           exit 0; \
+         fi; \
          {}; \
          dpkg --add-architecture amd64; \
          CODENAME=$(. /etc/os-release 2>/dev/null && echo \"$VERSION_CODENAME\"); \
@@ -3564,39 +3296,49 @@ fn rosetta_multiarch_script() -> String {
 /// The package set covers the loader, libc, C++ runtime, zlib, and systemd
 /// (valkey's official x86_64 tarballs link `libsystemd.so.0`); apt pulls the
 /// amd64 transitive deps.
+///
+/// Returns whether the golden gained the amd64 runtime. `false` means the
+/// guest skipped it — no apt, or apt sources that are not Ubuntu's — which is
+/// a real limitation for a configured image used as-is, not a bake failure.
 async fn prepare_rosetta_multiarch<P: VmProvider>(
     provider: &P,
     golden: &MachineName,
-) -> Result<(), OrchestratorError> {
+    unpacked_pack: bool,
+) -> Result<bool, OrchestratorError> {
     if !(cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64") {
-        return Ok(());
+        return Ok(true);
     }
-    // Ubuntu 24.04 uses deb822 `ubuntu.sources`; the pinned 22.04 image uses
-    // one-line `/etc/apt/sources.list` instead. Both arm64 sources point at
-    // ports.ubuntu.com, which has no amd64 packages. Scope native sources to
-    // arm64 before adding amd64, including any third-party `.list` entries
-    // without an architecture restriction, or every later apt-get update
-    // probes those mirrors for amd64 and fails. Add the explicit amd64 archive
-    // across all four suites: the base suite alone may be older than the
-    // image's security-update glibc, whose mutual Breaks pins block
-    // installation. One suite per deb line; the one-line format misparses
-    // extra suites as components. `sync` flushes before forking the golden.
     let script = rosetta_multiarch_script();
     let output = provider
         .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
         .await?;
     if output.exit_code != 0 {
-        return Err(OrchestratorError::Config(format!(
-            "rosetta multiarch install failed (exit {}): {}",
-            output.exit_code,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        // Fatal for a *packed* golden: the pack's jobs expect amd64 (it was
+        // built from the official multiarch image), so a half-installed base
+        // must not be adoptable. A configured image is the operator's own
+        // contract and is used as-is — refusing to bake it over a missing
+        // translation runtime would be the "everything must be checked" rule
+        // this design deleted.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if unpacked_pack {
+            return Err(OrchestratorError::Config(format!(
+                "rosetta multiarch install failed (exit {}): {stderr}",
+                output.exit_code
+            )));
+        }
+        warn!(
+            machine = golden.as_str(),
+            exit = output.exit_code,
+            "rosetta multiarch install failed; x86_64 binaries will not run in this \
+             golden's jobs: {stderr}"
+        );
+        return Ok(false);
     }
     info!(
         machine = golden.as_str(),
         "installed amd64 multiarch libs into golden for Rosetta x86_64 translation"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
@@ -3742,25 +3484,40 @@ async fn adopt_golden<P: VmProvider>(
     Ok(adopted)
 }
 
-/// Prepare a running forkable golden VM with the requested environment.
+/// Prepare the forkable golden this pool forks every runner from, or adopt the
+/// one a previous engine run left behind.
 ///
-/// SmolVM takes the forkable RAM/disk snapshot when `start --forkable` runs.
-/// Provision the guest while it is a normal machine, then restart it as the
-/// fork base so package and external-runtime writes are inherited by clones.
-async fn prepare_golden_for_env<P: VmProvider + 'static>(
+/// This is the pool's single golden: the environment is the pool's configured
+/// base image, so a second call only happens when a job's labels resolve to the
+/// official golden while the pool was configured with a custom image.
+///
+/// Two shapes, one contract:
+///
+/// * a **file-pack backend** (SmolVM) unpacks the packed artifact — the
+///   published official golden, or one baked here from a configured image —
+///   into a machine. A pack is the only shape whose guest writes a fork
+///   reliably inherits, which is why every golden on this backend is one;
+/// * a backend that keeps its packs server-side (AgentENV) has no artifact to
+///   unpack: boot the image, apply the contract in the guest, and let
+///   `start --forkable` capture the result, which that backend's snapshots do
+///   carry into forks.
+///
+/// Fatal on any failure. A pool without its golden cannot serve a job, and the
+/// deleted alternative — warn, then create runners directly from the image —
+/// ran jobs on a machine with none of the runner machinery.
+async fn prepare_fork_base<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
+    shutdown: &CancellationToken,
 ) -> Result<(), OrchestratorError> {
-    // The golden registry is in-memory, so without adoption every engine
-    // restart rebakes a golden that is still sitting there fully baked —
-    // apt plus rustup, five to eleven minutes, before the first job of that
-    // environment can run, paid again on every deploy.
+    // Adoption first: without it every engine restart repays the golden's full
+    // build or unpack (tens of GB of storage writes) before the first job.
     if adopt_golden(provider, config, golden, &env_spec.fingerprint, "golden").await? {
         return Ok(());
     }
-    // Any record must die before the machine does: a rebake interrupted
+    // Any record must die before the machine does: a rebuild interrupted
     // halfway would otherwise leave a fingerprint claiming a golden that no
     // longer carries it.
     remove_golden_record(config, golden);
@@ -3768,115 +3525,64 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         provider.delete(golden).await?;
         vm_telemetry_deregister(config, golden);
     }
-    let spec = MachineSpec {
-        name: golden.clone(),
-        image: env_spec.base.clone(),
-        cpus: config.cpus,
-        memory_mib: config.memory_mib,
-        storage_gib: config.storage_gib,
-        overlay_gib: config.overlay_gib,
-        network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, true)?,
-        sockets: config
-            .control_socket
-            .iter()
-            .map(|host| SocketMount {
-                host: host.clone(),
-                guest: PathBuf::from(GUEST_CONTROL_SOCKET),
-            })
-            .collect(),
-        dns: config.dns.clone(),
-        rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+    // Give up before the expensive part when a shutdown is already pending.
+    // The caller checks `is_cancelled` afterwards and reports a clean stop
+    // instead of a download or bake error.
+    if shutdown.is_cancelled() {
+        return Err(OrchestratorError::Pool(
+            "golden preparation cancelled by shutdown".into(),
+        ));
+    }
+    let prepared = if provider.capabilities().file_packs {
+        unpack_golden_pack(provider, config, golden, env_spec, shutdown).await
+    } else {
+        bake_golden_in_guest(provider, config, golden, env_spec).await
     };
-    provider.create(&spec).await?;
-    provider.start(golden).await?;
-    vm_telemetry_register(config, golden, "golden", Some(&spec));
-    if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
+    if let Err(error) = prepared {
         vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error);
     }
-    if env_spec.curated {
-        // Same contract as the packed-golden path: on Apple Silicon the
-        // multiarch shim must reach the forkable base, or every dynamically
-        // linked x86_64 binary fails at job time. Runs before the baseline
-        // install so the amd64 sources are scoped before any later apt
-        // update. Fatal, not a warning — a half-installed golden would be
-        // adopted on later restarts (amd64 arch added, loader missing).
-        // Custom bases skip it along with the rest of the bake: the image is
-        // the operator's contract.
-        if let Err(error) = prepare_rosetta_multiarch(provider.as_ref(), golden).await {
-            vm_telemetry_deregister(config, golden);
-            let _ = provider.delete(golden).await;
-            return Err(error);
-        }
-        if let Err(error) = install_base_dependencies(provider.as_ref(), golden).await {
-            vm_telemetry_deregister(config, golden);
-            let _ = provider.delete(golden).await;
-            return Err(error);
-        }
-    }
-    for layer in &env_spec.toolchains {
-        for command in layer.install_commands() {
-            if let Err(error) = provider.exec(golden, &command).await {
-                vm_telemetry_deregister(config, golden);
-                let _ = provider.delete(golden).await;
-                return Err(error.into());
-            }
-        }
-    }
-    if let Err(error) = write_bake_manifest(provider.as_ref(), golden, env_spec).await {
-        // Provenance is an audit aid, not a build gate.
-        warn!(machine = golden.as_str(), %error, "bake manifest not written");
-    }
-    if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
-        // A preload miss costs a run-time pull, not a broken job.
-        warn!(
-            machine = golden.as_str(),
-            %error, "image preload failed; jobs will pull at run time"
-        );
-    }
-    if let Err(error) = provider.stop(golden).await {
-        vm_telemetry_deregister(config, golden);
-        let _ = provider.delete(golden).await;
-        return Err(error.into());
-    }
-    if let Err(error) = provider.start_forkable(golden).await {
-        vm_telemetry_deregister(config, golden);
-        let _ = provider.delete(golden).await;
-        return Err(error.into());
-    }
     write_golden_record(config, golden, &env_spec.fingerprint);
-    info!(machine = golden.as_str(), "golden fork base ready");
+    info!(
+        machine = golden.as_str(),
+        base = %env_spec.base,
+        "golden fork base ready"
+    );
     Ok(())
 }
 
-/// Prepare a forkable golden from the dependency-prepared packed artifact.
+/// Refuse to start an expensive preparation while a shutdown is pending.
+///
+/// The warm is idempotent and resumable, so abandoning it costs one restart's
+/// preparation; waiting would make a restart sit through a multi-gigabyte
+/// download or an eleven-minute bake. Callers treat the error as a clean stop
+/// (they check [`CancellationToken::is_cancelled`]) rather than a failure.
+fn abort_preparation_if_shutting_down(
+    shutdown: &CancellationToken,
+) -> Result<(), OrchestratorError> {
+    if shutdown.is_cancelled() {
+        return Err(OrchestratorError::Pool(
+            "golden preparation cancelled by shutdown".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Unpack the packed artifact for `env_spec` into the forkable golden.
 ///
 /// Socket mappings are supplied by the local machine definition, never read
 /// from the artifact. SmolVM must preserve those explicit mappings on its
 /// `machine create --from` path for local control-plane routing to work.
-async fn prepare_packed_golden<P: VmProvider + 'static>(
+async fn unpack_golden_pack<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
     golden: &MachineName,
+    env_spec: &EnvironmentSpec,
+    shutdown: &CancellationToken,
 ) -> Result<(), OrchestratorError> {
-    // Same adoption rule as the baked-golden path: an engine restart must not
-    // re-unpack a multi-GiB packed golden that is still sitting there
-    // fingerprint-matched. Without this every `serve` restart pays the
-    // full unpack (tens of GB of storage writes) before the first job.
-    let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
-    if adopt_golden(
-        provider,
-        config,
-        golden,
-        &env_spec.fingerprint,
-        "packed golden",
-    )
-    .await?
-    {
-        return Ok(());
-    }
+    let payload = artifact_payload(&config.artifact_stem, &env_spec.base);
+    ensure_golden_payload(provider, config, env_spec, &payload, shutdown).await?;
     // Unpacking writes the golden's filesystem; its disk can grow to the
     // configured storage ceiling, and job forks grow on top of it. Not a
     // refusal: how much of the ceiling a given golden writes is image-specific
@@ -3885,18 +3591,13 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     warn_if_disk_below(
         &golden_disk_root(config),
         u64::from(config.storage_gib) * GIB,
-        "packed golden unpack",
+        "golden unpack",
     );
-    remove_golden_record(config, golden);
-    if provider.status(golden).await? != MachineState::Missing {
-        provider.delete(golden).await?;
-        vm_telemetry_deregister(config, golden);
-    }
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
     // IS the pack at the stem; a locally built golden leaves the pack in the
     // `.smolmachine` sidecar. Centralized in [`packed_golden_path`].
-    let pack = packed_golden_path(&config.artifact_payload());
+    let pack = packed_golden_path(&payload);
     let spec = MachineSpec {
         name: golden.clone(),
         image: pack.display().to_string(),
@@ -3917,40 +3618,28 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
-    if let Err(error) = provider.create(&spec).await {
-        let _ = provider.delete(golden).await;
-        return Err(error.into());
-    }
-    if let Err(error) = provider.start(golden).await {
-        let _ = provider.delete(golden).await;
-        return Err(error.into());
-    }
+    provider.create(&spec).await?;
+    provider.start(golden).await?;
     vm_telemetry_register(config, golden, "golden", Some(&spec));
-    if let Err(error) = await_guest_ready(provider.as_ref(), golden).await {
-        vm_telemetry_deregister(config, golden);
-        let _ = provider.delete(golden).await;
-        return Err(error);
-    }
-    // Fatal, not a warning: on Apple Silicon the multiarch shim is the
-    // golden's contract, and a failed install leaves a reusable base that is
-    // adoptable on later restarts (amd64 arch added, loader missing).
-    prepare_rosetta_multiarch(provider.as_ref(), golden).await?;
+    await_guest_ready(provider.as_ref(), golden).await?;
+    // Fatal for a packed golden: its jobs expect the multiarch shim, and a
+    // failed install leaves a reusable base that is adoptable on later
+    // restarts (amd64 arch added, loader missing).
+    prepare_rosetta_multiarch(provider.as_ref(), golden, true).await?;
+    // The published pack ships with apt's indices wiped (the runner-image dump
+    // does), and `sudo apt-get install <pkg>` with no `apt-get update` first is
+    // how real workflows install system packages. On Apple Silicon the
+    // multiarch step above already refreshed them; elsewhere nothing else
+    // would. Before the freeze, so every fork inherits them.
+    restore_apt_lists(provider.as_ref(), golden).await;
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
             %error, "image preload failed; jobs will pull at run time"
         );
     }
-    if let Err(error) = provider.stop(golden).await {
-        vm_telemetry_deregister(config, golden);
-        let _ = provider.delete(golden).await;
-        return Err(error.into());
-    }
-    if let Err(error) = provider.start_forkable(golden).await {
-        vm_telemetry_deregister(config, golden);
-        let _ = provider.delete(golden).await;
-        return Err(error.into());
-    }
+    provider.stop(golden).await?;
+    provider.start_forkable(golden).await?;
     // Issue #295: smolvm's pack export leaves ~29 GB of intermediates
     // (`storage.ext4`, `layers/*.tar`) beside the finished `storage.raw`,
     // and every fork copies the golden's whole data directory. Prune them
@@ -3959,21 +3648,297 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     match provider.prune_pack_intermediates(golden).await {
         Ok(true) => info!(
             machine = golden.as_str(),
-            "pruned pack/ build intermediates from packed golden"
+            "pruned pack/ build intermediates from golden"
         ),
         Ok(false) => {}
         Err(error) => warn!(
             machine = golden.as_str(),
             %error,
-            "failed to prune pack/ build intermediates from packed golden"
+            "failed to prune pack/ build intermediates from golden"
         ),
     }
-    write_golden_record(config, golden, &env_spec.fingerprint);
+    Ok(())
+}
+
+/// The image a non-file-pack backend boots for `env_spec`.
+///
+/// A configured image is its own base. The official sentinel resolves to the
+/// pinned runner image: the same one the release pipeline packs, so both
+/// golden sources stay the same image and the in-guest contract keeps the
+/// result equivalent to the published pack.
+fn golden_boot_image(env_spec: &EnvironmentSpec) -> Result<String, OrchestratorError> {
+    if !is_official_golden(&env_spec.base) {
+        return Ok(env_spec.base.clone());
+    }
+    official_boot_image().map(str::to_owned).ok_or_else(|| {
+        OrchestratorError::Config(format!(
+            "there is no official golden for {}: no runner image is pinned for this \
+                 architecture and this backend cannot restore the packed artifact. Configure \
+                 one with PRELOOP_RUNNER_BASE_IMAGE or `[golden] base_image`",
+            std::env::consts::ARCH
+        ))
+    })
+}
+
+/// Boot the environment's image, apply the golden contract, freeze it as the
+/// fork base.
+///
+/// The non-file-pack path: there is no artifact to unpack, and the backend's
+/// forkable snapshot is what carries the contract's guest writes into clones.
+///
+/// The official sentinel is not an image the backend can boot, so it resolves
+/// to the pinned runner image here — the same image the release pipeline
+/// packs for the pack-restoring backends. `PRELOOP_GOLDEN_OCI_REF` and
+/// `PRELOOP_GOLDEN_URL` name *packed* artifacts and are deliberately not
+/// consulted: there is nothing on this path that could restore a pack.
+async fn bake_golden_in_guest<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+    env_spec: &EnvironmentSpec,
+) -> Result<(), OrchestratorError> {
+    let base = golden_boot_image(env_spec)?;
+    let spec = MachineSpec {
+        name: golden.clone(),
+        image: base,
+        cpus: config.cpus,
+        memory_mib: config.memory_mib,
+        storage_gib: config.storage_gib,
+        overlay_gib: config.overlay_gib,
+        network: NetworkPolicy::PublicOnly,
+        volumes: runner_volumes(config, golden, true)?,
+        sockets: config
+            .control_socket
+            .iter()
+            .map(|host| SocketMount {
+                host: host.clone(),
+                guest: PathBuf::from(GUEST_CONTROL_SOCKET),
+            })
+            .collect(),
+        dns: config.dns.clone(),
+        rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+    };
+    provider.create(&spec).await?;
+    provider.start(golden).await?;
+    vm_telemetry_register(config, golden, "golden", Some(&spec));
+    await_guest_ready(provider.as_ref(), golden).await?;
+    prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
+    apply_golden_contract(provider.as_ref(), config, golden).await?;
+    if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
+        warn!(
+            machine = golden.as_str(),
+            %error, "image preload failed; jobs will pull at run time"
+        );
+    }
+    provider.stop(golden).await?;
+    provider.start_forkable(golden).await?;
+    Ok(())
+}
+
+/// Apply [`golden_contract_script`] to a machine booted from its image.
+///
+/// Through the root-or-sudo hop: a machine created from an arbitrary image may
+/// declare `USER` (the official runner image runs as `runner`), and the
+/// contract's `/etc` writes, `chown`s and account creation need root either
+/// way. Strict, so a refused sudo fails the bake instead of shipping a golden
+/// without its runner account.
+async fn apply_golden_contract<P: VmProvider>(
+    provider: &P,
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    let user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
+    let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
+    let contract = golden_contract_script(user, uid);
+    let output = provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                run_as_root_or_sudo_strict(&contract),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "golden contract failed on {} (exit {}): {}",
+            name.as_str(),
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown error")
+        )));
+    }
+    Ok(())
+}
+
+/// Ensure the packed golden payload exists at `payload`.
+///
+/// The official golden is fetched, never baked: it is published as a pack, and
+/// a download that cannot complete fails the caller — the Ubuntu baseline this
+/// used to fall back on is gone, and so is the class of failures that came with
+/// it (unpinned packages, an apt archive that moved past the pins). A
+/// configured image is baked here, as-is plus the runner contract.
+///
+/// `shutdown` is only consulted before the expensive work: a warm abandoned
+/// mid-transfer resumes on the next start, and an operator restart must not
+/// wait out a multi-gigabyte download.
+async fn ensure_golden_payload<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    env_spec: &EnvironmentSpec,
+    payload: &Path,
+    shutdown: &CancellationToken,
+) -> Result<(), OrchestratorError> {
+    if payload.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = payload.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if is_official_golden(&env_spec.base) {
+        abort_preparation_if_shutting_down(shutdown)?;
+        info!(payload = %payload.display(), "downloading the official golden");
+        return match download_prebaked_golden(payload, &config.release_version).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(OrchestratorError::Config(format!(
+                "the official golden could not be downloaded for {}: no OCI image at `{}` and no \
+                 release asset for v{}. Point PRELOOP_GOLDEN_OCI_REF or PRELOOP_GOLDEN_URL at a \
+                 reachable golden; Preloop does not bake a substitute image",
+                std::env::consts::ARCH,
+                official_golden_reference(),
+                config.release_version
+            ))),
+            Err(error) => Err(error),
+        };
+    }
+    abort_preparation_if_shutting_down(shutdown)?;
     info!(
-        machine = golden.as_str(),
-        artifact = %config.artifact_payload().display(),
-        "packed golden fork base ready"
+        base_image = %env_spec.base,
+        "building a golden from the configured image"
     );
+    build_golden_artifact(provider, config, env_spec, payload).await
+}
+
+/// Bake a packed golden from a configured image: boot it, apply the runner
+/// contract once, pack the result.
+///
+/// Nothing else is installed. The image is the operator's contract, and its
+/// contents are exactly what a job sees — the same rule GitHub-hosted runners
+/// follow, where a missing `bash`, `git` or `docker` fails the step that needs
+/// it rather than being repaired beforehand.
+async fn build_golden_artifact<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    env_spec: &EnvironmentSpec,
+    payload: &Path,
+) -> Result<(), OrchestratorError> {
+    let name = MachineName::new(format!("{}-builder", config.name_prefix))?;
+    if provider.status(&name).await? != MachineState::Missing {
+        provider.delete(&name).await?;
+    }
+    // Packing exports a second copy of the guest filesystem before producing
+    // the artifact. Give the one-shot builder headroom without increasing the
+    // storage allocated to job VMs.
+    let builder_storage_gib = golden_builder_storage_gib(config.storage_gib);
+    // Checked after the stale builder is gone, so its space counts as free.
+    ensure_disk_for_golden_build(&golden_disk_root(config), builder_storage_gib)
+        .map_err(OrchestratorError::Config)?;
+    let spec = MachineSpec {
+        name: name.clone(),
+        image: golden_boot_image(env_spec)?,
+        cpus: config.cpus,
+        memory_mib: config.memory_mib,
+        storage_gib: builder_storage_gib,
+        overlay_gib: config.overlay_gib,
+        network: NetworkPolicy::PublicOnly,
+        volumes: Vec::new(),
+        sockets: Vec::new(),
+        dns: config.dns.clone(),
+        rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
+    };
+    provider.create(&spec).await?;
+    provider.start(&name).await?;
+    if let Err(error) = await_guest_ready(provider.as_ref(), &name).await {
+        let _ = provider.delete(&name).await;
+        return Err(error);
+    }
+    if let Err(error) = apply_golden_contract(provider.as_ref(), config, &name).await {
+        // A golden whose runner account is wrong cannot run a job: every step
+        // fails on permissions, which reads as flaky CI. A gold build that
+        // cannot satisfy the contract (no glibc loader, no way to escalate to
+        // root) must not produce an artifact.
+        let _ = provider.delete(&name).await;
+        return Err(error);
+    }
+    // Bake the externals *pointer*, not the externals: the packed rootfs
+    // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
+    // the runner-bundle mount instead of being baked into the image or
+    // downloaded per machine. The symlink must live in the pack itself —
+    // forkable snapshots do not capture exec writes made after create —
+    // and it must be baked here, in the builder, where the rootfs layer
+    // is flattened into the artifact. The bundle's host side carries the
+    // real `externals/` (see `ensure_host_externals`).
+    let link_command = format!(
+        "mkdir -p {root} && rm -rf {root}/externals && \
+         ln -s /opt/preloop/bin/externals {root}/externals",
+        root = RUNNER_ROOT
+    );
+    let output = provider
+        .exec(&name, &["sh".to_owned(), "-c".to_owned(), link_command])
+        .await?;
+    if output.exit_code != 0 {
+        let _ = provider.delete(&name).await;
+        return Err(OrchestratorError::Config(format!(
+            "baking externals symlink failed (exit {}): {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown")
+        )));
+    }
+    if let Err(error) = write_bake_manifest(provider.as_ref(), &name, env_spec).await {
+        // Provenance is an audit aid, not a build gate.
+        warn!(machine = name.as_str(), %error, "bake manifest not written");
+    }
+    provider.stop(&name).await?;
+    let temporary = payload
+        .parent()
+        .map(|parent| parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())))
+        .ok_or_else(|| {
+            OrchestratorError::Config(format!(
+                "golden artifact path has no parent: {}",
+                payload.display()
+            ))
+        })?;
+    // Claim the companion lock for the pack duration: the heartbeat
+    // keeps it fresh, and dropping the guard removes it. A staging file
+    // without a fresh lock reads as orphaned to a concurrent sweep.
+    let _staging_guard = StagingLockGuard::claim(staging_lock_path(&temporary));
+    if let Err(error) = provider.pack(&name, &temporary).await {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    // smolvm pack writes two files: `<output>` (ELF executable stub) and
+    // `<output>.smolmachine` (the packed VM data). The latter is the
+    // artifact consumed by `machine create --from`; the stub is only a
+    // launcher and is discarded.
+    let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
+    let rename_res = std::fs::rename(&sidecar, payload);
+    let _ = std::fs::remove_file(&temporary);
+    rename_res.inspect_err(|_| {
+        let _ = std::fs::remove_file(&sidecar);
+    })?;
+    provider.delete(&name).await?;
+    if !payload.is_file() {
+        return Err(OrchestratorError::Config(format!(
+            "smolvm did not create expected artifact {}",
+            payload.display()
+        )));
+    }
     Ok(())
 }
 
@@ -4007,13 +3972,28 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         ensure_host_externals(&self.config)?;
         // A backend whose packs are not host files (AgentENV keeps them as
         // server-side snapshots) has no artifact to build, download, or
-        // relocate: its golden is prepared directly from the base image
-        // below, and building a pack first would boot and discard a whole
-        // extra VM for nothing.
+        // relocate: its golden is prepared directly from the base image by
+        // `prepare_fork_base` below.
+        //
+        // A shutdown that arrives before the warm starts must not begin a
+        // multi-gigabyte download at all; the caller only needs the pool to
+        // stop, and the next start resumes from the same point.
+        if shutdown.is_cancelled() {
+            self.remove_stale_machines().await?;
+            return Ok(());
+        }
         if self.provider.capabilities().file_packs
-            && (self.config.use_packed_artifact || self.config.control_socket.is_none())
+            && let Err(error) = self.prepare_artifact(&shutdown).await
         {
-            self.prepare_artifact(true).await?;
+            // A shutdown issued mid-download reads as a preparation error;
+            // report the stop, not a failure. Nothing is half-adopted: the
+            // payload is only renamed into place once complete.
+            if shutdown.is_cancelled() {
+                info!(%error, "shutdown during artifact preparation; stopping the pool");
+                self.remove_stale_machines().await?;
+                return Ok(());
+            }
+            return Err(error);
         }
         self.sweep_stale_artifacts().await;
         self.remove_stale_machines().await?;
@@ -4034,36 +4014,43 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             },
         };
 
-        let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
+        let golden_cache = Arc::new(GoldenCache::new(self.config.name_prefix.clone()));
 
-        // If fork mode is enabled, prepare a golden fork base VM for the
-        // workspace's default environment (base image plus any toolchains
-        // detected from version files like rust-toolchain.toml).
+        // Fork mode needs its golden before any job can run, and there is no
+        // fallback that could serve one: without a fork base a slot would have
+        // to boot a raw image, which is neither the official golden nor a
+        // baked contract. Fail startup loudly instead — the server's
+        // starvation sweep and `pool_status` report the pool as unavailable,
+        // which is the honest signal, where a warn line plus per-runner
+        // creation used to look like a working pool that never serves.
         if self.config.use_fork {
-            let default_environment = EnvironmentSpec::for_base(self.config.base_image.clone());
-            let golden = MachineName::new(format!("{}-golden", golden_registry.name_prefix))?;
-            let result = if self.config.use_packed_artifact {
-                prepare_packed_golden(&self.provider, &self.config, &golden).await
-            } else {
-                prepare_golden_for_env(&self.provider, &self.config, &golden, &default_environment)
-                    .await
-            };
-            if let Err(error) = result {
-                if self.config.use_packed_artifact {
-                    golden_registry.disable_packed();
-                    warn!(
-                        %error,
-                        "packed golden fork base unavailable; using direct per-runner creation \
-                         instead of building a second environment golden"
+            let environment = EnvironmentSpec::for_base(self.config.base_image.clone());
+            let golden = MachineName::new(format!("{}-golden", golden_cache.name_prefix))?;
+            // A shutdown arriving mid-warm must not wait for the rest of a
+            // multi-gigabyte download or an eleven-minute bake: an operator
+            // restarting the engine should not sit through either. The warm is
+            // idempotent (an interrupted payload is never adopted, and the
+            // next start resumes the download), so abandoning it is safe.
+            if let Err(error) = prepare_fork_base(
+                &self.provider,
+                &self.config,
+                &golden,
+                &environment,
+                &shutdown,
+            )
+            .await
+            {
+                if shutdown.is_cancelled() {
+                    info!(
+                        machine = golden.as_str(),
+                        "shutdown during golden preparation; leaving it for the next start"
                     );
-                } else {
-                    warn!(%error, "golden fork base unavailable; falling back to direct creation");
+                    self.remove_stale_machines().await?;
+                    return Ok(());
                 }
-            } else {
-                golden_registry
-                    .insert(default_environment.fingerprint, golden)
-                    .await;
+                return Err(error);
             }
+            golden_cache.insert(environment.fingerprint, golden).await;
         }
 
         // The warm is done: the pool can now register runners for queued
@@ -4090,7 +4077,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // jobs arrive, capped by the host's CPU and memory budget.
         if self.config.size == 0 {
             return self
-                .run_on_demand(shutdown, golden_registry, idle, keys, building)
+                .run_on_demand(shutdown, golden_cache, idle, keys, building)
                 .await;
         }
 
@@ -4130,7 +4117,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let provider = self.provider.clone();
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
-            let slot_registry = golden_registry.clone();
+            let slot_registry = golden_cache.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -4178,7 +4165,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // machine directory (fork snapshot) must survive so the next engine
         // start can adopt it instead of rebaking. `remove_stale_machines`
         // spares recorded goldens; the fingerprint record gates adoption.
-        for golden in golden_registry.all_names().await {
+        for golden in golden_cache.all_names().await {
             vm_telemetry_deregister(&self.config, &golden);
             if let Err(error) = self.provider.stop(&golden).await {
                 warn!(
@@ -4198,7 +4185,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     async fn run_on_demand(
         &self,
         shutdown: CancellationToken,
-        golden_registry: Arc<GoldenRegistry>,
+        golden_cache: Arc<GoldenCache>,
         idle: Arc<std::sync::Mutex<usize>>,
         keys: Arc<KeyPool>,
         building: Arc<AtomicUsize>,
@@ -4268,7 +4255,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let provider = self.provider.clone();
             let config = self.config.clone();
             let slot_shutdown = shutdown.child_token();
-            let slot_registry = golden_registry.clone();
+            let slot_registry = golden_cache.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -4338,7 +4325,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // snapshot) must survive so the next engine start can adopt the golden
         // instead of rebaking it. `remove_stale_machines` spares recorded
         // goldens; the fingerprint record gates adoption.
-        for golden in golden_registry.all_names().await {
+        for golden in golden_cache.all_names().await {
             vm_telemetry_deregister(&self.config, &golden);
             if let Err(error) = self.provider.stop(&golden).await {
                 warn!(
@@ -4352,278 +4339,94 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         Ok(())
     }
 
-    /// Build a fresh packed runner artifact without downloading or reusing an
-    /// existing release asset.
+    /// Build a fresh packed artifact from the configured image, ignoring any
+    /// payload that already exists.
+    ///
+    /// `preloop build-golden` builds an image into a golden with this. The
+    /// official golden cannot be rebuilt: it is published packed, and a local
+    /// build of it does not exist (that was the curated Ubuntu bake).
     pub async fn rebuild_artifact(&self) -> Result<(), OrchestratorError> {
+        if is_official_golden(&self.config.base_image) {
+            return Err(OrchestratorError::Config(
+                "the official golden is published packed and cannot be built locally; \
+                 pass the image to build from (`--base-image <ref>`)"
+                    .into(),
+            ));
+        }
         let payload = self.config.artifact_payload();
         match std::fs::remove_file(&payload) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        self.prepare_artifact(false).await
+        self.prepare_artifact(&CancellationToken::new()).await
     }
 
-    async fn prepare_artifact(&self, allow_download: bool) -> Result<(), OrchestratorError> {
-        let payload = self.config.artifact_payload();
-        if payload.is_file() {
-            return Ok(());
-        }
-        if let Some(parent) = self.config.artifact_stem.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let custom_golden_url = std::env::var("PRELOOP_GOLDEN_URL")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty());
-        if allow_download
-            && should_download_prebaked_golden(&self.config.base_image, custom_golden_url)
-        {
-            if download_prebaked_golden(&payload, &self.config.release_version).await? {
-                return Ok(());
-            }
-        } else if allow_download {
-            info!(
-                base_image = %self.config.base_image,
-                "custom base image has no PRELOOP_GOLDEN_URL; building its golden locally"
-            );
-        }
-
-        let name = MachineName::new(format!("{}-builder", self.config.name_prefix))?;
-        if self.provider.status(&name).await? != MachineState::Missing {
-            self.provider.delete(&name).await?;
-        }
-        // Packing exports a second copy of the guest filesystem before
-        // producing the artifact. Give the one-shot builder headroom
-        // without increasing the storage allocated to job VMs.
-        let builder_storage_gib = golden_builder_storage_gib(self.config.storage_gib);
-        // Checked after the stale builder is gone, so its space counts as free.
-        ensure_disk_for_golden_build(&golden_disk_root(&self.config), builder_storage_gib)
-            .map_err(OrchestratorError::Config)?;
-        let spec = MachineSpec {
-            name: name.clone(),
-            image: self.config.base_image.clone(),
-            cpus: self.config.cpus,
-            memory_mib: self.config.memory_mib,
-            storage_gib: builder_storage_gib,
-            overlay_gib: self.config.overlay_gib,
-            network: NetworkPolicy::PublicOnly,
-            volumes: Vec::new(),
-            sockets: Vec::new(),
-            dns: self.config.dns.clone(),
-            rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
-        };
-        self.provider.create(&spec).await?;
-        self.provider.start(&name).await?;
-        // Plain Ubuntu needs the hosted-runner package baseline. Official
-        // runner snapshots already contain it and workflow setup actions own
-        // language-toolchain selection.
-        let stock_base = is_stock_base_image(&self.config.base_image);
-        if stock_base
-            && let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await
-        {
-            let _ = self.provider.delete(&name).await;
-            return Err(error);
-        }
-        if stock_base {
-            for layer in curated_toolchains() {
-                for command in layer.install_commands() {
-                    let output = self.provider.exec(&name, &command).await?;
-                    if output.exit_code != 0 {
-                        let _ = self.provider.delete(&name).await;
-                        return Err(OrchestratorError::Config(format!(
-                            "toolchain install failed for {layer} (exit {}): {}",
-                            output.exit_code,
-                            String::from_utf8_lossy(&output.stderr)
-                                .lines()
-                                .last()
-                                .unwrap_or("unknown error")
-                        )));
-                    }
-                }
-            }
-            // Toolchain installation runs as root and recreates writable
-            // rustup state beneath these homes. Re-apply runner ownership
-            // after every layer; doing it only in the base script leaves
-            // `/usr/local/rustup/tmp` root-owned and job-time rustup updates
-            // fail with EACCES.
-            let output = self
-                .provider
-                .exec(
-                    &name,
-                    &[
-                        "sh".to_owned(),
-                        "-c".to_owned(),
-                        runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
-                    ],
-                )
-                .await?;
-            if output.exit_code != 0 {
-                let _ = self.provider.delete(&name).await;
-                return Err(OrchestratorError::Config(format!(
-                    "final runner-account ownership failed (exit {}): {}",
-                    output.exit_code,
-                    String::from_utf8_lossy(&output.stderr)
-                        .lines()
-                        .last()
-                        .unwrap_or("unknown error")
-                )));
-            }
-        }
-        // Stamp apt-index freshness into the image. Provisioning reads this
-        // back to log the pack's age and warn past the versions.toml policy;
-        // the weekly apt-indices-refresh workflow rebuilds stale packs. The
-        // policy travels in the marker so a running engine never needs the
-        // policy compiled in — only the bake-time CLI does. Never fail the
-        // bake for telemetry: a missing marker just means "stale", which is
-        // today's behavior (full refresh) everywhere.
-        if stock_base {
-            let stamp = format!(
-                "mkdir -p /etc/preloop && printf '%s\\n%s\\n' \"$(date -u +%F)\" \"{}\" > /etc/preloop/apt-indices-baked-at",
-                crate::APT_INDICES_MAX_AGE_DAYS
-            );
-            if let Err(error) = self
-                .provider
-                .exec(&name, &["sh".to_owned(), "-c".to_owned(), stamp])
-                .await
-            {
-                warn!(
-                    machine = name.as_str(),
-                    %error,
-                    "apt-index freshness stamp failed; pack will read as stale"
-                );
-            }
-        }
-        // Bake the externals *pointer*, not the externals: the packed rootfs
-        // gets `<root>/externals -> /opt/preloop/bin/externals` so node rides
-        // the runner-bundle mount instead of being baked into the image or
-        // downloaded per machine. The symlink must live in the pack itself —
-        // forkable snapshots do not capture exec writes made after create —
-        // and it must be baked here, in the builder, where the rootfs layer
-        // is flattened into the artifact. The bundle's host side carries the
-        // real `externals/` (see `ensure_host_externals`).
-        let link_command = format!(
-            "mkdir -p {root} && rm -rf {root}/externals && \
-             ln -s /opt/preloop/bin/externals {root}/externals",
-            root = RUNNER_ROOT
-        );
-        let output = self
-            .provider
-            .exec(&name, &["sh".to_owned(), "-c".to_owned(), link_command])
-            .await?;
-        if output.exit_code != 0 {
-            let _ = self.provider.delete(&name).await;
-            return Err(OrchestratorError::Config(format!(
-                "baking externals symlink failed (exit {}): {}",
-                output.exit_code,
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("unknown")
-            )));
-        }
-        // `base_install_script` already prepared the default account for
-        // curated bases, and provisioning reconciles it again before configure
-        // (custom bases get the fix there for the first time). Re-run it here
-        // only for a configured non-default user, whose identity the
-        // fingerprint cannot know: the script is idempotent either way.
-        let runner_user = self
-            .config
-            .runner_user
-            .as_deref()
-            .unwrap_or(DEFAULT_RUNNER_USER);
-        let runner_uid = self.config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
-        if runner_user != DEFAULT_RUNNER_USER || runner_uid != DEFAULT_RUNNER_UID {
-            let output = self
-                .provider
-                .exec(
-                    &name,
-                    &[
-                        "sh".to_owned(),
-                        "-c".to_owned(),
-                        runner_account_script(runner_user, runner_uid),
-                    ],
-                )
-                .await?;
-            if output.exit_code != 0 {
-                // A golden whose runner account is wrong cannot run a job:
-                // every step fails on permissions, which reads as flaky CI.
-                let _ = self.provider.delete(&name).await;
-                return Err(OrchestratorError::Config(format!(
-                    "baking runner account {runner_user} failed (exit {}): {}",
-                    output.exit_code,
-                    String::from_utf8_lossy(&output.stderr)
-                        .lines()
-                        .last()
-                        .unwrap_or("unknown")
-                )));
-            }
-        }
+    /// Ensure the packed artifact for the pool's configured image exists:
+    /// download the official golden, or bake a configured image into a pack.
+    async fn prepare_artifact(
+        &self,
+        shutdown: &CancellationToken,
+    ) -> Result<(), OrchestratorError> {
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
-        if let Err(error) = write_bake_manifest(self.provider.as_ref(), &name, &env_spec).await {
-            // Provenance is an audit aid, not a build gate.
-            warn!(machine = name.as_str(), %error, "bake manifest not written");
-        }
-        self.provider.stop(&name).await?;
-        let temporary = payload
-            .parent()
-            .map(|parent| parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())))
-            .ok_or_else(|| {
-                OrchestratorError::Config(format!(
-                    "golden artifact path has no parent: {}",
-                    payload.display()
-                ))
-            })?;
-        // Claim the companion lock for the pack duration: the heartbeat
-        // keeps it fresh, and dropping the guard removes it. A staging file
-        // without a fresh lock reads as orphaned to a concurrent sweep.
-        let _staging_guard = StagingLockGuard::claim(staging_lock_path(&temporary));
-        if let Err(error) = self.provider.pack(&name, &temporary).await {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-        // smolvm pack writes two files: `<output>` (ELF executable stub) and
-        // `<output>.smolmachine` (the packed VM data). The latter is the
-        // artifact consumed by `machine create --from`; the stub is only a
-        // launcher and is discarded.
-        let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
-        let rename_res = std::fs::rename(&sidecar, &payload);
-        let _ = std::fs::remove_file(&temporary);
-        rename_res.inspect_err(|_| {
-            let _ = std::fs::remove_file(&sidecar);
-        })?;
-        self.provider.delete(&name).await?;
-        if !payload.is_file() {
-            return Err(OrchestratorError::Config(format!(
-                "smolvm did not create expected artifact {}",
-                payload.display()
-            )));
-        }
-        Ok(())
+        let payload = self.config.artifact_payload();
+        ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
     }
 
-    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+    /// Delete every machine this pool owns that the startup adoption path
+    /// cannot reuse.
+    ///
+    /// A golden fork base recorded by a previous engine run is not stale: its
+    /// machine directory plus the fingerprint record are exactly what adoption
+    /// needs. Deleting it here forced a full rebake on every restart (#293);
+    /// the prepare path rebuilds it anyway when the fingerprint no longer
+    /// matches.
+    ///
+    /// The exception is a golden no environment can resolve to any more
+    /// ([`retired_golden`]): the curated per-`runs-on` goldens of earlier
+    /// releases. Their records would otherwise protect them forever, since
+    /// nothing prepares them again.
+    async fn remove_stale_runner_machines(&self) -> Result<(), OrchestratorError> {
         for name in self.provider.list().await? {
-            if name
+            if !name
                 .as_str()
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
-                // A golden fork base recorded by a previous engine run is not
-                // stale: its machine directory plus the fingerprint record are
-                // exactly what the startup adoption path needs. Deleting it
-                // here forced a full rebake on every restart (#293); the
-                // prepare path rebuilds it anyway when the fingerprint no
-                // longer matches.
-                if golden_record_path(&self.config, &name).is_some_and(|path| path.is_file()) {
-                    continue;
-                }
+                continue;
+            }
+            let retired = retired_golden(&self.config, &name);
+            if !retired
+                && golden_record_path(&self.config, &name).is_some_and(|path| path.is_file())
+            {
+                continue;
+            }
+            if !retired {
                 notify_runner_gone(&self.config, &name).await;
-                vm_telemetry_deregister(&self.config, &name);
-                if let Err(error) = self.provider.delete(&name).await {
+            }
+            vm_telemetry_deregister(&self.config, &name);
+            match self.provider.delete(&name).await {
+                // The record goes only with the machine: a failed delete keeps
+                // it, so the next start retries instead of forgetting a golden
+                // that still holds its storage.
+                Ok(()) if retired => {
+                    remove_golden_record(&self.config, &name);
+                    info!(
+                        machine = name.as_str(),
+                        "removed a golden no pool environment resolves to any more"
+                    );
+                }
+                Ok(()) => {}
+                Err(error) => {
                     record_slot_failure(&self.config, "stale_cleanup");
                     warn!(machine = name.as_str(), %error, "failed to delete stale Preloop runner");
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn remove_stale_machines(&self) -> Result<(), OrchestratorError> {
+        self.remove_stale_runner_machines().await?;
         // A crashed server orphans its detached `_boot-vm` hypervisor
         // processes; when the data dir was cleaned out from under them the
         // smolvm DB no longer knows the machines, so the deletes above
@@ -4706,7 +4509,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                         && suffix[1..].chars().all(|c| c.is_ascii_hexdigit())
                 })
             }) && path != current_payload;
-            if !stale_tmp && !stale_payload {
+            // Payloads under a stem this pool no longer produces: the stock
+            // Ubuntu bases are not golden sources any more, so no later
+            // fingerprint rotation would ever reach them.
+            let retired_payload = is_retired_stock_payload(&name) && path != current_payload;
+            if !stale_tmp && !stale_payload && !retired_payload {
                 continue;
             }
             match std::fs::remove_file(&path) {
@@ -4847,14 +4654,11 @@ async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
 struct RunnerEnvironment {
     /// Fingerprint of the golden this runner was forked from.
     fingerprint: Option<String>,
-    /// Base image this runner actually booted from.
+    /// Base image this runner actually booted from: the official golden, or the
+    /// configured image. Nothing is installed on top — the golden carries the
+    /// runner contract, and `runner_environment_labels` derives the labels a
+    /// job's `runs-on` can match from this value.
     base: String,
-    /// Toolchains this runner must carry (installed after boot when the
-    /// runner is created fresh rather than forked from a prepared golden).
-    toolchains: Vec<ToolchainLayer>,
-    /// Whether Preloop's curated bake applies to this base. Custom base
-    /// images are used as-is and must not receive the apt/toolchain bake.
-    curated: bool,
 }
 
 /// Handles every slot in the pool shares.
@@ -5249,20 +5053,12 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     config: RunnerPoolConfig,
     slot: usize,
     shutdown: CancellationToken,
-    golden_registry: Arc<GoldenRegistry>,
+    golden_cache: Arc<GoldenCache>,
     handles: PoolHandles,
     _slot_provisioning: Arc<std::sync::Mutex<usize>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
-    // Mirror `run_slot`: once the packed golden is known-unusable, on-demand
-    // slots must not attempt another environment-golden bake either — fall
-    // back to direct per-runner creation the same way.
-    let mut config = config;
-    if golden_registry.is_packed_disabled() {
-        config.use_packed_artifact = false;
-        config.use_fork = false;
-    }
     let provisioning = handles.provisioning.clone();
     let preparing = PreparingGuard::enter(
         provisioning.clone(),
@@ -5279,22 +5075,21 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             None => config.base_image.clone(),
         };
         let env_spec = EnvironmentSpec::for_base(env_base.clone());
-        let curated = env_spec.curated;
         let fingerprint = env_spec.fingerprint.clone();
-        let toolchains = env_spec.toolchains.clone();
-        let selected = golden_registry
+        let selected = golden_cache
             .get_or_prepare(&fingerprint, {
                 let provider = provider.clone();
                 let config = config.clone();
-                let name_prefix = golden_registry.name_prefix().to_owned();
+                let name_prefix = golden_cache.name_prefix().to_owned();
                 let fp = fingerprint.clone();
+                let shutdown = shutdown.clone();
                 async move {
                     let name = MachineName::new(format!(
                         "{}-golden-{}",
                         name_prefix,
                         &fp[..12.min(fp.len())]
                     ))?;
-                    prepare_golden_for_env(&provider, &config, &name, &env_spec).await?;
+                    prepare_fork_base(&provider, &config, &name, &env_spec, &shutdown).await?;
                     Ok(name)
                 }
             })
@@ -5308,20 +5103,15 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
             RunnerEnvironment {
                 fingerprint: Some(fingerprint),
                 base: env_base,
-                toolchains,
-                curated,
             },
         )
     } else {
         let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
-        let curated = env_spec.curated;
         (
             None,
             RunnerEnvironment {
                 fingerprint: None,
-                base: env_spec.base.clone(),
-                toolchains: env_spec.toolchains,
-                curated,
+                base: env_spec.base,
             },
         )
     };
@@ -5406,14 +5196,9 @@ async fn run_slot<P: VmProvider + 'static>(
     config: RunnerPoolConfig,
     slot: usize,
     shutdown: CancellationToken,
-    golden_registry: Arc<GoldenRegistry>,
+    golden_cache: Arc<GoldenCache>,
     handles: PoolHandles,
 ) -> Result<(), OrchestratorError> {
-    let mut config = config;
-    if golden_registry.is_packed_disabled() {
-        config.use_packed_artifact = false;
-        config.use_fork = false;
-    }
     let PoolHandles {
         idle,
         keys,
@@ -5448,26 +5233,23 @@ async fn run_slot<P: VmProvider + 'static>(
                 }
                 None => config.base_image.clone(),
             };
-            // The golden carries the curated toolchain set; base image still
-            // comes from the queued job's `runs-on` labels.
             let env_spec = EnvironmentSpec::for_base(env_base.clone());
-            let curated = env_spec.curated;
             let fingerprint = env_spec.fingerprint.clone();
-            let toolchains = env_spec.toolchains.clone();
 
-            let selected = match golden_registry
+            let selected = match golden_cache
                 .get_or_prepare(&fingerprint, {
                     let provider = provider.clone();
                     let config = config.clone();
-                    let name_prefix = golden_registry.name_prefix().to_owned();
+                    let name_prefix = golden_cache.name_prefix().to_owned();
                     let fp = fingerprint.clone();
+                    let shutdown = shutdown.clone();
                     async move {
                         let name = MachineName::new(format!(
                             "{}-golden-{}",
                             name_prefix,
                             &fp[..12.min(fp.len())]
                         ))?;
-                        prepare_golden_for_env(&provider, &config, &name, &env_spec).await?;
+                        prepare_fork_base(&provider, &config, &name, &env_spec, &shutdown).await?;
                         Ok(name)
                     }
                 })
@@ -5478,15 +5260,16 @@ async fn run_slot<P: VmProvider + 'static>(
                     Some(name)
                 }
                 Err(error) => {
-                    // A bake failure is usually deterministic (a stock apt
-                    // pin the archive dropped, a registry the guest cannot
-                    // resolve), so a fixed 500 ms retry meant this slot
-                    // rebuilt the same doomed golden ~100 times an hour --
-                    // each attempt boots a VM and runs apt -- while the
-                    // queue it was meant to drain starved. Back off
-                    // geometrically, capped, so a slot costs one attempt per
-                    // minute at worst and recovers immediately once the
-                    // environment becomes buildable again.
+                    // A golden prep failure is usually deterministic (the
+                    // official pack unreachable, a registry the guest cannot
+                    // resolve, an image that cannot satisfy the contract), so a
+                    // fixed 500 ms retry meant this slot retried the same
+                    // doomed prepare ~100 times an hour -- each attempt
+                    // downloading or booting a VM -- while the queue it was
+                    // meant to drain starved. Back off geometrically, capped,
+                    // so a slot costs one attempt per minute at worst and
+                    // recovers immediately once the golden becomes available
+                    // again.
                     let wait = golden_backoff.map_or(GOLDEN_RETRY_MIN, |last: Duration| {
                         (last * 2).min(GOLDEN_RETRY_MAX)
                     });
@@ -5509,21 +5292,16 @@ async fn run_slot<P: VmProvider + 'static>(
                 RunnerEnvironment {
                     fingerprint: Some(fingerprint),
                     base: env_base,
-                    toolchains,
-                    curated,
                 },
             )
         } else {
             // create-per-runner path: no golden, provision fresh each time.
             let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
-            let curated = env_spec.curated;
             (
                 None,
                 RunnerEnvironment {
                     fingerprint: None,
-                    base: env_spec.base.clone(),
-                    toolchains: env_spec.toolchains,
-                    curated,
+                    base: env_spec.base,
                 },
             )
         };
@@ -5690,7 +5468,19 @@ async fn provision_slot<P: VmProvider + 'static>(
     }
 }
 
+/// Labels a runner booted from `base` can serve beyond the pool's own.
+///
+/// The official golden *is* the hosted Ubuntu 24.04 image, so a job that says
+/// `runs-on: ubuntu-latest` can be matched to it. A configured image keeps the
+/// same name-based mapping it had before the bake was deleted — an operator who
+/// brings `ubuntu:22.04` still serves `runs-on: ubuntu-22.04` — but nothing
+/// about it is *provisioned* to match: `base_for_labels` only routes labels to
+/// the official golden, so a configured pool serves every label from its own
+/// image.
 fn runner_environment_labels(base: &str) -> Vec<String> {
+    if is_official_golden(base) {
+        return vec!["ubuntu-24.04".to_owned(), "ubuntu-latest".to_owned()];
+    }
     let normalized = base.to_ascii_lowercase();
     if normalized.contains("22.04") {
         vec!["ubuntu-22.04".to_owned()]
@@ -6189,6 +5979,83 @@ fn plain_packed_golden_name(config: &RunnerPoolConfig) -> String {
     format!("{}-golden", config.name_prefix)
 }
 
+/// Whether `golden` is a per-environment fork base no environment resolves to
+/// any more.
+///
+/// A pool resolves a job to exactly two bases: the official golden or its
+/// configured image (`EnvironmentSpec::base_for_labels`). A suffixed golden
+/// (`{prefix}-golden-{fingerprint12}`) whose suffix is neither base's
+/// fingerprint was prepared for an environment that no longer exists — the
+/// stock Ubuntu environments of earlier releases, or an image since replaced —
+/// and nothing will ever prepare or adopt it again. The plain golden is never
+/// retired here: `prepare_fork_base` replaces it in place.
+fn retired_golden(config: &RunnerPoolConfig, golden: &MachineName) -> bool {
+    let prefix = plain_packed_golden_name(config);
+    let Some(suffix) = golden
+        .as_str()
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    if suffix.len() != 12 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    ![
+        crate::environment::OFFICIAL_GOLDEN,
+        config.base_image.as_str(),
+    ]
+    .iter()
+    .any(|base| {
+        EnvironmentSpec::for_base((*base).to_owned())
+            .fingerprint
+            .starts_with(suffix)
+    })
+}
+
+/// Whether a file name is a packed-golden payload of a retired stock Ubuntu
+/// stem: `preloop-[mirror.gcr.io-library-]ubuntu-{24.04,22.04}[-sha256-<64
+/// hex>]-<arch>-<64 hex>`.
+///
+/// Earlier releases keyed the payload on the stock base they baked from; the
+/// stem is the base reference with `/`, `:` and `@` turned into `-`
+/// (`artifact_stem`). The architecture and both digests must match, so a
+/// hand-named file or another image's payload is never taken for one.
+fn is_retired_stock_payload(name: &str) -> bool {
+    let is_hex = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_hexdigit());
+    let Some(rest) = name.strip_prefix("preloop-") else {
+        return false;
+    };
+    let Some(split) = rest.len().checked_sub(65) else {
+        return false;
+    };
+    if !rest.is_char_boundary(split) {
+        return false;
+    }
+    let (stem, fingerprint) = rest.split_at(split);
+    if !fingerprint.starts_with('-') || fingerprint[1..].len() != 64 || !is_hex(&fingerprint[1..]) {
+        return false;
+    }
+    let stem = stem.strip_prefix("mirror.gcr.io-library-").unwrap_or(stem);
+    let Some(after_release) = stem
+        .strip_prefix("ubuntu-24.04")
+        .or_else(|| stem.strip_prefix("ubuntu-22.04"))
+    else {
+        return false;
+    };
+    let arch = match after_release.strip_prefix("-sha256-") {
+        Some(tail) => match tail.split_once('-') {
+            Some((digest, arch)) if digest.len() == 64 && is_hex(digest) => arch,
+            _ => return false,
+        },
+        None => match after_release.strip_prefix('-') {
+            Some(arch) => arch,
+            None => return false,
+        },
+    };
+    matches!(arch, "x86_64" | "aarch64")
+}
+
 /// Best-effort VM telemetry: register a just-created or forked machine.
 ///
 /// Fills what the pool knows about the machine; unknown fields stay unset.
@@ -6279,28 +6146,15 @@ async fn provision_runner<P: VmProvider + 'static>(
     keys: &Arc<KeyPool>,
     environment: &RunnerEnvironment,
 ) -> Result<Vec<String>, OrchestratorError> {
-    let mut direct_create_from_packed = config.use_packed_artifact;
+    // Every runner is a fork of the pool's golden. There is no backup path that
+    // boots a raw image: such a machine carries neither the published golden's
+    // contents nor the contract this pool baked, so it would register as a
+    // runner that cannot run the job it was created for. A fork that cannot be
+    // recovered here is an error, and the slot retries it with backoff.
     let forked_golden = match golden {
         Some(golden) => match provider.fork(golden, name).await {
             Ok(()) => Some(golden),
-            Err(error @ VmError::ForkBaseBusy { .. })
-                if config.use_packed_artifact && managed_golden(config, golden) =>
-            {
-                // A live plain-fork clone still depends on the golden's frozen
-                // storage. Do not touch the base and do not create another VM
-                // from that same packed payload: SmolVM's mixed fork/create
-                // path has returned ESTALE in both machines. Boot this slot
-                // independently from the job's OCI environment instead.
-                warn!(
-                    machine = name.as_str(),
-                    golden = golden.as_str(),
-                    %error,
-                    "fork base busy; creating runner independently from the OCI image"
-                );
-                direct_create_from_packed = false;
-                None
-            }
-            Err(error) if config.use_packed_artifact && managed_golden(config, golden) => {
+            Err(error) if managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
                     // partial-clone cleanup, the live-clone check, and the
@@ -6324,8 +6178,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                                         machine = name.as_str(),
                                         golden = golden.as_str(),
                                         %retry_error,
-                                        "re-armed golden still cannot fork; falling back to \
-                                         direct creation"
+                                        "re-armed golden still cannot fork"
                                     );
                                     let _ = provider.delete(name).await;
                                     None
@@ -6336,15 +6189,12 @@ async fn provision_runner<P: VmProvider + 'static>(
                             // A live clone (another runner forked from the
                             // golden) blocks the re-freeze; those clones are
                             // ephemeral and exit after their job. Wait for
-                            // them to drain, probing with exponential backoff
-                            // so a long-running job does not force the slow
-                            // direct-create path for every queued job in the
-                            // meantime. The fork path is ~0.5 s vs ~8 min for
-                            // independent creation, so waiting is worth it up
-                            // to a generous total budget; only then fall back
-                            // to direct creation (whose socket mount cannot
-                            // serve the control transport, so the fallback
-                            // usually fails registration anyway).
+                            // them to drain, probing with exponential backoff.
+                            // The fork path is ~0.5 s, so waiting is worth it
+                            // up to a generous total budget; past it the
+                            // provision fails and the slot retries, which is
+                            // the only honest outcome — no image boot can
+                            // stand in for a fork of this golden.
                             let mut rearmed = false;
                             let mut probe_delay = GOLDEN_DRAIN_PROBE_DELAY;
                             let drain_deadline = tokio::time::Instant::now() + GOLDEN_DRAIN_BUDGET;
@@ -6389,42 +6239,42 @@ async fn provision_runner<P: VmProvider + 'static>(
                                             machine = name.as_str(),
                                             golden = golden.as_str(),
                                             %retry_error,
-                                            "re-armed golden still cannot fork; falling back to \
-                                             direct creation"
+                                            "re-armed golden still cannot fork"
                                         );
                                         let _ = provider.delete(name).await;
-                                        None
+                                        return Err(retry_error.into());
                                     }
                                 }
                             } else {
                                 error!(
                                     golden = golden.as_str(),
                                     "fork base spent and could not be re-armed after waiting for \
-                                     clone drain; falling back to independent OCI creation"
+                                     clone drain; the slot will retry"
                                 );
                                 let _ = provider.delete(name).await;
-                                direct_create_from_packed = false;
-                                None
+                                return Err(OrchestratorError::Config(format!(
+                                    "golden {} is spent and could not be re-armed within {}s",
+                                    golden.as_str(),
+                                    GOLDEN_DRAIN_BUDGET.as_secs()
+                                )));
                             }
                         }
                         Err(rearm_error) => {
                             error!(
                                 golden = golden.as_str(),
                                 %rearm_error,
-                                "failed to re-arm spent fork base; falling back to independent \
-                                 OCI creation"
+                                "failed to re-arm spent fork base"
                             );
-                            direct_create_from_packed = false;
-                            None
+                            return Err(rearm_error.into());
                         }
                     }
                 } else {
                     // A restored clone can wedge transiently (agent readiness
                     // or rejuvenation timeouts) while the golden stays frozen
                     // with its retained checkpoint, so the fork itself is safe
-                    // to retry. A retry costs about a second; the direct
-                    // create cold-boots the packed image, which takes minutes
-                    // on macOS while the guest unpacks its layers.
+                    // to retry. A retry costs about a second; rebooting the
+                    // packed image cold takes minutes on macOS while the guest
+                    // unpacks its layers, so the retries are worth it.
                     let mut last_error = error;
                     let mut retried = None;
                     for attempt in 1..=FORK_RETRY_ATTEMPTS {
@@ -6434,7 +6284,7 @@ async fn provision_runner<P: VmProvider + 'static>(
                             golden = golden.as_str(),
                             attempt,
                             error = %last_error,
-                            "packed golden fork failed; retrying the fork"
+                            "golden fork failed; retrying the fork"
                         );
                         match provider.fork(golden, name).await {
                             Ok(()) => {
@@ -6444,21 +6294,19 @@ async fn provision_runner<P: VmProvider + 'static>(
                             Err(error) => last_error = error,
                         }
                     }
-                    if retried.is_none() {
-                        // A failed fork can leave a partial clone behind.
-                        // Best-effort cleanup makes the direct create safe; if
-                        // cleanup itself is still racing SmolVM state, create
-                        // returns the actionable error and the slot supervisor
-                        // retries normally.
-                        warn!(
-                            machine = name.as_str(),
-                            golden = golden.as_str(),
-                            error = %last_error,
-                            "packed golden fork failed; creating runner directly from packed artifact"
-                        );
+                    if let Some(golden) = retried {
+                        Some(golden)
+                    } else {
+                        // A failed fork can leave a partial clone behind, and
+                        // the slot retries this provision.
                         remove_failed_fork(provider, name).await;
+                        return Err(OrchestratorError::Config(format!(
+                            "forking {} from {} failed after {} attempts: {last_error}",
+                            name.as_str(),
+                            golden.as_str(),
+                            FORK_RETRY_ATTEMPTS
+                        )));
                     }
-                    retried
                 }
             }
             Err(error) => return Err(error.into()),
@@ -6466,144 +6314,37 @@ async fn provision_runner<P: VmProvider + 'static>(
         None => None,
     };
 
-    if let Some(golden) = forked_golden {
-        // The fork succeeded, so the clone exists as a live machine.
+    if forked_golden.is_some() {
+        // The fork succeeded, so the clone exists as a live machine — and it
+        // carries the whole golden: a pack has its rootfs flattened into the
+        // artifact, a snapshot backend carries the guest writes that built it.
+        // Nothing is installed here. The runner contract (account, ownership,
+        // tool cache, `/etc/environment`) was applied once, when the golden was
+        // built, which is also why no per-VM `chown` walk exists: on overlayfs
+        // a recursive one copies the tree into the per-VM upper layer.
         vm_telemetry_register(config, name, "runner", None);
-        // Fork from the already-booted golden VM instant CoW clone.
-        // The PACKED golden carries its bake inside the artifact's flattened
-        // rootfs, which forks inherit through the storage chain — so the apt
-        // baseline is already there. Environment goldens are different:
-        // `prepare_golden_for_env`
-        // bakes via guest `exec`, and SmolVM's forkable snapshot does NOT
-        // carry post-create exec writes into clones (verified empirically),
-        // so an env-golden fork boots the bare stock base image. Install the
-        // apt baseline into the fork itself — it is the job's single-use
-        // machine, so the writes persist for its lifetime. Language versions
-        // remain the workflow's setup action responsibility.
-        // Only the plain `{prefix}-golden` fork base is created from the
-        // packed artifact (`prepare_packed_golden` at pool startup), whose
-        // rootfs already carries the apt baseline that forks inherit.
-        // Fingerprint-suffixed goldens are baked by
-        // `prepare_golden_for_env` from the job's OCI image via guest exec,
-        // and SmolVM's forkable snapshot does NOT carry post-create exec
-        // writes into clones — so those forks must install the baseline
-        // themselves. Treating an env golden as packed skipped that install
-        // and provisioned runners without the curated baseline.
-        // A fork arrives already baked in two cases: it came from the packed
-        // artifact (the bake is inside the flattened rootfs), or the backend's
-        // snapshot carries the golden's post-boot writes. AgentENV does the
-        // latter; SmolVM does neither for an environment golden, which is why
-        // that case still installs the baseline per fork. Getting this wrong
-        // on a write-inheriting backend re-runs the whole bake (apt baseline,
-        // rust, go, docker tooling) inside every single-use runner.
-        let golden_is_baked = (config.use_packed_artifact
-            && golden.as_str() == plain_packed_golden_name(config))
-            || provider.capabilities().fork_inherits_guest_writes;
-        if golden_is_baked {
-            // The pack carries the apt baseline, but not necessarily apt's
-            // indices — restore them before any workflow apt-installs. A
-            // custom base is used as-is: no apt assumptions.
-            if environment.curated
-                && let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await
-            {
-                warn!(
-                machine = name.as_str(),
-                    %error, "apt list refresh failed; workflow apt installs may not resolve"
-                );
-            }
-            // Log the pack's apt-index age from the freshness marker baked
-            // with it. A missing marker just means "stale" (packs predating
-            // the stamp, or env-golden forks that boot bare) — the refresh
-            // above already ran, so behavior is unchanged; only the warning
-            // is new, and the weekly apt-indices-refresh rebuilds stale packs.
-            match provider
-                .exec(
-                    name,
-                    &["cat".to_owned(), APT_INDICES_MARKER_PATH.to_owned()],
-                )
-                .await
-            {
-                Ok(output) if output.exit_code == 0 => {
-                    let today_days = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_secs() / 86_400)
-                        .unwrap_or(0);
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    match crate::environment::apt_marker_age_days(&text, today_days) {
-                        Some((age_days, max_age_days)) if age_days > max_age_days => {
-                            warn!(
-                                machine = name.as_str(),
-                                age_days,
-                                max_age_days,
-                                "pack apt indices are stale; refresh ran but consider rebuilding the golden"
-                            );
-                        }
-                        Some((age_days, _)) => {
-                            info!(machine = name.as_str(), age_days, "pack apt indices fresh");
-                        }
-                        None => {
-                            debug!(
-                                machine = name.as_str(),
-                                "pack has no parseable apt-index marker"
-                            );
-                        }
-                    }
-                }
-                _ => {
-                    debug!(
-                        machine = name.as_str(),
-                        "pack has no apt-index marker; treating as stale"
-                    );
-                }
-            }
-        } else if environment.curated {
-            install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in &environment.toolchains {
-                for command in layer.install_commands() {
-                    if let Err(error) = provider.exec(name, &command).await {
-                        return Err(error.into());
-                    }
-                }
-                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
-            }
-        } else {
-            // Custom base image: used as-is, no apt bake, no toolchains.
-            debug!(
-                machine = name.as_str(),
-                base = %environment.base,
-                "custom base image — skipping the curated bake"
-            );
-        }
     } else {
-        // The packed-artifact fallback is valid only for the plain packed
-        // golden: it boots the *default* OS image. A fingerprint-suffixed
-        // golden is an environment golden baked from the job's requested
-        // image, so every fork-failure fallback must boot that job's own
-        // environment instead — regardless of which branch failed the fork.
-        // When no golden was attempted (`golden` is None, the create-per-
-        // runner path), the packed artifact is the pool's normal image and
-        // stays as-is.
-        let golden_is_plain_packed = match golden {
-            Some(golden) => golden.as_str() == plain_packed_golden_name(config),
-            None => true,
-        };
-        let uses_packed_artifact = direct_create_from_packed && golden_is_plain_packed;
+        // No golden at all: `use_fork` is off, so the machine is created from
+        // the golden's payload instead of forked from it. A file-pack backend
+        // boots the packed artifact — the same rootfs a fork would have
+        // inherited — while a backend without host-side packs boots the
+        // configured image and runs the contract on the machine itself, since
+        // there is no golden to inherit it from.
+        let from_packed = provider.capabilities().file_packs;
         let pack = packed_golden_path(&config.artifact_payload());
         let spec = MachineSpec {
             name: name.clone(),
-            image: if uses_packed_artifact {
+            image: if from_packed {
                 pack.display().to_string()
-            } else if config.use_packed_artifact {
-                environment.base.clone()
             } else {
-                config.base_image.clone()
+                environment.base.clone()
             },
             cpus: config.cpus,
             memory_mib: config.memory_mib,
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name, !uses_packed_artifact)?,
+            volumes: runner_volumes(config, name, !from_packed)?,
             sockets: config
                 .control_socket
                 .iter()
@@ -6618,59 +6359,16 @@ async fn provision_runner<P: VmProvider + 'static>(
         provider.create(&spec).await?;
         provider.start(name).await?;
         vm_telemetry_register(config, name, "runner", Some(&spec));
-        // The packed artifact is the golden's frozen image; the live golden
-        // receives the apt baseline and toolchain bake *after* boot, so a
-        // machine created from the artifact is bare and must install the
-        // baseline itself — otherwise node actions die with "curl: command
-        // not found" and rust jobs with "cargo: command not found". The
-        // installs are idempotent, so a fully baked artifact only pays the
-        // presence checks. A custom base is the operator's contract: no apt
-        // baseline, no toolchain curation.
-        if environment.curated {
-            install_base_dependencies(provider.as_ref(), name).await?;
-            for layer in &environment.toolchains {
-                for command in layer.install_commands() {
-                    if let Err(error) = provider.exec(name, &command).await {
-                        return Err(error.into());
-                    }
-                }
-                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
-            }
+        if !from_packed {
+            await_guest_ready(provider.as_ref(), name).await?;
+            apply_golden_contract(provider.as_ref(), config, name).await?;
         }
     }
 
-    // Reconcile ownership of the paths a job writes on every machine, whatever
-    // its provenance: curated stock bases, custom/official images, and forked
-    // goldens alike. `base_install_script` runs the full account script only
-    // inside the curated bake, so custom bases reached jobs with root-owned
-    // `/usr/local/rustup`, `/usr/local/cargo`, and `/opt/hostedtoolcache` — and
-    // any step that writes them (`rustup component add`, `cargo fmt`, toolcache
-    // drops) died with EACCES. This is the ownership half only: privilege
-    // policy stays where it was baked. One exec round trip, and the script
-    // itself no-ops when the machine is already correct.
-    {
-        let runner_user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
-        let runner_uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
-        let reconcile = runner_ownership_reconcile_script(runner_user, runner_uid);
-        let output = provider
-            .exec(name, &["sh".to_owned(), "-c".to_owned(), reconcile])
-            .await?;
-        if output.exit_code != 0 {
-            return Err(OrchestratorError::Config(format!(
-                "runner-ownership reconciliation failed on {} (exit {}): {} — \
-                 /usr/local/rustup, /usr/local/cargo, and /opt/hostedtoolcache must be \
-                 writable by uid {}; the engine could not escalate (image user is not \
-                 root and passwordless sudo is unavailable)",
-                name.as_str(),
-                output.exit_code,
-                String::from_utf8_lossy(&output.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("unknown"),
-                runner_uid
-            )));
-        }
-    }
+    // No per-VM ownership pass: the golden already owns every path a job
+    // writes, and a fork/snapshot inherits that. A `chown` here used to be the
+    // safety net for curated stock bases; with the contract baked once it would
+    // only walk (and on overlayfs, copy) a tree that is already correct.
 
     // Apply the hosted runtime init — the per-guest half of what the hosted
     // image's own init does for a GitHub-hosted runner. Same always-run,
@@ -6940,7 +6638,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     if user == "root" {
         return with_guest_hosted_limits(argv);
     }
-    let uid = config.runner_uid.unwrap_or(1001);
+    let uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
     let home = format!("/home/{user}");
     let program = shell_quote(&argv[0]);
     let args = argv[1..]
@@ -6954,6 +6652,15 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // the official golden declares USER runner, so `machine exec` lands on
     // runner and setpriv below self-drops to the same uid (no privilege
     // change needed).
+    //
+    // No ownership `chown` here: the golden owns every path a job writes
+    // (see `golden_ownership_script`), and a fork inherits that. A per-VM walk
+    // would be pure cost — on overlayfs a recursive one copies the tree it
+    // visits into the VM's upper layer (measured: 304 s and 1.22 GB on the
+    // production runner home). The tool-cache mode and `/etc/environment`
+    // lines below stay as a cheap, idempotent re-assert for a golden prepared
+    // by an older contract.
+    //
     // `/tmp` lives on the VM's ext4 data disk, not the overlayfs root: the
     // small tmpfs the guest boots with fills on real test suites, and the
     // overlay root it used to fall through to does not support
@@ -6968,10 +6675,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
            || true; \
          chmod 0440 /etc/sudoers.d/preloop-{user} 2>/dev/null || true; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         chown -R {uid}:{uid} /home/runner 2>/dev/null || true; \
          chown {uid}:{uid} /run/user/{uid} 2>/dev/null || true; \
-         if [ -d /usr/local/rustup ]; then chown -R {uid}:{uid} /usr/local/rustup; fi; \
-         if [ -d /usr/local/cargo ]; then chown -R {uid}:{uid} /usr/local/cargo; fi; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -7031,24 +6735,6 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
 /// Single-quote an argv element for the guest bootstrap shell.
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
-/// Fail the provision if a toolchain layer's binary is not on the default
-/// PATH after install. A provision interrupted between install commands (or
-/// an install that silently succeeded without producing the binary) would
-/// otherwise leave the job running without its toolchain — e.g. cargo-dist
-/// failing on "you don't appear to have cargo installed" with no hint that
-/// the machine itself was broken.
-async fn verify_toolchain_installed<P: VmProvider>(
-    provider: &P,
-    name: &MachineName,
-    layer: &ToolchainLayer,
-) -> Result<(), OrchestratorError> {
-    let command = vec!["sh".to_owned(), "-c".to_owned(), layer.verify_command()];
-    if let Err(error) = provider.exec(name, &command).await {
-        return Err(OrchestratorError::Vm(error));
-    }
-    Ok(())
 }
 
 /// Stage a pre-generated keypair for one `configure` call, if one is ready.
@@ -7287,6 +6973,8 @@ mod lifecycle_tests {
         /// When set, `exec` answers exit 1 for any argv whose debug form
         /// contains this marker — models a guest command that fails.
         fail_exec_containing: Mutex<Option<String>>,
+        /// Whether this provider keeps packs as host files. AgentENV does not.
+        file_packs: bool,
     }
 
     impl TestProvider {
@@ -7320,7 +7008,15 @@ mod lifecycle_tests {
                 suspends: false,
                 prune_pack_calls: Mutex::new(Vec::new()),
                 fail_exec_containing: Mutex::new(None),
+                file_packs: true,
             }
+        }
+
+        /// A backend whose packs are not host files (AgentENV): its golden is
+        /// prepared in the guest instead of unpacked from an artifact.
+        fn no_packs(mut self) -> Self {
+            self.file_packs = false;
+            self
         }
 
         fn that_suspends(mut self) -> Self {
@@ -7701,7 +7397,7 @@ esac
     async fn bake_manifest_is_written_as_root_and_verified() {
         let provider = TestProvider::new(false, false, false, false, false);
         let name = MachineName::new("golden-manifest".to_owned()).unwrap();
-        let env_spec = EnvironmentSpec::for_base(crate::environment::DEFAULT_BASE_IMAGE.to_owned());
+        let env_spec = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
 
         write_bake_manifest(&provider, &name, &env_spec)
             .await
@@ -7937,57 +7633,64 @@ chmod +x "$dest/bin/node"
         config.control_origin = Some("http://127.0.0.1:9090".to_owned());
         let name = MachineName::new("runner").unwrap();
 
-        let env = guest_env_prefix(&config, &name);
+        let env = guest_env_entries(&config, &name);
 
         assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
         assert!(!env.contains(&"PRELOOP_CONTROL_ORIGIN=http://192.168.1.20:9090".to_owned()));
     }
 
-    /// A workflow that installs a cargo subcommand and runs it in the next
-    /// step (`taiki-e/install-action` + `cargo hack`) only works when the
-    /// toolchain's bin directory is on the runner's PATH, as it is on hosted
-    /// images. Without it the install "succeeds" and the next step reports
-    /// `no such command: hack`.
+    /// The guest runner's environment is the image's, not the host's: the
+    /// launcher sources `/etc/environment` before handing over, so the PATH a
+    /// hosted step shell would get is the PATH a step here gets. The curated
+    /// Rust/Go bakes that used to justify host-side toolchain entries are
+    /// gone, so the pool's own list stays a system default and nothing
+    /// exports a Rust home.
     #[test]
-    fn runner_path_carries_toolchain_bin_directories() {
+    fn runner_env_comes_from_the_image_environment_file() {
         let config = test_config(false);
         let name = MachineName::new("runner").unwrap();
 
-        let env = guest_env_prefix(&config, &name);
+        let argv = guest_env_prefix(&config, &name);
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        let launcher = &argv[2];
+        assert!(
+            launcher.contains(". /etc/environment"),
+            "the image's environment must be sourced: {launcher}"
+        );
+        assert!(
+            launcher.contains("exec /usr/bin/env"),
+            "the pool's variables must survive the source: {launcher}"
+        );
+        // The `KEY=value` words after the launcher are the runner's
+        // environment, so the entries the assertions below read are exactly
+        // what `env` applies.
+        assert_eq!(
+            &argv[3],
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        assert_eq!(argv[4], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
 
+        let env = guest_env_entries(&config, &name);
         let path = env
             .iter()
             .find_map(|entry| entry.strip_prefix("PATH="))
-            .expect("the runner is launched with an explicit PATH");
-        let entries: Vec<&str> = path.split(':').collect();
-        assert!(
-            entries.contains(&"/usr/local/cargo/bin"),
-            "cargo-installed binaries must be reachable: {path}"
+            .expect("the runner is launched with a PATH");
+        assert_eq!(
+            path,
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         );
-        // Toolchain homes are fixed system addresses, identical for root
-        // and switched runners: a $HOME-derived location would be invisible
-        // across the bake-user/step-user boundary (/root is 0700).
-        for expected in [
-            "RUSTUP_HOME=/usr/local/rustup",
-            "CARGO_HOME=/usr/local/cargo",
+        for absent in [
+            "/usr/local/cargo/bin",
+            "/usr/local/go/bin",
+            "RUSTUP_HOME=",
+            "CARGO_HOME=",
         ] {
             assert!(
-                env.iter().any(|entry| entry == expected),
-                "guest env must pin {expected}: {env:?}"
+                !path.contains(absent) && !env.iter().any(|entry| entry.starts_with(absent)),
+                "the curated toolchain contract is deleted; {absent} must not be exported: {env:?}"
             );
         }
-        assert!(
-            entries.contains(&"/usr/local/go/bin"),
-            "the go layer untars into /usr/local/go: {path}"
-        );
-        assert!(
-            entries.contains(&"/usr/local/bin") && entries.contains(&"/usr/bin"),
-            "the system PATH must survive: {path}"
-        );
-        assert!(
-            env.contains(&"RUSTUP_HOME=/usr/local/rustup".to_owned()),
-            "the shared rustup metadata must be selected: {env:?}"
-        );
     }
 
     #[test]
@@ -7998,77 +7701,64 @@ chmod +x "$dest/bin/node"
         config.control_upstream = Some("http://10.0.0.161:9090".to_owned());
         let name = MachineName::new("runner").unwrap();
 
-        let env = guest_env_prefix(&config, &name);
+        let env = guest_env_entries(&config, &name);
 
         assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
         assert!(env.contains(&"PRELOOP_CONTROL_UPSTREAM=http://10.0.0.161:9090".to_owned()));
         assert!(!env.iter().any(|v| v.starts_with("PRELOOP_CONTROL_SOCKET")));
     }
 
-    /// The always-run ownership reconciliation must not install privilege
-    /// policy: custom/official images that never
-    /// had blanket sudo must not gain it just because a job runs there — and
-    /// it must not mask failures the way the account script's `|| true` tail
-    /// does.
+    /// The contract is the *whole* golden contract for a configured image, so
+    /// it must both refuse an image that could never run a job and hand the
+    /// runner account everything it writes.
     #[test]
-    fn ownership_reconcile_script_keeps_privilege_policy_out() {
-        let script = runner_ownership_reconcile_script(DEFAULT_RUNNER_USER, 1001);
-        assert!(!script.contains("NOPASSWD"), "{script}");
-        assert!(!script.contains("usermod"), "{script}");
-        assert!(!script.contains("sudoers"), "{script}");
-        assert!(!script.contains("docker"), "{script}");
+    fn golden_contract_requires_glibc_and_hands_over_the_runner_paths() {
+        let contract = golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID);
         assert!(
-            script.contains("needs=0"),
-            "an already-correct machine must skip the privileged half: {script}"
+            contract.contains("/lib64/ld-linux-*.so.*"),
+            "the glibc loader probe must be part of the contract: {contract}"
         );
         assert!(
-            script.contains("sudo -n sh"),
-            "a machine that needs changes must escalate: {script}"
+            contract.contains("this image carries no glibc dynamic loader"),
+            "a missing loader must fail the bake with a legible message: {contract}"
+        );
+        assert!(contract.contains("NOPASSWD"), "{contract}");
+        assert!(
+            contract.contains("/home/runner/_work") && contract.contains("mkdir -p"),
+            "{contract}"
         );
         assert!(
-            !script.contains("|| true"),
-            "escalation and chown failures must stay observable: {script}"
-        );
-        // Official runner images ship rustup under the runner's $HOME while
-        // the exported contract points at /usr/local; without adopting it,
-        // every `cargo`/`rustup` invocation resolves an empty home. The apply
-        // half travels base64-encoded, so assert on the decoded text.
-        let decoded = script
-            .split("| base64 -d")
-            .filter_map(|part| {
-                let close = part.rfind('\'')?;
-                let open = part[..close].rfind('\'')?;
-                Some(part[open + 1..close].to_owned())
-            })
-            .filter_map(|blob| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(blob)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            decoded.contains("ln -s /home/runner/.rustup /usr/local/rustup"),
-            "the image's rustup home must be adopted: {decoded}"
+            contract.contains("/opt/hostedtoolcache")
+                && contract.contains("AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"),
+            "the tool cache must be writable and advertised to the runner: {contract}"
         );
         assert!(
-            decoded.contains("ln -s /home/runner/.cargo /usr/local/cargo"),
-            "the image's cargo home must be adopted: {decoded}"
+            contract.contains("RUNNER_TOOL_CACHE=/opt/hostedtoolcache"),
+            "{contract}"
+        );
+    }
+
+    /// One owner-only walk at golden build, never a recursive `chown`: on
+    /// overlayfs a recursive one copies every visited file out of the packed
+    /// lower layer into the per-VM upper (measured: 304 s and 1.22 GB to
+    /// re-group two inodes), and a group predicate would re-group files the
+    /// official images deliberately leave in another group — GitHub ships
+    /// `/home/runner/.docker` as `runner:docker`.
+    #[test]
+    fn golden_ownership_walks_only_the_mismatched_inodes() {
+        let ownership = golden_ownership_script(1001);
+        assert!(
+            ownership
+                .contains("find /home/runner -xdev ! -user 1001 -exec chown -h 1001:1001 {} +"),
+            "the walk must match on the owner alone and touch only those inodes: {ownership}"
         );
         assert!(
-            script.contains("/home/runner/.rustup/settings.toml"),
-            "adoption must be gated on a usable rustup home: {script}"
-        );
-        // A runner-owned root with root-owned descendants passes a top-level
-        // `stat` and then skips the recursive chown; the probe must descend.
-        assert!(
-            script.contains("find \"$d/.\" ! -uid 1001 -print -quit"),
-            "the ownership probe must be recursive: {script}"
+            !ownership.contains("chown -R"),
+            "no recursive chown may exist at golden build: {ownership}"
         );
         assert!(
-            script.contains("stat -L -c %u"),
-            "the probe must dereference an adopted symlink home: {script}"
+            !ownership.contains("! -group"),
+            "a runner-owned file in another group must be left alone: {ownership}"
         );
     }
 
@@ -9576,6 +9266,99 @@ done
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
+    /// The runner account name is interpolated unquoted into root-run guest
+    /// scripts and into the `sudoers.d` filename, so the only safe contract is
+    /// to refuse anything that is not a Linux account name.
+    #[test]
+    fn runner_account_names_are_restricted_to_account_syntax() {
+        for valid in ["runner", "root", "_preloop", "ci-runner", "runner2"] {
+            assert!(is_valid_account_name(valid), "{valid} must be allowed");
+        }
+        for invalid in [
+            "",
+            "Runner",
+            "1runner",
+            "-runner",
+            "run ner",
+            "runner;id",
+            "runner$(id)",
+            "runner`id`",
+            "../root",
+            "runner\nroot",
+            "runner:root",
+        ] {
+            assert!(
+                !is_valid_account_name(invalid),
+                "{invalid:?} must be refused: it reaches a root shell unquoted"
+            );
+        }
+
+        // And the pool refuses it before touching machine state.
+        // `validate` also checks the registration-token environment; seed the
+        // fixture so this test stays focused on the account-name contract.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let mut config = test_config(false);
+        config.runner_user = Some("runner;id".to_owned());
+        let error = config
+            .validate()
+            .expect_err("an injectable runner user must be refused");
+        let message = error.to_string();
+        assert!(message.contains("runner;id"), "{message}");
+        assert!(message.contains("account name"), "{message}");
+        // The default and the explicit root keep validating.
+        config.runner_user = Some(DEFAULT_RUNNER_USER.to_owned());
+        config
+            .validate()
+            .expect("the default account must validate");
+        config.runner_user = Some("root".to_owned());
+        config.validate().expect("root must validate");
+    }
+
+    /// `PRELOOP_RUNNER_USER=root` runs the runner as the guest's own user:
+    /// there is no account to create, no ownership to hand over, and moving a
+    /// would-be `root` account's home would leave the image broken.
+    #[test]
+    fn root_runner_user_skips_the_account_and_ownership_steps() {
+        let contract = golden_contract_script("root", DEFAULT_RUNNER_UID);
+        assert!(
+            !contract.contains("useradd"),
+            "root must not be created as an account: {contract}"
+        );
+        assert!(
+            !contract.contains("NOPASSWD"),
+            "root needs no sudoers entry: {contract}"
+        );
+        assert!(
+            !contract.contains("find /home/runner"),
+            "root owns nothing that needs handing over: {contract}"
+        );
+        // The glibc requirement is a property of the image, not the account.
+        assert!(contract.contains("no glibc dynamic loader"), "{contract}");
+    }
+
+    /// An account the image already carries must be *moved* to the configured
+    /// uid, not assumed to have it: the runtime drops to that uid, so an image
+    /// whose `runner` sits at 1000 would hand jobs a uid that owns nothing.
+    #[test]
+    fn existing_runner_accounts_are_reconciled_to_the_configured_uid() {
+        let script = runner_account_script("runner", 2000);
+        assert!(
+            script.contains(r#"if [ "$(id -u runner 2>/dev/null)" != "2000" ]; then"#),
+            "{script}"
+        );
+        assert!(script.contains("usermod -u 2000 runner"), "{script}");
+        // A refusal must not be silent, but must not fail the bake either: the
+        // account may be one the image manages.
+        assert!(
+            script.contains("could not move %s to uid %s"),
+            "a refused usermod must say so: {script}"
+        );
+        assert!(
+            !script.contains("exit 1"),
+            "the reconciliation is best-effort: {script}"
+        );
+    }
+
     #[test]
     fn rosetta_multiarch_script_parses_as_posix_sh() {
         // A spliced fragment ending in a newline once put `;` at the start of
@@ -9677,15 +9460,19 @@ done
                 "run_as_root_or_sudo_strict".to_owned(),
                 run_as_root_or_sudo_strict("true"),
             ),
+            (
+                "golden_contract_script".to_owned(),
+                golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+            ),
+            (
+                "golden_contract_script (root)".to_owned(),
+                golden_contract_script("root", DEFAULT_RUNNER_UID),
+            ),
+            (
+                "restore_apt_lists_script".to_owned(),
+                restore_apt_lists_script(),
+            ),
         ];
-        // The curated-bake scripts this list used to carry
-        // (`base_install_script`, `runner_ownership_reconcile_script`,
-        // `apt_lists_refresh_command`, the toolchain install/verify commands)
-        // exist only on this branch's lineage: the main lineage replaces them
-        // with the golden-contract scripts, so listing them here would break
-        // the test build on a merged tree. Add that lineage's
-        // `golden_contract_script` / `golden_ownership_script` /
-        // `golden_glibc_check_script` here when the merge happens.
 
         for (name, script) in &scripts {
             let output = std::process::Command::new(shell)
@@ -9941,7 +9728,7 @@ done
             config.clone(),
             0,
             shutdown.clone(),
-            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            Arc::new(GoldenCache::new(config.name_prefix.clone())),
             handles,
         ));
 
@@ -10143,10 +9930,8 @@ done
         RunnerPoolConfig {
             size: 1,
             use_fork: false,
-            use_packed_artifact: false,
             name_prefix: "lifecycle-test".to_owned(),
             base_image: "base-image".to_owned(),
-            workspace: None,
             artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
             release_version: "9.9.9".to_owned(),
             runner_bundle,
@@ -10199,6 +9984,7 @@ done
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 preserves_runtime_state_on_suspend: self.suspends,
+                file_packs: self.file_packs,
                 ..ProviderCapabilities::default()
             }
         }
@@ -10359,7 +10145,12 @@ done
         }
 
         async fn list(&self) -> Result<Vec<MachineName>, VmError> {
-            Ok(Vec::new())
+            self.machines
+                .lock()
+                .await
+                .keys()
+                .map(|name| MachineName::new(name.clone()))
+                .collect::<Result<Vec<_>, _>>()
         }
 
         async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
@@ -10468,7 +10259,18 @@ done
             Ok(())
         }
 
-        async fn pack(&self, _name: &MachineName, _output: &Path) -> Result<(), VmError> {
+        async fn pack(&self, _name: &MachineName, output: &Path) -> Result<(), VmError> {
+            // The real provider writes an ELF launcher at the output stem and
+            // the pack data in the `<stem>.smolmachine` sidecar, and a bake
+            // consumes the sidecar (`packed_golden_path`). A fake that wrote
+            // nothing would fail every bake with "did not create expected
+            // artifact".
+            let failed = |source: std::io::Error| VmError::Launch {
+                program: "smolvm".to_owned(),
+                source,
+            };
+            std::fs::write(output, b"launcher").map_err(failed)?;
+            std::fs::write(format!("{}.smolmachine", output.display()), b"pack").map_err(failed)?;
             Ok(())
         }
     }
@@ -10489,8 +10291,6 @@ done
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
-                toolchains: Vec::new(),
-                curated: true,
             },
             &CancellationToken::new(),
         )
@@ -10513,16 +10313,13 @@ done
 
     #[tokio::test]
     async fn provisioning_failures_delete_created_runner() {
+        // No `fail_install` case: the only install that used to run was the
+        // curated apt bake, and nothing is installed on a machine any more.
         let cases = [
             (
                 TestProvider::new(true, false, false, false, false),
                 false,
                 "start-failure",
-            ),
-            (
-                TestProvider::new(false, true, false, false, false),
-                true,
-                "install-failure",
             ),
             (
                 TestProvider::new(false, false, true, false, false),
@@ -10571,8 +10368,6 @@ done
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
-                toolchains: Vec::new(),
-                curated: true,
             },
             &CancellationToken::new(),
         )
@@ -10593,8 +10388,6 @@ done
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
-                toolchains: Vec::new(),
-                curated: true,
             },
             &CancellationToken::new(),
         )
@@ -10694,7 +10487,7 @@ done
                 1,
                 None,
                 &keys,
-                test_runner_environment("base-image", Vec::new(), true),
+                test_runner_environment("base-image"),
                 &shutdown,
             );
             if case.starts {
@@ -10782,7 +10575,7 @@ done
                     generation,
                     None,
                     &Arc::new(KeyPool::new()),
-                    test_runner_environment("base-image", Vec::new(), true),
+                    test_runner_environment("base-image"),
                     &shutdown,
                 )
                 .await
@@ -10908,29 +10701,24 @@ done
     fn packed_fork_config() -> RunnerPoolConfig {
         let mut config = test_config(false);
         config.use_fork = true;
-        config.use_packed_artifact = true;
         config
     }
 
-    fn test_runner_environment(
-        base: impl Into<String>,
-        toolchains: Vec<ToolchainLayer>,
-        curated: bool,
-    ) -> RunnerEnvironment {
+    fn test_runner_environment(base: impl Into<String>) -> RunnerEnvironment {
         RunnerEnvironment {
             fingerprint: None,
             base: base.into(),
-            toolchains,
-            curated,
         }
     }
 
-    /// A retained SmolVM checkpoint can become unusable after the packed
-    /// golden has been prepared. Retrying the same fork forever starves every
-    /// queued job, while creating a runner directly from the same packed
-    /// artifact remains valid.
+    /// A retained SmolVM checkpoint can become unusable after the golden has
+    /// been prepared. The pool re-arms it and retries the fork; when the base
+    /// still cannot fork, the provision fails. It must not create a machine
+    /// from the raw image: that machine carries neither the packed golden's
+    /// contents nor the runner contract, so it would register as a runner that
+    /// cannot run the job it was created for.
     #[tokio::test]
-    async fn packed_golden_fork_failure_falls_back_to_direct_creation() {
+    async fn unrecoverable_fork_base_failure_fails_the_provision() {
         // Verbatim from SmolVM 1.7.x: a spent fork base is reported through the
         // CLI's stderr, so the signature match is the only handle on it.
         const SPENT_BASE: &str = "smolvm fork failed with exit code 1: Freezing golden \
@@ -10961,41 +10749,25 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
-        .expect("a broken packed-golden fork falls back to direct creation");
+        .expect_err("an unrecoverable fork base must fail the provision");
 
         let events = provider.events().await;
         let fork = format!("fork:{}:{}", golden.as_str(), name.as_str());
-        let delete = format!("delete:{}", name.as_str());
-        let create = format!("create:{}", name.as_str());
-        let start = format!("start:{}", name.as_str());
-        let fork_index = events
-            .iter()
-            .position(|event| event == &fork)
-            .expect("fork was attempted first");
-        let delete_index = events
-            .iter()
-            .position(|event| event == &delete)
-            .expect("a partial clone was cleaned up");
-        let create_index = events
-            .iter()
-            .position(|event| event == &create)
-            .expect("runner was created from the packed artifact");
-        let start_index = events
-            .iter()
-            .position(|event| event == &start)
-            .expect("directly created runner was started");
         assert!(
-            fork_index < delete_index && delete_index < create_index && create_index < start_index,
-            "fallback order must be fork, cleanup, create, start: {events:?}"
+            events.iter().any(|event| event == &fork),
+            "the fork must have been attempted: {events:?}"
         );
-        assert!(provider.has_machine(&name).await);
+        assert!(
+            !events.iter().any(|event| event.starts_with("create:")),
+            "no machine may be created from a raw image as a fork fallback: {events:?}"
+        );
     }
 
     #[tokio::test]
-    async fn transient_packed_golden_fork_failure_retries_the_fork_before_direct_creation() {
+    async fn transient_fork_failure_retries_the_fork() {
         let provider =
             Arc::new(TestProvider::new(false, false, false, false, false).failing_fork_once());
         let config = packed_fork_config();
@@ -11008,7 +10780,7 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
         .expect("a transient fork failure recovers by forking again");
@@ -11022,7 +10794,7 @@ done
         );
         assert!(
             !events.contains(&format!("start:{}", name.as_str())),
-            "a recovered fork must not cold-boot the packed artifact: {events:?}"
+            "a recovered fork must not cold-boot the image: {events:?}"
         );
     }
 
@@ -11056,18 +10828,28 @@ done
     /// finished disk. A failed prune is best-effort and must not fail the
     /// golden — but the hook itself must fire exactly once per preparation.
     #[tokio::test]
-    async fn packed_golden_prepare_prunes_pack_intermediates() {
+    async fn golden_prepare_prunes_pack_intermediates() {
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         // Keep the golden fingerprint record off /tmp: the test only needs a
         // writable directory, not the hardcoded lifecycle paths.
         let scratch = tempfile::tempdir().expect("scratch dir");
         let mut config = packed_fork_config();
         config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"packed-golden").unwrap();
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
 
-        prepare_packed_golden(&provider, &config, &golden)
-            .await
-            .expect("packed golden preparation succeeds");
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("golden preparation succeeds");
 
         assert_eq!(
             *provider.prune_pack_calls.lock().await,
@@ -11083,18 +10865,28 @@ done
     }
 
     /// The prune hook must not fire when the golden never becomes forkable:
-    /// `prepare_packed_golden` returns before the hook on any earlier failure.
+    /// `prepare_fork_base` returns before the hook on any earlier failure.
     #[tokio::test]
-    async fn packed_golden_prepare_skips_prune_on_start_failure() {
+    async fn golden_prepare_skips_prune_on_start_failure() {
         let provider = Arc::new(TestProvider::new(true, false, false, false, false));
         let scratch = tempfile::tempdir().expect("scratch dir");
         let mut config = packed_fork_config();
         config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"packed-golden").unwrap();
         let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
 
-        prepare_packed_golden(&provider, &config, &golden)
-            .await
-            .expect_err("start failure aborts golden preparation");
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("start failure aborts golden preparation");
 
         assert!(
             provider.prune_pack_calls.lock().await.is_empty(),
@@ -11122,7 +10914,7 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
         .expect("the re-armed golden serves the fork");
@@ -11172,7 +10964,7 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
         .expect("the re-armed fingerprint-suffixed golden serves the fork");
@@ -11200,19 +10992,18 @@ done
         );
     }
 
-    /// A fingerprint-suffixed golden is an *environment* golden baked from
-    /// the job's requested image. When its fork fails and the pool falls
-    /// back to independent creation, the runner must boot that job's
-    /// environment — not the default packed artifact, which would run a
-    /// non-default `runs-on` job on the wrong operating system.
+    /// A fingerprint-suffixed golden is the memoized golden for a different
+    /// environment. When its fork fails unrecoverably the provision fails; the
+    /// pool must not boot *any* image directly as a substitute, because a
+    /// machine created from a raw image carries none of the golden's contents.
     #[tokio::test]
-    async fn fingerprint_golden_fork_failure_falls_back_to_the_job_environment() {
+    async fn fingerprint_golden_fork_failure_does_not_boot_a_substitute_image() {
         let provider =
             Arc::new(TestProvider::new(false, false, false, false, false).failing_fork());
         let config = packed_fork_config();
         let golden = MachineName::new("lifecycle-test-golden-3577f5d5a384").unwrap();
         let name = MachineName::new("lifecycle-test-0-9").unwrap();
-        let env = test_runner_environment("mirror.gcr.io/library/ubuntu:22.04", Vec::new(), true);
+        let env = test_runner_environment("mirror.gcr.io/library/ubuntu:22.04");
 
         provision_runner(
             &provider,
@@ -11223,26 +11014,23 @@ done
             &env,
         )
         .await
-        .expect("an env-golden fork failure falls back to the job environment");
+        .expect_err("an unrecoverable fork failure must propagate");
 
-        let created = provider
-            .created_image(&name)
-            .await
-            .expect("the fallback created the runner machine");
-        assert_eq!(
-            created, "mirror.gcr.io/library/ubuntu:22.04",
-            "an env-golden fallback must boot the job's requested image, not the default pack"
+        assert!(
+            provider.created_image(&name).await.is_none(),
+            "no machine may be created from a raw image as a fork fallback"
         );
     }
 
     /// A spent base that still has live clones must NOT be re-armed: resuming
-    /// it would corrupt the copy-on-write clones. The pool falls back to a
-    /// full create instead.
+    /// it would corrupt the copy-on-write clones. The pool waits for them to
+    /// drain; when they outlive the wait, the provision fails rather than
+    /// booting the image — the slot retries once the clones are gone.
     // Paused time: the drain loop sleeps GOLDEN_DRAIN_PROBE_DELAY between
     // probes; without this the 12-probe worst case would stall the test for
     // two minutes of real time.
     #[tokio::test(start_paused = true)]
-    async fn spent_fork_base_with_live_clones_is_not_rearmed() {
+    async fn spent_fork_base_with_live_clones_times_out_and_fails() {
         let provider = Arc::new(
             TestProvider::new(false, false, false, false, false)
                 .with_live_forks(true)
@@ -11258,10 +11046,10 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
-        .expect("falls back to direct creation");
+        .expect_err("a base that cannot be re-armed within the drain budget fails the provision");
 
         let events = provider.events().await;
         assert!(
@@ -11269,19 +11057,14 @@ done
             "the golden must not be touched while clones exist: {events:?}"
         );
         assert!(
-            events.contains(&format!("delete:{}", name.as_str())),
-            "the partial clone is cleaned up: {events:?}"
-        );
-        assert_eq!(
-            provider.created_image(&name).await.as_deref(),
-            Some(config.base_image.as_str()),
-            "a live clone makes the shared packed payload unsafe; fallback must use OCI"
+            !events.iter().any(|event| event.starts_with("create:")),
+            "no machine may be created from a raw image: {events:?}"
         );
     }
 
     /// A live clone that exits mid-drain must be re-armed once it is gone:
     /// the drain loop keeps probing with backoff, and the golden resumes
-    /// serving forks instead of falling back to slow direct creation.
+    /// serving forks without booting the image.
     /// Paused time advances the probe sleeps instantly.
     #[tokio::test(start_paused = true)]
     async fn spent_fork_base_with_clone_that_drains_is_rearmed_and_retried() {
@@ -11301,7 +11084,7 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
         .expect("the re-armed golden serves the fork after the clone drains");
@@ -11332,9 +11115,10 @@ done
 
     /// The provider reports a live clone before invoking SmolVM for another
     /// plain fork. The orchestrator must neither re-arm the shared golden nor
-    /// instantiate the packed payload beside that clone.
+    /// instantiate any machine beside that clone — the clone owns the base's
+    /// frozen storage and no image boot may stand in for the fork.
     #[tokio::test]
-    async fn busy_packed_fork_base_uses_independent_environment_image() {
+    async fn busy_packed_fork_base_fails_without_touching_the_golden() {
         let provider =
             Arc::new(TestProvider::new(false, false, false, false, false).with_busy_fork_base());
         let config = packed_fork_config();
@@ -11348,20 +11132,19 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(environment_base, Vec::new(), true),
+            &test_runner_environment(environment_base),
         )
         .await
-        .expect("a busy plain-fork base falls back to an independent OCI machine");
+        .expect_err("a busy plain-fork base fails the provision");
 
         let events = provider.events().await;
         assert!(
             !events.iter().any(|event| event.starts_with("rearm:")),
             "a golden with a live clone must not be re-armed: {events:?}"
         );
-        assert_eq!(
-            provider.created_image(&name).await.as_deref(),
-            Some(environment_base),
-            "fallback must use the job's resolved environment, not the shared packed payload"
+        assert!(
+            provider.created_image(&name).await.is_none(),
+            "no machine may be created from an image as a fork fallback: {events:?}"
         );
     }
 
@@ -11384,10 +11167,10 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+            &test_runner_environment(config.base_image.clone()),
         )
         .await
-        .expect("falls back to direct creation");
+        .expect_err("a base that cannot even be cleaned up fails the provision");
 
         let events = provider.events().await;
         assert!(
@@ -11397,9 +11180,8 @@ done
     }
 
     /// An environment-specific golden may represent a different `runs-on`
-    /// image from the packed artifact. Falling back there would run the job
-    /// on the wrong operating system, so only the default packed golden may
-    /// take the direct-create recovery path.
+    /// image from the packed artifact, so no fork failure may substitute a
+    /// machine booted from a raw image.
     #[tokio::test]
     async fn environment_golden_fork_failure_does_not_change_the_job_image() {
         let provider =
@@ -11414,7 +11196,7 @@ done
             &name,
             Some(&golden),
             &Arc::new(KeyPool::new()),
-            &test_runner_environment("mirror.gcr.io/library/ubuntu:22.04", Vec::new(), true),
+            &test_runner_environment("mirror.gcr.io/library/ubuntu:22.04"),
         )
         .await
         .expect_err("an environment-golden fork failure must propagate");
@@ -11426,37 +11208,6 @@ done
                 .iter()
                 .any(|event| event == &format!("create:{}", name.as_str())),
             "must not replace an environment-specific image with the default pack: {events:?}"
-        );
-    }
-
-    /// A pack published before the baseline stopped wiping `/var/lib/apt/lists`
-    /// boots without apt indices, and `sudo apt-get install <pkg>` — how real
-    /// workflows install system packages — then resolves nothing.
-    #[tokio::test]
-    async fn packed_golden_fork_restores_apt_indices() {
-        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
-        let config = packed_fork_config();
-        let golden = MachineName::new("lifecycle-test-golden").unwrap();
-        let name = MachineName::new("lifecycle-test-0-3").unwrap();
-
-        provision_runner(
-            &provider,
-            &config,
-            &name,
-            Some(&golden),
-            &Arc::new(KeyPool::new()),
-            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
-        )
-        .await
-        .expect("provisioning succeeds");
-
-        let events = provider.events().await;
-        assert!(
-            events.iter().any(|event| event.contains("_Packages")
-                && event.contains("apt-get")
-                && event.contains("update")
-                && event.contains("timeout 120")),
-            "the fork must restore apt indices when the pack has none: {events:?}"
         );
     }
 
@@ -11541,7 +11292,7 @@ done
         );
     }
 
-    /// An adopted golden never went through `prepare_packed_golden`, so the
+    /// An adopted golden never went through `prepare_fork_base`, so the
     /// #295 pack/ prune must fire on the adopt path too — otherwise a golden
     /// carried across restarts keeps its intermediates forever and every
     /// fork copies them.
@@ -11622,6 +11373,190 @@ done
         assert!(goldens.is_dir(), "goldens/ record dir survives");
     }
 
+    /// Earlier releases keyed the payload on the stock Ubuntu base they baked
+    /// from. No fingerprint rotation under the current stem reaches those
+    /// files, so the sweep names them itself — and only them: another image's
+    /// payload, a hand-named file and an unknown architecture stay.
+    #[tokio::test]
+    async fn sweep_stale_artifacts_removes_payloads_of_retired_stock_stems() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-preloop-official-golden-aarch64");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(
+            Arc::new(TestProvider::new(false, false, false, false, false)),
+            config.clone(),
+        )
+        .expect("pool config validates");
+
+        let current = config.artifact_payload();
+        std::fs::write(&current, b"current").unwrap();
+        let retired = [
+            format!(
+                "preloop-mirror.gcr.io-library-ubuntu-24.04-sha256-{:064x}-aarch64-{:064x}",
+                1, 2
+            ),
+            format!("preloop-ubuntu-24.04-aarch64-{:064x}", 3),
+            format!("preloop-ubuntu-22.04-sha256-{:064x}-x86_64-{:064x}", 4, 5),
+        ];
+        let kept = [
+            format!(
+                "preloop-ghcr.io-acme-runner-images-ubuntu24-aarch64-{:064x}",
+                6
+            ),
+            "preloop-ubuntu-24.04-aarch64-notes.txt".to_owned(),
+            format!("preloop-ubuntu-24.04-armv7-{:064x}", 7),
+            format!("preloop-ubuntu-20.04-aarch64-{:064x}", 8),
+        ];
+        for name in retired.iter().chain(kept.iter()) {
+            std::fs::write(vms.join(name), b"payload").unwrap();
+        }
+
+        pool.sweep_stale_artifacts().await;
+
+        assert!(current.is_file(), "current payload survives");
+        for name in &retired {
+            assert!(!vms.join(name).exists(), "{name} is swept");
+        }
+        for name in &kept {
+            assert!(vms.join(name).is_file(), "{name} survives");
+        }
+    }
+
+    /// A suffixed golden record protects its machine from the startup cleanup
+    /// so adoption can reuse it — but only while some environment can still
+    /// resolve to that golden. The per-`runs-on` goldens of earlier releases
+    /// are recorded too and nothing prepares them again, so they must go, with
+    /// their records; the plain golden and the goldens of the two current
+    /// environments stay.
+    #[tokio::test]
+    async fn startup_cleanup_removes_goldens_no_environment_resolves_to() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-image-aarch64");
+        config.base_image = "ghcr.io/acme/runner-images:custom".to_owned();
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let pool =
+            RunnerPool::new(provider.clone(), config.clone()).expect("pool config validates");
+
+        let prefix = plain_packed_golden_name(&config);
+        let official =
+            EnvironmentSpec::for_base(crate::environment::OFFICIAL_GOLDEN.to_owned()).fingerprint;
+        let configured = EnvironmentSpec::for_base(config.base_image.clone()).fingerprint;
+        let plain = prefix.clone();
+        let official_golden = format!("{prefix}-{}", &official[..12]);
+        let configured_golden = format!("{prefix}-{}", &configured[..12]);
+        let retired_golden = format!("{prefix}-aaaaaaaaaaaa");
+        for name in [
+            &plain,
+            &official_golden,
+            &configured_golden,
+            &retired_golden,
+        ] {
+            let name = MachineName::new(name.clone()).unwrap();
+            provider
+                .create(&MachineSpec {
+                    name: name.clone(),
+                    image: "ubuntu".to_owned(),
+                    cpus: 1,
+                    memory_mib: 512,
+                    storage_gib: 1,
+                    overlay_gib: Some(1),
+                    network: NetworkPolicy::PublicOnly,
+                    volumes: Vec::new(),
+                    sockets: Vec::new(),
+                    dns: None,
+                    rosetta: false,
+                })
+                .await
+                .unwrap();
+            write_golden_record(&config, &name, "fp");
+        }
+
+        pool.remove_stale_runner_machines().await.unwrap();
+
+        let left: Vec<String> = provider
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        for kept in [&plain, &official_golden, &configured_golden] {
+            assert!(left.contains(kept), "{kept} is still reachable: {left:?}");
+            let name = MachineName::new(kept.clone()).unwrap();
+            assert!(
+                golden_record_path(&config, &name).unwrap().is_file(),
+                "{kept} keeps its record"
+            );
+        }
+        assert!(
+            !left.contains(&retired_golden),
+            "an unreachable golden is deleted: {left:?}"
+        );
+        let name = MachineName::new(retired_golden).unwrap();
+        assert!(
+            !golden_record_path(&config, &name).unwrap().exists(),
+            "its record goes with it"
+        );
+    }
+
+    /// The restore must not touch a golden that already has indices (it would
+    /// repay a download for nothing) and must refresh one that has none. Run
+    /// against a stub `apt-get` so only the decision is under test.
+    #[cfg(unix)]
+    #[test]
+    fn restore_apt_lists_refreshes_only_a_golden_without_indices() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = temp.path().join("apt-called");
+        let stub = bin.join("apt-get");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |lists: &Path| {
+            let script = restore_apt_lists_script_at(lists.to_str().unwrap());
+            let path = format!("{}:/usr/bin:/bin", bin.display());
+            let status = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("PATH", path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "the restore never fails the golden");
+        };
+
+        let empty = temp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        run(&empty);
+        let called = std::fs::read_to_string(&marker).expect("an empty lists dir is refreshed");
+        assert!(called.contains("update"), "{called}");
+
+        std::fs::remove_file(&marker).unwrap();
+        let populated = temp.path().join("populated");
+        std::fs::create_dir_all(&populated).unwrap();
+        std::fs::write(
+            populated.join("archive.ubuntu.com_ubuntu_dists_noble_main_binary-amd64_Packages"),
+            b"x",
+        )
+        .unwrap();
+        run(&populated);
+        assert!(!marker.exists(), "a golden with indices is left alone");
+    }
+
     /// A `.tmp-golden-*` staging file with a fresh companion lock must survive
     /// the startup sweep, so concurrent pools sharing the artifact directory
     /// cannot delete each other's in-flight bakes or downloads. A stale lock
@@ -11694,8 +11629,6 @@ done
             RunnerEnvironment {
                 fingerprint: None,
                 base: config.base_image.clone(),
-                toolchains: Vec::new(),
-                curated: true,
             },
             &CancellationToken::new(),
         )
@@ -11715,8 +11648,6 @@ done
                 environment: RunnerEnvironment {
                     fingerprint: None,
                     base: config.base_image.clone(),
-                    toolchains: Vec::new(),
-                    curated: true,
                 },
                 idle: &idle,
                 keys: &Arc::new(KeyPool::new()),
@@ -11753,7 +11684,7 @@ done
             config.clone(),
             0,
             CancellationToken::new(),
-            Arc::new(GoldenRegistry::new(config.name_prefix.clone())),
+            Arc::new(GoldenCache::new(config.name_prefix.clone())),
             handles,
             Arc::new(std::sync::Mutex::new(0)),
             Arc::new(tokio::sync::Semaphore::new(1)),
@@ -11775,60 +11706,113 @@ done
         );
     }
 
-    /// A custom base image is the operator's contract: the golden must not
-    /// receive Preloop's curated bake. Stock bases still get it.
+    /// A configured image is baked as-is plus the runner contract: the
+    /// contract runs once, through the root-or-sudo hop (an arbitrary image may
+    /// declare `USER`), and nothing else is installed.
+    ///
+    /// Exercised through `apply_golden_contract` rather than the whole bake:
+    /// the full path gates on the host's free disk (`ensure_disk_for_golden_build`
+    /// wants the builder disk plus pack staging free), which a unit test must
+    /// not depend on.
     #[tokio::test]
-    async fn custom_base_golden_skips_the_curated_bake() {
+    async fn configured_image_contract_runs_once_without_installing_anything() {
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         let config = test_config(false);
-        let golden = MachineName::new("lifecycle-test-nobake-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-builder").unwrap();
 
-        let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
-        assert!(!custom.curated);
-        prepare_golden_for_env(&provider, &config, &golden, &custom)
+        apply_golden_contract(provider.as_ref(), &config, &name)
             .await
-            .expect("custom base golden provision succeeds");
-        let custom_events = provider.events().await;
-        assert!(
-            !custom_events.iter().any(|event| event.contains("apt-get")),
-            "a custom base golden must not run the curated apt bake: {custom_events:?}"
-        );
-
-        let stock = EnvironmentSpec::for_base(crate::environment::UBUNTU_24_04_PIN.to_owned());
-        assert!(stock.curated);
-        prepare_golden_for_env(&provider, &config, &golden, &stock)
-            .await
-            .expect("stock base golden provision succeeds");
-        let stock_events = provider.events().await;
-        assert!(
-            stock_events.iter().any(|event| event.contains("apt-get")),
-            "a stock base golden must run the curated apt bake"
-        );
-    }
-
-    /// Direct (no-golden) provisioning of a custom base must not run the
-    /// curated apt bake either — the image is the operator's contract.
-    #[tokio::test]
-    async fn custom_base_direct_provision_skips_the_curated_bake() {
-        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
-        let config = test_config(false);
-        let name = MachineName::new("lifecycle-test-nobake-direct").unwrap();
-
-        provision_runner(
-            &provider,
-            &config,
-            &name,
-            None,
-            &Arc::new(KeyPool::new()),
-            &test_runner_environment("ghcr.io/acme/runner:latest", Vec::new(), false),
-        )
-        .await
-        .expect("custom base provisioning succeeds");
+            .expect("the contract applies to the image as-is");
 
         let events = provider.events().await;
         assert!(
-            !events.iter().any(|event| event.contains("apt-get")),
-            "a custom base must not receive the curated apt bake: {events:?}"
+            !events.iter().any(|event| event.contains("apt-get install")),
+            "a configured image must never receive a package install: {events:?}"
+        );
+        // The contract travels base64-encoded inside the root-or-sudo wrapper,
+        // which is what makes it work whether the exec lands as root or as an
+        // image-declared user with passwordless sudo.
+        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_script(
+            DEFAULT_RUNNER_USER,
+            DEFAULT_RUNNER_UID,
+        ));
+        assert!(
+            events.iter().any(|event| event.contains(&contract)),
+            "the golden contract must run on the builder: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| event.contains("sudo -n sh")),
+            "the wrapper must escalate when the exec is not root: {events:?}"
+        );
+    }
+
+    /// The official golden is published packed — there is nothing to bake it
+    /// from, and the deleted curated path is not a fallback. `build-golden`
+    /// must refuse it instead of producing a substitute image.
+    #[tokio::test]
+    async fn official_golden_cannot_be_built_locally() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let mut config = test_config(false);
+        config.base_image = crate::environment::OFFICIAL_GOLDEN.to_owned();
+        // SAFETY: test-only env for config validation; the pool never serves.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(provider.clone(), config).unwrap();
+
+        let error = pool
+            .rebuild_artifact()
+            .await
+            .expect_err("the official golden is not buildable locally");
+
+        assert!(error.to_string().contains("published packed"), "{error}");
+        assert!(
+            provider.created_images.lock().await.is_empty(),
+            "no builder VM may be booted for the official golden"
+        );
+    }
+
+    /// A backend without host-side packs (AgentENV) has no artifact to unpack,
+    /// so the golden is prepared in-guest: boot the image, apply the contract,
+    /// and freeze the result as the fork base.
+    #[tokio::test]
+    async fn imageless_backend_bakes_the_golden_in_guest() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false).no_packs());
+        let mut config = test_config(false);
+        config.base_image = "ghcr.io/acme/runner:latest".to_owned();
+        let golden = MachineName::new("lifecycle-test-nopack-golden").unwrap();
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the in-guest golden preparation succeeds");
+
+        let created = provider.created_images.lock().await.clone();
+        assert!(
+            created
+                .iter()
+                .any(|(name, image)| name == golden.as_str()
+                    && image == "ghcr.io/acme/runner:latest"),
+            "the golden must boot the configured image: {created:?}"
+        );
+        let events = provider.events().await;
+        assert!(
+            events.iter().any(|event| event
+                .contains(&format!("start_forkable:{}", golden.as_str()))
+                || event.contains(&format!("start:{}", golden.as_str()))),
+            "the golden must be frozen as the fork base: {events:?}"
+        );
+        let contract = base64::engine::general_purpose::STANDARD.encode(golden_contract_script(
+            DEFAULT_RUNNER_USER,
+            DEFAULT_RUNNER_UID,
+        ));
+        assert!(
+            events.iter().any(|event| event.contains(&contract)),
+            "the contract must be applied in the guest: {events:?}"
         );
     }
 }
@@ -11879,16 +11863,23 @@ mod golden_download_tests {
     }
 
     #[test]
-    fn custom_base_without_golden_url_does_not_adopt_stock_release() {
-        assert!(should_download_prebaked_golden("ubuntu:24.04", false));
-        assert!(!should_download_prebaked_golden(
-            "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64",
-            false
+    fn only_the_official_golden_is_downloaded() {
+        // The official sentinel is fetched (from the OCI reference or the
+        // release asset); a configured image is baked locally instead, with or
+        // without a PRELOOP_GOLDEN_URL mirror in the environment.
+        assert!(crate::environment::is_official_golden(
+            crate::environment::OFFICIAL_GOLDEN
         ));
-        assert!(should_download_prebaked_golden(
+        for configured in [
             "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64",
-            true
-        ));
+            "ubuntu:24.04",
+            "debian:bookworm-slim",
+        ] {
+            assert!(
+                !crate::environment::is_official_golden(configured),
+                "{configured} must not be mistaken for the official golden"
+            );
+        }
     }
 
     /// Answers exactly one request with `head` followed by `body`, then closes
@@ -11908,9 +11899,10 @@ mod golden_download_tests {
         format!("http://{address}/golden")
     }
 
-    /// Answers the payload request, then one more connection with
-    /// `checksum_body` (the `.sha256` companion). Used to exercise the
-    /// checksum verification path.
+    /// Answers the payload and checksum requests in either order. Keeping the
+    /// responses path-directed lets the client fetch the sidecar before or
+    /// after probing the payload without coupling the fixture to connection
+    /// reuse details.
     async fn serve_with_checksum(
         payload_head: String,
         payload_body: Vec<u8>,
@@ -11919,21 +11911,23 @@ mod golden_download_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            for (head, body) in [
-                (payload_head, payload_body),
-                (
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        checksum_body.len()
-                    ),
-                    checksum_body,
-                ),
-            ] {
+            let checksum_head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                checksum_body.len()
+            );
+            for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 1024];
-                let _ = socket.read(&mut request).await;
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let is_checksum =
+                    String::from_utf8_lossy(&request[..read]).contains("GET /golden.sha256 ");
+                let (head, body) = if is_checksum {
+                    (&checksum_head, &checksum_body)
+                } else {
+                    (&payload_head, &payload_body)
+                };
                 let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(&body).await;
+                let _ = socket.write_all(body).await;
                 let _ = socket.shutdown().await;
             }
         });
@@ -11957,9 +11951,15 @@ mod golden_download_tests {
         // Larger than any single chunk hyper will hand back, so the loop has to
         // append across iterations to reproduce the body.
         let body: Vec<u8> = (0..4_u32 * 1024 * 1024).map(|i| i as u8).collect();
-        let url = serve_once(
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(&body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = serve_with_checksum(
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
             body.clone(),
+            format!("{digest}  golden\n").into_bytes(),
         )
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
@@ -11980,9 +11980,10 @@ mod golden_download_tests {
         let directory = tempfile::tempdir().unwrap();
         let payload = directory.path().join("golden.smolmachine");
         let expected_bytes = 512 * 1024;
-        let url = serve_once(
+        let url = serve_with_checksum(
             format!("HTTP/1.1 200 OK\r\nContent-Length: {expected_bytes}\r\n\r\n"),
             Vec::new(),
+            format!("{}  golden\n", "00".repeat(32)).into_bytes(),
         )
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
@@ -12257,24 +12258,16 @@ mod golden_download_tests {
 }
 
 #[cfg(test)]
-mod golden_registry_tests {
+mod golden_cache_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-
-    #[test]
-    fn packed_failure_disables_secondary_environment_bakes() {
-        let registry = GoldenRegistry::new("test".to_owned());
-        assert!(!registry.is_packed_disabled());
-        registry.disable_packed();
-        assert!(registry.is_packed_disabled());
-    }
 
     /// Distinct environments must build concurrently: one fingerprint's bake
     /// must not park other slots (the pre-freeze `build_lock` behavior).
     #[tokio::test]
     async fn distinct_fingerprints_build_concurrently() {
-        let registry = GoldenRegistry::new("test".to_owned());
+        let registry = GoldenCache::new("test".to_owned());
         let started = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));
@@ -12312,7 +12305,7 @@ mod golden_registry_tests {
     /// the first caller's golden via the re-check.
     #[tokio::test]
     async fn same_fingerprint_builds_once() {
-        let registry = GoldenRegistry::new("test".to_owned());
+        let registry = GoldenCache::new("test".to_owned());
         let builds = Arc::new(AtomicUsize::new(0));
         let build = |builds: Arc<AtomicUsize>| async move {
             builds.fetch_add(1, Ordering::SeqCst);

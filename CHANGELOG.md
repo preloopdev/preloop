@@ -8,6 +8,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **One golden source: the official packed golden, or the image you
+  configured.** `runs-on: ubuntu-latest`/`ubuntu-24.04` — and any pooled
+  environment with no image configured — now resolve to the published packed
+  golden, downloaded per architecture from a digest-pinned OCI reference
+  (`PRELOOP_GOLDEN_OCI_REF` overrides it; `PRELOOP_GOLDEN_URL` still selects a
+  release-asset mirror) and installed only after its checksum (release asset)
+  or layer digest (OCI) matches. The transfer resumes from a `.partial` file
+  across retries and engine restarts, and a download that cannot complete
+  fails the job: there is no local bake and no stock-Ubuntu fallback behind it.
+  `ubuntu-22.04` now maps nowhere and keeps the configured image instead of
+  silently selecting a 24.04 base.
+
+  The curated stock bake is deleted with it: no toolchain layers
+  (Rust/Go/Python/Node), no `base_install_script`, no apt package pins or
+  index-freshness marker (and no weekly `apt-indices-refresh` workflow), no
+  goldens baked per `runs-on` environment, no local bake from stock Ubuntu and
+  no direct-create fallback when the packed artifact is unavailable.
+  `PRELOOP_USE_PACKED_GOLDEN` is gone — a file-pack backend always uses a
+  packed golden — and the pool holds one golden per pool environment and forks
+  it per job.
+
+  A configured image (`PRELOOP_RUNNER_BASE_IMAGE`, or the `[golden]
+  base_image` that `preloop init` records) is now used exactly as it is.
+  Preloop adds only the GitHub-runner machinery at golden build: a `runner`
+  account (uid 1001) with its home, `_work` and passwordless sudo unless the
+  image already has them; an owner-only ownership walk over the runner home
+  (`find … ! -user 1001 -exec chown -h 1001:1001 {} +`, which leaves a
+  runner-owned file's group alone); a writable `/opt/hostedtoolcache` with
+  `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`; and the
+  `/etc/preloop-bake.json` build record. The only checked requirement is a
+  glibc dynamic loader — a missing `bash`, `git` or `docker` fails the step
+  that needs it, exactly as on GitHub-hosted runners. `preloop build-golden`
+  takes the image it bakes (`--base-image <ref>`, or the configured image when
+  the flag is absent); the official golden is published packed and cannot be
+  built locally.
+
+  Guest `PATH`, `RUSTUP_HOME` and `CARGO_HOME` overrides are gone: the guest
+  runner's PATH is the system PATH, and tool versions come from the workflow's
+  `setup-*` actions, as they do on GitHub.
+
+- **A golden is keyed by everything that changes it.** The official golden's
+  fingerprint now covers the source this host would fetch it from
+  (`PRELOOP_GOLDEN_OCI_REF` or the `PRELOOP_GOLDEN_URL` mirror), so changing
+  the mirror re-fetches instead of serving the previous pack forever; a
+  configured image's fingerprint covers its effective runner account, so
+  changing `PRELOOP_RUNNER_USER`/`_UID` rebuilds instead of adopting a golden
+  baked for the account before it. A backend that cannot restore packs
+  (AgentENV) boots the pinned official runner image for the official golden —
+  the sentinel itself is not an image — and an unconfigured pool no longer
+  fails to start there.
+
+- **Leftovers of earlier releases are cleaned up at startup.** Packed-golden
+  payloads keyed on the retired stock Ubuntu bases
+  (`preloop-[mirror.gcr.io-library-]ubuntu-{24.04,22.04}[-sha256-…]-<arch>-<fingerprint>`)
+  live under a stem this release no longer produces, so no fingerprint
+  rotation would ever reach them; the startup sweep now removes them. Goldens
+  prepared per `runs-on` environment (`<prefix>-golden-<fingerprint12>`) keep
+  their fingerprint record, which exempted them from the stale-machine
+  cleanup; one that neither the official golden nor the configured image
+  resolves to is now deleted with its record.
+
+- **Apt indices are baked into the golden.** The runner-image dump ships with
+  `/var/lib/apt/lists` wiped, and a workflow's `sudo apt-get install <pkg>`
+  with no `apt-get update` first (uv's musl cell) fails with `E: Unable to
+  locate package`. The golden contract now refreshes the indices at build, and
+  an unpacked pack that has none is refreshed once before it is frozen, so
+  forks inherit them. Also fixes `golden_contract_script("root", …)`, which
+  rendered `; ;` and did not parse as `sh`.
+
+- **The guest runner inherits the image's environment.** It is launched
+  through a shell that sources `/etc/environment`, so the PATH a step sees is
+  the image's own — the tools a hosted image preinstalls keep resolving —
+  while the pool's variables are re-asserted afterwards. An image that
+  already carries a `runner` account at another uid now has that account moved
+  to the configured uid instead of running jobs as a uid that owns nothing.
+  The Rosetta amd64 install is no longer fatal for a configured image without
+  apt: the bake warns that x86_64 binaries will not run instead of refusing an
+  otherwise usable image.
+
+- **Stopping the engine no longer waits for a golden transfer.**
+  `prepare_fork_base` checks the shutdown token before starting a download or
+  bake, so a restart during the warm returns promptly; the transfer resumes on
+  the next start.
+
+### Security
+
+- **The golden's runner account name is validated** before it reaches the
+  root-run bake scripts and the `sudoers.d` filename: anything that is not a
+  Linux account name (or `root`) is refused, closing a shell-injection hole
+  for a hostile or mistyped `PRELOOP_RUNNER_USER`.
+
+- **A `PRELOOP_GOLDEN_URL` mirror must be verifiable.** Its bytes become the
+  image every job runs, so an unverified payload is now refused: the mirror
+  must publish `<asset>.sha256` or the host must pin the digest with
+  `PRELOOP_GOLDEN_SHA256`. The engine's own release assets keep the previous
+  tolerated-with-a-warning behavior.
 ### Added
 - In-place reruns now persist `jobs.request_id` and copy it into
   per-attempt `job_history`, preserving log/step/artifact resolution for
