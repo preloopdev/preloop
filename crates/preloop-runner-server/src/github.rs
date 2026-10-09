@@ -3373,6 +3373,11 @@ async fn process_check_run_rerequest(
         }
     }
 
+    let rerequest_sender = payload
+        .get("sender")
+        .and_then(|sender| sender.get("login"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
     let accepted = crate::rerun_run_with_mode(
         shared,
         run_id,
