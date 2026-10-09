@@ -374,6 +374,11 @@ pub struct WorkflowSubmission {
     /// configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prebuilt_merge: Option<PrebuiltMerge>,
+    /// Identifier returned by the hosted bundle upload endpoint. The engine
+    /// consumes the bundle into an isolated checkout before queueing the run;
+    /// the identifier is not a filesystem path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_bundle_id: Option<String>,
 }
 
 impl WorkflowSubmission {

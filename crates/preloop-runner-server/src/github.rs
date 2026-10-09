@@ -3790,18 +3790,25 @@ async fn process_delivery_payload_with_lease(
                 debug_on_failure: false,
                 push: None,
                 push_tree: None,
-                no_merge: false,
+                // Webhook pull-request payloads already identify GitHub's
+                // merge/head tree; never rebuild a local merge from the
+                // server workspace (which may intentionally have no origin).
+                no_merge: effective.event == "pull_request",
                 prebuilt_merge: None,
+                git_bundle_id: None,
             };
 
-            // The dedup gate decides whether a run may be submitted at all.
-            // A failed read must abort the delivery (GitHub redelivers), not
-            // fall through to submitting: `None` would re-run CI on the exact
-            // commit push-back already tested and published.
+            // Pull-request workflows check out the merge commit but GitHub
+            // delivers the echo for the head commit. Match the status-check
+            // SHA first so push-back on that head suppresses the PR echo too.
+            let echo_sha = submission
+                .status_check_sha
+                .as_deref()
+                .unwrap_or(&submission.sha);
             let tested_by = match crate::github_push::already_published(
                 shared,
                 &repo_full_name,
-                &submission.sha,
+                echo_sha,
                 submission.workflow_path.as_deref().unwrap_or_default(),
             )
             .await
@@ -3810,7 +3817,7 @@ async fn process_delivery_payload_with_lease(
                 Err(error) => {
                     error!(
                         ?error,
-                        sha = %submission.sha,
+                        sha = %echo_sha,
                         "failed to read push-back publication state; refusing to submit a possible duplicate"
                     );
                     return WebhookOutcome::TransientError(format!(
@@ -3821,7 +3828,7 @@ async fn process_delivery_payload_with_lease(
             if let Some(tested_by) = tested_by {
                 info!(
                     workflow = %filename,
-                    sha = %submission.sha,
+                    sha = %echo_sha,
                     run_id = %tested_by,
                     "skipping webhook run: this commit was already tested and published by push-back"
                 );

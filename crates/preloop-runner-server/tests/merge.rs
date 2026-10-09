@@ -11,8 +11,8 @@ mod common;
 use common::*;
 
 use preloop_runner_server::merge_builder::{
-    MergeError, MergeHead, MergeOutcome, MergeRequest, MergeSource, attach_prebuilt_merge,
-    build_merge, prebuilt_merge_record, webhook_merge_source,
+    MergeError, MergeHead, MergeOutcome, MergeRequest, attach_prebuilt_merge, build_merge,
+    prebuilt_merge_record, webhook_merge_source,
 };
 use std::path::{Path, PathBuf};
 
@@ -358,6 +358,85 @@ async fn push_events_never_merge() {
         .expect("run record");
     assert_eq!(record.github["sha"], serde_json::json!(fixture.head));
     assert!(record.workspace_snapshot.as_ref().unwrap().merge.is_none());
+}
+/// An uploaded commit bundle supplies both the dirty head and the base branch
+/// used to build a hosted pull-request test merge.
+#[tokio::test]
+async fn hosted_bundle_submission_merges_the_uploaded_dirty_commit() {
+    let fixture = MergeFixture::clean();
+    let (state, app) = fixture.app().await;
+    std::fs::write(fixture.workspace.join("hosted-dirty.txt"), "uploaded\n").unwrap();
+    git(&fixture.workspace, &["add", "-A"]);
+    let tree = git(&fixture.workspace, &["write-tree"]);
+    let head = git(
+        &fixture.workspace,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &fixture.head,
+            "-m",
+            "hosted submit",
+        ],
+    );
+    git(
+        &fixture.workspace,
+        &["update-ref", "refs/preloop/submit/test", &head],
+    );
+    let bundle_path = fixture.temp.path().join("hosted.bundle");
+    git(
+        &fixture.workspace,
+        &["bundle", "create", bundle_path.to_str().unwrap(), "--all"],
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/bundles")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(std::fs::read(bundle_path).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let mut submission = fixture.submission(false);
+    submission["sha"] = serde_json::json!(head);
+    submission["git_bundle_id"] = accepted["bundle_id"].clone();
+    let accepted_run = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
+    let run_id = accepted_run["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let record = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .expect("run record");
+    let snapshot = record.workspace_snapshot.as_ref().expect("bundle snapshot");
+    let merge = snapshot.merge.as_ref().expect("hosted PR merge");
+    assert_eq!(merge.base_sha, fixture.base);
+    assert_eq!(merge.head_sha, head);
+    assert_eq!(record.github["sha"], serde_json::json!(merge.sha));
+    assert!(
+        queued_message_for(&inner, run_id)
+            .preloop_snapshot_origin_rewrite
+            .is_some()
+    );
+    let served = fixture.state_dir.join("snapshots").join(run_id);
+    assert_eq!(
+        git(&served, &["log", "--format=%P", "-1", &merge.sha]),
+        format!("{} {head}", fixture.base)
+    );
+    assert_eq!(
+        git(
+            &served,
+            &["show", &format!("{}:hosted-dirty.txt", merge.sha)]
+        ),
+        "uploaded"
+    );
 }
 
 /// The shared builder contract: fetch + merge + serve, deterministic, and the

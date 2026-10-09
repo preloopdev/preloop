@@ -2145,7 +2145,11 @@ pub async fn submit_run(
     // Native callers cannot establish webhook provenance. Never allow a
     // request body to select the trust tier used by auto-PR and secret policy;
     // only the GitHub webhook adapters may stamp this field.
-    submission.trust_tier = None;
+    if let Some(bundle_id) = submission.git_bundle_id.clone() {
+        let workspace =
+            crate::bundles::materialize_bundle(&shared, &bundle_id, &submission.sha).await?;
+        submission.local_workspace = Some(workspace.to_string_lossy().into_owned());
+    }
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())

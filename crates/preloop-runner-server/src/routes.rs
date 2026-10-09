@@ -569,6 +569,15 @@ pub fn build_app(
                 .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
+            "/api/v1/bundles",
+            post(crate::bundles::upload_bundle)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                ))
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
             "/api/v1/secrets",
             get(list_secrets).route_layer(middleware::from_fn_with_state(
                 shared.clone(),

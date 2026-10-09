@@ -26,6 +26,9 @@ Releases before v0.27.0 predate the changelog.
   testing a different tree. `--no-merge` restores testing the branch alone,
   and `push` events are unchanged (they test the commit itself). The server
   also validates and serves prebuilt merges for other submission paths.
+- **Hosted dirty submits**: `--push` bundles the working-tree commit for
+  engine-side testing and publishes it after success; `--create-pr` opens a
+  pull request and reports checks on the tested commit.
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
   `environment:` are read from the repository's environments API —
@@ -163,6 +166,8 @@ Releases before v0.27.0 predate the changelog.
   every other origin requires HTTPS. Point a remote emulator or GHES at an
   `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
   authenticated.
+- **Webhook auto-PR requires delivery provenance**: native submissions cannot
+  trigger it by setting a trust-tier field.
 
 ### Fixed
 - **Golden workflows pass security checks**: the runtime-drift workflow now
