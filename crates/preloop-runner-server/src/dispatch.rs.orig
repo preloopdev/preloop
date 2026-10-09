@@ -329,30 +329,15 @@ pub async fn list_actions_runs(
 
 /// Resolve a `{run_id}` path segment to a run UUID: preloop UUIDs parse
 /// directly; GitHub's numeric ids match `stable_id(run_id)` — the same id
-/// `list_actions_runs` emits — over the repo's runs. UUIDs are validated against the repository
-/// to prevent access to runs in other repositories.
+/// `list_actions_runs` emits — over the repo's runs.
 async fn resolve_run_ref(
     shared: &Arc<SharedState>,
     repository: &str,
     run_ref: &str,
 ) -> Result<crate::RunId, ApiError> {
-    // Try parsing as a UUID first and validate it belongs to this repository
     if let Ok(run_id) = run_ref.parse::<crate::RunId>() {
-        let runs = shared
-            .state
-            .backend
-            .runs_for_repository(repository)
-            .await
-            .map_err(ApiError::from)?;
-        if runs.iter().any(|run| run.run_id == run_id) {
-            return Ok(run_id);
-        }
-        // UUID is valid but doesn't belong to this repository
-        return Err(ApiError::from(crate::control::ControlError::NotFound(
-            format!("run {run_ref}"),
-        )));
+        return Ok(run_id);
     }
-    // Try parsing as a numeric stable_id
     let numeric: u64 = run_ref.parse().map_err(|_| {
         ApiError::from(crate::control::ControlError::NotFound(format!(
             "run {run_ref}"

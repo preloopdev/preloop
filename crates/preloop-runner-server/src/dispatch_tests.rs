@@ -1840,3 +1840,40 @@ async fn rerun_shims_reject_a_token_without_actions_write_with_403() {
         assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
     }
 }
+
+#[tokio::test]
+async fn rerun_rejects_uuid_from_different_repository() {
+    // Create a run in repo A
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    
+    // Try to rerun it via a different repository's endpoint with the same UUID
+    // Should return 404 since the UUID doesn't belong to the other repo
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "{}", Some(TEST_API_TOKEN)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign UUID should be 404: {body}");
+    
+    // The original run should not be rerequested
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_failed_rejects_uuid_from_different_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+    
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun-failed-jobs");
+    let (status, body) = post_json(&app, &uri, "{}", Some(TEST_API_TOKEN)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign UUID should be 404: {body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn cancel_rejects_uuid_from_different_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/cancel");
+    let (status, body) = post_json(&app, &uri, "{}", Some(TEST_API_TOKEN)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign UUID should be 404: {body}");
+}

@@ -119,6 +119,7 @@ pub(crate) async fn process_check_suite_rerequest(
         run_id,
         crate::control::types::RerunMode::All,
         None,
+        rerequest_sender.map(|s| s.to_string()),
     )
     .await
     .map_err(|error| {
