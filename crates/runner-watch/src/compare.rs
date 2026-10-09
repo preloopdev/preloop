@@ -381,40 +381,109 @@ pub fn normalize_value(v: &Value) -> Value {
     }
 }
 
-/// True when the left (reference) schema has object keys, array shapes, or
-/// scalar types the right (candidate) schema lacks or changes. Additions on the
-/// right are tolerated. Inputs must already be [`to_schema_value`] shapes.
-fn schema_drops_fields(left: &Value, right: &Value) -> bool {
+/// Details of fields the candidate schema dropped or changed.
+#[derive(Debug, Clone, Default)]
+struct SchemaDropDetails {
+    any: bool,
+    missing_fields: BTreeSet<String>,
+    other: bool,
+}
+
+impl SchemaDropDetails {
+    fn merge(&mut self, mut other: Self) {
+        self.any |= other.any;
+        self.other |= other.other;
+        self.missing_fields.append(&mut other.missing_fields);
+    }
+}
+
+fn schema_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+/// Classify fields the right (candidate) schema lacks or changes relative to
+/// the left (reference) schema. Additions on the right are tolerated. Inputs
+/// must already be [`to_schema_value`] shapes.
+fn schema_drop_details(left: &Value, right: &Value, path: &str) -> SchemaDropDetails {
     match (left, right) {
         // Optional TemplateToken fields are encoded as null by the official
         // runner and as an empty typed token by preloop. The candidate's
         // richer representation is an addition, not a dropped field.
-        (Value::String(kind), Value::Object(_)) if kind == "null" => false,
-        (Value::Object(l), Value::Object(r)) => l.iter().any(|(k, lv)| match r.get(k) {
-            Some(rv) => schema_drops_fields(lv, rv),
-            None => {
-                // TemplateToken uses a tagged union: literal inputs carry
-                // `lit`, expression inputs carry `expr`. Either field is a
-                // complete representation, so switching variants is not a
-                // field drop.
-                let alternate_token_field = matches!(
-                    (k.as_str(), l.get("type"), l.get("expr"), l.get("lit")),
-                    ("expr", Some(Value::String(_)), Some(Value::String(_)), _)
-                ) && r.contains_key("lit")
-                    || matches!(
-                        (k.as_str(), l.get("type"), l.get("expr"), l.get("lit")),
-                        ("lit", Some(Value::String(_)), _, Some(Value::String(_)))
-                    ) && r.contains_key("expr");
-                !alternate_token_field
+        (Value::String(kind), Value::Object(_)) if kind == "null" => SchemaDropDetails::default(),
+        (Value::Object(l), Value::Object(r)) => {
+            let mut details = SchemaDropDetails::default();
+            for (key, left_value) in l {
+                match r.get(key) {
+                    Some(right_value) => {
+                        details.merge(schema_drop_details(
+                            left_value,
+                            right_value,
+                            &schema_path(path, key),
+                        ));
+                    }
+                    None => {
+                        // TemplateToken uses a tagged union: literal inputs
+                        // carry `lit`, expression inputs carry `expr`. Either
+                        // field is a complete representation, so switching
+                        // variants is not a field drop.
+                        let alternate_token_field = matches!(
+                            (key.as_str(), l.get("type"), l.get("expr"), l.get("lit")),
+                            ("expr", Some(Value::String(_)), Some(Value::String(_)), _)
+                        ) && r.contains_key("lit")
+                            || matches!(
+                                (key.as_str(), l.get("type"), l.get("expr"), l.get("lit")),
+                                ("lit", Some(Value::String(_)), _, Some(Value::String(_)))
+                            ) && r.contains_key("expr");
+                        if !alternate_token_field {
+                            details.any = true;
+                            details.missing_fields.insert(schema_path(path, key));
+                        }
+                    }
+                }
             }
-        }),
-        (Value::Object(_), _) => true,
-        (Value::Array(l), Value::Array(r)) => l
-            .iter()
-            .any(|lv| !r.iter().any(|rv| !schema_drops_fields(lv, rv))),
-        (Value::Array(_), _) => true,
-        (a, b) => a != b,
+            details
+        }
+        (Value::Object(_), _) => SchemaDropDetails {
+            any: true,
+            other: true,
+            ..SchemaDropDetails::default()
+        },
+        (Value::Array(left), Value::Array(right)) => {
+            let mut details = SchemaDropDetails::default();
+            for left_value in left {
+                if !right
+                    .iter()
+                    .any(|right_value| !schema_drop_details(left_value, right_value, path).any)
+                {
+                    details.any = true;
+                    details.other = true;
+                }
+            }
+            details
+        }
+        (Value::Array(_), _) => SchemaDropDetails {
+            any: true,
+            other: true,
+            ..SchemaDropDetails::default()
+        },
+        (left, right) if left != right => SchemaDropDetails {
+            any: true,
+            other: true,
+            ..SchemaDropDetails::default()
+        },
+        (_, _) => SchemaDropDetails::default(),
     }
+}
+
+#[cfg(test)]
+/// True when the left (reference) schema has object keys, array shapes, or
+/// scalar types the right (candidate) schema lacks or changes.
+fn schema_drops_fields(left: &Value, right: &Value) -> bool {
+    schema_drop_details(left, right, "").any
 }
 
 // ── structured conformance report (findings #1 / #4) ─────────────────────────
@@ -430,6 +499,10 @@ pub struct BodyComparison {
     pub schema_diff: String,
     /// Whether the candidate dropped/changed a field the reference has.
     pub schema_drops_fields: bool,
+    /// Dotted JSON paths that are absent from the candidate schema.
+    pub schema_missing_fields: BTreeSet<String>,
+    /// Whether any drop is a type/shape change or otherwise not a missing field.
+    pub schema_other_drops: bool,
 }
 
 /// One endpoint's cross-capture comparison.
@@ -491,6 +564,9 @@ pub enum ValueGate {
 pub struct GatePolicy {
     /// Endpoint substrings whose status mismatches are ignored (un-replayable).
     pub status_ignore: Vec<String>,
+    /// Endpoint/JSON-path pairs whose response fields may be absent. The
+    /// allowance applies only to missing fields, never type or shape changes.
+    pub response_schema_optional: Vec<(String, String)>,
     /// Endpoint substrings whose response-schema removals are gated.
     ///
     /// Matched against the normalized endpoint key built by `group_flows`
@@ -508,6 +584,13 @@ impl Default for GatePolicy {
     fn default() -> Self {
         Self {
             status_ignore: vec!["/oauth2/token".to_owned(), "/messages".to_owned()],
+            response_schema_optional: vec![
+                ("acquirejob".to_owned(), "variables.github_token".to_owned()),
+                (
+                    "acquirejob".to_owned(),
+                    "variables.system.github.token".to_owned(),
+                ),
+            ],
             response_schema_gate: vec!["acquirejob".to_owned()],
             value_gate: ValueGate::Off,
         }
@@ -590,8 +673,18 @@ impl ConformanceReport {
                     detail: "request body schema differs".to_owned(),
                 });
             }
+            let response_schema_drop = e.response.schema_drops_fields
+                && (e.response.schema_other_drops
+                    || e.response.schema_missing_fields.iter().any(|path| {
+                        !policy
+                            .response_schema_optional
+                            .iter()
+                            .any(|(endpoint, optional_path)| {
+                                e.key.contains(endpoint) && path == optional_path
+                            })
+                    }));
             if e.response.present
-                && e.response.schema_drops_fields
+                && response_schema_drop
                 && policy
                     .response_schema_gate
                     .iter()
@@ -677,6 +770,8 @@ fn body_comparison(lo: &[Value], ro: &[Value], field: &str, ll: &str, rl: &str) 
     let mut value_diffs = Vec::new();
     let mut schema_diffs = Vec::new();
     let mut drops = false;
+    let mut missing_fields = BTreeSet::new();
+    let mut other_drops = false;
     for i in 0..la.len().min(ra.len()) {
         if la[i].is_none() && ra[i].is_none() {
             continue;
@@ -691,15 +786,18 @@ fn body_comparison(lo: &[Value], ro: &[Value], field: &str, ll: &str, rl: &str) 
         if !sd.is_empty() {
             schema_diffs.push(sd);
         }
-        if schema_drops_fields(&to_schema_value(a), &to_schema_value(b)) {
-            drops = true;
-        }
+        let details = schema_drop_details(&to_schema_value(a), &to_schema_value(b), "");
+        drops |= details.any;
+        other_drops |= details.other;
+        missing_fields.extend(details.missing_fields);
     }
     BodyComparison {
         present: true,
         normalized_value_diff: redact_report(&value_diffs.join("\n")),
         schema_diff: schema_diffs.join("\n"),
         schema_drops_fields: drops,
+        schema_missing_fields: missing_fields,
+        schema_other_drops: other_drops,
     }
 }
 
@@ -1350,15 +1448,37 @@ mod tests {
         dir
     }
 
-    fn acquire_flow(status: i64, response: Value) -> Value {
+    fn response_flow(path: &str, status: i64, response: Value) -> Value {
         serde_json::json!({
             "method": "POST",
-            "path": "/broker/1/acquirejob",
+            "path": path,
             "status": status,
             "request_body_json": {"runnerId": 7},
             "response_body_json": response,
             "duration_ms": 1.0,
         })
+    }
+
+    fn acquire_flow(status: i64, response: Value) -> Value {
+        response_flow("/broker/1/acquirejob", status, response)
+    }
+    fn token_fields_response(include_tokens: bool, include_other: bool) -> Value {
+        let mut variables = serde_json::Map::new();
+        if include_tokens {
+            let token = serde_json::json!({
+                "isSecret": true,
+                "value": "***REDACTED***",
+            });
+            variables.insert("github_token".to_owned(), token.clone());
+            variables.insert("system.github.token".to_owned(), token);
+        }
+        if include_other {
+            variables.insert(
+                "unrelated_field".to_owned(),
+                serde_json::json!({"value": "present"}),
+            );
+        }
+        serde_json::json!({"variables": variables})
     }
 
     fn analyze_dirs(left: &std::path::Path, right: &std::path::Path) -> ConformanceReport {
@@ -1450,6 +1570,90 @@ mod tests {
         let r = tmp_capture("idr", &[acquire_flow(200, resp)]);
         let report = analyze_dirs(&l, &r);
         assert!(report.failures(&GatePolicy::default()).is_empty());
+    }
+
+    #[test]
+    fn gate_allows_token_fields_missing_on_acquirejob() {
+        let left = tmp_capture(
+            "tokenless-left",
+            &[acquire_flow(200, token_fields_response(true, false))],
+        );
+        let right = tmp_capture(
+            "tokenless-right",
+            &[acquire_flow(200, token_fields_response(false, false))],
+        );
+        let failures = analyze_dirs(&left, &right).failures(&GatePolicy::default());
+        assert!(
+            failures.is_empty(),
+            "tokenless fields should be optional: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn gate_still_catches_other_acquirejob_field_drops() {
+        let left = tmp_capture(
+            "other-left",
+            &[acquire_flow(200, token_fields_response(true, true))],
+        );
+        let right = tmp_capture(
+            "other-right",
+            &[acquire_flow(200, token_fields_response(true, false))],
+        );
+        let failures = analyze_dirs(&left, &right).failures(&GatePolicy::default());
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.kind == FailureKind::ResponseSchema),
+            "unrelated acquirejob drops must remain gated: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn gate_still_catches_token_fields_missing_elsewhere() {
+        let left = tmp_capture(
+            "other-endpoint-left",
+            &[response_flow(
+                "/broker/1/completejob",
+                200,
+                token_fields_response(true, false),
+            )],
+        );
+        let right = tmp_capture(
+            "other-endpoint-right",
+            &[response_flow(
+                "/broker/1/completejob",
+                200,
+                token_fields_response(false, false),
+            )],
+        );
+        let policy = GatePolicy {
+            response_schema_gate: vec!["completejob".to_owned()],
+            ..GatePolicy::default()
+        };
+        let failures = analyze_dirs(&left, &right).failures(&policy);
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.kind == FailureKind::ResponseSchema),
+            "optional fields must remain gated outside acquirejob: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn gate_accepts_token_fields_present_on_acquirejob() {
+        let left = tmp_capture(
+            "token-present-left",
+            &[acquire_flow(200, token_fields_response(true, false))],
+        );
+        let right = tmp_capture(
+            "token-present-right",
+            &[acquire_flow(200, token_fields_response(true, false))],
+        );
+        let failures = analyze_dirs(&left, &right).failures(&GatePolicy::default());
+        assert!(
+            failures.is_empty(),
+            "present token fields should conform: {failures:?}"
+        );
     }
 
     #[test]

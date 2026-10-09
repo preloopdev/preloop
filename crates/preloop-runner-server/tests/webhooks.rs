@@ -1312,9 +1312,11 @@ jobs:
         "job.workflow_sha must be the real workspace HEAD"
     );
 
-    let runtime_token = acquired["variables"]["system.github.token"]["value"]
-        .as_str()
-        .expect("acquired job should expose its runtime token");
+    // The runtime token authenticates the job to *this* engine; it travels on
+    // the service endpoint, never as the job's `GITHUB_TOKEN` (a tokenless
+    // engine leaves that empty so GitHub API clients go anonymous).
+    let runtime_token = service_endpoint_token(&acquired)
+        .expect("acquired job should expose its runtime token on the service endpoint");
     let unauthenticated = app
         .clone()
         .oneshot(
@@ -1736,9 +1738,8 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
     // holds only that commit.
     assert_eq!(acquired["snapshotOriginRewrite"], Value::Null);
 
-    let runtime_token = acquired["variables"]["system.github.token"]["value"]
-        .as_str()
-        .expect("the job exposes its runtime token");
+    let runtime_token = service_endpoint_token(&acquired)
+        .expect("the job exposes its runtime token on the service endpoint");
     let advertisement = app
         .clone()
         .oneshot(
