@@ -20,6 +20,17 @@ pub struct JobCompletedEvent {
     pub timeline_id: uuid::Uuid,
     #[serde(rename = "outputs", default)]
     pub outputs: BTreeMap<String, String>,
+    /// Deployment environment metadata, mirroring the official runner's
+    /// `JobCompletedEvent.ActionsEnvironment`: the runner resolves
+    /// `environment.url` after the job's steps and raises the event with the
+    /// evaluated value, which the server turns into the deployment status's
+    /// `environment_url`. Absent for jobs without an `environment:`.
+    #[serde(
+        rename = "actionsEnvironment",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub actions_environment: Option<super::job::ActionsEnvironment>,
 }
 
 // ─── Log upload DTOs ──────────────────────────────────────────────────────

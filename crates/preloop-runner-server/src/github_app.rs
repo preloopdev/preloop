@@ -592,6 +592,37 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
     }))
 }
 
+/// Why no registered App could be selected for a repository.
+#[derive(Debug)]
+pub enum AppLookupError {
+    /// Every candidate App answered with a definitive "no installation on
+    /// this owner" — the repository is simply not covered, which is an
+    /// answer, not a failure. Callers that fall back to the static PAT (or
+    /// to local rules) may treat it as such.
+    NotInstalled,
+    /// At least one lookup failed transiently (transport, 5xx, rate limit,
+    /// an unverifiable installation-id override) and no App succeeded. The
+    /// repository's coverage is unknown, so a caller that would fall back to
+    /// weaker protection must fail closed instead.
+    Transient(anyhow::Error),
+}
+
+/// `find_installation`'s bail message for an App that is not installed on the
+/// owner. `find_installation` is transparent for the definitive miss and does
+/// not cache it, so a caller can classify the message exactly once here.
+const NO_INSTALLATION_MARKER: &str = "has no installation on";
+
+/// Classify an `installation_id_for` failure: a definitive "no installation
+/// on <owner>" is [`AppLookupError::NotInstalled`]; anything else (a 5xx, a
+/// timeout, a rejected override) is a transient lookup failure.
+fn classify_installation_error(error: anyhow::Error) -> AppLookupError {
+    if error.to_string().contains(NO_INSTALLATION_MARKER) {
+        AppLookupError::NotInstalled
+    } else {
+        AppLookupError::Transient(error)
+    }
+}
+
 /// Every registered App whose installation covers `repository`'s owner, in
 /// registry order.
 ///
@@ -603,39 +634,89 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
 /// even when its installation lookup fails, exactly as `select_app_for_repo`
 /// always has: a lone misconfigured App is still the only App minting can
 /// try, and the mint failure policy (not selection) decides what happens.
+/// The fallback lives here — in the adapter — so push/check-run token
+/// callers keep the historical behavior while
+/// [`candidate_apps_for_repo_inner`] stays fail-closed for protection-rule
+/// callers.
 pub async fn candidate_apps_for_repo(
     shared: &crate::state::SharedState,
     repository: &str,
 ) -> Vec<GitHubAppCredentials> {
+    match candidate_apps_for_repo_inner(shared, repository).await {
+        Ok(candidates) => candidates,
+        Err(AppLookupError::NotInstalled) => Vec::new(),
+        Err(AppLookupError::Transient(_)) => {
+            // A registry of exactly one App still falls back to it: the lone
+            // App is the only one minting can try, and the mint failure
+            // policy (not selection) decides what a failed lookup means.
+            // Callers needing the fail-closed verdict use
+            // `candidate_apps_for_repo_inner` directly (the environment
+            // resolver does).
+            shared
+                .state
+                .github_apps
+                .as_ref()
+                .filter(|registry| registry.apps.len() == 1)
+                .map(|registry| vec![registry.default_app().clone()])
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// [`candidate_apps_for_repo`] without the error-collapsing adapter: callers
+/// that must distinguish "not covered" from "lookup failed" use this one.
+pub async fn candidate_apps_for_repo_inner(
+    shared: &crate::state::SharedState,
+    repository: &str,
+) -> Result<Vec<GitHubAppCredentials>, AppLookupError> {
     let Some(registry) = shared.state.github_apps.as_ref() else {
         // No registry — the legacy field (tests, older callers) is the App.
-        return shared.state.github_app.clone().into_iter().collect();
+        return Ok(shared.state.github_app.clone().into_iter().collect());
     };
     let owner = match split_repository(repository) {
         Ok((owner, _)) => owner.to_owned(),
         Err(_) => {
-            if registry.apps.len() == 1 {
-                return vec![registry.default_app().clone()];
-            }
-            return Vec::new();
+            // An unparsable repository names no owner, so no App is
+            // definitively installed on it.
+            return if registry.apps.len() == 1 {
+                Ok(vec![registry.default_app().clone()])
+            } else {
+                Ok(Vec::new())
+            };
         }
     };
     let api_base = api_base();
     let mut candidates: Vec<GitHubAppCredentials> = Vec::new();
+    // The first non-definitive failure, kept in case no App turns out to cover
+    // the owner: an empty (or non-empty) candidate list built while lookups
+    // were failing cannot be trusted as "the repository is uncovered".
+    let mut transient: Option<anyhow::Error> = None;
     for app in &registry.apps {
         let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
             Ok(jwt) => jwt,
-            Err(_) => continue,
+            Err(error) => {
+                transient = transient.or(Some(error));
+                continue;
+            }
         };
-        if installation_id_for(&api_base, app, &app_jwt, &owner)
-            .await
-            .is_ok()
-        {
-            candidates.push(app.clone());
+        match installation_id_for(&api_base, app, &app_jwt, &owner).await {
+            Ok(_) => candidates.push(app.clone()),
+            Err(error) => {
+                if let AppLookupError::Transient(error) = classify_installation_error(error) {
+                    transient = transient.or(Some(error));
+                }
+            }
         }
     }
-    if candidates.is_empty() && registry.apps.len() == 1 {
-        candidates.push(registry.default_app().clone());
+    if candidates.is_empty() {
+        // Nothing covers the repository (yet): a lookup that failed without a
+        // definitive answer means the coverage is unknown, not absent.
+        if let Some(error) = transient {
+            return Err(AppLookupError::Transient(error));
+        }
+        if registry.apps.len() == 1 {
+            candidates.push(registry.default_app().clone());
+        }
     }
     if candidates.is_empty() {
         debug!(
@@ -644,7 +725,7 @@ pub async fn candidate_apps_for_repo(
             "no registered GitHub App is installed on repository owner"
         );
     }
-    candidates
+    Ok(candidates)
 }
 
 /// Whether `app`'s installation covers the exact `repository`.
@@ -2823,6 +2904,49 @@ mod tests {
         assert!(
             error.to_string().contains("401"),
             "the error must surface the status: {error:#}"
+        );
+    }
+    #[tokio::test]
+    async fn candidate_adapter_keeps_sole_app_on_transient_lookup() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+
+        let stub = Router::new().route(
+            "/app/installations/101",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "temporary outage") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let mut app = GitHubAppCredentials::for_tests("101", test_key(), MintFailurePolicy::Error);
+        app.installation_id = Some(101);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().join("state"))
+            .await
+            .unwrap();
+        state.github_apps = Some(GitHubApps {
+            apps: vec![app],
+            default_index: 0,
+        });
+        let shared = Arc::new(crate::state::SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        assert!(matches!(
+            candidate_apps_for_repo_inner(&shared, "owner/repo").await,
+            Err(AppLookupError::Transient(_))
+        ));
+        assert_eq!(
+            candidate_apps_for_repo(&shared, "owner/repo").await.len(),
+            1,
+            "the non-fail-closed adapter retains the sole App for minting"
         );
     }
 }
