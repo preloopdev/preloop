@@ -10,6 +10,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **The warm pool forks on completion instead of replacing mid-job**: a slot
+  now serves exactly one job per VM — fork from the golden, run the job,
+  delete the VM, fork the next one — so a slot holds one VM instead of a
+  running runner plus a pre-provisioned successor, and no successor boot
+  competes with the running job for host CPU. The fork → ready window
+  (~5 s measured, against an average job time of ~400 s) now sits in front
+  of the job a slot picks up next, which costs roughly 1% throughput for
+  half the VMs per slot. The memory-derived warm pool cap therefore sizes
+  one runner ceiling per slot instead of two, and the queued-job backpressure
+  that decided whether a successor was worth building is gone. On-demand
+  (size=0) slots also no longer provision a successor alongside the running
+  job; each serves one job from one VM, like a warm slot.
+  `preloop status`'s `building` counter now reports the fork/boot in flight
+  (including direct environment boots) rather than successor builds, which no
+  longer exist, in both pool modes.
 - **One golden source: the official packed golden, or the image you
   configured.** `runs-on: ubuntu-latest`/`ubuntu-24.04` — and any pooled
   environment with no image configured — now resolve to the published packed
@@ -41,7 +56,7 @@ Releases before v0.27.0 predate the changelog.
   `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`; and the
   `/etc/preloop-bake.json` build record. The only checked requirement is a
   glibc dynamic loader — a missing `bash`, `git` or `docker` fails the step
-  that needs it, exactly as on GitHub-hosted runners. `preloop build-golden`
+  that needs it, exactly as on GitHub. `preloop build-golden`
   takes the image it bakes (`--base-image <ref>`, or the configured image when
   the flag is absent); the official golden is published packed and cannot be
   built locally.
@@ -93,6 +108,12 @@ Releases before v0.27.0 predate the changelog.
   `prepare_fork_base` checks the shutdown token before starting a download or
   bake, so a restart during the warm returns promptly; the transfer resumes on
   the next start.
+- **A mixed `runs-on` queue no longer retains a golden per environment on a
+  host that cannot hold them**: every retained golden is a full runner
+  ceiling, so a second environment is baked only when the host has memory
+  left for it next to the pool's runners. Otherwise its runners boot that
+  job's base image directly — a cold start instead of a host that runs past
+  its memory budget while jobs execute.
 
 ### Security
 
