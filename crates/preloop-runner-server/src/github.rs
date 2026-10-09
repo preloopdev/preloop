@@ -325,7 +325,7 @@ pub async fn report_check_run_queued(
 /// reports checks at all. `status_check_sha` wins so late-minted checks land
 /// on the same commit as intake-time checks (PR head vs. base/merge); a
 /// synced push run overrides with the published commit.
-fn check_run_report_coords(run: &crate::models::RunRecord) -> Option<(String, String)> {
+pub(crate) fn check_run_report_coords(run: &crate::models::RunRecord) -> Option<(String, String)> {
     if !run.reports_check_runs {
         return None;
     }
@@ -5534,6 +5534,14 @@ jobs:
         let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
         // Force the run terminal and plant the known check-run mapping. Both
         // go through the control database now — there is no in-memory mirror.
+        // `reports_check_runs` marks the run as a check reporter, which is
+        // what makes it a check-suite member.
+        shared
+            .state
+            .backend
+            .set_reports_check_runs(accepted.run_id, true)
+            .await
+            .unwrap();
         shared
             .state
             .test_db_mutate(|db| db.set_run_status(accepted.run_id, "completed", Some("success")))
@@ -5673,6 +5681,165 @@ jobs:
             1,
             "a blocked sender must not restart the run"
         );
+    }
+
+    /// A check-run rerequest records the webhook sender as the rerun's
+    /// `github.triggering_actor` while the run keeps its original actor.
+    #[tokio::test]
+    async fn check_run_rerequest_stamps_triggering_actor() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let (status, _) = process_check_run_rerequest(&shared, &rerequest_payload("bob"))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let runs = shared.state.test_tx().await.runs;
+        let run = runs.values().next().unwrap();
+        assert_eq!(run.run_attempt, 2);
+        assert_eq!(
+            run.github["triggering_actor"].as_str(),
+            Some("bob"),
+            "the webhook sender becomes github.triggering_actor: {}",
+            run.github
+        );
+        assert_eq!(
+            run.submission.actor, "alice",
+            "the original submission actor is unchanged"
+        );
+    }
+
+    /// Seed a second terminal workflow run on `shared`, reporting its checks
+    /// at `reported_sha` (the checkout SHA may differ, as on pull_request).
+    /// Returns the new run's id.
+    async fn seed_suite_run(
+        shared: &std::sync::Arc<crate::SharedState>,
+        workflow_file: &str,
+        checkout_sha: &str,
+        reported_sha: &str,
+        reports: bool,
+    ) -> RunId {
+        let submission = WorkflowSubmission {
+            workflow_yaml:
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                    .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(format!(".github/workflows/{workflow_file}")),
+            workflow_file: Some(workflow_file.to_owned()),
+            actor: "alice".to_owned(),
+            sha: checkout_sha.to_owned(),
+            status_check_sha: (reported_sha != checkout_sha).then(|| reported_sha.to_owned()),
+            resolved_sha: Some(checkout_sha.to_owned()),
+            ..Default::default()
+        };
+        let accepted = crate::submit_run_inner(shared, submission).await.unwrap();
+        shared
+            .state
+            .backend
+            .set_reports_check_runs(accepted.run_id, reports)
+            .await
+            .unwrap();
+        shared
+            .state
+            .test_db_mutate(|db| db.set_run_status(accepted.run_id, "completed", Some("success")))
+            .await
+            .unwrap();
+        accepted.run_id
+    }
+
+    /// Every check-reporting run whose checks landed on the suite's head SHA
+    /// is a member: a rerequest re-runs all of them, not just the newest.
+    /// Workflows that never reported checks cannot belong to the suite.
+    #[tokio::test]
+    async fn check_suite_rerequest_reruns_every_member_run() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let head = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let second = seed_suite_run(&shared, "deploy.yml", head, head, true).await;
+        let quiet = seed_suite_run(&shared, "docs.yml", head, head, false).await;
+
+        crate::rerequest::process_check_suite_rerequest(
+            &shared,
+            &check_suite_payload("rerequested", "alice"),
+        )
+        .await
+        .unwrap();
+
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 3, "in-place reruns mint no new runs");
+        let mut attempts: Vec<u64> = runs.values().map(|run| run.run_attempt).collect();
+        attempts.sort();
+        assert_eq!(
+            attempts,
+            vec![1, 2, 2],
+            "both reporting runs restart; the non-reporter stays at attempt 1"
+        );
+        assert_eq!(runs.get(&quiet).unwrap().run_attempt, 1);
+        assert_eq!(runs.get(&second).unwrap().run_attempt, 2);
+    }
+
+    /// A pull_request run checks out the merge commit but reports checks on
+    /// the PR head (`status_check_sha`); the suite rerequest names the
+    /// reported SHA, so the run matches on its report coordinate — not
+    /// `run.head_sha`.
+    #[tokio::test]
+    async fn check_suite_rerequest_matches_the_reported_sha() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let pr_head = "bbbb2222cccc3333dddd4444eeee5555ffff6666";
+        let checkout = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let pr_run = seed_suite_run(&shared, "pr.yml", checkout, pr_head, true).await;
+
+        let mut payload = check_suite_payload("rerequested", "alice");
+        payload["check_suite"]["head_sha"] = serde_json::json!(pr_head);
+        crate::rerequest::process_check_suite_rerequest(&shared, &payload)
+            .await
+            .unwrap();
+
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.get(&pr_run).unwrap().run_attempt,
+            2,
+            "the run reporting at the suite head_sha must rerun"
+        );
+        let fixture_run = runs.values().find(|run| run.run_id != pr_run).unwrap();
+        assert_eq!(
+            fixture_run.run_attempt, 1,
+            "the run reporting on another commit is untouched"
+        );
+    }
+
+    /// A suite rerequest that names another App's id does not restart the
+    /// registered App's runs — suite membership is per reporting app.
+    #[tokio::test]
+    async fn check_suite_rerequest_ignores_a_foreign_app_suite() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![crate::github_app::GitHubAppCredentials::for_tests(
+                "424",
+                rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+                crate::github_app::MintFailurePolicy::LocalJwt,
+            )],
+            default_index: 0,
+        });
+        let shared = state.shared();
+        let head = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let run_id = seed_suite_run(&shared, "ci.yml", head, head, true).await;
+
+        // 15368 is github.com's own "GitHub Actions" app id — a suite ours
+        // never reported.
+        let mut payload = check_suite_payload("rerequested", "alice");
+        payload["check_suite"]["app"] = serde_json::json!({"id": 15368});
+        crate::rerequest::process_check_suite_rerequest(&shared, &payload)
+            .await
+            .unwrap();
+        assert_eq!(shared.state.test_tx().await.runs[&run_id].run_attempt, 1);
+
+        // Naming the registered app id takes the normal path.
+        payload["check_suite"]["app"] = serde_json::json!({"id": 424});
+        crate::rerequest::process_check_suite_rerequest(&shared, &payload)
+            .await
+            .unwrap();
+        assert_eq!(shared.state.test_tx().await.runs[&run_id].run_attempt, 2);
     }
 
     /// Seed one plain run, reported or not. `submit_run_inner` never mints

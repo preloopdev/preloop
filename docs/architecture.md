@@ -202,6 +202,7 @@ Known limitations:
 | `models.rs`             | `QueuedJob`, `WebhookDeliveryRecord` and wire-facing run/job models       |
 | `runs.rs`               | `/api/v1/runs` handlers: submit, get, cancel, rerun, events             |
 | `github.rs`             | GitHub webhook receiver, durable queue worker, check runs               |
+| `rerequest.rs`         | `check_run`/`check_suite` rerequest webhook handling: in-place run reruns |
 | `github_breaker.rs`     | Circuit breaker + rate-limit classification for GitHub calls           |
 | `webhook_watchdog.rs`   | Delivery-history poll, phantom-ack join, redelivery                    |
 | `webhook_health.rs`     | Periodic App subscription / delivery-URL drift checks                  |

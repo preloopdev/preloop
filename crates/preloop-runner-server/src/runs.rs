@@ -3470,20 +3470,24 @@ pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    cancel_run_inner(&shared, run_id).await.map(Json)
+    cancel_run_inner(&shared, run_id)
+        .await
+        .map(|(record, _)| Json(record))
 }
 
 /// Cancel a run: stop its in-flight attempts, fail its queued jobs
 /// (`cancelled`), and report the cancelled jobs' check runs in the
 /// background. Shared by the native route and the GitHub-compat shim;
-/// `NotFound` when the run does not exist. Cancelling an already-terminal run
-/// is a no-op that returns the record (the native endpoint is idempotent; the
-/// compat shim pre-checks the status and answers `409` like github.com).
+/// `NotFound` when the run does not exist. Returns the record and whether this
+/// call cancelled a live run, as decided by the backend's locked transition.
+/// The native endpoint stays idempotent; the compat shim uses that outcome
+/// to reject an already-terminal run with `409`.
 pub(crate) async fn cancel_run_inner(
     shared: &Arc<SharedState>,
     run_id: RunId,
-) -> Result<RunRecord, ApiError> {
+) -> Result<(RunRecord, bool), ApiError> {
     let crate::control::types::CancelOutcome {
+        run_cancelled,
         cancellations: cancellation_count,
         record,
         cancelled_jobs,
@@ -3530,7 +3534,7 @@ pub(crate) async fn cancel_run_inner(
             .await;
         }
     });
-    Ok(record)
+    Ok((record, run_cancelled))
 }
 
 /// Request body for approving a pending environment protection gate.

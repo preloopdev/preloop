@@ -210,7 +210,7 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
 /// `preserve_on_failure` is a property of the run, carried to the runner on the
 /// job message. It must be absent unless asked for, so the default wire shape
 /// stays byte-identical to what an official runner expects.
-
+///
 pub fn selected_jobs_workflow() -> &'static str {
     r#"
 on: push
@@ -252,7 +252,7 @@ pub async fn open_protocol_live(app: &axum::Router, uri: String, bearer: &str) -
 
 /// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. A job may read its own feed.
-
+///
 /// Build a two-job run and return `(run_id, [(job_id, plan_id, agent_job_id)])`
 /// ordered by request id, so filter tests can address either job.
 pub async fn two_job_run_for_log_filters(
@@ -531,8 +531,8 @@ pub async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVa
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this
 /// control plane.
-
-// Non-asserting helper for tests that need to inspect an error response.
+///
+/// Non-asserting helper for tests that need to inspect an error response.
 pub async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
     if uri.starts_with("/api/v1/")
@@ -697,7 +697,7 @@ pub async fn request_status_without_bearer(
 /// Token validity alone used to authorize every worker route, so any live job
 /// could open a session on another job's behalf — suspending its timeout — and
 /// could drain its verdict, since taking a verdict consumes it.
-
+///
 /// Open a debug session as a worker would, for exchange tests.
 pub fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
     json!({
@@ -726,7 +726,7 @@ pub fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
 /// `ACTIONS_RUNTIME_TOKEN`, so the exchange has to be worth nothing to a step
 /// that replays it. Hence: exactly one issuance per job request, spent by the
 /// worker during job setup before any step runs.
-
+///
 pub async fn verdict_poll_timeout_is_not_an_abort_impl() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -963,7 +963,7 @@ pub fn jwt_sub(token: &str) -> Option<String> {
 /// configures no App. That PAT must reach jobs as their `GITHUB_TOKEN`:
 /// previously only `PRELOOP_GITHUB_TOKEN` was consulted, so setup reported
 /// success while every job silently ran on the local runtime token instead.
-
+///
 /// Send a request carrying a specific bearer token and return just the status
 /// code — the shared counterpart the cache-gating tests use, so a
 /// request-shape change lands in one place.
@@ -1177,10 +1177,10 @@ pub async fn generated_server_dag_properties_1000_cases() {
         let mut seed = 20250713u64 ^ case.wrapping_mul(0x9E37_79B9);
         let count = 2 + (next(&mut seed) % 4) as usize;
         let mut needs = vec![Vec::<usize>::new(); count];
-        for job in 1..count {
+        for (job, needs_of_job) in needs.iter_mut().enumerate().skip(1) {
             for dependency in 0..job {
                 if next(&mut seed) & 1 == 1 {
-                    needs[job].push(dependency);
+                    needs_of_job.push(dependency);
                 }
             }
         }
@@ -1668,10 +1668,10 @@ pub async fn register_live_job_in(
                 "UPDATE log_files SET plan_id = ?2 WHERE plan_id = ?1",
                 (&previous, &replacement),
             )?;
-            Ok::<_, rusqlite::Error>(tx.0.execute(
+            tx.0.execute(
                 "UPDATE job_requests SET agent_job_id = ?2 WHERE agent_job_id = ?1",
                 (&previous, &replacement),
-            )?)
+            )
         })
         .await
         .expect("re-key the seed attempt");

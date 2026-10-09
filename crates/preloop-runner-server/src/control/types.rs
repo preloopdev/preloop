@@ -541,6 +541,9 @@ pub(crate) struct CompleteOutcome {
 /// Result of `cancel_run` / `cancel_job`.
 #[derive(Debug)]
 pub(crate) struct CancelOutcome {
+    /// This `cancel_run` call transitioned a live run to cancelled under its lock.
+    /// False for an already-terminal run and for `cancel_job`.
+    pub(crate) run_cancelled: bool,
     /// Cancellation messages queued for in-progress jobs.
     pub(crate) cancellations: usize,
     /// Run status after cancellation (for `cancel_run`).

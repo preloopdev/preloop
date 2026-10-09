@@ -380,25 +380,24 @@ fn validate_rerun_body(body: Option<Bytes>) -> Result<Option<Value>, ApiError> {
     let Some(bytes) = body else {
         return Ok(None);
     };
-    
+
     if bytes.is_empty() {
         return Ok(None);
     }
-    
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        ApiError::unprocessable("Invalid request: body must be valid JSON")
-    })?;
-    
+
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::unprocessable("Invalid request: body must be valid JSON"))?;
+
     if value.is_null() {
         return Ok(None);
     }
-    
+
     let Some(object) = value.as_object() else {
         return Err(ApiError::unprocessable(
             "Invalid request: the re-run body must be a JSON object",
         ));
     };
-    
+
     for key in ["enable_debug_logging", "enable_debugger"] {
         if let Some(value) = object.get(key)
             && !value.is_boolean()
@@ -408,7 +407,7 @@ fn validate_rerun_body(body: Option<Bytes>) -> Result<Option<Value>, ApiError> {
             )));
         }
     }
-    
+
     Ok(Some(value))
 }
 
@@ -425,8 +424,14 @@ pub async fn rerun_actions_run(
     validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    crate::runs::rerun_run_with_mode(&shared, run_id, crate::control::types::RerunMode::All, None)
-        .await?;
+    crate::runs::rerun_run_with_mode(
+        &shared,
+        run_id,
+        crate::control::types::RerunMode::All,
+        None,
+        Some(identity.actor.clone()),
+    )
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -449,6 +454,7 @@ pub async fn rerun_actions_run_failed(
         run_id,
         crate::control::types::RerunMode::Failed,
         None,
+        Some(identity.actor.clone()),
     )
     .await?;
     Ok(StatusCode::CREATED)
@@ -524,6 +530,7 @@ pub async fn rerun_actions_job(
         run_id,
         crate::control::types::RerunMode::Job(job_id),
         None,
+        Some(identity.actor.clone()),
     )
     .await?;
     Ok(StatusCode::CREATED)
@@ -541,21 +548,23 @@ pub async fn cancel_actions_run(
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    
-    // Attempt to cancel the run. If it's already terminal, the backend cancel
-    // will refuse and we return 409. If the run becomes terminal between
-    // our read and the locked cancel, the cancel may still succeed: in that
-    // case we return 202 to indicate cancellation was initiated.
+    // github.com answers 202 only when this request cancelled a live run;
+    // an already-terminal run gets 409 "Cannot cancel a workflow run that
+    // is completed." The backend reports the locked transition's outcome,
+    // so a run that finished between the ref resolution and the cancel is
+    // a 409 here, not a stale 202. `resolve_run_ref` already proved the
+    // run belongs to this repository, so a `NotFound` from the cancel can
+    // only mean the archiver moved the (terminal) run mid-flight — also a
+    // 409 on github.com's terms.
     match crate::runs::cancel_run_inner(&shared, run_id).await {
-        Ok(_) => Ok(StatusCode::ACCEPTED),
-        Err(error) => {
-            // If the run is terminal, return 409 Conflict
-            if error.kind() == crate::ApiErrorKind::Conflict {
-                return Err(error);
-            }
-            // Other errors propagate
-            Err(error)
-        }
+        Ok((_, true)) => Ok(StatusCode::ACCEPTED),
+        Ok((_, false)) => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) if error.status() == StatusCode::NOT_FOUND => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) => Err(error),
     }
 }
 

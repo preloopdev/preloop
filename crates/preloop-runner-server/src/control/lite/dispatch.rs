@@ -514,7 +514,7 @@ impl LiteBackend {
             if !exists {
                 return Err(ControlError::NotFound(format!("run {run_id}")));
             }
-            let cancellations = settle::cancel_run_inner(tx, self, run_id)?;
+            let (cancellations, run_cancelled) = settle::cancel_run_inner(tx, self, run_id)?;
             let cancelled_jobs: Vec<JobId> = {
                 let mut stmt = tx
                     .prepare_cached(
@@ -532,6 +532,7 @@ impl LiteBackend {
             let (next_runs_on, queue_nonempty) = queue_gauges(tx)?;
             let record = jobs::run_record(tx, run_id)?;
             Ok(CancelOutcome {
+                run_cancelled,
                 cancellations,
                 run_status: record.as_ref().map(|r| r.status),
                 queue_nonempty,
@@ -570,6 +571,7 @@ impl LiteBackend {
             let (next_runs_on, queue_nonempty) = queue_gauges(tx)?;
             let record = jobs::run_record(tx, run_id)?;
             Ok(CancelOutcome {
+                run_cancelled: false,
                 cancellations,
                 run_status: record.as_ref().map(|r| r.status),
                 queue_nonempty,

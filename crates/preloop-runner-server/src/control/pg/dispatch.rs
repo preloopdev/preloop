@@ -1141,7 +1141,7 @@ async fn cancel_holder_inner(
 ) -> Result<CanceledWork, ControlError> {
     match holder {
         concurrency::Holder::Run(run_id) => {
-            let cancelled = cancel_run_tx(backend, tx, *run_id, reason).await?;
+            let (cancelled, _) = cancel_run_tx(backend, tx, *run_id, reason).await?;
             Ok(CanceledWork {
                 cancellations: cancelled,
             })
@@ -2198,7 +2198,8 @@ pub(super) async fn clear_assignment(
 
 /// `cancel_run_inner` parity: settle every non-terminal job, queue a
 /// cancellation for in-flight attempts, retire expandable-node requests,
-/// release every concurrency presence. Returns cancellations queued.
+/// release every concurrency presence. Returns cancellations queued and
+/// whether this transaction cancelled a live run.
 ///
 /// Statements: `SELECT job_id, status FROM jobs .. FOR UPDATE`; per
 /// in-flight job one deduped `INSERT INTO job_cancellations`; one `UPDATE
@@ -2212,7 +2213,7 @@ async fn cancel_run_tx(
     tx: &Transaction<'_>,
     run_id: RunId,
     reason: Option<&str>,
-) -> Result<usize, ControlError> {
+) -> Result<(usize, bool), ControlError> {
     let _ = reason;
     // In-flight attempts get a pending cancellation the next poll delivers;
     // every other non-terminal job simply turns terminal (its runner holds
@@ -2310,7 +2311,7 @@ async fn cancel_run_tx(
         )
         .await?;
     }
-    Ok(cancellations)
+    Ok((cancellations, finalized > 0))
 }
 
 /// Cancellation bookkeeping for the cancel commands: mark a
@@ -2465,7 +2466,8 @@ impl PgBackend {
             tx.rollback().await.map_err(db)?;
             return Err(ControlError::NotFound(format!("run {run_id}")));
         }
-        let cancellations = cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
+        let (cancellations, run_cancelled) =
+            cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
         let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
@@ -2474,6 +2476,7 @@ impl PgBackend {
             .map(|graph| graph.record);
         tx.commit().await.map_err(db)?;
         Ok(CancelOutcome {
+            run_cancelled,
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
             queue_nonempty: queue_nonempty || pending_cancels,
@@ -2503,6 +2506,7 @@ impl PgBackend {
             .map(|graph| graph.record);
         tx.commit().await.map_err(db)?;
         Ok(CancelOutcome {
+            run_cancelled: false,
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
             queue_nonempty: queue_nonempty || pending_cancels,
