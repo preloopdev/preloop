@@ -1,8 +1,0 @@
-@@ -494,6 +495,7 @@
-         &shared,
-         run_id,
-         crate::control::types::RerunMode::Job(job_id),
-         None,
-+        None,
-     )
-     .await?;

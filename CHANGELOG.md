@@ -59,6 +59,16 @@ Releases before v0.27.0 predate the changelog.
   `job_requests_timeline_cascade` trigger prunes the shared timeline with the
   last request.
 
+
+### Fixed
+
+- GitHub rerun/cancel endpoints now validate that a provided run UUID
+  belongs to the specified repository, preventing cross-repository
+  access via token reuse. A request with a foreign UUID returns 404.
+- Rerun and rerequest webhook handlers now pass the webhook sender
+  (`sender.login`) as `triggering_actor` to preserve the user who
+  initiated the rerun, while the original submission's actor is
+  retained for authorization.
 ### Changed
 
 - Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
