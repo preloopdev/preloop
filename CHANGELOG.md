@@ -434,6 +434,19 @@ Releases before v0.27.0 predate the changelog.
   Legs of one matrix share that `job_order`, so among themselves they fall
   back to `job_id`.
 
+- **Docker containers in the golden carry the Rosetta mount again** (#111):
+  every container the in-guest dockerd creates — each `container:` job,
+  `services:` sidecar, and `docker run` step — missed `/mnt/rosetta` and died
+  with `rosetta-wrapper: unexpected initial stop: 32512` on Apple Silicon,
+  because the agent only injects that mount into specs it assembles itself.
+  The golden now bakes a `crun-rosetta` OCI-runtime shim (static crun behind a
+  POSIX shell wrapper that drops dockerd's always-empty `blockIO` section,
+  which the VM kernel cannot honour, and appends the read-only mount when
+  Rosetta is enabled), installs it as docker's `default-runtime` and as the
+  PATH-selected `runc` buildx's embedded executor resolves, and verifies the
+  crun release asset against a pinned per-architecture sha256 before
+  installing it.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the

@@ -62,7 +62,9 @@ official GitHub runner-image golden is used as-is; `setup-*` actions resolve
 the exact language version requested by each workflow at job time.
 4. **Base dependencies**: the apt set `install_base_dependencies` installs
 git, curl, build-essential, python3, jq, unzip/zip, locales, …).
-5. **Docker**: daemon + CLI, so `container:` / `services:` jobs work.
+5. **Docker**: daemon + CLI, wired to the `crun-rosetta` `default-runtime`
+shim so containers inherit the Rosetta mount; `container:` / `services:` jobs
+work.
 
 Because setup actions own version selection, the same golden serves every
 project without baking a repository-specific language version.
@@ -76,10 +78,14 @@ On Apple Silicon, Preloop enables Rosetta 2 x86_64 translation for every VM
 it creates (`smolvm machine update --rosetta`, applied automatically, with
 the machine deleted if translation cannot be enabled), so an x86_64 golden
 also runs on an arm64 Mac. The golden must still be built on a host of its
-own architecture; translation only covers execution. Docker actions are not
-supported yet on this path: containers created by the in-guest dockerd do not
-carry the Rosetta mount, so amd64-only images fail inside Docker (a mount
-injection fix is in progress).
+own architecture; translation only covers execution. Containers created by the
+in-guest dockerd are covered too: the golden runs docker with the
+`crun-rosetta` OCI-runtime shim as its `default-runtime` (and as the `runc`
+buildx's embedded executor resolves on `PATH`), which appends the read-only
+`/mnt/rosetta` bind to each bundle's spec when Rosetta is enabled — without it
+an amd64-only image fails inside Docker with `unexpected initial stop: 32512`.
+`container:` / `services:` jobs and `docker run` steps on an arm64 host thus
+translate amd64 images like any other guest process.
 
 | Host / guest | Runner target               | Suggested artifact suffix |
 | ------------ | --------------------------- | ------------------------- |
@@ -406,6 +412,7 @@ set `PRELOOP_RUNNER_BUNDLE`.
 | `node20_externals_version` / `node24_externals_version` | Node runtimes baked as the runner's externals                                    | Same                                                                    |
 | `rustup_version`                                        | Rustup used to install baked Rust toolchains                                     | Toolchain bootstrap changes                                             |
 | `cargo_shear_version`                                   | Auxiliary cargo tooling                                                          | Same                                                                    |
+| `crun_version` / `crun_sha256_amd64` / `crun_sha256_arm64` | Static crun behind the golden's docker `default-runtime` shim (Rosetta mount injection) | Upstream crun ships a newer release — must stay >= 1.14 — and both per-arch sha256s are re-pinned from the release assets |
 
 
 The protocol target (`runner_version`) and the VM image are independent:

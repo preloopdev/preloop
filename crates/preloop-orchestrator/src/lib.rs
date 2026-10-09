@@ -1997,6 +1997,55 @@ pub fn docker_data_root() -> &'static str {
     DOCKER_DATA_ROOT
 }
 
+/// The OCI runtime shim wired as the golden's docker `default-runtime`.
+///
+/// Byte-identical to the shim proven live on the smolvm side
+/// (`scripts/rosetta/crun-rosetta` in the rosetta-mount-shim work; its sha256
+/// is pinned in `tests/golden_fidelity.rs` so an edit here fails loudly).
+/// dockerd resolves a named runtime to a binary path and execs it with the
+/// full OCI runtime CLI, so this POSIX sh wrapper rewrites the bundle's
+/// `config.json` before exec'ing the real crun:
+///
+/// 1. Drops dockerd's always-present empty `blockIO` section. The VM's
+///    libkrunfw kernel is built without `CONFIG_BLK_DEV_THROTTLING`, so crun
+///    treats the section as a directive to write `io.max` / `io.weight` and
+///    fails EVERY container create with the kernel-side error
+///    "open `io.max`: No such file or directory". runc silently skips the
+///    empty section; the strip mirrors it so crun can replace runc at all
+///    (arm64 included). Real IO limits are left untouched.
+///
+/// 2. Injects a read-only `/mnt/rosetta` bind mount, but only when Rosetta
+///    is enabled for the machine (`SMOLVM_ROSETTA=1` in the shim's
+///    environment, or the translator visible at `/mnt/rosetta/rosetta`) and
+///    no user mount already claims the path. Without it, amd64-only images
+///    die inside dockerd-created containers with `rosetta-wrapper:
+///    unexpected initial stop: 32512` — the binfmt wrapper's
+///    `execve("/mnt/rosetta/rosetta")` misses in the container's mount
+///    namespace, because the smolvm agent only injects the mount into specs
+///    it assembles itself, not ones dockerd builds.
+///
+/// Buildx's embedded executor (`docker build` on Docker >= 23) never consults
+/// the daemon's runtime config; it execs `runc` by PATH lookup. The bake
+/// therefore also symlinks `/usr/local/bin/runc` (PATH-prior to the real
+/// `/usr/bin/runc`, which stays untouched) at this shim.
+const CRUN_ROSETTA_SHIM: &str = include_str!("../assets/crun-rosetta");
+
+/// The docker `default-runtime` shim baked into the golden. Exposed for the
+/// fidelity tests.
+pub fn crun_rosetta_shim() -> &'static str {
+    CRUN_ROSETTA_SHIM
+}
+
+/// The `daemon.json` keys that wire the shim in as docker's `default-runtime`.
+///
+/// Two writers own `/etc/docker/daemon.json`: the bake ([`base_install_script`],
+/// which creates it) and the runtime storage-driver fallback
+/// ([`docker_start_command`], which rewrites it when the kernel forces `vfs`).
+/// Both must carry these keys — a rewrite that drops them silently downgrades
+/// every container back to runc and loses the Rosetta mount injection
+/// (`rosetta-wrapper: unexpected initial stop: 32512` on Apple Silicon).
+const DOCKER_RUNTIME_JSON: &str = "\"runtimes\":{\"crun-rosetta\":{\"path\":\"/usr/local/bin/crun-rosetta\"}},\"default-runtime\":\"crun-rosetta\"";
+
 /// Loopback `/etc/hosts` contents. Exposed for the fidelity tests.
 pub fn loopback_hosts() -> &'static str {
     LOOPBACK_HOSTS
@@ -2613,7 +2662,23 @@ pub fn base_install_script() -> String {
           docker buildx version | grep -F 'v{DOCKER_BUILDX_VERSION}' && \
           docker compose version --short | grep -F '{DOCKER_COMPOSE_VERSION}' && \
           mkdir -p {DOCKER_DATA_ROOT} /etc/docker && \
-          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\"}}\\n' > /etc/docker/daemon.json)) && \
+          printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",{DOCKER_RUNTIME_JSON}}}\\n' > /etc/docker/daemon.json)) && \
+         (echo \"### install crun v{CRUN_VERSION} + rosetta runtime shim\" >&2 && \
+          case \"$LFS_ARCH\" in \
+            amd64) crun_sha256={CRUN_SHA256_AMD64} ;; \
+            arm64) crun_sha256={CRUN_SHA256_ARM64} ;; \
+            *) echo \"no crun sha256 pin for arch $LFS_ARCH\" >&2; exit 1 ;; \
+          esac; \
+          curl -fsSL \"https://github.com/containers/crun/releases/download/{CRUN_VERSION}/crun-{CRUN_VERSION}-linux-$LFS_ARCH\" -o /tmp/crun && \
+          crun_actual=$(shasum -a 256 /tmp/crun 2>/dev/null | awk '{{print $1}}'); \
+          if [ -z \"$crun_actual\" ]; then crun_actual=$(sha256sum /tmp/crun 2>/dev/null | awk '{{print $1}}'); fi; \
+          if [ \"$crun_actual\" != \"$crun_sha256\" ]; then echo \"ERROR: crun {CRUN_VERSION} sha256 mismatch for $LFS_ARCH (got $crun_actual expected $crun_sha256)\" >&2; exit 1; fi; \
+          chmod 0755 /tmp/crun && \
+          mv /tmp/crun /usr/bin/crun && \
+          /usr/bin/crun --version | grep -F '{CRUN_VERSION}' && \
+          printf '%s' {crun_rosetta_shim_quoted} > /usr/local/bin/crun-rosetta && \
+          chmod 0755 /usr/local/bin/crun-rosetta && \
+          ln -sf crun-rosetta /usr/local/bin/runc) && \
          (echo \"### fetch cargo-shear\" >&2 && \
           curl -sSL https://github.com/Boshen/cargo-shear/releases/download/v{CARGO_SHEAR_VERSION}/cargo-shear-$(uname -m)-unknown-linux-musl.tar.gz 2>/dev/null | tar -xz -C /usr/local/bin 2>/dev/null || true) && \
          (echo \"### bake git v{GIT_VERSION}\" >&2 && \
@@ -2640,7 +2705,10 @@ pub fn base_install_script() -> String {
         runner_account = runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
         docker_packages = docker_apt_packages(),
         compiler_packages = compiler_apt_packages(),
-        base_packages_pinned = base_packages_pinned()
+        base_packages_pinned = base_packages_pinned(),
+        // One single-quoted shell word: the shim embeds verbatim, and only a
+        // NUL (which a shell script cannot contain) would break the quoting.
+        crun_rosetta_shim_quoted = shell_quote(CRUN_ROSETTA_SHIM)
     )
 }
 
@@ -2775,7 +2843,11 @@ fn docker_start_command() -> Vec<String> {
              fi; \
              rmdir /tmp/.preloop-ovprobe 2>/dev/null || true; \
              if [ -n \"$DRIVER\" ]; then \
-               printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+               if [ -x /usr/local/bin/crun-rosetta ]; then \
+                 printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\",{DOCKER_RUNTIME_JSON}}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+               else \
+                 printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json; \
+               fi; \
              fi; \
              start_dockerd() {{ \
                rm -f /var/run/docker.pid; \
@@ -2803,6 +2875,53 @@ fn docker_start_command() -> Vec<String> {
              exit 1"
         )),
     ]
+}
+
+#[cfg(test)]
+mod docker_daemon_tests {
+    use super::*;
+
+    /// The vfs fallback rewrites `/etc/docker/daemon.json`. It must keep the
+    /// crun-rosetta wiring the bake wrote — a plain rewrite silently drops
+    /// `default-runtime` and every container falls back to runc, losing the
+    /// Rosetta mount injection (`unexpected initial stop: 32512` on Apple
+    /// Silicon) — while still forcing the storage driver.
+    #[test]
+    fn vfs_fallback_keeps_the_crun_rosetta_runtime_wiring() {
+        let command = docker_start_command();
+        let script = &command[2];
+        let wired = format!(
+            "printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\",{DOCKER_RUNTIME_JSON}}}\\n' \"$DRIVER\" > /etc/docker/daemon.json"
+        );
+        assert!(
+            script.contains(&wired),
+            "the vfs rewrite must keep the runtime keys; got: {script}"
+        );
+        // Goldens that predate the shim keep the plain rewrite: pointing
+        // `default-runtime` at a binary the image lacks would fail every
+        // container create instead of merely losing the mount injection.
+        let plain = format!(
+            "printf '{{\"data-root\":\"{DOCKER_DATA_ROOT}\",\"storage-driver\":\"%s\"}}\\n' \"$DRIVER\" > /etc/docker/daemon.json"
+        );
+        assert!(
+            script.contains(&plain),
+            "shim-less goldens must keep the plain rewrite; got: {script}"
+        );
+        assert!(
+            script.contains("[ -x /usr/local/bin/crun-rosetta ]"),
+            "the runtime wiring is gated on the shim actually being installed"
+        );
+    }
+
+    #[test]
+    fn docker_start_script_parses_as_posix_shell() {
+        let command = docker_start_command();
+        let status = std::process::Command::new("sh")
+            .args(["-n", "-c", &command[2]])
+            .status()
+            .expect("run the shell parser");
+        assert!(status.success(), "docker start script must parse");
+    }
 }
 
 /// How long to wait for a freshly started guest to accept commands.
