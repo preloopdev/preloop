@@ -1846,13 +1846,17 @@ async fn rerun_rejects_uuid_from_different_repository() {
     // Create a run in repo A
     let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let run_id = dispatched_completed_run(&state, &app, "success").await;
-    
+
     // Try to rerun it via a different repository's endpoint with the same UUID
     // Should return 404 since the UUID doesn't belong to the other repo
     let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun");
     let (status, body) = post_json(&app, &uri, "{}", Some(TEST_API_TOKEN)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "foreign UUID should be 404: {body}");
-    
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+
     // The original run should not be rerequested
     assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
 }
@@ -1861,10 +1865,14 @@ async fn rerun_rejects_uuid_from_different_repository() {
 async fn rerun_failed_rejects_uuid_from_different_repository() {
     let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let run_id = dispatched_completed_run(&state, &app, "failure").await;
-    
+
     let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun-failed-jobs");
     let (status, body) = post_json(&app, &uri, "{}", Some(TEST_API_TOKEN)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "foreign UUID should be 404: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
     assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
 }
 
@@ -1872,8 +1880,55 @@ async fn rerun_failed_rejects_uuid_from_different_repository() {
 async fn cancel_rejects_uuid_from_different_repository() {
     let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
     let run_id = dispatched_completed_run(&state, &app, "success").await;
-    
+
     let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/cancel");
     let (status, body) = post_json(&app, &uri, "{}", Some(TEST_API_TOKEN)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "foreign UUID should be 404: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rerun_rejects_malformed_json_with_422() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    // Send malformed JSON
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+    let body_bytes = b"{invalid json}";
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("Authorization", format!("Bearer {}", TEST_API_TOKEN))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(body_bytes.to_vec()))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "malformed JSON should return 422"
+    );
+
+    // Run should not be rerun
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_accepts_empty_body() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "", Some(TEST_API_TOKEN)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "empty body should be accepted: {body}"
+    );
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
 }
