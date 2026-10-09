@@ -20,6 +20,27 @@ impl ControlBackend for PgBackend {
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError> {
         self.submit_run(submit).await
     }
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError> {
+        self.rerun_run(rerun).await
+    }
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
+        self.rerun_plan(run_id, mode).await
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        // Microsecond-epoch arithmetic keeps the timestamptz conversion
+        // exact for any value `now_unix_nanos` can produce.
+        self.test_execute(&format!(
+            "UPDATE runs SET completed_at = to_timestamp(0) \
+                 + ({completed_at_us}::bigint * interval '1 microsecond') \
+             WHERE run_id = '{run_id}'::uuid"
+        ))
+        .await
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,
@@ -206,8 +227,12 @@ impl ControlBackend for PgBackend {
     ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError> {
         self.terminal_jobs().await
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
-        self.archive_finished_runs(limit).await
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.archive_finished_runs(limit, rerun_hold).await
     }
     async fn expired_terminal_runs(
         &self,

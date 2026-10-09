@@ -856,6 +856,33 @@ pub const RETENTION_DAYS_ENV: &str = "PRELOOP_RETENTION_DAYS";
 /// Default run retention, in days, following GitHub's Actions retention setting.
 pub const DEFAULT_RETENTION_DAYS: u64 = 90;
 
+/// Env override for the in-place re-run window (see
+/// [`rerun_window_days`]): how long a completed run with failed jobs stays
+/// in the live control tables so it can be re-run in place.
+pub const RERUN_WINDOW_DAYS_ENV: &str = "PRELOOP_RERUN_WINDOW_DAYS";
+/// Default in-place re-run window, in days, following GitHub's 30-day
+/// re-run limit.
+pub const DEFAULT_RERUN_WINDOW_DAYS: u64 = 30;
+
+/// Resolve the archiver's in-place re-run hold: `PRELOOP_RERUN_WINDOW_DAYS`
+/// (default [`DEFAULT_RERUN_WINDOW_DAYS`]), in days. A run whose completed
+/// attempt has at least one failed/cancelled/timed-out job stays live this
+/// long so a re-run can reset its jobs in place; `0` disables the hold and
+/// restores the plain 60-second archive policy. An unparseable value is an
+/// error — a typo must fail closed rather than hold (or drop) scheduler rows
+/// silently; callers warn and disable the hold.
+pub fn rerun_window_days() -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(RERUN_WINDOW_DAYS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {RERUN_WINDOW_DAYS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(DEFAULT_RERUN_WINDOW_DAYS)
+}
+
 fn default_retention_days() -> u64 {
     DEFAULT_RETENTION_DAYS
 }

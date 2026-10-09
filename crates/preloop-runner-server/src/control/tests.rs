@@ -2721,7 +2721,7 @@ pub(crate) mod suite {
         backdate(run_id).await;
         assert!(
             backend
-                .archive_finished_runs(32)
+                .archive_finished_runs(32, None)
                 .await
                 .unwrap()
                 .contains(&run_id),
@@ -6469,7 +6469,6 @@ pub(crate) mod suite {
             outcome_b.run_number
         );
     }
-
     /// Ids and instants have one canonical stored form on both backends: run
     /// uuids lowercase (RFC 4122 text form), instants whole microseconds
     /// since the Unix epoch. A sub-microsecond input is truncated toward the
@@ -6531,6 +6530,953 @@ pub(crate) mod suite {
             Some(nanos),
             "nanosecond-typed stamps must keep full precision"
         );
+    }
+
+    /// A completed run reruns as a new attempt on the same `run_id`: the
+    /// archived attempt is snapshots-only, `run_attempt` increments, every
+    /// selected job row resets to queued with a fresh request, and the run
+    /// is no longer terminal.
+    pub(crate) async fn rerun_all_resets_jobs_and_bumps_attempt(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![
+                    submit_job(run_id, "build", 1),
+                    submit_job(run_id, "test", 2),
+                ],
+            ))
+            .await
+            .unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("test".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert!(record.status.is_terminal());
+        assert_eq!(record.run_attempt, 1);
+
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 2);
+        assert_eq!(outcome.queued_jobs, 2, "all jobs re-queue: {outcome:?}");
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(record.run_attempt, 2);
+        assert!(!record.status.is_terminal(), "rerun reopened the run");
+        assert_eq!(record.conclusion, None);
+        for job_id in ["build", "test"] {
+            assert_eq!(
+                record.jobs[&JobId(job_id.to_owned())],
+                ExecutionStatus::Queued,
+                "{job_id} must reset to queued",
+            );
+        }
+
+        // A second rerun stacks: attempt 3, same guards.
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("test".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 3);
+        assert_eq!(backend.run_record(run_id).await.unwrap().run_attempt, 3);
+
+        // An in-flight run refuses a rerun (GitHub requires a completed run).
+        let err = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .expect_err("a live run must not rerun");
+        assert!(
+            matches!(err, ControlError::Conflict(_)),
+            "expected conflict, got {err:?}"
+        );
+    }
+
+    /// `RerunMode::Failed` resets failed/cancelled jobs and every job that
+    /// transitively depends on them; succeeded jobs outside that cone keep
+    /// their result and outputs.
+    pub(crate) async fn rerun_failed_recovers_dependents(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut b = submit_job(run_id, "b", 2);
+        b.queued.needs = vec![JobId("a".to_owned())];
+        let mut c = submit_job(run_id, "c", 3);
+        c.queued.needs = vec![JobId("a".to_owned()), JobId("b".to_owned())];
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "a", 1), b, c]))
+            .await
+            .unwrap();
+        // a succeeds with an output; b fails; c is skipped by the failed edge.
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("a".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("v".to_owned(), serde_json::json!(1))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("b".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert!(record.status.is_terminal(), "run must settle: {record:?}");
+        assert_eq!(
+            record.jobs[&JobId("c".to_owned())],
+            ExecutionStatus::Skipped,
+            "c must skip on b's failure"
+        );
+
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::Failed,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(record.run_attempt, 2);
+        assert_eq!(
+            record.jobs[&JobId("a".to_owned())],
+            ExecutionStatus::Success,
+            "a is outside the rerun cone and keeps its result"
+        );
+        assert_eq!(
+            record.job_outputs.get(&JobId("a".to_owned())),
+            Some(&BTreeMap::from([("v".to_owned(), serde_json::json!(1))])),
+            "a's outputs carry forward to dependents"
+        );
+        let b_status = record.jobs[&JobId("b".to_owned())];
+        assert!(
+            matches!(b_status, ExecutionStatus::Queued | ExecutionStatus::Pending),
+            "b must re-run, got {b_status:?}"
+        );
+        let c_status = record.jobs[&JobId("c".to_owned())];
+        assert!(
+            matches!(c_status, ExecutionStatus::Queued | ExecutionStatus::Pending),
+            "c re-runs as a dependent of the failed job, got {c_status:?}"
+        );
+        assert!(
+            outcome
+                .rerun_jobs
+                .iter()
+                .any(|(id, _)| *id == JobId("b".to_owned()))
+                && outcome
+                    .rerun_jobs
+                    .iter()
+                    .any(|(id, _)| *id == JobId("c".to_owned())),
+            "the rerun set covers b and c: {:?}",
+            outcome.rerun_jobs
+        );
+        assert!(
+            !outcome
+                .rerun_jobs
+                .iter()
+                .any(|(id, _)| *id == JobId("a".to_owned())),
+            "a is not in the failed-cone"
+        );
+
+        // `Failed` with nothing failed/cancelled is a conflict — GitHub 404s
+        // `rerun-failed` on an all-success run.
+        let clean = RunId::new();
+        backend
+            .submit_run(submit_run(clean, vec![submit_job(clean, "only", 1)]))
+            .await
+            .unwrap();
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id: clean,
+                job_id: JobId("only".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .rerun_run(RerunRun {
+                run_id: clean,
+                mode: RerunMode::Failed,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .expect_err("rerun-failed on an all-success run must conflict");
+        assert!(
+            matches!(err, ControlError::Conflict(_)),
+            "expected conflict, got {err:?}"
+        );
+    }
+
+    /// A single-job rerun resets that job and its dependents; an unknown
+    /// job id is `NotFound`.
+    pub(crate) async fn rerun_job_selects_one_job_and_dependents(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut down = submit_job(run_id, "down", 2);
+        down.queued.needs = vec![JobId("pick".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![
+                    submit_job(run_id, "pick", 1),
+                    submit_job(run_id, "other", 3),
+                    down,
+                ],
+            ))
+            .await
+            .unwrap();
+        for job in ["pick", "down", "other"] {
+            backend
+                .complete_job(crate::control::backend::JobCompletionInput {
+                    run_id,
+                    job_id: JobId(job.to_owned()),
+                    agent_job_id: None,
+                    status: ExecutionStatus::Success,
+                    outputs: BTreeMap::new(),
+                    runner_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::Job(JobId("pick".to_owned())),
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let selected: Vec<&str> = outcome
+            .rerun_jobs
+            .iter()
+            .map(|(id, _)| id.0.as_str())
+            .collect();
+        assert!(
+            selected.contains(&"pick")
+                && selected.contains(&"down")
+                && !selected.contains(&"other"),
+            "job mode selects the job and dependents only: {selected:?}"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs[&JobId("other".to_owned())],
+            ExecutionStatus::Success,
+            "unrelated jobs keep their result"
+        );
+
+        // The run must be terminal again before the unknown-job probe:
+        // the completed-run guard precedes selection.
+        for job in ["pick", "down"] {
+            backend
+                .complete_job(crate::control::backend::JobCompletionInput {
+                    run_id,
+                    job_id: JobId(job.to_owned()),
+                    agent_job_id: None,
+                    status: ExecutionStatus::Success,
+                    outputs: BTreeMap::new(),
+                    runner_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        let err = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::Job(JobId("ghost".to_owned())),
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .expect_err("an unknown job id must 404");
+        assert!(
+            matches!(err, ControlError::NotFound(_)),
+            "expected not-found, got {err:?}"
+        );
+    }
+
+    /// `(µs since the epoch)` matching the `completed_at` column.
+    fn epoch_us() -> i64 {
+        crate::models::now_unix_nanos() / 1_000
+    }
+
+    /// One completed single-job run whose job settled with `status`.
+    pub(crate) async fn settle_single_job(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        status: ExecutionStatus,
+    ) {
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        complete_single_job(backend, run_id, status).await;
+    }
+
+    /// Complete the `build` job of an already-submitted single-job run.
+    /// (Re-submitting the same run id would collide on `job_specs`.)
+    pub(crate) async fn complete_single_job(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        status: ExecutionStatus,
+    ) {
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A re-run re-arms an environment protection gate for the new attempt:
+    /// the previous attempt's satisfied wait timer does not carry over, the
+    /// fresh gate parks the job, and only an elapsed timer releases it
+    /// through the normal promotion path.
+    pub(crate) async fn rerun_rearms_environment_gate(backend: &dyn ControlBackend) {
+        let rules = |wait_minutes: u64| {
+            let mut rules = EnvironmentRulesMap::new();
+            rules.entry("owner/repo".to_owned()).or_default().insert(
+                "prod".to_owned(),
+                crate::config::EnvironmentRules {
+                    deployment_branches: Vec::new(),
+                    wait_timer_minutes: wait_minutes,
+                    required_reviewers: 0,
+                    ..Default::default()
+                },
+            );
+            rules
+        };
+        let gate = |wait_until_unix_nanos: Option<i64>| crate::models::EnvironmentGateState {
+            wait_until_unix_nanos,
+            approval_requested_at_unix_nanos: None,
+            ..Default::default()
+        };
+        let now = crate::models::now_unix_nanos();
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules(0),
+        ));
+
+        // Attempt 1: an elapsed gate admits the job under a zero-minute
+        // timer; the job succeeds and the run settles.
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        submit.jobs[0].queued.environment_gate = Some(gate(Some(now - 1)));
+        backend.submit_run(submit).await.unwrap();
+        assert_eq!(
+            backend
+                .promote_ready_jobs(Some(run_id))
+                .await
+                .unwrap()
+                .promoted,
+            1,
+            "the elapsed gate admits attempt 1"
+        );
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: job_id.clone(),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules(5),
+        ));
+        // Attempt 2 runs under a 5-minute timer: the gate must re-arm, not
+        // inherit attempt 1's satisfied one.
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: rules(5),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 2);
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned())),
+            "the re-armed gate parks the re-run job"
+        );
+        let armed = backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job row")
+            .gate
+            .expect("the new attempt carries an armed gate");
+        let wait_until = armed
+            .wait_until_unix_nanos
+            .expect("the wait timer is armed");
+        assert!(
+            wait_until > now,
+            "the re-armed timer is in the future: {wait_until} vs {now}"
+        );
+        assert_eq!(
+            backend
+                .promote_ready_jobs(Some(run_id))
+                .await
+                .unwrap()
+                .promoted,
+            0,
+            "an unexpired re-armed timer must not release the job"
+        );
+        // The clock elapsing releases it through the same promotion path.
+        backend
+            .set_environment_gate(run_id, &job_id, Some(gate(Some(now - 1))))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .promote_ready_jobs(Some(run_id))
+                .await
+                .unwrap()
+                .promoted,
+            1,
+            "the elapsed re-armed timer releases the job"
+        );
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned()))
+        );
+    }
+
+    /// A re-run re-acquires the workflow-level concurrency group for its new
+    /// attempt: a completed run holds nothing, and the rerun parks behind a
+    /// live holder until the holder releases — then advances like any waiter.
+    pub(crate) async fn rerun_reacquires_workflow_concurrency(backend: &dyn ControlBackend) {
+        let run_x = RunId::new();
+        let mut submit_x = submit_run(run_x, vec![submit_job(run_x, "deploy", 1)]);
+        submit_x.workflow_concurrency = Some(workflow_concurrency("release", false));
+        assert!(!backend.submit_run(submit_x).await.unwrap().held);
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id: run_x,
+                job_id: JobId("deploy".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .run_record(run_x)
+                .await
+                .unwrap()
+                .status
+                .is_terminal()
+        );
+        assert!(
+            !backend.run_held(run_x).await.unwrap(),
+            "a completed run holds no concurrency group"
+        );
+
+        // A live holder takes the group.
+        let run_h = RunId::new();
+        let mut submit_h = submit_run(run_h, vec![submit_job(run_h, "hold", 2)]);
+        submit_h.workflow_concurrency = Some(workflow_concurrency("release", false));
+        assert!(!backend.submit_run(submit_h).await.unwrap().held);
+
+        // The re-run must re-acquire for attempt 2: parked behind the holder.
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id: run_x,
+                mode: RerunMode::All,
+                workflow_concurrency: Some(workflow_concurrency("release", false)),
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 2);
+        assert!(outcome.held, "the re-run parks behind the live holder");
+        assert!(backend.run_held(run_x).await.unwrap());
+        assert_eq!(
+            backend
+                .job_queue_state(run_x, &JobId("deploy".to_owned()))
+                .await
+                .unwrap()
+                .map(|(queue_state, _)| queue_state)
+                .as_deref(),
+            Some("blocked"),
+            "the rerun's job waits on the workflow gate"
+        );
+
+        // Releasing the holder promotes the parked re-run.
+        backend.cancel_run(run_h, None).await.unwrap();
+        assert!(!backend.run_held(run_x).await.unwrap());
+        assert_eq!(
+            backend
+                .job_queue_state(run_x, &JobId("deploy".to_owned()))
+                .await
+                .unwrap()
+                .map(|(queue_state, _)| queue_state)
+                .as_deref(),
+            Some("ready"),
+            "the released gate promotes the re-run's job"
+        );
+    }
+
+    /// A re-run re-acquires a job-level `concurrency:` group: a live holder
+    /// of the same group parks the re-run job, which advances when the holder
+    /// settles.
+    pub(crate) async fn rerun_reacquires_job_concurrency(backend: &dyn ControlBackend) {
+        let job_concurrency = |group: &str| preloop_gha_parser::Concurrency {
+            group: group.to_owned(),
+            cancel_in_progress: Some("false".to_owned()),
+            queue: preloop_gha_parser::ConcurrencyQueue::Single,
+        };
+        let run_x = RunId::new();
+        let mut job_x = submit_job(run_x, "deploy", 1);
+        job_x.queued.concurrency = Some(job_concurrency("job-g"));
+        assert!(
+            !backend
+                .submit_run(submit_run(run_x, vec![job_x]))
+                .await
+                .unwrap()
+                .held
+        );
+        assert_eq!(
+            backend
+                .job_queue_state(run_x, &JobId("deploy".to_owned()))
+                .await
+                .unwrap()
+                .map(|(queue_state, _)| queue_state)
+                .as_deref(),
+            Some("ready"),
+            "attempt 1 acquires the job gate"
+        );
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id: run_x,
+                job_id: JobId("deploy".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        // A live holder of the same job group.
+        let run_h = RunId::new();
+        let mut job_h = submit_job(run_h, "hold", 2);
+        job_h.queued.concurrency = Some(job_concurrency("job-g"));
+        assert!(
+            !backend
+                .submit_run(submit_run(run_h, vec![job_h]))
+                .await
+                .unwrap()
+                .held
+        );
+        assert_eq!(
+            backend
+                .job_queue_state(run_h, &JobId("hold".to_owned()))
+                .await
+                .unwrap()
+                .map(|(queue_state, _)| queue_state)
+                .as_deref(),
+            Some("ready"),
+            "the holder owns the job gate"
+        );
+
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id: run_x,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.queued_jobs, 1);
+        assert_eq!(
+            backend
+                .job_queue_state(run_x, &JobId("deploy".to_owned()))
+                .await
+                .unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned())),
+            "the re-run parks on the job gate"
+        );
+
+        // The holder settling promotes the parked re-run.
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id: run_h,
+                job_id: JobId("hold".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .job_queue_state(run_x, &JobId("deploy".to_owned()))
+                .await
+                .unwrap()
+                .map(|(queue_state, _)| queue_state)
+                .as_deref(),
+            Some("ready"),
+            "the released job gate promotes the re-run"
+        );
+    }
+
+    /// Attempt N+1 re-archives over the snapshotted attempt N: the rerun
+    /// leaves attempt 1 in `run_history`/`job_history`, and the archiver's
+    /// later insert of attempt 2 must not collide with it. The archived
+    /// record resolves to the newest attempt.
+    pub(crate) async fn rerun_then_archive_keeps_each_attempt(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Success).await;
+
+        // Attempt 2: rerun, complete, settle again.
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 2);
+        complete_single_job(backend, run_id, ExecutionStatus::Success).await;
+        assert_eq!(backend.run_record(run_id).await.unwrap().run_attempt, 2);
+
+        // Past the 60-second grace with the hold disabled: the archiver
+        // copies attempt 2 over the attempt-1 row the rerun snapshot wrote.
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 120 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32, None)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "the settled attempt-2 run archives"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.run_attempt, 2,
+            "the archived view is the newest attempt"
+        );
+        assert_eq!(record.status, ExecutionStatus::Success);
+        assert_eq!(record.conclusion.as_deref(), Some("success"));
+        assert_eq!(
+            record.jobs[&JobId("build".to_owned())],
+            ExecutionStatus::Success
+        );
+    }
+
+    /// The in-place re-run hold: a completed run with a failed job stays in
+    /// the live tables for the whole window (30 days by default) and is still
+    /// re-runnable in place long after the 60-second grace.
+    pub(crate) async fn archiver_hold_keeps_failed_runs_rerunnable(backend: &dyn ControlBackend) {
+        let hold = Some(std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Failure).await;
+        // Ten minutes later: far past the grace, well inside the window.
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 10 * 60 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            !backend
+                .archive_finished_runs(32, hold)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "a failed run inside the rerun window is held live"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(record.run_attempt, 1, "the live row is still attempt 1");
+        assert!(record.status.is_terminal());
+
+        // Held live means rerunnable in place.
+        let outcome = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_attempt, 2);
+        assert!(
+            !backend
+                .run_record(run_id)
+                .await
+                .unwrap()
+                .status
+                .is_terminal()
+        );
+    }
+
+    /// A successful run archives on the 60-second grace alone: the hold only
+    /// protects runs a re-run can still use (at least one failed job).
+    pub(crate) async fn archiver_archives_successful_runs_after_the_grace(
+        backend: &dyn ControlBackend,
+    ) {
+        let hold = Some(std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Success).await;
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 120 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32, hold)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "a successful run archives after the grace even with the hold set"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(record.status, ExecutionStatus::Success);
+        assert_eq!(record.run_attempt, 1);
+    }
+
+    /// A failed run older than the window archives on the same pass: the hold
+    /// is a countdown, not a permanent exemption.
+    pub(crate) async fn archiver_window_expiry_archives_failed_runs(backend: &dyn ControlBackend) {
+        let hold = Some(std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Failure).await;
+        // 31 days later — one day past the window.
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 31 * 24 * 60 * 60 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32, hold)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "a failed run past the window archives"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert!(record.status.is_terminal(), "the archived record resolves");
+        // A live row is gone: an in-place rerun is no longer possible.
+        let err = backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode: RerunMode::All,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .expect_err("an archived run has no live rows to rerun");
+        assert!(matches!(err, ControlError::NotFound(_)), "got {err:?}");
+    }
+
+    /// `PRELOOP_RERUN_WINDOW_DAYS=0` (the resolved `None` hold) disables the
+    /// exemption: a failed run archives on the 60-second policy.
+    pub(crate) async fn archiver_hold_disabled_archives_failed_runs(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Failure).await;
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 10 * 60 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32, None)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "a disabled hold archives a failed run"
+        );
+    }
+
+    /// Retention still wins over the re-run hold: `expired_terminal_runs`
+    /// selects a held live row and `delete_expired_run` removes it.
+    pub(crate) async fn retention_removes_held_failed_runs(backend: &dyn ControlBackend) {
+        let hold = Some(std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Failure).await;
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 10 * 60 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            !backend
+                .archive_finished_runs(32, hold)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "the hold keeps the run live"
+        );
+        let expired = backend.expired_terminal_runs(epoch_us(), 32).await.unwrap();
+        assert!(
+            expired.contains(&run_id),
+            "retention sees the held live run: {expired:?}"
+        );
+        backend.delete_expired_run(run_id).await.unwrap();
+        let err = backend
+            .run_record(run_id)
+            .await
+            .expect_err("the deleted run is gone");
+        assert!(matches!(err, ControlError::NotFound(_)), "got {err:?}");
+    }
+
+    /// A held failed run is invisible to the scheduling paths: its jobs are
+    /// terminal, so promotion finds nothing, the ready queue stays empty and
+    /// a polling runner claims nothing.
+    pub(crate) async fn held_failed_run_is_invisible_to_scheduling(backend: &dyn ControlBackend) {
+        use crate::control::types::PollOutcome;
+
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let hold = Some(std::time::Duration::from_secs(30 * 24 * 60 * 60));
+        let run_id = RunId::new();
+        settle_single_job(backend, run_id, ExecutionStatus::Failure).await;
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 10 * 60 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            !backend
+                .archive_finished_runs(32, hold)
+                .await
+                .unwrap()
+                .contains(&run_id)
+        );
+
+        assert_eq!(
+            backend.queue_stats().await.unwrap().ready,
+            0,
+            "the held run has no ready job"
+        );
+        assert_eq!(
+            backend
+                .promote_ready_jobs(Some(run_id))
+                .await
+                .unwrap()
+                .promoted,
+            0,
+            "promotion finds nothing in a terminal run"
+        );
+        assert_eq!(
+            backend.queue_stats().await.unwrap().ready,
+            0,
+            "still nothing after the promotion sweep"
+        );
+        match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Empty => {}
+            other => panic!("a held terminal run must not dispatch: {other:?}"),
+        }
     }
 }
 
@@ -7968,6 +8914,109 @@ mod pg {
         };
         suite::ids_and_timestamps_are_stored_canonically(&backend).await;
     }
+    #[tokio::test]
+    async fn rerun_all_resets_jobs_and_bumps_attempt() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_all_resets_jobs_and_bumps_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_failed_recovers_dependents() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_failed_recovers_dependents(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_job_selects_one_job_and_dependents() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_job_selects_one_job_and_dependents(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_rearms_environment_gate() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_rearms_environment_gate(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_reacquires_workflow_concurrency() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_reacquires_workflow_concurrency(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_reacquires_job_concurrency() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_reacquires_job_concurrency(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_then_archive_keeps_each_attempt() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_then_archive_keeps_each_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn archiver_hold_keeps_failed_runs_rerunnable() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::archiver_hold_keeps_failed_runs_rerunnable(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn archiver_archives_successful_runs_after_the_grace() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::archiver_archives_successful_runs_after_the_grace(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn archiver_window_expiry_archives_failed_runs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::archiver_window_expiry_archives_failed_runs(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn archiver_hold_disabled_archives_failed_runs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::archiver_hold_disabled_archives_failed_runs(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn retention_removes_held_failed_runs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::retention_removes_held_failed_runs(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn held_failed_run_is_invisible_to_scheduling() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::held_failed_run_is_invisible_to_scheduling(&backend).await;
+    }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
@@ -8260,6 +9309,76 @@ mod lite {
             total - consumed,
             "a reopened consumer must resume at the persisted bookmark"
         );
+    }
+
+    #[tokio::test]
+    async fn rerun_all_resets_jobs_and_bumps_attempt() {
+        suite::rerun_all_resets_jobs_and_bumps_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_failed_recovers_dependents() {
+        suite::rerun_failed_recovers_dependents(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_job_selects_one_job_and_dependents() {
+        suite::rerun_job_selects_one_job_and_dependents(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_rearms_environment_gate() {
+        suite::rerun_rearms_environment_gate(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_reacquires_workflow_concurrency() {
+        suite::rerun_reacquires_workflow_concurrency(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_reacquires_job_concurrency() {
+        suite::rerun_reacquires_job_concurrency(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn rerun_then_archive_keeps_each_attempt() {
+        suite::rerun_then_archive_keeps_each_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn archiver_hold_keeps_failed_runs_rerunnable() {
+        suite::archiver_hold_keeps_failed_runs_rerunnable(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn archiver_archives_successful_runs_after_the_grace() {
+        suite::archiver_archives_successful_runs_after_the_grace(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn archiver_window_expiry_archives_failed_runs() {
+        suite::archiver_window_expiry_archives_failed_runs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn archiver_hold_disabled_archives_failed_runs() {
+        suite::archiver_hold_disabled_archives_failed_runs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retention_removes_held_failed_runs() {
+        suite::retention_removes_held_failed_runs(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn held_failed_run_is_invisible_to_scheduling() {
+        suite::held_failed_run_is_invisible_to_scheduling(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -8623,7 +9742,7 @@ mod lite {
             .unwrap();
         assert!(
             backend
-                .archive_finished_runs(32)
+                .archive_finished_runs(32, None)
                 .await
                 .unwrap()
                 .contains(&run_id),

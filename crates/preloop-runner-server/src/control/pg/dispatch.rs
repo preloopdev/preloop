@@ -416,7 +416,7 @@ async fn insert_spec_rows(
 /// Mint a `job_requests` row (identity `request_id`) and the step manifest.
 /// No `job_leases` row: the schema's lease exists only while an attempt is
 /// claimed (`bind_claim` inserts it); the row is NOT NULL on runner/expiry.
-async fn insert_request_row(
+pub(super) async fn insert_request_row(
     tx: &Transaction<'_>,
     graph: &RunGraph,
     request: &TaskAgentJobRequestRecord,
@@ -2672,11 +2672,11 @@ impl<'a> Sweep<'a> {
         }))
     }
 
-    fn mark(&mut self, run_id: RunId, job_id: &JobId) {
+    pub(super) fn mark(&mut self, run_id: RunId, job_id: &JobId) {
         self.dirty.insert((run_id, job_id.clone()));
     }
 
-    fn node_mut(&mut self, run_id: RunId, job_id: &JobId) -> Option<&mut Node> {
+    pub(super) fn node_mut(&mut self, run_id: RunId, job_id: &JobId) -> Option<&mut Node> {
         self.graphs.get_mut(&run_id)?.nodes.get_mut(job_id)
     }
 
@@ -3046,7 +3046,11 @@ impl<'a> Sweep<'a> {
     }
 
     /// Hydrate + enqueue one promotable job.
-    async fn enqueue(&mut self, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
+    pub(super) async fn enqueue(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
         self.hydrate_node(run_id, job_id).await?;
         let now = self.now;
         let graph = self.graph(run_id).await?;
@@ -3080,7 +3084,7 @@ impl<'a> Sweep<'a> {
     }
 
     /// Park a promotable node behind concurrency (`held` state).
-    fn hold_node(&mut self, run_id: RunId, job_id: &JobId) {
+    pub(super) fn hold_node(&mut self, run_id: RunId, job_id: &JobId) {
         let now = self.now;
         if let Some(node) = self.node_mut(run_id, job_id) {
             node.status = ExecutionStatus::Pending;
@@ -3403,7 +3407,7 @@ impl<'a> Sweep<'a> {
     }
 
     /// Evaluate + acquire a job's own `concurrency:` gate.
-    async fn job_gate(
+    pub(super) async fn job_gate(
         &mut self,
         run_id: RunId,
         job_id: &JobId,
