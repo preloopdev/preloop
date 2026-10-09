@@ -106,6 +106,11 @@ pub struct BrokerRenewJobRequest {
     pub annotations: Vec<serde_json::Value>,
     #[serde(default)]
     pub step_results: Vec<preloop_gha_protocol::CompletionStepResult>,
+    /// The job's `environment.url`, evaluated by the runner after its steps
+    /// (official `CompleteJobRequest.environmentUrl`). Absent when the job
+    /// has no environment URL or its expression did not resolve.
+    #[serde(rename = "environmentUrl", default)]
+    pub environment_url: Option<String>,
 }
 
 pub fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -1310,6 +1315,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
             outputs: preloop_gha_protocol::OutputMap::new(),
             annotations: Vec::new(),
             step_results: Vec::new(),
+            environment_url: None,
         };
         // The caller is already returning the mint failure to the runner, so a
         // secondary bookkeeping error must not mask it.
@@ -1696,6 +1702,7 @@ pub async fn broker_complete_job(
             outputs,
             annotations: request.annotations.clone(),
             step_results: request.step_results.clone(),
+            environment_url: request.environment_url.clone(),
         },
         Some(crate::distributed_task::AttemptSettle {
             agent_job_id: request.job_id,

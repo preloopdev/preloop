@@ -7,6 +7,7 @@
 
 use super::codec::{self, now_us};
 use super::db;
+use crate::control::logic;
 use crate::control::types::*;
 use crate::models::{QueuedJob, RunRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
@@ -347,6 +348,12 @@ pub(super) fn insert_job(
     job_order: i64,
     spec_extras: &SpecExtras<'_>,
 ) -> Result<(), ControlError> {
+    let event: String = tx
+        .prepare_cached("SELECT event FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id)], |row| row.get(0))
+        .map_err(db)?;
+    let priority = logic::run_priority(&event);
     let now = now_us();
     tx.prepare_cached(
         "INSERT INTO jobs (run_id, job_id, namespace_id, kind, parent_job_id, \
@@ -354,7 +361,7 @@ pub(super) fn insert_job(
              runner_group, priority, run_order, job_order, enqueued_at, \
              deps_ready_at, concurrency_wait_at, concurrency_acquired_at, \
              environment_gate, created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?15,?16,?17,?18,?19,?20) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
          ON CONFLICT (run_id, job_id) DO NOTHING",
     )
     .map_err(db)?
@@ -371,6 +378,7 @@ pub(super) fn insert_job(
         compute_pool_key(&job.runs_on, job.runner_group.as_deref()),
         serde_json::to_string(&job.runs_on).unwrap_or_default(),
         job.runner_group,
+        priority,
         run_order,
         job_order,
         job.enqueued_at_unix_nanos
@@ -581,11 +589,12 @@ pub(super) fn ready_count(tx: &Transaction<'_>) -> Result<usize, ControlError> {
         .map_err(db)
 }
 
-/// `runs-on` labels of the ready-queue front, in claim order.
+/// `runs-on` labels of the ready-queue front, in claim order (the shared
+/// global queue order, matching pg `ready_front_labels_on`).
 pub(super) fn next_ready_labels(tx: &Transaction<'_>) -> Result<Vec<String>, ControlError> {
     tx.prepare_cached(
         "SELECT runs_on FROM jobs WHERE queue_state = 'ready' \
-         ORDER BY priority DESC, run_order, job_order LIMIT 1",
+         ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
     )
     .map_err(db)?
     .query_row([], |row| row.get::<_, String>(0))
@@ -1419,6 +1428,17 @@ pub(super) fn namespace_of(tx: &Transaction<'_>, run_id: RunId) -> Result<String
         .optional()
         .map_err(db)
         .map(|value: Option<String>| value.unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned()))
+}
+
+/// The run's submit time in microseconds (0 when the row is missing): the
+/// `run_order` every job of the run shares.
+pub(super) fn run_created_at_us(tx: &Transaction<'_>, run_id: RunId) -> Result<i64, ControlError> {
+    tx.prepare_cached("SELECT created_at FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| row.get(0))
+        .optional()
+        .map_err(db)
+        .map(|value: Option<i64>| value.unwrap_or(0))
 }
 
 /// Overlay a live-derived map onto the stored `record_details` map: stored

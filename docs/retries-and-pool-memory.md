@@ -1,9 +1,7 @@
 # Retry, backoff, and pool memory bounds
 
 How preloop retries failures, when it backs off, and how the runner pool
-keeps itself inside the host's memory budget. Written after the 2026-08-20
-outage, where a 22 GiB production host OOMed because on-demand fork
-concurrency was sized by CPU only.
+keeps itself inside the host's memory budget.
 
 ## Retry philosophy, in one line
 
@@ -92,8 +90,8 @@ No retry loops — single-shot submits with a reqwest timeout.
 
 1. **`run_on_demand_slot` provision failure retries at fixed 500 ms, unbounded.**
    The slot-supervisor exponential backoff above it does **not** damp this
-   inner loop — a broken smolvm spins ~2 attempts/s. Not the OOM cause, but
-   noisy; a per-slot attempt counter with escalation would be an improvement.
+   inner loop — a broken smolvm spins ~2 attempts/s. Noisy; a per-slot
+   attempt counter with escalation would be an improvement.
 2. **`wait_for_services_healthy` polls forever** (exp 2→32 s, no cap). Only
    the outer job timeout ends it. Matches the official runner, so changing
    it needs a fidelity note.
@@ -104,14 +102,14 @@ No retry loops — single-shot submits with a reqwest timeout.
 
 ## Pool memory bounds (the OOM guard)
 
-Before 2026-08-20, on-demand fork concurrency was sized **by CPU only**:
+Sizing on-demand fork concurrency **by CPU only** is not safe:
 
 ```
 (available_parallelism / cpus_per_runner) - 1   // floor 1
 ```
 
-On the 6-core / 22 GiB production host with `PRELOOP_RUNNER_MEMORY_MIB=8192`,
-that allowed enough 8 GiB forks to exhaust RAM and OOM the control plane —
+With `PRELOOP_RUNNER_MEMORY_MIB=8192` on a modest host, that allows enough
+8 GiB forks to exhaust RAM and OOM the control plane —
 the golden alone commits 8 GiB, every fork inherits that footprint and grows
 toward the ceiling while its job runs, and warm mode provisions a successor
 mid-job (so `size + 1` VMs are live).
@@ -141,7 +139,7 @@ max_concurrent = min(cpu_term, by_memory)
 
 | Host | Runner ceiling | Cap |
 |---|---|---|
-| 22 GiB | 8 GiB | 1 (production case) |
+| 22 GiB | 8 GiB | 1 |
 | 64 GiB | 8 GiB | 6 |
 | 32 GiB | 4 GiB | 6 |
 | 8 GiB | 8 GiB | 1 (floor) |
