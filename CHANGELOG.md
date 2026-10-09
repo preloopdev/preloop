@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.34.0] - 2026-10-09
+
 ### Changed
 
 - **The warm pool forks on completion instead of replacing mid-job**: a slot
