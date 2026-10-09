@@ -170,9 +170,7 @@ async fn render_session_message(
         // a real GitHub credential. Without one the job's token surface stays
         // empty — never the job-scoped runtime token, which is an engine
         // credential (`broker_acquire_job` documents the full reasoning).
-        if !fork_restricted
-            && let Some(pat) = shared.state.static_github_pat()
-        {
+        if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // The PAT is embedded only when its OAuth scopes are verified
             // (fresh cache, or re-introspected here: the job may have queued
             // past the cache TTL); unverifiable authority stays withheld and

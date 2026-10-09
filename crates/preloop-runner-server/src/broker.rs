@@ -1051,9 +1051,7 @@ pub async fn broker_acquire_job(
                 ctx.id_token_granted.unwrap_or(false),
             )
             .fork_restricted;
-        if !fork_restricted
-            && let Some(pat) = shared.state.static_github_pat()
-        {
+        if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // A static PAT is embedded only when its OAuth scopes are
             // verified (fresh cache, or re-introspected here: the job may have
             // queued past the cache TTL); unverifiable authority stays
