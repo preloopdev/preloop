@@ -1000,15 +1000,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     .unwrap();
 
     let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
-    // Local pull-request submissions now build GitHub's test merge, so this
-    // webhook fixture needs the same origin that a checked-out workspace has.
-    let origin = temp.path().join("origin.git");
-    git_fixture_command(&ws_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-    git_fixture_command(
-        &ws_dir,
-        &["remote", "add", "origin", origin.to_str().unwrap()],
-    );
-    git_fixture_command(&ws_dir, &["push", "-q", "origin", "main"]);
+    add_fixture_origin(temp.path(), &ws_dir);
 
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());

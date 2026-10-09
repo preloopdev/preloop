@@ -1308,6 +1308,21 @@ pub fn commit_workflow_fixture(worktree: &FsPath, paths: &[&str]) -> String {
         .trim()
         .to_owned()
 }
+/// Give a local Git fixture the origin remote required by pull-request merge
+/// snapshots. The bare repository is kept beside the workspace so each test
+/// remains self-contained.
+pub fn add_fixture_origin(root: &FsPath, worktree: &FsPath) {
+    let origin = root.join("origin.git");
+    git_fixture_command(
+        worktree,
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+    git_fixture_command(
+        worktree,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git_fixture_command(worktree, &["push", "-q", "origin", "main"]);
+}
 
 pub fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
     // Fixture commits must not depend on the machine's global git identity:
