@@ -45,7 +45,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
@@ -145,7 +145,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
@@ -285,7 +285,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
       - name: Select Rust toolchain binaries
@@ -405,7 +405,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
       - name: Select Rust toolchain binaries

@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
           lfs: true
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: 0.26.3
@@ -67,3 +67,28 @@ jobs:
             .runner-watch/conformance-report.md
             .runner-watch/conformance-fail.toml
           if-no-files-found: error
+
+  hosted-runtime-parity:
+    name: Hosted runtime parity
+    # Runs inside a real preloop guest on the cpane bench and asserts the
+    # runtime a job sees there — process limits, sysctls, the machine's own
+    # hostname, the step environment — against a real GitHub-hosted runner's
+    # (values and provenance in fixtures/hosted-runtime-probe.sh, the same
+    # script the fixture workflows run). It takes seconds and needs no network
+    # beyond the checkout.
+    #
+    # This checks the DEPLOYED engine and golden, not the pull request's build:
+    # the job's VM is provisioned by the bench's running engine, and nothing in
+    # this workflow boots an engine built from the PR. A golden rebake or a
+    # deployed-engine regression shows up here as a red check; the PR's own
+    # binary is validated by the guest run recorded in the pull request body
+    # (the macstudio/AgentENV harnesses rebuild from a branch and re-run this
+    # same script).
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Assert the guest's runtime matches a GitHub-hosted runner's
+        run: sh fixtures/hosted-runtime-probe.sh
