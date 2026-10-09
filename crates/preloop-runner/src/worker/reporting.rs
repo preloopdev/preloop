@@ -126,6 +126,22 @@ fn azdo_timeline_record_from_step_update(s: &super::server_queue::StepUpdate) ->
         }
     }
 
+    // Official `JobServerQueue` merges the background-step metadata into the
+    // timeline record (v2.336.0): `IsBackground` only when set, the control
+    // fields with `??` semantics, so they survive later status-only updates.
+    if let Some(is_background) = s.is_background {
+        record["isBackground"] = serde_json::json!(is_background);
+    }
+    if let Some(control_type) = &s.background_control_type {
+        record["backgroundControlType"] = serde_json::json!(control_type);
+    }
+    if !s.background_control_step_ids.is_empty() {
+        record["backgroundControlStepIds"] = serde_json::json!(s.background_control_step_ids);
+    }
+    if let Some(group) = &s.parallel_group_id {
+        record["parallelGroupId"] = serde_json::json!(group);
+    }
+
     record
 }
 
@@ -525,5 +541,73 @@ pub(crate) async fn upload_diagnostic_logs(
             zip_path.display()
         ),
         Err(e) => warn!("Diagnostic log upload failed: {e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::server_queue::{StepUpdate, step_conclusion, step_status};
+
+    /// The AzDO timeline record carries the official background-step metadata
+    /// (v2.336.0 `JobServerQueue` merge): `isBackground`, the control fields,
+    /// and the parallel group, each omitted when unset.
+    #[test]
+    fn azdo_record_carries_background_step_metadata() {
+        let background = StepUpdate {
+            external_id: "bg".into(),
+            number: 3,
+            name: "background".into(),
+            status: step_status::IN_PROGRESS,
+            is_background: Some(true),
+            parallel_group_id: Some("group-1".into()),
+            ..Default::default()
+        };
+        let record = azdo_timeline_record_from_step_update(&background);
+        assert_eq!(record["isBackground"], serde_json::json!(true));
+        assert_eq!(record["parallelGroupId"], serde_json::json!("group-1"));
+        assert!(record.get("backgroundControlType").is_none());
+        assert!(record.get("backgroundControlStepIds").is_none());
+
+        let control = StepUpdate {
+            external_id: "wait".into(),
+            number: 4,
+            name: "wait".into(),
+            status: step_status::COMPLETED,
+            conclusion: step_conclusion::SUCCEEDED,
+            background_control_type: Some("waitAll".into()),
+            background_control_step_ids: vec!["bg-external-id".into()],
+            ..Default::default()
+        };
+        let record = azdo_timeline_record_from_step_update(&control);
+        assert_eq!(
+            record["backgroundControlType"],
+            serde_json::json!("waitAll")
+        );
+        assert_eq!(
+            record["backgroundControlStepIds"],
+            serde_json::json!(["bg-external-id"])
+        );
+        assert_eq!(record["state"], serde_json::json!("completed"));
+        assert!(record.get("isBackground").is_none());
+
+        // An ordinary step serializes none of the metadata.
+        let ordinary = StepUpdate {
+            external_id: "run".into(),
+            number: 5,
+            name: "echo hi".into(),
+            status: step_status::COMPLETED,
+            conclusion: step_conclusion::SUCCEEDED,
+            ..Default::default()
+        };
+        let record = azdo_timeline_record_from_step_update(&ordinary);
+        for key in [
+            "isBackground",
+            "backgroundControlType",
+            "backgroundControlStepIds",
+            "parallelGroupId",
+        ] {
+            assert!(record.get(key).is_none(), "{key} must be omitted");
+        }
     }
 }

@@ -111,6 +111,7 @@ async fn periodic_drain_flushes_queued_step_updates() {
         started_at: Some("2026-01-01T00:00:00Z".to_string()),
         completed_at: None,
         conclusion: 0,
+        ..Default::default()
     });
 
     let (cancel_tx, mut cancel_rx) = watch::channel(false);

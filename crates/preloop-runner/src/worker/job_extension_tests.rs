@@ -1172,7 +1172,10 @@ fn lifecycle_fixture(
             timeout_minutes: spec.timeout_minutes,
             env,
             raw: serde_json::json!({"generated": index, "metadata": spec.metadata}),
-            is_background: index % 2 == 0,
+            // Foreground: these fixtures pin lifecycle ordering, and a
+            // background step would inject the implicit wait-all (covered by
+            // the dedicated background-step tests).
+            is_background: false,
         });
     }
 
@@ -1630,4 +1633,83 @@ fn step_timeout_is_read_from_a_number_token() {
 
     assert_eq!(built.len(), 1);
     assert_eq!(built[0].timeout_minutes, Some(1));
+}
+
+/// A control step's `stepIds` arrive in the coordinator's own key space
+/// (context names) on live payloads, but a payload that lists the target's
+/// wire `id` (the GUID used as `external_id`) must resolve too: an unresolved
+/// target is reported unknown and the wait/cancel silently does nothing.
+#[test]
+fn build_step_list_translates_control_targets_to_context_names() {
+    let background_id = "11111111-1111-1111-1111-111111111111";
+    let steps = vec![
+        serde_json::json!({
+            "id": background_id,
+            "contextName": "db",
+            "background": true,
+            "reference": { "type": "script" },
+            "inputs": { "type": 2, "map": [{ "key": "script", "value": "echo hi" }] },
+        }),
+        serde_json::json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "contextName": "wait-db",
+            "controlType": "waitAll",
+            "stepIds": [background_id],
+        }),
+    ];
+
+    let result = build_step_list(&steps, &serde_json::json!({}));
+
+    assert!(result[0].is_background);
+    match &result[1].step_type {
+        StepType::ControlFlow {
+            control_type,
+            step_ids,
+        } => {
+            assert_eq!(control_type, "waitAll");
+            assert_eq!(
+                step_ids,
+                &["db".to_string()],
+                "the wire id must be translated to the context name"
+            );
+        }
+        other => panic!("expected a control step, got {other:?}"),
+    }
+}
+
+/// Control-flow types are stored in the official
+/// `Pipelines.BackgroundControlTypes` spelling; the hyphenated `wait-all` is
+/// accepted for preloop-generated payloads.
+#[test]
+fn build_step_list_canonicalizes_control_types() {
+    let steps = vec![
+        serde_json::json!({
+            "id": "w1",
+            "contextName": "wait-all",
+            "controlType": "wait-all",
+            "stepIds": ["db"],
+        }),
+        serde_json::json!({
+            "id": "w2",
+            "contextName": "wait-one",
+            "controlType": "wait",
+            "stepIds": ["db"],
+        }),
+        serde_json::json!({
+            "id": "w3",
+            "contextName": "kill",
+            "controlType": "cancel",
+            "stepIds": ["db"],
+        }),
+    ];
+
+    let result = build_step_list(&steps, &serde_json::json!({}));
+
+    let control_type = |index: usize| match &result[index].step_type {
+        StepType::ControlFlow { control_type, .. } => control_type.clone(),
+        other => panic!("expected a control step, got {other:?}"),
+    };
+    assert_eq!(control_type(0), "waitAll");
+    assert_eq!(control_type(1), "wait");
+    assert_eq!(control_type(2), "cancel");
 }

@@ -66,6 +66,25 @@ pub struct FileCommandPaths {
     pub artifacts_list_file: PathBuf,
 }
 
+/// The writes a step's file commands applied, in application order.
+///
+/// Background steps defer their state until a wait/cancel flush. Recording the
+/// writes themselves — rather than diffing the post-execution snapshot against
+/// the dispatch-time one — keeps a write that happens to restore the
+/// dispatch-time value, and lets the flush replay exactly what the step asked
+/// for: the official `DeferredEnvironmentVariables` / `DeferredPrependPath` /
+/// deferred-state semantics.
+#[derive(Debug, Default, Clone)]
+pub struct FileCommandWrites {
+    /// `GITHUB_ENV` assignments in file order (later assignments win).
+    pub env: Vec<(String, String)>,
+    /// `GITHUB_PATH` entries in file order.
+    pub path: Vec<String>,
+    /// `GITHUB_STATE` assignments as `(step id, key, value)`; the step id is
+    /// already mapped through the `__pre_`/`__post_` aliasing.
+    pub state: Vec<(String, String, String)>,
+}
+
 /// Create temp files for file commands and return the paths.
 ///
 /// When `job` is provided, `$GITHUB_ARTIFACTS_LIST` is pre-populated with the
@@ -323,6 +342,21 @@ pub fn apply_file_commands(
     step_id: &str,
     job: &mut super::contexts::JobContext,
 ) -> Result<()> {
+    let mut writes = FileCommandWrites::default();
+    apply_file_commands_tracked(paths, step_id, job, &mut writes)
+}
+
+/// [`apply_file_commands`], additionally recording every write it applies.
+///
+/// Background steps use the recorded writes to defer `GITHUB_ENV` /
+/// `GITHUB_PATH` / `GITHUB_STATE` to their wait/cancel flush exactly, instead
+/// of inferring the delta from the final snapshot.
+pub fn apply_file_commands_tracked(
+    paths: &FileCommandPaths,
+    step_id: &str,
+    job: &mut super::contexts::JobContext,
+    writes: &mut FileCommandWrites,
+) -> Result<()> {
     // Apply GITHUB_ENV. Match the official runner security block: NODE_OPTIONS
     // must not be set through GITHUB_ENV because it can alter runner-hosted
     // Node action execution.
@@ -335,6 +369,7 @@ pub fn apply_file_commands(
             continue;
         }
         debug!("GITHUB_ENV: {k}={v}");
+        writes.env.push((k.clone(), v.clone()));
         job.env.insert(k, v);
     }
 
@@ -342,6 +377,9 @@ pub fn apply_file_commands(
     // each non-empty file line in read order. Preserve that order while keeping
     // newer file-command batches ahead of older additions.
     let extra_paths = parse_path_file(&paths.path_file)?;
+    // Record in file order (the application loop below rewinds); the deferred
+    // flush replays the same order.
+    writes.path.extend(extra_paths.iter().cloned());
     for p in extra_paths.into_iter().rev() {
         debug!("GITHUB_PATH: {p}");
         job.extra_path.insert(0, p);
@@ -366,6 +404,9 @@ pub fn apply_file_commands(
             .unwrap_or(step_id);
         let step_state = job.state.entry(state_step_id.to_string()).or_default();
         for (k, v) in state {
+            writes
+                .state
+                .push((state_step_id.to_string(), k.clone(), v.clone()));
             step_state.insert(k, v);
         }
     }
