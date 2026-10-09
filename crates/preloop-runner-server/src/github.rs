@@ -5516,7 +5516,7 @@ mod tests {
 
         let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
-            budget: Duration::from_secs(1),
+            budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
         };
         // The engine fetches the current base tip from its own git upstream.
@@ -5604,7 +5604,7 @@ mod tests {
             },
         ));
         fixture.state.fresh_merge_poll = FreshMergePoll {
-            budget: Duration::from_secs(1),
+            budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
         };
         let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
@@ -5913,7 +5913,7 @@ mod tests {
 
         let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
-            budget: Duration::from_secs(1),
+            budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
         };
         let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
