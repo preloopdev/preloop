@@ -170,7 +170,6 @@ fn rerun_run_tx(
         run_id,
         mode,
         workflow_concurrency,
-        environment_rules,
         templates,
     } = rerun;
     let run = codec::run_key(run_id);
@@ -357,6 +356,7 @@ fn rerun_run_tx(
     let mut queued = 0usize;
     let platforms = jobs::registered_platforms(tx)?;
     let pool_labels = backend.pool_labels();
+    let environment_resolver = backend.environment_resolver();
     let runner_labels = if pool_labels.is_empty() {
         Vec::new()
     } else {
@@ -476,19 +476,26 @@ fn rerun_run_tx(
             continue;
         }
 
-        // Environment protection re-evaluates exactly like submit: the old
-        // gate state is discarded (`None`) and a wait/approval re-arms.
         let mut gate = None;
-        let _env_outcome = runtime_scheduling::evaluate_environment_gate(
-            &environment_rules,
-            &repository,
-            &git_ref,
-            run_id,
-            &job_id,
-            spec.environment.as_ref(),
-            &mut gate,
-            crate::models::now_unix_nanos(),
-        );
+        if let Some(environment) = spec
+            .environment
+            .as_ref()
+            .and_then(|value| runtime_scheduling::environment_gate_name_of(Some(value)))
+            .map(str::to_owned)
+            && (member.needs.is_empty()
+                || runtime_scheduling::resolved_environment_name_of(&environment).is_some())
+        {
+            let lookup = environment_resolver.lookup_sync(&repository, &environment);
+            let _env_outcome = runtime_scheduling::evaluate_environment_gate(
+                &lookup,
+                &git_ref,
+                run_id,
+                &job_id,
+                &environment,
+                &mut gate,
+                crate::models::now_unix_nanos(),
+            );
+        }
         // Submit parks a `Wait`/`Failed` verdict as held+pending; the
         // reaper's `promote_ready_jobs` sweep releases or fails it.
         let gate_json = gate

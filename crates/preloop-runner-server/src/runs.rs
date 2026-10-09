@@ -3840,7 +3840,6 @@ pub(crate) async fn rerun_run_inner(
             run_id,
             mode: mode.clone(),
             workflow_concurrency,
-            environment_rules: shared.state.environment_rules.clone(),
             templates,
         })
         .await

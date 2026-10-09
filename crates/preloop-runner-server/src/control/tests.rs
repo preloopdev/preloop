@@ -2721,7 +2721,7 @@ pub(crate) mod suite {
         backdate(run_id).await;
         assert!(
             backend
-                .archive_finished_runs(32)
+                .archive_finished_runs(32, None)
                 .await
                 .unwrap()
                 .contains(&run_id),
@@ -6579,7 +6579,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6626,7 +6625,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6640,7 +6638,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6700,7 +6697,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::Failed,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6770,7 +6766,6 @@ pub(crate) mod suite {
                 run_id: clean,
                 mode: RerunMode::Failed,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6817,7 +6812,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::Job(JobId("pick".to_owned())),
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6860,7 +6854,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::Job(JobId("ghost".to_owned())),
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -6912,18 +6905,21 @@ pub(crate) mod suite {
                     deployment_branches: Vec::new(),
                     wait_timer_minutes: wait_minutes,
                     required_reviewers: 0,
+                    ..Default::default()
                 },
             );
             rules
         };
         let gate = |wait_until_unix_nanos: Option<i64>| crate::models::EnvironmentGateState {
             wait_until_unix_nanos,
-            approval_requested_at_unix_nanos: None,
-            approvals_unix_nanos: Vec::new(),
+            ..Default::default()
         };
         let now = crate::models::now_unix_nanos();
         let run_id = RunId::new();
         let job_id = JobId("deploy".to_owned());
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules(0),
+        ));
 
         // Attempt 1: an elapsed gate admits the job under a zero-minute
         // timer; the job succeeds and the run settles.
@@ -6933,7 +6929,7 @@ pub(crate) mod suite {
         backend.submit_run(submit).await.unwrap();
         assert_eq!(
             backend
-                .promote_ready_jobs(Some(run_id), &rules(0))
+                .promote_ready_jobs(Some(run_id))
                 .await
                 .unwrap()
                 .promoted,
@@ -6951,6 +6947,9 @@ pub(crate) mod suite {
             })
             .await
             .unwrap();
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules(5),
+        ));
 
         // Attempt 2 runs under a 5-minute timer: the gate must re-arm, not
         // inherit attempt 1's satisfied one.
@@ -6959,7 +6958,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: rules(5),
                 templates: Vec::new(),
             })
             .await
@@ -6986,7 +6984,7 @@ pub(crate) mod suite {
         );
         assert_eq!(
             backend
-                .promote_ready_jobs(Some(run_id), &rules(5))
+                .promote_ready_jobs(Some(run_id))
                 .await
                 .unwrap()
                 .promoted,
@@ -7000,7 +6998,7 @@ pub(crate) mod suite {
             .unwrap();
         assert_eq!(
             backend
-                .promote_ready_jobs(Some(run_id), &rules(5))
+                .promote_ready_jobs(Some(run_id))
                 .await
                 .unwrap()
                 .promoted,
@@ -7057,7 +7055,6 @@ pub(crate) mod suite {
                 run_id: run_x,
                 mode: RerunMode::All,
                 workflow_concurrency: Some(workflow_concurrency("release", false)),
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -7159,7 +7156,6 @@ pub(crate) mod suite {
                 run_id: run_x,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -7212,7 +7208,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -7278,7 +7273,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -7346,7 +7340,6 @@ pub(crate) mod suite {
                 run_id,
                 mode: RerunMode::All,
                 workflow_concurrency: None,
-                environment_rules: EnvironmentRulesMap::default(),
                 templates: Vec::new(),
             })
             .await
@@ -7440,7 +7433,7 @@ pub(crate) mod suite {
         );
         assert_eq!(
             backend
-                .promote_ready_jobs(Some(run_id), &EnvironmentRulesMap::new())
+                .promote_ready_jobs(Some(run_id))
                 .await
                 .unwrap()
                 .promoted,

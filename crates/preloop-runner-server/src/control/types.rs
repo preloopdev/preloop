@@ -402,9 +402,6 @@ pub(crate) struct RerunRun {
     /// `run_submissions.record_details.workflow_concurrency`), re-acquired
     /// for the new attempt. `None` when the workflow declares none.
     pub(crate) workflow_concurrency: Option<WorkflowConcurrency>,
-    /// The node-local environment protection rules, re-evaluated for every
-    /// reset job exactly as at submit.
-    pub(crate) environment_rules: crate::config::EnvironmentRulesMap,
     /// Rebuilt templates for reset jobs that have no stored `job_messages`
     /// row. A reset job with neither a stored row nor a template here is
     /// concluded `Failure` rather than left messageless on the ready queue.
