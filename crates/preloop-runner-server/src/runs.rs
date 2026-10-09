@@ -4075,7 +4075,7 @@ pub async fn rerun_run(
         job_id: None,
     });
     let mode = crate::control::types::RerunMode::try_from(&request)?;
-    rerun_run_with_mode(&shared, run_id, mode, None)
+    rerun_run_with_mode(&shared, run_id, mode, None, None)
         .await
         .map(Json)
 }

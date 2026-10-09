@@ -8641,187 +8641,6 @@ mod pg {
             "no decision is recorded against a job the sweep already failed"
         );
     }
-    #[tokio::test]
-    async fn rerun_all_resets_jobs_and_bumps_attempt() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_all_resets_jobs_and_bumps_attempt(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn rerun_failed_recovers_dependents() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_failed_recovers_dependents(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn rerun_job_selects_one_job_and_dependents() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_job_selects_one_job_and_dependents(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn rerun_rearms_environment_gate() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_rearms_environment_gate(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn rerun_reacquires_workflow_concurrency() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_reacquires_workflow_concurrency(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn rerun_reacquires_job_concurrency() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_reacquires_job_concurrency(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn rerun_then_archive_keeps_each_attempt() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_then_archive_keeps_each_attempt(&backend).await;
-    }
-    #[tokio::test]
-    async fn rerun_request_links_actor_and_history() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::rerun_request_links_and_actor(&backend).await;
-        let run_id = backend
-            .runs_for_repository("owner/repo")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|run| run.run_attempt == 2)
-            .expect("rerun run")
-            .run_id;
-        let client = backend.writer().await.unwrap();
-        let rows = client
-            .query(
-                "SELECT run_attempt, job_id, request_id FROM job_history \
-                 WHERE run_id = $1::text::uuid ORDER BY run_attempt, job_id",
-                &[&run_id.0.to_string()],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 4);
-        let values: Vec<(i32, String, Option<i64>)> = rows
-            .iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2)))
-            .collect();
-        let a1 = values
-            .iter()
-            .find(|(a, j, _)| *a == 1 && j == "a")
-            .unwrap()
-            .2;
-        let b1 = values
-            .iter()
-            .find(|(a, j, _)| *a == 1 && j == "b")
-            .unwrap()
-            .2;
-        let a2 = values
-            .iter()
-            .find(|(a, j, _)| *a == 2 && j == "a")
-            .unwrap()
-            .2;
-        let b2 = values
-            .iter()
-            .find(|(a, j, _)| *a == 2 && j == "b")
-            .unwrap()
-            .2;
-        assert!(a1.is_some() && b1.is_some());
-        assert_eq!(a2, a1);
-        assert!(b2.is_some() && b2 != b1);
-        let submission: String = client
-            .query_one(
-                "SELECT submission::text FROM run_history \
-                 WHERE run_id = $1::text::uuid AND run_attempt = 1",
-                &[&run_id.0.to_string()],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&submission).unwrap()["actor"],
-            "original"
-        );
-        drop(client);
-        let skipped = suite::rerun_reset_concluded_clears_request(&backend).await;
-        let client = backend.writer().await.unwrap();
-        let pointer: Option<i64> = client
-            .query_one(
-                "SELECT request_id FROM jobs WHERE run_id = $1::text::uuid AND job_id = 'skip'",
-                &[&skipped.0.to_string()],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(pointer, None);
-    }
-
-    #[tokio::test]
-    async fn archiver_hold_keeps_failed_runs_rerunnable() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::archiver_hold_keeps_failed_runs_rerunnable(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn archiver_archives_successful_runs_after_the_grace() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::archiver_archives_successful_runs_after_the_grace(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn archiver_window_expiry_archives_failed_runs() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::archiver_window_expiry_archives_failed_runs(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn archiver_hold_disabled_archives_failed_runs() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::archiver_hold_disabled_archives_failed_runs(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn retention_removes_held_failed_runs() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::retention_removes_held_failed_runs(&backend).await;
-    }
-
-    #[tokio::test]
-    async fn held_failed_run_is_invisible_to_scheduling() {
-        let Some((_pg, backend)) = backend().await else {
-            return skip_no_postgres();
-        };
-        suite::held_failed_run_is_invisible_to_scheduling(&backend).await;
-    }
-
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
         // Distinct `run_number` per submit: the agreed schema keys
         // `runs_number` on (namespace, repo, path, number, attempt), so
@@ -9309,6 +9128,70 @@ mod pg {
             return skip_no_postgres();
         };
         suite::rerun_then_archive_keeps_each_attempt(&backend).await;
+    }
+    #[tokio::test]
+    async fn rerun_request_links_actor_and_history() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::rerun_request_links_and_actor(&backend).await;
+        let run_id = backend
+            .runs_for_repository("owner/repo")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run_attempt == 2)
+            .expect("rerun run")
+            .run_id;
+        let client = backend.writer().await.unwrap();
+        let rows = client
+            .query(
+                "SELECT run_attempt, job_id, request_id FROM job_history \
+                 WHERE run_id = $1::text::uuid ORDER BY run_attempt, job_id",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        let values: Vec<(i32, String, Option<i64>)> = rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        let a1 = values
+            .iter()
+            .find(|(a, j, _)| *a == 1 && j == "a")
+            .unwrap()
+            .2;
+        let b1 = values
+            .iter()
+            .find(|(a, j, _)| *a == 1 && j == "b")
+            .unwrap()
+            .2;
+        let a2 = values
+            .iter()
+            .find(|(a, j, _)| *a == 2 && j == "a")
+            .unwrap()
+            .2;
+        let b2 = values
+            .iter()
+            .find(|(a, j, _)| *a == 2 && j == "b")
+            .unwrap()
+            .2;
+        assert!(a1.is_some() && b1.is_some());
+        assert_eq!(a2, a1);
+        assert!(b2.is_some() && b2 != b1);
+        drop(client);
+        let skipped = suite::rerun_reset_concluded_clears_request(&backend).await;
+        let client = backend.writer().await.unwrap();
+        let pointer: Option<i64> = client
+            .query_one(
+                "SELECT request_id FROM jobs WHERE run_id = $1::text::uuid AND job_id = 'skip'",
+                &[&skipped.0.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(pointer, None);
     }
 
     #[tokio::test]
