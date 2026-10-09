@@ -1,4 +1,9 @@
 //! Check-run webhook adapter.
+//!
+//! A `check_run` workflow run executes the workflow file from the repository
+//! default branch (the check's head SHA is payload data, not the checkout
+//! revision), so the run carries default branch (`Trusted`) authority,
+//! exactly as on github.com.
 
 use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
@@ -43,7 +48,7 @@ impl EventAdapter for Adapter {
             sha: None,
             status_check_sha: None,
             activity_type: Some(action.to_owned()),
-            trust_tier: Some(TrustTier::Untrusted),
+            trust_tier: Some(TrustTier::Trusted),
             skip: false,
             payload: payload.clone(),
             upstream_workflow_names: vec![],

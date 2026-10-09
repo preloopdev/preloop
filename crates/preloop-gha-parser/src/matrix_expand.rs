@@ -283,6 +283,82 @@ fn value_key(value: &Value) -> String {
     }
 }
 
+/// GitHub's display-name length cap (`JobNameBuilder.Build`).
+const MAX_DISPLAY_NAME_LEN: usize = 100;
+
+/// Collect the scalar leaves of one matrix value in declaration order.
+///
+/// `JobNameBuilder` walks the cell with `Traverse(omitKeys: true)` and appends
+/// a segment for every `String`/`Number`/`Boolean` leaf it meets, so an object
+/// or array axis value is flattened into its values (keys dropped, `null`
+/// skipped) rather than rendered as JSON.
+fn display_segments(value: &Value, segments: &mut Vec<String>) {
+    match value {
+        Value::String(value) => {
+            if !value.is_empty() {
+                segments.push(value.clone());
+            }
+        }
+        Value::Number(number) => segments.push(number.to_string()),
+        Value::Bool(flag) => segments.push(flag.to_string()),
+        Value::Array(values) => {
+            for value in values {
+                display_segments(value, segments);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                display_segments(value, segments);
+            }
+        }
+        Value::Null => {}
+    }
+}
+
+/// GitHub's display name for one expanded matrix job: `base (leaf, leaf)`.
+///
+/// Unlike [`expanded_job_id`], which keeps every cell uniquely identifiable,
+/// this is the string GitHub shows as the job/check name. An object-valued
+/// matrix cell renders as its values in declaration order — valkey's
+/// `server: [{version: 8.1.4, file: …}]` reads
+/// `test-ubuntu-latest-compatibility (8.1.4, valkey-8.1.4-noble-x86_64.tar.gz)`
+/// — and the whole name is capped at 100 characters, trailing `...`.
+///
+/// The cap applies with or without segments: `JobNameBuilder.Build` picks the
+/// bare name when nothing was appended and runs the length check afterwards,
+/// so a job with no scalar leaves (no matrix at all, or only `null`/empty
+/// cells) still truncates.
+pub fn display_job_name(base: &str, matrix: &IndexMap<String, Value>) -> String {
+    let mut segments = Vec::new();
+    for value in matrix.values() {
+        display_segments(value, &mut segments);
+    }
+    if segments.is_empty() {
+        return truncate_display_name(base.to_owned());
+    }
+    truncate_display_name(format!("{base} ({})", segments.join(", ")))
+}
+
+/// `JobNameBuilder` truncates past 100 characters: the first 97 plus `...`.
+///
+/// .NET counts UTF-16 code units; cut on a `char` boundary so a multi-byte
+/// character is never split.
+fn truncate_display_name(name: String) -> String {
+    let mut units = 0;
+    let mut keep = 0;
+    for (index, character) in name.char_indices() {
+        if units + character.len_utf16() > MAX_DISPLAY_NAME_LEN - 3 {
+            break;
+        }
+        units += character.len_utf16();
+        keep = index + character.len_utf8();
+    }
+    if name.encode_utf16().count() <= MAX_DISPLAY_NAME_LEN {
+        return name;
+    }
+    format!("{}...", &name[..keep])
+}
+
 fn matches_partial(candidate: &IndexMap<String, Value>, partial: &IndexMap<String, Value>) -> bool {
     partial.iter().all(|(key, value)| {
         candidate
@@ -1168,5 +1244,109 @@ jobs:
                 jobs.len()
             );
         }
+    }
+
+    /// An object-valued axis renders as its values, the way GitHub's
+    /// `JobNameBuilder` walks the cell with `Traverse(omitKeys: true)`.
+    ///
+    /// valkey's compatibility matrix is `server: [{version, file}]`; GitHub
+    /// shows `(8.1.4, valkey-8.1.4-noble-x86_64.tar.gz)`, not the JSON object.
+    #[test]
+    fn display_name_flattens_object_valued_axis() {
+        let mut matrix = IndexMap::new();
+        matrix.insert(
+            "server".into(),
+            json!({"version": "8.1.4", "file": "valkey-8.1.4-noble-x86_64.tar.gz"}),
+        );
+        assert_eq!(
+            display_job_name("test-ubuntu-latest-compatibility", &matrix),
+            "test-ubuntu-latest-compatibility (8.1.4, valkey-8.1.4-noble-x86_64.tar.gz)"
+        );
+        // The id keeps every cell distinguishable — and for scalars it is the
+        // same string, which is why the two builders coincide on the common shape.
+        assert_eq!(
+            expanded_job_id("test-ubuntu-latest-compatibility", &matrix),
+            "test-ubuntu-latest-compatibility ({\"version\":\"8.1.4\",\"file\":\"valkey-8.1.4-noble-x86_64.tar.gz\"})"
+        );
+    }
+
+    /// Scalar axes, numbers and booleans keep GitHub's rendering; null and
+    /// nested containers are flattened (never rendered as JSON).
+    #[test]
+    fn display_name_flattens_nested_values_and_skips_null() {
+        let mut matrix = IndexMap::new();
+        matrix.insert("os".into(), json!("ubuntu-latest"));
+        matrix.insert("node".into(), json!(3.9));
+        matrix.insert("experimental".into(), json!(true));
+        assert_eq!(
+            display_job_name("build", &matrix),
+            "build (ubuntu-latest, 3.9, true)"
+        );
+        assert_eq!(
+            display_job_name("build", &matrix),
+            expanded_job_id("build", &matrix)
+        );
+
+        let mut nested = IndexMap::new();
+        nested.insert("empty".into(), json!(null));
+        nested.insert("pair".into(), json!([{"a": "x", "b": "y"}, "z"]));
+        assert_eq!(display_job_name("build", &nested), "build (x, y, z)");
+
+        let mut nothing = IndexMap::new();
+        nothing.insert("empty".into(), json!(null));
+        assert_eq!(display_job_name("build", &nothing), "build");
+    }
+
+    /// `JobNameBuilder.Build` caps the rendered name at 100 characters, first
+    /// 97 plus `...`, without splitting a multi-byte character.
+    #[test]
+    fn display_name_caps_at_github_max_length() {
+        let long = "x".repeat(120);
+        let mut matrix = IndexMap::new();
+        matrix.insert("axis".into(), json!(long.clone()));
+        let name = display_job_name("job", &matrix);
+        assert_eq!(name.encode_utf16().count(), 100);
+        assert!(name.ends_with("..."));
+        // 100 = 5 ("job (") + 92 leaves + 3 ("..."), i.e. the first 97
+        // characters preserved and then the ellipsis.
+        assert_eq!(name, format!("job ({}...", "x".repeat(92)));
+
+        // Exactly 100 characters is left alone.
+        let exact = "y".repeat(100 - "job (".len() - ")".len());
+        let mut matrix = IndexMap::new();
+        matrix.insert("axis".into(), json!(exact));
+        assert_eq!(display_job_name("job", &matrix).len(), 100);
+
+        // A multi-byte tail is cut on a char boundary.
+        let mut matrix = IndexMap::new();
+        matrix.insert("axis".into(), json!("é".repeat(120)));
+        let name = display_job_name("job", &matrix);
+        assert!(name.ends_with("..."));
+        assert!(name.is_char_boundary(name.len() - 3));
+    }
+
+    /// The cap applies to the bare name too: `JobNameBuilder.Build` selects
+    /// the bare name when no segment was appended and runs the length check
+    /// unconditionally, so a matrix whose cells carry no scalar leaves (only
+    /// `null`, or an empty object/array) still truncates a long job key.
+    #[test]
+    fn display_name_caps_bare_name_without_segments() {
+        let long_base = "b".repeat(120);
+        for matrix in [
+            IndexMap::<String, Value>::new(),
+            IndexMap::from([("empty".to_string(), json!(null))]),
+            IndexMap::from([("blank".to_string(), json!(""))]),
+            IndexMap::from([("object".to_string(), json!({}))]),
+            IndexMap::from([("array".to_string(), json!([[], {}]))]),
+        ] {
+            let name = display_job_name(&long_base, &matrix);
+            assert_eq!(name.encode_utf16().count(), 100, "matrix: {matrix:?}");
+            assert_eq!(name, format!("{}...", "b".repeat(97)));
+        }
+
+        // Under the cap the bare name is returned unchanged.
+        let mut nothing = IndexMap::new();
+        nothing.insert("empty".into(), json!(null));
+        assert_eq!(display_job_name("build", &nothing), "build");
     }
 }

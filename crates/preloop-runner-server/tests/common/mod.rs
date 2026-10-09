@@ -1786,6 +1786,38 @@ pub fn wire_variable<'a>(message: &'a Value, name: &str) -> Option<&'a str> {
         })
 }
 
+/// The `github` context's `token` entry from a claimed wire job message.
+///
+/// `contextData.github` rides the official typed-dict encoding
+/// (`{"d": [{"k": …, "v": …}, …]}`), so a plain `["token"]` lookup finds
+/// nothing; `None` therefore means the context carries no token entry at all —
+/// the same state the official runner sees in a message without
+/// `system.github.token`, where `${{ github.token }}` resolves empty.
+pub fn github_context_token(message: &Value) -> Option<String> {
+    message["contextData"]["github"]["d"]
+        .as_array()?
+        .iter()
+        .find(|pair| pair["k"].as_str() == Some("token"))
+        .and_then(|pair| pair["v"].as_str())
+        .map(str::to_owned)
+}
+
+/// The `SystemVssConnection` endpoint's access token — the job-scoped runtime
+/// token the engine authenticates its own APIs with, which is deliberately not
+/// the job's `GITHUB_TOKEN`.
+pub fn service_endpoint_token(message: &Value) -> Option<String> {
+    message["resources"]["endpoints"]
+        .as_array()?
+        .iter()
+        .find(|endpoint| {
+            endpoint["name"]
+                .as_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SystemVssConnection"))
+        })
+        .and_then(|endpoint| endpoint["authorization"]["parameters"]["AccessToken"].as_str())
+        .map(str::to_owned)
+}
+
 /// Submission-supplied secrets survive a restart in the SecretProvider's run
 /// tier (where acquire resolves them) and never in the control database.
 pub async fn assert_run_secrets_outside_database(
