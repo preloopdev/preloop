@@ -1021,6 +1021,35 @@ callees are unchanged: `secrets: inherit` keeps the caller's whole scope,
 (`secrets.GITHUB_TOKEN`, OIDC/runtime tokens) are minted per claim and
 never went through the stored set anyway.
 
+### 3d. Environment protection (GitHub-sourced rules)
+
+Environment rules come from the repository's environments API (branch
+policies, wait timer, required reviewers, `prevent_self_review`). Known gap
+against GitHub:
+
+**Custom deployment protection rules — job fails closed (deliberate).**
+GitHub drives these third-party Apps (Datadog, Honeycomb, New Relic, Sentry,
+ServiceNow, NodeSource, or an org's own App) by sending the
+`deployment_protection_rule` webhook once a *GitHub Actions* job reaches the
+environment; the App answers through
+`POST /repos/{o}/{r}/actions/runs/{run_id}/deployment_protection_rule`, which
+needs a GitHub Actions run id. Preloop jobs have none, and preloop cannot send
+the webhook itself (the App's webhook URL and signing secret belong to the
+App's owner). So an environment with any enabled custom rule fails the job
+(`runtime_scheduling::evaluate_environment_gate`, logged as `environment gate
+denied: custom deployment protection rules are enabled` with the App slugs).
+Nothing can override it, including the native `/approve` endpoint: the job is
+already terminal. Workaround: disable the rule on that environment. Prevalence
+(2026-10-08 survey of ~460 public repos: 265 deploying to
+`environment: production`, plus the 200 most-starred): 0 vendor Apps, 2
+homegrown Apps (`electron/electron`, `astral-sh/uv`). Private repos can only
+use custom rules on GitHub Enterprise, so the survey cannot see that usage.
+Options if demand appears: admin bypass gated on the environment's
+`can_admins_bypass`; per-vendor checks (Datadog's rule is "every monitor
+tagged `git_repo`/`git_env` is OK", reproducible through its monitor API);
+or dispatching a stand-in GitHub Actions job against the environment and
+mirroring its outcome.
+
 ---
 
 ## 4. Pluggable backends &amp; deployment modes

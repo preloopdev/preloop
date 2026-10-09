@@ -551,6 +551,54 @@ Run Postgres however you like, a managed service, a `postgres` container on
 the same host, or an OS package. The engine does not bundle or spawn a
 database server; SQLite is the embedded option, Postgres is an external
 dependency you point at.
+
+### Importing a legacy `preloop.db`
+
+Builds before the control backend stored durable state in a different SQLite
+layout at the same default path (`<state dir>/preloop.db`, `PRAGMA
+user_version = 11`). It is never read automatically — `preloop serve` refuses
+a database it does not recognize — so move it forward explicitly, once:
+
+```sh
+sudo systemctl stop preloop          # stop the legacy server first
+preloop store import-legacy \
+  --source /var/lib/preloop/preloop.db \
+  --target /var/lib/preloop/control.db \
+  --state-dir /var/lib/preloop
+```
+
+The source is opened read-only and hashed before and after the run; nothing
+is written to it. The database and its sidecars (run-secret tiers under
+`<state dir>/run-secrets/<run_id>`, log segments under
+`<state dir>/live-logs`) are staged in hidden target-owned paths, verified
+(`PRAGMA foreign_key_check`, row counts, schema version), and only then
+published: sidecars first (never replacing an existing file), then the
+database renamed into place. A failure removes the staging files and
+publishes nothing, and a retry adopts byte-equivalent leftovers. Point the
+server at the imported file with `preloop serve --store
+sqlite:///var/lib/preloop/control.db`, or move it over `preloop.db` after
+keeping a backup.
+
+Work that was in flight when the old server stopped is refused by default:
+claimed attempts on unfinished jobs, session bindings to them, and live
+concurrency gates are listed and the import aborts. A claim whose job and run
+are already terminal is stale history, not live work: the attempt is imported
+settled — terminal result, `finished_at`, no runner/session binding, no lease,
+never `ready`/`claimed` — and the settlement is counted in the report.
+Concurrency gates whose holder runs are terminal or were already evicted are
+released as history the same way (a stopped legacy process can never release
+them); gates held by an unfinished run still refuse. Let the old server drain,
+or choose explicitly: `--active=requeue` releases the claims and requeues the
+jobs, `--active=cancel` settles them as cancelled; both record what they
+released in the report. The legacy event log is carried into the outbox and the
+finalized artifact registry (v1 `meta.artifacts` records and
+`artifact_v2_registry.json`) into `artifacts`, and buffered timeline events
+into the outbox. Anything the importer does not carry into a table is written
+to `<state dir>/legacy-import-archive.json`; only state that cannot be
+carried faithfully and is node-local (queued broker/protocol frames,
+in-flight artifact/cache uploads, pool provisioning marks) refuses the
+import rather than dropping it. `--json` prints the full report, including
+everything that was reconstructed or archived.
 ## Running as a service
 
 For a team server that must survive reboots and restarts, install the engine

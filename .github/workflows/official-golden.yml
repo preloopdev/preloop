@@ -227,9 +227,9 @@ jobs:
           cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
           rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4"
           # Guest disk must hold extracted layers + merged layer + pack
-          # staging. 120G died at `pack binary: tar error: No space left
-          # on device` (35267336773, 35279487232); sparse on host, so
-          # 200G is safe.
+          # staging. 120G was not enough (`pack binary: tar error: No space
+          # left on device`) and the file is sparse on the host, so 200G is
+          # safe.
           truncate -s "${GOLDEN_GUEST_GIB}G" "$HOME/.smolvm/storage-template.ext4"
           mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
           truncate -s "${GOLDEN_GUEST_GIB}G" "$HOME/.smolvm/overlay-template.ext4"
@@ -258,17 +258,15 @@ jobs:
           set -euo pipefail
           # `pack create` stages the extracted layers, the merged layer, the
           # agent rootfs and an ext4 template next to the output — tens of
-          # GiB for a runner-scale base. release-golden #73 died there with
-          # `flushing extracted layers to disk failed (out of space?)`.
-          # Hosted images ship ~30 GiB of toolchains this bake never touches.
+          # GiB for a runner-scale base, on top of the ~30 GiB of toolchains
+          # a hosted image ships and this bake never touches.
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           # Release build finished above; build-golden only needs the
-          # binaries and the runner bundle. Drop rebuild cache and registry
-          # downloads: 35257438708 died writing flat-export.tmp (ENOSPC)
-          # with 105G free — pack staging needs every GiB.
+          # binaries and the runner bundle. Drop the rebuild cache and
+          # registry downloads: pack staging needs every GiB.
           rm -rf target/release/deps target/release/build \
             target/release/.fingerprint target/release/incremental \
             "$HOME/.cargo/registry/cache" "$HOME/.cargo/registry/src" || true
@@ -284,9 +282,9 @@ jobs:
           set -euo pipefail
           # `pack create` writes the export's layers and an ext4 template the
           # size of the guest disk next to the output, so the host needs at
-          # least the guest's own size free. 35257438708 burned three attempts
-          # inside `smolvm pack` with 110G free for a ${GOLDEN_GUEST_GIB}G
-          # guest; fail fast here instead.
+          # least the guest's own size free; fail fast here instead of letting
+          # `smolvm pack` burn its full runtime and die with `tar error: No
+          # space left on device`.
           need_gib=$((GOLDEN_GUEST_GIB + 20))
           avail_gib=$(df --output=avail -BG / | tail -n1 | tr -dc '0-9')
           echo "pack staging: ${avail_gib}G free, needs ~${need_gib}G (guest ${GOLDEN_GUEST_GIB}G + staging and output)"
@@ -323,17 +321,16 @@ jobs:
           clear_staging
           # Stream the base from the registry inside the bake VM. Do NOT go
           # back to a host `docker save` tar: the 17 GiB export does not fit
-          # the hosted runner's disk (release-golden #66-rerun/#71: `docker
-          # save` dies with `no space left on device` after a successful
-          # pull). Streaming keeps every copy off the host filesystem.
+          # the hosted runner's disk, and `docker save` dies with `no space
+          # left on device` after a successful pull. Streaming keeps every
+          # copy off the host filesystem.
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           # Guest disk must hold extracted layers + merged layer + pack
-          # staging. 120G died at `pack binary: tar error: No space left on
-          # device` (35267336773), and 200G died the same way on a host with
-          # 110G free (35257438708): the pack materialises the template on the
-          # *host*, so "sparse on host" does not make 200G safe — the headroom
-          # gate above requires host free space to cover it before starting.
+          # staging. A guest-sized disk alone is never enough: the pack
+          # materialises the template on the *host*, so "sparse on host" does
+          # not make a 200G template safe — the headroom gate above requires
+          # host free space to cover it before starting.
           export PRELOOP_RUNNER_STORAGE_GB="$GOLDEN_GUEST_GIB"
           export PRELOOP_RUNNER_OVERLAY_GB="$GOLDEN_GUEST_GIB"
           # The runner-large base archive is ~17 GiB uncompressed, over
@@ -342,22 +339,20 @@ jobs:
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
           # `pack create --from-vm` boots an export helper whose disk defaults
           # to 3x the source. Growing the template filesystem to that size at
-          # helper boot (~420 ms) delays the agent's accept loop; its control
-          # listener has a backlog of 1, so the host's other boot connections
-          # are reset and libkrun abandons them after 10000 back-to-back
-          # retries (~350 ms on a fast KVM host), failing the pack with
-          # `Connection reset by peer`. A helper disk the template's size boots
-          # without the grow.
+          # helper boot delays the agent's accept loop; its control listener
+          # has a backlog of 1, so the host's other boot connections are reset
+          # and libkrun abandons them after 10000 back-to-back retries,
+          # failing the pack with `Connection reset by peer`. A helper disk
+          # the template's size boots without the grow.
           export SMOLVM_EXPORT_HELPER_STORAGE_GIB="$GOLDEN_GUEST_GIB"
           # SmolVM machine names allow only ASCII alphanumerics and hyphens.
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-x86-64"
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
-          # Answer the guest directly instead of through the NAT DNS proxy
-          # (100.96.0.1), which has never resolved ghcr.io from a bake VM on
-          # a hosted runner: release-golden #68/#69/#70 burned 9/9 attempts
-          # on `crane manifest ... lookup ghcr.io ... i/o timeout`, and #73
-          # proved the same run pulls fine the moment this is set. Trying the
-          # broken default first only costs an attempt and a backoff.
+          # Answer the guest directly instead of through the NAT DNS proxy:
+          # the proxy has never resolved ghcr.io from a bake VM on a hosted
+          # runner (`crane manifest ... lookup ghcr.io ... i/o timeout`), and
+          # this setting makes the same pull succeed. Trying the default first
+          # only costs an attempt and a backoff.
           export PRELOOP_RUNNER_DNS=1.1.1.1
           need_mib=6144
           attempts=3
@@ -463,6 +458,7 @@ jobs:
           split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
           sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
 
-  # aarch64 golden: built once on macstudio (hosted macOS EINVAL blocks the
-  # bake), published to ghcr.io/preloopdev/preloop-arm64-smolvm-golden
-  # and consumed via PRELOOP_GOLDEN_OCI_REF. No CI bake — the artifact is a release input.
+  # aarch64 golden: built once on an Apple Silicon host (hosted macOS EINVAL
+  # blocks the bake), published to
+  # ghcr.io/preloopdev/preloop-arm64-smolvm-golden and consumed via
+  # PRELOOP_GOLDEN_OCI_REF. No CI bake — the artifact is a release input.
