@@ -732,20 +732,17 @@ mod tests {
         assert!(selection.warnings.is_empty());
     }
 
-    /// Regression: upstream's `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION`
-    /// (`NodeUtil.GetInternalNodeVersion`, v2.338.0) selects the runtime for
-    /// the runner's own node consumers. This runner has none — every node
-    /// binary it executes is selected here, job-driven — so the variable is
-    /// intentionally ignored and job-declared `using: node20` keeps the
-    /// upstream phase-1 default (`useNode24ByDefault=false`). If an internal
-    /// node consumer is ever added (e.g. a `check` command or node-executed
-    /// `hashFiles`), it must resolve through a dedicated analogue that honors
-    /// this env var and defaults to `node24`, not through this function.
-    /// `resolve` takes no environment input, so this test only asserts the
-    /// default selection — env mutation belongs in a dedicated consumer test
-    /// (in a child process) if one is ever added.
+    /// Regression: job-side `resolve` keeps the upstream phase-1 default
+    /// (`useNode24ByDefault=false`) — `using: node20` selects node20 with no
+    /// warning. This function takes no environment input; the internal-node
+    /// analogue that *does* honor `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION`
+    /// lives in `completion.rs` for `.js` job hooks (v2.338.0
+    /// `GetInternalNodeVersion`: `_defaultNodeVersion` node20 → node24). Any
+    /// further internal consumer (a `check` command, node-executed
+    /// `hashFiles`) must resolve through a dedicated analogue, not this
+    /// function — env mutation belongs in a child-process test for it.
     #[test]
-    fn forced_internal_node_version_has_no_effect() {
+    fn node20_action_keeps_phase_one_default() {
         let plain = resolve("node20", &[], None, None, false, false, "linux", "x64");
         assert_eq!(plain.version, "node20");
         assert!(plain.warnings.is_empty());
