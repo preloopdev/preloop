@@ -3204,6 +3204,43 @@ impl<'a> Sweep<'a> {
             .any(|row| row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0))
     }
 
+    /// Whether a settled leg freed a `max-parallel` slot that a parked leg of
+    /// its cohort can take: the cohort has a `blocked` leg with zero remaining
+    /// needs and fewer active legs than its cap. A parked leg names no sibling
+    /// in `job_needs`, so `refresh_remaining_needs` never reports it; the caller
+    /// treats `true` as a promotion trigger. The sweep that trigger runs loads
+    /// the run graph, so every such completion pays that load; admitting the
+    /// leg on a leg-scoped view instead is the follow-up.
+    pub(super) async fn cohort_has_admissible_leg(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        base_id: &str,
+    ) -> Result<bool, ControlError> {
+        let row = tx
+            .query_one(
+                "SELECT \
+                   EXISTS (SELECT 1 FROM jobs j \
+                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
+                       AND j.queue_state='blocked' AND j.remaining_needs <= 0 \
+                       AND j.status NOT IN \
+                         ('success','failure','cancelled','skipped','timed_out')), \
+                   (SELECT s.max_parallel FROM job_specs s \
+                     JOIN jobs j ON j.run_id=s.run_id AND j.job_id=s.job_id \
+                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
+                       AND s.max_parallel IS NOT NULL LIMIT 1), \
+                   (SELECT count(*) FROM jobs a \
+                     WHERE a.run_id=$1::text::uuid AND a.base_id=$2 \
+                       AND (a.status='in_progress' OR a.queue_state IN ('ready','claimed')))",
+                &[&run_id.0.to_string(), &base_id],
+            )
+            .await
+            .map_err(db)?;
+        let parked: bool = row.get(0);
+        let cap: Option<i32> = row.get(1);
+        let active: i64 = row.get(2);
+        Ok(parked && cap.is_some_and(|cap| active < i64::from(cap)))
+    }
+
     /// Try to fold a reusable workflow caller when one of its inner jobs
     /// completes. If every inner job of one of its callers is terminal,
     /// resolves the caller's `outputs` from its `output_definitions` (the
@@ -6763,11 +6800,9 @@ impl PgBackend {
             current = caller.clone();
             outcome.folded_callers.push(caller);
         }
-        // 5. Refresh the dependents' `remaining_needs` for everything that just
-        // turned terminal: the job, its fail-fast siblings and the folded
-        // callers. A dependent that is now `blocked` with zero needs left is
-        // what the promotion sweep below picks up.
-        let mut promotable = Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
+        // The bases this completion turned terminal in: the job's own, and each
+        // fail-fast sibling's and folded caller's.
+        let mut settled_bases = vec![(job_id.clone(), base_id.clone())];
         for settled in outcome
             .cancelled_siblings
             .iter()
@@ -6781,8 +6816,25 @@ impl PgBackend {
                 .await
                 .map_err(db)?
                 .get(0);
-            promotable |=
-                Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
+            settled_bases.push((settled.clone(), settled_base));
+        }
+        // 5. Refresh the dependents' `remaining_needs` for everything that just
+        // turned terminal. A dependent that is now `blocked` with zero needs left
+        // is what the promotion sweep below picks up. A parked leg names no
+        // sibling in `job_needs`, so the refresh never reports it: the settled
+        // leg's cohort is checked for a parked leg the freed slot can take.
+        let mut promotable = false;
+        for (settled, settled_base) in &settled_bases {
+            promotable |= Sweep::refresh_remaining_needs(tx, run_id, settled, settled_base).await?;
+        }
+        let mut cohorts: Vec<&str> = settled_bases
+            .iter()
+            .map(|(_, cohort)| cohort.as_str())
+            .collect();
+        cohorts.sort_unstable();
+        cohorts.dedup();
+        for cohort in cohorts {
+            promotable |= Sweep::cohort_has_admissible_leg(tx, run_id, cohort).await?;
         }
         outcome.promotable_dependents = promotable;
         // 6. Run status via the DB aggregate; the caller holds the run lock.
