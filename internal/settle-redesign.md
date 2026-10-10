@@ -155,9 +155,10 @@ When a job that is an inner job of a reusable call completes:
    ```
    Status = `aggregate_need_status` over inner statuses (failure > cancelled >
    skipped > success).
-6. Treat the caller as a completed job: find *its* dependents via `dependents_of`,
-   run the unblock step for each. (This replaces lite's `refresh_remaining_needs`
-   and pg's in-memory sweep propagation.)
+6. Treat the caller as a completed job: refresh the `remaining_needs` of every job
+   that declares it (or its matrix base) as a need, the same unblock step each
+   settled job gets (`Sweep::refresh_remaining_needs`). This replaces pg's
+   in-memory sweep propagation.
 7. Emit `job.completed.v1` for the caller. **Note:** pg currently skips this
    (divergence from lite); the redesign fixes it for parity.
 8. Walk up: if the caller itself has a `parent_job_id` pointing to another
