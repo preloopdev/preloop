@@ -22,12 +22,30 @@ pub struct NeedsCycle {
 }
 
 /// Detect a cycle in a needs graph via three-color DFS.
+///
+/// The walk keeps an explicit frame stack instead of recursing, so the length
+/// of a needs chain is bounded by heap memory rather than the thread's stack.
 pub fn detect_needs_cycle(edges: &NeedsGraph) -> Result<(), NeedsCycle> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Color {
         White,
         Gray,
         Black,
+    }
+
+    /// A job whose dependencies are being walked; `deps` yields the edges not
+    /// yet visited, in declaration order.
+    struct Frame<'a> {
+        node: &'a str,
+        deps: std::slice::Iter<'a, String>,
+    }
+
+    fn frame_for<'a>(edges: &'a NeedsGraph, node: &'a str) -> Frame<'a> {
+        let deps = edges.get(node).map(Vec::as_slice).unwrap_or_default();
+        Frame {
+            node,
+            deps: deps.iter(),
+        }
     }
 
     let mut color: BTreeMap<&str, Color> =
@@ -38,33 +56,32 @@ pub fn detect_needs_cycle(edges: &NeedsGraph) -> Result<(), NeedsCycle> {
         }
     }
 
-    fn visit<'a>(
-        node: &'a str,
-        edges: &'a NeedsGraph,
-        color: &mut BTreeMap<&'a str, Color>,
-    ) -> Result<(), NeedsCycle> {
-        color.insert(node, Color::Gray);
-        if let Some(deps) = edges.get(node) {
-            for dep in deps {
-                match color.get(dep.as_str()).copied().unwrap_or(Color::White) {
-                    Color::Gray => {
-                        return Err(NeedsCycle {
-                            witness: dep.clone(),
-                        });
-                    }
-                    Color::White => visit(dep.as_str(), edges, color)?,
-                    Color::Black => {}
-                }
-            }
-        }
-        color.insert(node, Color::Black);
-        Ok(())
-    }
-
     let nodes: Vec<&str> = color.keys().copied().collect();
-    for node in nodes {
-        if color.get(node) == Some(&Color::White) {
-            visit(node, edges, &mut color)?;
+    let mut stack = Vec::new();
+    for root in nodes {
+        if color.get(root) != Some(&Color::White) {
+            continue;
+        }
+        color.insert(root, Color::Gray);
+        stack.push(frame_for(edges, root));
+        while let Some(top) = stack.last_mut() {
+            let Some(dep) = top.deps.next() else {
+                color.insert(top.node, Color::Black);
+                stack.pop();
+                continue;
+            };
+            match color.get(dep.as_str()).copied().unwrap_or(Color::White) {
+                Color::Gray => {
+                    return Err(NeedsCycle {
+                        witness: dep.clone(),
+                    });
+                }
+                Color::White => {
+                    color.insert(dep.as_str(), Color::Gray);
+                    stack.push(frame_for(edges, dep.as_str()));
+                }
+                Color::Black => {}
+            }
         }
     }
     Ok(())
@@ -219,6 +236,76 @@ mod tests {
         let layers = topo_layers(&g).unwrap();
         assert_eq!(layers[0], vec!["a".to_string()]);
         assert!(layers.last().unwrap().contains(&"d".to_string()));
+    }
+
+    /// Zero-padded ids make key order match chain order, so the first DFS
+    /// root is `j00000`, the start of the chain.
+    fn chain_job(i: usize) -> String {
+        format!("j{i:05}")
+    }
+
+    /// `j00000` needs `j00001`, which needs `j00002`, and so on; the last job
+    /// needs nothing.
+    fn long_chain(n: usize) -> NeedsGraph {
+        (0..n)
+            .map(|i| {
+                let needs = if i + 1 < n {
+                    vec![chain_job(i + 1)]
+                } else {
+                    Vec::new()
+                };
+                (chain_job(i), needs)
+            })
+            .collect()
+    }
+
+    /// Runs detection on an explicit 2 MiB stack, where a call stack that grows
+    /// with chain length would overflow.
+    fn detect_on_small_stack(graph: NeedsGraph) -> Result<(), NeedsCycle> {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || detect_needs_cycle(&graph))
+            .expect("spawn 2 MiB test thread")
+            .join()
+            .expect("cycle detection must not panic")
+    }
+
+    /// The first DFS root reaches depth 20,000 before any job turns black.
+    #[test]
+    fn long_acyclic_chain_is_accepted_on_small_stack() {
+        assert_eq!(detect_on_small_stack(long_chain(20_000)), Ok(()));
+    }
+
+    /// Tail needing the root closes the 20,000-job chain; the DFS enters the
+    /// cycle at the root, which is therefore the witness.
+    #[test]
+    fn long_cyclic_chain_reports_root_witness_on_small_stack() {
+        let mut graph = long_chain(20_000);
+        graph.insert(chain_job(19_999), vec![chain_job(0)]);
+        let cycle = detect_on_small_stack(graph).unwrap_err();
+        assert_eq!(cycle.witness, chain_job(0));
+    }
+
+    /// Absent graph keys are implicit leaf nodes at this API; unknown needs
+    /// are reported by `validate_job_plans`.
+    #[test]
+    fn implicit_dependency_nodes_are_accepted() {
+        let mut g = NeedsGraph::new();
+        g.insert("a".into(), vec!["missing".into()]);
+        g.insert("b".into(), vec!["missing".into(), "a".into()]);
+        assert!(detect_needs_cycle(&g).is_ok());
+    }
+
+    /// The witness is the back-edge target found first in DFS order: `a`
+    /// enters the `b`/`c` cycle and `c` closes it back onto `b`.
+    #[test]
+    fn cycle_witness_is_first_back_edge_target() {
+        let mut g = NeedsGraph::new();
+        g.insert("a".into(), vec!["b".into()]);
+        g.insert("b".into(), vec!["c".into()]);
+        g.insert("c".into(), vec!["b".into()]);
+        let cycle = detect_needs_cycle(&g).unwrap_err();
+        assert_eq!(cycle.witness, "b");
     }
 
     /// Generate a DAG by only allowing edges to lower indices.

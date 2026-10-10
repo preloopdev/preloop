@@ -16,20 +16,67 @@ use super::{
 /// aborted there before the guard fired. The official runner caps expression
 /// trees at depth 50, so nothing a real workflow can express comes near this.
 ///
-/// Member-access chains (`a.b[0][('k')]…`) fold left-leaning `Index` /
-/// `MemberAccess` nodes, deepening the AST exactly like nested parentheses,
-/// so every folded segment permanently consumes one level of this budget
-/// (unlike the scoped `enter()` calls, the member loops never unwind it: a
-/// bracket key can itself contain a member chain, so only a cumulative
-/// count bounds the total). A parsed expression therefore holds at most
-/// `MAX_EXPRESSION_DEPTH` member segments, which keeps every AST walker and
-/// the evaluator's own recursion guard well clear of the stack.
+/// Two limits enforce it. Recursion (parentheses, call arguments, computed
+/// keys, `!`) is capped while parsing. The depth of the tree is tracked as
+/// each node is built, a leaf being 1 and every node one deeper than its
+/// deepest child: calls, `!`, index folds, operators, and member access on a
+/// computed base all add a level, while literal segments appended to an open
+/// path stay flat. A node past the ceiling is refused before it is built, so
+/// no parsed tree exceeds it and the AST walkers and the evaluator's own
+/// recursion guard stay clear of the stack.
 pub(crate) const MAX_EXPRESSION_DEPTH: usize = 128;
 
 pub(crate) struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    /// Recursion levels on the parse stack; see `enter`.
     depth: usize,
+}
+
+/// A parsed subtree with the depth of the tree it roots. Folds check the
+/// ceiling from these fields alone, so no tree is walked to measure it.
+struct ParsedExpr {
+    expr: Expr,
+    depth: usize,
+}
+
+impl ParsedExpr {
+    fn leaf(expr: Expr) -> Self {
+        Self { expr, depth: 1 }
+    }
+
+    fn binary(op: BinaryOp, left: Self, right: Self) -> Result<Self, ExpressionError> {
+        let depth = node_depth(left.depth.max(right.depth))?;
+        Ok(Self {
+            expr: Expr::Binary {
+                op,
+                left: Box::new(left.expr),
+                right: Box::new(right.expr),
+            },
+            depth,
+        })
+    }
+
+    fn index(base: Self, key: Self) -> Result<Self, ExpressionError> {
+        let depth = node_depth(base.depth.max(key.depth))?;
+        Ok(Self {
+            expr: Expr::Index {
+                base: Box::new(base.expr),
+                key: Box::new(key.expr),
+            },
+            depth,
+        })
+    }
+}
+
+/// Depth of a node built over children no deeper than `deepest_child`.
+/// Callers construct the node only after this passes.
+fn node_depth(deepest_child: usize) -> Result<usize, ExpressionError> {
+    let depth = deepest_child + 1;
+    if depth > MAX_EXPRESSION_DEPTH {
+        return Err(ExpressionError::TooDeep(MAX_EXPRESSION_DEPTH));
+    }
+    Ok(depth)
 }
 
 impl Parser {
@@ -43,11 +90,6 @@ impl Parser {
 
     /// Enter one nesting level, refusing input past the depth ceiling. An
     /// over-deep error aborts the whole parse, so the counter is not unwound.
-    ///
-    /// Member-access segments use this too, but permanently: the member
-    /// loops never decrement the counter, so a bracket key containing its
-    /// own member chain (`a[b[c[…]]]`) keeps consuming the same budget and
-    /// the total number of member segments in one expression stays bounded.
     fn enter(&mut self) -> Result<(), ExpressionError> {
         self.depth += 1;
         if self.depth > MAX_EXPRESSION_DEPTH {
@@ -57,10 +99,17 @@ impl Parser {
     }
 
     pub(crate) fn parse_expr(&mut self) -> Result<Expr, ExpressionError> {
+        self.parse_tracked_expr().map(|parsed| parsed.expr)
+    }
+
+    /// Parse one expression together with its tree depth. Parenthesized
+    /// groups, call arguments, and computed keys all re-enter here, so the
+    /// recursion level is counted here.
+    fn parse_tracked_expr(&mut self) -> Result<ParsedExpr, ExpressionError> {
         self.enter()?;
-        let expr = self.parse_or();
+        let parsed = self.parse_or();
         self.depth -= 1;
-        expr
+        parsed
     }
 
     pub(crate) fn expect_end(&self) -> Result<(), ExpressionError> {
@@ -70,45 +119,28 @@ impl Parser {
         }
     }
 
-    fn parse_or(&mut self) -> Result<Expr, ExpressionError> {
+    fn parse_or(&mut self) -> Result<ParsedExpr, ExpressionError> {
         let mut expr = self.parse_and()?;
-        let mut chain_depth = 0;
         while matches!(self.current(), Token::Or) {
             self.advance();
-            self.enter()?;
-            chain_depth += 1;
             let right = self.parse_and()?;
-            expr = Expr::Binary {
-                op: BinaryOp::Or,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = ParsedExpr::binary(BinaryOp::Or, expr, right)?;
         }
-        self.depth -= chain_depth;
         Ok(expr)
     }
 
-    fn parse_and(&mut self) -> Result<Expr, ExpressionError> {
+    fn parse_and(&mut self) -> Result<ParsedExpr, ExpressionError> {
         let mut expr = self.parse_eq()?;
-        let mut chain_depth = 0;
         while matches!(self.current(), Token::And) {
             self.advance();
-            self.enter()?;
-            chain_depth += 1;
             let right = self.parse_eq()?;
-            expr = Expr::Binary {
-                op: BinaryOp::And,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = ParsedExpr::binary(BinaryOp::And, expr, right)?;
         }
-        self.depth -= chain_depth;
         Ok(expr)
     }
 
-    fn parse_eq(&mut self) -> Result<Expr, ExpressionError> {
+    fn parse_eq(&mut self) -> Result<ParsedExpr, ExpressionError> {
         let mut expr = self.parse_unary()?;
-        let mut chain_depth = 0;
         loop {
             let op = match self.current() {
                 Token::Eq => BinaryOp::Eq,
@@ -120,36 +152,34 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            self.enter()?;
-            chain_depth += 1;
             let right = self.parse_unary()?;
-            expr = Expr::Binary {
-                op,
-                left: Box::new(expr),
-                right: Box::new(right),
-            };
+            expr = ParsedExpr::binary(op, expr, right)?;
         }
-        self.depth -= chain_depth;
         Ok(expr)
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, ExpressionError> {
+    fn parse_unary(&mut self) -> Result<ParsedExpr, ExpressionError> {
         if matches!(self.current(), Token::Bang) {
             self.advance();
             self.enter()?;
             let inner = self.parse_unary();
             self.depth -= 1;
-            Ok(Expr::UnaryNot(Box::new(inner?)))
+            let inner = inner?;
+            let depth = node_depth(inner.depth)?;
+            Ok(ParsedExpr {
+                expr: Expr::UnaryNot(Box::new(inner.expr)),
+                depth,
+            })
         } else {
             self.parse_primary()
         }
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, ExpressionError> {
+    fn parse_primary(&mut self) -> Result<ParsedExpr, ExpressionError> {
         match self.current().clone() {
             Token::String(value) => {
                 self.advance();
-                Ok(Expr::Literal(Value::String(value)))
+                Ok(ParsedExpr::leaf(Expr::Literal(Value::String(value))))
             }
             Token::Number(value) => {
                 self.advance();
@@ -157,20 +187,20 @@ impl Parser {
                     .parse::<serde_json::Number>()
                     .map(Value::Number)
                     .unwrap_or(Value::Null);
-                Ok(Expr::Literal(number))
+                Ok(ParsedExpr::leaf(Expr::Literal(number)))
             }
             Token::Bool(value) => {
                 self.advance();
-                Ok(Expr::Literal(Value::Bool(value)))
+                Ok(ParsedExpr::leaf(Expr::Literal(Value::Bool(value))))
             }
             Token::Null => {
                 self.advance();
-                Ok(Expr::Literal(Value::Null))
+                Ok(ParsedExpr::leaf(Expr::Literal(Value::Null)))
             }
             Token::Ident(name) => self.parse_ident_or_call(name),
             Token::LParen => {
                 self.advance();
-                let expr = self.parse_expr()?;
+                let expr = self.parse_tracked_expr()?;
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
@@ -179,14 +209,17 @@ impl Parser {
         }
     }
 
-    fn parse_ident_or_call(&mut self, name: String) -> Result<Expr, ExpressionError> {
+    fn parse_ident_or_call(&mut self, name: String) -> Result<ParsedExpr, ExpressionError> {
         self.advance();
         if matches!(self.current(), Token::LParen) {
             self.advance();
             let mut args = Vec::new();
+            let mut deepest_arg = 0usize;
             if !matches!(self.current(), Token::RParen) {
                 loop {
-                    args.push(self.parse_expr()?);
+                    let arg = self.parse_tracked_expr()?;
+                    deepest_arg = deepest_arg.max(arg.depth);
+                    args.push(arg.expr);
                     if matches!(self.current(), Token::Comma) {
                         self.advance();
                     } else {
@@ -195,32 +228,29 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen)?;
-            let call = Expr::Call { name, args };
+            let depth = node_depth(deepest_arg)?;
+            let call = ParsedExpr {
+                expr: Expr::Call { name, args },
+                depth,
+            };
             // Check for trailing member access: fromJSON('...').*.name,
             // fn()[0], or fn()[expr.key]
             self.parse_member_suffix(call)
         } else {
-            let mut base = Expr::Path(vec![name]);
+            let mut base = ParsedExpr::leaf(Expr::Path(vec![name]));
             loop {
                 match self.current() {
                     // Dot access: a.b or a.*
-                    //
-                    // Each folded segment permanently consumes one depth
-                    // level (see `enter`): member chains deepen the AST like
-                    // nested parentheses, and only a cumulative count bounds
-                    // chains nested inside bracket keys.
                     Token::Dot => {
                         self.advance();
                         match self.current().clone() {
                             Token::Ident(segment) => {
                                 self.advance();
-                                self.enter()?;
-                                push_path_segment(&mut base, segment);
+                                push_path_segment(&mut base, segment)?;
                             }
                             Token::Star => {
                                 self.advance();
-                                self.enter()?;
-                                push_path_segment(&mut base, "*".to_string());
+                                push_path_segment(&mut base, "*".to_string())?;
                             }
                             other => {
                                 return Err(ExpressionError::Unexpected(format!("{other:?}")));
@@ -259,17 +289,12 @@ impl Parser {
                         match literal {
                             Some(segment) => {
                                 self.expect(Token::RBracket)?;
-                                self.enter()?;
-                                push_path_segment(&mut base, segment);
+                                push_path_segment(&mut base, segment)?;
                             }
                             None => {
-                                let key = self.parse_expr()?;
+                                let key = self.parse_tracked_expr()?;
                                 self.expect(Token::RBracket)?;
-                                self.enter()?;
-                                base = Expr::Index {
-                                    base: Box::new(base),
-                                    key: Box::new(key),
-                                };
+                                base = ParsedExpr::index(base, key)?;
                             }
                         }
                     }
@@ -283,16 +308,10 @@ impl Parser {
     /// Parse trailing `.ident`, `.*`, `['key']`, or `[expr]` segments after
     /// an expression, folding them onto `base`.
     ///
-    /// Each folded segment permanently consumes one expression depth level
-    /// (see `enter`): a long bracket run deepens the AST exactly like nested
-    /// parentheses, and without this `github[('x')]×500` built a 500-deep
-    /// tree whose evaluation overflowed the thread stack and aborted the
-    /// whole server process. The count is cumulative across the whole parse
-    /// — a bracket key can itself contain a member chain (`a[b[c[…]]]`), so
-    /// only a never-unwound count bounds the total. A depth violation is
-    /// fatal to the parse (unlike a malformed key, which still backs off);
-    /// it must never be swallowed into a silently truncated expression.
-    fn parse_member_suffix(&mut self, mut base: Expr) -> Result<Expr, ExpressionError> {
+    /// A depth violation is fatal to the parse (unlike a malformed key, which
+    /// still backs off); it must never be swallowed into a silently truncated
+    /// expression.
+    fn parse_member_suffix(&mut self, mut base: ParsedExpr) -> Result<ParsedExpr, ExpressionError> {
         loop {
             match self.current() {
                 Token::Dot => {
@@ -300,13 +319,11 @@ impl Parser {
                     match self.current().clone() {
                         Token::Ident(segment) => {
                             self.advance();
-                            self.enter()?;
-                            push_path_segment(&mut base, segment);
+                            push_path_segment(&mut base, segment)?;
                         }
                         Token::Star => {
                             self.advance();
-                            self.enter()?;
-                            push_path_segment(&mut base, "*".to_string());
+                            push_path_segment(&mut base, "*".to_string())?;
                         }
                         _ => break,
                     }
@@ -337,27 +354,24 @@ impl Parser {
                             if self.expect(Token::RBracket).is_err() {
                                 break;
                             }
-                            self.enter()?;
-                            push_path_segment(&mut base, segment);
+                            push_path_segment(&mut base, segment)?;
                         }
                         None => {
                             // Suffix parsing never fails its caller: only
                             // fold the index when the key and bracket parse.
                             let save = self.index;
-                            match self.parse_expr().and_then(|key| {
+                            let saved_depth = self.depth;
+                            match self.parse_tracked_expr().and_then(|key| {
                                 self.expect(Token::RBracket)?;
                                 Ok(key)
                             }) {
-                                Ok(key) => {
-                                    self.enter()?;
-                                    base = Expr::Index {
-                                        base: Box::new(base),
-                                        key: Box::new(key),
-                                    };
-                                }
+                                Ok(key) => base = ParsedExpr::index(base, key)?,
                                 Err(e @ ExpressionError::TooDeep(_)) => return Err(e),
                                 Err(_) => {
+                                    // Rewind the cursor and recursion depth to
+                                    // the pre-key state.
                                     self.index = save;
+                                    self.depth = saved_depth;
                                     break;
                                 }
                             }
@@ -389,17 +403,21 @@ impl Parser {
 }
 
 /// Append a literal path segment onto a base expression, extending a
-/// trailing static path when one is open.
-fn push_path_segment(base: &mut Expr, segment: String) {
-    match base {
+/// trailing static path when one is open. Only wrapping a non-path base adds
+/// a level to the tree.
+fn push_path_segment(base: &mut ParsedExpr, segment: String) -> Result<(), ExpressionError> {
+    match &mut base.expr {
         Expr::Path(path) => path.push(segment),
         Expr::MemberAccess { path, .. } => path.push(segment),
         other => {
+            let depth = node_depth(base.depth)?;
             let drained = std::mem::replace(other, Expr::Literal(serde_json::Value::Null));
             *other = Expr::MemberAccess {
                 expr: Box::new(drained),
                 path: vec![segment],
             };
+            base.depth = depth;
         }
     }
+    Ok(())
 }
