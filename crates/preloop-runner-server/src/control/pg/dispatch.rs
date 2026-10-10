@@ -3289,7 +3289,9 @@ impl<'a> Sweep<'a> {
                         .is_some_and(|(status, _)| status.is_terminal())
                 });
             if !all_complete {
-                return Ok(None);
+                // This caller still waits on inner jobs; a nested caller that
+                // shares these ids may be complete and must still fold.
+                continue;
             }
             // Expression context: `jobs.<inner-id-without-caller-prefix>
             // .outputs.<name>` plus the call's `with:` inputs.
