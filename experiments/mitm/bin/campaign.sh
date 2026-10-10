@@ -224,7 +224,7 @@ $(vm_runner_env)
 ENVEOF
 ./config.sh --unattended --replace \\
   --url https://github.com/$GH_REPO --token '$token' \\
-  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm,edge-v2337,overnight --work _work \\
   > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
 nohup ./run.sh > \$HOME/runner.log 2>&1 &
 SCRIPT
@@ -234,7 +234,7 @@ cd /opt/plrunner
 rm -f .runner .credentials .runner.json
 ./preloop-runner configure \\
   --url https://github.com/$GH_REPO --token '$token' \\
-  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm,edge-v2337,overnight --work _work \\
   --unattended --replace \\
   > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
 nohup ./preloop-runner run --via broker > \$HOME/runner.log 2>&1 &
@@ -299,7 +299,7 @@ cd /opt/runner/actions-runner
 rm -f .runner .credentials .credentials_rsaparams .env
 ./config.sh --unattended --replace \\
   --url http://$LAN_IP --token '$PRELOOP_SYSTEM_TOKEN' \\
-  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm,edge-v2337,overnight --work _work \\
   > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
 nohup ./run.sh > \$HOME/runner.log 2>&1 &
 SCRIPT
@@ -309,7 +309,7 @@ cd /opt/plrunner
 rm -f .runner .credentials .runner.json
 ./preloop-runner configure \\
   --url http://$LAN_IP:$PRELOOP_PORT --token '$PRELOOP_SYSTEM_TOKEN' \\
-  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm,edge-v2337,overnight --work _work \\
   --unattended --replace \\
   > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
 nohup ./preloop-runner run --via broker > \$HOME/runner.log 2>&1 &
