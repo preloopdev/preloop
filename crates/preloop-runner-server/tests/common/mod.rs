@@ -439,6 +439,7 @@ pub async fn complete_job(state: &AppState, run_id: RunId, job_id: &str, status:
             annotations: Vec::new(),
             step_results: Vec::new(),
             environment_url: None,
+            infrastructure_failure_category: None,
         },
     )
     .await

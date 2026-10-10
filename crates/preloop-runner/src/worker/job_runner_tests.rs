@@ -890,6 +890,39 @@ fn tunnel_failure_maps_to_infrastructure() {
     };
     assert!(message.contains("lost its connection"));
 }
+#[test]
+fn final_step_tunnel_drop_forces_failed_completejob_conclusion() {
+    // Model a tunnel watcher report that lands after the final step returned
+    // `Succeeded`, but before the completejob payload is derived.
+    let mut job = super::super::contexts::JobContext::new(
+        "job-1".to_owned(),
+        "Build".to_owned(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    let applied = super::apply_tunnel_failure(
+        &mut job,
+        "The debugger lost its connection to the tunnel and the job cannot continue.".to_owned(),
+    );
+    let (result, conclusion) = super::derive_terminal_result(
+        "Build",
+        &Ok("Succeeded".to_owned()),
+        false,
+        false,
+        false,
+        applied,
+        &mut job,
+    );
+
+    assert!(applied);
+    assert_eq!(job.job_status, super::super::contexts::JobStatus::Failure);
+    assert_eq!(result, "Failed");
+    assert_eq!(conclusion, "Failed");
+    assert_eq!(
+        job.infrastructure_failure_category.as_deref(),
+        Some("debugger_tunnel_failure")
+    );
+}
 
 #[test]
 fn non_tunnel_errors_map_to_failed_telemetry() {

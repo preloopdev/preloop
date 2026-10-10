@@ -830,6 +830,47 @@ fn which_devtunnel() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Inspect the host child while holding the same mutex as the watcher, then
+/// begin intentional teardown. This closes the poll/sleep race where the host
+/// exited before finalization but the watcher had not reached its next tick.
+async fn prepare_tunnel_shutdown(core: &Arc<DebuggerCore>) {
+    use std::sync::atomic::Ordering;
+
+    let unexpected_exit = {
+        let mut child_guard = core.devtunnel_child.lock().await;
+        let status = child_guard.as_mut().map(|child| child.try_wait());
+        match status {
+            Some(Ok(Some(exit))) => {
+                // Reap the already-exited child from the shared slot before
+                // reporting; the watcher will observe `None` and stop.
+                let _ = child_guard.take();
+                Some(format!("devtunnel host exited ({exit})"))
+            }
+            Some(Err(error)) => {
+                let _ = child_guard.take();
+                Some(format!("devtunnel host wait failed: {error}"))
+            }
+            Some(Ok(None)) => {
+                // The child was observed alive while the watcher was excluded
+                // by the mutex. From this point on its exit is intentional.
+                core.tunnel_shutting_down.store(true, Ordering::SeqCst);
+                if let Some(mut child) = child_guard.take() {
+                    let _ = child.start_kill();
+                }
+                None
+            }
+            None => {
+                core.tunnel_shutting_down.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    };
+
+    if let Some(detail) = unexpected_exit {
+        report_tunnel_disconnected(core, &detail);
+    }
+}
+
 /// Poll the devtunnel host subprocess and report a tunnel failure when it
 /// exits unexpectedly. Mirrors upstream `ConnectionStatusChanged` →
 /// `HandleTunnelConnectionStatusChanged`: the Dev Tunnel SDK reconnects on
@@ -1118,6 +1159,9 @@ impl IDapDebugger for DapDebugger {
     }
 
     async fn on_job_completed(&self) -> Result<(), DapError> {
+        // Inspect the child before marking teardown intentional. The watcher
+        // may be between polls while the host has already exited.
+        prepare_tunnel_shutdown(&self.core).await;
         // Official runner sends terminated + exited directly — no final pause.
         let seq = self.next_seq_internal().await;
         let _ = self
@@ -1130,16 +1174,6 @@ impl IDapDebugger for DapDebugger {
             Event::new(seq, EVENT_EXITED).with_body(json!({"exitCode": 0})),
         ));
         *self.core.state.lock() = DapSessionState::Terminated;
-        // Everything from here on is deliberate teardown, so any tunnel
-        // exit it produces is expected and must not be reported as a
-        // failure — mirrors upstream `_tunnelShuttingDown = true` in
-        // `StopAsync`.
-        self.core
-            .tunnel_shutting_down
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(mut child) = self.core.devtunnel_child.lock().await.take() {
-            let _ = child.start_kill();
-        }
         if let Some(tx) = self.core.cancel.lock().await.as_ref() {
             let _ = tx.send(true);
         }
@@ -1148,16 +1182,9 @@ impl IDapDebugger for DapDebugger {
     }
 
     async fn stop(&self) -> Result<(), DapError> {
-        // Everything from here on is deliberate teardown, so any tunnel
-        // exit it produces is expected and must not be reported as a
-        // failure — mirrors upstream `_tunnelShuttingDown = true` in
-        // `StopAsync`.
-        self.core
-            .tunnel_shutting_down
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(mut child) = self.core.devtunnel_child.lock().await.take() {
-            let _ = child.start_kill();
-        }
+        // Inspect the child under the watcher mutex before making teardown
+        // intentional; an already-exited host is a real tunnel failure.
+        prepare_tunnel_shutdown(&self.core).await;
         if let Some(tx) = self.core.cancel.lock().await.as_ref() {
             let _ = tx.send(true);
         }

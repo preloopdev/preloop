@@ -332,6 +332,7 @@ pub async fn complete_job_compat(
             annotations: Vec::new(),
             step_results: Vec::new(),
             environment_url: None,
+            infrastructure_failure_category: None,
         },
     )
     .await
@@ -520,6 +521,7 @@ pub async fn agent_request_patch(
                 annotations: Vec::new(),
                 step_results: Vec::new(),
                 environment_url: None,
+                infrastructure_failure_category: None,
             }
         });
         if let Some(c) = completion {
@@ -680,6 +682,36 @@ fn mask_completion_payload(
     shared: &SharedState,
     completion: &mut JobCompletion,
 ) -> Result<(), ApiError> {
+    // The official runner carries the infrastructure category separately from
+    // annotation entries. The existing jobs metadata stores annotations, so
+    // enrich infrastructure annotations before persistence; this avoids a new
+    // schema column while keeping the category available on read-back.
+    if let Some(category) = completion.infrastructure_failure_category.clone() {
+        let mut found = false;
+        for annotation in &mut completion.annotations {
+            if annotation
+                .get("isInfrastructureIssue")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                found = true;
+                if let Some(object) = annotation.as_object_mut() {
+                    object
+                        .entry("category")
+                        .or_insert_with(|| serde_json::Value::String(category.clone()));
+                }
+            }
+        }
+        if !found {
+            completion.annotations.push(serde_json::json!({
+                "level": "failure",
+                "message": "infrastructure failure",
+                "isInfrastructureIssue": true,
+                "category": category,
+            }));
+        }
+    }
+
     let secrets = completion_secret_values(shared, completion.run_id)?;
     completion.annotations = preloop_gha_protocol::mask_annotations(
         std::mem::take(&mut completion.annotations),

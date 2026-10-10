@@ -391,6 +391,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                         annotations: Vec::new(),
                         step_results: Vec::new(),
                         environment_url: None,
+                        infrastructure_failure_category: None,
                     })
                     .collect();
                 (outcome.cancellations, completions, outcome.starved)

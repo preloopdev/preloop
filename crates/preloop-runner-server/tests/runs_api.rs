@@ -393,6 +393,7 @@ async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
         state.shared(),
         preloop_gha_protocol::JobCompletion {
             environment_url: None,
+            infrastructure_failure_category: None,
             run_id,
             job_id: preloop_gha_protocol::JobId("build".to_owned()),
             agent_job_id: Some(second_agent_job_id),

@@ -405,6 +405,9 @@ pub async fn run_steps(
         step_idx += 1;
         let step_number = (idx as u32) + step_offset;
 
+        if super::job_runner::consume_recorded_tunnel_failure(job) {
+            any_failed = true;
+        }
         let expr_ctx = job.build_expression_context();
         let mut resolved_display_name = {
             let evaluated =

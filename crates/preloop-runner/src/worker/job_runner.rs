@@ -832,46 +832,6 @@ pub async fn run_job(
         }
     };
 
-    let (result_str, conclusion) = if was_timeout {
-        ("Failed".to_string(), "Failed".to_string())
-    } else if was_lease_lost {
-        // Official JobDispatcher: a renew that dies mid-job (404 or the
-        // LockedUntil + 5 min retry window exhausted) cancels the worker and
-        // completes the request with `TaskResult.Abandoned` — not Failed.
-        // The job never finished on this runner; the server maps abandoned
-        // to a failure conclusion, matching GitHub's self-hosted disposition.
-        ("abandoned".to_string(), "abandoned".to_string())
-    } else if debugger_cancelled {
-        // `catch (OperationCanceledException)` in upstream `JobExtension`:
-        // cancelled before the debugger client connected completes the job
-        // as `TaskResult.Canceled`, not `Failed`.
-        ("Cancelled".to_string(), "Cancelled".to_string())
-    } else {
-        match &job_result {
-            Ok(conclusion) => {
-                info!("Job {job_name} completed: {conclusion}");
-                (conclusion.clone(), conclusion.clone())
-            }
-            Err(e) => {
-                let msg = format!("Job {job_name} failed: {e:#}");
-                error!("{msg}");
-                // Add job-level annotation for infrastructure failure
-                job_ctx.add_job_annotation(super::execution_context::Annotation {
-                    level: super::execution_context::AnnotationLevel::Error,
-                    message: msg,
-                    title: None,
-                    file: None,
-                    line: None,
-                    end_line: None,
-                    col: None,
-                    end_column: None,
-                    is_infrastructure_issue: false,
-                    category: None,
-                });
-                ("Failed".to_string(), "Failed".to_string())
-            }
-        }
-    };
     if let Some(handle) = drain_handle {
         handle.abort();
     }
@@ -903,24 +863,9 @@ pub async fn run_job(
     }
 
     // DAP: OnJobCompleted — pause for debugger inspection.
-    // Mirrors `JobExtension.cs` FinalizeJob block.
-    // A tunnel drop during the final step never reaches `on_step_starting`,
-    // so nothing has converted it into a job failure yet. Extract the
-    // recorded failure first (ending the immutable borrow of job_ctx), then
-    // surface it the way upstream `ReportTunnelDisconnected` does:
-    // infrastructure failure + category, before the completion payload.
-    let tunnel_failure = job_ctx
-        .dap_debugger
-        .as_ref()
-        .and_then(|dbg| dbg.tunnel_failure());
-    if let Some(preloop_dap::debugger::DapError::TunnelFailure(message)) = tunnel_failure {
-        error!("{message}");
-        job_ctx.infrastructure_error(
-            message,
-            super::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
-        );
-        job_ctx.job_status = super::contexts::JobStatus::Failure;
-    }
+    // Mirrors `JobExtension.cs` FinalizeJob block. The watcher is checked
+    // before teardown is marked intentional, so a final-step tunnel drop is
+    // still visible before deriving the terminal result.
     if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
         info!("Job completed — pausing for debugger inspection. Press continue to finish.");
         if let Err(e) = dbg.on_job_completed().await {
@@ -930,6 +875,16 @@ pub async fn run_job(
             warn!("DAP debugger stop failed: {e}");
         }
     }
+    let tunnel_failure_failed = consume_recorded_tunnel_failure(&mut job_ctx);
+    let (result_str, conclusion) = derive_terminal_result(
+        job_name,
+        &job_result,
+        was_timeout,
+        was_lease_lost,
+        debugger_cancelled,
+        tunnel_failure_failed,
+        &mut job_ctx,
+    );
 
     // Report job completion — actually POST to the server
     if let Err(e) = report_completion(
@@ -986,6 +941,50 @@ pub async fn run_job(
     Ok(())
 }
 
+/// Consume a DAP tunnel failure recorded asynchronously by the watcher.
+///
+/// A drop can race the final step, so the step loop and finalization both use
+/// this boundary. Cancellation and lease abandonment retain precedence, while
+/// the infrastructure annotation/category is preserved in every case.
+pub(crate) fn consume_recorded_tunnel_failure(job_ctx: &mut super::contexts::JobContext) -> bool {
+    let tunnel_failure = job_ctx
+        .dap_debugger
+        .as_ref()
+        .and_then(|dbg| dbg.tunnel_failure());
+    let Some(preloop_dap::debugger::DapError::TunnelFailure(message)) = tunnel_failure else {
+        return false;
+    };
+
+    apply_tunnel_failure(job_ctx, message)
+}
+
+/// Apply a tunnel failure that was already observed by the debugger watcher.
+///
+/// The message is separated from observation so final-result tests can model
+/// a drop in the last step without depending on a real devtunnel process.
+pub(crate) fn apply_tunnel_failure(
+    job_ctx: &mut super::contexts::JobContext,
+    message: String,
+) -> bool {
+    error!("{message}");
+    let category = super::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE;
+    let already_recorded = job_ctx.job_annotations.iter().any(|annotation| {
+        annotation.is_infrastructure_issue
+            && annotation.category.as_deref() == Some(category)
+            && annotation.message == message
+    });
+    if !already_recorded {
+        job_ctx.infrastructure_error(message, category);
+    }
+
+    if job_ctx.job_status == super::contexts::JobStatus::Cancelled {
+        false
+    } else {
+        job_ctx.job_status = super::contexts::JobStatus::Failure;
+        true
+    }
+}
+
 /// Whether any step ended in a genuine execution failure.
 ///
 /// `continue-on-error` steps count: their `outcome` stays `Failure` even when
@@ -994,6 +993,54 @@ pub async fn run_job(
 fn any_step_failed(steps: &indexmap::IndexMap<String, super::contexts::StepResult>) -> bool {
     steps.values().any(|result| result.outcome == "Failure")
 }
+fn derive_terminal_result(
+    job_name: &str,
+    job_result: &Result<String, anyhow::Error>,
+    was_timeout: bool,
+    was_lease_lost: bool,
+    debugger_cancelled: bool,
+    tunnel_failure_failed: bool,
+    job_ctx: &mut super::contexts::JobContext,
+) -> (String, String) {
+    if was_timeout {
+        ("Failed".to_string(), "Failed".to_string())
+    } else if was_lease_lost {
+        // Official JobDispatcher: a renew that dies mid-job (404 or the
+        // LockedUntil + 5 min retry window exhausted) completes as Abandoned.
+        ("abandoned".to_string(), "abandoned".to_string())
+    } else if debugger_cancelled || job_ctx.job_status == super::contexts::JobStatus::Cancelled {
+        // Cancellation wins over a tunnel exit observed during teardown.
+        ("Cancelled".to_string(), "Cancelled".to_string())
+    } else if tunnel_failure_failed {
+        // A tunnel drop can be observed after the final step returned success.
+        ("Failed".to_string(), "Failed".to_string())
+    } else {
+        match job_result {
+            Ok(conclusion) => {
+                info!("Job {job_name} completed: {conclusion}");
+                (conclusion.clone(), conclusion.clone())
+            }
+            Err(error) => {
+                let msg = format!("Job {job_name} failed: {error:#}");
+                error!("{msg}");
+                job_ctx.add_job_annotation(super::execution_context::Annotation {
+                    level: super::execution_context::AnnotationLevel::Error,
+                    message: msg,
+                    title: None,
+                    file: None,
+                    line: None,
+                    end_line: None,
+                    col: None,
+                    end_column: None,
+                    is_infrastructure_issue: false,
+                    category: None,
+                });
+                ("Failed".to_string(), "Failed".to_string())
+            }
+        }
+    }
+}
+
 /// Env knob gating the four fire-and-forget service health probes fired after
 /// the first `renewjob`.
 ///
