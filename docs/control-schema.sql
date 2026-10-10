@@ -239,7 +239,7 @@ CREATE TABLE jobs (
     -- results
     outputs                 jsonb,
     annotations             jsonb,
-    check_run_id            bigint,
+    check_run_id           bigint,
     -- GitHub deployment id for jobs with `environment:` (created when the
     -- run reports checks; deployment statuses update on gate decisions and
     -- job completion). `NULL` for unreported or environment-less jobs.
@@ -260,6 +260,7 @@ CREATE TABLE jobs (
     concurrency_acquired_at timestamptz,
     started_at              timestamptz,
     completed_at            timestamptz,
+    request_id              bigint,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
@@ -770,7 +771,7 @@ CREATE TABLE run_history (
     created_at              timestamptz NOT NULL,
     started_at              timestamptz,
     completed_at            timestamptz,
-    PRIMARY KEY (run_id, created_at)
+    PRIMARY KEY (run_id, created_at, run_attempt)
 ) PARTITION BY RANGE (created_at);
 CREATE TABLE run_history_default PARTITION OF run_history DEFAULT;
 CREATE INDEX run_history_namespace ON run_history(namespace_id, created_at DESC);
@@ -790,12 +791,13 @@ CREATE TABLE job_history (
     pool_key                text NOT NULL,
     outputs                 jsonb,
     annotations             jsonb,
-    check_run_id            bigint,
+    check_run_id           bigint,
     created_at              timestamptz NOT NULL,
     deps_ready_at           timestamptz,
     started_at              timestamptz,
     completed_at            timestamptz,
-    PRIMARY KEY (run_id, job_id, run_created_at)
+    request_id              bigint,
+    PRIMARY KEY (run_id, job_id, run_created_at, run_attempt)
 ) PARTITION BY RANGE (run_created_at);
 CREATE TABLE job_history_default PARTITION OF job_history DEFAULT;
 

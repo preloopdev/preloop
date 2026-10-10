@@ -28,6 +28,7 @@ mod promote;
 mod queries;
 mod reaper;
 mod requests;
+mod rerun;
 mod runners;
 mod settle;
 mod steps;

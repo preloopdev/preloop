@@ -37,7 +37,7 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUTDIR/driver.log
 
 case "$SUBSTRATE" in
   aenv) export PRELOOP_VM_BACKEND=agentenv ;;
-  smolvm) export PRELOOP_VM_BACKEND=smolvm PRELOOP_USE_PACKED_GOLDEN=1 ;;
+  smolvm) export PRELOOP_VM_BACKEND=smolvm ;;
   *) echo "unknown substrate: $SUBSTRATE" >&2; exit 2 ;;
 esac
 

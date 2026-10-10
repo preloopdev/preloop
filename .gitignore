@@ -129,7 +129,10 @@ benchmarks/real-world/conformance-4repos/payloads/
 plans
 
 # Conformance campaign captures: multi-MB run records and logs, regenerated
-# by the harness and not reviewable in a diff.
+# by the harness and not reviewable in a diff. `logs.txt` is the runs' raw job
+# output (the server stores the runner's merged upload verbatim), so it must
+# never be swept into a commit with the results.
+benchmarks/real-world/results/conformance-5repos/**/logs.txt
 benchmarks/real-world/results/conformance-4repos/**/run*.json
 benchmarks/real-world/results/conformance-4repos/**/run*.log
 

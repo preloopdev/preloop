@@ -1133,7 +1133,7 @@ async fn run_step_manifests_survive_archival() {
             .unwrap();
     }
     assert!(
-        node.archive_finished_runs(64)
+        node.archive_finished_runs(64, None)
             .await
             .unwrap()
             .contains(&run_id),
@@ -1191,7 +1191,7 @@ async fn job_point_reads_fall_back_to_archived_rows() {
             .unwrap();
     }
     assert!(
-        node.archive_finished_runs(64)
+        node.archive_finished_runs(64, None)
             .await
             .unwrap()
             .contains(&run_id),

@@ -8,7 +8,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.34.0] - 2026-10-09
+
+### Changed
+
+- **The warm pool forks on completion instead of replacing mid-job**: a slot
+  now serves exactly one job per VM — fork from the golden, run the job,
+  delete the VM, fork the next one — so a slot holds one VM instead of a
+  running runner plus a pre-provisioned successor, and no successor boot
+  competes with the running job for host CPU. The fork → ready window
+  (~5 s measured, against an average job time of ~400 s) now sits in front
+  of the job a slot picks up next, which costs roughly 1% throughput for
+  half the VMs per slot. The memory-derived warm pool cap therefore sizes
+  one runner ceiling per slot instead of two, and the queued-job backpressure
+  that decided whether a successor was worth building is gone. On-demand
+  (size=0) slots also no longer provision a successor alongside the running
+  job; each serves one job from one VM, like a warm slot.
+  `preloop status`'s `building` counter now reports the fork/boot in flight
+  (including direct environment boots) rather than successor builds, which no
+  longer exist, in both pool modes.
+- **One golden source: the official packed golden, or the image you
+  configured.** `runs-on: ubuntu-latest`/`ubuntu-24.04` — and any pooled
+  environment with no image configured — now resolve to the published packed
+  golden, downloaded per architecture from a digest-pinned OCI reference
+  (`PRELOOP_GOLDEN_OCI_REF` overrides it; `PRELOOP_GOLDEN_URL` still selects a
+  release-asset mirror) and installed only after its checksum (release asset)
+  or layer digest (OCI) matches. The transfer resumes from a `.partial` file
+  across retries and engine restarts, and a download that cannot complete
+  fails the job: there is no local bake and no stock-Ubuntu fallback behind it.
+  `ubuntu-22.04` now maps nowhere and keeps the configured image instead of
+  silently selecting a 24.04 base.
+
+  The curated stock bake is deleted with it: no toolchain layers
+  (Rust/Go/Python/Node), no `base_install_script`, no apt package pins or
+  index-freshness marker (and no weekly `apt-indices-refresh` workflow), no
+  goldens baked per `runs-on` environment, no local bake from stock Ubuntu and
+  no direct-create fallback when the packed artifact is unavailable.
+  `PRELOOP_USE_PACKED_GOLDEN` is gone — a file-pack backend always uses a
+  packed golden — and the pool holds one golden per pool environment and forks
+  it per job.
+
+  A configured image (`PRELOOP_RUNNER_BASE_IMAGE`, or the `[golden]
+  base_image` that `preloop init` records) is now used exactly as it is.
+  Preloop adds only the GitHub-runner machinery at golden build: a `runner`
+  account (uid 1001) with its home, `_work` and passwordless sudo unless the
+  image already has them; an owner-only ownership walk over the runner home
+  (`find … ! -user 1001 -exec chown -h 1001:1001 {} +`, which leaves a
+  runner-owned file's group alone); a writable `/opt/hostedtoolcache` with
+  `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`; and the
+  `/etc/preloop-bake.json` build record. The only checked requirement is a
+  glibc dynamic loader — a missing `bash`, `git` or `docker` fails the step
+  that needs it, exactly as on GitHub. `preloop build-golden`
+  takes the image it bakes (`--base-image <ref>`, or the configured image when
+  the flag is absent); the official golden is published packed and cannot be
+  built locally.
+
+  Guest `PATH`, `RUSTUP_HOME` and `CARGO_HOME` overrides are gone: the guest
+  runner's PATH is the system PATH, and tool versions come from the workflow's
+  `setup-*` actions, as they do on GitHub.
+
+- **A golden is keyed by everything that changes it.** The official golden's
+  fingerprint now covers the source this host would fetch it from
+  (`PRELOOP_GOLDEN_OCI_REF` or the `PRELOOP_GOLDEN_URL` mirror), so changing
+  the mirror re-fetches instead of serving the previous pack forever; a
+  configured image's fingerprint covers its effective runner account, so
+  changing `PRELOOP_RUNNER_USER`/`_UID` rebuilds instead of adopting a golden
+  baked for the account before it. A backend that cannot restore packs
+  (AgentENV) boots the pinned official runner image for the official golden —
+  the sentinel itself is not an image — and an unconfigured pool no longer
+  fails to start there.
+
+- **Leftovers of earlier releases are cleaned up at startup.** Packed-golden
+  payloads keyed on the retired stock Ubuntu bases
+  (`preloop-[mirror.gcr.io-library-]ubuntu-{24.04,22.04}[-sha256-…]-<arch>-<fingerprint>`)
+  live under a stem this release no longer produces, so no fingerprint
+  rotation would ever reach them; the startup sweep now removes them. Goldens
+  prepared per `runs-on` environment (`<prefix>-golden-<fingerprint12>`) keep
+  their fingerprint record, which exempted them from the stale-machine
+  cleanup; one that neither the official golden nor the configured image
+  resolves to is now deleted with its record.
+
+- **Apt indices are baked into the golden.** The runner-image dump ships with
+  `/var/lib/apt/lists` wiped, and a workflow's `sudo apt-get install <pkg>`
+  with no `apt-get update` first (uv's musl cell) fails with `E: Unable to
+  locate package`. The golden contract now refreshes the indices at build, and
+  an unpacked pack that has none is refreshed once before it is frozen, so
+  forks inherit them. Also fixes `golden_contract_script("root", …)`, which
+  rendered `; ;` and did not parse as `sh`.
+
+- **The guest runner inherits the image's environment.** It is launched
+  through a shell that sources `/etc/environment`, so the PATH a step sees is
+  the image's own — the tools a hosted image preinstalls keep resolving —
+  while the pool's variables are re-asserted afterwards. An image that
+  already carries a `runner` account at another uid now has that account moved
+  to the configured uid instead of running jobs as a uid that owns nothing.
+  The Rosetta amd64 install is no longer fatal for a configured image without
+  apt: the bake warns that x86_64 binaries will not run instead of refusing an
+  otherwise usable image.
+
+- **Stopping the engine no longer waits for a golden transfer.**
+  `prepare_fork_base` checks the shutdown token before starting a download or
+  bake, so a restart during the warm returns promptly; the transfer resumes on
+  the next start.
+- **A mixed `runs-on` queue no longer retains a golden per environment on a
+  host that cannot hold them**: every retained golden is a full runner
+  ceiling, so a second environment is baked only when the host has memory
+  left for it next to the pool's runners. Otherwise its runners boot that
+  job's base image directly — a cold start instead of a host that runs past
+  its memory budget while jobs execute.
+
+### Security
+
+- **The golden's runner account name is validated** before it reaches the
+  root-run bake scripts and the `sudoers.d` filename: anything that is not a
+  Linux account name (or `root`) is refused, closing a shell-injection hole
+  for a hostile or mistyped `PRELOOP_RUNNER_USER`.
+
+- **A `PRELOOP_GOLDEN_URL` mirror must be verifiable.** Its bytes become the
+  image every job runs, so an unverified payload is now refused: the mirror
+  must publish `<asset>.sha256` or the host must pin the digest with
+  `PRELOOP_GOLDEN_SHA256`. The engine's own release assets keep the previous
+  tolerated-with-a-warning behavior.
 ### Added
+- In-place reruns now persist `jobs.request_id` and copy it into
+  per-attempt `job_history`, preserving log/step/artifact resolution for
+  carried-forward and newly minted executions on both control backends.
+  Rerun context updates `github.triggering_actor` while retaining the
+  original `github.actor`; migration `V2026100508__job_request_links` carries
+  the nullable columns forward.
 
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
@@ -160,6 +287,14 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Fixed
+- **A restart no longer fails the queued backlog as starved**: the starvation
+  sweep measured every queued job from its ready-enqueue instant, so jobs
+  queued for more than an hour before an engine restart failed with
+  `none appeared within 3600s` seconds after boot — before the restarted
+  pool had registered a single runner (221 jobs on one deploy). Both the
+  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
+  whichever is later, so a restart gives the backlog the same window a newly
+  queued job gets.
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
@@ -437,6 +572,42 @@ Releases before v0.27.0 predate the changelog.
   Legs of one matrix share that `job_order`, so among themselves they fall
   back to `job_id`.
 
+- **A new store no longer replays three days of webhook history**: the
+  delivery watchdog treated every delivery in GitHub's history as a phantom
+  ack when the store had no watchdog cursor, and asked GitHub to redeliver
+  all of them. After a store cutover this re-ran CI for merged PRs and
+  superseded pushes, and the replays queued ahead of live webhooks in the
+  inbox. A store's first poll now adopts the history before it (the
+  watermark starts at the grace boundary, drawn and persisted at the first
+  attempt, so a history outage right after startup cannot swallow the
+  deliveries that failed while polling was down); later passes repair
+  phantom acks and edge failures as before, and a restored snapshot keeps
+  its cursor and still repairs everything since. Recover a known gap by
+  redelivering it from GitHub.
+
+- **Judged-missing webhooks are no longer stranded below the watchdog
+  watermark**: the watermark advances past everything a pass examines, so a
+  delivery judged missing — a redelivery request GitHub refused, a
+  redelivery that never landed, or a repair left by an older build's
+  unfinished first scan — was never examined again: its repair row stayed
+  open and the webhook stayed missing. Every pass now works the open-repair
+  table directly from the delivery ids it stores: rows whose delivery landed
+  locally close, the rest are requested again under the same per-GUID
+  backoff and attempt cap as the scan, so untracked history is still never
+  replayed. The retry scan reads this App's rows that are still below the
+  attempt cap, so another App's backlog — or rows at the cap — cannot fill
+  the bounded window and starve newer repairs out of it. An attempt is
+  claimed before the request, in one conditional store write, so two
+  watchdogs overlapping a restart cannot both request or both charge the
+  same delivery.
+
+- **The conformance campaign survives a second run against the same
+  Postgres database**: `conformance-5repos.sh` wiped the campaign home,
+  including the node key, on every run while requiring a persistent
+  Postgres store, so the next run died on the store's key-fingerprint
+  guard. The node key now survives the wipe, restored private (`0600`)
+  rather than carrying a saved file's permissions.
+
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
   a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
@@ -601,6 +772,29 @@ Releases before v0.27.0 predate the changelog.
   pool provisioning marks) refuses the import, and only provably unreachable
   tombstones/ephemeral tokens are reported as skipped. `preloop serve` still
   never migrates a database on its own.
+- Workflow runs can be re-run in place as a new attempt: the same run id
+  with `github.run_attempt` incremented and the previous attempt kept in
+  history, exactly like GitHub's "Re-run jobs". Three modes match GitHub's
+  buttons: all jobs, failed/cancelled jobs plus their dependents, and one
+  job plus its dependents (`POST /api/v1/runs/:id/rerun` with
+  `{"mode":"all|failed|job","job_id":…}`, or the new
+  `preloop rerun <run-id> [--failed|--job <id>]`). Re-run jobs re-arm
+  `environment:` protection gates and re-acquire workflow/job concurrency
+  groups; jobs outside the selection keep their results and outputs, so
+  dependents see the carried-forward `needs` context. A run the archiver
+  already moved to history can only be re-run in full, which starts a new
+  run (previous behavior).
+- `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0` disables) keeps completed runs
+  that have a failed/cancelled/timed-out job in the live control tables so
+  they stay re-runnable in place; everything else still archives within a
+  minute of completion, and retention (`PRELOOP_RETENTION_DAYS`) still wins.
+  The volume cost is one live run row plus its jobs and attempts per failed
+  run for up to the window — small next to the run's own artifacts and logs,
+  and the knob trades it for keeping "Re-run failed jobs" working long after
+  the 60-second archive grace.
+
+### Changed
+
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and

@@ -323,12 +323,11 @@ jobs:
           subject-path: artifacts/*
       # Engines resolve the golden at their own release tag, so a release must
       # carry a complete, verifiable golden pair — but goldens are baked by
-      # their own hosts (x86_64 on a Linux KVM host, aarch64 on an Apple
-      # Silicon host), never by this pipeline: a golden's content is keyed by
-      # the official image pin, the toolchain pins and the apt-index bake
-      # date, and the runner bundle is mounted from the engine at job time, so
-      # a per-release bake would ship an identical artifact for >110 GiB of
-      # staging.
+      # their own hosts (x86_64 on an x86_64 KVM host, aarch64 on macstudio),
+      # never by this pipeline: a golden's content is keyed by the official
+      # image pin and the runner contract, and the runner bundle is mounted
+      # from the engine at job time, so a per-release bake would ship an
+      # identical artifact for >110 GiB of staging.
       # Seed the newest pair that exists, sidecars included, so a release is
       # never a guaranteed 404 (golden_url_candidates prefers the own tag) and
       # never claims a checksum it cannot prove.

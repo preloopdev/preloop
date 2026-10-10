@@ -47,8 +47,9 @@ pub struct GoldenConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Base image `serve` boots its golden from: an OCI reference, a
-    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent means the
-    /// engine's stock base — the packed official GitHub runner golden.
+    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent selects the
+    /// packed official GitHub runner golden — the image `runs-on:
+    /// ubuntu-latest` means, downloaded and verified, never baked locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
     /// Dockerfile a `kind = "dockerfile"` tar was built from, so a re-run can
@@ -58,7 +59,7 @@ pub struct GoldenConfig {
 }
 
 /// Effective golden base image: [`BASE_IMAGE_ENV`] when set to a non-blank
-/// value, else the `[golden]` section. `None` means the engine's stock base.
+/// value, else the `[golden]` section. `None` means the packed official golden.
 ///
 /// An exported-but-blank variable behaves like an unset one — the same rule
 /// `PRELOOP_GOLDEN_URL` follows — so a shell that exports an empty value
@@ -855,6 +856,33 @@ pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES
 pub const RETENTION_DAYS_ENV: &str = "PRELOOP_RETENTION_DAYS";
 /// Default run retention, in days, following GitHub's Actions retention setting.
 pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+
+/// Env override for the in-place re-run window (see
+/// [`rerun_window_days`]): how long a completed run with failed jobs stays
+/// in the live control tables so it can be re-run in place.
+pub const RERUN_WINDOW_DAYS_ENV: &str = "PRELOOP_RERUN_WINDOW_DAYS";
+/// Default in-place re-run window, in days, following GitHub's 30-day
+/// re-run limit.
+pub const DEFAULT_RERUN_WINDOW_DAYS: u64 = 30;
+
+/// Resolve the archiver's in-place re-run hold: `PRELOOP_RERUN_WINDOW_DAYS`
+/// (default [`DEFAULT_RERUN_WINDOW_DAYS`]), in days. A run whose completed
+/// attempt has at least one failed/cancelled/timed-out job stays live this
+/// long so a re-run can reset its jobs in place; `0` disables the hold and
+/// restores the plain 60-second archive policy. An unparseable value is an
+/// error — a typo must fail closed rather than hold (or drop) scheduler rows
+/// silently; callers warn and disable the hold.
+pub fn rerun_window_days() -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(RERUN_WINDOW_DAYS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {RERUN_WINDOW_DAYS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(DEFAULT_RERUN_WINDOW_DAYS)
+}
 
 fn default_retention_days() -> u64 {
     DEFAULT_RETENTION_DAYS

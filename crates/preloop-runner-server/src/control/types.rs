@@ -355,6 +355,109 @@ pub(crate) struct SubmitOutcome {
     pub(crate) events: Vec<preloop_gha_protocol::NdjsonEvent>,
 }
 
+/// Which jobs a re-run resets, mirroring github.com's three re-run modes
+/// (<https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs>):
+/// all jobs, failed/cancelled jobs plus their dependents, or one job plus
+/// its dependents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RerunMode {
+    /// Every job of the run (`gh run rerun` / "Re-run all jobs").
+    All,
+    /// Failed and cancelled jobs plus every job reachable downstream
+    /// ("Re-run failed jobs"; dependents include jobs skipped by a failed
+    /// `needs:` — they re-evaluate against the new attempt).
+    Failed,
+    /// One job plus its dependents (REST `…/actions/jobs/{job_id}/rerun`,
+    /// `gh run rerun --job`). The id matches a job id or a matrix/caller
+    /// base id, the same rule `job_needs` matching uses.
+    Job(JobId),
+}
+
+/// A rebuilt message template for a re-run job that has no stored
+/// `job_messages` row (e.g. it was concluded `Skipped` at submit and GitHub
+/// lets a new attempt run it). The handler builds these with the same
+/// `build_job_artifacts` path a submit uses.
+#[derive(Debug)]
+pub(crate) struct RerunJobTemplate {
+    pub(crate) job_id: JobId,
+    /// Fresh secret-free template; carries the attempt's new `jobId`,
+    /// `planId`, `timeline.id` and the bumped `github.run_attempt`.
+    pub(crate) message: azdo::AgentJobRequestMessage,
+    /// Fresh `if:`/needs expression context built from the bumped github
+    /// context (mirrors `QueuedJob.condition_context` at submit).
+    pub(crate) condition_context: preloop_gha_expressions::Context,
+    /// Deferred App-token mint request for this job's new request id.
+    pub(crate) token_request: Option<crate::models::GitHubTokenRequest>,
+}
+
+/// `rerun_run` input: the run to re-execute plus the admission inputs the
+/// handler re-evaluated outside the transaction. GitHub re-runs the same
+/// workflow snapshot, so job specs, needs edges and stored messages are
+/// reused; what changes is the attempt identity.
+#[derive(Debug)]
+pub(crate) struct RerunRun {
+    pub(crate) run_id: RunId,
+    pub(crate) mode: RerunMode,
+    /// User who requested this re-run. Native control-plane callers do not
+    /// carry a user identity and pass `None`; the stored triggering actor is
+    /// left unchanged in that case.
+    pub(crate) triggering_actor: Option<String>,
+    /// Evaluated workflow-level concurrency as at submit (persisted in
+    /// `run_submissions.record_details.workflow_concurrency`), re-acquired
+    /// for the new attempt. `None` when the workflow declares none.
+    pub(crate) workflow_concurrency: Option<WorkflowConcurrency>,
+    /// The node-local environment protection rules, re-evaluated for every
+    /// reset job exactly as at submit.
+    pub(crate) environment_rules: crate::config::EnvironmentRulesMap,
+    /// Rebuilt templates for reset jobs that have no stored `job_messages`
+    /// row. A reset job with neither a stored row nor a template here is
+    /// concluded `Failure` rather than left messageless on the ready queue.
+    pub(crate) templates: Vec<RerunJobTemplate>,
+}
+
+/// Outcome of `rerun_run`.
+#[derive(Debug)]
+pub(crate) struct RerunOutcome {
+    pub(crate) run_id: RunId,
+    /// The attempt the run is now executing (`previous + 1`).
+    pub(crate) run_attempt: u64,
+    pub(crate) run_number: u64,
+    /// Jobs admitted to the queue this attempt (`RunAccepted.queued_jobs`).
+    pub(crate) queued_jobs: usize,
+    /// Run status after the reset (Queued / Pending / terminal).
+    pub(crate) status: ExecutionStatus,
+    /// Jobs concluded during re-admission (skipped `if:`s, gate failures,
+    /// arrival-cancelled) — the handler emits events for them.
+    pub(crate) concluded: Vec<(JobId, ExecutionStatus, Option<String>)>,
+    /// Job ids whose rows were reset and dispatched again, with the fresh
+    /// `agent_job_id` minted for the attempt (`None` when the job carried no
+    /// request row — expandable placeholders re-mint at expansion).
+    pub(crate) rerun_jobs: Vec<(JobId, Option<String>)>,
+    /// Every job the mode selected for reset (superset of `rerun_jobs` —
+    /// includes members concluded during re-admission and expandable
+    /// nodes). Reporting surfaces (check runs, webhooks) act on this set.
+    pub(crate) selected: BTreeSet<JobId>,
+    /// Whether the attempt was parked behind a workflow-level gate.
+    pub(crate) held: bool,
+    /// `runs-on` labels of the next ready job, for `next_job_runs_on`.
+    /// (The ready-queue depth gauge is the sampler's; a rerun never counts
+    /// the queue itself.)
+    pub(crate) next_runs_on: Vec<String>,
+}
+
+/// Read-side view of what a `rerun_run` call would touch: the selected job
+/// set plus the members that carry no runnable `job_messages` template
+/// (skipped/unhostable at submit) and therefore need a rebuilt template in
+/// `RerunRun::templates`. Expandable nodes (deferred matrix parents,
+/// reusable callers) mint at expansion and are never listed as missing.
+#[derive(Debug)]
+pub(crate) struct RerunPlan {
+    /// Selected jobs (the rerun_set result, minus dead matrix parents).
+    pub(crate) set: std::collections::BTreeSet<JobId>,
+    /// Members with no usable stored template — handler rebuilds these.
+    pub(crate) missing_templates: Vec<JobId>,
+}
+
 /// What a session poll produced. The handler maps each variant onto the
 /// wire response; `Empty` means long-poll or return the empty body.
 #[derive(Debug)]
@@ -996,14 +1099,16 @@ pub(crate) struct ReapSweep {
     pub(crate) paused: std::collections::BTreeMap<i64, std::time::Duration>,
     /// A co-hosted pool is preparing/provisioning a runner.
     pub(crate) pool_preparing: bool,
-    /// This process started less than `MAX_QUEUED_GRACE` ago.
-    pub(crate) warm_window_open: bool,
+    /// When this node's process started: starvation clocks never start
+    /// before it (`logic::starvation_verdict`).
+    pub(crate) booted_at: std::time::SystemTime,
     /// Labels the co-hosted pool advertises; empty when it published none.
     pub(crate) pool_labels: Vec<String>,
     /// Node-local starvation marks: the instant this node's
     /// reaper first saw each unmatched ready job. Backends feed
     /// `first_seen.get(&(run, job))` to `logic::starvation_verdict`; they
-    /// never persist marks. A missing entry falls back to `enqueued_at`.
+    /// never persist marks. A missing entry falls back to `enqueued_at` or
+    /// `booted_at`, whichever is later.
     pub(crate) first_seen: std::collections::BTreeMap<(RunId, JobId), std::time::SystemTime>,
 }
 

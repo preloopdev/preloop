@@ -4,6 +4,7 @@
 //! plus the expansion-build machinery that produces [`BuiltExpansion`] for
 //! `apply_expansion`. Both backends call these so they cannot diverge.
 
+use crate::control::types::ControlError;
 use crate::models::{QueuedJob, RunRecord};
 use crate::state::JobSetGate;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, WorkflowSubmission};
@@ -69,10 +70,11 @@ pub(crate) fn run_priority(event: &str) -> i32 {
 
 /// How long an unmatched ready job may wait for a matching runner.
 pub(crate) const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
-/// Absolute backstop, measured from ready-enqueue, on how long a job whose
-/// labels the pool can satisfy — or whose runner a preparing pool may still
-/// provide — waits for a matching runner. One hour covers a full golden
-/// rebuild plus several failed provision rounds.
+/// Absolute backstop on how long a job whose labels the pool can satisfy —
+/// or whose runner a preparing pool may still provide — waits for a matching
+/// runner. Measured from ready-enqueue or this node's boot, whichever is
+/// later. One hour covers a full golden rebuild plus several failed
+/// provision rounds.
 pub(crate) const MAX_QUEUED_GRACE: Duration = Duration::from_secs(3600);
 
 /// Ready-job inputs for starvation evaluation.
@@ -196,14 +198,18 @@ pub(crate) fn concludes_at_submit(
 
 /// Decide starvation using the production 120/3600 second grace rules.
 ///
-/// Ages are measured on this node's clock; an enqueue instant another node
-/// stamped slightly in the future counts as age zero rather than as expired.
-/// `enqueued_at == UNIX_EPOCH` means the enqueue instant is unknown.
+/// Every clock starts at ready-enqueue or `booted_at` (this node's start),
+/// whichever is later: a restart kills the co-hosted pool's runners, so time
+/// a job spent queued before it says nothing about whether the restarted
+/// pool can serve it. `enqueued_at == UNIX_EPOCH` (instant unknown) measures
+/// from boot. Ages are measured on this node's clock; an instant another
+/// node stamped slightly in the future counts as age zero rather than as
+/// expired.
 pub(crate) fn starvation_verdict(
     job: &StarvationCandidate<'_>,
     now: SystemTime,
     pool_preparing: bool,
-    warm_window_open: bool,
+    booted_at: SystemTime,
     pool_labels: &[String],
 ) -> StarvationVerdict {
     // Non-Linux jobs can only run on a registered host; keep them queued
@@ -211,9 +217,8 @@ pub(crate) fn starvation_verdict(
     if job.any_runner_matches || needs_external_host(job.runs_on) {
         return StarvationVerdict::ClearMark;
     }
-    let enqueue_age = (job.enqueued_at != SystemTime::UNIX_EPOCH)
-        .then(|| now.duration_since(job.enqueued_at).unwrap_or_default());
-    let within_ceiling = enqueue_age.is_some_and(|age| age < MAX_QUEUED_GRACE);
+    let waiting_since = job.enqueued_at.max(booted_at);
+    let within_ceiling = now.duration_since(waiting_since).unwrap_or_default() < MAX_QUEUED_GRACE;
     // A job the pool's advertised labels can satisfy is exempt from the short
     // grace — its runner appears once the pool warms — so only the backstop
     // applies; one they can never satisfy fails fast instead of starving.
@@ -226,16 +231,14 @@ pub(crate) fn starvation_verdict(
         }
     }
     let grace = if pool_preparing {
-        // A known enqueue instant is protected until the ceiling; a restored
-        // job whose instant was lost gets this process's warm window only.
-        if within_ceiling || (enqueue_age.is_none() && warm_window_open) {
+        if within_ceiling {
             // Provisioning time does not consume the short grace. Re-stamp
             // at every protected tick so a retry gap starts a fresh window.
             return StarvationVerdict::Mark { first_seen: now };
         }
         MAX_QUEUED_GRACE
     } else {
-        let first_seen = job.first_seen.unwrap_or(job.enqueued_at);
+        let first_seen = job.first_seen.unwrap_or(waiting_since);
         if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
             return StarvationVerdict::Mark { first_seen };
         }
@@ -430,6 +433,141 @@ pub(crate) struct NeedRow {
     pub(crate) job_id: JobId,
     pub(crate) status: ExecutionStatus,
     pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+}
+
+/// One `jobs` row as the re-run selector sees it.
+///
+/// `status` is the wire status string the backend stores (`timed_out` folds
+/// into the failure cohort — the `jobs` CHECK allows it even though
+/// `status_str` never writes it).
+#[derive(Debug, Clone)]
+pub(crate) struct RerunJobRow {
+    pub(crate) job_id: JobId,
+    /// `jobs.kind` (`job` / `matrix_parent` / `matrix_leg` /
+    /// `reusable_caller`).
+    pub(crate) kind: String,
+    pub(crate) base_id: String,
+    /// `jobs.parent_job_id` — matrix legs and reusable callee jobs carry
+    /// their parent's job id here.
+    pub(crate) parent_job_id: Option<String>,
+    pub(crate) status: String,
+    /// `job_needs` edges out of this job, in declared order.
+    pub(crate) needs: Vec<JobId>,
+}
+
+/// GitHub's three re-run modes resolved to the set of `jobs` rows the new
+/// attempt resets
+/// (<https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs>).
+///
+/// Seeds: `All` takes every matchable row; `Failed` takes
+/// `failure`/`cancelled`/`timed_out` rows; `Job(id)` resolves against
+/// `job_id`/`base_id` like `job_needs` matching (a matrix base id selects
+/// all its legs).
+///
+/// Fixpoint closure:
+/// - a job joins when a declared `needs:` edge lands on a member —
+///   dependents re-evaluate against the new attempt;
+/// - every callee child of a member `reusable_caller` joins, and the
+///   caller joins when any callee child is a member — GitHub re-runs a
+///   reusable call wholesale, and the child rows cannot be deleted
+///   (`job_requests`/`job_needs` FK edges), so the subtree resets in place
+///   and the caller re-enters `in_progress`;
+/// - a `matrix_parent` that already expanded is derived state — it is
+///   never a member (re-entering `blocked` would re-expand it and collide
+///   on its existing leg rows); its legs are selected individually.
+///
+/// `Err(NotFound)` when a `Job` mode names nothing, `Err(Conflict)` when
+/// `Failed` matches nothing — GitHub declines a failed-only re-run of a
+/// fully-green run.
+pub(crate) fn rerun_set(
+    mode: &crate::control::types::RerunMode,
+    jobs: &[RerunJobRow],
+) -> Result<std::collections::BTreeSet<JobId>, ControlError> {
+    use crate::control::types::RerunMode;
+    let has_children: HashSet<&str> = jobs
+        .iter()
+        .filter_map(|job| job.parent_job_id.as_deref())
+        .collect();
+    let kind_of: std::collections::BTreeMap<&str, &str> = jobs
+        .iter()
+        .map(|job| (job.job_id.0.as_str(), job.kind.as_str()))
+        .collect();
+    let dead_parent = |row: &RerunJobRow| {
+        row.kind == "matrix_parent" && has_children.contains(row.job_id.0.as_str())
+    };
+    // The selector's view excludes expanded matrix parents — the same rows
+    // `run_graph` drops for status purposes.
+    let matchable: Vec<&RerunJobRow> = jobs.iter().filter(|row| !dead_parent(row)).collect();
+    let matches = |row: &RerunJobRow, need: &JobId| row.job_id == *need || row.base_id == need.0;
+
+    let mut set: std::collections::BTreeSet<JobId> = std::collections::BTreeSet::new();
+    match mode {
+        RerunMode::All => {
+            set.extend(matchable.iter().map(|row| row.job_id.clone()));
+        }
+        RerunMode::Failed => {
+            for row in &matchable {
+                if matches!(row.status.as_str(), "failure" | "cancelled" | "timed_out") {
+                    set.insert(row.job_id.clone());
+                }
+            }
+            if set.is_empty() {
+                return Err(ControlError::Conflict(
+                    "run has no failed or cancelled jobs to re-run".to_owned(),
+                ));
+            }
+        }
+        RerunMode::Job(id) => {
+            let seeds: Vec<JobId> = matchable
+                .iter()
+                .filter(|row| matches(row, id))
+                .map(|row| row.job_id.clone())
+                .collect();
+            if seeds.is_empty() {
+                return Err(ControlError::NotFound(format!(
+                    "no job matching `{id}` in this run"
+                )));
+            }
+            set.extend(seeds);
+        }
+    }
+
+    // Fixpoint closure: a job joins when a declared need landed in the set
+    // (downstream dependent), or when it is the parent of a member (callers
+    // re-enter `in_progress` while their subtree re-runs).
+    loop {
+        let mut added = false;
+        for row in &matchable {
+            if set.contains(&row.job_id) {
+                continue;
+            }
+            let is_dependent = row.needs.iter().any(|need| {
+                jobs.iter()
+                    .filter(|candidate| matches(candidate, need))
+                    .any(|candidate| set.contains(&candidate.job_id))
+            });
+            // A callee child of a member caller joins (the subtree resets
+            // wholesale), and a caller joins when any child does so it can
+            // return to `in_progress` and pull its subtree in.
+            let parent_is_member_caller = row.parent_job_id.as_deref().is_some_and(|parent| {
+                kind_of.get(parent) == Some(&"reusable_caller")
+                    && set.contains(&JobId(parent.to_owned()))
+            });
+            let is_caller_of_member = row.kind == "reusable_caller"
+                && jobs.iter().any(|child| {
+                    child.parent_job_id.as_deref() == Some(row.job_id.0.as_str())
+                        && set.contains(&child.job_id)
+                });
+            if is_dependent || parent_is_member_caller || is_caller_of_member {
+                set.insert(row.job_id.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    Ok(set)
 }
 
 /// Decision after all direct needs are inspected.
@@ -1078,6 +1216,9 @@ mod decision_tests {
         assert_eq!(counts, (1, 2, 4));
     }
 
+    /// A node that booted long before any job under test was enqueued.
+    const LONG_UP: SystemTime = SystemTime::UNIX_EPOCH;
+
     fn starvation_candidate<'a>(
         runs_on: &'a [String],
         enqueued_ago: Duration,
@@ -1099,13 +1240,13 @@ mod decision_tests {
         let mut job = starvation_candidate(&linux, Duration::from_secs(10_000), None, now);
         job.any_runner_matches = true;
         assert_eq!(
-            starvation_verdict(&job, now, false, false, &[]),
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
             StarvationVerdict::ClearMark
         );
         let mac = labels(&["macOS-14"]);
         let job = starvation_candidate(&mac, Duration::from_secs(10_000), None, now);
         assert_eq!(
-            starvation_verdict(&job, now, false, false, &[]),
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
             StarvationVerdict::ClearMark
         );
     }
@@ -1121,14 +1262,14 @@ mod decision_tests {
             now,
         );
         assert_eq!(
-            starvation_verdict(&job, now, false, false, &[]),
+            starvation_verdict(&job, now, false, LONG_UP, &[]),
             StarvationVerdict::Mark {
                 first_seen: now - Duration::from_secs(30)
             }
         );
         let job = starvation_candidate(&linux, Duration::from_secs(121), None, now);
         let StarvationVerdict::Starve { reason, grace } =
-            starvation_verdict(&job, now, false, false, &[])
+            starvation_verdict(&job, now, false, LONG_UP, &[])
         else {
             panic!("an unmatched job past the grace window must starve");
         };
@@ -1143,31 +1284,56 @@ mod decision_tests {
         // Protected ticks re-stamp the observation clock.
         let young = starvation_candidate(&linux, Duration::from_secs(3599), None, now);
         assert_eq!(
-            starvation_verdict(&young, now, true, false, &[]),
+            starvation_verdict(&young, now, true, LONG_UP, &[]),
             StarvationVerdict::Mark { first_seen: now }
         );
-        // The ceiling holds even inside this process's warm window: a known
-        // enqueue instant past it starves.
         let old = starvation_candidate(&linux, MAX_QUEUED_GRACE, None, now);
-        for warm_window_open in [false, true] {
-            assert!(matches!(
-                starvation_verdict(&old, now, true, warm_window_open, &[]),
-                StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
-            ));
-        }
-        // A restored job whose enqueue instant was lost gets the warm window
-        // only.
+        assert!(matches!(
+            starvation_verdict(&old, now, true, LONG_UP, &[]),
+            StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
+        ));
+    }
+
+    /// A restart kills the co-hosted pool's runners, so the backlog it finds
+    /// must not be failed on time it spent queued before boot.
+    #[test]
+    fn restart_restarts_every_starvation_clock() {
+        let now = SystemTime::now();
+        let booted_at = now - Duration::from_secs(10);
+        let linux = labels(&["self-hosted", "linux"]);
+        let pool = labels(&["self-hosted", "linux", "x64"]);
+        let backlog = starvation_candidate(&linux, Duration::from_secs(7_200), None, now);
         let unknown = StarvationCandidate {
             enqueued_at: SystemTime::UNIX_EPOCH,
-            ..starvation_candidate(&linux, Duration::ZERO, None, now)
+            ..backlog.clone()
         };
-        assert_eq!(
-            starvation_verdict(&unknown, now, true, true, &[]),
-            StarvationVerdict::Mark { first_seen: now }
-        );
+        for job in [&backlog, &unknown] {
+            // Pool advertising matching labels, preparing, or neither.
+            assert_eq!(
+                starvation_verdict(job, now, false, booted_at, &pool),
+                StarvationVerdict::ClearMark
+            );
+            assert_eq!(
+                starvation_verdict(job, now, true, booted_at, &[]),
+                StarvationVerdict::Mark { first_seen: now }
+            );
+            assert_eq!(
+                starvation_verdict(job, now, false, booted_at, &[]),
+                StarvationVerdict::Mark {
+                    first_seen: booted_at
+                }
+            );
+        }
+        // The windows still close, measured from boot.
+        let later = booted_at + MAX_QUEUED_GRACE;
         assert!(matches!(
-            starvation_verdict(&unknown, now, true, false, &[]),
-            StarvationVerdict::Starve { .. }
+            starvation_verdict(&backlog, later, true, booted_at, &pool),
+            StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
+        ));
+        let later = booted_at + QUEUED_JOB_GRACE;
+        assert!(matches!(
+            starvation_verdict(&unknown, later, false, booted_at, &[]),
+            StarvationVerdict::Starve { grace, .. } if grace == QUEUED_JOB_GRACE
         ));
     }
 
@@ -1178,7 +1344,7 @@ mod decision_tests {
         let gpu = labels(&["self-hosted", "gpu"]);
         let fresh_gpu = starvation_candidate(&gpu, Duration::from_secs(1), None, now);
         let StarvationVerdict::Unschedulable { reason } =
-            starvation_verdict(&fresh_gpu, now, true, true, &pool)
+            starvation_verdict(&fresh_gpu, now, true, LONG_UP, &pool)
         else {
             panic!("labels the pool can never satisfy must fail fast");
         };
@@ -1187,19 +1353,19 @@ mod decision_tests {
         let mac = labels(&["macos-14"]);
         let mac_job = starvation_candidate(&mac, Duration::from_secs(1), None, now);
         assert_eq!(
-            starvation_verdict(&mac_job, now, false, false, &pool),
+            starvation_verdict(&mac_job, now, false, LONG_UP, &pool),
             StarvationVerdict::ClearMark
         );
         // A job the pool can satisfy skips the short grace until the ceiling.
         let linux = labels(&["self-hosted", "linux"]);
         let waiting = starvation_candidate(&linux, Duration::from_secs(600), None, now);
         assert_eq!(
-            starvation_verdict(&waiting, now, false, false, &pool),
+            starvation_verdict(&waiting, now, false, LONG_UP, &pool),
             StarvationVerdict::ClearMark
         );
         let stuck = starvation_candidate(&linux, MAX_QUEUED_GRACE, None, now);
         assert!(matches!(
-            starvation_verdict(&stuck, now, false, false, &pool),
+            starvation_verdict(&stuck, now, false, LONG_UP, &pool),
             StarvationVerdict::Starve { .. }
         ));
     }
@@ -1308,11 +1474,11 @@ mod decision_tests {
             ..starvation_candidate(&linux, Duration::ZERO, None, now)
         };
         assert!(matches!(
-            starvation_verdict(&ahead, now, false, false, &[]),
+            starvation_verdict(&ahead, now, false, LONG_UP, &[]),
             StarvationVerdict::Mark { .. }
         ));
         assert_eq!(
-            starvation_verdict(&ahead, now, true, false, &[]),
+            starvation_verdict(&ahead, now, true, LONG_UP, &[]),
             StarvationVerdict::Mark { first_seen: now }
         );
     }

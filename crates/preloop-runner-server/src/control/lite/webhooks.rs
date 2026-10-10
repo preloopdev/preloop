@@ -723,6 +723,95 @@ impl LiteBackend {
         })
     }
 
+    /// Unresolved repairs for one App that are still below the attempt cap,
+    /// in retry order: the row that has waited longest since its last
+    /// attempt first (never-attempted rows at the front), then oldest-first.
+    ///
+    /// Scoping and the cap live in SQL on purpose: the retry pass reads a
+    /// bounded window, and a global query would let another App's backlog —
+    /// or rows already at the cap, which are never retried — fill it and
+    /// starve this App's repairs.
+    pub(crate) async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        self.read(|tx| {
+            let mut stmt = tx
+                .prepare_cached(&format!(
+                    "SELECT {REDELIVERY_COLUMNS} FROM webhook_redeliveries \
+                     WHERE resolved_at IS NULL AND app_id = ?1 AND attempts < ?2 \
+                     ORDER BY last_attempt_at ASC NULLS FIRST, first_seen_at ASC LIMIT ?3"
+                ))
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        app_id,
+                        attempt_cap.min(i32::MAX as u32) as i64,
+                        limit.min(i64::MAX as usize) as i64
+                    ],
+                    redelivery_row,
+                )
+                .map_err(db)?;
+            rows.map(|row| row.map_err(db).and_then(finish_redelivery))
+                .collect()
+        })
+    }
+
+    /// Take one redelivery attempt for a repair row, or report that someone
+    /// else already did.
+    ///
+    /// The `WHERE` on the conflict path is the compare of a compare-and-swap
+    /// over the row the caller read: an attempt committed since that read
+    /// (another watchdog, a restart overlap, a second server on the store)
+    /// no longer matches, so the update is skipped, nothing is returned, and
+    /// the caller sends no request. The charge and the last-attempt clock
+    /// move in the same statement, so a claimed attempt is exactly one
+    /// request. `IS` is null-safe equality, so an open row (`resolved_at`
+    /// NULL) matches a NULL `resolved_at` and a closed row only reopens
+    /// under the resolution the caller read.
+    pub(crate) async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        self.write(|tx| {
+            tx.query_row(
+                &format!(
+                    "INSERT INTO webhook_redeliveries (delivery_guid, github_delivery_id, app_id, \
+                     reason, attempts, first_seen_at, last_attempt_at, resolved_at, last_error) \
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, NULL) \
+                     ON CONFLICT (delivery_guid) DO UPDATE SET \
+                     github_delivery_id = excluded.github_delivery_id, \
+                     app_id = excluded.app_id, reason = excluded.reason, \
+                     attempts = webhook_redeliveries.attempts + 1, \
+                     last_attempt_at = excluded.last_attempt_at, \
+                     resolved_at = NULL, last_error = NULL \
+                     WHERE webhook_redeliveries.attempts = ?7 \
+                     AND webhook_redeliveries.resolved_at IS ?8 \
+                     RETURNING {REDELIVERY_COLUMNS}"
+                ),
+                params![
+                    observed.delivery_guid,
+                    observed.github_delivery_id,
+                    observed.app_id,
+                    observed.reason.as_str(),
+                    observed.first_seen_at_us,
+                    claimed_at_us,
+                    observed.attempts as i64,
+                    observed.resolved_at_us,
+                ],
+                redelivery_row,
+            )
+            .optional()
+            .map_err(db)?
+            .map(finish_redelivery)
+            .transpose()
+        })
+    }
+
     /// Close an open repair; `false` when unknown or already resolved.
     pub(crate) async fn resolve_webhook_redelivery(
         &self,

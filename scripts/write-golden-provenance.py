@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
 import hashlib
 import json
 import os
@@ -32,8 +31,6 @@ def main() -> None:
     parser.add_argument("--golden", type=Path, required=True)
     parser.add_argument("--base-evidence", type=Path, required=True)
     parser.add_argument("--base-sbom", type=Path, required=True)
-    parser.add_argument("--apt-indices-date", default=None)
-    parser.add_argument("--apt-indices-max-age-days", default=None)
     args = parser.parse_args()
 
     evidence = json.loads(args.base_evidence.read_text(encoding="utf-8"))
@@ -69,17 +66,6 @@ def main() -> None:
         },
         "base_evidence": file_record(args.base_evidence),
         "base_sbom": file_record(args.base_sbom),
-        "apt_indices": {
-            key: value
-            for key, value in {
-                "baked_at": args.apt_indices_date
-                or datetime.date.today().isoformat(),
-                "max_age_days": int(args.apt_indices_max_age_days)
-                if args.apt_indices_max_age_days
-                else 7,
-            }.items()
-            if value
-        },
         "workflow": {
             key: value
             for key, value in {
