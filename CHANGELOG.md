@@ -773,6 +773,12 @@ Releases before v0.27.0 predate the changelog.
   dependents see the carried-forward `needs` context. A run the archiver
   already moved to history can only be re-run in full, which starts a new
   run (previous behavior).
+- GitHub-compatible re-run/cancel endpoints for tooling and `gh run rerun`:
+  `POST /repos/{owner}/{repo}/actions/runs/{id}/rerun`,
+  `…/rerun-failed-jobs`, `…/actions/jobs/{job_id}/rerun`, and
+  `…/actions/runs/{id}/cancel`, authorized with the dispatch credential
+  chain (`actions: write`) and mirroring github.com's 201/202/403/404/409
+  statuses.
 - `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0` disables) keeps completed runs
   that have a failed/cancelled/timed-out job in the live control tables so
   they stay re-runnable in place; everything else still archives within a
