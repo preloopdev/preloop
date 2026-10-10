@@ -1156,20 +1156,8 @@ pub async fn broker_acquire_job(
     // Run-service payloads use the DTO default; internal request IDs remain in
     // `job_requests` and broker lookup maps for renew/complete bookkeeping.
     message.request_id = 0;
-    let mut payload = serde_json::to_value(&message)
+    let payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
-    // Runner v2.323+ reads server-enforced settings from the acquire response.
-    // Keep the local control plane explicit even when no overrides are
-    // configured; omitted fields make the runner fall back inconsistently.
-    payload
-        .as_object_mut()
-        .ok_or_else(|| ApiError::internal("broker job payload must serialize as an object"))?
-        .insert(
-            "runnerSettings".to_owned(),
-            serde_json::to_value(azdo::RunnerServerSettings::default()).map_err(|error| {
-                ApiError::internal(format!("serialize runner server settings: {error}"))
-            })?,
-        );
     // Broker poll outcome — bounded, exactly one per successful claim. Queue
     // wait is recorded at the claim sites in `next_message_broker_ref` /
     // `next_message_disttask`, where the enqueue timestamp is still on the

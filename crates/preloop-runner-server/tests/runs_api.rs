@@ -2481,13 +2481,10 @@ jobs:
         acquired["variables"]["actions_self_repository"]["value"],
         "true"
     );
-    assert_eq!(
-        acquired["runnerSettings"],
-        json!({
-            "isHostedServer": false,
-            "agentDownloadUrls": {}
-        })
-    );
+    // Server-enforced settings live on the settings endpoint, not the acquire
+    // contract: upstream AgentJobRequestMessage has no consumer for an
+    // injected `runnerSettings` member.
+    assert!(acquired.get("runnerSettings").is_none());
     assert_eq!(
         acquired["resources"]["endpoints"][0]["url"],
         "http://127.0.0.1:9090/broker/1/"
