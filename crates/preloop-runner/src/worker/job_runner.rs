@@ -599,15 +599,20 @@ pub async fn run_job(
     });
 
     // Execute steps with the derived cancel channel
+    // Set when the job was cancelled while waiting for the debugger client;
+    // the job completes as a cancellation, not a failure (v2.338.0 parity).
+    let mut debugger_cancelled = false;
     let mut debugger_result = Ok(());
     if let Some(dbg) = job_ctx.dap_debugger.clone() {
         info!("Starting debugger…");
+        // Mirror `JobExtension.cs` (v2.338.0): a tunnel that cannot be
+        // established or drops while we wait is an infrastructure failure
+        // (`DebuggerTunnelException`), cancellation stays a cancellation,
+        // and anything else is a job error.
         if let Err(e) = dbg.start(job_id, &[]).await {
             error!("DAP debugger failed to start: {e}");
-            job_ctx.debugger_telemetry.push("Failed".to_string());
-            debugger_result = Err(anyhow::anyhow!(
-                "The debugger failed to start or no debugger client connected in time."
-            ));
+            debugger_result = Err(classify_debugger_failure(&e));
+            let _ = dbg.stop().await;
         } else {
             // Register the bound local port with the server
             if let Some(run_id_str) = job_message
@@ -635,9 +640,8 @@ pub async fn run_job(
                 r = wait_ready => {
                     if let Err(e) = r {
                         error!("DAP debugger failed to connect: {e}");
-                        job_ctx.debugger_telemetry.push("Failed".to_string());
+                        debugger_result = Err(classify_debugger_failure(&e));
                         let _ = dbg.stop().await;
-                        debugger_result = Err(anyhow::anyhow!("The debugger failed to start or no debugger client connected in time."));
                     } else {
                         info!("Debugger connected.");
                         job_ctx.debugger_telemetry.push("Connected".to_string());
@@ -645,10 +649,10 @@ pub async fn run_job(
                 }
                 _ = job_cancel.changed() => {
                     if *job_cancel.borrow() {
-                        error!("Job was cancelled before debugger client connected.");
-                        job_ctx.debugger_telemetry.push("Canceled".to_string());
+                        debugger_result = Err(DebuggerWaitFailure::Cancelled(
+                            "Job was cancelled before debugger client connected.".to_string(),
+                        ));
                         let _ = dbg.stop().await;
-                        debugger_result = Err(anyhow::anyhow!("Job was cancelled before debugger client connected."));
                     }
                 }
             }
@@ -660,8 +664,39 @@ pub async fn run_job(
     // post-mortem marker below must not fire a second time for the same
     // failure.
     let mut debug_was_active = false;
-    let job_result = if let Err(e) = debugger_result {
-        Err(e)
+    let job_result = if let Err(error) = debugger_result {
+        match error {
+            // `catch (DebuggerTunnelException)` → `InfrastructureError` +
+            // `DebuggerConnectionResult: TunnelFailed` (v2.338.0).
+            DebuggerWaitFailure::Infrastructure(message) => {
+                job_ctx.debugger_telemetry.push("TunnelFailed".to_string());
+                job_ctx.infrastructure_error(
+                    message.clone(),
+                    super::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
+                );
+                Err(anyhow::anyhow!(message))
+            }
+            // `catch (OperationCanceledException)` → telemetry `Canceled` +
+            // the job completes as a cancellation, not a failure.
+            DebuggerWaitFailure::Cancelled(message) => {
+                error!("{message}");
+                job_ctx.debugger_telemetry.push("Canceled".to_string());
+                job_ctx.job_status = super::contexts::JobStatus::Cancelled;
+                job_ctx.add_job_annotation(super::execution_context::Annotation::error(
+                    message.clone(),
+                ));
+                debugger_cancelled = true;
+                Err(anyhow::anyhow!(message))
+            }
+            // Generic `catch (Exception)` → a job error:
+            // `Failed: {exception type}` telemetry + the upstream wait message.
+            DebuggerWaitFailure::Job(message) => {
+                job_ctx.debugger_telemetry.push(message);
+                Err(anyhow::anyhow!(
+                    "The debugger failed to start or no debugger client connected in time."
+                ))
+            }
+        }
     } else {
         // `preloopDebugOnFailure` is separate from preservation: a detached
         // run may request a post-mortem shell without making the worker wait
@@ -754,6 +789,8 @@ pub async fn run_job(
             end_line: None,
             col: None,
             end_column: None,
+            is_infrastructure_issue: false,
+            category: None,
         });
     }
 
@@ -770,6 +807,8 @@ pub async fn run_job(
             end_line: None,
             col: None,
             end_column: None,
+            is_infrastructure_issue: false,
+            category: None,
         });
     }
 
@@ -802,6 +841,11 @@ pub async fn run_job(
         // The job never finished on this runner; the server maps abandoned
         // to a failure conclusion, matching GitHub's self-hosted disposition.
         ("abandoned".to_string(), "abandoned".to_string())
+    } else if debugger_cancelled {
+        // `catch (OperationCanceledException)` in upstream `JobExtension`:
+        // cancelled before the debugger client connected completes the job
+        // as `TaskResult.Canceled`, not `Failed`.
+        ("Cancelled".to_string(), "Cancelled".to_string())
     } else {
         match &job_result {
             Ok(conclusion) => {
@@ -821,6 +865,8 @@ pub async fn run_job(
                     end_line: None,
                     col: None,
                     end_column: None,
+                    is_infrastructure_issue: false,
+                    category: None,
                 });
                 ("Failed".to_string(), "Failed".to_string())
             }
@@ -1252,6 +1298,49 @@ async fn first_renew_gate(
                 }
             }
         }
+    }
+}
+
+/// How a debugger startup / wait-for-client failure maps onto the job.
+///
+/// Mirrors the three `catch` arms upstream added around
+/// `WaitUntilReadyAsync` in `JobExtension.cs` (v2.338.0):
+/// `DebuggerTunnelException` → infrastructure failure,
+/// `OperationCanceledException` → cancellation, anything else → job error.
+#[derive(Debug)]
+enum DebuggerWaitFailure {
+    /// The tunnel could not be established or dropped while waiting — an
+    /// infrastructure failure reported with `debugger_tunnel_failure`.
+    Infrastructure(String),
+    /// The job was cancelled before the debug client connected.
+    Cancelled(String),
+    /// Any other debugger fault — a plain job error. Carries the
+    /// `Failed: {exception type}` telemetry string upstream emits.
+    Job(String),
+}
+
+/// Classify a `DapError` the way `JobExtension.cs` classifies the
+/// exceptions thrown by `StartAsync`/`WaitUntilReadyAsync`.
+fn classify_debugger_failure(error: &preloop_dap::debugger::DapError) -> DebuggerWaitFailure {
+    match error {
+        preloop_dap::debugger::DapError::TunnelFailure(message) => {
+            DebuggerWaitFailure::Infrastructure(message.clone())
+        }
+        other => DebuggerWaitFailure::Job(format!("Failed: {}", dap_error_type_name(other))),
+    }
+}
+
+/// The `Failed: {ex.GetType().Name}` telemetry suffix upstream builds from
+/// the thrown exception's type. `DapError` is an enum, so the variant name
+/// plays the type's role.
+fn dap_error_type_name(error: &preloop_dap::debugger::DapError) -> &'static str {
+    match error {
+        preloop_dap::debugger::DapError::Io(_) => "Io",
+        preloop_dap::debugger::DapError::Protocol(_) => "Protocol",
+        preloop_dap::debugger::DapError::Json(_) => "Json",
+        preloop_dap::debugger::DapError::ChannelClosed => "ChannelClosed",
+        preloop_dap::debugger::DapError::InvalidConfig(_) => "InvalidConfig",
+        preloop_dap::debugger::DapError::TunnelFailure(_) => "TunnelFailure",
     }
 }
 

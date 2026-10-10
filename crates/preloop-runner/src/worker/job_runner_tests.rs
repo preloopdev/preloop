@@ -876,3 +876,46 @@ fn unauthorized_error_is_detected_for_token_expiry() {
     });
     assert!(!super::is_unauthorized(&not_found));
 }
+
+#[test]
+fn tunnel_failure_maps_to_infrastructure() {
+    // v2.338.0 `JobExtension.cs`: `DebuggerTunnelException` becomes an
+    // infrastructure failure, never the generic wait message.
+    let error = preloop_dap::debugger::DapError::TunnelFailure(
+        "The debugger lost its connection to the tunnel and the job cannot continue.".into(),
+    );
+    let classified = super::classify_debugger_failure(&error);
+    let super::DebuggerWaitFailure::Infrastructure(message) = &classified else {
+        panic!("expected Infrastructure, got {classified:?}");
+    };
+    assert!(message.contains("lost its connection"));
+}
+
+#[test]
+fn non_tunnel_errors_map_to_failed_telemetry() {
+    // Generic `catch (Exception)` parity: `Failed: {exception type}` is the
+    // telemetry payload the completion path reports.
+    let error = preloop_dap::debugger::DapError::Protocol("configurationDone timeout".into());
+    let classified = super::classify_debugger_failure(&error);
+    let super::DebuggerWaitFailure::Job(telemetry) = &classified else {
+        panic!("expected Job, got {classified:?}");
+    };
+    assert_eq!(telemetry, "Failed: Protocol");
+}
+
+#[test]
+fn dap_error_type_names_are_stable() {
+    use preloop_dap::debugger::DapError;
+    assert_eq!(
+        super::dap_error_type_name(&DapError::ChannelClosed),
+        "ChannelClosed"
+    );
+    assert_eq!(
+        super::dap_error_type_name(&DapError::InvalidConfig("x".into())),
+        "InvalidConfig"
+    );
+    assert_eq!(
+        super::dap_error_type_name(&DapError::TunnelFailure("x".into())),
+        "TunnelFailure"
+    );
+}

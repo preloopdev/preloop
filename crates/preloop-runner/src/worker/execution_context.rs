@@ -1260,6 +1260,8 @@ mod tests {
             end_line: None,
             col: None,
             end_column: None,
+            is_infrastructure_issue: false,
+            category: None,
         });
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "test error");
@@ -1278,6 +1280,8 @@ mod tests {
                 end_line: None,
                 col: None,
                 end_column: None,
+                is_infrastructure_issue: false,
+                category: None,
             });
         }
         assert_eq!(ctx.annotations.len(), 10);
@@ -1356,6 +1360,8 @@ mod tests {
             end_line: None,
             col: None,
             end_column: None,
+            is_infrastructure_issue: false,
+            category: None,
         });
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message.len(), 4096);

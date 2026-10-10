@@ -767,6 +767,8 @@ mod tests {
                 end_line: None,
                 col: None,
                 end_column: None,
+                is_infrastructure_issue: false,
+                category: None,
             },
             Annotation {
                 level: AnnotationLevel::Error,
@@ -777,6 +779,8 @@ mod tests {
                 end_line: None,
                 col: Some(9),
                 end_column: None,
+                is_infrastructure_issue: false,
+                category: None,
             },
         ];
         let diagnostics = diagnostics_from_annotations(&annotations, 10);

@@ -809,6 +809,8 @@ fn job_annotation_aggregation_is_feature_gated_and_preserves_fields() {
         end_line: Some(8),
         col: Some(3),
         end_column: Some(9),
+        is_infrastructure_issue: false,
+        category: None,
     };
 
     job.add_step_annotations_to_job(std::slice::from_ref(&annotation));
@@ -828,4 +830,46 @@ fn job_annotation_aggregation_is_feature_gated_and_preserves_fields() {
     );
     disabled.add_step_annotations_to_job(std::slice::from_ref(&annotation));
     assert!(disabled.job_annotations.is_empty());
+}
+
+#[test]
+fn infrastructure_error_sets_category_once_and_flags_annotation() {
+    // Mirrors `GlobalContext.InfrastructureFailureCategory`: the first
+    // infrastructure error recorded wins; later errors must not overwrite
+    // the root-cause category.
+    use crate::worker::contexts::infra_failure_categories;
+    let mut job = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.infrastructure_error(
+        "The debugger lost its connection to the tunnel and the job cannot continue.",
+        infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
+    );
+    job.infrastructure_error("a later, unrelated fault", "other_category");
+
+    assert_eq!(
+        job.infrastructure_failure_category.as_deref(),
+        Some("debugger_tunnel_failure")
+    );
+    assert_eq!(job.job_annotations.len(), 2);
+    let first = &job.job_annotations[0];
+    assert!(first.is_infrastructure_issue);
+    assert_eq!(first.category.as_deref(), Some("debugger_tunnel_failure"));
+    assert!(first.message.contains("lost its connection"));
+    let second = &job.job_annotations[1];
+    assert!(second.is_infrastructure_issue);
+    assert_eq!(second.category.as_deref(), Some("other_category"));
+}
+
+#[test]
+fn category_constant_matches_upstream() {
+    // `Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure`
+    // (actions/runner v2.338.0, Constants.cs).
+    assert_eq!(
+        crate::worker::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
+        "debugger_tunnel_failure"
+    );
 }

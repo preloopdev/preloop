@@ -572,6 +572,8 @@ fn convert_to_annotation(
         end_line,
         col,
         end_column,
+        is_infrastructure_issue: false,
+        category: None,
     })
 }
 

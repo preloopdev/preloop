@@ -134,6 +134,12 @@ pub(crate) fn annotation_to_json(ann: &Annotation, step_number: u32) -> serde_js
         obj["endColumn"] = serde_json::json!(end_col);
     }
 
+    // `CompleteJobRequest.Annotation.isInfrastructureIssue` — the category
+    // itself travels as the request's top-level `infrastructureFailureCategory`.
+    if ann.is_infrastructure_issue {
+        obj["isInfrastructureIssue"] = serde_json::json!(true);
+    }
+
     obj
 }
 
@@ -170,11 +176,20 @@ fn annotation_to_timeline_issue(annotation: &Annotation) -> serde_json::Value {
     if let Some(title) = &annotation.title {
         data.insert("title".to_owned(), serde_json::json!(title));
     }
-    serde_json::json!({
+    // Upstream `Issue`: `Category` and `IsInfrastructureIssue` ride at the
+    // top level (`EmitDefaultValue` keeps false/none off the wire).
+    let mut issue = serde_json::json!({
         "type": issue_type,
         "message": annotation.message,
         "data": data,
-    })
+    });
+    if let Some(category) = &annotation.category {
+        issue["category"] = serde_json::json!(category);
+    }
+    if annotation.is_infrastructure_issue {
+        issue["isInfrastructureIssue"] = serde_json::json!(true);
+    }
+    issue
 }
 
 pub(crate) fn completejob_type_and_action(step: &Step) -> (&'static str, String) {
@@ -445,6 +460,12 @@ pub(crate) async fn report_completion(
     if let Some(url) = environment_url {
         completion_body["environmentUrl"] = serde_json::json!(url);
     }
+    // Official `CompleteJobRequest.InfrastructureFailureCategory`
+    // (`EmitDefaultValue=false`): present only when an infrastructure error
+    // such as the debugger tunnel dropping was recorded.
+    if let Some(category) = &job_ctx.infrastructure_failure_category {
+        completion_body["infrastructureFailureCategory"] = serde_json::json!(category);
+    }
 
     // Use reporting context if available, otherwise fall back to creating a new client
     if let Some(rpt) = reporting {
@@ -619,6 +640,8 @@ mod tests {
             end_line: Some(12),
             col: Some(2),
             end_column: Some(8),
+            is_infrastructure_issue: false,
+            category: None,
         };
 
         let json = annotation_to_json(&annotation, 0);
@@ -639,6 +662,37 @@ mod tests {
         assert_eq!(timeline["data"]["col"], "2");
         assert_eq!(timeline["data"]["endColumn"], "8");
         assert_eq!(timeline["data"]["title"], "Build");
+    }
+
+    #[test]
+    fn infrastructure_annotation_serializes_flag_and_category() {
+        // v2.338.0 wire parity: `InfrastructureError` produces an issue with
+        // `IsInfrastructureIssue` + `Category`; the completejob annotation
+        // contract carries the flag, the AzDO `Issue` carries both.
+        let annotation = Annotation::infrastructure_error(
+            "The debugger lost its connection to the tunnel and the job cannot continue.",
+            "debugger_tunnel_failure",
+        );
+
+        let json = annotation_to_json(&annotation, 0);
+        assert_eq!(json["isInfrastructureIssue"], true);
+        assert_eq!(json["level"], "failure");
+
+        let timeline = annotation_to_timeline_issue(&annotation);
+        assert_eq!(timeline["isInfrastructureIssue"], true);
+        assert_eq!(timeline["category"], "debugger_tunnel_failure");
+    }
+
+    #[test]
+    fn ordinary_annotation_omits_infrastructure_fields() {
+        // `EmitDefaultValue=false` parity: plain errors must not carry the
+        // infrastructure flag or a category on either wire shape.
+        let annotation = Annotation::error("step failed");
+        let json = annotation_to_json(&annotation, 0);
+        assert!(json.get("isInfrastructureIssue").is_none());
+        let timeline = annotation_to_timeline_issue(&annotation);
+        assert!(timeline.get("isInfrastructureIssue").is_none());
+        assert!(timeline.get("category").is_none());
     }
 
     #[test]

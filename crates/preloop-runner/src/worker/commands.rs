@@ -238,6 +238,8 @@ fn build_annotation(
         end_line: cmd.properties.get("endline").and_then(|v| v.parse().ok()),
         col: cmd.properties.get("col").and_then(|v| v.parse().ok()),
         end_column: cmd.properties.get("endcolumn").and_then(|v| v.parse().ok()),
+        is_infrastructure_issue: false,
+        category: None,
     }
 }
 
