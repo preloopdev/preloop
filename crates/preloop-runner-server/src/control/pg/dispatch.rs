@@ -6458,6 +6458,19 @@ impl Default for SettleCoreOutcome {
     }
 }
 
+/// A completion reports a terminal verdict. `Queued`, `Pending` and
+/// `InProgress` would leave the job outside the queue with no path that
+/// promotes it again, and the attempt would finish without a result.
+fn require_terminal_completion(status: ExecutionStatus) -> Result<(), ControlError> {
+    if status.is_terminal() {
+        return Ok(());
+    }
+    Err(ControlError::BadRequest(format!(
+        "completion status {} is not terminal",
+        status_str(status)
+    )))
+}
+
 impl PgBackend {
     /// `complete_job`: settle the attempt, flip the job, propagate outputs and
     /// dependents, fail-fast siblings.
@@ -6465,6 +6478,7 @@ impl PgBackend {
         &self,
         completion: JobCompletionInput,
     ) -> Result<CompleteOutcome, ControlError> {
+        require_terminal_completion(completion.status)?;
         let run_id = completion.run_id;
         let job_id = completion.job_id.clone();
         let mut client = self.writer().await?;
@@ -6515,6 +6529,7 @@ impl PgBackend {
         settle: SettleJob,
     ) -> Result<SettleJobOutcome, ControlError> {
         let comp = settle.completion.clone();
+        require_terminal_completion(comp.status)?;
         let run_id = comp.run_id;
         let job_id = comp.job_id.clone();
         let mut client = self.writer().await?;
