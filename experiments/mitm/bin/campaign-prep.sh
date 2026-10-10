@@ -9,7 +9,7 @@ set -euo pipefail
 RUNNER_VERSION="${RUNNER_VERSION:-2.338.0}"
 RUNNER_TARBALL="/tmp/actions-runner-linux-arm64-$RUNNER_VERSION.tar.gz"
 SRC_TARBALL="/tmp/preloop-src-338.tar.gz"
-CA_SRC="${MITM_CA:-$PWD/.cache/mitmproxy/mitmproxy-ca-cert.pem}"
+CA_SRC="${MITM_CA:-${MITM_CONFDIR:-$PWD/.cache/mitmproxy}/mitmproxy-ca-cert.pem}"
 
 log() { echo "[prep] $*"; }
 vexec() { smolvm machine exec --name "$1" -- bash -lc "$2"; }
@@ -43,7 +43,7 @@ provision_common() {
   local name="$1"
   log "installing base packages in $name"
   vexec "$name" "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq &&
-    apt-get install -y -qq curl ca-certificates git jq python3 sudo tar gzip unzip xz-utils iproute2 >/dev/null &&
+    apt-get install -y -qq curl ca-certificates git jq python3 sudo tar gzip unzip xz-utils iproute2 procps >/dev/null &&
     (apt-get install -y -qq docker.io >/dev/null 2>&1 || true)"
   # dockerd, best-effort (may not run in all guests; container scenarios degrade)
   vexec "$name" "nohup dockerd > /var/log/dockerd.log 2>&1 & sleep 3; docker info >/dev/null 2>&1 && echo DOCKER_OK || echo DOCKER_UNAVAILABLE" || true
@@ -56,6 +56,8 @@ provision_common() {
     smolvm machine cp "$CA_SRC" "$name:/etc/mitmproxy/mitmproxy-ca-cert.pem" || true
     vexec "$name" "cp /etc/mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy.crt && update-ca-certificates >/dev/null 2>&1 || true"
   fi
+  # dedicated runner user — official config.sh refuses root/sudo
+  vexec "$name" "useradd -m -s /bin/bash runner 2>/dev/null; usermod -aG docker runner 2>/dev/null; chown -R runner:runner /opt/runner /opt/plrunner 2>/dev/null || true"
 }
 
 build_preloop_runner() {

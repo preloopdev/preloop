@@ -47,28 +47,29 @@ def _b64_decode(s: str) -> str:
         return ""
 
 
-def match_event(event: str, flows: list[dict]) -> bool:
+def match_event_index(event: str, flows: list[dict]) -> int | None:
+    """Return the flow_index of the first flow matching `event`, else None."""
     for f in flows:
         path = f.get("path", "")
         method = f.get("method", "")
         status = f.get("status", "")
         if event == "runner_registered":
             if "POST" in method and status in (200, 201) and "/_apis/distributedtask/pools/" in path and "/agents" in path:
-                return True
+                return f.get("flow_index", 0)
         elif event == "job_assigned":
             resp = f.get("response_body_json")
             if resp and isinstance(resp, dict) and resp.get("messageType") in ("PipelineAgentJobRequest", "RunnerJobRequest"):
-                return True
+                return f.get("flow_index", 0)
             body = _b64_decode(f.get("response_body_b64", ""))
             if "PipelineAgentJobRequest" in body or "RunnerJobRequest" in body:
-                return True
+                return f.get("flow_index", 0)
         elif event == "job_completed":
             if "/jobrequests/" in path or path.endswith("/completejob"):
-                return True
+                return f.get("flow_index", 0)
             body = _b64_decode(f.get("request_body_b64", "")) + _b64_decode(f.get("response_body_b64", ""))
             if "JobCompleted" in body:
-                return True
-    return False
+                return f.get("flow_index", 0)
+    return None
 
 
 def declared_job_ids(workflow_path: Path) -> set[str]:
@@ -131,18 +132,21 @@ def assert_capture_is_our_job(capture_dir: Path, workflow_path: Path) -> None:
 
 def wait_for_event(
     event: str, capture_dir: Path, timeout: int, after_flow_index: int = 0
-) -> bool:
+) -> int | None:
+    """Poll flows until `event` matches. Returns the matching flow_index so the
+    caller's cursor advances only past the consumed event — never past a flow
+    that raced in between match and snapshot (which previously let a fast job's
+    completejob land above the cursor and starve the next wait step)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        flows = [
-            flow
-            for flow in load_flows(capture_dir)
-            if flow.get("flow_index", 0) > after_flow_index
-        ]
-        if match_event(event, flows):
-            return True
+        idx = match_event_index(
+            event,
+            [f for f in load_flows(capture_dir) if f.get("flow_index", 0) > after_flow_index],
+        )
+        if idx is not None:
+            return idx
         time.sleep(2)
-    return False
+    return None
 
 
 def submit_workflow_official(workflow_path: str) -> str | None:
@@ -276,7 +280,8 @@ def submit_workflow_preloop(workflow_path: str) -> str | None:
     req = urllib.request.Request(
         f"{preloop_url}/api/v1/runs",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {os.environ.get('PRELOOP_SYSTEM_TOKEN','')}"},
         method="POST",
     )
     resp = urllib.request.urlopen(req)
@@ -292,7 +297,8 @@ def cancel_workflow_preloop(run_id: str):
     preloop_url = preloop_url.removesuffix("/runner/server").rstrip("/")
     url = f"{preloop_url}/api/v1/runs/{run_id}/cancel"
     log(f"cancelling run {run_id} via {url}")
-    req = urllib.request.Request(url, method="POST", data=b"")
+    headers = {"Authorization": f"Bearer {os.environ.get('PRELOOP_SYSTEM_TOKEN','')}"}
+    req = urllib.request.Request(url, method="POST", data=b"", headers=headers)
     urllib.request.urlopen(req)
 
 
@@ -346,16 +352,10 @@ def main():
             event = step.get("event", "")
             timeout = step.get("timeout", 60)
             log(f"step {i}: waiting for event '{event}' (timeout {timeout}s)")
-            ok = wait_for_event(event, capture_dir, timeout, event_cursor)
-            if ok:
+            matched_idx = wait_for_event(event, capture_dir, timeout, event_cursor)
+            if matched_idx is not None:
                 log(f"step {i}: event '{event}' matched", "ok")
-                event_cursor = max(
-                    (
-                        flow.get("flow_index", 0)
-                        for flow in load_flows(capture_dir)
-                    ),
-                    default=event_cursor,
-                )
+                event_cursor = matched_idx
             else:
                 log(f"step {i}: event '{event}' timed out", "err")
                 sys.exit(10)

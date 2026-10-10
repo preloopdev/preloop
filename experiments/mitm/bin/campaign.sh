@@ -56,17 +56,16 @@ case "$CELL" in
   pl-preloop)   BACKEND=preloop;  KIND=preloop;  KINDVER="preloop-runner" ;;
 esac
 
-LAN_IP="${LAN_IP:-$(ipconfig getifaddr en0 2>/dev/null || ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')}"
-[ -n "$LAN_IP" ] || { echo "cannot determine host LAN IP" >&2; exit 1; }
+
+STARTED_AT="$(date -u +%Y%m%dT%H%M%SZ)"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="$OUT_ROOT/$CELL/$SCENARIO"
 RUN_DIR="$RUN_LOG_ROOT/$CELL/$SCENARIO-$TS"
 mkdir -p "$OUT" "$RUN_DIR" "$STATE_ROOT"
 export MITM_CAPTURE_DIR="$RUN_DIR/mitm"
-mkdir -p "$MITM_CAPTURE_DIR"
-
-STARTED_AT="$(date -u +%Y%m%dT%H%M%SZ)"
+LAN_IP="${LAN_IP:-$(ipconfig getifaddr en1 2>/dev/null || ipconfig getifaddr en0 2>/dev/null || ifconfig 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {print $2; exit}')}"
+[ -n "$LAN_IP" ] || { echo "cannot determine host LAN IP (set LAN_IP)" >&2; exit 1; }
 STATUS="ok" RUNNER_EXIT=0 WATCH_EXIT=0
 FLOWS_COUNT=0 SERVER_FLOWS=0
 RUN_ID=""
@@ -108,16 +107,30 @@ stop_mitm() {
 start_preloop() {
   local runner_url="$1"
   rm -f "$STATE_ROOT/current/flows.jsonl"
+  # Isolate from the operator's real ~/.preloop config (sealed secrets under a
+  # different key fail the load) and from the OS keychain.
+  : > "$STATE_ROOT/empty-config.toml"
+  mkdir -p "$STATE_ROOT/current"
+  PRELOOP_CONFIG="$STATE_ROOT/empty-config.toml" \
+    preloop store migrate --store "sqlite://$STATE_ROOT/current/preloop.db" >/dev/null 2>&1 || true
+  PRELOOP_CONFIG="$STATE_ROOT/empty-config.toml" \
+  PRELOOP_CREDENTIAL_STORE=memory \
   PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" \
   PRELOOP_REGISTRATION_POLICY=permissive \
   PRELOOP_PUBLIC_URL="http://$LAN_IP:$PRELOOP_PORT" \
   PRELOOP_RUNNER_URL="$runner_url" \
-    "$SERVER_BIN" serve --listen "0.0.0.0:$PRELOOP_PORT" \
+    "$SERVER_BIN" serve --listen "127.0.0.1:$PRELOOP_PORT" \
       --state-dir "$STATE_ROOT/current" \
       --record-flows "$STATE_ROOT/current/flows.jsonl" \
       > "$RUN_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$RUN_DIR/server.pid"
+  # Loopback-only permissive policy: relay LAN :9191 → loopback so the VMs
+  # can reach the API (and the official runner can reach :80 → :9191).
+  socat TCP-LISTEN:$PRELOOP_PORT,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:$PRELOOP_PORT \
+    > "$RUN_DIR/socat-relay.log" 2>&1 &
+  RELAY_PID=$!
+  echo "$RELAY_PID" > "$RUN_DIR/relay.pid"
   for i in $(seq 1 60); do
     curl -fsS "http://127.0.0.1:$PRELOOP_PORT/healthz" >/dev/null 2>&1 && return 0
     kill -0 "$SERVER_PID" 2>/dev/null || { tail -20 "$RUN_DIR/server.log" >&2; return 1; }
@@ -189,39 +202,48 @@ wait_pl_terminal() {
 
 RUNNER_NAME="conf-$CELL-$SCENARIO-$(date +%s | tail -c 7)"
 
-# ---------------------------------------------------------------- gh cells
 run_gh_cell() {
   cleanup_gh
   start_mitm
   local token; token=$(gh_regtoken)
 
+  # Generated guest script — runs as the `runner` user (official config.sh
+  # refuses root/sudo; preloop-runner doesn't care).
+  cat > "$RUN_DIR/setup-runner.sh" <<SCRIPT
+#!/bin/bash
+set -uo pipefail
+$(vm_runner_env | sed 's/^/export /')
+export HOME=/home/runner
+SCRIPT
   if [ "$KIND" = official ]; then
-    vexec "cd /opt/runner/actions-runner && rm -f .runner .credentials .credentials_rsaparams &&
-      $(vm_runner_env | tr '\n' ' ') ./config.sh --unattended --replace \
-        --url https://github.com/$GH_REPO --token '$token' \
-        --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \
-        > /tmp/config.log 2>&1 || { cat /tmp/config.log; exit 1; }" \
-      > "$RUN_DIR/runner-config.log" 2>&1 || { STATUS=config_failed; }
-    if [ "$STATUS" = ok ]; then
-      vexec "cd /opt/runner/actions-runner && cat > .env <<'EOF'
+    cat >> "$RUN_DIR/setup-runner.sh" <<SCRIPT
+cd /opt/runner/actions-runner
+rm -f .runner .credentials .credentials_rsaparams
+cat > .env <<'ENVEOF'
 $(vm_runner_env)
-EOF
-$(vm_runner_env | tr '\n' ' ') nohup ./run.sh > /tmp/runner.log 2>&1 & echo \$!" \
-        > "$RUN_DIR/runner-start.log" 2>&1
-    fi
+ENVEOF
+./config.sh --unattended --replace \\
+  --url https://github.com/$GH_REPO --token '$token' \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
+nohup ./run.sh > \$HOME/runner.log 2>&1 &
+SCRIPT
   else
-    vexec "cd /opt/plrunner && rm -f .runner .credentials .runner.json &&
-      $(vm_runner_env | tr '\n' ' ') ./preloop-runner configure \
-        --url https://github.com/$GH_REPO --token '$token' \
-        --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \
-        --unattended --replace \
-        > /tmp/config.log 2>&1 || { cat /tmp/config.log; exit 1; }" \
-      > "$RUN_DIR/runner-config.log" 2>&1 || { STATUS=config_failed; }
-    if [ "$STATUS" = ok ]; then
-      vexec "cd /opt/plrunner && $(vm_runner_env | tr '\n' ' ') nohup ./preloop-runner run --via broker > /tmp/runner.log 2>&1 & echo started" \
-        > "$RUN_DIR/runner-start.log" 2>&1 || true
-    fi
+    cat >> "$RUN_DIR/setup-runner.sh" <<SCRIPT
+cd /opt/plrunner
+rm -f .runner .credentials .runner.json
+./preloop-runner configure \\
+  --url https://github.com/$GH_REPO --token '$token' \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  --unattended --replace \\
+  > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
+nohup ./preloop-runner run --via broker > \$HOME/runner.log 2>&1 &
+SCRIPT
   fi
+  echo 'echo "runner started pid=$!" >> $HOME/runner.log' >> "$RUN_DIR/setup-runner.sh"
+  smolvm machine cp "$RUN_DIR/setup-runner.sh" "$VM:/tmp/setup-runner.sh"
+  vexec "chmod +x /tmp/setup-runner.sh && su runner -s /bin/bash -c /tmp/setup-runner.sh" \
+    > "$RUN_DIR/runner-config.log" 2>&1 || STATUS=config_failed
 
   if [ "$STATUS" = ok ]; then
     GITHUB_OWNER="${GH_REPO%%/*}" GITHUB_REPO="${GH_REPO##*/}" GITHUB_REF="$GH_REF" \
@@ -239,15 +261,16 @@ $(vm_runner_env | tr '\n' ' ') nohup ./run.sh > /tmp/runner.log 2>&1 & echo \$!"
   fi
 
   vexec "pkill -INT -f 'Runner.Listener|preloop-runner run' 2>/dev/null; sleep 1; pkill -KILL -f 'Runner.Listener|Runner.Worker|preloop-runner' 2>/dev/null; exit 0" || true
-  if [ "$KIND" = official ] && [ -n "$RUN_ID" ] || [ "$KIND" = official ]; then
+  if [ "$KIND" = official ]; then
     local rtok; rtok=$(gh_regtoken 2>/dev/null || true)
-    [ -n "$rtok" ] && vexec "cd /opt/runner/actions-runner && ./config.sh remove --unattended --token '$rtok' >/dev/null 2>&1 || true" || true
+    [ -n "$rtok" ] && vexec "su runner -s /bin/bash -c 'cd /opt/runner/actions-runner && ./config.sh remove --unattended --token $rtok' >/dev/null 2>&1 || true" || true
+  else
+    vexec "su runner -s /bin/bash -c 'cd /opt/plrunner && ./preloop-runner remove --token $token' >/dev/null 2>&1 || true" 2>/dev/null || true
   fi
-  vexec "cd /opt/plrunner && ./preloop-runner remove --token '$token' >/dev/null 2>&1 || true" 2>/dev/null || true
   cleanup_gh
   stop_mitm
   [ -d "$MITM_CAPTURE_DIR" ] && cp "$MITM_CAPTURE_DIR/flows.jsonl" "$OUT/flows.jsonl" 2>/dev/null || true
-  RUNNER_EXIT=$(vexec "test -f /tmp/runner.log; echo \$?" 2>/dev/null || echo 0)
+  RUNNER_EXIT=$(vexec "test -f /home/runner/runner.log; echo \$?" 2>/dev/null || echo 0)
 }
 
 # ---------------------------------------------------------------- pl cells
@@ -265,34 +288,41 @@ run_pl_cell() {
   fi
   start_preloop "$runner_url"
 
+  cat > "$RUN_DIR/setup-runner.sh" <<SCRIPT
+#!/bin/bash
+set -uo pipefail
+export HOME=/home/runner
+SCRIPT
   if [ "$KIND" = official ]; then
-    vexec "cd /opt/runner/actions-runner && rm -f .runner .credentials .credentials_rsaparams &&
-      ./config.sh --unattended --replace \
-        --url http://$LAN_IP --token '$PRELOOP_SYSTEM_TOKEN' \
-        --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \
-        > /tmp/config.log 2>&1 || { cat /tmp/config.log; exit 1; }" \
-      > "$RUN_DIR/runner-config.log" 2>&1 || { STATUS=config_failed; }
-    if [ "$STATUS" = ok ]; then
-      vexec "cd /opt/runner/actions-runner && nohup ./run.sh > /tmp/runner.log 2>&1 & echo started" \
-        > "$RUN_DIR/runner-start.log" 2>&1 || true
-    fi
+    cat >> "$RUN_DIR/setup-runner.sh" <<SCRIPT
+cd /opt/runner/actions-runner
+rm -f .runner .credentials .credentials_rsaparams .env
+./config.sh --unattended --replace \\
+  --url http://$LAN_IP --token '$PRELOOP_SYSTEM_TOKEN' \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
+nohup ./run.sh > \$HOME/runner.log 2>&1 &
+SCRIPT
   else
-    vexec "cd /opt/plrunner && rm -f .runner .credentials .runner.json &&
-      ./preloop-runner configure \
-        --url http://$LAN_IP:$PRELOOP_PORT/runner/server --token '$PRELOOP_SYSTEM_TOKEN' \
-        --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \
-        --unattended --replace \
-        > /tmp/config.log 2>&1 || { cat /tmp/config.log; exit 1; }" \
-      > "$RUN_DIR/runner-config.log" 2>&1 || { STATUS=config_failed; }
-    if [ "$STATUS" = ok ]; then
-      vexec "cd /opt/plrunner && nohup ./preloop-runner run --via broker > /tmp/runner.log 2>&1 & echo started" \
-        > "$RUN_DIR/runner-start.log" 2>&1 || true
-    fi
+    cat >> "$RUN_DIR/setup-runner.sh" <<SCRIPT
+cd /opt/plrunner
+rm -f .runner .credentials .runner.json
+./preloop-runner configure \\
+  --url http://$LAN_IP:$PRELOOP_PORT --token '$PRELOOP_SYSTEM_TOKEN' \\
+  --name '$RUNNER_NAME' --labels self-hosted,mitm --work _work \\
+  --unattended --replace \\
+  > \$HOME/config.log 2>&1 || { cat \$HOME/config.log; exit 1; }
+nohup ./preloop-runner run --via broker > \$HOME/runner.log 2>&1 &
+SCRIPT
   fi
+  smolvm machine cp "$RUN_DIR/setup-runner.sh" "$VM:/tmp/setup-runner.sh"
+  vexec "chmod +x /tmp/setup-runner.sh && su runner -s /bin/bash -c /tmp/setup-runner.sh" \
+    > "$RUN_DIR/runner-config.log" 2>&1 || STATUS=config_failed
 
   if [ "$STATUS" = ok ]; then
     sleep 2   # let the session register before the job lands
     PRELOOP_API_URL="http://127.0.0.1:$PRELOOP_PORT" \
+    PRELOOP_SYSTEM_TOKEN="$PRELOOP_SYSTEM_TOKEN" \
       timeout "$WATCH_DEADLINE" \
       "$PWD/experiments/mitm/bin/_run_scenario.py" \
         --backend preloop --scenario "$SCEN_DIR/scenario.toml" \
