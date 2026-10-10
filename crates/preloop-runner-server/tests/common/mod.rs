@@ -474,22 +474,35 @@ pub async fn open_live(app: &axum::Router, uri: String) -> Response {
 }
 
 /// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
-/// `kind`, `job` ("" for system), `jti` = staging dir name. Returns
-/// `(jwt, jti)` — the pending-reservation maps key on `jti`.
-pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str) -> (String, String) {
+/// `kind`, `op` ("read" | "write"), `job` (never empty), `jti` = staging
+/// dir name. Returns `(jwt, jti)` — the pending-reservation maps key on
+/// `jti`.
+pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str, op: &str) -> (String, String) {
     let jti = uuid::Uuid::new_v4().to_string();
-    let jwt = state
+    (mint_blob_jwt_for_jti(state, kind, job, op, &jti), jti)
+}
+
+/// Mint a blob JWT for an existing staging dir `jti` (e.g. a `read` token
+/// for a blob uploaded through a `write` token).
+pub fn mint_blob_jwt_for_jti(
+    state: &AppState,
+    kind: &str,
+    job: &str,
+    op: &str,
+    jti: &str,
+) -> String {
+    state
         .local_jwt_with_lifetime(
             json!({
                 "sub": "preloop-blob",
                 "kind": kind,
+                "op": op,
                 "job": job,
                 "jti": jti,
             }),
-            crate::memory_caps::PENDING_UPLOAD_TTL,
+            crate::memory_caps::SIGNED_BLOB_URL_TTL,
         )
-        .unwrap();
-    (jwt, jti)
+        .unwrap()
 }
 
 /// Point PAT scope introspection at a dead local address so tests that

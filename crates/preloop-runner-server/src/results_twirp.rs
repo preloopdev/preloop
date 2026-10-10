@@ -101,7 +101,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     )?;
     let job_id = match &identity {
         crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
-        crate::auth::ResultsIdentity::System => String::new(),
+        crate::auth::ResultsIdentity::System => crate::blob_store::BLOB_SYSTEM_OWNER.to_owned(),
     };
     // The bearerless upload token is a server-signed blob JWT: `job` binds it
     // to the owning job so the blob gate can reject writes from any other job
@@ -110,14 +110,11 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     // bearer (Azure SDK compat), so the signature — not a bearer — is the
     // credential here.
     let jti = uuid::Uuid::new_v4().to_string();
+    // The upload token is bound to `write`; serve-time enforcement rejects
+    // any GET against it (round-3 finding 3).
     let token = shared.state.local_jwt_with_lifetime(
-        json!({
-            "sub": "preloop-blob",
-            "kind": "diag",
-            "job": job_id,
-            "jti": jti,
-        }),
-        crate::memory_caps::PENDING_UPLOAD_TTL,
+        crate::blob_store::blob_jwt_claims("diag", crate::blob_store::BLOB_OP_WRITE, &job_id, &jti),
+        crate::memory_caps::SIGNED_BLOB_URL_TTL,
     )?;
     // Re-check liveness against the backend before minting an upload
     // credential: the job may have settled between the gate and now.
@@ -849,14 +846,17 @@ pub async fn twirp_cache_v2_create(
             }),
         ));
     }
+    // The upload token is bound to `write` and to the minting job (the
+    // `system` owner for control-plane-minted URLs, never empty); serve-time
+    // enforcement rejects any GET against it (round-3 finding 3).
     let token = shared.state.local_jwt_with_lifetime(
-        json!({
-            "sub": "preloop-blob",
-            "kind": "cache",
-            "job": job_backend_id.unwrap_or_default(),
-            "jti": jti,
-        }),
-        crate::memory_caps::PENDING_UPLOAD_TTL,
+        crate::blob_store::blob_jwt_claims(
+            "cache",
+            crate::blob_store::BLOB_OP_WRITE,
+            &crate::blob_store::blob_owner_for_job(job_backend_id),
+            &jti,
+        ),
+        crate::memory_caps::SIGNED_BLOB_URL_TTL,
     )?;
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
     // The cache key is workflow-controlled content; never log it or the
@@ -1072,17 +1072,24 @@ pub async fn twirp_cache_v2_get_dl_url(
     // in its claims, so blob_get resolves the entry statelessly — a minted
     // URL survives restarts, unlike the dl-token map (kept for accounting).
     let dl_jti = uuid::Uuid::new_v4().to_string();
-    let dl_token = shared.state.local_jwt_with_lifetime(
-        json!({
-            "sub": "preloop-blob",
-            "kind": "cache",
-            "job": "",
-            "jti": dl_jti,
-            "key": entry.key,
-            "version": entry.version,
-        }),
-        crate::memory_caps::PENDING_UPLOAD_TTL,
-    )?;
+    // The download token is bound to `read`: any PUT against it is 403, so a
+    // cache entry can no longer be overwritten through its download URL
+    // (round-3 finding 3). `job` names the minting job (`system` for
+    // control-plane callers), never empty.
+    let mut dl_claims = crate::blob_store::blob_jwt_claims(
+        "cache",
+        crate::blob_store::BLOB_OP_READ,
+        &crate::blob_store::blob_owner_for_job(crate::memory_caps::job_backend_id_from_bearer(
+            &shared.state,
+            &headers,
+        )),
+        &dl_jti,
+    );
+    dl_claims["key"] = json!(entry.key);
+    dl_claims["version"] = json!(entry.version);
+    let dl_token = shared
+        .state
+        .local_jwt_with_lifetime(dl_claims, crate::memory_caps::SIGNED_BLOB_URL_TTL)?;
     {
         let mut inner = shared.state.inner.lock().await;
         inner

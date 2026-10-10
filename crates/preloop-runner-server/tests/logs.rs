@@ -584,6 +584,8 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
         .unwrap();
     assert_eq!(upload.status(), StatusCode::CREATED);
 
+    // Op binding: the `write` diag URL must not serve GETs, even though the
+    // same bytes are on disk.
     let downloaded = app
         .oneshot(
             Request::builder()
@@ -594,9 +596,24 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
         )
         .await
         .unwrap();
-    assert_eq!(downloaded.status(), StatusCode::OK);
-    let downloaded_bytes = to_bytes(downloaded.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(downloaded_bytes.as_ref(), bytes);
+    assert_eq!(downloaded.status(), StatusCode::FORBIDDEN);
+
+    // The bytes did land: read them back from the staging dir (named by the
+    // token's `jti`).
+    let claims = state
+        .verify_local_jwt_claims(blob_token_clean)
+        .expect("diag token must be a valid blob JWT");
+    assert_eq!(claims["op"].as_str(), Some("write"));
+    let jti = claims["jti"].as_str().unwrap();
+    let staged = std::fs::read(
+        temp.path()
+            .join("blobs")
+            .join("diag")
+            .join(jti)
+            .join("data"),
+    )
+    .unwrap();
+    assert_eq!(staged.as_slice(), bytes);
 }
 
 /// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
@@ -612,7 +629,10 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
 
     // The blob gate requires a server-signed blob JWT whose `job`
     // claim matches the bearer's job on writes.
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string(), "write");
+    // The round-trip read goes through a `read` token for the same staging
+    // dir: the `write` upload token no longer serves GETs (op binding).
+    let read_jwt = mint_blob_jwt_for_jti(&state, "artifact", &job_id.to_string(), "read", &jti);
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
@@ -648,7 +668,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
+                .uri(format!("/twirp-blob/artifact/{read_jwt}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -674,7 +694,10 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
 
     // The blob gate requires a server-signed blob JWT whose `job`
     // claim matches the bearer's job on writes.
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string(), "write");
+    // The read-back goes through a `read` token for the same staging dir:
+    // the `write` upload token no longer serves GETs (op binding).
+    let read_jwt = mint_blob_jwt_for_jti(&state, "artifact", &job_id.to_string(), "read", &jti);
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
@@ -687,6 +710,7 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
         );
     }
     let put_uri = format!("/twirp-blob/artifact/{blob_jwt}");
+    let get_uri = format!("/twirp-blob/artifact/{read_jwt}");
 
     // Stage two 1 MiB blocks (ids are base64-safe, so they survive
     // blockid_to_filename unchanged and match the commit XML verbatim).
@@ -754,7 +778,7 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(put_uri)
+                .uri(get_uri)
                 .header(header::AUTHORIZATION, bearer)
                 .body(Body::empty())
                 .unwrap(),
@@ -794,8 +818,12 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
     // Blob PUTs with a job token require a live job record.
     register_live_job(&state, job_id, "plan-blob").await;
     let auth_header = format!("Bearer {token}");
-    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "write");
+    // The read-back goes through a `read` token for the same staging dir:
+    // the `write` upload token no longer serves GETs (op binding).
+    let read_jwt = mint_blob_jwt_for_jti(&state, "cache", &job_id.to_string(), "read", &jti);
     let put_uri = format!("/twirp-blob/cache/{blob_jwt}");
+    let get_uri = format!("/twirp-blob/cache/{read_jwt}");
 
     // 128 MiB in 2 x 64 MiB blocks, the block size the Azure SDK uses for
     // @actions/cache v6 (BlockBlobClient.uploadFile with uploadChunkSize).
@@ -846,7 +874,7 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(put_uri)
+                .uri(get_uri)
                 .header(header::AUTHORIZATION, auth_header)
                 .body(Body::empty())
                 .unwrap(),
@@ -869,7 +897,7 @@ async fn blob_block_upload_still_rejects_blocks_over_cap() {
     let token = state.mint_runtime_token("plan-blob", &job_id);
     register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
-    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "write");
 
     // One byte over the per-block cap: rejected before reading the body.
     let over_cap = memory_caps::MAX_BLOCK_BYTES + 1;
@@ -903,7 +931,7 @@ async fn blob_block_upload_midstream_cap_rejects_without_temp_file() {
     let token = state.mint_runtime_token("plan-blob", &job_id);
     register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "write");
 
     let chunk_bytes = 1024 * 1024usize;
     let n_chunks = (memory_caps::MAX_BLOCK_BYTES + 1).div_ceil(chunk_bytes);

@@ -3164,7 +3164,7 @@ async fn blob_rejects_wrong_job_write() {
     // Both jobs are live so the ownership mismatch is the only rejection.
     register_live_job(&state, owner_job, "plan-blob").await;
     register_live_job(&state, other_job, "plan-blob").await;
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &owner_job.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &owner_job.to_string(), "write");
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
@@ -3205,7 +3205,7 @@ async fn bearerless_put_requires_live_owner() {
 
     let job_id = uuid::Uuid::new_v4();
     register_live_job(&state, job_id, "plan-blob").await;
-    let (blob_jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string(), "write");
     let uri = format!("/twirp-blob/artifact/{blob_jwt}");
 
     // Live owner: bearerless PUT succeeds.
