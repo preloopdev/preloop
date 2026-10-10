@@ -44,6 +44,14 @@ pub struct ConnectionData {
         skip_serializing_if = "Option::is_none"
     )]
     pub use_runner_admin_flow: Option<bool>,
+    /// Location service data (serviceDefinitions map); absent for local
+    /// control-plane responses until advertised.
+    #[serde(
+        rename = "locationServiceData",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub location_service_data: Option<LocationServiceData>,
 }
 
 /// Access mapping for location service resolution.
