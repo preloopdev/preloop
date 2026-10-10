@@ -1704,10 +1704,10 @@ async fn ws_probe_connects_holds_and_cancels_on_job_end() {
         .strip_prefix("broker_websocket_telemetry:")
         .expect("probe telemetry carries the upstream prefix");
     let result: serde_json::Value = serde_json::from_str(payload).unwrap();
-    assert_eq!(result["Connected"], true);
-    assert_eq!(result["ConnectCount"], 1);
-    assert_eq!(result["PingsReceived"], 1);
-    assert_eq!(result["LastCloseReason"], "job_completed");
+    assert_eq!(result["connected"], true);
+    assert_eq!(result["connectCount"], 1);
+    assert_eq!(result["pingsReceived"], 1);
+    assert_eq!(result["lastCloseReason"], "job_completed");
 }
 
 #[tokio::test]
@@ -1740,9 +1740,9 @@ async fn ws_probe_records_connect_failure_when_unreachable() {
     let message = entries[0]["message"].as_str().unwrap();
     let payload = message.strip_prefix("broker_websocket_telemetry:").unwrap();
     let result: serde_json::Value = serde_json::from_str(payload).unwrap();
-    assert_eq!(result["Connected"], false);
-    assert_eq!(result["ConnectFailures"], 1);
-    assert_eq!(result["LastCloseReason"], "connect_failed");
+    assert_eq!(result["connected"], false);
+    assert_eq!(result["connectFailures"], 1);
+    assert_eq!(result["lastCloseReason"], "connect_failed");
 }
 
 #[tokio::test]
@@ -1762,9 +1762,9 @@ async fn ws_probe_reports_endpoint_missing_without_service_token() {
     let message = entries[0]["message"].as_str().unwrap();
     let payload = message.strip_prefix("broker_websocket_telemetry:").unwrap();
     let result: serde_json::Value = serde_json::from_str(payload).unwrap();
-    assert_eq!(result["Connected"], false);
+    assert_eq!(result["connected"], false);
     assert!(
-        result["Errors"].as_array().unwrap()[0]
+        result["errors"].as_array().unwrap()[0]
             .as_str()
             .unwrap()
             .contains("SystemVssConnection")

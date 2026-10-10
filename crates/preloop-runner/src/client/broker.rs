@@ -143,11 +143,13 @@ impl BrokerClient {
 /// Telemetry payload for the temporary broker long-poll websocket probe.
 ///
 /// Mirrors `BrokerWebSocketProbeResult` (v2.338.0
-/// `src/Sdk/DTWebApi/WebApi/BrokerWebSocketProbeResult.cs`): `Connected` and
-/// `Errors` carry `EmitDefaultValue = true`, the rest `false`, so they are
-/// omitted from the JSON while holding their default value.
+/// `src/Sdk/DTWebApi/WebApi/BrokerWebSocketProbeResult.cs`). Upstream writes it
+/// through `StringUtil.ConvertToJson`, whose formatter uses the camelCase
+/// contract resolver — the wire names are `connected`, `connectCount`, ... .
+/// `Errors`/`Connected` carry `EmitDefaultValue = true`, the rest `false`, so
+/// they are omitted from the JSON while holding their default value.
 #[derive(Debug, Default, serde::Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "camelCase")]
 pub struct BrokerWebSocketProbeResult {
     /// Whether at least one websocket connection was established.
     pub connected: bool,
@@ -232,13 +234,29 @@ pub async fn run_long_poll_websocket_probe(
                     Some(Ok(Message::Text(text))) => {
                         result.pings_received += 1;
                         info!(%text, "Runner websocket received a ping");
-                        if let Err(error) = socket.send(Message::Text(text.clone())).await {
-                            absorb_probe_error(&mut result, error);
-                            break;
+                        // Race the echo against cancellation: a peer that
+                        // stops reading leaves this send parked on a full
+                        // socket buffer, and the cancelled probe would then
+                        // pin job finalization forever.
+                        tokio::select! {
+                            sent = socket.send(Message::Text(text.clone())) => {
+                                if let Err(error) = sent {
+                                    absorb_probe_error(&mut result, error);
+                                    break;
+                                }
+                            }
+                            _ = &mut *cancel => {
+                                result.last_close_reason = Some("job_completed".to_owned());
+                                break;
+                            }
                         }
                         info!(%text, "Runner replied via websocket");
                     }
-                    Some(Ok(_)) => result.pings_received += 1,
+                    // .NET ReceiveAsync folds binary data into one result; ping
+                    // and pong frames are answered by the protocol layer and
+                    // never surface to the app on either implementation.
+                    Some(Ok(Message::Binary(_))) => result.pings_received += 1,
+                    Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         absorb_probe_error(&mut result, error);
                         break;
@@ -301,8 +319,8 @@ async fn connect_websocket(
 
     info!("Attempting to start runner websocket client.");
     tokio::select! {
-        outcome = connect_async(request) => match outcome {
-            Ok((socket, _)) => {
+        outcome = ws_handshake(request) => match outcome {
+            Ok(socket) => {
                 info!("Successfully started runner websocket client.");
                 WebSocketConnect::Connected(Box::new(socket))
             }
@@ -313,6 +331,178 @@ async fn connect_websocket(
         },
         _ = &mut *cancel => WebSocketConnect::Cancelled,
     }
+}
+
+/// Dial the websocket, honoring the runner's proxy environment.
+///
+/// `RunnerWebProxy.GetProxy` (v2.338.0): `wss://` selects the HTTPS proxy,
+/// `ws://` the HTTP proxy; loopback and `no_proxy` entries bypass. tokio-
+/// tungstenite has no proxy support, so the proxied path tunnels via HTTP
+/// CONNECT before the websocket handshake.
+async fn ws_handshake(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> std::result::Result<
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let Some(proxy) = ws_proxy_for(request.uri()) else {
+        return connect_async(request).await.map(|(socket, _)| socket);
+    };
+
+    let host = request
+        .uri()
+        .host()
+        .ok_or(tokio_tungstenite::tungstenite::Error::Url(
+            tokio_tungstenite::tungstenite::error::UrlError::NoHostName,
+        ))?
+        .to_owned();
+    let scheme = request.uri().scheme_str().unwrap_or_default();
+    let port = request.uri().port_u16().unwrap_or(match scheme {
+        "wss" => 443,
+        _ => 80,
+    });
+
+    let mut socket = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
+    // CONNECT host:port, then handshake the websocket over the tunnel. For
+    // wss, client_async_tls_with_config upgrades the tunnel stream to TLS.
+    let authority = format!("{host}:{port}");
+    let mut connect_request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: preloop-runner/{}\r\n",
+        crate::PROTOCOL_COMPAT_VERSION
+    );
+    if let Some((user, pass)) = proxy.credentials {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        connect_request.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+    }
+    connect_request.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    socket.write_all(connect_request.as_bytes()).await?;
+    let mut response = vec![0u8; 8192];
+    let mut total = 0;
+    loop {
+        let n = socket.read(&mut response[total..]).await?;
+        if n == 0 {
+            return Err(tokio_tungstenite::tungstenite::Error::Http(
+                tokio_tungstenite::tungstenite::http::Response::new(None),
+            ));
+        }
+        total += n;
+        if response[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if total == response.len() {
+            return Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "proxy response too large"),
+            ));
+        }
+    }
+    let status = std::str::from_utf8(&response[..total])
+        .ok()
+        .and_then(|text| text.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("proxy CONNECT {authority} returned HTTP {status}"),
+            ),
+        ));
+    }
+
+    tokio_tungstenite::client_async_tls_with_config(request, socket, None, None)
+        .await
+        .map(|(socket, _)| socket)
+}
+
+/// Proxy endpoint resolved from the environment for one websocket target.
+struct WsProxy {
+    host: String,
+    port: u16,
+    credentials: Option<(String, String)>,
+}
+
+/// `RunnerWebProxy.GetProxy`/`IsBypassed` for ws targets: `wss` -> HTTPS
+/// proxy, `ws` -> HTTP proxy; loopback and no_proxy always bypass.
+fn ws_proxy_for(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Option<WsProxy> {
+    let scheme = uri.scheme_str()?;
+    let host = uri.host()?.to_owned();
+    if is_loopback_host(&host) {
+        return None;
+    }
+    let env_keys: &[&str] = match scheme {
+        "wss" => &["HTTPS_PROXY", "https_proxy"],
+        "ws" => &["HTTP_PROXY", "http_proxy"],
+        _ => return None,
+    };
+    if no_proxy_matches(&host) {
+        return None;
+    }
+    let raw = env_keys.iter().find_map(|key| std::env::var(key).ok())?;
+    parse_proxy_url(&raw)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "localhost.localdomain")
+        || host == "::1"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// `no_proxy` bypass: `*` or exact/suffix host match, comma-separated.
+fn no_proxy_matches(host: &str) -> bool {
+    let Some(raw) = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok())
+    else {
+        return false;
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|entry| {
+            let entry = entry.strip_prefix('.').unwrap_or(entry);
+            entry == "*"
+                || host.eq_ignore_ascii_case(entry)
+                || host
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(".{}", entry.to_ascii_lowercase()))
+        })
+}
+
+fn parse_proxy_url(raw: &str) -> Option<WsProxy> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Accept `http://[user:pass@]host[:port]` and bare `host[:port]`.
+    let raw = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .unwrap_or(raw);
+    let (authority, credentials) = match raw.split_once('@') {
+        Some((auth, rest)) => {
+            let (user, pass) = auth.split_once(':').unwrap_or((auth, ""));
+            (rest, Some((user.to_owned(), pass.to_owned())))
+        }
+        None => (raw, None),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h, p.parse().ok()?),
+        _ => (authority, 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(WsProxy {
+        host: host.to_owned(),
+        port,
+        credentials,
+    })
 }
 
 /// Upstream's `catch (Exception)` inside the hold loop: unique error strings
