@@ -565,9 +565,10 @@ pub async fn run_job(
     // job message's `system.runner.brokerwebsocketprobeurl` variable. Uses
     // the job's SystemVssConnection bearer; result lands in completejob
     // telemetry at `finish` below. Never affects the job outcome.
-    let ws_probe = super::job_extension::BrokerWsProbe::spawn(
+    let ws_probe = super::job_extension::BrokerWsProbe::spawn_with_http(
         &job_ctx,
         reporting.as_ref().map(|rpt| rpt.token()),
+        reporting.as_ref().map(|rpt| rpt.results.http().clone()),
     );
 
     // Spawn job-timeout timer that trips cancel and sets the timed_out flag.
