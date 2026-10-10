@@ -1,4 +1,4 @@
-runner_version = "2.336.0"
+runner_version = "2.338.0"
 
 # SmolVM runtime floor: v1.18.1 is the first release that carries
 # `machine fork --freeze-source` (upstream PR #1376), which preloop-vm passes
