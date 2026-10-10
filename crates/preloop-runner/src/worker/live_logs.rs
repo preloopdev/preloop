@@ -30,6 +30,7 @@ const AGGRESSIVE_DURATION: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRIES: usize = 3;
+const SINGLE_CONNECT_ATTEMPT: usize = 1;
 
 /// How long after the last failed connection attempt the feed is re-dialed,
 /// mirroring the official runner's `_lastConnectionFailure.AddMinutes(10)`
@@ -113,7 +114,7 @@ impl LiveLogQueue {
             retry_interval,
             shutdown_tx,
         });
-        queue.spawn_connect();
+        queue.spawn_connect(RETRIES);
         queue
     }
 
@@ -121,7 +122,9 @@ impl LiveLogQueue {
     /// sender, or stamps `last_connect_failure` when every attempt fails.
     /// Each spawn dials a brand-new WebSocket — like the official runner's
     /// `CreateWebSocketClient()` — so a dead socket is never retried.
-    fn spawn_connect(self: &Arc<Self>) {
+    /// `connect_attempts` is three for initial setup and one for periodic
+    /// recovery, matching the upstream `retryConnection` flag.
+    fn spawn_connect(self: &Arc<Self>, connect_attempts: usize) {
         let Some((feed_url, access_token)) = self.feed.clone() else {
             return;
         };
@@ -130,7 +133,7 @@ impl LiveLogQueue {
         tokio::spawn(async move {
             let mut shutdown_rx = connecting.shutdown_tx.subscribe();
             let sender = tokio::select! {
-                sender = WebSocketSender::connect(feed_url, access_token) => sender,
+                sender = WebSocketSender::connect(feed_url, access_token, connect_attempts) => sender,
                 _ = shutdown_rx.changed() => {
                     connecting.connect_in_flight.store(false, Ordering::SeqCst);
                     return;
@@ -165,7 +168,7 @@ impl LiveLogQueue {
     /// Re-dial the feed once the retry window since the last failed connect
     /// has elapsed — the same gate the official runner applies to
     /// `_lastConnectionFailure` before re-initializing its websocket client.
-    fn retry_connect_if_due(self: &Arc<Self>) {
+    async fn retry_connect_if_due(self: &Arc<Self>) {
         if self.feed.is_none() || self.connect_in_flight.load(Ordering::SeqCst) {
             return;
         }
@@ -174,9 +177,18 @@ impl LiveLogQueue {
             .lock()
             .expect("live log failure clock poisoned")
             .is_none_or(|failed_at| failed_at.elapsed() >= self.retry_interval);
-        if due {
-            self.spawn_connect();
+        if !due {
+            return;
         }
+
+        // Recheck the socket while holding the same lock used by the
+        // connection task when it publishes a successful sender. This closes
+        // the gap between drain_once observing None and scheduling a retry.
+        let ws = self.ws.lock().await;
+        if ws.is_some() || self.connect_in_flight.load(Ordering::SeqCst) {
+            return;
+        }
+        self.spawn_connect(SINGLE_CONNECT_ATTEMPT);
     }
 
     /// Build a queue with no WebSocket, used by tests and degraded live-log mode.
@@ -289,7 +301,7 @@ impl LiveLogQueue {
         if self.ws.lock().await.is_none() {
             // A dead feed is not permanent: once the retry window since the
             // last failed connect elapses, the next drain re-dials it.
-            self.retry_connect_if_due();
+            self.retry_connect_if_due().await;
             return;
         }
         let batch = self.dequeue(limit);
@@ -360,13 +372,13 @@ struct WebSocketSender {
 }
 
 impl WebSocketSender {
-    async fn connect(url: String, token: String) -> Option<Self> {
-        let ws = connect_websocket(&url, &token).await?;
+    async fn connect(url: String, token: String, connect_attempts: usize) -> Option<Self> {
+        let ws = connect_websocket(&url, &token, connect_attempts).await?;
         Some(Self { url, token, ws })
     }
 
     async fn reconnect(&mut self) -> bool {
-        match connect_websocket(&self.url, &self.token).await {
+        match connect_websocket(&self.url, &self.token, SINGLE_CONNECT_ATTEMPT).await {
             Some(ws) => {
                 self.ws = ws;
                 true
@@ -436,8 +448,9 @@ impl WebSocketSender {
 async fn connect_websocket(
     url: &str,
     token: &str,
+    connect_attempts: usize,
 ) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    for attempt in 0..RETRIES {
+    for attempt in 0..connect_attempts {
         let mut request = match url.into_client_request() {
             Ok(request) => request,
             Err(error) => {
@@ -476,7 +489,7 @@ async fn connect_websocket(
         }
         // Only back off when another attempt follows; sleeping after the last
         // failure just delays the caller's fall back to blob-only logging.
-        if attempt + 1 < RETRIES {
+        if attempt + 1 < connect_attempts {
             random_backoff().await;
         }
     }
@@ -799,6 +812,64 @@ mod tests {
             extract_feed_stream_url(&message).as_deref(),
             Some("ws://localhost/ws/live-logs/job")
         );
+    }
+
+    #[tokio::test]
+    async fn periodic_reconnect_uses_one_dial_after_retry_window() {
+        use tokio::net::TcpListener;
+
+        let placeholder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = placeholder.local_addr().unwrap();
+        drop(placeholder);
+
+        let retry_interval = Duration::from_millis(50);
+        let queue = LiveLogQueue::connect_with_retry(
+            format!("ws://{addr}/ws/live-logs/job"),
+            "job-token".to_owned(),
+            Arc::new(RwLock::new(HashSet::new())),
+            retry_interval,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failed_at = loop {
+            if let Some(failed_at) = *queue
+                .last_connect_failure
+                .lock()
+                .expect("live log failure clock poisoned")
+            {
+                break failed_at;
+            }
+            assert!(Instant::now() < deadline, "initial connect never failed");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        while failed_at.elapsed() < retry_interval {
+            assert!(Instant::now() < deadline, "retry window never elapsed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_server = Arc::clone(&attempts);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                attempts_for_server.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        queue.drain_once(DRAIN_LIMIT).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.connect_in_flight.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "periodic connect never finished");
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     /// Forced first-connect failure, then the endpoint comes up: the drain
