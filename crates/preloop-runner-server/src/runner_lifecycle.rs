@@ -32,6 +32,11 @@ fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
 fn runner_admin_properties() -> serde_json::Map<String, serde_json::Value> {
     let mut properties = serde_json::Map::new();
     let runner_root = runner_server_url();
+    let options = runner_v2_connection_options();
+    let server_url_v2 = options
+        .broker_url
+        .clone()
+        .unwrap_or_else(|| runner_root.clone());
     properties.insert(
         "RequireFipsCryptography".to_owned(),
         json!({"$type": "System.Boolean", "$value": false}),
@@ -42,14 +47,13 @@ fn runner_admin_properties() -> serde_json::Map<String, serde_json::Value> {
     );
     properties.insert(
         "ServerUrlV2".to_owned(),
-        json!({"$type": "System.String", "$value": runner_server_url()}),
+        json!({"$type": "System.String", "$value": server_url_v2}),
     );
     properties.insert(
         "UseV2Flow".to_owned(),
         json!({"$type": "System.Boolean", "$value": true}),
     );
 
-    let options = runner_v2_connection_options();
     if let Some(auth_url_v2) = options.auth_url_v2 {
         properties.insert(
             "EnableAuthMigrationByDefault".to_owned(),
