@@ -244,14 +244,17 @@ pub async fn twirp_artifact_v2_create(
             },
         );
     }
+    // The upload token is bound to `write` and to the minting job (the
+    // `system` owner for control-plane-minted URLs, never empty); serve-time
+    // enforcement rejects any GET against it (round-3 finding 3).
     let token = shared.state.local_jwt_with_lifetime(
-        json!({
-            "sub": "preloop-blob",
-            "kind": "artifact",
-            "job": job_backend_id.unwrap_or_default(),
-            "jti": jti,
-        }),
-        crate::memory_caps::PENDING_UPLOAD_TTL,
+        crate::blob_store::blob_jwt_claims(
+            "artifact",
+            crate::blob_store::BLOB_OP_WRITE,
+            &crate::blob_store::blob_owner_for_job(job_backend_id),
+            &jti,
+        ),
+        crate::memory_caps::SIGNED_BLOB_URL_TTL,
     )?;
     let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
     info!(
@@ -462,14 +465,18 @@ pub async fn twirp_artifact_v2_get_signed_url(
 
     // Mint a fresh download JWT bound to the stored staging dir — the upload
     // token's TTL is upload-scoped, so downloads get their own credential.
+    // The download token is bound to `read`: any PUT against it is 403, so a
+    // finalized artifact can no longer be overwritten through its download
+    // URL (round-3 finding 3). `job` names the minting job (`system` for
+    // control-plane callers), never empty.
     let dl_token = shared.state.local_jwt_with_lifetime(
-        json!({
-            "sub": "preloop-blob",
-            "kind": "artifact",
-            "job": "",
-            "jti": blob_jti,
-        }),
-        crate::memory_caps::PENDING_UPLOAD_TTL,
+        crate::blob_store::blob_jwt_claims(
+            "artifact",
+            crate::blob_store::BLOB_OP_READ,
+            &crate::blob_store::blob_owner_for_job(job),
+            &blob_jti,
+        ),
+        crate::memory_caps::SIGNED_BLOB_URL_TTL,
     )?;
     // URL must end in .zip so the toolkit's streamExtract detects it as a zip.
     let signed_url = format!("{}/twirp-blob/artifact/{dl_token}.zip", runner_base_url());

@@ -140,6 +140,14 @@ pub const MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE: usize = 16;
 /// their upload leave an entry behind; without a TTL those would accumulate.
 pub const PENDING_UPLOAD_TTL: Duration = Duration::from_secs(3600);
 
+/// Lifetime of the signed `/twirp-blob` upload/download URLs themselves
+/// (the JWT `exp`). Round-3 finding 3: the old 60-minute window let a
+/// finalized artifact's *download* URL keep authorizing PUTs that overwrote
+/// the blob. 20 minutes covers the runner's immediate PUT-after-mint and
+/// GET-after-mint flows (including large multipart uploads) while bounding
+/// replay; the pending-reservation maps still sweep on `PENDING_UPLOAD_TTL`.
+pub const SIGNED_BLOB_URL_TTL: Duration = Duration::from_secs(20 * 60);
+
 /// Unix seconds for pending-upload timestamps.
 pub fn now_unix() -> i64 {
     SystemTime::now()
