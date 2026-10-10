@@ -2481,7 +2481,13 @@ jobs:
         acquired["variables"]["actions_self_repository"]["value"],
         "true"
     );
-    assert!(acquired.get("runnerSettings").is_none());
+    assert_eq!(
+        acquired["runnerSettings"],
+        json!({
+            "isHostedServer": false,
+            "agentDownloadUrls": {}
+        })
+    );
     assert_eq!(
         acquired["resources"]["endpoints"][0]["url"],
         "http://127.0.0.1:9090/broker/1/"

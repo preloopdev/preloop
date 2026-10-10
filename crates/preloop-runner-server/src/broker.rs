@@ -1156,8 +1156,20 @@ pub async fn broker_acquire_job(
     // Run-service payloads use the DTO default; internal request IDs remain in
     // `job_requests` and broker lookup maps for renew/complete bookkeeping.
     message.request_id = 0;
-    let payload = serde_json::to_value(&message)
+    let mut payload = serde_json::to_value(&message)
         .map_err(|error| ApiError::internal(format!("serialize broker job payload: {error}")))?;
+    // Runner v2.323+ reads server-enforced settings from the acquire response.
+    // Keep the local control plane explicit even when no overrides are
+    // configured; omitted fields make the runner fall back inconsistently.
+    payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("broker job payload must serialize as an object"))?
+        .insert(
+            "runnerSettings".to_owned(),
+            serde_json::to_value(azdo::RunnerServerSettings::default()).map_err(|error| {
+                ApiError::internal(format!("serialize runner server settings: {error}"))
+            })?,
+        );
     // Broker poll outcome — bounded, exactly one per successful claim. Queue
     // wait is recorded at the claim sites in `next_message_broker_ref` /
     // `next_message_disttask`, where the enqueue timestamp is still on the
@@ -1736,7 +1748,13 @@ mod tests {
     async fn runner_settings_returns_default_wire_shape() {
         let Json(settings) = runner_settings().await;
         let wire = serde_json::to_value(settings).unwrap();
-        assert_eq!(wire, json!({"isHostedServer": false}));
+        assert_eq!(
+            wire,
+            json!({
+                "isHostedServer": false,
+                "agentDownloadUrls": {}
+            })
+        );
     }
 
     #[tokio::test]
@@ -1753,6 +1771,7 @@ mod tests {
         for path in [
             "/_apis/v1/settings/runner",
             "/acme/_apis/v1/settings/runner",
+            "/runner/server/_apis/v1/settings/runner",
         ] {
             let response = app
                 .clone()
@@ -1770,7 +1789,7 @@ mod tests {
                 serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                     .unwrap();
             assert_eq!(wire["isHostedServer"], false, "path={path}");
-            assert!(wire.get("agentDownloadUrls").is_none(), "path={path}");
+            assert_eq!(wire["agentDownloadUrls"], json!({}), "path={path}");
         }
     }
 

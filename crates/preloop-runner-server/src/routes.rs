@@ -498,6 +498,10 @@ pub fn build_app(
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
         .route(
+            "/runner/server/_apis/v1/settings/runner",
+            get(runner_settings),
+        )
+        .route(
             "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)

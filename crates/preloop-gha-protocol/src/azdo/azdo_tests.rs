@@ -949,9 +949,17 @@ fn runner_server_settings_serialization_roundtrip() {
     assert_eq!(decoded.is_hosted_server, settings.is_hosted_server);
     assert_eq!(decoded.agent_download_urls, settings.agent_download_urls);
 
-    let defaults: RunnerServerSettings = serde_json::from_value(json!({})).unwrap();
-    assert!(!defaults.is_hosted_server);
-    assert!(defaults.agent_download_urls.is_none());
+    let defaults = RunnerServerSettings::default();
+    assert_eq!(
+        serde_json::to_value(&defaults).unwrap(),
+        json!({
+            "isHostedServer": false,
+            "agentDownloadUrls": {}
+        })
+    );
+    let decoded_defaults: RunnerServerSettings = serde_json::from_value(json!({})).unwrap();
+    assert!(!decoded_defaults.is_hosted_server);
+    assert_eq!(decoded_defaults.agent_download_urls, Some(json!({})));
 }
 // Tier 2 authority (actions/runner v2.335.1, commit 7d737449ef346f6524f75688d0c9c95fa10ba10a):
 // VariableValue: https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Sdk/DTWebApi/WebApi/VariableValue.cs#L8-L38
