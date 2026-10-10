@@ -27,11 +27,23 @@ pub struct RunnerServerSettings {
 pub struct ConnectionData {
     #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// Optional v2 authorization endpoint advertised by runner-admin.
     #[serde(
-        rename = "locationServiceData",
+        rename = "auth_url_v2",
+        default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub location_service_data: Option<LocationServiceData>,
+    pub auth_url_v2: Option<String>,
+    /// Optional broker endpoint advertised by runner-admin.
+    #[serde(rename = "BrokerUrl", default, skip_serializing_if = "Option::is_none")]
+    pub broker_url: Option<String>,
+    /// Optional runner-admin flow capability flag.
+    #[serde(
+        rename = "UseRunnerAdminFlow",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub use_runner_admin_flow: Option<bool>,
 }
 
 /// Access mapping for location service resolution.
