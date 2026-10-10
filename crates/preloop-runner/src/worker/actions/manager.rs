@@ -107,6 +107,27 @@ fn random_backoff(min: Duration, max: Duration) -> Duration {
 /// `min` yields a random backoff in `[min, min+30s)`; above `max`, a random
 /// backoff in `[max, max+30s)` — the same random band the official helper
 /// returns rather than a hard clamp. Unparseable values yield `None`.
+fn parse_http_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // `DateTime::parse_from_rfc2822` accepts the IMF-fixdate-compatible
+    // numeric-offset form already used by the existing tests. The HTTP
+    // parser in .NET also accepts the three HTTP-date wire forms below:
+    // IMF-fixdate, obsolete RFC 850, and asctime-date.
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(date.with_timezone(&chrono::Utc));
+    }
+    [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ]
+    .into_iter()
+    .find_map(|format| {
+        chrono::NaiveDateTime::parse_from_str(value, format)
+            .ok()
+            .map(|date| date.and_utc())
+    })
+}
+
 fn convert_retry_after_to_duration(
     retry_after: Option<&str>,
     min: Duration,
@@ -118,7 +139,7 @@ fn convert_retry_after_to_duration(
     }
     let delay = if let Ok(seconds) = retry_after.parse::<u64>() {
         Duration::from_secs(seconds)
-    } else if let Ok(date) = chrono::DateTime::parse_from_rfc2822(retry_after) {
+    } else if let Some(date) = parse_http_date(retry_after) {
         // Absolute HTTP-date → delay relative to now. A date in the past is
         // ignored, matching the official guard against clock skew.
         date.signed_duration_since(chrono::Utc::now())
@@ -410,6 +431,11 @@ pub async fn download_action(
                     // We are being throttled, use the Retry-After header (if
                     // provided) to decide backoff time; otherwise the random
                     // backoff — prefer the Retry-After header.
+                    // Action preparation runs before `run_steps` creates the
+                    // synthetic setup-step log, and this manager also serves
+                    // on-demand nested actions. Neither caller supplies an
+                    // ExecutionContext/StepContext or reporting sink, so
+                    // tracing is the only reachable warning channel here.
                     let back_off = action_download_backoff(retry_after_value.as_deref());
                     warn!("Back off {} seconds before retry.", back_off.as_secs_f64());
                     tokio::time::sleep(back_off).await;
@@ -1930,15 +1956,33 @@ mod tests {
     }
 
     #[test]
-    fn convert_retry_after_to_duration_parses_http_date() {
+    fn convert_retry_after_to_duration_parses_http_date_forms() {
         let min = Duration::from_secs(10);
         let max = Duration::from_secs(600);
 
         let future = chrono::Utc::now() + chrono::Duration::seconds(120);
-        let delay = convert_retry_after_to_duration(Some(&future.to_rfc2822()), min, max).unwrap();
+        let imf_fixdate = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let rfc850 = future.format("%A, %d-%b-%y %H:%M:%S GMT").to_string();
+        let asctime = future.format("%a %b %e %H:%M:%S %Y").to_string();
+        for (label, value) in [
+            ("IMF-fixdate", imf_fixdate.as_str()),
+            ("RFC 850", rfc850.as_str()),
+            ("asctime-date", asctime.as_str()),
+        ] {
+            let delay = convert_retry_after_to_duration(Some(value), min, max).unwrap();
+            assert!(
+                delay > Duration::from_secs(100) && delay <= Duration::from_secs(120),
+                "{label} converts to a delay relative to now, got {delay:?}"
+            );
+        }
+
+        // Keep accepting the numeric-offset form accepted by the previous
+        // parser as well.
+        let rfc2822 = future.to_rfc2822();
+        let delay = convert_retry_after_to_duration(Some(&rfc2822), min, max).unwrap();
         assert!(
             delay > Duration::from_secs(100) && delay <= Duration::from_secs(120),
-            "HTTP-date form converts to a delay relative to now, got {delay:?}"
+            "RFC 2822 form converts to a delay relative to now, got {delay:?}"
         );
 
         let past = chrono::Utc::now() - chrono::Duration::seconds(60);
