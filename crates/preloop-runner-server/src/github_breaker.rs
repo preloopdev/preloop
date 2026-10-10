@@ -395,9 +395,233 @@ pub async fn send_observed(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified outbound GitHub client: breaker coverage + per-subsystem
+// consumption accounting for every GitHub call, not just the check-runs
+// reporting path.
+// ---------------------------------------------------------------------------
+
+/// Which part of the server is spending the GitHub API budget. Labels stay a
+/// small closed set so counters and traces never grow a series per repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GithubSubsystem {
+    /// Check-run / check-suite reporting (`github.rs` sender path).
+    CheckRuns,
+    /// Action tarball downloads (`actions.rs`).
+    Actions,
+    /// Action ref → SHA resolution (`actions.rs`).
+    RefResolve,
+    /// Environment protection-rule resolution (`environment_resolver.rs`).
+    Env,
+    /// Snapshot checkout-cache and on-demand LFS fetches (`snapshots.rs`).
+    Snapshots,
+}
+
+impl GithubSubsystem {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GithubSubsystem::CheckRuns => "check-runs",
+            GithubSubsystem::Actions => "actions",
+            GithubSubsystem::RefResolve => "ref-resolve",
+            GithubSubsystem::Env => "env",
+            GithubSubsystem::Snapshots => "snapshots",
+        }
+    }
+
+    const ALL: [GithubSubsystem; 5] = [
+        GithubSubsystem::CheckRuns,
+        GithubSubsystem::Actions,
+        GithubSubsystem::RefResolve,
+        GithubSubsystem::Env,
+        GithubSubsystem::Snapshots,
+    ];
+}
+
+/// Per-subsystem counters for one [`GithubConsumption`].
+#[derive(Debug, Default)]
+struct SubsystemCounters {
+    /// Completed HTTP exchanges actually sent to GitHub.
+    requests: std::sync::atomic::AtomicU64,
+    /// Response body bytes attributed to the subsystem (advertised
+    /// `content-length`, or the exact streamed byte count where the caller
+    /// measures it).
+    bytes: std::sync::atomic::AtomicU64,
+    /// Exchanges GitHub answered with a rate limit (429, or 403 with an
+    /// exhausted budget).
+    rate_limited: std::sync::atomic::AtomicU64,
+    /// Attempts refused without touching GitHub because the breaker was open.
+    breaker_blocked: std::sync::atomic::AtomicU64,
+}
+
+/// Process-wide consumption accounting for outbound GitHub traffic.
+///
+/// Lives in [`crate::state::AppState`] next to the breaker (atomics only, no
+/// lock), so every subsystem's spend is visible in one place: the
+/// operational snapshot, the webhooks health endpoint, and tracing events.
+/// This is deliberately not a second metrics framework — it mirrors the
+/// [`BreakerSnapshot`] pattern the breaker already uses for operational
+/// visibility.
+#[derive(Debug, Default)]
+pub struct GithubConsumption {
+    counters: [SubsystemCounters; 5],
+}
+
+impl GithubConsumption {
+    fn counters(&self, subsystem: GithubSubsystem) -> &SubsystemCounters {
+        let index = GithubSubsystem::ALL
+            .iter()
+            .position(|candidate| *candidate == subsystem)
+            .expect("every GithubSubsystem is in ALL");
+        &self.counters[index]
+    }
+
+    /// One HTTP exchange was sent to GitHub for `subsystem`.
+    pub fn record_request(&self, subsystem: GithubSubsystem) {
+        self.counters(subsystem)
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Attribute `bytes` of response body to `subsystem`.
+    pub fn record_bytes(&self, subsystem: GithubSubsystem, bytes: u64) {
+        self.counters(subsystem)
+            .bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Attribute a response's advertised body size (`content-length`, when
+    /// present) to `subsystem`. Call before consuming the body. Streaming
+    /// callers that measure the exact byte count should use
+    /// [`GithubConsumption::record_bytes`] after the stream instead — not
+    /// both.
+    pub fn record_advertised_bytes(
+        &self,
+        subsystem: GithubSubsystem,
+        response: &reqwest::Response,
+    ) {
+        let bytes = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if bytes > 0 {
+            self.record_bytes(subsystem, bytes);
+        }
+    }
+
+    /// GitHub answered with a rate limit for `subsystem`.
+    pub fn record_rate_limited(&self, subsystem: GithubSubsystem) {
+        self.counters(subsystem)
+            .rate_limited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An attempt for `subsystem` was refused because the breaker was open —
+    /// no GitHub budget was spent.
+    pub fn record_breaker_blocked(&self, subsystem: GithubSubsystem) {
+        self.counters(subsystem)
+            .breaker_blocked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Point-in-time per-subsystem usage, in [`GithubSubsystem::ALL`] order.
+    pub fn snapshot(&self) -> Vec<GithubSubsystemUsage> {
+        GithubSubsystem::ALL
+            .iter()
+            .map(|subsystem| {
+                let counters = self.counters(*subsystem);
+                let load = |counter: &std::sync::atomic::AtomicU64| {
+                    counter.load(std::sync::atomic::Ordering::Relaxed)
+                };
+                GithubSubsystemUsage {
+                    subsystem: subsystem.as_str(),
+                    requests: load(&counters.requests),
+                    bytes: load(&counters.bytes),
+                    rate_limited: load(&counters.rate_limited),
+                    breaker_blocked: load(&counters.breaker_blocked),
+                }
+            })
+            .collect()
+    }
+}
+
+/// One row of [`GithubConsumption::snapshot`]: the GitHub spend of a single
+/// subsystem. Serializable so the operational snapshot and the webhooks
+/// health endpoint can publish it as JSON.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GithubSubsystemUsage {
+    pub subsystem: &'static str,
+    pub requests: u64,
+    pub bytes: u64,
+    pub rate_limited: u64,
+    pub breaker_blocked: u64,
+}
+
+/// Send a GitHub request through the shared breaker with per-subsystem
+/// consumption accounting.
+///
+/// This is the one funnel for outbound GitHub traffic: the breaker sees the
+/// whole dependency (a 429 on an action tarball parks webhook deliveries too,
+/// because the PAT budget they share is what is actually exhausted), and the
+/// accounting attributes every request, byte, and rate limit to the
+/// subsystem that caused it. Response semantics are unchanged from
+/// [`send_observed`]: a 404 still means what it meant to the caller, it just
+/// also proves GitHub is up.
+///
+/// Beyond [`send_observed`], the primary rate budget advertised on the
+/// response (`x-ratelimit-remaining: 0` + `x-ratelimit-reset`) is honoured
+/// for every subsystem, so a call that spends the last request parks the
+/// next one instead of burning it on a guaranteed 403.
+pub async fn send_observed_labeled(
+    breaker: &GithubBreaker,
+    consumption: &GithubConsumption,
+    subsystem: GithubSubsystem,
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    if let Err(remaining) = breaker.acquire() {
+        consumption.record_breaker_blocked(subsystem);
+        tracing::debug!(
+            subsystem = subsystem.as_str(),
+            retry_in_secs = remaining.as_secs(),
+            "GitHub request refused without touching GitHub: circuit breaker open"
+        );
+        anyhow::bail!(
+            "GitHub circuit breaker is open (retry after {}s)",
+            remaining.as_secs_f64()
+        );
+    }
+    match request.send().await {
+        Ok(response) => {
+            consumption.record_request(subsystem);
+            let status = response.status();
+            let kind = breaker.observe_status(status, response.headers());
+            if matches!(kind, Some(GithubFailureKind::RateLimited { .. })) {
+                consumption.record_rate_limited(subsystem);
+                tracing::warn!(
+                    subsystem = subsystem.as_str(),
+                    %status,
+                    "GitHub rate-limited a request; breaker is backing off"
+                );
+            }
+            // Honour the primary budget advertised on the response: once
+            // remaining hits zero, wait for the reset instead of spending
+            // the next call on a guaranteed 403.
+            breaker.observe_rate_budget(response.headers());
+            Ok(response)
+        }
+        Err(error) => {
+            breaker.observe_transport_error(&error);
+            consumption.record_request(subsystem);
+            Err(error.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_config() -> BreakerConfig {
         BreakerConfig {
@@ -549,5 +773,208 @@ mod tests {
         let snapshot = breaker.snapshot();
         assert!(!snapshot.open);
         assert_eq!(snapshot.consecutive_failures, 10);
+    }
+
+    #[test]
+    fn subsystem_labels_are_a_small_closed_set() {
+        let labels: Vec<&str> = GithubSubsystem::ALL
+            .iter()
+            .map(GithubSubsystem::as_str)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["check-runs", "actions", "ref-resolve", "env", "snapshots"]
+        );
+    }
+
+    #[test]
+    fn consumption_snapshot_starts_at_zero_for_every_subsystem() {
+        let consumption = GithubConsumption::default();
+        let snapshot = consumption.snapshot();
+        assert_eq!(snapshot.len(), GithubSubsystem::ALL.len());
+        for usage in &snapshot {
+            assert_eq!(usage.requests, 0);
+            assert_eq!(usage.bytes, 0);
+            assert_eq!(usage.rate_limited, 0);
+            assert_eq!(usage.breaker_blocked, 0);
+        }
+    }
+
+    /// A tiny stub GitHub: serves scripted responses and counts hits, so
+    /// tests prove the breaker engages without touching the real github.com.
+    struct StubGitHub {
+        base: String,
+        hits: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl StubGitHub {
+        async fn serve(
+            status: axum::http::StatusCode,
+            headers: Vec<(String, String)>,
+            body: &'static str,
+        ) -> Self {
+            use std::sync::atomic::Ordering;
+            let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let hits_route = hits.clone();
+            let app = axum::Router::new().route(
+                "/*path",
+                axum::routing::any(move || {
+                    let hits_route = hits_route.clone();
+                    async move {
+                        hits_route.fetch_add(1, Ordering::SeqCst);
+                        let mut builder = axum::http::Response::builder().status(status);
+                        for (name, value) in &headers {
+                            builder = builder.header(name, value);
+                        }
+                        builder.body(axum::body::Body::from(body)).unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self { base, hits }
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_download_opens_breaker_and_is_accounted() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            vec![("x-ratelimit-reset".to_owned(), reset.to_string())],
+            "rate limited",
+        )
+        .await;
+        let breaker = GithubBreaker::new(test_config());
+        let consumption = GithubConsumption::default();
+
+        // First exchange: the 429 reaches GitHub, trips the breaker
+        // immediately (rate limits do not wait for the failure threshold),
+        // and is accounted to the actions subsystem.
+        let response = send_observed_labeled(
+            &breaker,
+            &consumption,
+            GithubSubsystem::Actions,
+            crate::shared_http::CLIENT.get(format!("{}/repos/o/r/tarball/main", stub.base)),
+        )
+        .await
+        .expect("the 429 response itself is returned, not an error");
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(breaker.is_open(), "a 429 must open the breaker at once");
+        assert!(breaker.snapshot().rate_limited);
+
+        // Second attempt: refused without touching GitHub — the hammering
+        // the pre-fix code path did is exactly what the breaker now stops.
+        let blocked = send_observed_labeled(
+            &breaker,
+            &consumption,
+            GithubSubsystem::Actions,
+            crate::shared_http::CLIENT.get(format!("{}/repos/o/r/tarball/main", stub.base)),
+        )
+        .await;
+        assert!(blocked.is_err(), "breaker-open must fail fast");
+        assert_eq!(
+            stub.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first exchange may reach GitHub"
+        );
+
+        let usage: std::collections::HashMap<&str, GithubSubsystemUsage> = consumption
+            .snapshot()
+            .into_iter()
+            .map(|usage| (usage.subsystem, usage))
+            .collect();
+        let actions = &usage["actions"];
+        assert_eq!(actions.requests, 1);
+        assert_eq!(actions.rate_limited, 1);
+        assert_eq!(actions.breaker_blocked, 1);
+        // Other subsystems stay untouched: attribution, not a global count.
+        for (label, usage) in &usage {
+            if *label != "actions" {
+                assert_eq!(usage.requests, 0, "{label} must not be charged");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_response_records_advertised_bytes() {
+        let body = "hello-github";
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::OK,
+            vec![("content-length".to_owned(), body.len().to_string())],
+            body,
+        )
+        .await;
+        let breaker = GithubBreaker::new(test_config());
+        let consumption = GithubConsumption::default();
+
+        let response = send_observed_labeled(
+            &breaker,
+            &consumption,
+            GithubSubsystem::RefResolve,
+            crate::shared_http::CLIENT.get(format!("{}/repos/o/r/commits/main", stub.base)),
+        )
+        .await
+        .unwrap();
+        consumption.record_advertised_bytes(GithubSubsystem::RefResolve, &response);
+        assert!(!breaker.is_open());
+
+        let usage: std::collections::HashMap<&str, GithubSubsystemUsage> = consumption
+            .snapshot()
+            .into_iter()
+            .map(|usage| (usage.subsystem, usage))
+            .collect();
+        let ref_resolve = &usage["ref-resolve"];
+        assert_eq!(ref_resolve.requests, 1);
+        assert_eq!(ref_resolve.bytes, body.len() as u64);
+        assert_eq!(ref_resolve.rate_limited, 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_primary_budget_parks_the_next_call() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let stub = StubGitHub::serve(
+            axum::http::StatusCode::OK,
+            vec![
+                ("x-ratelimit-remaining".to_owned(), "0".to_owned()),
+                ("x-ratelimit-reset".to_owned(), reset.to_string()),
+                ("content-length".to_owned(), "2".to_owned()),
+            ],
+            "ok",
+        )
+        .await;
+        let breaker = GithubBreaker::new(test_config());
+        let consumption = GithubConsumption::default();
+
+        // A 200 that spends the last request still parks the breaker: the
+        // next call would be a guaranteed 403.
+        send_observed_labeled(
+            &breaker,
+            &consumption,
+            GithubSubsystem::Env,
+            crate::shared_http::CLIENT.get(format!("{}/repos/o/r/environments/prod", stub.base)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            breaker.is_open(),
+            "remaining=0 on a 200 must park the breaker until the reset"
+        );
+        let usage: std::collections::HashMap<&str, GithubSubsystemUsage> = consumption
+            .snapshot()
+            .into_iter()
+            .map(|usage| (usage.subsystem, usage))
+            .collect();
+        assert_eq!(usage["env"].requests, 1);
+        assert_eq!(usage["env"].rate_limited, 0);
     }
 }
