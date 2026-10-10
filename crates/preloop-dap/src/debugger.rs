@@ -144,6 +144,11 @@ pub trait IDapDebugger: Send + Sync {
     /// Job has completed: emit `terminated`/`exited`, pause for
     /// final inspection, then tear down.
     async fn on_job_completed(&self) -> Result<(), DapError>;
+    /// The recorded tunnel failure, if the devtunnel dropped while the job
+    /// was running. The step loop only sees a tunnel drop on the next
+    /// `on_step_starting`; a drop during the final step would otherwise
+    /// complete the job successfully with no infrastructure category.
+    fn tunnel_failure(&self) -> Option<DapError>;
     /// Stop the debugger unconditionally. Cancels everything.
     async fn stop(&self) -> Result<(), DapError>;
     /// Read-only view of the current state.
@@ -1082,6 +1087,12 @@ impl IDapDebugger for DapDebugger {
 
         let mut rx = self.core.resume_tx.subscribe();
         let _ = rx.borrow_and_update();
+        // A tunnel drop that landed between the earlier failure check and
+        // `subscribe()` left the stored `()` already current, so `changed()`
+        // below would never fire. Re-check now that the value is stable.
+        if let Some(failure) = tunnel_failure_error(&self.core) {
+            return Err(failure);
+        }
         rx.changed()
             .await
             .map_err(|_| DapError::Protocol("debugger resume channel closed".into()))?;
@@ -1094,6 +1105,10 @@ impl IDapDebugger for DapDebugger {
         // continued event is sent by the dispatcher loop after the
         // continue response, matching official runner ordering.
         Ok(())
+    }
+
+    fn tunnel_failure(&self) -> Option<DapError> {
+        tunnel_failure_error(&self.core)
     }
 
     fn on_step_completed(&self, _step: &SourceEntry) {
