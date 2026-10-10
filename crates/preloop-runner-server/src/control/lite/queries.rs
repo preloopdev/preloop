@@ -39,6 +39,86 @@ fn run_known(tx: &rusqlite::Transaction<'_>, run: &str) -> Result<bool, ControlE
     .map_err(db)
 }
 
+/// The newest attempt of a run and whether its live `runs` row still holds
+/// it (`false` once the run is archived). `None` when the run is unknown.
+fn latest_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    run: &str,
+) -> Result<Option<(i64, bool)>, ControlError> {
+    let live: Option<i64> = tx
+        .prepare_cached("SELECT run_attempt FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([run], |row| row.get(0))
+        .optional()
+        .map_err(db)?;
+    if let Some(attempt) = live {
+        return Ok(Some((attempt, true)));
+    }
+    let archived: Option<i64> = tx
+        .prepare_cached("SELECT MAX(run_attempt) FROM run_history WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([run], |row| row.get(0))
+        .map_err(db)?;
+    Ok(archived.map(|attempt| (attempt, false)))
+}
+
+/// One attempt an attempt read addresses, checked against the run's attempts.
+struct ResolvedAttempt {
+    number: i64,
+    /// The run's newest attempt: read through the ordinary record path.
+    newest: bool,
+    /// The newest attempt while the run is still live: its execution
+    /// pointers are the live `jobs` rows.
+    live: bool,
+}
+
+/// Resolve a 1-based attempt of `run_id`. `NotFound` when the run is unknown
+/// or the attempt is outside `1..=newest`.
+fn resolve_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: RunId,
+    attempt: u64,
+) -> Result<ResolvedAttempt, ControlError> {
+    let (newest_number, live_run) = latest_attempt(tx, &codec::run_key(run_id))?
+        .ok_or_else(|| ControlError::NotFound(format!("run {run_id} not found")))?;
+    let number = i64::try_from(attempt)
+        .ok()
+        .filter(|number| (1..=newest_number).contains(number))
+        .ok_or_else(|| ControlError::NotFound(format!("run {run_id} has no attempt {attempt}")))?;
+    let newest = number == newest_number;
+    Ok(ResolvedAttempt {
+        number,
+        newest,
+        live: newest && live_run,
+    })
+}
+
+/// The SQL window over request rows aliased `q` that selects one attempt's
+/// requests. `?2` binds the attempt number and `?3` the live-newest flag.
+///
+/// Each job has an execution pointer for the attempt: its live `jobs` row
+/// when the attempt is the live newest, else its `job_history` snapshot. A
+/// request belongs to the attempt when it is that pointer, or when it lies in
+/// `(floor, pointer]`. The floor is the newest pointer any earlier attempt
+/// snapshotted, so the window holds the requests minted during the attempt.
+/// A pointer cleared by a rerun (the job concluded without minting) is
+/// `NULL` and contributes nothing; the floor ignores it, so requests minted
+/// before the clear stay out of later attempts.
+fn attempt_window() -> String {
+    let pointer = "CASE WHEN ?3 THEN (SELECT j.request_id FROM jobs j \
+                       WHERE j.run_id = q.run_id AND j.job_id = q.job_id) \
+                   ELSE (SELECT h.request_id FROM job_history h \
+                       WHERE h.run_id = q.run_id AND h.job_id = q.job_id \
+                       AND h.run_attempt = ?2) END";
+    let floor = "COALESCE((SELECT MAX(h.request_id) FROM job_history h \
+                   WHERE h.run_id = q.run_id AND h.job_id = q.job_id \
+                   AND h.run_attempt < ?2), 0)";
+    format!(
+        "(q.request_id = ({pointer}) OR \
+         (q.request_id > {floor} AND q.request_id <= ({pointer})))"
+    )
+}
+
 fn submission_value(json: &str) -> Result<serde_json::Value, ControlError> {
     serde_json::from_str(json).map_err(ControlError::backend)
 }
@@ -1052,6 +1132,59 @@ impl LiteBackend {
                     // `record_row` reads as absent.
                     super::requests::record_row(row)
                 })
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)
+        })
+    }
+
+    /// `run_record` for one attempt. The newest attempt reads exactly as
+    /// `run_record`; an earlier one projects its `run_history` head and
+    /// `job_history` snapshot (see `run_record_at`).
+    pub(crate) async fn run_record_attempt(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<crate::models::RunRecord, ControlError> {
+        self.read(move |tx| {
+            let resolved = resolve_attempt(tx, run_id, attempt)?;
+            let record = if resolved.newest {
+                super::jobs::run_record(tx, run_id)?
+            } else {
+                super::jobs::run_record_at(tx, run_id, Some(resolved.number))?
+            };
+            record.ok_or_else(|| {
+                ControlError::NotFound(format!("run {run_id} has no attempt {attempt}"))
+            })
+        })
+    }
+
+    /// `run_attempt_requests`: the requests attempt `attempt` executed, in
+    /// request order (see [`attempt_window`]).
+    pub(crate) async fn run_attempt_requests(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<Vec<crate::models::TaskAgentJobRequestRecord>, ControlError> {
+        self.read(move |tx| {
+            let resolved = resolve_attempt(tx, run_id, attempt)?;
+            let window = attempt_window();
+            let live = format!(
+                "SELECT {} FROM {} WHERE q.run_id = ?1 AND {window}",
+                super::requests::RECORD_COLUMNS,
+                super::requests::RECORD_FROM
+            );
+            let mut stmt = tx
+                .prepare_cached(&format!(
+                    "{live} UNION ALL \
+                     SELECT {ATTEMPT_HISTORY_COLUMNS} FROM {ATTEMPT_HISTORY_FROM} \
+                     WHERE q.run_id = ?1 AND {window} ORDER BY 1"
+                ))
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(
+                    params![codec::run_key(run_id), resolved.number, resolved.live],
+                    super::requests::record_row,
+                )
                 .map_err(db)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(db)
         })

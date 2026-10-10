@@ -539,6 +539,20 @@ impl ControlBackend for PgBackend {
     ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
         self.run_requests(run_id).await
     }
+    async fn run_record_attempt(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<RunRecord, ControlError> {
+        self.run_record_attempt(run_id, attempt).await
+    }
+    async fn run_attempt_requests(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
+        self.run_attempt_requests(run_id, attempt).await
+    }
     async fn run_step_manifests(
         &self,
         run_id: RunId,

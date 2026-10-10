@@ -2921,20 +2921,34 @@ pub fn project_run_data(
 pub async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
+    Query(query): Query<RunAttemptQuery>,
 ) -> Result<Json<RunRecord>, ApiError> {
     // Indexed point reads — no working-set load. Steps resolve through the
-    // request↔manifest join; a held run is `pending`, never `queued`.
+    // request↔manifest join; a held run is `pending`, never `queued`. An
+    // attempt read takes that attempt's record and its requests instead.
+    let attempt = requested_attempt(query.attempt)?;
     let backend = &shared.state.backend;
-    let run = backend
-        .run_record(run_id)
-        .await
-        .map_err(|error| match error {
-            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
-            other => ApiError::from(other),
-        })?;
+    let run = match attempt {
+        None => backend
+            .run_record(run_id)
+            .await
+            .map_err(|error| match error {
+                crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+                other => ApiError::from(other),
+            })?,
+        Some(attempt) => backend
+            .run_record_attempt(run_id, attempt)
+            .await
+            .map_err(ApiError::from)?,
+    };
     let (held, requests, manifests) = tokio::try_join!(
         async { backend.run_held(run_id).await },
-        async { backend.run_requests(run_id).await },
+        async {
+            match attempt {
+                None => backend.run_requests(run_id).await,
+                Some(attempt) => backend.run_attempt_requests(run_id, attempt).await,
+            }
+        },
         async { backend.run_step_manifests(run_id).await },
     )
     .map_err(ApiError::from)?;
@@ -2965,6 +2979,60 @@ pub async fn get_run(
             })
     });
     Ok(Json(projected))
+}
+
+/// `?attempt=N` on `GET /api/v1/runs/:run_id`: the 1-based attempt to read.
+/// Absent reads the newest attempt.
+#[derive(Debug, Default, Deserialize)]
+pub struct RunAttemptQuery {
+    #[serde(default)]
+    attempt: Option<u64>,
+}
+
+/// Validate an `attempt` selector: attempts are 1-based.
+fn requested_attempt(attempt: Option<u64>) -> Result<Option<u64>, ApiError> {
+    match attempt {
+        Some(0) => Err(ApiError::bad_request(
+            "attempt is 1-based; use `attempt=1` for the first attempt",
+        )),
+        attempt => Ok(attempt),
+    }
+}
+
+/// `GET /api/v1/runs/:run_id/attempts`: every attempt of the run, oldest first.
+/// Each attempt carries the status `GET /api/v1/runs/:run_id?attempt=N` reports
+/// for it, so a queued attempt reads `queued`, not the stored `in_progress`.
+pub async fn list_run_attempts(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<Vec<RunAttempt>>, ApiError> {
+    let backend = &shared.state.backend;
+    let latest = backend
+        .run_record(run_id)
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?
+        .run_attempt;
+    let held = backend.run_held(run_id).await.map_err(ApiError::from)?;
+    let mut attempts = Vec::new();
+    for attempt in 1..=latest {
+        let record = backend
+            .run_record_attempt(run_id, attempt)
+            .await
+            .map_err(ApiError::from)?;
+        let record = project_run_data(record, held, &|_, _| None);
+        attempts.push(RunAttempt {
+            run_attempt: attempt,
+            status: record.status,
+            conclusion: record.conclusion,
+            created_at: record.created_at,
+            started_at: record.started_at,
+            completed_at: record.completed_at,
+        });
+    }
+    Ok(Json(attempts))
 }
 
 /// Browser-safe status page linked from GitHub Check Runs.
@@ -3067,8 +3135,9 @@ pub async fn list_runs(
 
 /// Optional filters for `GET /api/v1/runs/:run_id/logs`.
 ///
-/// Both are absent for the historical whole-run behavior, so an unfiltered
-/// request still returns every job's log merged in request order.
+/// Every filter is absent for the historical whole-run behavior, so an
+/// unfiltered request still returns every job's log, from every attempt,
+/// merged in request order.
 #[derive(Debug, Default, Deserialize)]
 pub struct RunLogsQuery {
     /// Workflow job key (`job_id`) or the agent job UUID. Matched exactly as
@@ -3079,6 +3148,10 @@ pub struct RunLogsQuery {
     /// `preloop debug --from`, which also counts user-visible steps from 1.
     #[serde(default)]
     step: Option<usize>,
+    /// 1-based attempt whose logs to read: the requests that attempt executed
+    /// (see `GET /api/v1/runs/:run_id/attempts`). Absent reads every attempt.
+    #[serde(default)]
+    attempt: Option<u64>,
 }
 
 /// Files uploaded for one job's individual steps.
@@ -3323,7 +3396,12 @@ pub async fn get_run_logs(
     // step manifest. `inner.logs` (console blocks) is node-local and read
     // below.
     let backend = &shared.state.backend;
-    let mut requests = backend.run_requests(run_id).await.map_err(ApiError::from)?;
+    let attempt = requested_attempt(query.attempt)?;
+    let mut requests = match attempt {
+        None => backend.run_requests(run_id).await,
+        Some(attempt) => backend.run_attempt_requests(run_id, attempt).await,
+    }
+    .map_err(ApiError::from)?;
     if requests.is_empty() {
         // An existing run with no dispatched attempts still reads as having
         // no requests, so confirm the run itself before reporting the job.

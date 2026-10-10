@@ -869,6 +869,27 @@ pub(crate) trait ControlBackend: Send + Sync {
         run_id: RunId,
     ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError>;
 
+    /// A run's record as attempt `attempt` ran it. The newest attempt reads
+    /// as [`Self::run_record`]. An earlier attempt projects its `run_history`
+    /// head and `job_history` snapshot and carries no steps: the caller
+    /// attaches each job's manifest from [`Self::run_attempt_requests`].
+    /// `NotFound` when the run or the attempt does not exist.
+    async fn run_record_attempt(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<RunRecord, ControlError>;
+
+    /// The requests attempt `attempt` executed, sorted by request id: for
+    /// each job, the requests minted during that attempt plus the job's
+    /// execution pointer for it (the request a carried-forward job ran
+    /// under). `NotFound` when the run or the attempt does not exist.
+    async fn run_attempt_requests(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError>;
+
     /// A run's stored `job_steps` manifests keyed by agent job id.
     async fn run_step_manifests(
         &self,
@@ -2774,6 +2795,26 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.run_requests(run_id).await,
             Self::Postgres(b) => b.run_requests(run_id).await,
+        }
+    }
+    async fn run_record_attempt(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<RunRecord, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_record_attempt(run_id, attempt).await,
+            Self::Postgres(b) => b.run_record_attempt(run_id, attempt).await,
+        }
+    }
+    async fn run_attempt_requests(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_attempt_requests(run_id, attempt).await,
+            Self::Postgres(b) => b.run_attempt_requests(run_id, attempt).await,
         }
     }
     async fn run_step_manifests(

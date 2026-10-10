@@ -931,6 +931,36 @@ impl PgBackend {
             .collect()
     }
 
+    /// `run_attempt_requests`: the requests attempt `attempt` executed, in
+    /// request order (see [`attempt_window`]).
+    ///
+    /// Statement: `SELECT <request columns> .. WHERE q.run_id AND <window>
+    /// UNION ALL SELECT <history columns> .. WHERE q.run_id AND <window>
+    /// ORDER BY 1`, on the attempt resolved in the same read transaction.
+    pub(super) async fn run_attempt_requests(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
+        let mut client = self.reader().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let resolved = resolve_attempt_tx(&tx, run_id, attempt).await?;
+        let window = attempt_window();
+        let rows = tx
+            .query(
+                &format!(
+                    "{REQUEST_SELECT} WHERE q.run_id = $1::text::uuid AND {window} UNION ALL \
+                     {ATTEMPT_HISTORY_SELECT} WHERE q.run_id = $1::text::uuid AND {window} \
+                     ORDER BY 1"
+                ),
+                &[&run_text(run_id), &resolved.number, &resolved.live],
+            )
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        rows.iter().map(request_from_row).collect()
+    }
+
     /// Resolve a check-run rerequest to `(run_id, job_id)` among completed
     /// runs (live or archived) of `repository` at `head_sha`: an exact
     /// check-run id hit first, else the check-run name against job ids and
@@ -1559,7 +1589,7 @@ impl PgBackend {
             let run_wait: bool = row.get(2);
             let (record, mut jobs) = if archived {
                 (
-                    archived_record_tx(&tx, run_id).await?,
+                    archived_record_tx(&tx, run_id, None).await?,
                     archived_job_rows(&tx, run_id).await?,
                 )
             } else {
@@ -1568,7 +1598,7 @@ impl PgBackend {
                     None => {
                         // Archived between select and read: fall back.
                         (
-                            archived_record_tx(&tx, run_id).await?,
+                            archived_record_tx(&tx, run_id, None).await?,
                             archived_job_rows(&tx, run_id).await?,
                         )
                     }
@@ -1621,11 +1651,11 @@ impl PgBackend {
         for row in rows {
             let run_id = codec::run_id(row.get::<_, &str>(0))?;
             if row.get::<_, bool>(1) {
-                runs.push(archived_record_tx(&tx, run_id).await?);
+                runs.push(archived_record_tx(&tx, run_id, None).await?);
             } else if let Some(graph) = PgBackend::load_graph(self, &tx, run_id).await? {
                 runs.push(graph.record);
             } else {
-                runs.push(archived_record_tx(&tx, run_id).await?);
+                runs.push(archived_record_tx(&tx, run_id, None).await?);
             }
         }
         tx.commit().await.map_err(db)?;
@@ -1776,17 +1806,93 @@ async fn hydrate_steps(
     Ok(())
 }
 
-/// The archived `RunRecord`: `run_history` head row plus its latest
-/// `job_history` snapshot as `jobs`/`job_names`/`jobs_list` (the blob
-/// fields the archive keeps are narrower — outputs, caller plans, needs
-/// and gate state are gone with the live row).
+/// The newest attempt of a run and whether its live `runs` row still holds
+/// it (`false` once archived). `None` when the run is unknown.
+async fn latest_attempt_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    run: &str,
+) -> Result<Option<(i32, bool)>, ControlError> {
+    let row = tx
+        .query_one(
+            "SELECT (SELECT run_attempt FROM runs WHERE run_id = $1::text::uuid), \
+                    (SELECT MAX(run_attempt) FROM run_history WHERE run_id = $1::text::uuid)",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+    let live: Option<i32> = row.get(0);
+    let archived: Option<i32> = row.get(1);
+    Ok(match (live, archived) {
+        (Some(attempt), _) => Some((attempt, true)),
+        (None, Some(attempt)) => Some((attempt, false)),
+        (None, None) => None,
+    })
+}
+
+/// One attempt an attempt read addresses, checked against the run's attempts.
+pub(super) struct ResolvedAttempt {
+    /// The 1-based attempt number.
+    pub(super) number: i32,
+    /// The run's newest attempt: read through the ordinary record path.
+    pub(super) newest: bool,
+    /// The newest attempt while the run is live: its execution pointers are
+    /// the live `jobs` rows.
+    pub(super) live: bool,
+}
+
+/// Resolve a 1-based attempt of `run_id`. `NotFound` when the run is unknown
+/// or the attempt is outside `1..=newest`.
+pub(super) async fn resolve_attempt_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+    attempt: u64,
+) -> Result<ResolvedAttempt, ControlError> {
+    let (newest_number, live_run) = latest_attempt_tx(tx, &run_text(run_id))
+        .await?
+        .ok_or_else(|| ControlError::NotFound(format!("run {run_id} not found")))?;
+    let number = i32::try_from(attempt)
+        .ok()
+        .filter(|number| (1..=newest_number).contains(number))
+        .ok_or_else(|| ControlError::NotFound(format!("run {run_id} has no attempt {attempt}")))?;
+    let newest = number == newest_number;
+    Ok(ResolvedAttempt {
+        number,
+        newest,
+        live: newest && live_run,
+    })
+}
+
+/// The SQL window over request rows aliased `q` that selects one attempt's
+/// requests: the PG twin of the lite `attempt_window`. `$2` binds the attempt
+/// number and `$3` the live-newest flag.
+fn attempt_window() -> String {
+    let pointer = "CASE WHEN $3 THEN (SELECT j.request_id FROM jobs j \
+                       WHERE j.run_id = q.run_id AND j.job_id = q.job_id) \
+                   ELSE (SELECT h.request_id FROM job_history h \
+                       WHERE h.run_id = q.run_id AND h.job_id = q.job_id \
+                       AND h.run_attempt = $2) END";
+    let floor = "COALESCE((SELECT MAX(h.request_id) FROM job_history h \
+                   WHERE h.run_id = q.run_id AND h.job_id = q.job_id \
+                   AND h.run_attempt < $2), 0)";
+    format!(
+        "(q.request_id = ({pointer}) OR \
+         (q.request_id > {floor} AND q.request_id <= ({pointer})))"
+    )
+}
+
+/// The archived `RunRecord` of `attempt` (`None`: the newest): the
+/// `run_history` head row plus that attempt's `job_history` snapshot as
+/// `jobs`/`job_names`/`jobs_list` (the blob fields the archive keeps are
+/// narrower — outputs, caller plans, needs and gate state are gone with the
+/// live row).
 ///
-/// Statements: `SELECT .. FROM run_history WHERE run_id ORDER BY created_at
-/// DESC LIMIT 1`; `SELECT job_id, status, display_name FROM job_history`
-/// of that snapshot.
+/// Statements: `SELECT .. FROM run_history WHERE run_id ORDER BY run_attempt
+/// DESC LIMIT 1` (the attempt's row when given); `SELECT job_id, status,
+/// display_name FROM job_history` of that snapshot.
 pub(super) async fn archived_record_tx(
     tx: &tokio_postgres::Transaction<'_>,
     run_id: RunId,
+    attempt: Option<i32>,
 ) -> Result<crate::models::RunRecord, ControlError> {
     let run = run_text(run_id);
     let row = tx
@@ -1804,9 +1910,10 @@ pub(super) async fn archived_record_tx(
                  fork_approval_approved_at, fork_approval_note, \
                  reports_check_runs, record_details::text \
                  FROM run_history WHERE run_id = $1::text::uuid \
+                   AND ($2::int4 IS NULL OR run_attempt = $2::int4) \
                  ORDER BY run_attempt DESC LIMIT 1"
             ),
-            &[&run],
+            &[&run, &attempt],
         )
         .await
         .map_err(db)?
@@ -1828,15 +1935,15 @@ pub(super) async fn archived_record_tx(
              AND run_created_at = (SELECT created_at FROM run_history \
                                    WHERE run_id = $1::text::uuid \
                                    ORDER BY run_attempt DESC LIMIT 1) \
-             AND run_attempt = (SELECT max(run_attempt) FROM run_history \
-                                WHERE run_id = $1::text::uuid) \
+             AND run_attempt = COALESCE($2::int4, (SELECT max(run_attempt) FROM run_history \
+                                WHERE run_id = $1::text::uuid)) \
              AND NOT (kind IN ('matrix_parent','reusable_caller') AND EXISTS (\
                   SELECT 1 FROM job_history c WHERE c.run_id = $1::text::uuid \
                   AND c.run_created_at = job_history.run_created_at \
                   AND c.run_attempt = job_history.run_attempt \
                   AND c.parent_job_id = job_history.job_id)) \
              ORDER BY job_id",
-            &[&run],
+            &[&run, &attempt],
         )
         .await
         .map_err(db)?;

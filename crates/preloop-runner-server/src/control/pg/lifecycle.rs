@@ -1626,8 +1626,33 @@ impl PgBackend {
                 record
             }
             // Archived: the run row is gone, its history rows are not.
-            None => super::lookups::archived_record_tx(&tx, run_id).await?,
+            None => super::lookups::archived_record_tx(&tx, run_id, None).await?,
         };
+        tx.commit().await.map_err(db)?;
+        Ok(record)
+    }
+
+    /// `run_record` for one attempt. The newest attempt reads exactly as
+    /// `run_record`; an earlier one projects its `run_history` head and
+    /// `job_history` snapshot (`archived_record_tx` with the attempt).
+    pub(super) async fn run_record_attempt(
+        &self,
+        run_id: RunId,
+        attempt: u64,
+    ) -> Result<RunRecord, ControlError> {
+        let resolved = {
+            let mut client = self.reader().await?;
+            let tx = client.transaction().await.map_err(db)?;
+            let resolved = super::lookups::resolve_attempt_tx(&tx, run_id, attempt).await?;
+            tx.commit().await.map_err(db)?;
+            resolved
+        };
+        if resolved.newest {
+            return self.run_record(run_id).await;
+        }
+        let mut client = self.reader().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let record = super::lookups::archived_record_tx(&tx, run_id, Some(resolved.number)).await?;
         tx.commit().await.map_err(db)?;
         Ok(record)
     }

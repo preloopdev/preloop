@@ -667,6 +667,13 @@ pub fn build_app(
             )),
         )
         .route(
+            "/api/v1/runs/:run_id/attempts",
+            get(list_run_attempts).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
             "/api/v1/runs/:run_id/logs",
             get(get_run_logs).route_layer(middleware::from_fn_with_state(
                 shared.clone(),

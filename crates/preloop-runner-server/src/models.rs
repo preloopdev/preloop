@@ -364,6 +364,19 @@ pub struct RunRecord {
     pub fork_approval_note: Option<String>,
 }
 
+/// One attempt of a run, as `GET /api/v1/runs/:run_id/attempts` lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunAttempt {
+    pub run_attempt: u64,
+    /// The attempt's run status, projected as `GET /api/v1/runs/:run_id` reports it.
+    pub status: ExecutionStatus,
+    /// The attempt's conclusion, once it has completed.
+    pub conclusion: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Lenient `workspace_snapshot` decode: a snapshot whose shape this binary no
 /// longer understands restores as `None` rather than failing the whole run
 /// load (the store is best-effort; one stale record must not brick startup).

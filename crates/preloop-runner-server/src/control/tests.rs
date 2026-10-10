@@ -7487,6 +7487,270 @@ pub(crate) mod suite {
             ExecutionStatus::Success
         );
     }
+
+    /// Sorted request ids, for comparing one attempt's executed requests.
+    fn sorted_request_ids(requests: &[TaskAgentJobRequestRecord]) -> Vec<i64> {
+        let mut ids: Vec<i64> = requests.iter().map(|request| request.request_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Complete one job of a submitted run through the backend.
+    async fn complete_job_as(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job: &str,
+        status: ExecutionStatus,
+    ) {
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId(job.to_owned()),
+                agent_job_id: None,
+                status,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The newest request minted for `job` of `run_id`.
+    async fn latest_request_id(backend: &dyn ControlBackend, run_id: RunId, job: &str) -> i64 {
+        backend
+            .request(RequestKey::Job(run_id, JobId(job.to_owned())))
+            .await
+            .unwrap()
+            .request_id
+    }
+
+    /// Re-run `run_id` in `mode` as its next attempt.
+    async fn rerun_as(backend: &dyn ControlBackend, run_id: RunId, mode: RerunMode) {
+        backend
+            .rerun_run(RerunRun {
+                run_id,
+                mode,
+                triggering_actor: None,
+                workflow_concurrency: None,
+                environment_rules: EnvironmentRulesMap::default(),
+                templates: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// One attempt read back: its record's conclusion and job statuses, and
+    /// the requests it executed.
+    async fn expect_attempt(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        attempt: u64,
+        conclusion: &str,
+        jobs: &[(&str, ExecutionStatus)],
+        requests: &[i64],
+    ) {
+        let record = backend.run_record_attempt(run_id, attempt).await.unwrap();
+        assert_eq!(record.run_attempt, attempt);
+        assert_eq!(
+            record.conclusion.as_deref(),
+            Some(conclusion),
+            "attempt {attempt}"
+        );
+        for (job, status) in jobs {
+            assert_eq!(
+                record.jobs[&JobId((*job).to_owned())],
+                *status,
+                "attempt {attempt}: job {job}"
+            );
+        }
+        let mut expected = requests.to_vec();
+        expected.sort_unstable();
+        let executed = backend.run_attempt_requests(run_id, attempt).await.unwrap();
+        assert_eq!(
+            sorted_request_ids(&executed),
+            expected,
+            "attempt {attempt}: executed requests"
+        );
+    }
+
+    /// The three attempts of `attempt_reads_serve_each_attempt`, read back
+    /// with the not-found cases.
+    async fn assert_three_attempts(backend: &dyn ControlBackend, run_id: RunId, ids: [i64; 5]) {
+        let [a_1, b_1, b_2, a_3, b_3] = ids;
+        let (success, failure) = (ExecutionStatus::Success, ExecutionStatus::Failure);
+        expect_attempt(
+            backend,
+            run_id,
+            1,
+            "failure",
+            &[("a", success), ("b", failure)],
+            &[a_1, b_1],
+        )
+        .await;
+        expect_attempt(
+            backend,
+            run_id,
+            2,
+            "failure",
+            &[("a", success), ("b", failure)],
+            &[a_1, b_2],
+        )
+        .await;
+        expect_attempt(
+            backend,
+            run_id,
+            3,
+            "success",
+            &[("a", success), ("b", success)],
+            &[a_3, b_3],
+        )
+        .await;
+        assert_eq!(backend.run_record(run_id).await.unwrap().run_attempt, 3);
+
+        for attempt in [0, 4] {
+            assert!(
+                matches!(
+                    backend.run_record_attempt(run_id, attempt).await,
+                    Err(ControlError::NotFound(_))
+                ),
+                "attempt {attempt} does not exist"
+            );
+            assert!(
+                matches!(
+                    backend.run_attempt_requests(run_id, attempt).await,
+                    Err(ControlError::NotFound(_))
+                ),
+                "attempt {attempt} has no requests"
+            );
+        }
+    }
+
+    /// Each attempt reads as it stood while it ran: the statuses the run had
+    /// then and the requests it executed. A job a re-run did not select keeps
+    /// the request it ran under. The same reads hold once the run is archived.
+    pub(crate) async fn attempt_reads_serve_each_attempt(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "a", 1), submit_job(run_id, "b", 2)],
+            ))
+            .await
+            .unwrap();
+        complete_job_as(backend, run_id, "a", ExecutionStatus::Success).await;
+        complete_job_as(backend, run_id, "b", ExecutionStatus::Failure).await;
+        let a_1 = latest_request_id(backend, run_id, "a").await;
+        let b_1 = latest_request_id(backend, run_id, "b").await;
+
+        // Attempt 2 re-runs only the failed job: `a` carries forward.
+        rerun_as(backend, run_id, RerunMode::Failed).await;
+        complete_job_as(backend, run_id, "b", ExecutionStatus::Failure).await;
+        let b_2 = latest_request_id(backend, run_id, "b").await;
+
+        // Attempt 3 re-runs everything and succeeds, so the run archives.
+        rerun_as(backend, run_id, RerunMode::All).await;
+        complete_job_as(backend, run_id, "a", ExecutionStatus::Success).await;
+        complete_job_as(backend, run_id, "b", ExecutionStatus::Success).await;
+        let a_3 = latest_request_id(backend, run_id, "a").await;
+        let b_3 = latest_request_id(backend, run_id, "b").await;
+        assert_ne!(a_3, a_1, "attempt 3 mints a fresh request for `a`");
+
+        let ids = [a_1, b_1, b_2, a_3, b_3];
+        assert_three_attempts(backend, run_id, ids).await;
+
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 120 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32, None)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "the settled attempt-3 run archives"
+        );
+        assert_three_attempts(backend, run_id, ids).await;
+    }
+
+    /// The three attempts of `attempt_reads_skip_cleared_pointers`: attempt 1
+    /// ran `skip` under `skip_1`; attempt 2 skipped it without a request, so
+    /// it executed nothing; attempt 3 ran it under `skip_3` alone.
+    async fn assert_skip_attempts(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        skip_1: i64,
+        skip_3: i64,
+    ) {
+        expect_attempt(
+            backend,
+            run_id,
+            1,
+            "failure",
+            &[("skip", ExecutionStatus::Failure)],
+            &[skip_1],
+        )
+        .await;
+        let skipped = backend.run_record_attempt(run_id, 2).await.unwrap();
+        assert_eq!(
+            skipped.jobs[&JobId("skip".to_owned())],
+            ExecutionStatus::Skipped
+        );
+        assert!(
+            backend
+                .run_attempt_requests(run_id, 2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a skipped attempt executes no request"
+        );
+        expect_attempt(
+            backend,
+            run_id,
+            3,
+            "success",
+            &[("skip", ExecutionStatus::Success)],
+            &[skip_3],
+        )
+        .await;
+    }
+
+    /// A job whose condition is false on a re-run concludes without minting,
+    /// which clears its execution pointer. Its attempt-1 request must not leak
+    /// into the attempt that mints the job again, live or archived.
+    pub(crate) async fn attempt_reads_skip_cleared_pointers(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "skip", 1)]);
+        submit.jobs[0].queued.if_condition = Some("${{ github.run_attempt != 2 }}".to_owned());
+        submit.record.github = serde_json::json!({"run_attempt": 1});
+        backend.submit_run(submit).await.unwrap();
+        complete_job_as(backend, run_id, "skip", ExecutionStatus::Failure).await;
+        let skip_1 = latest_request_id(backend, run_id, "skip").await;
+
+        // Attempt 2: the condition is false, so the job skips without a request.
+        rerun_as(backend, run_id, RerunMode::Failed).await;
+        // Attempt 3: the condition holds again and the job mints a fresh request.
+        rerun_as(backend, run_id, RerunMode::All).await;
+        complete_job_as(backend, run_id, "skip", ExecutionStatus::Success).await;
+        let skip_3 = latest_request_id(backend, run_id, "skip").await;
+        assert_ne!(skip_3, skip_1);
+
+        assert_skip_attempts(backend, run_id, skip_1, skip_3).await;
+        backend
+            .test_backdate_run_completed(run_id, epoch_us() - 120 * 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32, None)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "the settled attempt-3 run archives"
+        );
+        assert_skip_attempts(backend, run_id, skip_1, skip_3).await;
+    }
+
     /// Failed reruns preserve the execution pointer for carried-forward jobs,
     /// replace it for re-admitted jobs, and stamp the requesting actor without
     /// changing the original `github.actor`.
@@ -9409,6 +9673,23 @@ mod pg {
         };
         suite::rerun_then_archive_keeps_each_attempt(&backend).await;
     }
+
+    #[tokio::test]
+    async fn attempt_reads_serve_each_attempt() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::attempt_reads_serve_each_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn attempt_reads_skip_cleared_pointers() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::attempt_reads_skip_cleared_pointers(&backend).await;
+    }
+
     #[tokio::test]
     async fn rerun_request_links_actor_and_history() {
         let Some((_pg, backend)) = backend().await else {
@@ -9849,6 +10130,17 @@ mod lite {
     async fn rerun_then_archive_keeps_each_attempt() {
         suite::rerun_then_archive_keeps_each_attempt(&LiteBackend::in_memory().unwrap()).await;
     }
+
+    #[tokio::test]
+    async fn attempt_reads_serve_each_attempt() {
+        suite::attempt_reads_serve_each_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn attempt_reads_skip_cleared_pointers() {
+        suite::attempt_reads_skip_cleared_pointers(&LiteBackend::in_memory().unwrap()).await;
+    }
+
     #[tokio::test]
     async fn rerun_request_links_actor_and_history() {
         let backend = LiteBackend::in_memory().unwrap();

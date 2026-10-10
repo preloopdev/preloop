@@ -127,6 +127,24 @@ pub struct RunResponse {
     pub conclusion: Option<String>,
 }
 
+/// One attempt of a workflow run. A rerun starts the next attempt.
+#[derive(Debug, ToSchema)]
+pub struct RunAttemptResponse {
+    /// 1-based attempt number.
+    pub run_attempt: u64,
+    /// The run status `GET /api/v1/runs/{run_id}` reports for the attempt
+    /// (`queued`, `pending`, `in_progress`, `success`, `failure`, ...).
+    pub status: String,
+    /// Conclusion once the attempt completed (`success`, `failure`, ...).
+    pub conclusion: Option<String>,
+    /// When the attempt was created (RFC 3339).
+    pub created_at: String,
+    /// When the attempt started (RFC 3339).
+    pub started_at: Option<String>,
+    /// When the attempt completed (RFC 3339).
+    pub completed_at: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // OpenAPI document
 // ---------------------------------------------------------------------------
@@ -153,6 +171,7 @@ pub struct RunResponse {
         list_runs,
         get_run,
         get_run_logs,
+        list_run_attempts,
         live_run_logs,
         cancel_run,
         rerun_run,
@@ -196,7 +215,8 @@ pub struct RunResponse {
             ApiErrorResponse,
             RunAcceptedResponse,
             WorkflowSubmissionRequest,
-            RunResponse
+            RunResponse,
+            RunAttemptResponse
         )
     ),
     modifiers(&SecuritySchemes)
@@ -357,7 +377,10 @@ fn list_runs() {}
 /// Get a single workflow run.
 #[utoipa::path(
     get, path = "/api/v1/runs/{run_id}", tag = "Runs",
-    params(("run_id" = String, Path, description = "Run UUID")),
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("attempt" = Option<u64>, Query, description = "1-based attempt to read; omit for the newest attempt")
+    ),
     responses(
         (status = 200, description = "Run details", body = RunResponse),
         (status = 404, description = "Run not found", body = ApiErrorResponse)
@@ -372,7 +395,8 @@ fn get_run() {}
     params(
         ("run_id" = String, Path, description = "Run UUID"),
         ("job" = Option<String>, Query, description = "Workflow job key or agent job UUID; omit for every job"),
-        ("step" = Option<usize>, Query, description = "1-based step index within the job, in execution order")
+        ("step" = Option<usize>, Query, description = "1-based step index within the job, in execution order"),
+        ("attempt" = Option<u64>, Query, description = "1-based attempt whose logs to read; omit for every attempt, merged in request order")
     ),
     responses(
         (status = 200, content_type = "text/plain", description = "Merged log text", body = String),
@@ -384,6 +408,18 @@ fn get_run() {}
 )]
 
 fn get_run_logs() {}
+
+/// List every attempt of a workflow run, oldest first.
+#[utoipa::path(
+    get, path = "/api/v1/runs/{run_id}/attempts", tag = "Runs",
+    params(("run_id" = String, Path, description = "Run UUID")),
+    responses(
+        (status = 200, description = "Attempts of the run, oldest first", body = Vec<RunAttemptResponse>),
+        (status = 404, description = "Run not found", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn list_run_attempts() {}
 
 /// Follow one job's live console output as server-sent events.
 #[utoipa::path(

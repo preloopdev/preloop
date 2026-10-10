@@ -906,15 +906,29 @@ pub(super) fn run_record(
     tx: &Transaction<'_>,
     run_id: RunId,
 ) -> Result<Option<RunRecord>, ControlError> {
+    run_record_at(tx, run_id, None)
+}
+
+/// [`run_record`] for one attempt. `None` is the newest attempt: the live
+/// rows while the run exists, else its archive. `Some(n)` reads attempt `n`
+/// from `run_history`/`job_history` whether or not the run is still live,
+/// with no steps: the API attaches each job's manifest from the attempt's
+/// requests, as it does for an archived run.
+pub(super) fn run_record_at(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    attempt: Option<i64>,
+) -> Result<Option<RunRecord>, ControlError> {
     let run = codec::run_key(run_id);
-    let archived = tx
-        .prepare_cached(
-            "SELECT NOT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1) \
+    let archived = attempt.is_some()
+        || tx
+            .prepare_cached(
+                "SELECT NOT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1) \
                           AND EXISTS(SELECT 1 FROM run_history WHERE run_id = ?1)",
-        )
-        .map_err(db)?
-        .query_row([&run], |row| row.get::<_, bool>(0))
-        .map_err(db)?;
+            )
+            .map_err(db)?
+            .query_row([&run], |row| row.get::<_, bool>(0))
+            .map_err(db)?;
     // An archived run's live row is gone: the head read falls back to
     // `run_history`, the job projection to `job_history`.
     let head = if archived {
@@ -926,10 +940,11 @@ pub(super) fn run_record(
                     r.fork_approval_pending, r.fork_approval_requested_at, \
                     r.fork_approval_approved_at, r.fork_approval_note, \
                     r.reports_check_runs \
-             FROM run_history r WHERE r.run_id = ?1 ORDER BY r.run_attempt DESC LIMIT 1",
+             FROM run_history r WHERE r.run_id = ?1 AND (?2 IS NULL OR r.run_attempt = ?2) \
+             ORDER BY r.run_attempt DESC LIMIT 1",
         )
         .map_err(db)?
-        .query_row([&run], |row| {
+        .query_row(params![&run, attempt], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -1047,9 +1062,9 @@ pub(super) fn run_record(
         let mut stmt = tx
             .prepare_cached(
                 "SELECT job_id, status, base_id, outputs FROM job_history h \
-                 WHERE h.run_id = ?1 AND h.run_attempt = ( \
+                 WHERE h.run_id = ?1 AND h.run_attempt = COALESCE(?2, ( \
                      SELECT MAX(run_attempt) FROM job_history \
-                     WHERE run_id = ?1) \
+                     WHERE run_id = ?1)) \
                  AND NOT (h.kind = 'matrix_parent' AND EXISTS ( \
                      SELECT 1 FROM job_history c WHERE c.run_id = h.run_id \
                      AND c.run_attempt = h.run_attempt \
@@ -1057,7 +1072,7 @@ pub(super) fn run_record(
             )
             .map_err(db)?;
         let rows = stmt
-            .query_map([&run], |row| {
+            .query_map(params![&run, attempt], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1137,12 +1152,12 @@ pub(super) fn run_record(
         tx.prepare_cached(
             "SELECT job_id, display_name, NULL, NULL, NULL, check_run_id, \
                     annotations, base_id, CAST(NULL AS INTEGER), status FROM job_history \
-             WHERE run_id = ?1 AND run_attempt = ( \
-                 SELECT MAX(run_attempt) FROM job_history WHERE run_id = ?1) \
+             WHERE run_id = ?1 AND run_attempt = COALESCE(?2, ( \
+                 SELECT MAX(run_attempt) FROM job_history WHERE run_id = ?1)) \
              ORDER BY job_id",
         )
         .map_err(db)?
-        .query_map([&run], |row| {
+        .query_map(params![&run, attempt], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1229,8 +1244,11 @@ pub(super) fn run_record(
             job_continue_on_error.insert(job_id.clone(), flag != 0);
         }
         // Steps live in the attempt-scoped manifest (job_steps for live,
-        // step_history once archived); jobs never dispatched show `[]`.
-        let steps = if archived {
+        // step_history once archived); jobs never dispatched show `[]`. An
+        // attempt read carries none: the API attaches them from its requests.
+        let steps = if attempt.is_some() {
+            Vec::new()
+        } else if archived {
             super::steps::archived_attempt_steps(tx, &run, &job_id)?
         } else {
             super::steps::latest_attempt_steps(tx, &run, &job_id)?

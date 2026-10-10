@@ -346,6 +346,144 @@ async fn step_lists_and_job_logs_follow_execution_order() {
     assert_eq!(body, b"one\n");
 }
 
+/// The plan and agent job ids of `build`'s newest request.
+async fn latest_build_attempt(state: &AppState, run_id: RunId) -> (String, String) {
+    let inner = state.test_tx().await;
+    let request = inner
+        .job_requests
+        .values()
+        .filter(|request| request.run_id == run_id && request.job_id.0 == "build")
+        .max_by_key(|request| request.request_id)
+        .expect("build has a request");
+    (request.plan_id.clone(), request.agent_job_id.to_string())
+}
+
+/// Read a run's attempts back over HTTP: the attempt list, each attempt's
+/// record and its logs, and the selectors that must be refused. `second` is
+/// the newest attempt's `(status, conclusion)` at the time of the read.
+async fn assert_attempt_reads(app: &Router, run_id: RunId, second: (&str, Value)) {
+    let attempts = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/runs/{run_id}/attempts"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(attempts.as_array().map(Vec::len), Some(2), "{attempts}");
+    assert_eq!(attempts[0]["run_attempt"], 1);
+    assert_eq!(attempts[0]["status"], "failure");
+    assert_eq!(attempts[0]["conclusion"], "failure");
+    assert_eq!(attempts[1]["run_attempt"], 2);
+    assert_eq!(attempts[1]["status"], second.0);
+    assert_eq!(attempts[1]["conclusion"], second.1);
+
+    let first = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/runs/{run_id}?attempt=1"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(first["run_attempt"], 1);
+    assert_eq!(first["conclusion"], "failure");
+    assert_eq!(first["jobs_list"][0]["conclusion"], "failure");
+    assert_eq!(
+        first["jobs_list"][0]["steps"].as_array().map(Vec::len),
+        Some(3),
+        "attempt 1 reads its own step manifest"
+    );
+
+    let selected = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/runs/{run_id}?attempt=2"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(selected["run_attempt"], 2);
+    let newest = get_run_json(app, &run_id.to_string()).await;
+    assert_eq!(
+        newest["run_attempt"], 2,
+        "the default is the newest attempt"
+    );
+
+    let (status, body) = get_logs(
+        app,
+        format!("/api/v1/runs/{run_id}/logs?job=build&attempt=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"first attempt\n");
+    let (status, body) = get_logs(
+        app,
+        format!("/api/v1/runs/{run_id}/logs?job=build&attempt=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"second attempt\n");
+    let (status, body) = get_logs(app, format!("/api/v1/runs/{run_id}/logs?job=build")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, b"first attempt\nsecond attempt\n",
+        "the unselected log keeps every attempt, merged in request order"
+    );
+
+    for uri in [
+        format!("/api/v1/runs/{run_id}?attempt=0"),
+        format!("/api/v1/runs/{run_id}?attempt=one"),
+    ] {
+        let (status, _) = try_req(app, Method::GET, &uri, Value::Null).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    for uri in [
+        format!("/api/v1/runs/{run_id}?attempt=3"),
+        format!("/api/v1/runs/{run_id}/logs?job=build&attempt=3"),
+    ] {
+        let (status, _) = try_req(app, Method::GET, &uri, Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+/// A re-run keeps each attempt readable on its own: the attempt list, the
+/// run record and job steps the attempt ran with, and the attempt's own logs.
+/// The same reads hold after the run archives.
+#[tokio::test]
+async fn attempt_reads_serve_the_requested_attempt_live_and_archived() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let (plan_1, agent_1) = (jobs[0].1.clone(), jobs[0].2.clone());
+    write_merged_job_log(&temp, &plan_1, &agent_1, "first attempt\n").await;
+    complete_job(&state, run_id, "build", ExecutionStatus::Failure).await;
+
+    // Attempt 2 re-runs the failed job under a fresh request.
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/rerun"),
+        Value::Null,
+    )
+    .await;
+    let (plan_2, agent_2) = latest_build_attempt(&state, run_id).await;
+    assert_ne!(agent_2, agent_1, "the re-run mints a new attempt");
+    write_merged_job_log(&temp, &plan_2, &agent_2, "second attempt\n").await;
+    assert_attempt_reads(&app, run_id, ("queued", Value::Null)).await;
+
+    complete_job(&state, run_id, "build", ExecutionStatus::Success).await;
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(run_id, old).unwrap();
+        })
+        .await;
+    assert!(
+        state.test_archive_finished_runs_once().await >= 1,
+        "the settled run must archive"
+    );
+    assert_attempt_reads(&app, run_id, ("success", Value::from("success"))).await;
+}
+
 /// A completion reconciles the attempt that actually reported.
 ///
 /// `job_requests` is keyed by monotonic request id, so picking the first match

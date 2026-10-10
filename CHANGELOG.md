@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- **Per-attempt run reads**: a re-run keeps every earlier attempt, and the
+  native API can now read one. `GET /api/v1/runs/:run_id?attempt=N` returns
+  that attempt's record (job statuses, outputs, check runs, and each job's
+  steps as that attempt ran them), and `GET /api/v1/runs/:run_id/logs?attempt=N`
+  returns only the logs of the requests that attempt executed, with `job` and
+  `step` still applying. `GET /api/v1/runs/:run_id/attempts` lists the attempts
+  with their status, conclusion, and timestamps. Earlier attempts read from the
+  history tables, so they answer the same way after the run archives. Omitting
+  `attempt` is unchanged: the run record is the newest attempt, and the
+  unfiltered logs keep merging every attempt in request order. An `attempt`
+  outside `1..=newest` is 404; `attempt=0` is 400.
+
 ## [0.34.0] - 2026-10-09
 
 ### Changed
