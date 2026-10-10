@@ -19,7 +19,10 @@ async fn agent_request_ack_returns_no_content_for_all_aliases() {
     for (uri, body) in [
         ("/_apis/v1/AgentRequest/1/1", Value::Null),
         ("/runner/server/_apis/v1/AgentRequest/1/1", json!({})),
-        ("/acme/_apis/v1/AgentRequest/1/1", json!({"status": "accepted"})),
+        (
+            "/acme/_apis/v1/AgentRequest/1/1",
+            json!({"status": "accepted"}),
+        ),
     ] {
         assert_eq!(
             request_status_with_bearer(&app, Method::POST, uri, body, &runner_token).await,
@@ -40,7 +43,6 @@ async fn agent_request_ack_returns_no_content_for_all_aliases() {
         "ack route must retain runner bearer authentication",
     );
 }
-
 
 /// A worker that stops renewing while its session keeps polling is hung, not
 /// disconnected: the live session proves the guest is reachable, so the stale
