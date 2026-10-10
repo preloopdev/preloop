@@ -578,20 +578,33 @@ pub(crate) async fn report_completion(
 }
 
 /// Build a synthetic script Step for a job hook (ACTIONS_RUNNER_HOOK_JOB_STARTED
-/// / ACTIONS_RUNNER_HOOK_JOB_COMPLETED). The hook path is a shell script on the
-/// runner host, executed with the default shell exactly like a `run:` step.
+/// / ACTIONS_RUNNER_HOOK_JOB_COMPLETED). The hook variable carries a path on the
+/// runner host. Upstream `HostContext.GetDefaultShellForScript` routes `.js`
+/// hook scripts through `GetInternalNodeVersion()` (node24 by default,
+/// overridable via `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION`) and
+/// everything else through the default shell — mirrored here by emitting the
+/// file's contents as the script body and resolving node via the custom-shell
+/// template, so the hook runs on the same bundled internal runtime.
 pub(crate) fn make_hook_step(
     id: &str,
     context_name: &str,
     script_path: &str,
+    workspace: &str,
 ) -> super::steps_runner::Step {
+    let mut script = script_path.to_string();
+    let mut shell: Option<String> = None;
+    if script_path.to_ascii_lowercase().ends_with(".js") {
+        let node = internal_node_for_hook(std::path::Path::new(workspace));
+        shell = Some(format!("{node} {{0}}"));
+        script = std::fs::read_to_string(script_path).unwrap_or(script);
+    }
     super::steps_runner::Step {
         id: id.to_string(),
         context_name: context_name.to_string(),
         display_name: context_name.replace('_', " ").trim().to_string(),
         step_type: super::steps_runner::StepType::Script {
-            script: script_path.to_string(),
-            shell: None,
+            script,
+            shell,
             working_directory: None,
         },
         condition: Some("always()".to_string()),
@@ -601,6 +614,37 @@ pub(crate) fn make_hook_step(
         raw: serde_json::json!({}),
         is_background: false,
     }
+}
+
+/// The analogue of upstream `NodeUtil.GetInternalNodeVersion` for the one
+/// internal-node consumer this runner has: `.js` job hooks. node24 is the
+/// v2.338.0 default; `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION` forces a
+/// built-in version when it names one. Prefers the bundled externals binary
+/// found by walking up from the workspace; falls back to system `node` when
+/// externals are absent (`--no-externals` installs).
+fn internal_node_for_hook(workspace: &std::path::Path) -> String {
+    let version = match std::env::var("ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION") {
+        Ok(v) if v == "node20" => "node20",
+        _ => "node24",
+    };
+    if let Some(runner_root) = workspace
+        .ancestors()
+        .find(|dir| dir.join("externals").is_dir())
+    {
+        let bundled = if cfg!(target_os = "windows") {
+            runner_root.join("externals").join(version).join("node.exe")
+        } else {
+            runner_root
+                .join("externals")
+                .join(version)
+                .join("bin")
+                .join("node")
+        };
+        if bundled.is_file() {
+            return bundled.to_string_lossy().into_owned();
+        }
+    }
+    "node".to_string()
 }
 
 #[cfg(test)]

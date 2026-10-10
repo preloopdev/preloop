@@ -125,20 +125,20 @@ fn required_major_from_version_extracts_correctly() {
 ///
 /// Upstream v2.338.0 raised the *internal* node default to `node24`
 /// (`NodeUtil.GetInternalNodeVersion`: `_defaultNodeVersion` node20 → node24,
-/// `BuiltInNodeVersions` now `[node20, node24]`). This runner has no
-/// internal-node consumer to port that change to — every upstream
-/// `GetInternalNodeVersion` caller is absent or node-free here:
-/// the `--check` extensions (`CheckUtil`/`NodeJsCheck`, no `check`
-/// subcommand exists), the node-executed `hashFiles` expression (ours is
-/// native Rust in `preloop-gha-expressions`), job/container hook `.js` shell
-/// resolution (`HostContext.GetDefaultShellForScript` — hook env vars carry
-/// script *contents* here, executed by `script.rs` under the default shell),
-/// and the macOS `DYLD_INSERT_LIBRARIES` invoker in `ScriptHandler.cs`.
-/// Every node binary this runner execs is selected by this function, driven
-/// by `runs_using` plus the job-variable/flag inputs read in `run()`.
-/// `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION` is therefore intentionally
-/// unread, and node20 stays the phase-1 default for `node20` actions,
-/// matching upstream `useNode24ByDefault=false`.
+/// `BuiltInNodeVersions` now `[node20, node24]`). Almost every upstream
+/// `GetInternalNodeVersion` caller is absent or node-free here: the `--check`
+/// extensions (`CheckUtil`/`NodeJsCheck`, no `check` subcommand exists), the
+/// node-executed `hashFiles` expression (ours is native Rust in
+/// `preloop-gha-expressions`), and the macOS `DYLD_INSERT_LIBRARIES` invoker
+/// in `ScriptHandler.cs`. The one internal-node consumer that does exist —
+/// `.js` job/container hook shell resolution
+/// (`HostContext.GetDefaultShellForScript`) — lives in
+/// `completion.rs::internal_node_for_hook`, which honors
+/// `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION` and defaults to `node24`.
+/// Every *action* node binary this runner execs is still selected by this
+/// function, driven by `runs_using` plus the job-variable/flag inputs read in
+/// `run()`; node20 stays the phase-1 default for `node20` actions, matching
+/// upstream `useNode24ByDefault=false`.
 #[allow(clippy::too_many_arguments)]
 fn resolve_node_version(
     runs_using: &str,
@@ -741,19 +741,11 @@ mod tests {
     /// node consumer is ever added (e.g. a `check` command or node-executed
     /// `hashFiles`), it must resolve through a dedicated analogue that honors
     /// this env var and defaults to `node24`, not through this function.
-    /// `std::env::set_var` is unsafe under edition 2024; safe because no code
-    /// in this crate reads that variable (see the doc comment above).
-    #[allow(unsafe_code)]
+    /// `resolve` takes no environment input, so this test only asserts the
+    /// default selection — env mutation belongs in a dedicated consumer test
+    /// (in a child process) if one is ever added.
     #[test]
     fn forced_internal_node_version_has_no_effect() {
-        unsafe { std::env::set_var("ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION", "node24") };
-        let forced = resolve("node20", &[], None, None, false, false, "linux", "x64");
-        unsafe { std::env::remove_var("ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION") };
-
-        assert_eq!(forced.version, "node20");
-        assert!(forced.warnings.is_empty());
-
-        // And with nothing set at all: same default selection.
         let plain = resolve("node20", &[], None, None, false, false, "linux", "x64");
         assert_eq!(plain.version, "node20");
         assert!(plain.warnings.is_empty());
