@@ -136,17 +136,22 @@ impl LiveLogQueue {
                     return;
                 }
             };
-            connecting.connect_in_flight.store(false, Ordering::SeqCst);
             let Some(sender) = sender else {
+                // Stamp the failure before clearing in-flight: a concurrent
+                // retry_connect_if_due must observe either in_flight or the
+                // failure timestamp, never the empty gap between them.
                 connecting.record_connect_failure();
+                connecting.connect_in_flight.store(false, Ordering::SeqCst);
                 return;
             };
             // The drain task tears the socket down on shutdown; installing a
             // freshly dialed one afterwards would leak a live connection.
             if *connecting.shutdown_tx.borrow() {
+                connecting.connect_in_flight.store(false, Ordering::SeqCst);
                 return;
             }
             *connecting.ws.lock().await = Some(sender);
+            connecting.connect_in_flight.store(false, Ordering::SeqCst);
         });
     }
 
