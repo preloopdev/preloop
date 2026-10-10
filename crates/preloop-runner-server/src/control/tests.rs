@@ -5274,6 +5274,425 @@ pub(crate) mod suite {
         );
     }
 
+    /// A deferred callee job as `build_reusable_expansion` hands it to
+    /// `apply_expansion`: caller-prefixed id and needs, optional deferred matrix.
+    fn deferred_callee_job(
+        run_id: RunId,
+        job_id: &str,
+        needs: &[&str],
+        deferred_matrix: Option<&str>,
+    ) -> crate::control::logic::BuiltJob {
+        let plan: preloop_gha_protocol::JobPlan = serde_json::from_value(serde_json::json!({
+            "id": job_id,
+            "base_id": job_id,
+            "name": job_id,
+            "runs_on": ["self-hosted"],
+            "needs": needs,
+            "deferred_matrix": deferred_matrix,
+            "fail_fast": true,
+            "continue_on_error": false,
+        }))
+        .expect("callee plan decodes");
+        crate::control::logic::BuiltJob {
+            plan,
+            condition_context: preloop_gha_expressions::Context::default(),
+            artifacts: crate::runs::BuiltJobArtifacts {
+                agent_msg: job_message(job_id, 0),
+                job_request: request_record(run_id, job_id, 0),
+                id_token_granted: false,
+                oidc_ctx: crate::state::OidcJobContext {
+                    environment: None,
+                    job_workflow_ref: None,
+                    job_workflow_sha: None,
+                },
+                github_token_request: None,
+            },
+        }
+    }
+
+    /// A deferred reusable caller `caller` and its dependent `after`, plus
+    /// `extra` jobs. `inner` seeds the caller's recorded `inner_job_ids`: the
+    /// parser leaves them empty until the subtree materializes.
+    fn deferred_caller_run(run_id: RunId, inner: &[&str], extra: Vec<SubmitJob>) -> SubmitRun {
+        let mut caller = submit_job(run_id, "caller", 1);
+        caller.request = None;
+        caller.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
+            uses: "./.github/workflows/callee.yml".to_owned(),
+            workflow_file: "callee.yml".to_owned(),
+            workflow_sha: None,
+            workflow_repository: None,
+            depth: 1,
+        });
+        let mut after = submit_job(run_id, "after", 2);
+        after.queued.needs = vec![JobId("caller".to_owned())];
+        let mut jobs = vec![caller, after];
+        jobs.extend(extra);
+        let mut submit = submit_run(run_id, jobs);
+        submit.record.caller_plans.insert(
+            JobId("caller".to_owned()),
+            serde_json::from_value(serde_json::json!({
+                "id": "caller",
+                "base_id": "caller",
+                "name": "caller",
+                "runs_on": ["self-hosted"],
+            }))
+            .expect("a minimal caller plan"),
+        );
+        submit.record.reusable_calls.insert(
+            "caller".to_owned(),
+            preloop_gha_parser::ReusableCallMetadata {
+                caller_job_id: "caller".to_owned(),
+                output_definitions: BTreeMap::from([(
+                    "out".to_owned(),
+                    "${{ jobs.gen.outputs.val }}".to_owned(),
+                )]),
+                inner_job_ids: inner.iter().map(|id| (*id).to_owned()).collect(),
+                inputs: BTreeMap::new(),
+                caller_concurrency: None,
+                embedded_concurrency: None,
+                matrix: BTreeMap::new(),
+                if_condition: None,
+                workflow_sha: None,
+                workflow_repository: None,
+            },
+        );
+        submit
+    }
+
+    /// Leases the deferred caller without applying a subtree.
+    async fn lease_deferred_caller(backend: &dyn ControlBackend) {
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred caller must be leased");
+        assert_eq!(claim.job.job_id, JobId("caller".to_owned()));
+    }
+
+    /// Leases the deferred caller and applies `jobs` as its subtree.
+    async fn expand_deferred_caller(
+        backend: &dyn ControlBackend,
+        jobs: Vec<crate::control::logic::BuiltJob>,
+    ) {
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred caller must be leased");
+        assert_eq!(claim.job.job_id, JobId("caller".to_owned()));
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Reusable {
+                    caller_id: JobId("caller".to_owned()),
+                    jobs,
+                    reusable_calls: BTreeMap::new(),
+                }),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Leases the deferred matrix `job_id` and applies its legs.
+    async fn expand_deferred_matrix(
+        backend: &dyn ControlBackend,
+        job_id: &str,
+        legs: Vec<crate::control::logic::BuiltJob>,
+    ) {
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred matrix must be leased");
+        assert_eq!(claim.job.job_id, JobId(job_id.to_owned()));
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix { jobs: legs }),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Completes a subtree job through the public completion path (no runner).
+    async fn finish_callee(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &str,
+        outputs: BTreeMap<String, serde_json::Value>,
+    ) {
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId(job_id.to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs,
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Dispatches what the session can claim, completing each claim as it
+    /// lands, and returns the dispatched ids.
+    async fn drain_dispatched(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        session_id: &str,
+        runner_id: i64,
+    ) -> Vec<JobId> {
+        let mut dispatched = Vec::new();
+        for _ in 0..8 {
+            let PollOutcome::Claimed(claimed) = backend
+                .poll_session(poll(session_id, runner_id))
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            let job_id = claimed.queued.job_id.clone();
+            backend
+                .complete_job(JobCompletionInput {
+                    run_id,
+                    job_id: job_id.clone(),
+                    agent_job_id: Some(claimed.request.agent_job_id),
+                    status: ExecutionStatus::Success,
+                    outputs: BTreeMap::new(),
+                    runner_id: Some(runner_id),
+                })
+                .await
+                .unwrap();
+            dispatched.push(job_id);
+        }
+        dispatched
+    }
+
+    /// The fold's contract once the subtree finished: the caller is `Success`
+    /// with its resolved output, the dependent was released and dispatched, and
+    /// the run completed.
+    async fn assert_reusable_caller_folded(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        dispatched: &[JobId],
+    ) {
+        let record = backend.run_record(run_id).await.unwrap();
+        let caller = JobId("caller".to_owned());
+        assert_eq!(
+            record.jobs.get(&caller),
+            Some(&ExecutionStatus::Success),
+            "the caller must fold once its subtree finished"
+        );
+        assert_eq!(
+            record.job_outputs.get(&caller),
+            Some(&BTreeMap::from([(
+                "out".to_owned(),
+                serde_json::json!("hi")
+            )])),
+            "the fold resolves the caller's output"
+        );
+        assert!(
+            dispatched.contains(&JobId("after".to_owned())),
+            "the fold must release the dependent; dispatched {dispatched:?}"
+        );
+        assert_eq!(record.status, ExecutionStatus::Success, "the run must complete");
+    }
+
+    /// A deferred reusable caller whose subtree is one static job. The apply
+    /// must record the subtree as the caller's `inner_job_ids`, so completing
+    /// that job folds the caller and releases the dependent.
+    pub(crate) async fn reusable_caller_folds_after_a_deferred_callee(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(deferred_caller_run(run_id, &[], Vec::new()))
+            .await
+            .unwrap();
+        expand_deferred_caller(
+            backend,
+            vec![deferred_callee_job(run_id, "caller/gen", &[], None)],
+        )
+        .await;
+        finish_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            BTreeMap::from([("val".to_owned(), serde_json::json!("hi"))]),
+        )
+        .await;
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_reusable_caller_folded(backend, run_id, &dispatched).await;
+    }
+
+    /// The subtree holds a needs-driven matrix. Its expansion replaces the
+    /// matrix parent's id in the caller's `inner_job_ids` with its legs, so the
+    /// fold waits for the legs instead of the placeholder.
+    pub(crate) async fn reusable_caller_folds_after_a_deferred_matrix_callee(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(deferred_caller_run(run_id, &[], Vec::new()))
+            .await
+            .unwrap();
+        expand_deferred_caller(
+            backend,
+            vec![
+                deferred_callee_job(run_id, "caller/gen", &[], None),
+                deferred_callee_job(
+                    run_id,
+                    "caller/fan",
+                    &["caller/gen"],
+                    Some("${{ fromJSON(needs.gen.outputs.m) }}"),
+                ),
+            ],
+        )
+        .await;
+        finish_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            BTreeMap::from([
+                ("val".to_owned(), serde_json::json!("hi")),
+                (
+                    "m".to_owned(),
+                    serde_json::json!({"include": [{"n": 1}, {"n": 2}]}),
+                ),
+            ]),
+        )
+        .await;
+        expand_deferred_matrix(
+            backend,
+            "caller/fan",
+            vec![
+                built_matrix_leg(run_id, "caller/fan-1", "caller/fan", 1, 2),
+                built_matrix_leg(run_id, "caller/fan-2", "caller/fan", 2, 2),
+            ],
+        )
+        .await;
+        finish_callee(backend, run_id, "caller/fan-1", BTreeMap::new()).await;
+        finish_callee(backend, run_id, "caller/fan-2", BTreeMap::new()).await;
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_reusable_caller_folded(backend, run_id, &dispatched).await;
+    }
+
+    /// The caller's recorded `inner_job_ids` already name a deferred matrix
+    /// placeholder. Its expansion must splice the legs in for the placeholder
+    /// id, as an expansion-time fill of the list would have.
+    pub(crate) async fn reusable_caller_folds_after_a_pre_seeded_matrix_placeholder(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let mut fan = submit_job(run_id, "caller/fan", 4);
+        fan.queued.needs = vec![JobId("caller/gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(deferred_caller_run(
+                run_id,
+                &["caller/gen", "caller/fan"],
+                vec![submit_job(run_id, "caller/gen", 3), fan],
+            ))
+            .await
+            .unwrap();
+        lease_deferred_caller(backend).await;
+        finish_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            BTreeMap::from([
+                ("val".to_owned(), serde_json::json!("hi")),
+                (
+                    "m".to_owned(),
+                    serde_json::json!({"include": [{"n": 1}, {"n": 2}]}),
+                ),
+            ]),
+        )
+        .await;
+        expand_deferred_matrix(
+            backend,
+            "caller/fan",
+            vec![
+                built_matrix_leg(run_id, "caller/fan-1", "caller/fan", 1, 2),
+                built_matrix_leg(run_id, "caller/fan-2", "caller/fan", 2, 2),
+            ],
+        )
+        .await;
+        finish_callee(backend, run_id, "caller/fan-1", BTreeMap::new()).await;
+        finish_callee(backend, run_id, "caller/fan-2", BTreeMap::new()).await;
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_reusable_caller_folded(backend, run_id, &dispatched).await;
+    }
+
+    /// The control for the placeholder case: the subtree's jobs are submitted
+    /// up front and named in `inner_job_ids` from the start, so no splice is
+    /// needed and the fold must hold.
+    pub(crate) async fn reusable_caller_folds_with_prepopulated_legs(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(deferred_caller_run(
+                run_id,
+                &["caller/gen", "caller/build-1", "caller/build-2"],
+                vec![
+                    submit_job(run_id, "caller/gen", 3),
+                    submit_job(run_id, "caller/build-1", 4),
+                    submit_job(run_id, "caller/build-2", 5),
+                ],
+            ))
+            .await
+            .unwrap();
+        lease_deferred_caller(backend).await;
+        finish_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            BTreeMap::from([("val".to_owned(), serde_json::json!("hi"))]),
+        )
+        .await;
+        finish_callee(backend, run_id, "caller/build-1", BTreeMap::new()).await;
+        finish_callee(backend, run_id, "caller/build-2", BTreeMap::new()).await;
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_reusable_caller_folded(backend, run_id, &dispatched).await;
+    }
+
     /// A workflow-held run's row reads `queued` — its `holder_kind = 'run'`
     /// wait row carries the logical `Pending` — so it counts with
     /// in-progress, and its parked jobs are not job-level concurrency
@@ -8785,6 +9204,38 @@ mod pg {
         suite::reusable_caller_outputs_survive_a_reload(&backend).await;
     }
 
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_deferred_callee() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_after_a_deferred_callee(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_deferred_matrix_callee() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_after_a_deferred_matrix_callee(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_pre_seeded_matrix_placeholder() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_after_a_pre_seeded_matrix_placeholder(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_with_prepopulated_legs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_with_prepopulated_legs(&backend).await;
+    }
+
     /// Pool assignments on: the pairing path only runs in that mode.
     #[tokio::test]
     async fn pairing_marks_runner_pool_proven() {
@@ -10619,6 +11070,34 @@ mod lite {
     #[tokio::test]
     async fn reusable_caller_outputs_survive_a_reload() {
         suite::reusable_caller_outputs_survive_a_reload(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_deferred_callee() {
+        suite::reusable_caller_folds_after_a_deferred_callee(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_deferred_matrix_callee() {
+        suite::reusable_caller_folds_after_a_deferred_matrix_callee(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_pre_seeded_matrix_placeholder() {
+        suite::reusable_caller_folds_after_a_pre_seeded_matrix_placeholder(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_with_prepopulated_legs() {
+        suite::reusable_caller_folds_with_prepopulated_legs(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

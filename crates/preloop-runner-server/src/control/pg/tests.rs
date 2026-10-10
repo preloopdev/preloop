@@ -1263,14 +1263,77 @@ fn gate(group: &str) -> preloop_gha_parser::Concurrency {
     }
 }
 
-/// A max-parallel re-park must keep the waiter's FIFO slot and drop the
-/// finished holder's row: `park_waiter` re-inserted at the tail and left the
-/// group naming a terminal job, so the group was wedged behind a ghost holder.
-#[tokio::test]
-async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
-    let Some((_pg, node, _other)) = backend_pair().await else {
-        return skip_no_postgres();
-    };
+/// Queue states of one matrix cohort, in `job_order`.
+async fn cohort_queue_states(node: &PgBackend, run: RunId, base: &str) -> Vec<(String, String)> {
+    node.writer()
+        .await
+        .unwrap()
+        .query(
+            "SELECT job_id, queue_state FROM jobs \
+             WHERE run_id=$1::text::uuid AND base_id=$2 ORDER BY job_order",
+            &[&run.0.to_string(), &base],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect()
+}
+
+/// One job's queue state.
+async fn queue_state(node: &PgBackend, run: RunId, job: &str) -> String {
+    node.writer()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT queue_state FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run.0.to_string(), &job],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Completes `job` successfully through the public completion path.
+async fn complete_ok(node: &PgBackend, run: RunId, job: &str) {
+    node.complete_job(JobCompletionInput {
+        run_id: run,
+        job_id: JobId(job.to_owned()),
+        agent_job_id: None,
+        status: ExecutionStatus::Success,
+        outputs: BTreeMap::new(),
+        runner_id: None,
+    })
+    .await
+    .unwrap();
+}
+
+/// A reusable caller's plan: `job_specs.reusable_call` is written only for a
+/// submitted caller that has one.
+fn caller_plan(caller: &str) -> preloop_gha_protocol::JobPlan {
+    serde_json::from_value(serde_json::json!({
+        "id": caller,
+        "base_id": caller,
+        "name": caller,
+        "runs_on": ["self-hosted"],
+    }))
+    .expect("caller plan decodes")
+}
+
+/// Caller metadata whose `inner` job ids the fold waits on.
+fn caller_meta(caller: &str, inner: &[&str]) -> preloop_gha_parser::ReusableCallMetadata {
+    serde_json::from_value(serde_json::json!({
+        "caller_job_id": caller,
+        "output_definitions": {},
+        "inner_job_ids": inner,
+    }))
+    .expect("caller metadata decodes")
+}
+
+/// Parks `aw` behind `a` on gate `g1`, then completes `a` while cohort `m`
+/// (max-parallel 2) is saturated by `bb` and `cc`: `promote_waiter` re-parks
+/// `aw` at its FIFO slot and clears `g1`. Returns the run and `aw`'s wait id.
+async fn saturated_repark(node: &PgBackend) -> (RunId, i64) {
     let run = RunId::new();
     // Cohort `m` (max-parallel 2): `a` holds gate `g1`, `aw` waits behind it,
     // `bb` takes `g2`, and `cc` fills the other slot.
@@ -1299,23 +1362,8 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     submit.jobs[2].queued.concurrency = Some(gate("g2"));
     node.submit_run(submit).await.unwrap();
 
-    let complete = |job: &'static str| {
-        let node = &node;
-        async move {
-            node.complete_job(JobCompletionInput {
-                run_id: run,
-                job_id: JobId(job.to_owned()),
-                agent_job_id: None,
-                status: ExecutionStatus::Success,
-                outputs: BTreeMap::new(),
-                runner_id: None,
-            })
-            .await
-            .unwrap();
-        }
-    };
     // Park `aw` behind `a`.
-    complete("t1").await;
+    complete_ok(node, run, "t1").await;
     let wait_id: i64 = node
         .writer()
         .await
@@ -1328,7 +1376,7 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         .unwrap()
         .get(0);
     // Fill both slots so `aw`'s promotion finds the cohort saturated.
-    complete("t2").await;
+    complete_ok(node, run, "t2").await;
     node.writer()
         .await
         .unwrap()
@@ -1340,7 +1388,19 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         .await
         .unwrap();
     // Completing `a` releases `g1` and re-parks `aw`.
-    complete("a").await;
+    complete_ok(node, run, "a").await;
+    (run, wait_id)
+}
+
+/// A max-parallel re-park must keep the waiter's FIFO slot and drop the
+/// finished holder's row: `park_waiter` re-inserted at the tail and left the
+/// group naming a terminal job, so the group was wedged behind a ghost holder.
+#[tokio::test]
+async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let (run, wait_id) = saturated_repark(&node).await;
 
     let hold: Option<(String, Option<String>)> = node
         .writer()
@@ -1391,6 +1451,48 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         Some(wait_id),
         "the re-parked waiter must keep its FIFO position"
     );
+}
+
+/// A re-parked cohort waiter is retried when a completion on another gate frees
+/// the cohort's slot: `bb` leaves `g2` and `cc` is the only active leg, so `aw`
+/// must take `g1` back at its original FIFO position.
+#[tokio::test]
+async fn max_parallel_repark_is_retried_when_the_cohort_frees_on_another_gate() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let (run, wait_id) = saturated_repark(&node).await;
+    complete_ok(&node, run, "bb").await;
+    assert_eq!(
+        queue_state(&node, run, "aw").await,
+        "ready",
+        "the freed slot must admit the re-parked waiter"
+    );
+    let holder: Option<String> = node
+        .writer()
+        .await
+        .unwrap()
+        .query_opt(
+            "SELECT holder_job_id FROM concurrency_holds \
+             WHERE repository='owner/repo' AND group_name='g1'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    assert_eq!(holder.as_deref(), Some("aw"), "aw takes gate g1");
+    let waiting: i64 = node
+        .writer()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM concurrency_waits WHERE wait_id=$1",
+            &[&wait_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(waiting, 0, "the admitted waiter leaves the FIFO");
 }
 
 /// The last terminal JobSet member releases the shared concurrency hold.
@@ -1835,6 +1937,231 @@ async fn refresh_remaining_needs_reports_only_the_unblocked_dependent() {
     .unwrap();
     assert!(promotable, "deploy should unblock when test is terminal");
     tx.rollback().await.unwrap();
+}
+
+/// A `max-parallel: 2` cohort of three legs admits two at submit and parks the
+/// third at the cap. Completing an admitted leg frees a slot, so that completion
+/// must admit the parked leg. The leg names no sibling in `job_needs`, so the
+/// targeted refresh never reports it: the cohort check must.
+#[tokio::test]
+async fn max_parallel_completion_admits_the_capped_leg() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    let mut submit = submit_run(
+        run,
+        vec![
+            submit_job(run, "m1", 1),
+            submit_job(run, "m2", 2),
+            submit_job(run, "m3", 3),
+        ],
+    );
+    for job in &mut submit.jobs {
+        job.queued.base_id = "m".to_owned();
+        job.queued.max_parallel = Some(2);
+    }
+    node.submit_run(submit).await.unwrap();
+    let states = cohort_queue_states(&node, run, "m").await;
+    let admitted: Vec<&str> = states
+        .iter()
+        .filter(|(_, state)| state == "ready")
+        .map(|(job, _)| job.as_str())
+        .collect();
+    let parked: Vec<&str> = states
+        .iter()
+        .filter(|(_, state)| state == "blocked")
+        .map(|(job, _)| job.as_str())
+        .collect();
+    assert_eq!(admitted.len(), 2, "two legs fit under the cap: {states:?}");
+    assert_eq!(parked.len(), 1, "the third leg waits at the cap: {states:?}");
+
+    complete_ok(&node, run, admitted[0]).await;
+    assert_eq!(
+        queue_state(&node, run, parked[0]).await,
+        "ready",
+        "the completion freed a slot, so the parked leg must be admitted"
+    );
+}
+
+/// A dependent of a capped matrix base waits for every leg, the one parked at
+/// the cap included, and is released by the completion that finishes the base.
+#[tokio::test]
+async fn max_parallel_cohort_releases_its_dependent_after_the_last_leg() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    let mut submit = submit_run(
+        run,
+        vec![
+            submit_job(run, "m1", 1),
+            submit_job(run, "m2", 2),
+            submit_job(run, "m3", 3),
+            submit_job(run, "after", 4),
+        ],
+    );
+    for job in &mut submit.jobs {
+        if job.queued.job_id.0.starts_with('m') {
+            job.queued.base_id = "m".to_owned();
+            job.queued.max_parallel = Some(2);
+        }
+    }
+    // `job_needs` references job rows, so the dependent names each leg.
+    submit.jobs[3].queued.needs = ["m1", "m2", "m3"]
+        .map(|id| JobId(id.to_owned()))
+        .to_vec();
+    node.submit_run(submit).await.unwrap();
+    let states = cohort_queue_states(&node, run, "m").await;
+    let admitted: Vec<String> = states
+        .iter()
+        .filter(|(_, state)| state == "ready")
+        .map(|(job, _)| job.clone())
+        .collect();
+    let parked: Vec<String> = states
+        .iter()
+        .filter(|(_, state)| state == "blocked")
+        .map(|(job, _)| job.clone())
+        .collect();
+    assert_eq!(admitted.len(), 2, "two legs fit under the cap: {states:?}");
+    assert_eq!(parked.len(), 1, "the third leg waits at the cap: {states:?}");
+    assert_eq!(queue_state(&node, run, "after").await, "blocked");
+
+    complete_ok(&node, run, &admitted[0]).await;
+    assert_eq!(queue_state(&node, run, &parked[0]).await, "ready");
+    assert_eq!(
+        queue_state(&node, run, "after").await,
+        "blocked",
+        "the base still has legs running"
+    );
+    complete_ok(&node, run, &admitted[1]).await;
+    assert_eq!(
+        queue_state(&node, run, "after").await,
+        "blocked",
+        "the parked leg is still running"
+    );
+    complete_ok(&node, run, &parked[0]).await;
+    assert_eq!(
+        queue_state(&node, run, "after").await,
+        "ready",
+        "the last leg finished the base"
+    );
+}
+
+/// Nested reusable callers share inner job ids: `outer` waits on `outer/inner`
+/// and its leaf, and `outer/inner` waits on the leaf too. When the leaf
+/// completes, `outer` is still incomplete and visited first; the fold must keep
+/// looking so `outer/inner` folds, which is what lets `outer` fold.
+#[tokio::test]
+async fn reusable_fold_continues_past_an_incomplete_caller() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    let mut submit = submit_run(
+        run,
+        vec![
+            submit_job(run, "gate", 1),
+            submit_job(run, "outer", 2),
+            submit_job(run, "outer/a", 3),
+            submit_job(run, "outer/inner", 4),
+            submit_job(run, "outer/inner/leaf", 5),
+        ],
+    );
+    // Both callers wait on `gate`, which nobody completes, so they stay blocked
+    // while their inner jobs run.
+    for job in &mut submit.jobs {
+        if matches!(job.queued.job_id.0.as_str(), "outer" | "outer/inner") {
+            job.queued.needs = vec![JobId("gate".to_owned())];
+        }
+    }
+    submit
+        .record
+        .caller_plans
+        .insert(JobId("outer".to_owned()), caller_plan("outer"));
+    submit
+        .record
+        .caller_plans
+        .insert(JobId("outer/inner".to_owned()), caller_plan("outer/inner"));
+    submit.record.reusable_calls.insert(
+        "outer".to_owned(),
+        caller_meta("outer", &["outer/a", "outer/inner", "outer/inner/leaf"]),
+    );
+    submit.record.reusable_calls.insert(
+        "outer/inner".to_owned(),
+        caller_meta("outer/inner", &["outer/inner/leaf"]),
+    );
+    node.submit_run(submit).await.unwrap();
+
+    complete_ok(&node, run, "outer/a").await;
+    complete_ok(&node, run, "outer/inner/leaf").await;
+    let callers: Vec<(String, String, bool)> = node
+        .writer()
+        .await
+        .unwrap()
+        .query(
+            "SELECT job_id, status, outputs IS NOT NULL FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id IN ('outer', 'outer/inner') \
+             ORDER BY job_id",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(
+        callers,
+        vec![
+            ("outer".to_owned(), "success".to_owned(), true),
+            ("outer/inner".to_owned(), "success".to_owned(), true),
+        ],
+        "both nested callers fold once their inner jobs finish"
+    );
+}
+
+/// A completion must carry a terminal verdict. A non-terminal status would
+/// leave the job outside the queue with no promotion path, so it is rejected
+/// before anything is written.
+#[tokio::test]
+async fn complete_job_rejects_a_non_terminal_status() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(run, vec![submit_job(run, "solo", 1)]))
+        .await
+        .unwrap();
+    let before = queue_state(&node, run, "solo").await;
+    let rejected = node
+        .complete_job(JobCompletionInput {
+            run_id: run,
+            job_id: JobId("solo".to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::InProgress,
+            outputs: BTreeMap::new(),
+            runner_id: None,
+        })
+        .await
+        .err();
+    assert!(
+        matches!(rejected, Some(ControlError::BadRequest(_))),
+        "a non-terminal completion must be a bad request, got {rejected:?}"
+    );
+    let row = node
+        .writer()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT status, queue_state FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='solo'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
+    let (status, after): (String, String) = (row.get(0), row.get(1));
+    assert_eq!(after, before, "the rejected completion must not change the queue state");
+    assert_eq!(status, "queued", "the rejected completion must not change the status");
 }
 
 /// `cancel_fail_fast_siblings` cancels non-terminal legs sharing the base.
