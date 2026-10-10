@@ -330,7 +330,7 @@ async fn sqlite_recovery_restores_post_restart_state() {
 /// a disposable Postgres (the repo gate does not assume one is running).
 /// TLS URLs (`?sslmode=require|verify-full`) additionally need
 /// `PRELOOP_TEST_PG_CA` set to a PEM trust anchor for the test database.
-
+///
 /// Postgres twin of `sqlite_recovery_restores_post_restart_state`: the same
 /// state a restart must restore. Runs on its own database when
 /// `PRELOOP_TEST_POSTGRES_URL` names a Postgres server; skipped otherwise.
@@ -676,8 +676,7 @@ jobs:
         let inner = state.test_tx().await;
         assert_eq!(inner.ready().count(), 1);
         assert_eq!(inner.pending_jobs.len(), 2);
-        let job_id = inner.ready().next().unwrap().job_id.clone();
-        job_id
+        inner.ready().next().unwrap().job_id.clone()
     };
 
     request_json(
@@ -725,8 +724,7 @@ async fn completejob_annotations_are_stored_on_the_job_record() {
     let run_id = accepted["run_id"].as_str().unwrap().to_string();
     let job_id = {
         let inner = state.test_tx().await;
-        let id = inner.ready().next().unwrap().job_id.0.clone();
-        id
+        inner.ready().next().unwrap().job_id.0.clone()
     };
 
     // The listener's force-fail completion carries the worker-crash detail as
@@ -2449,10 +2447,10 @@ async fn live_log_websocket_cross_job_attempt_preserves_history() {
         loop {
             {
                 let inner = state.inner.lock().await;
-                if let Some(job_lines) = inner.live_log_lines.get(&agent_b) {
-                    if job_lines.lock().await.lines.len() == 1 {
-                        break;
-                    }
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_b)
+                    && job_lines.lock().await.lines.len() == 1
+                {
+                    break;
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
