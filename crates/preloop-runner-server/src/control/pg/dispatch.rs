@@ -1903,6 +1903,58 @@ async fn job_under_max_parallel(
     Ok(active < limit as i64)
 }
 
+/// Re-admits a cohort's waiters that `promote_waiter` parked at the cap.
+///
+/// A waiter that finds its cohort saturated is re-parked at its FIFO slot and
+/// its gate's holder row is cleared, so the gate is free and nothing wakes it:
+/// only a release of that gate reaches the waiter. Once `job_id` has left its
+/// cohort's active set, every free gate holding a waiter of `base_id` in this
+/// run is retried through the normal FIFO promotion. The head keeps its
+/// `wait_id`. A gate with a live holder is left to that holder's release.
+async fn retry_cohort_waiters(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    base_id: &str,
+) -> Result<(), ControlError> {
+    let groups = tx
+        .query(
+            "SELECT w.namespace_id, w.repository, w.group_name \
+             FROM concurrency_waits w \
+             JOIN jobs j ON j.run_id = w.holder_run_id AND j.job_id = w.holder_job_id \
+             WHERE w.holder_run_id = $1::text::uuid AND w.holder_kind = 'job' \
+               AND j.base_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM concurrency_holds h \
+                    WHERE h.namespace_id = w.namespace_id AND h.repository = w.repository \
+                      AND h.group_name = w.group_name) \
+             GROUP BY w.namespace_id, w.repository, w.group_name \
+             ORDER BY MIN(w.wait_id)",
+            &[&run_id.0.to_string(), &base_id],
+        )
+        .await
+        .map_err(db)?;
+    if groups.is_empty() || !job_under_max_parallel(tx, run_id, job_id).await? {
+        return Ok(());
+    }
+    for row in groups {
+        let namespace: String = row.get(0);
+        let key = (row.get::<_, String>(1), row.get::<_, String>(2));
+        // The order `acquire_gate` takes: foreign runs first, then the group.
+        lock_gate_runs(tx, &namespace, &key, run_id).await?;
+        // `lock_group` takes the group's mutex (a probe row). A holder that
+        // landed meanwhile keeps the gate; its release retries the cohort.
+        let Some(group) = lock_group(tx, &namespace, &key, &run_id.0.to_string()).await? else {
+            continue;
+        };
+        if group.holder.is_some() {
+            continue;
+        }
+        promote_after_release(backend, tx, &namespace, &key).await?;
+    }
+    Ok(())
+}
+
 /// A run-waiter promoted: the jobs it parked behind its own workflow gate go
 /// back to `blocked` and the normal promotion sweep decides what may run
 /// (needs, job-level gates, max-parallel) — mirroring lite's
@@ -6817,6 +6869,11 @@ impl PgBackend {
                 .map_err(db)?
                 .get(0);
             settled_bases.push((settled.clone(), settled_base));
+        }
+        // A settled leg may have freed a `max-parallel` slot that a waiter of
+        // its cohort was parked for behind a gate nothing else will release.
+        for (settled, settled_base) in &settled_bases {
+            retry_cohort_waiters(self, tx, run_id, settled, settled_base).await?;
         }
         // 5. Refresh the dependents' `remaining_needs` for everything that just
         // turned terminal. A dependent that is now `blocked` with zero needs left
