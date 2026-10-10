@@ -7446,9 +7446,11 @@ impl PgBackend {
                 sweep.outcome.skipped.push((run_id, node_id));
             }
             BuiltExpansion::Matrix { jobs } => {
+                let leg_ids: Vec<String> = jobs.iter().map(|job| job.plan.id.0.clone()).collect();
                 let registered = self
                     .register_expansion_jobs(&tx, &mut sweep, run_id, &node_id, jobs)
                     .await?;
+                splice_matrix_parent(&tx, run_id, &node_id, &leg_ids).await?;
                 // The parent leaves the run's status map; its legs take over.
                 if let Some(node) = sweep.node_mut(run_id, &node_id) {
                     node.has_children = true;
@@ -7469,9 +7471,11 @@ impl PgBackend {
                 jobs,
                 reusable_calls,
             } => {
+                let inner_ids: Vec<String> = jobs.iter().map(|job| job.plan.id.0.clone()).collect();
                 let registered = self
                     .register_expansion_jobs(&tx, &mut sweep, run_id, &caller_id, jobs)
                     .await?;
+                write_reusable_meta(&tx, run_id, &caller_id, &inner_ids, &reusable_calls).await?;
                 if let Some(node) = sweep.node_mut(run_id, &caller_id) {
                     node.status = ExecutionStatus::InProgress;
                     node.queue_state = logic::QueueState::None;
@@ -7689,6 +7693,108 @@ impl PgBackend {
         }
         Ok(registered)
     }
+}
+
+/// A job's reusable spec envelope (`job_specs.reusable_call`), if it has one.
+async fn load_reusable_spec(
+    tx: &Transaction<'_>,
+    run: &str,
+    job_id: &str,
+) -> Result<Option<ReusableNodeSpec>, ControlError> {
+    let json: Option<String> = tx
+        .query_opt(
+            "SELECT reusable_call::text FROM job_specs \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &job_id],
+        )
+        .await
+        .map_err(db)?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    json.map(|json| serde_json::from_str(&json).map_err(ControlError::backend))
+        .transpose()
+}
+
+async fn store_reusable_spec(
+    tx: &Transaction<'_>,
+    run: &str,
+    job_id: &str,
+    spec: &ReusableNodeSpec,
+) -> Result<(), ControlError> {
+    let json = serde_json::to_string(spec).map_err(ControlError::backend)?;
+    tx.execute(
+        "UPDATE job_specs SET reusable_call=$3::text::jsonb \
+         WHERE run_id=$1::text::uuid AND job_id=$2",
+        &[&run, &job_id, &json],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// The reusable-metadata half of a deferred reusable expansion (lite's
+/// `write_reusable_meta`): each callee's metadata lands on its spec row, and the
+/// caller's `inner_job_ids` become the subtree just registered, so the fold
+/// waits on exactly that subtree.
+async fn write_reusable_meta(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    caller_id: &JobId,
+    inner_ids: &[String],
+    callee_meta: &BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
+) -> Result<(), ControlError> {
+    let run = run_id.0.to_string();
+    for (job_id, meta) in callee_meta {
+        let mut spec = load_reusable_spec(tx, &run, job_id)
+            .await?
+            .unwrap_or_default();
+        spec.meta = Some(meta.clone());
+        store_reusable_spec(tx, &run, job_id, &spec).await?;
+    }
+    let Some(mut spec) = load_reusable_spec(tx, &run, &caller_id.0).await? else {
+        return Ok(());
+    };
+    let Some(meta) = spec.meta.as_mut() else {
+        return Ok(());
+    };
+    meta.inner_job_ids = inner_ids.to_vec();
+    store_reusable_spec(tx, &run, &caller_id.0, &spec).await
+}
+
+/// The matrix-parent half of a deferred matrix expansion (lite's
+/// `splice_matrix_parents`): each caller whose recorded subtree names the
+/// expanded parent has that id replaced by its legs, so the fold waits for the
+/// legs rather than a placeholder that never completes.
+async fn splice_matrix_parent(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    node_id: &JobId,
+    leg_ids: &[String],
+) -> Result<(), ControlError> {
+    let run = run_id.0.to_string();
+    let callers = tx
+        .query(
+            "SELECT job_id FROM job_specs WHERE run_id=$1::text::uuid \
+             AND reusable_call IS NOT NULL AND reusable_call <> 'null'::jsonb",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+    for row in callers {
+        let caller: String = row.get(0);
+        let Some(mut spec) = load_reusable_spec(tx, &run, &caller).await? else {
+            continue;
+        };
+        let Some(meta) = spec.meta.as_mut() else {
+            continue;
+        };
+        let Some(pos) = meta.inner_job_ids.iter().position(|id| id == &node_id.0) else {
+            continue;
+        };
+        meta.inner_job_ids
+            .splice(pos..=pos, leg_ids.iter().cloned());
+        store_reusable_spec(tx, &run, &caller, &spec).await?;
+    }
+    Ok(())
 }
 
 /// A built job's parent: its matrix parent when it expanded from one.
