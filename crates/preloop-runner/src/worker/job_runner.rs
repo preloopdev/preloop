@@ -904,22 +904,24 @@ pub async fn run_job(
 
     // DAP: OnJobCompleted — pause for debugger inspection.
     // Mirrors `JobExtension.cs` FinalizeJob block.
+    // A tunnel drop during the final step never reaches `on_step_starting`,
+    // so nothing has converted it into a job failure yet. Extract the
+    // recorded failure first (ending the immutable borrow of job_ctx), then
+    // surface it the way upstream `ReportTunnelDisconnected` does:
+    // infrastructure failure + category, before the completion payload.
+    let tunnel_failure = job_ctx
+        .dap_debugger
+        .as_ref()
+        .and_then(|dbg| dbg.tunnel_failure());
+    if let Some(preloop_dap::debugger::DapError::TunnelFailure(message)) = tunnel_failure {
+        error!("{message}");
+        job_ctx.infrastructure_error(
+            message,
+            super::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
+        );
+        job_ctx.job_status = super::contexts::JobStatus::Failure;
+    }
     if let Some(dbg) = job_ctx.dap_debugger.as_ref() {
-        // A tunnel drop during the final step never reaches
-        // `on_step_starting`, so nothing has converted it into a job
-        // failure yet. Surface it here the way upstream
-        // `ReportTunnelDisconnected` does: infrastructure failure +
-        // category, before the completion payload is built.
-        if let Some(preloop_dap::debugger::DapError::TunnelFailure(message)) =
-            dbg.tunnel_failure()
-        {
-            error!("{message}");
-            job_ctx.infrastructure_error(
-                message.clone(),
-                super::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
-            );
-            job_ctx.job_status = super::contexts::JobStatus::Failure;
-        }
         info!("Job completed — pausing for debugger inspection. Press continue to finish.");
         if let Err(e) = dbg.on_job_completed().await {
             warn!("DAP OnJobCompleted failed: {e}");
