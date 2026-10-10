@@ -8,6 +8,7 @@ use super::{
     ast::{BinaryOp, Expr},
     conditions::is_truthy,
     context::Context,
+    expr_parser::MAX_EXPRESSION_DEPTH,
 };
 
 fn function_arity(name: &str) -> Option<(usize, usize)> {
@@ -222,6 +223,7 @@ pub(super) const MAX_EVALUATED_VALUE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Default)]
 pub(super) struct EvalBudget {
     used_bytes: usize,
+    eval_depth: usize,
 }
 
 impl EvalBudget {
@@ -265,6 +267,28 @@ fn value_size(value: &Value) -> usize {
 }
 
 pub(super) fn eval(
+    expr: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    // Belt-and-braces recursion ceiling: the parser guarantees ASTs no
+    // deeper than MAX_EXPRESSION_DEPTH, but an AST built programmatically
+    // (or reaching `eval` through any future path that skips the parser)
+    // must still fail with an error instead of overflowing the thread
+    // stack, which aborts the process instead of unwinding. The depth
+    // counter is decremented on the way out so sequential sibling
+    // subtrees each get the full budget.
+    budget.eval_depth += 1;
+    if budget.eval_depth > MAX_EXPRESSION_DEPTH {
+        budget.eval_depth -= 1;
+        return Err(ExpressionError::TooDeep(MAX_EXPRESSION_DEPTH));
+    }
+    let result = eval_inner(expr, context, budget);
+    budget.eval_depth -= 1;
+    result
+}
+
+fn eval_inner(
     expr: &Expr,
     context: &Context,
     budget: &mut EvalBudget,

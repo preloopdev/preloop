@@ -1217,6 +1217,145 @@ mod official_semantics {
         }
     }
 
+    /// The round-3 crash (finding 1): `github[('x')]×500` folded 500
+    /// `Index` nodes through the member-suffix loop, which never counted
+    /// depth, and evaluating the 500-deep tree overflowed the thread stack —
+    /// aborting the whole server process. The chain must hit the same
+    /// ceiling as every other nesting shape and surface as `TooDeep`,
+    /// never as a crash.
+    #[test]
+    fn deeply_nested_index_chain_errors_instead_of_overflowing() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // `parse_expr` consumes one level for the root and the parenthesized
+        // key consumes one more, so this is the largest accepted bracket
+        // chain at the top level.
+        let ok_segments = MAX_EXPRESSION_DEPTH - 2;
+        let ok = format!("github{}", "[('x')]".repeat(ok_segments));
+        assert!(
+            validate_expression(&ok).is_ok(),
+            "{ok_segments}-segment index chain should still parse"
+        );
+        assert!(
+            eval_expression(&ok, &Context::default()).is_ok(),
+            "{ok_segments}-segment index chain should still evaluate"
+        );
+
+        let too_deep = format!("github{}", "[('x')]".repeat(ok_segments + 1));
+        assert!(
+            matches!(
+                validate_expression(&too_deep),
+                Err(ExpressionError::TooDeep(_))
+            ),
+            "over-long index chain should be rejected"
+        );
+
+        // The original killer input: 500 bracket pairs.
+        let killer = format!("github{}", "[('x')]".repeat(500));
+        assert!(
+            matches!(
+                validate_expression(&killer),
+                Err(ExpressionError::TooDeep(_))
+            ),
+            "500-segment index chain should be rejected, not crash"
+        );
+    }
+
+    /// Member chains after a call (`fn()[0][('k')]…`) run through
+    /// `parse_member_suffix`, the loop named in the finding; dot and
+    /// literal-bracket segments fold onto the same spine and count toward
+    /// the same ceiling.
+    #[test]
+    fn member_chain_depth_limit_covers_suffix_and_flat_segments() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        let too_deep_call = format!("toJSON('{{}}'){}", "[('x')]".repeat(MAX_EXPRESSION_DEPTH));
+        assert!(
+            matches!(
+                validate_expression(&too_deep_call),
+                Err(ExpressionError::TooDeep(_))
+            ),
+            "post-call index chain should be depth-limited"
+        );
+        let ok_call = format!(
+            "toJSON('{{}}'){}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 2)
+        );
+        assert!(validate_expression(&ok_call).is_ok());
+
+        let too_deep_dots = format!("a{}", ".b".repeat(MAX_EXPRESSION_DEPTH));
+        assert!(
+            matches!(
+                validate_expression(&too_deep_dots),
+                Err(ExpressionError::TooDeep(_))
+            ),
+            "dot chain should be depth-limited"
+        );
+        let ok_dots = format!("a{}", ".b".repeat(MAX_EXPRESSION_DEPTH - 1));
+        assert!(validate_expression(&ok_dots).is_ok());
+    }
+
+    /// The evaluator's own recursion ceiling: a programmatically built tree
+    /// deeper than the parser allows must still fail as `TooDeep` instead
+    /// of overflowing the stack.
+    #[test]
+    fn evaluator_rejects_programmatically_deep_trees() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+        use crate::ast::Expr;
+        use crate::evaluator::{EvalBudget, eval};
+
+        // Each `Index` level costs one `eval` entry, plus one for the leaf:
+        // 127 levels fit exactly under the ceiling, 128 do not.
+        let build = |levels: usize| {
+            let mut expr = Expr::Literal(serde_json::Value::Null);
+            for _ in 0..levels {
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    key: Box::new(Expr::Literal(json!("k"))),
+                };
+            }
+            expr
+        };
+
+        let within = build(MAX_EXPRESSION_DEPTH - 1);
+        let mut budget = EvalBudget::default();
+        assert!(
+            eval(&within, &Context::default(), &mut budget).is_ok(),
+            "a tree at the ceiling must still evaluate"
+        );
+
+        let over = build(MAX_EXPRESSION_DEPTH);
+        let mut budget = EvalBudget::default();
+        assert!(
+            matches!(
+                eval(&over, &Context::default(), &mut budget),
+                Err(ExpressionError::TooDeep(_))
+            ),
+            "a tree past the ceiling must fail, not overflow"
+        );
+    }
+
+    /// Member chains nested inside bracket keys (`a[b[c[…]]]`) share one
+    /// cumulative depth budget: without it each nesting level would reset
+    /// the count and an attacker could still build a thousands-deep tree.
+    #[test]
+    fn nested_key_member_chains_share_one_depth_budget() {
+        // 60 key-nested levels, each carrying a 60-segment trailing chain:
+        // far past the budget in total member segments.
+        let mut expr = "x".to_owned();
+        for _ in 0..60 {
+            expr = format!("a[{expr}]{}", "[0]".repeat(60));
+        }
+        assert!(
+            matches!(validate_expression(&expr), Err(ExpressionError::TooDeep(_))),
+            "nested key chains must be rejected, not crash"
+        );
+
+        // A single computed key one level deep stays well within budget.
+        assert!(validate_expression("a[b['k']]").is_ok());
+        assert!(validate_expression("a[b[c['k']]]").is_ok());
+    }
+
     #[test]
     fn tojson_pretty_prints_with_two_space_indent() {
         // Live-verified against GitHub-hosted runners 2026-09-19.

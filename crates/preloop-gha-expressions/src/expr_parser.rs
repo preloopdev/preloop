@@ -15,6 +15,15 @@ use super::{
 /// nesting level costs ~10 KiB on aarch64 Linux: 256 needed 2-3 MiB and
 /// aborted there before the guard fired. The official runner caps expression
 /// trees at depth 50, so nothing a real workflow can express comes near this.
+///
+/// Member-access chains (`a.b[0][('k')]…`) fold left-leaning `Index` /
+/// `MemberAccess` nodes, deepening the AST exactly like nested parentheses,
+/// so every folded segment permanently consumes one level of this budget
+/// (unlike the scoped `enter()` calls, the member loops never unwind it: a
+/// bracket key can itself contain a member chain, so only a cumulative
+/// count bounds the total). A parsed expression therefore holds at most
+/// `MAX_EXPRESSION_DEPTH` member segments, which keeps every AST walker and
+/// the evaluator's own recursion guard well clear of the stack.
 pub(crate) const MAX_EXPRESSION_DEPTH: usize = 128;
 
 pub(crate) struct Parser {
@@ -34,6 +43,11 @@ impl Parser {
 
     /// Enter one nesting level, refusing input past the depth ceiling. An
     /// over-deep error aborts the whole parse, so the counter is not unwound.
+    ///
+    /// Member-access segments use this too, but permanently: the member
+    /// loops never decrement the counter, so a bracket key containing its
+    /// own member chain (`a[b[c[…]]]`) keeps consuming the same budget and
+    /// the total number of member segments in one expression stays bounded.
     fn enter(&mut self) -> Result<(), ExpressionError> {
         self.depth += 1;
         if self.depth > MAX_EXPRESSION_DEPTH {
@@ -184,21 +198,28 @@ impl Parser {
             let call = Expr::Call { name, args };
             // Check for trailing member access: fromJSON('...').*.name,
             // fn()[0], or fn()[expr.key]
-            Ok(self.parse_member_suffix(call))
+            self.parse_member_suffix(call)
         } else {
             let mut base = Expr::Path(vec![name]);
             loop {
                 match self.current() {
                     // Dot access: a.b or a.*
+                    //
+                    // Each folded segment permanently consumes one depth
+                    // level (see `enter`): member chains deepen the AST like
+                    // nested parentheses, and only a cumulative count bounds
+                    // chains nested inside bracket keys.
                     Token::Dot => {
                         self.advance();
                         match self.current().clone() {
                             Token::Ident(segment) => {
                                 self.advance();
+                                self.enter()?;
                                 push_path_segment(&mut base, segment);
                             }
                             Token::Star => {
                                 self.advance();
+                                self.enter()?;
                                 push_path_segment(&mut base, "*".to_string());
                             }
                             other => {
@@ -238,11 +259,13 @@ impl Parser {
                         match literal {
                             Some(segment) => {
                                 self.expect(Token::RBracket)?;
+                                self.enter()?;
                                 push_path_segment(&mut base, segment);
                             }
                             None => {
                                 let key = self.parse_expr()?;
                                 self.expect(Token::RBracket)?;
+                                self.enter()?;
                                 base = Expr::Index {
                                     base: Box::new(base),
                                     key: Box::new(key),
@@ -259,7 +282,17 @@ impl Parser {
 
     /// Parse trailing `.ident`, `.*`, `['key']`, or `[expr]` segments after
     /// an expression, folding them onto `base`.
-    fn parse_member_suffix(&mut self, mut base: Expr) -> Expr {
+    ///
+    /// Each folded segment permanently consumes one expression depth level
+    /// (see `enter`): a long bracket run deepens the AST exactly like nested
+    /// parentheses, and without this `github[('x')]×500` built a 500-deep
+    /// tree whose evaluation overflowed the thread stack and aborted the
+    /// whole server process. The count is cumulative across the whole parse
+    /// — a bracket key can itself contain a member chain (`a[b[c[…]]]`), so
+    /// only a never-unwound count bounds the total. A depth violation is
+    /// fatal to the parse (unlike a malformed key, which still backs off);
+    /// it must never be swallowed into a silently truncated expression.
+    fn parse_member_suffix(&mut self, mut base: Expr) -> Result<Expr, ExpressionError> {
         loop {
             match self.current() {
                 Token::Dot => {
@@ -267,10 +300,12 @@ impl Parser {
                     match self.current().clone() {
                         Token::Ident(segment) => {
                             self.advance();
+                            self.enter()?;
                             push_path_segment(&mut base, segment);
                         }
                         Token::Star => {
                             self.advance();
+                            self.enter()?;
                             push_path_segment(&mut base, "*".to_string());
                         }
                         _ => break,
@@ -302,6 +337,7 @@ impl Parser {
                             if self.expect(Token::RBracket).is_err() {
                                 break;
                             }
+                            self.enter()?;
                             push_path_segment(&mut base, segment);
                         }
                         None => {
@@ -313,11 +349,13 @@ impl Parser {
                                 Ok(key)
                             }) {
                                 Ok(key) => {
+                                    self.enter()?;
                                     base = Expr::Index {
                                         base: Box::new(base),
                                         key: Box::new(key),
                                     };
                                 }
+                                Err(e @ ExpressionError::TooDeep(_)) => return Err(e),
                                 Err(_) => {
                                     self.index = save;
                                     break;
@@ -329,7 +367,7 @@ impl Parser {
                 _ => break,
             }
         }
-        base
+        Ok(base)
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), ExpressionError> {
