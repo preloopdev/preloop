@@ -1974,7 +1974,11 @@ async fn max_parallel_completion_admits_the_capped_leg() {
         .map(|(job, _)| job.as_str())
         .collect();
     assert_eq!(admitted.len(), 2, "two legs fit under the cap: {states:?}");
-    assert_eq!(parked.len(), 1, "the third leg waits at the cap: {states:?}");
+    assert_eq!(
+        parked.len(),
+        1,
+        "the third leg waits at the cap: {states:?}"
+    );
 
     complete_ok(&node, run, admitted[0]).await;
     assert_eq!(
@@ -2008,9 +2012,7 @@ async fn max_parallel_cohort_releases_its_dependent_after_the_last_leg() {
         }
     }
     // `job_needs` references job rows, so the dependent names each leg.
-    submit.jobs[3].queued.needs = ["m1", "m2", "m3"]
-        .map(|id| JobId(id.to_owned()))
-        .to_vec();
+    submit.jobs[3].queued.needs = ["m1", "m2", "m3"].map(|id| JobId(id.to_owned())).to_vec();
     node.submit_run(submit).await.unwrap();
     let states = cohort_queue_states(&node, run, "m").await;
     let admitted: Vec<String> = states
@@ -2024,7 +2026,11 @@ async fn max_parallel_cohort_releases_its_dependent_after_the_last_leg() {
         .map(|(job, _)| job.clone())
         .collect();
     assert_eq!(admitted.len(), 2, "two legs fit under the cap: {states:?}");
-    assert_eq!(parked.len(), 1, "the third leg waits at the cap: {states:?}");
+    assert_eq!(
+        parked.len(),
+        1,
+        "the third leg waits at the cap: {states:?}"
+    );
     assert_eq!(queue_state(&node, run, "after").await, "blocked");
 
     complete_ok(&node, run, &admitted[0]).await;
@@ -2160,8 +2166,14 @@ async fn complete_job_rejects_a_non_terminal_status() {
         .await
         .unwrap();
     let (status, after): (String, String) = (row.get(0), row.get(1));
-    assert_eq!(after, before, "the rejected completion must not change the queue state");
-    assert_eq!(status, "queued", "the rejected completion must not change the status");
+    assert_eq!(
+        after, before,
+        "the rejected completion must not change the queue state"
+    );
+    assert_eq!(
+        status, "queued",
+        "the rejected completion must not change the status"
+    );
 }
 
 /// `cancel_fail_fast_siblings` cancels non-terminal legs sharing the base.

@@ -5497,13 +5497,19 @@ pub(crate) mod suite {
             dispatched.contains(&JobId("after".to_owned())),
             "the fold must release the dependent; dispatched {dispatched:?}"
         );
-        assert_eq!(record.status, ExecutionStatus::Success, "the run must complete");
+        assert_eq!(
+            record.status,
+            ExecutionStatus::Success,
+            "the run must complete"
+        );
     }
 
     /// A deferred reusable caller whose subtree is one static job. The apply
     /// must record the subtree as the caller's `inner_job_ids`, so completing
     /// that job folds the caller and releases the dependent.
-    pub(crate) async fn reusable_caller_folds_after_a_deferred_callee(backend: &dyn ControlBackend) {
+    pub(crate) async fn reusable_caller_folds_after_a_deferred_callee(
+        backend: &dyn ControlBackend,
+    ) {
         let run_id = RunId::new();
         let runner = backend
             .register_runner(register_runner("r1"))
@@ -5654,9 +5660,7 @@ pub(crate) mod suite {
     /// The control for the placeholder case: the subtree's jobs are submitted
     /// up front and named in `inner_job_ids` from the start, so no splice is
     /// needed and the fold must hold.
-    pub(crate) async fn reusable_caller_folds_with_prepopulated_legs(
-        backend: &dyn ControlBackend,
-    ) {
+    pub(crate) async fn reusable_caller_folds_with_prepopulated_legs(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
             .register_runner(register_runner("r1"))
