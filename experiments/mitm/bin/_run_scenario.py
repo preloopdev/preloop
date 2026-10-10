@@ -90,7 +90,7 @@ def declared_job_ids(workflow_path: Path) -> set[str]:
     return ids
 
 
-def assert_capture_is_our_job(capture_dir: Path, workflow_path: Path) -> None:
+def assert_capture_is_our_job(capture_dir: Path, workflow_path: Path, run_id: str | None = None) -> None:
     """Fail the recording if the runner acquired someone else's job.
 
     The runner is a generic `self-hosted` agent in a shared repo: it asks for
@@ -104,6 +104,28 @@ def assert_capture_is_our_job(capture_dir: Path, workflow_path: Path) -> None:
     declared = declared_job_ids(workflow_path)
     if not declared:
         return
+    # The reconstructed workflow is a wire-replay stand-in, not the repo's real
+    # workflow file: its job ids can differ from the actual dispatched run's.
+    # Authoritative membership check = the job names GitHub reports for the run
+    # id we dispatched; fall back to declared ids only if the API is unusable.
+    expected_names: set[str] | None = None
+    if run_id:
+        owner = os.environ.get("GITHUB_OWNER")
+        repo = os.environ.get("GITHUB_REPO")
+        gh_env = os.environ.copy()
+        for key in ("https_proxy","HTTPS_PROXY","http_proxy","HTTP_PROXY","all_proxy","ALL_PROXY"):
+            gh_env.pop(key, None)
+        try:
+            result = subprocess.run(
+                ["gh", "api", f"repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
+                 "--jq", ".jobs[].name"],
+                check=True, capture_output=True, text=True, env=gh_env, timeout=30,
+            )
+            names = {n.strip() for n in result.stdout.splitlines() if n.strip()}
+            if names:
+                expected_names = names
+        except Exception as error:
+            log(f"run-jobs lookup failed ({error}); falling back to declared ids", "wait")
     for flow in load_flows(capture_dir):
         if "acquirejob" not in (flow.get("path") or ""):
             continue
@@ -117,6 +139,8 @@ def assert_capture_is_our_job(capture_dir: Path, workflow_path: Path) -> None:
         text = "".join(p.read_text() for p in sorted(source.rglob("*.y*ml")))
         # A matrix cell renders as `build (ubuntu-latest, 18)`; an explicit
         # `name:` renders as that name, which appears in the workflow source.
+        if expected_names is not None and display in expected_names:
+            return
         if any(display == i or display.startswith(f"{i} (") for i in declared):
             return
         if display in text:
@@ -391,7 +415,7 @@ def main():
 
     # The capture is only meaningful if it is a capture of *this* scenario.
     if args.backend == "official" and last_workflow_path is not None:
-        assert_capture_is_our_job(capture_dir, last_workflow_path)
+        assert_capture_is_our_job(capture_dir, last_workflow_path, run_id=last_run_id)
 
     log("scenario complete", "ok")
 
