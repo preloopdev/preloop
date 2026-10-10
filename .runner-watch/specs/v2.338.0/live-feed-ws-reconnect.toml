@@ -1,0 +1,50 @@
+change_id = "live-feed-ws-reconnect"
+upstream_version = "v2.338.0"
+category = "nit"
+tags = ["runner", "twirp", "websocket", "live-logs"]
+ai_status = "manual-delta-analysis"
+
+[description]
+what = '''
+ResultsServer live console feed websocket hardening: the client is now
+recreated when a connect attempt fails (previously it reused a disposed
+socket and could wedge), disposed on connect failure, and the bearer token
+comes from the stored field instead of a parameter — net effect: reconnects
+actually re-establish after the first failure and the 10-minute retry window
+keeps working.
+'''
+why = '''
+A failed first connect used to leave the feed permanently dead; jobs then
+lost live console streaming for the rest of the run.
+'''
+runner_behavior = '''
+On ws connect/send failure: dispose socket, recreate with fresh
+Authorization+User-Agent headers, reconnect with random backoff; retry
+window ~10 minutes since last failure.
+'''
+failure_mode = '''
+If our Twirp live-log client wedges on first failed connect the same way,
+live logs silently stop streaming for long jobs.
+'''
+
+[wire]
+request = "GET wss://<results>/liveConsoleFeed (Bearer <job token>)"
+expected_response = "Reconnect cycle recreates socket; auth/UA headers resent each attempt"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/worker/live_logs.rs", area = "ws client lifecycle + reconnect" },
+]
+
+[implementation]
+approach = '''
+Audit live_logs.rs ws connect path: socket recreated per attempt (not reused
+after failure), headers re-applied, failure timestamp drives the same ~10min
+retry ceiling. Align divergences only — no new protocol surface.
+'''
+test = "Unit/integration: forced first-connect failure then stub endpoint up → feed re-establishes."
+
+[[source_entries]]
+file = "src/Runner.Common/ResultsServer.cs"
+change_type = "field_added"
+fields = ["CreateWebSocketClient()"]

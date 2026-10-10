@@ -1,0 +1,75 @@
+change_id = "broker-session-id-delete"
+upstream_version = "v2.338.0"
+category = "concern"
+tags = ["protocol", "broker", "session"]
+ai_status = "manual-delta-analysis"
+
+[description]
+what = '''
+v2.338.0 passes the owned session id explicitly on broker session teardown:
+BrokerServer.DeleteSessionAsync now takes (Guid sessionId, CancellationToken)
+and BrokerHttpClient issues DELETE {brokerBase}/session?sessionId={guid}
+instead of the bare DELETE {brokerBase}/session (v2.336.0). The session id
+moved from the X-Actions-Session header to the sessionId query parameter.
+Additionally, BrokerMessageListener now creates sessions with
+TaskAgentSession.BrokerSession = true (serialized "brokerSession": true).
+'''
+why = '''
+Broker leaks session bindings on long-lived engines; the explicit sessionId
+lets the broker drop the correct session instead of relying on the
+implicitly-owned session. Server must pair the correct session row.
+'''
+runner_behavior = '''
+POST {broker}/session body gains "brokerSession": true.
+DELETE {broker}/session?sessionId=<uuid> on listener shutdown.
+'''
+failure_mode = '''
+preloop server already accepts DELETE /session (root) with sessionId query
+param OR X-Actions-Session header, and /session/:session_id path variants —
+no server change needed. preloop-runner still sends X-Actions-Session header
+without the query param, which remains accepted but diverges from official
+bytes captured in new-version goldens.
+'''
+
+[wire]
+request = '''
+DELETE {broker}/session?sessionId=9f0b...   (was: DELETE /session + X-Actions-Session header)
+POST  {broker}/session                     body: {..., "brokerSession": true}
+'''
+expected_response = "204 No Content (idempotent)"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/client/broker.rs", area = "delete_session URL + session create body" },
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/listener/broker_listener.rs", area = "session_body json! (add brokerSession)" },
+]
+
+[implementation]
+approach = '''
+client/broker.rs::delete_session: change URL to `{base}/session?sessionId={id}`
+(query param, drop the X-Actions-Session header — mirror upstream exactly).
+broker_listener.rs session_body: add "brokerSession": true.
+Verify server still matches: broker_delete_session_root accepts the query
+param today; no server diff required.
+'''
+test = '''
+Update existing delete_session tests to assert the ?sessionId= query form.
+Golden replay: DELETE /session?sessionId=... must hit broker_delete_session_root → 204.
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+fields = ["DeleteSessionAsync(Guid, CancellationToken)"]
+
+[[source_entries]]
+file = "src/Runner.Listener/BrokerMessageListener.cs"
+change_type = "file_changed"
+snippet = '''
+var taskAgentSession = new TaskAgentSession(sessionName, agent)
+{
+    BrokerSession = true,
+};
+...
+await _brokerServer.DeleteSessionAsync(_session.SessionId, ts.Token);
+'''
