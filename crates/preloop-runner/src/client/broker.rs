@@ -4,7 +4,17 @@
 //! `/runner/` and `/broker/` endpoints.
 
 use anyhow::{Context, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+
+use futures::{SinkExt, StreamExt};
+use rand::Rng;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::{Message, protocol::CloseFrame};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tracing::{info, warn};
 
 use super::http::{HttpClient, HttpError};
 
@@ -128,6 +138,220 @@ impl BrokerClient {
             }
         }
     }
+}
+
+/// Telemetry payload for the temporary broker long-poll websocket probe.
+///
+/// Mirrors `BrokerWebSocketProbeResult` (v2.338.0
+/// `src/Sdk/DTWebApi/WebApi/BrokerWebSocketProbeResult.cs`): `Connected` and
+/// `Errors` carry `EmitDefaultValue = true`, the rest `false`, so they are
+/// omitted from the JSON while holding their default value.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct BrokerWebSocketProbeResult {
+    /// Whether at least one websocket connection was established.
+    pub connected: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub connect_count: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub connect_failures: u64,
+    /// .NET `ReceiveAsync` folds every non-close frame into one result; this
+    /// counts the same (tungstenite answers ping/pong frames itself).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pings_received: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_close_reason: Option<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub total_duration_ms: u64,
+    pub errors: Vec<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Official `BackoffTimerHelper.GetRandomBackoff` bounds for the probe's
+/// websocket reconnect delay.
+const MIN_DELAY_FOR_WEBSOCKET_RECONNECT: Duration = Duration::from_secs(10);
+const MAX_DELAY_FOR_WEBSOCKET_RECONNECT: Duration = Duration::from_secs(300);
+
+/// Connect to the broker probe URL over websocket and hold/reconnect until
+/// `cancel` fires. Mirror of `BrokerServer.RunLongPollWebSocketProbeAsync`
+/// (v2.338.0): connect failures back off 10–300 s, holds that end for any
+/// other reason reconnect immediately, and the probe never fails the job.
+pub async fn run_long_poll_websocket_probe(
+    probe_url: &str,
+    bearer_token: &str,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+) -> BrokerWebSocketProbeResult {
+    let mut result = BrokerWebSocketProbeResult::default();
+    let start = Instant::now();
+
+    loop {
+        let mut socket = match connect_websocket(probe_url, bearer_token, cancel).await {
+            WebSocketConnect::Connected(socket) => *socket,
+            outcome => {
+                // Upstream counts any connect exception — cancellation
+                // included — as a connect failure; its `Task.Delay` then
+                // throws immediately when cancelled.
+                result.connect_failures += 1;
+                result.last_close_reason = Some("connect_failed".to_owned());
+                if matches!(outcome, WebSocketConnect::Cancelled) {
+                    break;
+                }
+                let delay = rand::thread_rng().gen_range(
+                    MIN_DELAY_FOR_WEBSOCKET_RECONNECT..MAX_DELAY_FOR_WEBSOCKET_RECONNECT,
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => continue,
+                    _ = &mut *cancel => break,
+                }
+            }
+        };
+
+        result.connected = true;
+        result.connect_count += 1;
+
+        // Hold the socket: count every message like upstream's
+        // `PingsReceived`, echo text frames back, and take the close frame as
+        // the server's close reason.
+        loop {
+            tokio::select! {
+                _ = &mut *cancel => {
+                    result.last_close_reason = Some("job_completed".to_owned());
+                    break;
+                }
+                message = socket.next() => match message {
+                    Some(Ok(Message::Close(frame))) => {
+                        let (code, reason) = close_status_strings(&frame);
+                        result.last_close_reason =
+                            Some(format!("server_closed:{code}:{reason}"));
+                        info!(code = %code, %reason, "Runner websocket closed by server");
+                        break;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        result.pings_received += 1;
+                        info!(%text, "Runner websocket received a ping");
+                        if let Err(error) = socket.send(Message::Text(text.clone())).await {
+                            absorb_probe_error(&mut result, error);
+                            break;
+                        }
+                        info!(%text, "Runner replied via websocket");
+                    }
+                    Some(Ok(_)) => result.pings_received += 1,
+                    Some(Err(error)) => {
+                        absorb_probe_error(&mut result, error);
+                        break;
+                    }
+                    // Stream ended without a close handshake: upstream takes
+                    // the exception path; either way we reconnect.
+                    None => {
+                        result.last_close_reason = Some("error".to_owned());
+                        break;
+                    }
+                },
+            }
+        }
+
+        // Upstream sends the close handshake whenever the socket is still
+        // open; a half-closed socket here is already our answer to the
+        // server's close frame.
+        let _ = socket.close(None).await;
+        if result.last_close_reason.as_deref() == Some("job_completed") {
+            break;
+        }
+    }
+
+    result.total_duration_ms = start.elapsed().as_millis() as u64;
+    result
+}
+
+/// Outcome of one probe connect attempt. `Cancelled` exists so the caller
+/// never polls the completed oneshot receiver again (doing so panics).
+enum WebSocketConnect {
+    Connected(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    Failed,
+    Cancelled,
+}
+
+/// Mirror of `BrokerServer.ConnectWebSocketAsync`: any failure is `Failed`
+/// for the caller to back off on. Cancellation is reported separately only
+/// because the oneshot receiver cannot be polled once completed.
+async fn connect_websocket(
+    probe_url: &str,
+    bearer_token: &str,
+    cancel: &mut tokio::sync::oneshot::Receiver<()>,
+) -> WebSocketConnect {
+    let mut request = match probe_url.into_client_request() {
+        Ok(request) => request,
+        Err(error) => {
+            info!(%error, %probe_url, "Invalid runner websocket probe URL");
+            return WebSocketConnect::Failed;
+        }
+    };
+    match format!("Bearer {bearer_token}").parse() {
+        Ok(value) => {
+            request.headers_mut().insert(header::AUTHORIZATION, value);
+        }
+        Err(error) => {
+            warn!(%error, "Invalid runner websocket probe authorization header");
+            return WebSocketConnect::Failed;
+        }
+    }
+
+    info!("Attempting to start runner websocket client.");
+    tokio::select! {
+        outcome = connect_async(request) => match outcome {
+            Ok((socket, _)) => {
+                info!("Successfully started runner websocket client.");
+                WebSocketConnect::Connected(Box::new(socket))
+            }
+            Err(error) => {
+                info!(%error, "Runner websocket connect failed, will retry.");
+                WebSocketConnect::Failed
+            }
+        },
+        _ = &mut *cancel => WebSocketConnect::Cancelled,
+    }
+}
+
+/// Upstream's `catch (Exception)` inside the hold loop: unique error strings
+/// are collected and the socket is reported closed with reason `error`.
+fn absorb_probe_error(
+    result: &mut BrokerWebSocketProbeResult,
+    error: tokio_tungstenite::tungstenite::Error,
+) {
+    info!(%error, "Exception caught while holding runner websocket, will reconnect.");
+    let message = error.to_string();
+    if !result.errors.contains(&message) {
+        result.errors.push(message);
+    }
+    result.last_close_reason = Some("error".to_owned());
+}
+
+/// Render a close frame as upstream's
+/// `$"server_closed:{CloseStatus}:{CloseStatusDescription}"`: the .NET
+/// `WebSocketCloseStatus` member name (numeric for undefined codes) and the
+/// frame's reason string.
+fn close_status_strings(frame: &Option<CloseFrame>) -> (String, String) {
+    let Some(frame) = frame else {
+        return ("0".to_owned(), String::new());
+    };
+    let code = match frame.code {
+        CloseCode::Normal => "NormalClosure".to_owned(),
+        CloseCode::Away => "EndpointUnavailable".to_owned(),
+        CloseCode::Protocol => "ProtocolError".to_owned(),
+        CloseCode::Unsupported => "InvalidMessageType".to_owned(),
+        CloseCode::Invalid => "InvalidPayloadData".to_owned(),
+        CloseCode::Policy => "PolicyViolation".to_owned(),
+        CloseCode::Size => "MessageTooBig".to_owned(),
+        CloseCode::Extension => "MandatoryExtension".to_owned(),
+        CloseCode::Error => "InternalServerError".to_owned(),
+        // Codes with no `WebSocketCloseStatus` member (1005, 1006, 1012,
+        // 1013, ...) stringify as their number in .NET too.
+        other => u16::from(other).to_string(),
+    };
+    (code, frame.reason.to_string())
 }
 
 /// Detect the official runner-version deprecation response.
