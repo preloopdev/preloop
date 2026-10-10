@@ -802,6 +802,14 @@ pub struct AppState {
     /// Default 90 follows GitHub; `0` disables the sweep. Resolved from
     /// `retention_days` in the config file, `PRELOOP_RETENTION_DAYS` wins.
     pub retention_days: u64,
+    /// Maximum jobs one run may expand to (after matrix expansion). API
+    /// submits past this are rejected with 400 before the insert
+    /// transaction opens; webhook deliveries bypass it (a push is never
+    /// refused — the namespace quotas behave the same way) and rely on
+    /// chunked inserts to bound their writer hold. Default 500; `0`
+    /// disables the cap. Resolved from `max_jobs_per_run` in the config
+    /// file, `PRELOOP_MAX_JOBS_PER_RUN` wins.
+    pub max_jobs_per_run: u64,
     /// Environment protection rules resolver: `[environment_rules]` TOML as
     /// the local fallback, GitHub's environments API when an App (or
     /// `PRELOOP_GITHUB_TOKEN`) covers the run's repository.
@@ -1271,6 +1279,7 @@ impl AppState {
         crate::config::merge_secret_stores(&mut config, credential);
         let checkout_cache = crate::config::checkout_cache_config(&config)?;
         let retention_days = crate::config::retention_days(&config)?;
+        let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let github_apps = crate::github_app::load_from(&config)?;
         let github_app = github_apps
             .as_ref()
@@ -1503,6 +1512,7 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
             retention_days,
+            max_jobs_per_run,
             environment_resolver: crate::environment_resolver::EnvironmentResolver::local(
                 config.environment_rules.clone(),
             ),

@@ -4065,10 +4065,85 @@ async fn admit_submit(
     Ok(())
 }
 
+/// Phase-1 state for a chunked pg submit: everything the job chunks and the
+/// finalize step need after the replay check, the run row, and the workflow
+/// concurrency gate have committed.
+struct PgSubmitProceed {
+    namespace: String,
+    record: RunRecord,
+    /// `record.run_id` rendered for SQL params.
+    run: String,
+    now: i64,
+    platforms: Vec<&'static str>,
+    pool_labels: Vec<String>,
+    runner_labels: Vec<Vec<String>>,
+    check_hostable: bool,
+    held: bool,
+}
+
+/// What [`PgBackend::submit_run_head`] hands back: either a finished outcome
+/// (replay, empty concurrency group, arrival-cancelled) or the state to
+/// continue with.
+#[allow(clippy::large_enum_variant)]
+// Both variants are large (`RunRecord` dominates); the enum is built and
+// matched once per submit, so boxing would buy nothing.
+enum PgSubmitHead {
+    Done(SubmitOutcome),
+    Proceed(PgSubmitProceed, Vec<SubmitJob>),
+}
+
+/// Best-effort poison for a submit that failed after phase 1 committed:
+/// release the workflow-gate hold the run may own, then mark the run
+/// terminal so dispatchers never pick up its partial jobs. Runs in its own
+/// transaction; a poison failure is logged, never propagated — the original
+/// error is already on its way to the caller.
+async fn poison_partial_submit(backend: &PgBackend, run_id: RunId) {
+    let result: Result<(), ControlError> = async {
+        let run = run_id.0.to_string();
+        let mut client = backend.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        release_concurrency_for_run(backend, &tx, run_id).await?;
+        tx.execute(
+            "UPDATE runs SET concurrency_group = NULL WHERE run_id = $1::text::uuid",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute(
+            "UPDATE runs SET status='completed', conclusion='failure', completed_at = now() \
+             WHERE run_id = $1::text::uuid AND status <> 'completed'",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+        emit_outbox(
+            &tx,
+            Some(run_id),
+            "run.completed.v1",
+            serde_json::json!({"conclusion": "failure", "reason": "submit aborted mid-insert"}),
+        )
+        .await?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%run_id, ?error, "failed to poison partially submitted run");
+    }
+}
+
 impl PgBackend {
-    /// `submit_run`: one transaction that records the run, its jobs and their
-    /// dispatch state, acquires the workflow-level gate, and runs the first
-    /// promotion sweep.
+    /// `submit_run`: records the run, its jobs and their dispatch state,
+    /// acquires the workflow-level gate, and runs the first promotion sweep.
+    ///
+    /// Chunked: phase 1 commits the replay check, the run row and the gates;
+    /// each [`SUBMIT_JOB_CHUNK_SIZE`](crate::control::types::SUBMIT_JOB_CHUNK_SIZE)
+    /// job slice commits on its own; a final transaction recounts
+    /// `remaining_needs`, sweeps, and summarizes. No single request pins the
+    /// writer (or its pooled connection) for the whole insert — a concurrent
+    /// control write waits for one chunk at most. A failure after phase 1
+    /// commits poisons the run (completed/failure) so a partial submit can
+    /// never dispatch or wedge a concurrency group.
     ///
     /// Statements: replay `SELECT run_id` (webhook delivery + path); namespace
     /// upsert; `INSERT INTO runs`; `run_submissions`; `run_push_states`;
@@ -4079,6 +4154,72 @@ impl PgBackend {
         &self,
         submit: SubmitRun,
     ) -> Result<SubmitOutcome, ControlError> {
+        // Phase 1 (one transaction): replay check, run row, gates.
+        let (proceed, mut jobs) = match self.submit_run_head(submit).await? {
+            PgSubmitHead::Done(outcome) => return Ok(outcome),
+            PgSubmitHead::Proceed(proceed, jobs) => (proceed, jobs),
+        };
+        let run_id = proceed.record.run_id;
+        let mut graph = RunGraph {
+            record: proceed.record.clone(),
+            namespace: proceed.namespace.clone(),
+            nodes: BTreeMap::new(),
+            submission: proceed.record.submission.clone(),
+            github: proceed.record.github.clone(),
+            touched: true,
+        };
+        // Jobs admitted (not concluded at submit) — `RunAccepted.queued_jobs`.
+        let mut accepted = 0usize;
+        let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
+        let mut position_offset = 0usize;
+        while !jobs.is_empty() {
+            let take = jobs.len().min(crate::control::types::SUBMIT_JOB_CHUNK_SIZE);
+            let chunk: Vec<SubmitJob> = jobs.drain(..take).collect();
+            // One transaction per chunk, and the pooled writer connection is
+            // checked back in between chunks.
+            let mut client = self.writer().await?;
+            let tx = client.transaction().await.map_err(db)?;
+            let chunk_result = submit_job_chunk(
+                &tx,
+                &mut graph,
+                &proceed,
+                &mut accepted,
+                &mut concluded,
+                position_offset,
+                chunk,
+            )
+            .await;
+            position_offset += take;
+            match chunk_result {
+                Ok(()) => {
+                    tx.commit().await.map_err(db)?;
+                    drop(client);
+                }
+                Err(error) => {
+                    drop(tx);
+                    drop(client);
+                    poison_partial_submit(self, run_id).await;
+                    return Err(error);
+                }
+            }
+        }
+        match self
+            .submit_run_finalize(&proceed, graph, accepted, concluded)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                poison_partial_submit(self, run_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Phase 1 of [`PgBackend::submit_run`]: the idempotent-replay check,
+    /// run-number allocation, namespace admission, the run row, and the
+    /// workflow concurrency gate. Commits on its own so the job chunks that
+    /// follow never redo it; early-return outcomes carry no partial state.
+    async fn submit_run_head(&self, submit: SubmitRun) -> Result<PgSubmitHead, ControlError> {
         let SubmitRun {
             namespace,
             mut record,
@@ -4100,12 +4241,12 @@ impl PgBackend {
                 drop(tx);
                 drop(client);
                 let existing = self.run_record(existing).await?;
-                return self.replay_outcome(existing).await;
+                return Ok(PgSubmitHead::Done(self.replay_outcome(existing).await?));
             }
         }
         // Reject outright on an empty concurrency group (nothing persists).
         if empty_concurrency_group {
-            return Ok(SubmitOutcome {
+            return Ok(PgSubmitHead::Done(SubmitOutcome {
                 run_id: record.run_id,
                 run_number: record.run_number,
                 queued_jobs: 0,
@@ -4120,7 +4261,7 @@ impl PgBackend {
                 existing: None,
                 next_runs_on: Vec::new(),
                 events: Vec::new(),
-            });
+            }));
         }
 
         let now = now_us();
@@ -4264,7 +4405,7 @@ impl PgBackend {
             drop(tx);
             drop(client);
             let existing = self.run_record(existing).await?;
-            return self.replay_outcome(existing).await;
+            return Ok(PgSubmitHead::Done(self.replay_outcome(existing).await?));
         }
         // The submission record. Secret values never reach the database
         // (the SecretProvider holds them); clear defensively at the boundary.
@@ -4392,7 +4533,7 @@ impl PgBackend {
                     .await?;
                     tx.commit().await.map_err(db)?;
                     drop(client);
-                    return Ok(SubmitOutcome {
+                    return Ok(PgSubmitHead::Done(SubmitOutcome {
                         run_id: record.run_id,
                         run_number: record.run_number,
                         queued_jobs: 0,
@@ -4403,155 +4544,201 @@ impl PgBackend {
                         existing: None,
                         next_runs_on: self.ready_front_labels().await?,
                         events: Vec::new(),
-                    });
+                    }));
                 }
             }
         }
 
-        // Jobs admitted (not concluded at submit) — `RunAccepted.queued_jobs`.
-        let mut accepted = 0usize;
-        let final_status;
-        let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
-        let mut graph = RunGraph {
-            record: record.clone(),
-            namespace: namespace.clone(),
-            nodes: BTreeMap::new(),
-            submission: record.submission.clone(),
-            github: record.github.clone(),
-            touched: true,
-        };
-        for (position, submit_job) in jobs.into_iter().enumerate() {
-            let SubmitJob {
-                queued,
-                request,
-                token_request,
-                id_token_granted,
-                oidc_context,
-                step_manifest,
-                initially_skipped,
-            } = submit_job;
-            let job_id = queued.job_id.clone();
-            let (mut node, mut message, _secret_names) =
-                submit_node(&record, queued.clone(), position, now);
-            node.id_token_granted = id_token_granted;
-            if let Some(oidc) = oidc_context {
-                node.oidc = oidc;
-            }
-            // Unhostable platform: conclude immediately. Deferred for
-            // needs-gated jobs — they park until their `if:` can be
-            // evaluated, and a job GitHub would skip must not fail here on
-            // labels it will never need; promotion re-runs this check.
-            if check_hostable
-                && queued.needs.is_empty()
-                && let Some(platform) =
-                    crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
-            {
-                node.status = ExecutionStatus::Failure;
-                node.queue_state = logic::QueueState::None;
-                node.completed_at_us = Some(now);
-                concluded.push((
-                    job_id.clone(),
-                    ExecutionStatus::Failure,
-                    Some(logic::unhostable_reason(platform, &node.runs_on)),
-                ));
-            }
-            if initially_skipped && node.status != ExecutionStatus::Failure {
-                node.status = ExecutionStatus::Skipped;
-                node.queue_state = logic::QueueState::None;
-                node.completed_at_us = Some(now);
-                concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
-            }
-            // Labels the co-hosted pool can never satisfy and no registered
-            // runner serves: conclude now instead of starving in the queue.
-            // Placeholders are skipped — expansion materializes their jobs.
-            // Needs-gated jobs defer too: they park until their `if:` can be
-            // evaluated, and the promotion path re-runs this check.
-            if !matches!(
+        tx.commit().await.map_err(db)?;
+        drop(client);
+        Ok(PgSubmitHead::Proceed(
+            PgSubmitProceed {
+                namespace,
+                record,
+                run,
+                now,
+                platforms,
+                pool_labels,
+                runner_labels,
+                check_hostable,
+                held,
+            },
+            jobs,
+        ))
+    }
+}
+
+/// Insert one [`SUBMIT_JOB_CHUNK_SIZE`](crate::control::types::SUBMIT_JOB_CHUNK_SIZE)-sized
+/// slice of the submit's jobs in its own transaction: node classification
+/// plus the `jobs` / `job_specs` / `job_needs` / `job_messages` /
+/// `job_requests` rows. The in-memory `graph` accumulates across chunks; the
+/// finalize step sweeps it once every chunk has committed.
+async fn submit_job_chunk(
+    tx: &Transaction<'_>,
+    graph: &mut RunGraph,
+    proceed: &PgSubmitProceed,
+    accepted: &mut usize,
+    concluded: &mut Vec<(JobId, ExecutionStatus, Option<String>)>,
+    position_offset: usize,
+    jobs: Vec<SubmitJob>,
+) -> Result<(), ControlError> {
+    let record = &proceed.record;
+    let run: &str = &proceed.run;
+    let now = proceed.now;
+    let platforms = &proceed.platforms;
+    let pool_labels = &proceed.pool_labels;
+    let runner_labels = &proceed.runner_labels;
+    let check_hostable = proceed.check_hostable;
+    let held = proceed.held;
+    for (index, submit_job) in jobs.into_iter().enumerate() {
+        let position = position_offset + index;
+        let SubmitJob {
+            queued,
+            request,
+            token_request,
+            id_token_granted,
+            oidc_context,
+            step_manifest,
+            initially_skipped,
+        } = submit_job;
+        let job_id = queued.job_id.clone();
+        let (mut node, mut message, _secret_names) =
+            submit_node(record, queued.clone(), position, now);
+        node.id_token_granted = id_token_granted;
+        if let Some(oidc) = oidc_context {
+            node.oidc = oidc;
+        }
+        // Unhostable platform: conclude immediately. Deferred for
+        // needs-gated jobs — they park until their `if:` can be
+        // evaluated, and a job GitHub would skip must not fail here on
+        // labels it will never need; promotion re-runs this check.
+        if check_hostable
+            && queued.needs.is_empty()
+            && let Some(platform) =
+                crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
+        {
+            node.status = ExecutionStatus::Failure;
+            node.queue_state = logic::QueueState::None;
+            node.completed_at_us = Some(now);
+            concluded.push((
+                job_id.clone(),
+                ExecutionStatus::Failure,
+                Some(logic::unhostable_reason(platform, &node.runs_on)),
+            ));
+        }
+        if initially_skipped && node.status != ExecutionStatus::Failure {
+            node.status = ExecutionStatus::Skipped;
+            node.queue_state = logic::QueueState::None;
+            node.completed_at_us = Some(now);
+            concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
+        }
+        // Labels the co-hosted pool can never satisfy and no registered
+        // runner serves: conclude now instead of starving in the queue.
+        // Placeholders are skipped — expansion materializes their jobs.
+        // Needs-gated jobs defer too: they park until their `if:` can be
+        // evaluated, and the promotion path re-runs this check.
+        if !matches!(
+            node.status,
+            ExecutionStatus::Failure | ExecutionStatus::Skipped
+        ) && queued.reusable_call.is_none()
+            && queued.deferred_matrix.is_none()
+            && queued.needs.is_empty()
+            && let Some(reason) = logic::unschedulable_reason(
+                &node.runs_on,
+                pool_labels,
+                runner_labels.iter().any(|labels| {
+                    crate::runtime_scheduling::job_matches_runner(&node.runs_on, labels)
+                }),
+            )
+        {
+            tracing::warn!(
+                run_id = %record.run_id,
+                job = %job_id.0,
+                labels = ?node.runs_on,
+                pool_labels = ?pool_labels,
+                "runs-on unsatisfiable by runner pool; failing the job at enqueue"
+            );
+            node.status = ExecutionStatus::Failure;
+            node.queue_state = logic::QueueState::None;
+            node.completed_at_us = Some(now);
+            concluded.push((job_id.clone(), ExecutionStatus::Failure, Some(reason)));
+        }
+        if !matches!(
+            node.status,
+            ExecutionStatus::Failure | ExecutionStatus::Skipped
+        ) {
+            *accepted += 1;
+        }
+        // A node that reaches admission behind a hold parks: the workflow
+        // gate is not this run's turn yet (`held`), the run is held by the
+        // fork-PR approval policy, or its environment protection gate is
+        // not satisfied. All three park identically — held, pending, no
+        // promotion candidate — and are released by `promote_ready_jobs`
+        // once the hold lifts.
+        if (held || record.fork_approval_pending || node.environment_gate.is_some())
+            && !matches!(
                 node.status,
                 ExecutionStatus::Failure | ExecutionStatus::Skipped
-            ) && queued.reusable_call.is_none()
-                && queued.deferred_matrix.is_none()
-                && queued.needs.is_empty()
-                && let Some(reason) = logic::unschedulable_reason(
-                    &node.runs_on,
-                    &pool_labels,
-                    runner_labels.iter().any(|labels| {
-                        crate::runtime_scheduling::job_matches_runner(&node.runs_on, labels)
-                    }),
-                )
-            {
-                tracing::warn!(
-                    run_id = %record.run_id,
-                    job = %job_id.0,
-                    labels = ?node.runs_on,
-                    pool_labels = ?pool_labels,
-                    "runs-on unsatisfiable by runner pool; failing the job at enqueue"
-                );
-                node.status = ExecutionStatus::Failure;
-                node.queue_state = logic::QueueState::None;
-                node.completed_at_us = Some(now);
-                concluded.push((job_id.clone(), ExecutionStatus::Failure, Some(reason)));
-            }
-            if !matches!(
-                node.status,
-                ExecutionStatus::Failure | ExecutionStatus::Skipped
-            ) {
-                accepted += 1;
-            }
-            // A node that reaches admission behind a hold parks: the workflow
-            // gate is not this run's turn yet (`held`), the run is held by the
-            // fork-PR approval policy, or its environment protection gate is
-            // not satisfied. All three park identically — held, pending, no
-            // promotion candidate — and are released by `promote_ready_jobs`
-            // once the hold lifts.
-            if (held || record.fork_approval_pending || node.environment_gate.is_some())
-                && !matches!(
-                    node.status,
-                    ExecutionStatus::Failure | ExecutionStatus::Skipped
-                )
-            {
-                node.queue_state = logic::QueueState::Held;
-                node.concurrency_wait_at_us = Some(now);
-            }
-            insert_job_row(&tx, &graph, &node, &job_id).await?;
-            insert_spec_rows(&tx, &graph, &node, &job_id, None).await?;
-            // Mint the request correlation inside the writer transaction so
-            // the id is allocated under the cross-process writer lock.
-            if let Some(request) = &request {
-                let request_id = insert_request_row(
-                    &tx,
-                    &graph,
-                    request,
-                    token_request.as_ref(),
-                    &step_manifest,
-                )
-                .await?;
-                node.request_id = Some(request_id);
-                message.request_id = request_id;
-                message.job_id = request.agent_job_id;
-            }
-            // Skipped nodes carry a placeholder message and mint nothing —
-            // `job_messages` (like the request row) exists only for
-            // dispatchable jobs.
-            if !initially_skipped {
-                tx.execute(
-                    "INSERT INTO job_messages (run_id, job_id, message_template, secret_names, \
+            )
+        {
+            node.queue_state = logic::QueueState::Held;
+            node.concurrency_wait_at_us = Some(now);
+        }
+        insert_job_row(tx, graph, &node, &job_id).await?;
+        insert_spec_rows(tx, graph, &node, &job_id, None).await?;
+        // Mint the request correlation inside the writer transaction so
+        // the id is allocated under the cross-process writer lock.
+        if let Some(request) = &request {
+            let request_id =
+                insert_request_row(tx, graph, request, token_request.as_ref(), &step_manifest)
+                    .await?;
+            node.request_id = Some(request_id);
+            message.request_id = request_id;
+            message.job_id = request.agent_job_id;
+        }
+        // Skipped nodes carry a placeholder message and mint nothing —
+        // `job_messages` (like the request row) exists only for
+        // dispatchable jobs.
+        if !initially_skipped {
+            tx.execute(
+                "INSERT INTO job_messages (run_id, job_id, message_template, secret_names, \
                      condition_context) VALUES ($1::text::uuid,$2,$3::text::jsonb,$4::text::jsonb,\
                      $5::text::jsonb)",
-                    &[
-                        &run,
-                        &job_id.0,
-                        &json(&message)?,
-                        &json(&node.secret_names)?,
-                        &json(&node.condition_context)?,
-                    ],
-                )
-                .await
-                .map_err(db)?;
-            }
-            graph.record.jobs.insert(job_id.clone(), node.status);
-            graph.nodes.insert(job_id, node);
+                &[
+                    &run,
+                    &job_id.0,
+                    &json(&message)?,
+                    &json(&node.secret_names)?,
+                    &json(&node.condition_context)?,
+                ],
+            )
+            .await
+            .map_err(db)?;
         }
+        graph.record.jobs.insert(job_id.clone(), node.status);
+        graph.nodes.insert(job_id, node);
+    }
+    Ok(())
+}
+
+impl PgBackend {
+    /// Phase 3 of [`PgBackend::submit_run`]: the whole-run fixups that must
+    /// see every committed chunk — `remaining_needs` recount, the promotion
+    /// sweep, run resummarize, outbox rows, and the persisted events the
+    /// handler replays.
+    async fn submit_run_finalize(
+        &self,
+        proceed: &PgSubmitProceed,
+        mut graph: RunGraph,
+        accepted: usize,
+        mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)>,
+    ) -> Result<SubmitOutcome, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let record = &proceed.record;
+        let now = proceed.now;
+        let held = proceed.held;
+        let final_status;
 
         // `remaining_needs` was initialized as `needs.len()` before submit-time
         // conclusions (unhostable, `if: false`) settled their parents, so it

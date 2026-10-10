@@ -5781,6 +5781,107 @@ pub(crate) mod suite {
         assert!(backend.run_record(throttled).await.is_err());
     }
 
+    /// Chunked submit equivalence: a run larger than `SUBMIT_JOB_CHUNK_SIZE`
+    /// lands in the same final state a single-transaction submit produced —
+    /// every job row, its message, request correlation, step manifest, token
+    /// request and OIDC grant — while no single transaction holds the writer
+    /// for the whole insert. Runs against both backends via the shared suite.
+    pub(crate) async fn chunked_submit_matches_single_chunk_state(backend: &dyn ControlBackend) {
+        use crate::control::types::SUBMIT_JOB_CHUNK_SIZE;
+        let total = SUBMIT_JOB_CHUNK_SIZE + 50;
+        let run_id = RunId::new();
+        // The first three jobs carry the full truncate-family payload (token
+        // request, OIDC grant + context, declared step manifest); the rest
+        // are plain. Chunk 1 ends mid-list so jobs on both sides of a chunk
+        // boundary are covered.
+        let jobs: Vec<SubmitJob> = (0..total)
+            .map(|index| {
+                let job_id = format!("job-{index:04}");
+                if index < 3 {
+                    submit_job_full(run_id, &job_id, index as i64 + 1)
+                } else {
+                    submit_job(run_id, &job_id, index as i64 + 1)
+                }
+            })
+            .collect();
+        let outcome = backend
+            .submit_run(submit_run(run_id, jobs))
+            .await
+            .expect("chunked submit succeeds");
+        assert_eq!(outcome.queued_jobs, total, "every job admitted");
+        assert_eq!(outcome.status, ExecutionStatus::Queued);
+        assert!(
+            outcome.concluded.is_empty(),
+            "nothing concluded at submit: {:?}",
+            outcome.concluded
+        );
+        assert!(outcome.existing.is_none());
+
+        let record = backend.run_record(run_id).await.expect("run persisted");
+        assert_eq!(record.jobs.len(), total, "every job row persisted");
+        assert!(
+            record
+                .jobs
+                .values()
+                .all(|status| *status == ExecutionStatus::Queued),
+            "all jobs queued"
+        );
+        assert_eq!(record.status, ExecutionStatus::Queued);
+
+        // Request/message correlation round-trips for the full-payload jobs
+        // and for jobs on both sides of each chunk boundary. Request ids
+        // allocate sequentially from 1 on a fresh backend in submit order.
+        let boundary = SUBMIT_JOB_CHUNK_SIZE as i64;
+        for (request_id, job_id, full) in [
+            (1, "job-0000", true),
+            (2, "job-0001", true),
+            (3, "job-0002", true),
+            (
+                boundary,
+                &format!("job-{:04}", SUBMIT_JOB_CHUNK_SIZE - 1),
+                false,
+            ),
+            (
+                boundary + 1,
+                &format!("job-{:04}", SUBMIT_JOB_CHUNK_SIZE),
+                false,
+            ),
+            (total as i64, &format!("job-{:04}", total - 1), false),
+        ] {
+            let ctx = backend
+                .acquire_context(request_id)
+                .await
+                .unwrap_or_else(|_| panic!("request {request_id} persisted"));
+            assert_eq!(
+                ctx.message.request_id, request_id,
+                "message carries the allocated request id for {job_id}"
+            );
+            assert_eq!(ctx.request.job_id, JobId(job_id.to_owned()));
+            if full {
+                assert!(
+                    ctx.token_request.is_some(),
+                    "deferred token-mint request persisted for {job_id}"
+                );
+                assert_eq!(
+                    ctx.id_token_granted,
+                    Some(true),
+                    "OIDC grant persisted for {job_id}"
+                );
+            }
+        }
+
+        // Declared step manifests landed for exactly the three full jobs.
+        let manifests = backend
+            .run_step_manifests(run_id)
+            .await
+            .expect("step manifests readable");
+        assert_eq!(manifests.len(), 3, "one manifest per full job");
+        for steps in manifests.values() {
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].name, "Build");
+        }
+    }
+
     /// A webhook-originated run is never refused by a namespace limit or a
     /// suspension (GitHub does not redeliver, so a refusal loses the push):
     /// it is recorded and waits at claim. Only a deleted namespace refuses
@@ -9120,6 +9221,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn chunked_submit_matches_single_chunk_state() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::chunked_submit_matches_single_chunk_state(&backend).await;
+    }
+
+    #[tokio::test]
     async fn webhook_runs_bypass_submit_quotas() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10567,6 +10676,12 @@ mod lite {
             |sql| async move { db.exec_for_test(&sql) },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn chunked_submit_matches_single_chunk_state() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::chunked_submit_matches_single_chunk_state(&backend).await;
     }
 
     #[tokio::test]

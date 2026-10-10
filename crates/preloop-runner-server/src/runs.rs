@@ -1090,6 +1090,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
     }
 
+    // Server-wide submit cap, enforced after expansion (the count above is
+    // post-matrix-expansion and post-closure-filter) but before the build
+    // loop and the insert transaction: a rejected run never opens a giant
+    // transaction, so it can never pin the writer. Webhook deliveries
+    // bypass it — like the namespace submit quotas, a push is never
+    // refused; chunked inserts bound their writer hold instead.
+    if webhook_delivery_id.is_none() {
+        let max_jobs_per_run = shared.state.max_jobs_per_run;
+        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
+            return Err(ApiError::bad_request(format!(
+                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
+                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
+                jobs.len(),
+            )));
+        }
+    }
+
     let run_id = RunId::new();
     // Durable before the run commits: any node may acquire its jobs later.
     // Dropped again unless the submit commits a new run.
@@ -2522,7 +2539,8 @@ pub(crate) fn build_job_artifacts(
     }
 
     // The request id is the `job_requests` primary key; it is minted inside
-    // the writer transaction (`submit_run_tx`/`register_expanded_jobs`) under
+    // the writer transaction (`submit_run`'s chunk transactions /
+    // `register_expanded_jobs`) under
     // the cross-process writer lock, not here — a process-local atomic would
     // let two engines sharing one database allocate the same id. Stamp the
     // placeholder the transaction overwrites on both the message and the
@@ -5193,6 +5211,169 @@ mod tests {
                 .is_ok(),
             "a logged-not-blocked submission must still create a run"
         );
+    }
+
+    /// The server-wide `max_jobs_per_run` cap fails a run fast: a 3-job
+    /// submit against a cap of 2 is rejected with 400 after expansion but
+    /// before the build loop and the insert transaction, while exactly 2
+    /// jobs are accepted.
+    #[tokio::test]
+    async fn submit_run_inner_enforces_max_jobs_per_run() {
+        fn three_job_submission() -> preloop_gha_protocol::WorkflowSubmission {
+            preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                    .to_owned(),
+                event: "push".to_owned(),
+                repository: "owner/repo".to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                workflow_file: Some("ci.yml".to_owned()),
+                actor: "alice".to_owned(),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                ..Default::default()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 2;
+        let shared = state.shared();
+
+        let error = submit_run_inner(&shared, three_job_submission())
+            .await
+            .expect_err("3 jobs over a cap of 2 must be rejected");
+        assert!(
+            error.message().contains("max_jobs_per_run"),
+            "rejection names the limit, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("3 jobs"),
+            "rejection names the expanded count, got: {}",
+            error.message()
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "an oversized submit is a 4xx"
+        );
+
+        // Exactly at the cap: accepted, both jobs recorded.
+        let mut two_jobs = three_job_submission();
+        two_jobs.workflow_yaml = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+            .to_owned();
+        let accepted = submit_run_inner(&shared, two_jobs).await.unwrap();
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(run.jobs.len(), 2, "a run at exactly the cap is accepted");
+    }
+
+    /// The cap counts expanded jobs, not declared ones: 2 declared matrix
+    /// jobs expanding to 400 legs are rejected by a cap of 300 and accepted
+    /// by a cap of 500 (the accepted run also exercises the chunked insert:
+    /// 400 > `SUBMIT_JOB_CHUNK_SIZE`).
+    #[tokio::test]
+    async fn submit_run_inner_cap_counts_expanded_jobs() {
+        fn matrix_submission(
+            jobs: usize,
+            cells: usize,
+        ) -> preloop_gha_protocol::WorkflowSubmission {
+            let values = (1..=cells)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut yaml = String::from("on: push\njobs:\n");
+            for j in 0..jobs {
+                yaml.push_str(&format!(
+                    "  m{j}:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        i: [{values}]\n    steps:\n      - run: echo hi\n"
+                ));
+            }
+            preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: yaml,
+                event: "push".to_owned(),
+                repository: "owner/repo".to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                workflow_file: Some("ci.yml".to_owned()),
+                actor: "alice".to_owned(),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                ..Default::default()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 300;
+        let shared = state.shared();
+
+        let error = submit_run_inner(&shared, matrix_submission(2, 200))
+            .await
+            .expect_err("400 expanded jobs over a cap of 300 must be rejected");
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "an oversized expanded submit is a 4xx"
+        );
+
+        // `shared()` snapshots the state, so re-snapshot after raising the cap.
+        state.max_jobs_per_run = 500;
+        let shared = state.shared();
+        let accepted = submit_run_inner(&shared, matrix_submission(2, 200))
+            .await
+            .expect("400 expanded jobs fit a cap of 500");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(
+            run.jobs.len(),
+            400,
+            "all 400 expanded legs persisted via chunked inserts"
+        );
+    }
+
+    /// Webhook deliveries bypass the cap — like the namespace submit quotas,
+    /// a push is never refused; chunked inserts bound its writer hold
+    /// instead.
+    #[tokio::test]
+    async fn webhook_delivery_bypasses_max_jobs_per_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 2;
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner_with_webhook_delivery(
+            &shared,
+            submission,
+            Some("delivery-cap-bypass"),
+        )
+        .await
+        .expect("webhook deliveries bypass the cap");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(run.jobs.len(), 3, "the push's run is recorded whole");
     }
 
     /// A submission whose only job is gated off by its `if:` has no runner

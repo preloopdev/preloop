@@ -168,6 +168,7 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_CREDENTIAL_STORE` | `os` | Credential backend for the engine token and GitHub App/PAT credentials. `os` uses the native keychain/secret-service; `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt — use for headless hosts, containers, and local iteration where repeated keychain prompts are unacceptable); `memory` is non-persistent (tests only) |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run (counted after matrix expansion). API submits expanding past it are rejected with 400 before the insert transaction opens; `0` disables the cap. Webhook deliveries bypass it (a push is never refused) — see [Submit limits](#submit-limits) |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
 Managed engines read their generated token from the OS credential store (or
@@ -248,6 +249,30 @@ matter how old it is. A background sweep deletes expired runs once at
 startup and hourly afterwards, from both memory and the durable store, so
 a restart cannot resurrect them. Workflows see the effective value as
 `github.retention_days`.
+
+### Submit limits
+
+One HTTP request used to mean one database transaction: a 20,000-job
+submit held the writer for over a minute (SQLite) or pinned a Postgres
+writer connection until the pool exhausted. Two guards now bound that:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run, counted **after** matrix expansion. An API submit expanding past it is rejected with `400` before the insert transaction opens, so no giant transaction ever starts. `0` disables the cap. |
+
+The same key lives at the top level of the config file as
+`max_jobs_per_run`; the environment wins. The per-namespace quotas
+(`namespace_limits.max_jobs_per_run`, `submit_rate_per_minute`,
+`max_queued_jobs`) remain the finer-grained, opt-in control — the server
+cap is the backstop that is always on.
+
+Webhook deliveries bypass the cap, like the namespace quotas: a push is
+never refused. Their protection is the second guard — the submit insert
+is chunked in slices of 250 jobs, committing between chunks, on both the
+SQLite and Postgres backends. A concurrent control write waits for one
+chunk at most, never the whole insert. If a chunk fails after the run row
+committed, the run is marked completed/failed so a partial submit can
+never dispatch or wedge a concurrency group.
 
 ### Runner pool
 
