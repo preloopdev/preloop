@@ -131,6 +131,11 @@ path = "tests/concurrency.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "blob_url_binding"
+path = "tests/blob_url_binding.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "execution_protection_api"
 path = "tests/execution_protection_api.rs"
 required-features = ["test-support"]
@@ -143,6 +148,11 @@ required-features = ["test-support"]
 [[test]]
 name = "store_env"
 path = "tests/store_env.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "mint_liveness"
+path = "tests/mint_liveness.rs"
 required-features = ["test-support"]
 
 [dev-dependencies]

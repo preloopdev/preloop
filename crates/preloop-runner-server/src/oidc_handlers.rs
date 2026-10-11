@@ -15,7 +15,9 @@ pub struct OidcTokenResponse {
 /// `GET /runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken`
 ///
 /// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
-/// originating workflow run to populate claims, and enforces `id-token: write`.
+/// originating workflow run to populate claims, enforces `id-token: write`,
+/// and requires the job to be live: the minted id-token outlives the
+/// runtime token, so a settled job must not re-mint (round-3 finding 5).
 pub async fn oidc_token_run_service(
     State(shared): State<Arc<SharedState>>,
     Path((_orchestration_id, plan_id, job_id)): Path<(String, String, String)>,
@@ -49,6 +51,11 @@ pub async fn oidc_token(
             "OIDC runtime token is not bound to this job",
         ));
     }
+    // A settled job's still-unexpired runtime token must not mint a fresh
+    // cloud identity credential: the minted id-token outlives the ~50min
+    // runtime-token window (round-3 finding 5). The engine (system) identity
+    // bypasses, like the write-path gate.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let requested_job_id = job_id
         .parse::<uuid::Uuid>()
         .map_err(|_| ApiError::not_found("OIDC: plan and job do not match"))?;
