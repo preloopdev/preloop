@@ -7,22 +7,48 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// POST action download info — resolve action references to download URLs.
+///
+/// Tickets are minted only for actions declared in the run's workflow
+/// (`uses:`, transitively through reusable callees and composite nests);
+/// any other requested action fails the whole batch with 403 — a job
+/// runtime token must not turn the engine into a fetch oracle for
+/// arbitrary repositories on the operator's API quota. The run is
+/// identified by the `plan_id` path segment; an unknown plan fails closed.
 pub async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
+    Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    let collection = collect_action_download_infos(&shared.state, &request).await;
-    Json(serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })))
+) -> Result<Json<serde_json::Value>, ApiError> {
+    action_download_info_for_plan(&shared, &plan_id, &request).await
+}
+
+pub(crate) async fn action_download_info_for_plan(
+    shared: &Arc<SharedState>,
+    plan_id: &str,
+    request: &serde_json::Value,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let collection = collect_action_download_infos(&shared.state, plan_id, request).await?;
+    Ok(Json(
+        serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })),
+    ))
 }
 
 pub async fn runnerresolve_actions(
     State(shared): State<Arc<SharedState>>,
+    Path((orchestration_id, job_id)): Path<(String, String)>,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let mut actions = serde_json::Map::new();
-    collect_runnerresolve_refs(&shared.state, &request, &mut actions).await;
+    collect_runnerresolve_refs(
+        &shared.state,
+        &orchestration_id,
+        &job_id,
+        &request,
+        &mut actions,
+    )
+    .await?;
 
-    Json(json!({ "actions": actions }))
+    Ok(Json(json!({ "actions": actions })))
 }
 
 /// Maximum archive-checksum pins held in memory. Pins are minted only by
@@ -141,9 +167,12 @@ fn action_tarball_response(
         .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))
 }
 
-/// How long a minted archive ticket stays valid. Actions are fetched during
-/// job setup, so this only has to outlive a queue wait, not a whole run.
-pub const ACTION_TICKET_TTL_SECS: u64 = 6 * 60 * 60;
+/// How long a minted archive ticket stays valid: 20 minutes. Actions are
+/// fetched during job setup, so the ticket only has to outlive a queue wait
+/// plus the setup waves (a composite action's nested refs resolve in later
+/// waves, minutes after the first), not a whole run. Short enough that a
+/// leaked bearerless ticket URL is a briefly-open window, not a 6-hour one.
+pub const ACTION_TICKET_TTL_SECS: u64 = 20 * 60;
 /// How long a resolved action ref→SHA binding is trusted before the ref is
 /// re-resolved. Matches the freshness GitHub gives a `@main`-style reference:
 /// a new push to the ref is picked up after at most one TTL window.
@@ -574,8 +603,8 @@ pub fn action_download_ticket(
     let runner_url = runner_base_url();
     // The download route is bearerless and reachable from inside runner VMs,
     // so the URL itself has to be the capability: signed, scoped to this one
-    // action, and short-lived. Actions are fetched during job setup, so a few
-    // hours covers even a long queue wait.
+    // action, and short-lived (20 minutes — minted at job setup and used
+    // within minutes, so a leaked URL is a briefly-open window).
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs())
@@ -607,14 +636,20 @@ pub const MAX_ACTION_CONCURRENCY: usize = 16;
 
 pub async fn collect_runnerresolve_refs(
     state: &AppState,
+    orchestration_id: &str,
+    job_id: &str,
     value: &serde_json::Value,
     actions: &mut serde_json::Map<String, serde_json::Value>,
-) {
+) -> Result<(), ApiError> {
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     collect_runnerresolve_requests(value, &mut requests);
     let mut seen = std::collections::HashSet::new();
     requests.retain(|request| seen.insert(request.clone()));
     requests.truncate(MAX_ACTION_BATCH_SIZE);
+
+    let (run_id, declared) =
+        declared_actions_for_runnerresolve(state, orchestration_id, job_id).await?;
+    enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
         runnerresolve_action(state, &action, version.as_deref()).await
@@ -625,13 +660,19 @@ pub async fn collect_runnerresolve_refs(
     for (key, value) in resolved.into_iter().flatten() {
         actions.entry(key).or_insert(value);
     }
+    Ok(())
 }
 
 /// Batch collector for the official JobServer `ActionDownloadInfo` endpoint.
+///
+/// Every requested action must be declared in the run's workflow (see
+/// [`enforce_declared_actions`]); an undeclared action fails the whole
+/// batch with 403 instead of minting a ticket.
 pub async fn collect_action_download_infos(
     state: &AppState,
+    plan_id: &str,
     value: &serde_json::Value,
-) -> ActionDownloadInfoCollection {
+) -> Result<ActionDownloadInfoCollection, ApiError> {
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     if let Ok(list) = serde_json::from_value::<ActionReferenceList>(value.clone()) {
         for item in list.actions.into_iter() {
@@ -652,6 +693,9 @@ pub async fn collect_action_download_infos(
     requests.retain(|request| seen.insert(request.clone()));
     requests.truncate(MAX_ACTION_BATCH_SIZE);
 
+    let (run_id, declared) = declared_actions_for_plan(state, plan_id).await?;
+    enforce_declared_actions(state, run_id, &declared, &requests).await?;
+
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
         action_download_info_entry(state, &action, version.as_deref()).await
     }))
@@ -663,7 +707,553 @@ pub async fn collect_action_download_infos(
         actions.insert(key, value);
     }
 
-    ActionDownloadInfoCollection { actions }
+    Ok(ActionDownloadInfoCollection { actions })
+}
+
+/// Normalize a `uses:` reference to its `owner/repo` download scope
+/// (lowercased), or `None` when the reference names no fixed remote
+/// repository: local (`./`, `../`), `docker://`, self-repo (`$/`),
+/// expression-driven owners (`${{ }}` in the repo part), and malformed
+/// references. A subpath (`owner/repo/sub/dir@ref`) normalizes to
+/// `owner/repo`: the tarball — and the quota it burns — is per repository.
+pub fn normalize_action_owner_repo(uses: &str) -> Option<String> {
+    let uses = uses.trim();
+    if uses.is_empty() {
+        return None;
+    }
+    for prefix in ["./", "../", "docker://", "$/"] {
+        if uses.starts_with(prefix) {
+            return None;
+        }
+    }
+    // The ref may be dynamic (`@${{ matrix.ref }}`); only the repo part has
+    // to be static — enforcement is owner/repo-scoped, never ref-pinned.
+    let repo_part = uses.split('@').next().unwrap_or(uses);
+    if repo_part.contains("${{") {
+        return None;
+    }
+    let mut segments = repo_part.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    for segment in [owner, repo] {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || segment.contains('\0')
+        {
+            return None;
+        }
+    }
+    Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
+}
+
+/// Normalize a bare `owner/repo` slug (e.g. the run's repository) to its
+/// lowercased form, or `None` when it is not exactly two clean segments.
+fn normalize_repo_slug(slug: &str) -> Option<String> {
+    let slug = slug.trim().trim_matches('/');
+    let mut segments = slug.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    for segment in [owner, repo] {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || segment.contains('\0')
+        {
+            return None;
+        }
+    }
+    Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
+}
+
+/// Maximum nesting depth when following reusable-workflow callees while
+/// collecting a run's declared actions. Mirrors the submit-time
+/// `MAX_REUSABLE_WORKFLOW_DEPTH` so the allowlist sees the same tree the
+/// expander did.
+const DECLARED_ACTION_REUSABLE_DEPTH: usize = 4;
+
+/// The actions a run may download, named directly by its workflow: every
+/// `owner/repo` in a step `uses:` or a job-level reusable `uses:`
+/// (transitively through local and already-fetched remote callee YAML),
+/// plus the workflow's own repository — `$/path` self-references resolve
+/// to it through the forge and the runner asks the server to resolve them.
+///
+/// Derived from the run record's stored submission, so it needs no extra
+/// per-run state and survives engine restarts. A workflow that cannot be
+/// (re)parsed yields an empty set: fail closed, never fail open.
+fn direct_declared_actions(
+    workflow_yaml: &str,
+    reusable_workflows: &BTreeMap<String, String>,
+    repository: &str,
+) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    let workflow = match preloop_gha_parser::parse_workflow(workflow_yaml) {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            warn!("cannot parse stored workflow for declared-action allowlist: {error:#}");
+            return declared;
+        }
+    };
+    // `$/path` self-references resolve to the workflow's own repository.
+    if let Some(slug) = normalize_repo_slug(repository) {
+        declared.insert(slug);
+    }
+    let mut visited = BTreeSet::new();
+    collect_workflow_declared(
+        &workflow,
+        reusable_workflows,
+        &mut declared,
+        &mut visited,
+        0,
+    );
+    declared
+}
+
+fn collect_workflow_declared(
+    workflow: &preloop_gha_parser::Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    declared: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+    depth: usize,
+) {
+    if depth > DECLARED_ACTION_REUSABLE_DEPTH {
+        return;
+    }
+    for job in workflow.jobs.values() {
+        // A job-level `uses:` is a reusable-workflow call: the callee repo
+        // is declared, and the callee's own steps are too (recurse into the
+        // callee YAML stashed on the submission at submit time).
+        if let Some(uses) = job.uses.as_deref() {
+            if let Some(owner_repo) = normalize_action_owner_repo(uses) {
+                declared.insert(owner_repo);
+            }
+            if visited.insert(uses.to_owned())
+                && let Some(yaml) = reusable_callee_yaml(uses, reusable_workflows)
+                && let Ok(callee) = preloop_gha_parser::parse_workflow(yaml)
+            {
+                collect_workflow_declared(
+                    &callee,
+                    reusable_workflows,
+                    declared,
+                    visited,
+                    depth + 1,
+                );
+            }
+        }
+        for step in &job.steps {
+            if let Some(uses) = step.uses.as_deref()
+                && let Some(owner_repo) = normalize_action_owner_repo(uses)
+            {
+                declared.insert(owner_repo);
+            }
+        }
+    }
+}
+
+/// Callee YAML for a job-level reusable `uses:`: remote callees are keyed
+/// by the full reference string (stashed by submit-time fetching); local
+/// callees (`./`, `$/`) are keyed by repository-relative path.
+fn reusable_callee_yaml<'a>(
+    uses: &str,
+    reusable_workflows: &'a BTreeMap<String, String>,
+) -> Option<&'a String> {
+    if let Some(yaml) = reusable_workflows.get(uses) {
+        return Some(yaml);
+    }
+    let without_ref = uses.split('@').next().unwrap_or(uses);
+    let path = without_ref
+        .strip_prefix("./")
+        .or_else(|| without_ref.strip_prefix("$/"))?;
+    // Lexically normalize the relative path the way the expander does, so
+    // `./a/../b/c.yml` finds the `b/c.yml` key.
+    let normalized = std::path::Path::new(path)
+        .components()
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .into_owned();
+    reusable_workflows
+        .get(&normalized)
+        .or_else(|| reusable_workflows.get(path))
+}
+
+/// Resolve the run behind a JobServer `plan_id` path segment and return its
+/// declared action allowlist. An unknown plan fails closed: without a run
+/// there is no declared set to mint against.
+async fn declared_actions_for_plan(
+    state: &AppState,
+    plan_id: &str,
+) -> Result<(RunId, BTreeSet<String>), ApiError> {
+    use crate::control::backend::RequestKey;
+    let run_id = match state
+        .backend
+        .request(RequestKey::PlanId(plan_id.to_owned()))
+        .await
+    {
+        Ok(request) => request.run_id,
+        Err(crate::control::ControlError::NotFound(_)) => {
+            return Err(ApiError::forbidden(format!(
+                "action downloads are not permitted for unknown plan `{plan_id}`"
+            )));
+        }
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    let declared = declared_actions_for_run_id(state, run_id).await?;
+    Ok((run_id, declared))
+}
+
+/// Resolve the run behind a `runnerresolve` (`orchestration_id`, `job_id`)
+/// path pair and return its declared action allowlist. Prefers the job id
+/// (exact), falling back to the orchestration plan id.
+async fn declared_actions_for_runnerresolve(
+    state: &AppState,
+    orchestration_id: &str,
+    job_id: &str,
+) -> Result<(RunId, BTreeSet<String>), ApiError> {
+    use crate::control::backend::RequestKey;
+    let mut run_id = None;
+    if let Ok(agent_job_id) = job_id.parse::<uuid::Uuid>()
+        && let Ok(request) = state
+            .backend
+            .request(RequestKey::AgentJobId(agent_job_id))
+            .await
+    {
+        run_id = Some(request.run_id);
+    }
+    let run_id = match run_id {
+        Some(run_id) => run_id,
+        None => match state
+            .backend
+            .request(RequestKey::PlanId(orchestration_id.to_owned()))
+            .await
+        {
+            Ok(request) => request.run_id,
+            Err(crate::control::ControlError::NotFound(_)) => {
+                return Err(ApiError::forbidden(format!(
+                    "action downloads are not permitted for unknown job `{job_id}`"
+                )));
+            }
+            Err(error) => return Err(ApiError::from(error)),
+        },
+    };
+    let declared = declared_actions_for_run_id(state, run_id).await?;
+    Ok((run_id, declared))
+}
+
+async fn declared_actions_for_run_id(
+    state: &AppState,
+    run_id: RunId,
+) -> Result<BTreeSet<String>, ApiError> {
+    let run = state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(direct_declared_actions(
+        &run.submission.workflow_yaml,
+        &run.submission.reusable_workflows,
+        &run.submission.repository,
+    ))
+}
+
+/// Cap on a fetched action manifest's decoded bytes. Manifests are small
+/// YAML files; anything larger is not a manifest we should parse.
+const ACTION_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+
+/// Nested `uses:` scopes from a composite action's manifest, memoized per
+/// (`owner`, `repo`, `ref`). Only definitive answers are cached (see
+/// [`ActionManifestNestedUses`]); a transient failure returns an empty set
+/// uncached so the next adjudication retries.
+async fn nested_action_uses(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> BTreeSet<String> {
+    let key = (
+        owner.to_lowercase(),
+        repo.to_lowercase(),
+        git_ref.to_owned(),
+    );
+    if let Ok(cache) = state.action_manifest_nested_uses.lock()
+        && let Some(cached) = cache.get(&key)
+    {
+        return cached.clone();
+    }
+    // A transient failure yields `None`: fail closed for this adjudication
+    // without poisoning the cache — the next wave retries the fetch.
+    // Definitive answers (even empty: a non-composite action, or a repo
+    // with no manifest, never grows nested uses at this ref) are cached.
+    let Some(nested) = fetch_action_manifest_nested_uses(state, owner, repo, git_ref).await else {
+        return BTreeSet::new();
+    };
+    if let Ok(mut cache) = state.action_manifest_nested_uses.lock() {
+        cache.insert(key, nested.clone());
+    }
+    nested
+}
+
+/// Fetch `action.yml`/`action.yaml` for (`owner`, `repo`, `ref`) through
+/// the forge contents API and extract nested `uses:` scopes when the action
+/// is composite. Returns `None` on transient failures (not cached);
+/// `Some` (possibly empty) for definitive answers: a manifest was read, or
+/// no manifest exists (404), or the forge definitively refused.
+async fn fetch_action_manifest_nested_uses(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Option<BTreeSet<String>> {
+    // The (owner, repo) pair reaching here was already resolved for this run
+    // (it is in the run's declared set or was admitted through it), so
+    // fetching its manifest spends quota the run's own execution would
+    // spend anyway — never on an attacker's arbitrary repository.
+    let api_base = state.github_urls.api_url.trim_end_matches('/').to_owned();
+    let enc_owner = percent_encode_path_segment(owner);
+    let enc_repo = percent_encode_path_segment(repo);
+    for manifest in ["action.yml", "action.yaml"] {
+        let url = format!(
+            "{api_base}/repos/{enc_owner}/{enc_repo}/contents/{manifest}?ref={}",
+            percent_encode_path_segment(git_ref)
+        );
+        let mut request = crate::shared_http::CLIENT.get(&url);
+        if let Some(pat) = state.static_github_pat()
+            && url_targets_configured_github(&url, &state.github_urls)
+        {
+            request = request.bearer_auth(pat);
+        }
+        let response = match crate::github_breaker::send_observed_labeled(
+            &state.github_breaker,
+            &state.github_consumption,
+            crate::github_breaker::GithubSubsystem::Actions,
+            request,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%owner, %repo, %git_ref, %error, "action manifest fetch failed; denying nested uses for this wave");
+                return None;
+            }
+        };
+        state
+            .github_consumption
+            .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Actions, &response);
+        let status = response.status();
+        if status.is_success() {
+            let body = match response.json::<serde_json::Value>().await {
+                Ok(body) => body,
+                Err(_) => return Some(BTreeSet::new()),
+            };
+            return Some(manifest_nested_uses(&body));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            continue; // Try the other manifest filename.
+        }
+        if status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return None; // Transient: do not cache, retry next time.
+        }
+        // Definitive refusal (401/403/422 on a private repo without a PAT,
+        // …): no readable manifest, hence no nested uses.
+        return Some(BTreeSet::new());
+    }
+    // Neither manifest exists: not a composite action (or no manifest at
+    // all) — definitively no nested uses.
+    Some(BTreeSet::new())
+}
+
+/// Look up `key` in a YAML mapping.
+fn yaml_get<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    value
+        .as_mapping()?
+        .get(serde_yaml::Value::String(key.to_owned()))
+}
+
+/// Extract nested `uses:` scopes from a forge contents-API response for an
+/// action manifest. Only composite actions (`runs.using: composite`) can
+/// nest remote `uses:`; anything else — Node/Docker actions, unparseable
+/// bodies — yields an empty set.
+fn manifest_nested_uses(body: &serde_json::Value) -> BTreeSet<String> {
+    let mut nested = BTreeSet::new();
+    let content = body.get("content").and_then(|value| value.as_str());
+    let Some(encoded) = content else {
+        return nested;
+    };
+    // The contents API wraps base64 at 60 columns; strip whitespace before
+    // decoding and cap the decoded size — this is a small YAML file.
+    let cleaned: String = encoded.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let decoded = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        cleaned.as_bytes(),
+    ) {
+        Ok(decoded) if decoded.len() <= ACTION_MANIFEST_MAX_BYTES => decoded,
+        _ => return nested,
+    };
+    let manifest: serde_yaml::Value = match serde_yaml::from_slice(&decoded) {
+        Ok(manifest) => manifest,
+        Err(_) => return nested,
+    };
+    let runs = yaml_get(&manifest, "runs");
+    let using_is_composite = runs
+        .and_then(|runs| yaml_get(runs, "using"))
+        .and_then(|using| using.as_str())
+        .is_some_and(|using| using == "composite");
+    if !using_is_composite {
+        return nested;
+    }
+    let steps = runs.and_then(|runs| yaml_get(runs, "steps"));
+    let Some(steps) = steps.and_then(|steps| steps.as_sequence()) else {
+        return nested;
+    };
+    for step in steps {
+        if let Some(uses) = yaml_get(step, "uses").and_then(|uses| uses.as_str())
+            && let Some(owner_repo) = normalize_action_owner_repo(uses)
+        {
+            nested.insert(owner_repo);
+        }
+    }
+    nested
+}
+
+/// Enforce the run's declared-action allowlist on one resolution batch.
+///
+/// Every requested remote action must be in `declared`, or be nested inside
+/// the manifest of an action this run already resolved (the transitive
+/// composite closure: a composite action's nested `uses:` arrive in later
+/// waves, after the parent's own download, so they cannot be in the
+/// workflow's direct set). Anything else fails the whole batch with 403 —
+/// no ticket is minted for an undeclared action, closing the download
+/// oracle.
+///
+/// Requests that are not remote actions (local `./`, `docker://`,
+/// self-repo `$/`, expression-driven) are left to the resolver, which drops
+/// them exactly as before: they can never mint a ticket.
+///
+/// On success, this batch's admitted (`owner/repo`, `ref`) triples are
+/// recorded on the run's resolution ledger for later waves.
+async fn enforce_declared_actions(
+    state: &AppState,
+    run_id: RunId,
+    declared: &BTreeSet<String>,
+    requests: &[(String, Option<String>)],
+) -> Result<(), ApiError> {
+    // (batch index, owner/repo, ref) for requests naming a remote action.
+    let mut remote: Vec<(usize, String, String)> = Vec::new();
+    for (index, (action, version)) in requests.iter().enumerate() {
+        if let Some(owner_repo) = normalize_action_owner_repo(action) {
+            remote.push((index, owner_repo, version.clone().unwrap_or_default()));
+        }
+    }
+
+    let mut admitted: BTreeSet<usize> = BTreeSet::new();
+    // (`owner/repo`, `ref`) triples whose manifests may authorize nested
+    // uses: this batch's direct hits plus earlier batches' ledger.
+    let mut manifest_sources: Vec<(String, String)> = Vec::new();
+    for (index, owner_repo, git_ref) in &remote {
+        if declared.contains(owner_repo) {
+            admitted.insert(*index);
+            manifest_sources.push((owner_repo.clone(), git_ref.clone()));
+        }
+    }
+
+    // Fast path: everything directly declared — no manifest fetch needed.
+    // The transitive closure below only runs when some request is not
+    // directly declared, so ordinary job setups never pay for it.
+    let mut unadmitted: Vec<(usize, String, String)> = remote
+        .iter()
+        .filter(|(index, _, _)| !admitted.contains(index))
+        .cloned()
+        .collect();
+    if !unadmitted.is_empty() {
+        // Seed cross-batch sources: nested refs arrive in later waves, after
+        // the parent's own download, so earlier batches' ledger entries must
+        // be consultable here.
+        if let Ok(ledger) = state.action_resolved_uses.lock()
+            && let Some(prior) = ledger.get(&run_id)
+        {
+            manifest_sources.extend(prior.iter().cloned());
+        }
+        // Transitive composite closure, to a fixpoint within the batch: each
+        // newly admitted action's manifest may admit further nested actions.
+        let mut checked: BTreeSet<(String, String)> = BTreeSet::new();
+        loop {
+            let mut nested_union: BTreeSet<String> = BTreeSet::new();
+            let mut newly_checked = false;
+            for (owner_repo, git_ref) in &manifest_sources {
+                if !checked.insert((owner_repo.clone(), git_ref.clone())) {
+                    continue;
+                }
+                newly_checked = true;
+                // `normalize_action_owner_repo` always yields `owner/repo`.
+                let (owner, repo) = owner_repo
+                    .split_once('/')
+                    .unwrap_or((owner_repo.as_str(), ""));
+                nested_union.extend(nested_action_uses(state, owner, repo, git_ref).await);
+            }
+            if !newly_checked {
+                break;
+            }
+            let mut progressed = false;
+            unadmitted.retain(|(index, owner_repo, git_ref)| {
+                if nested_union.contains(owner_repo) {
+                    admitted.insert(*index);
+                    manifest_sources.push((owner_repo.clone(), git_ref.clone()));
+                    progressed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    let denied: Vec<String> = remote
+        .iter()
+        .filter(|(index, _, _)| !admitted.contains(index))
+        .map(|(_, owner_repo, git_ref)| {
+            if git_ref.is_empty() {
+                owner_repo.clone()
+            } else {
+                format!("{owner_repo}@{git_ref}")
+            }
+        })
+        .collect();
+    if !denied.is_empty() {
+        warn!(
+            "action download denied for run {}: {} not declared in the run's workflow `uses:`",
+            run_id.0,
+            denied.join(", ")
+        );
+        return Err(ApiError::forbidden(format!(
+            "action download not permitted: {} not declared in this run's workflow `uses:`",
+            denied.join(", ")
+        )));
+    }
+
+    // Ledger this batch's admitted triples for later waves' closures.
+    if let Ok(mut ledger) = state.action_resolved_uses.lock() {
+        let entry = ledger.entry(run_id).or_default();
+        for (index, owner_repo, git_ref) in &remote {
+            if admitted.contains(index) && !entry.contains(&(owner_repo.clone(), git_ref.clone())) {
+                entry.push((owner_repo.clone(), git_ref.clone()));
+            }
+        }
+        if entry.len() > crate::state::MAX_RESOLVED_USES_PER_RUN {
+            let excess = entry.len() - crate::state::MAX_RESOLVED_USES_PER_RUN;
+            entry.drain(..excess);
+        }
+    }
+    Ok(())
 }
 
 fn collect_runnerresolve_requests(
@@ -1285,5 +1875,173 @@ mod tests {
         drop(second);
         assert_eq!(stub.hits(), 1, "the cache hit must not touch GitHub");
         assert_eq!(actions_usage(&shared).requests, 1);
+    }
+
+    /// `normalize_action_owner_repo` maps `uses:` to the lowercased
+    /// `owner/repo` download scope, and rejects everything that names no
+    /// fixed remote repository.
+    #[test]
+    fn normalize_action_owner_repo_cases() {
+        let some = |s: &str| Some(s.to_string());
+        // Standard refs, case-insensitive, subpaths collapse to the repo.
+        assert_eq!(
+            normalize_action_owner_repo("actions/checkout@v4"),
+            some("actions/checkout")
+        );
+        assert_eq!(
+            normalize_action_owner_repo("Actions/Checkout@V4"),
+            some("actions/checkout")
+        );
+        assert_eq!(
+            normalize_action_owner_repo("owner/repo/sub/dir@main"),
+            some("owner/repo")
+        );
+        assert_eq!(
+            normalize_action_owner_repo("actions/setup-node.js@v4"),
+            some("actions/setup-node.js")
+        );
+        // A dynamic ref is fine: enforcement is owner/repo-scoped.
+        assert_eq!(
+            normalize_action_owner_repo("actions/checkout@${{ matrix.ref }}"),
+            some("actions/checkout")
+        );
+        // The `docker/` org is a real org; only the `docker://` scheme is local.
+        assert_eq!(
+            normalize_action_owner_repo("docker/build-push-action@v5"),
+            some("docker/build-push-action")
+        );
+        // No fixed remote repository: local, docker scheme, self-repo,
+        // expression-driven owners, malformed.
+        assert_eq!(normalize_action_owner_repo("./.github/actions/local"), None);
+        assert_eq!(normalize_action_owner_repo("../shared/action@v1"), None);
+        assert_eq!(normalize_action_owner_repo("docker://alpine:3.20"), None);
+        assert_eq!(normalize_action_owner_repo("$/actions/local@v1"), None);
+        assert_eq!(
+            normalize_action_owner_repo("${{ matrix.owner }}/repo@v1"),
+            None
+        );
+        assert_eq!(normalize_action_owner_repo("just-a-name"), None);
+        assert_eq!(normalize_action_owner_repo("owner/@v1"), None);
+        assert_eq!(normalize_action_owner_repo("/repo@v1"), None);
+        assert_eq!(normalize_action_owner_repo(""), None);
+        assert_eq!(normalize_action_owner_repo("   "), None);
+    }
+
+    /// `direct_declared_actions` collects step `uses:`, job-level reusable
+    /// calls, and the workflow's own repository (for `$/` self-references).
+    #[test]
+    fn direct_declared_actions_covers_steps_reusables_and_self_repo() {
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Actions/Setup-Node@v4
+      - uses: owner/repo/sub/dir@main
+      - uses: ./local/action
+      - uses: docker://alpine:3.20
+      - run: echo hi
+  call:
+    uses: octo-org/octo-repo/.github/workflows/ci.yml@v1
+"#;
+        let declared = direct_declared_actions(yaml, &BTreeMap::new(), "MyOrg/MyRepo");
+        assert!(declared.contains("actions/checkout"), "{declared:?}");
+        assert!(declared.contains("actions/setup-node"), "{declared:?}");
+        assert!(declared.contains("owner/repo"), "{declared:?}");
+        assert!(declared.contains("octo-org/octo-repo"), "{declared:?}");
+        // The workflow's own repo: `$/path` self-references resolve to it.
+        assert!(declared.contains("myorg/myrepo"), "{declared:?}");
+        assert_eq!(declared.len(), 5, "{declared:?}");
+    }
+
+    /// A corrupt stored workflow fails closed: nothing is declared, so no
+    /// ticket is minted.
+    #[test]
+    fn direct_declared_actions_fails_closed_on_unparseable_yaml() {
+        let declared = direct_declared_actions("not: [valid", &BTreeMap::new(), "o/r");
+        assert!(declared.is_empty(), "{declared:?}");
+    }
+
+    /// Reusable callees contribute their own steps' actions, transitively.
+    #[test]
+    fn direct_declared_actions_follows_reusable_callees() {
+        let callee = r#"
+on: workflow_call
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v5
+"#;
+        let root = r#"
+on: push
+jobs:
+  call:
+    uses: ./reusable/ci.yml
+"#;
+        let mut reusables = BTreeMap::new();
+        reusables.insert("reusable/ci.yml".to_string(), callee.to_string());
+        let declared = direct_declared_actions(root, &reusables, "o/r");
+        assert!(
+            declared.contains("docker/build-push-action"),
+            "{declared:?}"
+        );
+        assert!(declared.contains("o/r"), "{declared:?}");
+        assert_eq!(declared.len(), 2, "{declared:?}");
+    }
+
+    /// `manifest_nested_uses` extracts nested `uses:` only from composite
+    /// action manifests; Node/Docker actions and junk yield nothing.
+    #[test]
+    fn manifest_nested_uses_only_for_composite() {
+        fn contents_body(yaml: &str) -> serde_json::Value {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(yaml);
+            serde_json::json!({ "content": encoded, "encoding": "base64" })
+        }
+        let composite = contents_body(
+            "name: composite\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n    - run: echo hi\n",
+        );
+        let nested = manifest_nested_uses(&composite);
+        assert_eq!(nested, BTreeSet::from(["actions/checkout".to_string()]));
+
+        let node = contents_body("name: node\nruns:\n  using: node20\n  main: dist/index.js\n");
+        assert!(manifest_nested_uses(&node).is_empty());
+
+        let docker = contents_body("name: docker\nruns:\n  using: docker\n  image: Dockerfile\n");
+        assert!(manifest_nested_uses(&docker).is_empty());
+
+        assert!(manifest_nested_uses(&serde_json::json!({})).is_empty());
+        assert!(
+            manifest_nested_uses(&serde_json::json!({"content": "!!!not-base64!!!"})).is_empty()
+        );
+    }
+
+    /// Ticket TTL is ~20 minutes, not 6 hours: a leaked bearerless ticket URL
+    /// is a briefly-open window.
+    #[tokio::test]
+    async fn action_ticket_ttl_is_twenty_minutes_not_six_hours() {
+        let state = test_state().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (_, ticket) =
+            action_download_ticket(&state, "actions/checkout@v4", None).expect("ticket must mint");
+        let url = ticket.get("url").and_then(|u| u.as_str()).unwrap();
+        let exp: u64 = url
+            .split('?')
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("exp=").and_then(|v| v.parse().ok()))
+            .expect("ticket URL must carry exp");
+        let ttl = exp.saturating_sub(now);
+        assert_eq!(ACTION_TICKET_TTL_SECS, 20 * 60);
+        assert!(
+            (15 * 60..=30 * 60).contains(&ttl),
+            "ticket TTL {ttl}s is outside the 15–30 minute window"
+        );
     }
 }

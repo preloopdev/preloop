@@ -921,6 +921,26 @@ pub async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
     .await
 }
 
+/// Submit a workflow and return its first job's `(run_id, plan_id,
+/// agent_job_id)`. The JobServer action-download endpoints resolve the run
+/// from the plan id in the URL, so tests addressing them need a real one.
+pub async fn submit_run_first_job(
+    app: &axum::Router,
+    state: &AppState,
+    yaml: &str,
+) -> (String, String, uuid::Uuid) {
+    let accepted = submit_yaml(app, yaml, "owner/repo").await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let parsed: RunId = run_id.parse().unwrap();
+    let inner = state.test_tx().await;
+    let request = inner
+        .job_requests
+        .values()
+        .find(|request| request.run_id == parsed)
+        .expect("submit must create a job request");
+    (run_id, request.plan_id.clone(), request.agent_job_id)
+}
+
 /// Extract the queued job message for a run, wherever it currently sits.
 pub fn queued_message_for(
     tx: &crate::control::testview::TestState,
