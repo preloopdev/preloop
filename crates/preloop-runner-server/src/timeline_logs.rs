@@ -835,13 +835,18 @@ pub async fn finish_job_plan(
     Json(serde_json::Value::Null)
 }
 
+/// Resolve and authorize a legacy reporting callback target.
+///
+/// Returns the request record the bearer was authorized against, so write
+/// handlers can additionally require the job to be live (see
+/// [`require_live_reporting_job`]).
 pub async fn authorize_reporting_callback(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     plan_id: &str,
     timeline_id: Option<uuid::Uuid>,
     agent_job_id: Option<uuid::Uuid>,
-) -> Result<(), ApiError> {
+) -> Result<Option<TaskAgentJobRequestRecord>, ApiError> {
     use crate::control::backend::RequestKey;
     let keys = [
         agent_job_id.map(RequestKey::AgentJobId),
@@ -860,7 +865,33 @@ pub async fn authorize_reporting_callback(
         }
     }
     let request = request.filter(|request| request.plan_id == plan_id);
-    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
+    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())?;
+    Ok(request)
+}
+
+/// Require the authorized reporting target to be live before a legacy
+/// reporting write.
+///
+/// This is the legacy `/_apis/v1` twin of the results-plane gate
+/// ([`crate::auth::require_live_results_job`]): a settled job's runtime
+/// token must not patch timelines, create or append logs, or stream live-log
+/// lines after the job died — the live-log ingest paths reopen a closed feed
+/// on fresh input, wiping the retained tail. The system credential bypasses,
+/// matching the results-plane rule.
+pub async fn require_live_reporting_job(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    let bypass = crate::auth::bearer_from_headers(headers)
+        .is_some_and(|bearer| bearer == shared.state.system_token);
+    if bypass {
+        return Ok(());
+    }
+    let request = request.ok_or_else(|| {
+        ApiError::forbidden("job runtime token cannot resolve the reporting target")
+    })?;
+    crate::auth::require_live_job(&shared.state, request.agent_job_id).await
 }
 
 pub async fn patch_timeline_records_authenticated(
@@ -870,7 +901,9 @@ pub async fn patch_timeline_records_authenticated(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    let request =
+        authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     patch_timeline_records(State(shared), Path(path), Json(wrapper)).await
 }
 
@@ -891,7 +924,8 @@ pub async fn create_log_authenticated(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    let request = authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     create_log(State(shared), Path(path), Json(log)).await
 }
 
@@ -901,7 +935,8 @@ pub async fn append_log_authenticated(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    let request = authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     Ok(append_log(State(shared), Path(path), body).await)
 }
 
@@ -912,7 +947,9 @@ pub async fn console_log_authenticated(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let timeline_id = path.3.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    let request =
+        authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     Ok(console_log(State(shared), Path(path), body).await)
 }
 
@@ -947,7 +984,9 @@ pub async fn patch_timeline_records_plan_authenticated(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    let request =
+        authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper)).await
 }
 
@@ -968,7 +1007,8 @@ pub async fn create_log_plan_authenticated(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    let request = authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     create_log_plan(State(shared), Path(plan_id), Json(log)).await
 }
 
@@ -978,7 +1018,8 @@ pub async fn append_log_plan_authenticated(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    let request = authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
+    require_live_reporting_job(&shared, &headers, request.as_ref()).await?;
     Ok(append_log_plan(State(shared), Path((plan_id, log_id)), body).await)
 }
 
