@@ -25,6 +25,16 @@ Releases before v0.27.0 predate the changelog.
 - **Composite actions carry nesting depth through every re-entry**: `./`
   fallbacks and remote composite references restarted the depth at zero, so a
   self-referencing composite was not stopped by the 10-level cap.
+- **Golden unpacks wait for disk instead of filling it, and failed unpacks
+  clean up after themselves**: unpacking a packed golden writes several times
+  the pack's size before smolvm's own layer preflight runs, and a failed
+  attempt left ~29 GB of `pack/` intermediates that survived every retry
+  until a restart's stale-machine sweep happened to claim them — enough to
+  fill a volume at 100% on a loop. The unpack now stalls behind the same
+  disk-wait discipline as job VMs when the volume lacks
+  `PRELOOP_GOLDEN_UNPACK_FACTOR` (default 6) times the pack's compressed
+  size, prunes `pack/` on any failure, and the startup sweep prunes the
+  residue a crashed delete left inside registered machines.
 
 ## [0.34.0] - 2026-10-09
 

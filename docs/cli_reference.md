@@ -515,6 +515,7 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 80 GiB) |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | Free space kept on the VM volume (`PRELOOP_RUNNER_STORAGE_GB`'s volume) before a job VM is forked or created (default 20 GiB; `0` disables). Below it the pool holds the slot and re-measures instead of starting a runner, logging `waiting for disk: …`; jobs wait, they are not failed. A volume that cannot be measured never blocks |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | Proceed past the golden disk check with a warning. Without it, a golden download is refused when the artifact cannot fit on its volume, and a golden build when the SmolVM data volume has less than the builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB of pack staging free |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | Free space the golden unpack waits for, as a multiple of the pack's compressed size (default 6). smolvm writes several times the pack before its own layer preflight runs, so the engine stalls the unpack rather than ENOSPC mid-write; a failed attempt prunes its own `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses this wait too |
 | `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
