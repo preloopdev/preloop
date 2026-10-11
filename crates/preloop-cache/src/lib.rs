@@ -1,14 +1,27 @@
 //! Local cache storage compatible with GitHub Actions cache semantics.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 /// POSIX `NAME_MAX` for the filesystems we target (APFS, ext4, XFS, overlayfs):
 /// a single path component may not exceed 255 bytes.
 const MAX_NAME_BYTES: usize = 255;
+
+/// Default total quota for finalized cache entries: 10 GiB. Matches GitHub's
+/// 10 GB per-repository cache limit; this is the server-wide total across
+/// every cache namespace. Operators override it with `[cache]
+/// total_quota_bytes` (or `PRELOOP_CACHE_TOTAL_QUOTA_BYTES`).
+pub const DEFAULT_CACHE_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// How long an interrupted upload may leave debris behind — a `.part` file
+/// with no committed archive, or metadata with no archive — before quota
+/// enforcement reaps it. Crashed writers never come back to finish those, and
+/// without reaping they would wedge the entry (and the quota) forever.
+const STALE_WRITE_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// Cache storage error.
 #[derive(Debug, thiserror::Error)]
@@ -46,14 +59,153 @@ pub struct CacheEntry {
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     root: PathBuf,
+    /// Total bytes of finalized entries the store keeps. When a commit
+    /// pushes the total over this quota, least-recently-used entries are
+    /// evicted until the total fits again.
+    quota_bytes: u64,
 }
 
 impl CacheStore {
-    /// Create a cache store rooted at `root`.
+    /// Create a cache store rooted at `root`, with the default quota
+    /// ([`DEFAULT_CACHE_QUOTA_BYTES`]).
     pub async fn new(root: impl Into<PathBuf>) -> Result<Self, CacheError> {
         let root = root.into();
         fs::create_dir_all(&root).await?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            quota_bytes: DEFAULT_CACHE_QUOTA_BYTES,
+        })
+    }
+
+    /// Override the total quota for finalized entries. The server sets this
+    /// from `[cache] total_quota_bytes` at startup.
+    pub fn set_quota_bytes(&mut self, quota_bytes: u64) {
+        self.quota_bytes = quota_bytes;
+    }
+
+    /// The effective total quota for finalized entries.
+    pub fn quota_bytes(&self) -> u64 {
+        self.quota_bytes
+    }
+
+    /// Claim the entry directory and write the metadata sidecars. The caller
+    /// places `archive.tzst` inside the returned directory, then calls
+    /// [`CacheStore::finish_commit`]. A directory left without an archive
+    /// (crashed writer) is reaped by quota enforcement once stale.
+    async fn begin_commit(
+        &self,
+        namespace: &str,
+        key: &str,
+        version: &str,
+    ) -> Result<PathBuf, CacheError> {
+        validate_key(key, "Cache")?;
+        let directory = self.entry_dir_scoped(namespace, key, version);
+        match fs::create_dir(&directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(CacheError::AlreadyExists {
+                    key: key.to_owned(),
+                    version: version.to_owned(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string();
+        if let Err(error) = async {
+            fs::write(directory.join("namespace"), namespace).await?;
+            fs::write(directory.join("key"), key).await?;
+            fs::write(directory.join("version"), version).await?;
+            fs::write(directory.join("created_at"), created_at).await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await
+        {
+            let _ = fs::remove_dir_all(&directory).await;
+            return Err(error.into());
+        }
+        Ok(directory)
+    }
+
+    /// Mark the archive committed: refresh its LRU timestamp and evict
+    /// least-recently-used entries while the store is over quota. `protect`
+    /// is the just-committed archive, which is never evicted by its own
+    /// commit — a single entry larger than the quota stays until a later
+    /// commit evicts it.
+    async fn finish_commit(
+        &self,
+        directory: &Path,
+        key: &str,
+        version: &str,
+        protect: &Path,
+    ) -> Result<CacheEntry, CacheError> {
+        let archive = directory.join("archive.tzst");
+        let size = fs::metadata(&archive).await?.len();
+        touch_file(&archive).await;
+        self.enforce_quota_except(Some(protect)).await?;
+        Ok(CacheEntry {
+            key: key.to_owned(),
+            version: version.to_owned(),
+            path: archive,
+            size,
+        })
+    }
+
+    /// Commit an already-staged blob file as a cache archive without ever
+    /// loading it into RAM: the file is renamed into the entry directory
+    /// (same filesystem), falling back to a bounded-buffer streaming copy.
+    /// The staging file is consumed — moved or deleted — on success.
+    ///
+    /// This is the finalize path for chunked uploads: chunks were streamed
+    /// to `src` as they arrived, so committing a 150 MB blob costs only a
+    /// rename and a directory scan, not a full-blob read.
+    pub async fn commit_file_scoped(
+        &self,
+        namespace: &str,
+        key: &str,
+        version: &str,
+        src: &Path,
+    ) -> Result<CacheEntry, CacheError> {
+        if !fs::try_exists(src).await? {
+            return Err(CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("staged cache file not found: {}", src.display()),
+            )));
+        }
+        let directory = self.begin_commit(namespace, key, version).await?;
+        let archive = directory.join("archive.tzst");
+        let staged = async {
+            match fs::rename(src, &archive).await {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Cross-filesystem staging (or a platform without an
+                    // atomic rename): stream the bytes over with a small
+                    // constant buffer instead of failing the commit.
+                    stream_copy(src, &archive).await?;
+                    fs::remove_file(src).await?;
+                    Ok(())
+                }
+            }
+        }
+        .await;
+        if let Err(error) = staged {
+            let _ = fs::remove_dir_all(&directory).await;
+            return Err(error);
+        }
+        self.finish_commit(&directory, key, version, &archive).await
+    }
+
+    /// Commit an already-staged blob file in the default (unscoped) namespace.
+    pub async fn commit_file(
+        &self,
+        key: &str,
+        version: &str,
+        src: &Path,
+    ) -> Result<CacheEntry, CacheError> {
+        self.commit_file_scoped("", key, version, src).await
     }
 
     /// Save an immutable cache archive.
@@ -82,44 +234,45 @@ impl CacheStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<CacheEntry, CacheError> {
-        validate_key(key, "Cache")?;
-        let directory = self.entry_dir_scoped(namespace, key, version);
-        match fs::create_dir(&directory).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(CacheError::AlreadyExists {
-                    key: key.to_owned(),
-                    version: version.to_owned(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        }
-
-        let path = directory.join("archive.tzst");
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_string();
-        if let Err(error) = async {
-            fs::write(directory.join("namespace"), namespace).await?;
-            fs::write(directory.join("key"), key).await?;
-            fs::write(directory.join("version"), version).await?;
-            fs::write(directory.join("created_at"), created_at).await?;
-            fs::write(&path, bytes).await
-        }
-        .await
-        {
+        let directory = self.begin_commit(namespace, key, version).await?;
+        let archive = directory.join("archive.tzst");
+        if let Err(error) = fs::write(&archive, bytes).await {
             let _ = fs::remove_dir_all(&directory).await;
             return Err(error.into());
         }
+        self.finish_commit(&directory, key, version, &archive).await
+    }
 
-        Ok(CacheEntry {
-            key: key.to_owned(),
-            version: version.to_owned(),
-            path,
-            size: bytes.len() as u64,
-        })
+    /// Resolve a cache entry's metadata without reading the archive bytes.
+    /// Restores that only need the entry identity (existence checks, download
+    /// URL minting) use this so a 150 MB restore lookup does not pull 150 MB
+    /// into RAM just to throw the bytes away. Every successful resolution
+    /// refreshes the entry's LRU timestamp.
+    pub async fn lookup(
+        &self,
+        key: &str,
+        version: &str,
+        restore_keys: &[String],
+    ) -> Result<Option<CacheEntry>, CacheError> {
+        self.lookup_scoped("", key, version, restore_keys).await
+    }
+
+    /// Resolve a cache entry's metadata within one namespace, without reading
+    /// the archive bytes. See [`CacheStore::lookup`].
+    pub async fn lookup_scoped(
+        &self,
+        namespace: &str,
+        key: &str,
+        version: &str,
+        restore_keys: &[String],
+    ) -> Result<Option<CacheEntry>, CacheError> {
+        let entry = self
+            .resolve_scoped(namespace, key, version, restore_keys)
+            .await?;
+        if let Some(entry) = &entry {
+            touch_file(&entry.path).await;
+        }
+        Ok(entry)
     }
 
     /// Restore a cache using GitHub's lookup order: exact primary key, partial
@@ -143,6 +296,27 @@ impl CacheStore {
         version: &str,
         restore_keys: &[String],
     ) -> Result<Option<(CacheEntry, Vec<u8>)>, CacheError> {
+        let Some(entry) = self
+            .lookup_scoped(namespace, key, version, restore_keys)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let bytes = fs::read(&entry.path).await?;
+        Ok(Some((entry, bytes)))
+    }
+
+    /// Shared entry resolution for [`CacheStore::lookup_scoped`] and
+    /// [`CacheStore::get_scoped`]: key validation, exact-path probe (plus the
+    /// legacy layout probe), then prefix scan. Does not touch the LRU
+    /// timestamp; callers do that once they know the entry is used.
+    async fn resolve_scoped(
+        &self,
+        namespace: &str,
+        key: &str,
+        version: &str,
+        restore_keys: &[String],
+    ) -> Result<Option<CacheEntry>, CacheError> {
         validate_key(key, "Cache")?;
         if restore_keys.len() > 10 {
             return Err(CacheError::InvalidKey(format!(
@@ -167,22 +341,18 @@ impl CacheStore {
             None
         };
         if let Some(path) = exact_path {
-            let bytes = fs::read(&path).await?;
-            return Ok(Some((
-                CacheEntry {
-                    key: key.to_owned(),
-                    version: version.to_owned(),
-                    path,
-                    size: bytes.len() as u64,
-                },
-                bytes,
-            )));
+            let metadata = fs::metadata(&path).await?;
+            return Ok(Some(CacheEntry {
+                key: key.to_owned(),
+                version: version.to_owned(),
+                path,
+                size: metadata.len(),
+            }));
         }
 
         for prefix in std::iter::once(key).chain(restore_keys.iter().map(String::as_str)) {
             if let Some(entry) = self.find_prefix_scoped(namespace, prefix, version).await? {
-                let bytes = fs::read(&entry.path).await?;
-                return Ok(Some((entry, bytes)));
+                return Ok(Some(entry));
             }
         }
         Ok(None)
@@ -278,6 +448,107 @@ impl CacheStore {
         }
         Ok(newest.map(|(entry, _)| entry))
     }
+
+    /// Evict least-recently-used entries until the finalized total fits the
+    /// quota. Also reaps stale incomplete writes (crashed uploads) so they
+    /// can never wedge an entry or the quota. Runs after every commit and at
+    /// server startup.
+    pub async fn enforce_quota(&self) -> Result<(), CacheError> {
+        self.enforce_quota_except(None).await
+    }
+
+    async fn enforce_quota_except(&self, protect: Option<&Path>) -> Result<(), CacheError> {
+        let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        let mut read_dir = fs::read_dir(&self.root).await?;
+        while let Some(child) = read_dir.next_entry().await? {
+            if !child.file_type().await?.is_dir() {
+                continue;
+            }
+            let dir = child.path();
+            let archive = dir.join("archive.tzst");
+            match fs::metadata(&archive).await {
+                Ok(metadata) => {
+                    // Entries whose mtime cannot be read sort as oldest and
+                    // are evicted first — the safe direction.
+                    let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+                    entries.push((archive, metadata.len(), mtime));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.reap_stale_incomplete(&dir).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut total: u64 = entries.iter().map(|(_, size, _)| size).sum();
+        if total <= self.quota_bytes {
+            return Ok(());
+        }
+        // Oldest use first.
+        entries.sort_by(|a, b| a.2.cmp(&b.2));
+        for (archive, size, _) in entries {
+            if total <= self.quota_bytes {
+                break;
+            }
+            if protect.is_some_and(|protected| protected == archive.as_path()) {
+                continue;
+            }
+            // Best-effort: a concurrent reader may hold the file; it will be
+            // reaped on the next commit.
+            if let Some(parent) = archive.parent()
+                && fs::remove_dir_all(parent).await.is_ok()
+            {
+                total = total.saturating_sub(size);
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an entry directory that holds no committed archive once it is
+    /// older than [`STALE_WRITE_MAX_AGE`]: a crashed writer's debris. Fresh
+    /// incomplete directories are left alone — a commit may be in flight.
+    async fn reap_stale_incomplete(&self, dir: &Path) {
+        let mut newest = UNIX_EPOCH;
+        let mut any = false;
+        if let Ok(mut read_dir) = fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                any = true;
+                if let Ok(metadata) = entry.metadata().await
+                    && let Ok(modified) = metadata.modified()
+                {
+                    newest = newest.max(modified);
+                }
+            }
+        }
+        // An empty directory is always debris: `begin_commit` writes the
+        // metadata sidecars immediately after creating it.
+        let stale = !any
+            || SystemTime::now()
+                .duration_since(newest)
+                .is_ok_and(|age| age > STALE_WRITE_MAX_AGE);
+        if stale {
+            let _ = fs::remove_dir_all(dir).await;
+        }
+    }
+}
+
+/// Refresh a file's mtime to now. Best-effort: filesystems that cannot set
+/// mtimes simply age entries by creation time.
+async fn touch_file(path: &Path) {
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+}
+
+/// Copy `src` to `dst` with a small constant buffer, never loading the whole
+/// file into RAM. Fallback for commits whose staging area lives on another
+/// filesystem than the cache root (the fast path is an atomic rename).
+async fn stream_copy(src: &Path, dst: &Path) -> Result<(), CacheError> {
+    let mut reader = fs::File::open(src).await?;
+    let mut writer = fs::File::create(dst).await?;
+    tokio::io::copy(&mut reader, &mut writer).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Match `actions/toolkit` JavaScript `String.length` semantics: cache keys
@@ -487,5 +758,181 @@ mod tests {
                 assert!(miss.is_none(), "unknown {key_len}-byte key must miss");
             }
         });
+    }
+
+    /// Current process RSS in bytes, Linux only. Used to prove commits never
+    /// buffer the full blob in RAM.
+    #[cfg(target_os = "linux")]
+    fn rss_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmRSS:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<u64>().ok())
+            })
+            .map(|kb| kb * 1024)
+            .unwrap_or(0)
+    }
+
+    /// Committing a staged blob file must stream it into place: finalizing a
+    /// 150 MB blob (the round-3 repro size) must not spike process RSS the
+    /// way the old full-blob-in-RAM read did (+265 MB).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn commit_file_streams_large_blob_with_small_rss_delta() {
+        use std::io::Write as _;
+
+        const BLOB_MB: usize = 150;
+        const RSS_DELTA_LIMIT: u64 = 64 * 1024 * 1024;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(temp.path().join("cache")).await.unwrap();
+
+        // Stage a 150 MB blob on disk in 1 MiB chunks, the way chunked
+        // uploads arrive. Writing it must not inflate process RSS either
+        // (page cache, not process memory) — the assertion below covers the
+        // whole finalize path.
+        let stage = temp.path().join("stage.bin");
+        let chunk = vec![0xABu8; 1024 * 1024];
+        let mut file = std::fs::File::create(&stage).unwrap();
+        for _ in 0..BLOB_MB {
+            file.write_all(&chunk).unwrap();
+        }
+        drop(file);
+
+        let before = rss_bytes();
+        assert!(before > 0, "could not read process RSS");
+        let entry = store
+            .commit_file("big-blob", "v1", &stage)
+            .await
+            .expect("commit must succeed");
+        let after = rss_bytes();
+        let delta = after.saturating_sub(before);
+
+        assert_eq!(entry.size, (BLOB_MB * 1024 * 1024) as u64);
+        assert!(
+            !stage.exists(),
+            "the staging file must be consumed by the commit"
+        );
+        let (_restored_entry, bytes) = store
+            .get("big-blob", "v1", &[])
+            .await
+            .unwrap()
+            .expect("entry must be readable");
+        assert_eq!(bytes.len(), BLOB_MB * 1024 * 1024);
+        assert!(
+            delta < RSS_DELTA_LIMIT,
+            "finalizing a {BLOB_MB} MB blob spiked RSS by {} MiB (limit {} MiB)",
+            delta / (1024 * 1024),
+            RSS_DELTA_LIMIT / (1024 * 1024),
+        );
+    }
+
+    /// Quota enforcement evicts least-recently-used entries first: filling
+    /// past the quota drops the oldest untouched entry while a recently read
+    /// (older-created) entry and the newest entries survive.
+    #[tokio::test]
+    async fn quota_evicts_least_recently_used() {
+        const MIB: usize = 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = CacheStore::new(temp.path()).await.unwrap();
+        store.set_quota_bytes(3 * MIB as u64);
+
+        let payload = vec![0xCDu8; MIB];
+        for key in ["k1", "k2", "k3"] {
+            store.put(key, "v", &payload).await.unwrap();
+            // mtime granularity insurance: commits must sort k1 < k2 < k3.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // k1 was created first, but a read refreshes its LRU timestamp, so
+        // the eviction must take k2 (oldest untouched) instead.
+        let _ = store.get("k1", "v", &[]).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        store.put("k4", "v", &payload).await.unwrap();
+
+        assert!(
+            store.lookup("k2", "v", &[]).await.unwrap().is_none(),
+            "k2 (least recently used) must be evicted past quota"
+        );
+        for key in ["k1", "k3", "k4"] {
+            assert!(
+                store.lookup(key, "v", &[]).await.unwrap().is_some(),
+                "{key} must survive quota eviction"
+            );
+        }
+        // Total finalized size is back under quota.
+        let mut total = 0u64;
+        let mut read_dir = tokio::fs::read_dir(temp.path()).await.unwrap();
+        while let Some(child) = read_dir.next_entry().await.unwrap() {
+            let archive = child.path().join("archive.tzst");
+            if let Ok(metadata) = tokio::fs::metadata(&archive).await {
+                total += metadata.len();
+            }
+        }
+        assert!(total <= 3 * MIB as u64, "total {total} over quota");
+    }
+
+    /// A single entry larger than the quota is kept by its own commit (it is
+    /// never evicted by the commit that created it); the next commit evicts
+    /// it first.
+    #[tokio::test]
+    async fn oversized_single_entry_survives_its_own_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = CacheStore::new(temp.path()).await.unwrap();
+        store.set_quota_bytes(1024);
+
+        let entry = store.put("big", "v", &vec![0u8; 2048]).await.unwrap();
+        assert_eq!(entry.size, 2048);
+        assert!(store.lookup("big", "v", &[]).await.unwrap().is_some());
+
+        store.put("small", "v", b"x").await.unwrap();
+        assert!(
+            store.lookup("big", "v", &[]).await.unwrap().is_none(),
+            "the oversized entry must be evicted by the next commit"
+        );
+        assert!(store.lookup("small", "v", &[]).await.unwrap().is_some());
+    }
+
+    /// `commit_file` round-trips bytes and reports AlreadyExists on a
+    /// duplicate key+version, matching `put` semantics.
+    #[tokio::test]
+    async fn commit_file_roundtrip_and_duplicate() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(temp.path()).await.unwrap();
+
+        let stage = temp.path().join("stage.bin");
+        tokio::fs::write(&stage, b"staged-payload").await.unwrap();
+        let entry = store.commit_file("staged", "v9", &stage).await.unwrap();
+        assert_eq!(entry.key, "staged");
+        assert_eq!(entry.version, "v9");
+        assert_eq!(entry.size, 14);
+
+        let stage2 = temp.path().join("stage2.bin");
+        tokio::fs::write(&stage2, b"staged-payload").await.unwrap();
+        let duplicate = store.commit_file("staged", "v9", &stage2).await;
+        assert!(matches!(duplicate, Err(CacheError::AlreadyExists { .. })));
+        // The failed commit must not consume the caller's staging file.
+        assert!(stage2.exists());
+    }
+
+    /// Metadata-only reads never pull the archive into RAM: `lookup` returns
+    /// the entry identity while the bytes stay on disk.
+    #[tokio::test]
+    async fn lookup_returns_metadata_without_reading_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(temp.path()).await.unwrap();
+        let payload = vec![7u8; 1024];
+        store.put("meta-only", "v", &payload).await.unwrap();
+
+        let entry = store
+            .lookup("meta-only", "v", &[])
+            .await
+            .unwrap()
+            .expect("entry must resolve");
+        assert_eq!(entry.size, 1024);
+        assert!(entry.path.ends_with("archive.tzst"));
     }
 }

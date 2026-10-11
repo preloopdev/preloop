@@ -771,7 +771,18 @@ pub struct PendingCache {
     pub namespace: String,
     #[serde(default)]
     pub job_backend_id: String,
-    pub bytes: Vec<u8>,
+    /// Absolute path of the on-disk staging file receiving the upload
+    /// chunks. Chunks are appended here as they arrive so a large upload
+    /// never sits in server RAM; `cache_commit` hands the file to
+    /// `CacheStore::commit_file_scoped`, which moves it into the entry
+    /// directory. The TTL sweeper deletes the staging file of abandoned
+    /// reservations.
+    #[serde(default)]
+    pub staging_path: PathBuf,
+    /// Bytes staged so far; the running total the upload caps are enforced
+    /// against.
+    #[serde(default)]
+    pub staging_len: u64,
     /// Unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.

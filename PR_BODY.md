@@ -1,70 +1,139 @@
-# Fix: bind legacy artifact handlers to the caller's run; stop leaking `storage_key` in list responses
+# Fix: stream cache blob writes + total cache quota with LRU eviction
 
-Round-3 pentest finding §6 — cross-run legacy artifact squat (+ path leak).
+Fixes round-3 report §11 (Cache flood → RAM spike + permanent disk).
 
-## The bug
+## Problem
 
-`POST /_apis/pipelines/workflows/<run_id>/artifacts` accepted any valid
-local JWT and never checked that `:run_id` belonged to the caller, so run
-A's LIVE job token could create artifacts catalogued under run B
-(`200`, squatting the victim run's artifact namespace), and list/get
-run B's artifacts. The list response also returned the server-side
-`storage_key` — a filesystem path — in each entry.
+Two compounding defects in the Actions cache path:
 
-## The fix (`crates/preloop-runner-server/src/cache_artifacts.rs`)
+1. **Full-blob-in-RAM finalize.** The Twirp v2 flow (`twirp_cache_v2_finalize`)
+   staged upload chunks to disk correctly, then did `tokio::fs::read` of the
+   whole staged blob and passed the `Vec<u8>` to `CacheStore::put`, which
+   wrote it again. Reproduced in round 3: finalizing a 150 MB blob spiked
+   server RSS **69 MB → 341 MB** (+265 MB ≈ 1.8× blob size). The legacy
+   `/_apis/artifactcache` flow was worse: `cache_upload` appended every PATCH
+   chunk to `PendingCache::bytes`, holding the entire blob in server RAM for
+   the reservation's lifetime.
+2. **No quota, no eviction.** `CacheStore::put` validated key format only. A
+   finalized entry sat in `state/cache/` forever; disk filled for the lifetime
+   of the state directory.
 
-- New `require_legacy_artifact_run_binding()`: resolves the caller's
-  `job_id` from its job token through the job request record and requires
-  `record.run_id == :run_id`, else `403 "artifact access requires a token
-  for that workflow run"` (same message as the v2 artifact path's
-  `artifact_v2_authorized_run_scope`). Applied to `artifact_create`,
-  `artifact_list`, and `artifact_get_compat`. The system bearer bypasses,
-  mirroring the other legacy artifact checks; a request with no resolvable
-  job claims is rejected (401/403).
-- `artifact_list` no longer emits `path`/`storage_key` — entries are
-  `{id, run_id, name, file_name, size}`. (`ArtifactRecord` on create still
-  carries `path`; that surface returns only the artifact the caller just
-  created and was left as-is.)
-- Scoping note: the adjacent native handlers (`POST /api/v1/artifacts`,
-  `GET /api/v1/artifacts/:artifact_id`) sit behind the system-token-only
-  `require_native_bearer` middleware, so they have no job-token run-binding
-  gap — no change there.
+## Fix
+
+**Streaming writes (never buffer the full blob in RAM):**
+- `preloop-cache`: new `CacheStore::commit_file_scoped(namespace, key,
+  version, src)` — claims the entry dir, writes metadata sidecars, then
+  *moves* the staged file into place (atomic rename; bounded-buffer
+  streaming copy fallback for cross-filesystem staging). The staging file is
+  consumed, never read into RAM.
+- Twirp v2 finalize now commits the staged `blobs/cache/<jti>/data` file via
+  `commit_file_scoped`. Cleanup of the reservation + staging dir is
+  unconditional (also runs on commit failure).
+- Legacy v1 flow: `cache_reserve` creates `<state_dir>/cache-staging/<id>.part`;
+  `cache_upload` appends each chunk to the file (open/append/close under the
+  state lock, so the per-upload and per-job byte caps can't be raced);
+  `cache_commit` hands the file to `commit_file_scoped`. `PendingCache::bytes:
+  Vec<u8>` is gone — replaced by `staging_path` + `staging_len`. Abandoned
+  reservations' staging files are deleted by the TTL sweeper
+  (`sweep_pending_uploads` now returns the files; `reap_once` deletes them
+  after releasing the lock); a crashed server's leftovers are reaped at boot.
+
+**Total quota with LRU eviction:**
+- New `[cache] total_quota_bytes`, default **10 GiB** (matches GitHub's 10 GB
+  per-repository cache limit; this is the server-wide total across all
+  namespaces). Env `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins; unparseable
+  values fail startup. Documented in `docs/self-hosting.md`.
+- Every commit (and server boot) runs `CacheStore::enforce_quota`: entries are
+  ordered by last use (archive mtime, refreshed on every read and commit) and
+  the oldest are deleted until the total fits. The just-committed entry is
+  never evicted by its own commit — a single entry larger than the quota is
+  kept, then evicted by the next commit. Stale incomplete writes (crashed
+  uploads: `.part` debris or metadata without an archive, older than 1h) are
+  reaped so they can never wedge an entry or the quota.
+
+**Read path survey:**
+- `GET /twirp-blob/cache/<token>` (the v2 download) previously did
+  `cache.get()` — loading the whole archive into RAM — then served it. It now
+  resolves metadata only (`CacheStore::lookup`) and streams the file with
+  `ReaderStream`. The staging-file fallback branch streams too.
+- `twirp_cache_v2_get_dl_url` and both existence checks (`create`, finalize's
+  already-exists path) use the metadata-only `lookup` instead of `get`: a
+  restore lookup no longer pulls the archive into RAM just to throw the bytes
+  away.
+- `GET /api/v1/cache` (legacy base64-in-JSON) is unchanged by design: base64
+  in a JSON body inherently requires the full content in memory. The v2
+  streaming download is the large-blob path.
+
+## Behavior changes
+
+- Legacy `cache_reserve` now creates its staging file up front; a failed
+  reserve (disk full, staging unwritable) surfaces at reserve time instead of
+  at first chunk.
+- `sweep_pending_uploads` signature: now returns `Vec<PathBuf>` (staging
+  files to delete); `reap_once` deletes them.
 
 ## Tests
 
-- Updated `legacy_artifact_create_rejects_stale_job_token` to bind the
-  legacy path to the job's real run (`register_live_job_with_run` now
-  returns the run key), since a random `:run_id` is now 403 by design.
-- New `legacy_artifact_handlers_bind_to_caller_run` (in
-  `crates/preloop-runner-server/tests/concurrency.rs`): two runs, each with
-  a live job token —
-  - run A's live token → create/list/get under run B → 403 (all three);
-  - same-run create/list/get → 200 for both tokens;
-  - list response contains no `path` or `storage_key`.
+- `preloop-cache` (12 passed):
+  - `commit_file_streams_large_blob_with_small_rss_delta`: finalizes a
+    **150 MB** blob, asserts process RSS delta **< 64 MiB**.
+  - `quota_evicts_least_recently_used`: 3 MiB quota, 4× 1 MiB entries; the
+    oldest *untouched* entry is evicted while a recently-read older entry
+    and the newest survive; total back under quota.
+  - `oversized_single_entry_survives_its_own_commit`, plus
+    `commit_file` round-trip/duplicate and metadata-only `lookup` tests.
+- `cargo check` + `cargo clippy --all-targets`: clean. `cargo fmt`: applied.
 
-## Repro verification (live patched server, port 19106)
+## Repro verification (patched server, port 19109)
 
-Built `preloop-server` from this branch, migrated state, served on
-127.0.0.1:19106. Submitted two runs
-(run A `48002afe-…`, run B `ecb1b11c-…`), registered two runners over the
-real distributedtask/broker protocol, acquired each run's job, and used the
-jobs' live `SystemVssConnection` access tokens:
+Setup: `preloop store migrate` then `preloop serve --listen 127.0.0.1:19109`
+with `PRELOOP_HOME=<worktree>/.repro-19109`,
+`PRELOOP_SYSTEM_TOKEN=repro-sys-token-19109`,
+`PRELOOP_CACHE_TOTAL_QUOTA_BYTES=262144000` (250 MiB, to exercise eviction).
+State dir under the worktree, never /tmp. Server PID 19041; RSS sampled from
+`/proc/<pid>/status` (VmRSS).
 
-| # | request | result |
-|---|---------|--------|
-| 1 | token A → `POST /_apis/pipelines/workflows/<run-B>/artifacts` | **403** |
-| 2 | token A → `POST …/<run-A>/artifacts` | 200 |
-| 3 | token B → `POST …/<run-B>/artifacts` | 200 |
-| 4 | token A → `GET …/<run-B>/artifacts` | **403** |
-| 5 | token A → `GET …/<run-B>/artifacts/<id>` | **403** |
-| 6 | token B → `GET …/<run-B>/artifacts` | 200, body `{"count":1,"value":[{"id":…,"run_id":…,"name":"b-art","size":0}]}` — no storage path |
-| 7 | token B → `GET …/<run-B>/artifacts/<id>` | 200 |
-| 8 | headerless → `GET …/<run-B>/artifacts` | 401 |
+**1. Streaming finalize — the +265 MB spike is gone.**
+Drove the legacy chunked flow with the system bearer (same fixed commit
+primitive as the Twirp v2 finalize, plus it exercises all the new staging
+code):
+- `POST /_apis/artifactcache/cache` `{"key":"repro-key-a2","version":"v1"}` → `cacheId`
+- 75× `PATCH /_apis/artifactcache/cache/<id>` with 2 MiB chunks (150 MB blob)
+- `POST /_apis/artifactcache/cache/<id>` `{"size":157286400}` → commit
 
-Checks run: `cargo fmt --check`, `cargo clippy -p preloop-runner-server
---all-targets` (clean), `cargo test -p preloop-runner-server --features
-test-support --test concurrency legacy_artifact` → 2 passed.
+| Phase | Server RSS |
+|---|---|
+| Baseline | 104.5 MiB |
+| Peak during 150 MB chunked upload | 113.3 MiB (delta 8.8 MiB) |
+| **Peak during commit (finalize)** | **107.8 MiB — delta 0.1 MiB** |
 
-Note: `preloop serve` (the engine wrapper) failed its own `/readyz`
-readiness check in this sandbox, so the repro ran against the
-`preloop-server serve` binary directly — same control plane, same routes.
+Round-3 unpatched: 69 → 341 MB (+265 MB) during finalize. The finalize is
+now a file rename + directory scan; commit returned in <0.1s. Committed
+archive sha256 matches the source blob; `cache_lookup` reports the entry.
+
+**2. Quota eviction end-to-end.** With the 250 MiB quota:
+- Committed `repro-key-a` (150 MB), then `repro-key-a2` (150 MB): the second
+  commit pushed the total to 300 MB → `repro-key-a` evicted. Disk:
+  `state/cache/` = 151M, 1 archive.
+- LRU ordering: committed `lru-1..lru-3` (50 MB each), read `lru-1` via
+  lookup (refreshes its LRU timestamp), committed `lru-4..lru-6`. Evicted:
+  `repro-key-a2` (oldest) then `lru-2` (oldest *untouched* — `lru-1` survived
+  because it was read). Final: `lru-1,lru-3,lru-4,lru-5,lru-6` on disk,
+  total 251M ≈ quota.
+
+**3. Read path.** `twirp_cache_v2_get_dl_url` and both existence checks now
+use metadata-only `lookup` (no archive bytes loaded). The `/twirp-blob/cache`
+download streams via `ReaderStream` (same idiom as the action-tarball path);
+the signed-URL download leg needs a live job token so it was verified by code
+inspection, not live — the legacy base64 endpoint (`GET /api/v1/cache`) is
+unchanged by design (base64-in-JSON inherently buffers).
+
+**4. Unit tests.** `cargo test -p preloop-cache`: 12/12 pass, including
+`commit_file_streams_large_blob_with_small_rss_delta` (150 MB finalize, RSS
+delta < 64 MiB bound) and `quota_evicts_least_recently_used`. `cargo check`
+and `cargo clippy -p preloop-cache -p preloop-runner-server --all-targets`:
+clean. `cargo fmt`: applied.
+
+Not run: the full `just test-ci` gate (fmt+clippy done; the workspace test
+suite needs hours under the current 4-way sibling build contention — the
+server's lib test profile alone takes ~30 min to link here).
