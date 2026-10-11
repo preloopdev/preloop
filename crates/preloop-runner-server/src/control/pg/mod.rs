@@ -24,6 +24,7 @@ mod dispatch;
 mod graph;
 mod lifecycle;
 mod lookups;
+mod needs;
 mod outbox;
 mod reaper;
 mod rerun;
