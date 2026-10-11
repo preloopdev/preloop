@@ -802,6 +802,15 @@ pub struct AppState {
     /// Default 90 follows GitHub; `0` disables the sweep. Resolved from
     /// `retention_days` in the config file, `PRELOOP_RETENTION_DAYS` wins.
     pub retention_days: u64,
+    /// Maximum age, in seconds, of a diagnostic-log staging directory under
+    /// `<state_dir>/blobs/diag/` before the reaper's age-based sweep deletes
+    /// it. Staging directories whose upload token expired (TTL) or was
+    /// evicted are removed promptly on the next reaper tick regardless of
+    /// this value; the age sweep is the backstop for orphaned directories
+    /// (crash leftovers, pre-fix accumulation). `0` disables the age-based
+    /// sweep. Resolved from `diag_staging_max_age_hours` in the config
+    /// file (default 24), `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins.
+    pub diag_staging_max_age_seconds: u64,
     /// Environment protection rules resolver: `[environment_rules]` TOML as
     /// the local fallback, GitHub's environments API when an App (or
     /// `PRELOOP_GITHUB_TOKEN`) covers the run's repository.
@@ -1271,6 +1280,8 @@ impl AppState {
         crate::config::merge_secret_stores(&mut config, credential);
         let checkout_cache = crate::config::checkout_cache_config(&config)?;
         let retention_days = crate::config::retention_days(&config)?;
+        let diag_staging_max_age_seconds =
+            crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
         let github_apps = crate::github_app::load_from(&config)?;
         let github_app = github_apps
             .as_ref()
@@ -1503,6 +1514,7 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
             retention_days,
+            diag_staging_max_age_seconds,
             environment_resolver: crate::environment_resolver::EnvironmentResolver::local(
                 config.environment_rules.clone(),
             ),

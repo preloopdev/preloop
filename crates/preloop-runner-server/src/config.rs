@@ -832,6 +832,16 @@ pub struct ConfigFile {
     /// `PRELOOP_SECRETS_STORE` overrides this key.
     #[serde(default)]
     pub secrets_store: Option<String>,
+    /// Maximum age, in hours, of a diagnostic-log staging directory under
+    /// `<state_dir>/blobs/diag/` before the reaper deletes it. Staging
+    /// directories whose upload token expired (TTL) or was evicted are
+    /// removed promptly on the next reaper tick regardless of this value;
+    /// this is the backstop for anything orphaned (a crash between staging
+    /// and registration, pre-fix leftovers). `0` disables the age-based
+    /// sweep. Default 24 follows the "a day of debug data" intuition.
+    /// Env: `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over this key.
+    #[serde(default = "default_diag_staging_max_age_hours")]
+    pub diag_staging_max_age_hours: u64,
 }
 
 impl Default for ConfigFile {
@@ -901,6 +911,32 @@ pub fn retention_days(config: &ConfigFile) -> anyhow::Result<u64> {
         });
     }
     Ok(config.retention_days)
+}
+
+/// Env override for the diag staging max age; see
+/// [`ConfigFile::diag_staging_max_age_hours`].
+pub const DIAG_STAGING_MAX_AGE_HOURS_ENV: &str = "PRELOOP_DIAG_STAGING_MAX_AGE_HOURS";
+/// Default diag staging max age, in hours.
+pub const DEFAULT_DIAG_STAGING_MAX_AGE_HOURS: u64 = 24;
+
+fn default_diag_staging_max_age_hours() -> u64 {
+    DEFAULT_DIAG_STAGING_MAX_AGE_HOURS
+}
+
+/// Resolve the effective diag staging max age, in hours:
+/// `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over the config file key. An
+/// unparseable value is an error — a typo must fail closed rather than
+/// silently keep (or delete) staging data on the wrong schedule.
+pub fn diag_staging_max_age_hours(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(DIAG_STAGING_MAX_AGE_HOURS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {DIAG_STAGING_MAX_AGE_HOURS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.diag_staging_max_age_hours)
 }
 
 /// Parse a checkout-cache mode. Unknown values are an error from the parser;
@@ -1822,6 +1858,7 @@ mod tests {
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
+            diag_staging_max_age_hours: DEFAULT_DIAG_STAGING_MAX_AGE_HOURS,
             golden: GoldenConfig::default(),
         }
     }

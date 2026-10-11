@@ -684,3 +684,56 @@ pub async fn replay_results_put(
         }
     }
 }
+
+/// Age-based backstop for `<state_dir>/blobs/diag/` staging directories.
+///
+/// The reaper deletes the staging dir of a token the moment its
+/// `diag_upload_tokens` reservation expires or is evicted, but anything
+/// orphaned on disk (a crash between staging and registration, leftovers
+/// from before eviction invalidated PUTs) would otherwise accumulate
+/// forever. This walk deletes every staging directory whose mtime is older
+/// than `now - max_age` and returns the number removed. Only real
+/// directories are candidates — never the `diag` root itself, never
+/// symlinks — and every filesystem error is logged and skipped: the
+/// sweeper is best-effort housekeeping, never on a request path.
+///
+/// `now` is a parameter (rather than read here) so tests can drive the
+/// clock deterministically instead of sleeping through real ages.
+pub async fn sweep_diag_staging(
+    state_dir: &std::path::Path,
+    max_age: Duration,
+    now: SystemTime,
+) -> usize {
+    let diag_root = state_dir.join("blobs").join("diag");
+    let mut entries = match tokio::fs::read_dir(&diag_root).await {
+        Ok(entries) => entries,
+        Err(_) => return 0, // No diag staging yet (or unreadable): nothing to do.
+    };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let path = entry.path();
+        let aged = tokio::fs::metadata(&path)
+            .await
+            .ok()
+            .and_then(|md| md.modified().ok())
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > max_age);
+        if !aged {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {
+                removed += 1;
+                tracing::debug!(path = %path.display(), "swept aged diag staging dir");
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), ?error, "failed to sweep aged diag staging dir");
+            }
+        }
+    }
+    removed
+}

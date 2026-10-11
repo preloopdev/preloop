@@ -123,7 +123,7 @@ pub async fn require_results_bearer(
 /// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
 /// without attaching the job bearer — so the gate cannot simply require a
 /// bearer without breaking wire compatibility with the official toolkit.
-/// Instead it enforces three properties:
+/// Instead it enforces four properties:
 ///   1. the kind is allowlisted and the token is decode-then-validated, so no
 ///      request can address outside `<state_dir>/blobs/{kind}/`;
 ///   2. the token must be a server-signed blob JWT (`sub: preloop-blob`,
@@ -135,6 +135,14 @@ pub async fn require_results_bearer(
 ///      claim names the owner recorded at mint time, so a completed job's
 ///      upload URL stops working immediately instead of at TTL sweep. A
 ///      presented bearer is verified and must match the `job` claim.
+///   4. diag uploads additionally require the token's `jti` to still be
+///      registered in `diag_upload_tokens`: the per-job cap evicts the
+///      oldest token, and eviction must invalidate — a signature alone
+///      cannot see eviction, so without this a live job could re-mint
+///      forever and accumulate unbounded staging directories. (Consequence:
+///      diag URLs no longer survive an engine restart; the map is
+///      in-memory only. Diag uploads happen immediately after minting, so a
+///      restart in between was already a lost upload.)
 ///
 /// Reads stay bearer-optional — the unguessable, server-minted URL is the
 /// credential, the same SAS-style model as `/replay/results/*` — because the
@@ -156,6 +164,28 @@ async fn authorize_blob_request(
         return Err(ApiError::not_found("blob not found"));
     };
     let owner = crate::blob_store::blob_token_job(&claims).unwrap_or_default();
+
+    // Diag upload tokens are bearerless single-job reservations: the mint
+    // handler records the token's `jti` in `diag_upload_tokens` and evicts
+    // the oldest per job at the cap. A signature alone cannot see eviction,
+    // so an evicted (or never-registered) diag token's PUT must not upload —
+    // otherwise a live job could re-mint forever and accumulate unbounded
+    // staging directories. Membership in the live map is the credential for
+    // diag PUTs, on top of the signature and owner-job liveness checks.
+    if is_write && kind == "diag" {
+        let jti = crate::blob_store::blob_token_jti(&claims)
+            .ok_or_else(|| ApiError::bad_request("malformed blob token"))?;
+        let registered = state
+            .inner
+            .lock()
+            .await
+            .diag_upload_tokens
+            .contains_key(&jti);
+        if !registered {
+            warn!(jti, "rejected diag PUT for evicted or unknown upload token");
+            return Err(ApiError::not_found("blob not found"));
+        }
+    }
 
     match bearer_from_headers(request.headers()) {
         Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
