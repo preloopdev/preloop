@@ -245,13 +245,24 @@ async fn resolve_ref_to_sha(
     {
         request = request.bearer_auth(pat);
     }
-    let response = match request.send().await {
+    let response = match crate::github_breaker::send_observed_labeled(
+        &state.github_breaker,
+        &state.github_consumption,
+        crate::github_breaker::GithubSubsystem::RefResolve,
+        request,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(%owner, %repo, %git_ref, %error, "action ref resolution request failed; falling back to ref");
             return None;
         }
     };
+    state.github_consumption.record_advertised_bytes(
+        crate::github_breaker::GithubSubsystem::RefResolve,
+        &response,
+    );
     let sha = if response.status().is_success() {
         response
             .json::<serde_json::Value>()
@@ -411,9 +422,28 @@ pub async fn download_action_tarball(
     {
         request = request.bearer_auth(pat);
     }
-    let response = request.send().await.map_err(|e| {
-        ApiError::internal(format!("failed to send download request to GitHub: {e}"))
-    })?;
+    let response = match crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breaker,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Actions,
+        request,
+    )
+    .await
+    {
+        Ok(response) => response,
+        // A tripped breaker fails fast with 503 instead of queueing behind
+        // the outage; runners retry the download on the next attempt.
+        Err(error) if shared.state.github_breaker.is_open() => {
+            return Err(ApiError::service_unavailable(format!(
+                "GitHub is temporarily unavailable: {error:#}"
+            )));
+        }
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to send download request to GitHub: {error:#}"
+            )));
+        }
+    };
 
     if !response.status().is_success() {
         return Err(ApiError::not_found(format!(
@@ -428,6 +458,7 @@ pub async fn download_action_tarball(
         .map_err(|e| ApiError::internal(format!("failed to create temporary action file: {e}")))?;
 
     let mut hasher = Sha256::new();
+    let mut streamed_bytes: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -437,6 +468,7 @@ pub async fn download_action_tarball(
         // pins is computed over exactly the bytes written to the cache —
         // no second read, no TOCTOU between write and hash.
         hasher.update(&chunk);
+        streamed_bytes = streamed_bytes.saturating_add(chunk.len() as u64);
         tokio::io::copy(&mut &chunk[..], &mut temp_file)
             .await
             .map_err(|e| {
@@ -444,6 +476,12 @@ pub async fn download_action_tarball(
             })?;
     }
     let digest = format!("{:x}", hasher.finalize());
+    // Exact byte count, measured off the stream — the one true number for
+    // tarball bandwidth accounting.
+    shared.state.github_consumption.record_bytes(
+        crate::github_breaker::GithubSubsystem::Actions,
+        streamed_bytes,
+    );
 
     // Atomically rename to final target path. A concurrent request may have
     // published the same action first — then the cached file is the winner's
@@ -1056,5 +1094,196 @@ mod tests {
             res.headers().get(ACTION_ARCHIVE_SHA256_HEADER).is_none(),
             "no digest must mean no header, not a failed download"
         );
+    }
+
+    /// Stub "GitHub" for the tarball download path: serves one scripted
+    /// response on the tarball route and counts hits, so tests prove the
+    /// breaker engages without touching the real github.com.
+    struct TarballStub {
+        base: String,
+        hits: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl TarballStub {
+        async fn serve(status: StatusCode, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+            let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let hits_route = hits.clone();
+            let app = axum::Router::new().route(
+                "/repos/o/r/tarball/main",
+                axum::routing::any(move || {
+                    let hits_route = hits_route.clone();
+                    async move {
+                        hits_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut builder = axum::http::Response::builder().status(status);
+                        for (name, value) in &headers {
+                            builder = builder.header(name, value);
+                        }
+                        builder.body(axum::body::Body::from(body)).unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self { base, hits }
+        }
+
+        fn hits(&self) -> u64 {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Shared state pointed at the stub instead of the real GitHub. The
+    /// download path reads `github_urls` live, so setting the struct field
+    /// needs no env vars and cannot leak into other tests.
+    async fn tarball_shared(stub_base: &str) -> (Arc<SharedState>, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_urls = crate::state::GitHubUrls {
+            server_url: stub_base.to_owned(),
+            api_url: stub_base.to_owned(),
+            graphql_url: stub_base.to_owned(),
+        };
+        (
+            Arc::new(SharedState {
+                state,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            }),
+            temp,
+        )
+    }
+
+    /// Extractor tuple for one `download_action_tarball` call.
+    type DownloadCall = (
+        State<Arc<SharedState>>,
+        Path<(String, String, String)>,
+        Query<ActionTicketQuery>,
+    );
+
+    fn download_call(shared: &Arc<SharedState>) -> DownloadCall {
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let sig = shared
+            .state
+            .sign_action_ticket("o", "r", "main", expires_at);
+        (
+            State(shared.clone()),
+            Path(("o".to_owned(), "r".to_owned(), "main".to_owned())),
+            Query(ActionTicketQuery {
+                exp: Some(expires_at),
+                sig: Some(sig),
+            }),
+        )
+    }
+
+    fn actions_usage(shared: &SharedState) -> crate::github_breaker::GithubSubsystemUsage {
+        shared
+            .state
+            .github_consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == "actions")
+            .expect("actions subsystem must be in the snapshot")
+    }
+
+    /// A 429 with `x-ratelimit-reset` on the tarball route trips the shared
+    /// breaker immediately; the next download fails fast without a second
+    /// GitHub hit, and the accounting attributes everything to `actions`.
+    /// Pre-fix this path had no breaker at all and hammered the 429.
+    #[tokio::test]
+    async fn tarball_download_429_engages_breaker() {
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let stub = TarballStub::serve(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![("x-ratelimit-reset".to_owned(), reset.to_string())],
+            b"rate limited".to_vec(),
+        )
+        .await;
+        let (shared, _temp) = tarball_shared(&stub.base).await;
+
+        let (state, path, query) = download_call(&shared);
+        let err = download_action_tarball(state, path, query)
+            .await
+            .expect_err("a 429 tarball fetch must fail the download");
+        // The 429 response itself still maps the way it did pre-fix; the
+        // behavior change is the breaker tripping, not the status code.
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(
+            shared.state.github_breaker.is_open(),
+            "the 429 must trip the breaker at once, not after a threshold"
+        );
+        assert!(shared.state.github_breaker.snapshot().rate_limited);
+
+        // The breaker is open now: the next download fails fast with 503
+        // instead of spending another request on the guaranteed 429.
+        let (state, path, query) = download_call(&shared);
+        let err = download_action_tarball(state, path, query)
+            .await
+            .expect_err("breaker-open must fail fast");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message().contains("circuit breaker is open"),
+            "unexpected error: {}",
+            err.message()
+        );
+        assert_eq!(
+            stub.hits(),
+            1,
+            "only the first exchange may reach GitHub; the second is breaker-blocked"
+        );
+
+        let usage = actions_usage(&shared);
+        assert_eq!(usage.requests, 1);
+        assert_eq!(usage.rate_limited, 1);
+        assert_eq!(usage.breaker_blocked, 1);
+        // Other subsystems are not charged for the actions path's 429.
+        for other in shared
+            .state
+            .github_consumption
+            .snapshot()
+            .into_iter()
+            .filter(|usage| usage.subsystem != "actions")
+        {
+            assert_eq!(other.requests, 0, "{} must not be charged", other.subsystem);
+        }
+    }
+
+    /// A successful tarball download accounts the exact streamed byte count
+    /// to `actions`, and the second download serves from the disk cache
+    /// without touching GitHub again.
+    #[tokio::test]
+    async fn tarball_download_success_accounts_bytes_and_caches() {
+        let body = b"fake-tarball-bytes-for-accounting".to_vec();
+        let stub = TarballStub::serve(StatusCode::OK, vec![], body.clone()).await;
+        let (shared, _temp) = tarball_shared(&stub.base).await;
+
+        let (state, path, query) = download_call(&shared);
+        let first = download_action_tarball(state, path, query).await;
+        assert!(first.is_ok(), "download must succeed: {first:?}");
+        drop(first);
+
+        let usage = actions_usage(&shared);
+        assert_eq!(usage.requests, 1);
+        assert_eq!(
+            usage.bytes,
+            body.len() as u64,
+            "accounting must see the exact streamed bytes"
+        );
+        assert_eq!(usage.rate_limited, 0);
+
+        // Cache hit: served from disk, no second GitHub exchange.
+        let (state, path, query) = download_call(&shared);
+        let second = download_action_tarball(state, path, query).await;
+        assert!(second.is_ok(), "cached download must succeed: {second:?}");
+        drop(second);
+        assert_eq!(stub.hits(), 1, "the cache hit must not touch GitHub");
+        assert_eq!(actions_usage(&shared).requests, 1);
     }
 }

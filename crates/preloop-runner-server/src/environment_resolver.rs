@@ -305,7 +305,8 @@ impl EnvironmentResolver {
             for creds in &candidates {
                 let fetched = match environment_token(creds, repository).await {
                     Ok(token) => {
-                        fetch_environment_rules(api_base, &token, repository, environment).await
+                        fetch_environment_rules(shared, api_base, &token, repository, environment)
+                            .await
                     }
                     Err(error) => Err(error),
                 };
@@ -332,7 +333,7 @@ impl EnvironmentResolver {
             }
         } else if let Some(token) = pat {
             self.github_configured.store(true, Ordering::Release);
-            let rules = fetch_environment_rules(api_base, &token, repository, environment)
+            let rules = fetch_environment_rules(shared, api_base, &token, repository, environment)
                 .await
                 .map(Arc::new);
             if rules.is_ok() {
@@ -502,7 +503,8 @@ impl EnvironmentResolver {
             })?
         };
         let members =
-            fetch_team_members(&crate::github::github_api_base(), &token, org, slug).await?;
+            fetch_team_members(shared, &crate::github::github_api_base(), &token, org, slug)
+                .await?;
         self.team_members
             .write()
             .insert(key, (Instant::now(), members.clone()));
@@ -532,15 +534,32 @@ async fn environment_token(
 }
 
 /// GET `path` under the token, decoding JSON. `Ok(None)` on 404.
-async fn github_get(api_base: &str, token: &str, path: &str) -> anyhow::Result<Option<Value>> {
-    let res = crate::shared_http::CLIENT
-        .get(format!("{api_base}{path}"))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2026-03-10")
-        .send()
-        .await?;
+///
+/// Goes through the shared GitHub breaker with the `env` accounting label,
+/// so environment fetches stop hammering a rate-limited GitHub instead of
+/// each reaper tick discovering the 429 on its own.
+async fn github_get(
+    shared: &crate::state::SharedState,
+    api_base: &str,
+    token: &str,
+    path: &str,
+) -> anyhow::Result<Option<Value>> {
+    let res = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breaker,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Env,
+        crate::shared_http::CLIENT
+            .get(format!("{api_base}{path}"))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10"),
+    )
+    .await?;
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Env, &res);
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -562,18 +581,33 @@ async fn github_get(api_base: &str, token: &str, path: &str) -> anyhow::Result<O
 /// an App without `actions: read` 404s a protected environment). Treating
 /// that second 404 as "auto-created unprotected" would fail open, so the
 /// caller only accepts the 404 as "no protection" when this probe succeeds.
-async fn actions_readable(api_base: &str, token: &str, repository: &str) -> bool {
+async fn actions_readable(
+    shared: &crate::state::SharedState,
+    api_base: &str,
+    token: &str,
+    repository: &str,
+) -> bool {
     let path = format!("/repos/{repository}/actions/runs?per_page=1");
-    match crate::shared_http::CLIENT
-        .get(format!("{api_base}{path}"))
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2026-03-10")
-        .send()
-        .await
+    match crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breaker,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Env,
+        crate::shared_http::CLIENT
+            .get(format!("{api_base}{path}"))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10"),
+    )
+    .await
     {
-        Ok(res) => res.status().is_success(),
+        Ok(res) => {
+            shared
+                .state
+                .github_consumption
+                .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Env, &res);
+            res.status().is_success()
+        }
         Err(error) => {
             tracing::warn!(repository, %error, "Actions-surface probe failed; keeping the gate closed");
             false
@@ -589,6 +623,7 @@ async fn actions_readable(api_base: &str, token: &str, repository: &str) -> bool
 /// and the enabled custom deployment protection rules. `protected_branches`
 /// mode expands to the repo's protected-branch names, matched exactly.
 async fn fetch_environment_rules(
+    shared: &crate::state::SharedState,
     api_base: &str,
     token: &str,
     repository: &str,
@@ -596,7 +631,7 @@ async fn fetch_environment_rules(
 ) -> anyhow::Result<EnvironmentRules> {
     let encoded_env = url_path_segment(environment);
     let env_path = format!("/repos/{repository}/environments/{encoded_env}");
-    let Some(env_json) = github_get(api_base, token, &env_path).await? else {
+    let Some(env_json) = github_get(shared, api_base, token, &env_path).await? else {
         // GitHub auto-creates an environment the first time a workflow
         // references it, with no protection — but the same 404 is also what a
         // credential that cannot read the repository's environment
@@ -605,7 +640,7 @@ async fn fetch_environment_rules(
         // `actions: read` grant; otherwise fail closed (the key stays pending
         // and the gate holds).
         anyhow::ensure!(
-            actions_readable(api_base, token, repository).await,
+            actions_readable(shared, api_base, token, repository).await,
             "GET {env_path} returned 404 and the credential cannot read \
              {repository}'s Actions surface: the 404 may be an authorization \
              failure, so the environment rules stay unresolved (fail closed)"
@@ -663,13 +698,15 @@ async fn fetch_environment_rules(
         {
             rules.protected_branches_only = true;
             rules.deployment_branches =
-                fetch_protected_branches(api_base, token, repository).await?;
+                fetch_protected_branches(shared, api_base, token, repository).await?;
         } else if policy
             .get("custom_branch_policies")
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            for policy in fetch_branch_policies(api_base, token, repository, &encoded_env).await? {
+            for policy in
+                fetch_branch_policies(shared, api_base, token, repository, &encoded_env).await?
+            {
                 match policy.get("type").and_then(Value::as_str) {
                     Some("branch") => rules
                         .deployment_branches
@@ -690,7 +727,7 @@ async fn fetch_environment_rules(
     // preloop cannot impersonate that contract, so enabled rules are recorded
     // and the gate fails the job closed with an explicit message.
     let rules_path = format!("{env_path}/deployment_protection_rules");
-    if let Some(json) = github_get(api_base, token, &rules_path).await? {
+    if let Some(json) = github_get(shared, api_base, token, &rules_path).await? {
         rules.custom_protection_rules = json
             .get("custom_deployment_protection_rules")
             .and_then(Value::as_array)
@@ -756,6 +793,7 @@ fn parse_reviewer(value: &Value, repository: &str) -> Option<EnvironmentReviewer
 
 /// Page through `GET .../environments/{env}/deployment-branch-policies`.
 async fn fetch_branch_policies(
+    shared: &crate::state::SharedState,
     api_base: &str,
     token: &str,
     repository: &str,
@@ -767,7 +805,7 @@ async fn fetch_branch_policies(
             "/repos/{repository}/environments/{encoded_env}/deployment-branch-policies\
              ?per_page=100&page={page}"
         );
-        let Some(json) = github_get(api_base, token, &path).await? else {
+        let Some(json) = github_get(shared, api_base, token, &path).await? else {
             return Ok(policies);
         };
         let page_policies: Vec<Value> = json
@@ -794,6 +832,7 @@ async fn fetch_branch_policies(
 /// The repo's protected branch names (exact-match expansion of GitHub's
 /// `protected_branches` policy mode).
 async fn fetch_protected_branches(
+    shared: &crate::state::SharedState,
     api_base: &str,
     token: &str,
     repository: &str,
@@ -801,7 +840,7 @@ async fn fetch_protected_branches(
     let mut names = Vec::new();
     for page in 1..=MAX_PROTECTED_PAGES {
         let path = format!("/repos/{repository}/branches?protected=true&per_page=100&page={page}");
-        let Some(json) = github_get(api_base, token, &path).await? else {
+        let Some(json) = github_get(shared, api_base, token, &path).await? else {
             return Ok(names);
         };
         let Some(list) = json.as_array() else {
@@ -828,6 +867,7 @@ async fn fetch_protected_branches(
 
 /// Page through `GET /orgs/{org}/teams/{slug}/members`.
 async fn fetch_team_members(
+    shared: &crate::state::SharedState,
     api_base: &str,
     token: &str,
     org: &str,
@@ -839,7 +879,7 @@ async fn fetch_team_members(
             "/orgs/{org}/teams/{}/members?per_page=100&page={page}",
             url_path_segment(slug)
         );
-        let Some(json) = github_get(api_base, token, &path).await? else {
+        let Some(json) = github_get(shared, api_base, token, &path).await? else {
             // Team not visible to the installation → deny membership.
             return Ok(Vec::new());
         };
@@ -969,17 +1009,24 @@ mod tests {
     /// test — the vars are process-global — and restored when the guards
     /// drop (including on panic): a leaked stub base or token poisons every
     /// later test in the binary that resolves refs or reads the config PAT.
+    ///
+    /// The lock guard is the LAST tuple field on purpose: tuple fields drop
+    /// in declaration order, so the env vars are restored before the lock is
+    /// released. The previous order (`(guard, token, api)`) released the lock
+    /// first, letting the next test set its own stub base and then have it
+    /// clobbered by this test's still-pending restore — the fetch then went
+    /// to the real github.com and failed the test flakily.
     async fn pat_env(
         api_base: &str,
     ) -> (
+        crate::state::TestEnvVar,
+        crate::state::TestEnvVar,
         tokio::sync::MutexGuard<'static, ()>,
-        crate::state::TestEnvVar,
-        crate::state::TestEnvVar,
     ) {
         let lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
         let api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
-        (lock, token, api)
+        (token, api, lock)
     }
 
     #[tokio::test]
@@ -1386,18 +1433,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let shared = shared().await;
 
-        let protected_error = fetch_protected_branches(&base, "token", "owner/repo")
+        let protected_error = fetch_protected_branches(&shared, &base, "token", "owner/repo")
             .await
             .expect_err("a full page at the cap must be treated as truncation");
         assert!(protected_error.to_string().contains("truncated"));
 
-        let policy_error = fetch_branch_policies(&base, "token", "owner/repo", "prod")
+        let policy_error = fetch_branch_policies(&shared, &base, "token", "owner/repo", "prod")
             .await
             .expect_err("a full policy page at the cap must be treated as truncation");
         assert!(policy_error.to_string().contains("truncated"));
 
-        let member_error = fetch_team_members(&base, "token", "owner", "deployers")
+        let member_error = fetch_team_members(&shared, &base, "token", "owner", "deployers")
             .await
             .expect_err("a full member page at the cap must be treated as truncation");
         assert!(member_error.to_string().contains("truncated"));

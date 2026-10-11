@@ -730,6 +730,11 @@ pub struct AppState {
     /// ingress outage cannot suppress status transitions for runs already in
     /// progress.
     pub github_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Per-subsystem consumption accounting for outbound GitHub traffic
+    /// (requests, bytes, rate limits, breaker-blocked attempts). Every
+    /// GitHub call goes through [`crate::github_breaker::send_observed`]
+    /// or its labeled variant, which record here next to the breaker.
+    pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
     pub webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
@@ -1476,6 +1481,7 @@ impl AppState {
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             observability: preloop_observability::Observability::noop(),
