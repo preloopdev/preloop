@@ -664,6 +664,10 @@ impl PgBackend {
                         *active_by_base.entry(base_id.clone()).or_default() += 1;
                     }
                     GateOutcome::Parked => {
+                        // Parked jobs are hydrated (as `Sweep::promote` does
+                        // before the gate): the release enqueues the job from
+                        // its own rows, without the run's graph.
+                        sweep.hydrate_node(run_id, &job_id).await?;
                         sweep.hold_node(run_id, &job_id);
                         raw_status.insert(
                             job_id.clone(),
