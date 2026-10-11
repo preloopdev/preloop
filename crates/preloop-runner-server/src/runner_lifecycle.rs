@@ -23,6 +23,62 @@ fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
     out
 }
 
+/// Build the typed `TaskAgent.Properties` payload shared by agent
+/// registration, lookup, and update responses.
+///
+/// Legacy v2 settings are always present because the runner already depends
+/// on them. Runner-admin additions remain opt-in: unset environment variables
+/// do not add wire keys to the response.
+fn runner_admin_properties() -> serde_json::Map<String, serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    let runner_root = runner_server_url();
+    let options = runner_v2_connection_options();
+    let server_url_v2 = options
+        .broker_url
+        .clone()
+        .unwrap_or_else(|| runner_root.clone());
+    properties.insert(
+        "RequireFipsCryptography".to_owned(),
+        json!({"$type": "System.Boolean", "$value": false}),
+    );
+    properties.insert(
+        "ServerUrl".to_owned(),
+        json!({"$type": "System.String", "$value": runner_root}),
+    );
+    properties.insert(
+        "ServerUrlV2".to_owned(),
+        json!({"$type": "System.String", "$value": server_url_v2}),
+    );
+    properties.insert(
+        "UseV2Flow".to_owned(),
+        json!({"$type": "System.Boolean", "$value": true}),
+    );
+
+    if let Some(auth_url_v2) = options.auth_url_v2 {
+        properties.insert(
+            "EnableAuthMigrationByDefault".to_owned(),
+            json!({"$type": "System.Boolean", "$value": true}),
+        );
+        properties.insert(
+            "AuthorizationUrlV2".to_owned(),
+            json!({"$type": "System.String", "$value": auth_url_v2}),
+        );
+    }
+    if let Some(broker_url) = options.broker_url {
+        properties.insert(
+            "BrokerUrl".to_owned(),
+            json!({"$type": "System.String", "$value": broker_url}),
+        );
+    }
+    if let Some(use_runner_admin_flow) = options.use_runner_admin_flow {
+        properties.insert(
+            "UseRunnerAdminFlow".to_owned(),
+            json!({"$type": "System.Boolean", "$value": use_runner_admin_flow}),
+        );
+    }
+    properties
+}
+
 pub async fn register_runner(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerRegistrationRequest>,
@@ -604,7 +660,8 @@ pub async fn agent_lookup(
             "authorization": {
                 "clientId": client_id,
                 "publicKey": {"exponent": "AQAB", "modulus": ""}
-            }
+            },
+            "properties": runner_admin_properties()
         }]}));
     }
     // Return empty collection (not 404) — runner expects VssJsonCollectionWrapper format
@@ -806,12 +863,7 @@ pub async fn register_runner_compat(
             "clientId": client_id,
             "publicKey": public_key_object
         },
-        "properties": {
-            "RequireFipsCryptography": {"$type": "System.Boolean", "$value": false},
-            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
-            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
-            "UseV2Flow": {"$type": "System.Boolean", "$value": true}
-        }
+        "properties": runner_admin_properties()
     })))
 }
 
@@ -912,11 +964,7 @@ pub(crate) async fn update_agent(
         "runnerGroupId": runner.runner_group_id.unwrap_or(1),
         "runnerGroupName": runner.runner_group_name,
         "labels": runner.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
-        "properties": {
-            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
-            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
-            "UseV2Flow": {"$type": "System.Boolean", "$value": true}
-        }
+        "properties": runner_admin_properties()
     })))
 }
 
