@@ -2687,6 +2687,7 @@ pub(crate) mod suite {
                     annotations: Vec::new(),
                     step_results: Vec::new(),
                     environment_url: Some("https://vm-42.example.com".to_owned()),
+                    infrastructure_failure_category: None,
                 },
                 settle: Some(AttemptSettle {
                     agent_job_id: claimed.request.agent_job_id,
@@ -2819,6 +2820,7 @@ pub(crate) mod suite {
                     annotations: Vec::new(),
                     step_results: Vec::new(),
                     environment_url: None,
+                    infrastructure_failure_category: None,
                 },
                 settle: Some(AttemptSettle {
                     agent_job_id: claimed.request.agent_job_id,
@@ -5047,6 +5049,7 @@ pub(crate) mod suite {
                     annotations: Vec::new(),
                     step_results: Vec::new(),
                     environment_url: None,
+                    infrastructure_failure_category: None,
                 },
                 settle: Some(AttemptSettle {
                     agent_job_id: agent,
@@ -5105,6 +5108,7 @@ pub(crate) mod suite {
                         conclusion: Some(serde_json::json!("succeeded")),
                     }],
                     environment_url: None,
+                    infrastructure_failure_category: None,
                 },
                 settle: Some(AttemptSettle {
                     agent_job_id: agent,

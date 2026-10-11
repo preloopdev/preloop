@@ -111,6 +111,10 @@ pub struct BrokerRenewJobRequest {
     /// has no environment URL or its expression did not resolve.
     #[serde(rename = "environmentUrl", default)]
     pub environment_url: Option<String>,
+    /// Official `CompleteJobRequest.InfrastructureFailureCategory`, emitted
+    /// by the runner when infrastructure (rather than workflow) fails.
+    #[serde(rename = "infrastructureFailureCategory", default)]
+    pub infrastructure_failure_category: Option<String>,
 }
 
 pub fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
@@ -1327,6 +1331,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
             annotations: Vec::new(),
             step_results: Vec::new(),
             environment_url: None,
+            infrastructure_failure_category: None,
         };
         // The caller is already returning the mint failure to the runner, so a
         // secondary bookkeeping error must not mask it.
@@ -1714,6 +1719,7 @@ pub async fn broker_complete_job(
             annotations: request.annotations.clone(),
             step_results: request.step_results.clone(),
             environment_url: request.environment_url.clone(),
+            infrastructure_failure_category: request.infrastructure_failure_category.clone(),
         },
         Some(crate::distributed_task::AttemptSettle {
             agent_job_id: request.job_id,
@@ -1815,6 +1821,44 @@ mod tests {
         assert_eq!(
             execution_status_from_runner_result("Abandoned"),
             Some(ExecutionStatus::Failure)
+        );
+    }
+
+    #[test]
+    fn broker_completion_preserves_infrastructure_failure_category() {
+        let request: BrokerRenewJobRequest = serde_json::from_value(json!({
+            "jobId": uuid::Uuid::nil(),
+            "planId": "plan-1",
+            "conclusion": "failed",
+            "infrastructureFailureCategory": "debugger_tunnel_failure"
+        }))
+        .expect("runner completejob payload should deserialize");
+        assert_eq!(
+            request.infrastructure_failure_category.as_deref(),
+            Some("debugger_tunnel_failure")
+        );
+
+        let completion = JobCompletion {
+            run_id: RunId::new(),
+            job_id: JobId("build".to_owned()),
+            agent_job_id: Some(request.job_id),
+            status: ExecutionStatus::Failure,
+            outputs: preloop_gha_protocol::OutputMap::new(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+            environment_url: None,
+            infrastructure_failure_category: request.infrastructure_failure_category,
+        };
+        let wire = serde_json::to_value(&completion).expect("completion should serialize");
+        assert_eq!(
+            wire["infrastructureFailureCategory"],
+            "debugger_tunnel_failure"
+        );
+        let decoded: JobCompletion =
+            serde_json::from_value(wire).expect("completion should round-trip");
+        assert_eq!(
+            decoded.infrastructure_failure_category.as_deref(),
+            Some("debugger_tunnel_failure")
         );
     }
 

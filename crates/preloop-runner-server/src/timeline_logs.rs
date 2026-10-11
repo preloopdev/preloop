@@ -609,6 +609,7 @@ pub async fn finish_job(
                 .as_ref()
                 .and_then(|environment| environment.url.as_ref())
                 .and_then(resolved_environment_url),
+            infrastructure_failure_category: None,
         })
     } else {
         None
@@ -824,6 +825,7 @@ pub async fn finish_job_plan(
             environment_url: event
                 .pointer("/actionsEnvironment/url")
                 .and_then(resolved_environment_url),
+            infrastructure_failure_category: None,
         })
     } else {
         warn!(plan_id, "finish_job_plan: could not resolve run/job");

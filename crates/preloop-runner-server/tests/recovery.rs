@@ -3133,6 +3133,7 @@ jobs:
         state.shared(),
         preloop_gha_protocol::JobCompletion {
             environment_url: None,
+            infrastructure_failure_category: None,
             run_id,
             job_id: preloop_gha_protocol::JobId("gen".to_owned()),
             agent_job_id: None,
@@ -3236,6 +3237,7 @@ jobs:
         state.shared(),
         preloop_gha_protocol::JobCompletion {
             environment_url: None,
+            infrastructure_failure_category: None,
             run_id,
             job_id: preloop_gha_protocol::JobId("gen".to_owned()),
             agent_job_id: None,

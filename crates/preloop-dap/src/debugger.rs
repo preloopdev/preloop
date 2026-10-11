@@ -104,6 +104,13 @@ pub enum DapError {
     /// Configuration is invalid (e.g. missing tunnel info).
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    /// The debugger tunnel could not be established, or dropped while
+    /// the session was live. The user can't do anything about that, so
+    /// callers must surface it as an infrastructure failure rather than
+    /// a job error — mirrors upstream `DebuggerTunnelException`.
+    #[error("{0}")]
+    TunnelFailure(String),
 }
 
 /// The `IDapDebugger` service interface. Mirrors the C# interface
@@ -137,6 +144,11 @@ pub trait IDapDebugger: Send + Sync {
     /// Job has completed: emit `terminated`/`exited`, pause for
     /// final inspection, then tear down.
     async fn on_job_completed(&self) -> Result<(), DapError>;
+    /// The recorded tunnel failure, if the devtunnel dropped while the job
+    /// was running. The step loop only sees a tunnel drop on the next
+    /// `on_step_starting`; a drop during the final step would otherwise
+    /// complete the job successfully with no infrastructure category.
+    fn tunnel_failure(&self) -> Option<DapError>;
     /// Stop the debugger unconditionally. Cancels everything.
     async fn stop(&self) -> Result<(), DapError>;
     /// Read-only view of the current state.
@@ -182,6 +194,17 @@ struct DebuggerCore {
     /// Whether we've already paused at the job entry point.
     /// Official runner only pauses at the first step, then runs the rest.
     entry_paused: std::sync::atomic::AtomicBool,
+    /// Set before we intentionally tear the devtunnel down so the child
+    /// exit that teardown produces isn't mistaken for a failure —
+    /// mirrors upstream `_tunnelShuttingDown`.
+    tunnel_shutting_down: std::sync::atomic::AtomicBool,
+    /// 0 until an unexpected tunnel exit has been reported, so the job is
+    /// only failed once no matter how the drop is observed — mirrors
+    /// upstream `_tunnelFailureReported`.
+    tunnel_failure_reported: std::sync::atomic::AtomicBool,
+    /// Message of the reported tunnel failure, so `wait_until_ready` and
+    /// `on_step_starting` can return it as `DapError::TunnelFailure`.
+    tunnel_failure: PlMutex<Option<String>>,
 }
 
 /// Internal envelope of an outgoing DAP message (response or
@@ -258,6 +281,9 @@ impl DapDebugger {
                 context: parking_lot::Mutex::new(serde_json::json!({})),
                 masks: parking_lot::Mutex::new(std::collections::HashSet::new()),
                 entry_paused: std::sync::atomic::AtomicBool::new(false),
+                tunnel_shutting_down: std::sync::atomic::AtomicBool::new(false),
+                tunnel_failure_reported: std::sync::atomic::AtomicBool::new(false),
+                tunnel_failure: PlMutex::new(None),
             }),
         }
     }
@@ -287,8 +313,10 @@ impl DapDebugger {
         tunnel: &DebuggerTunnelInfo,
     ) -> Result<tokio::process::Child, DapError> {
         let bin = which_devtunnel().ok_or_else(|| {
-            DapError::InvalidConfig(
-                "devtunnel binary not found in PATH or well-known locations".into(),
+            DapError::TunnelFailure(
+                "Failed to connect to the debugger tunnel: devtunnel binary not found \
+                 in PATH or well-known locations"
+                    .into(),
             )
         })?;
         let mut cmd = tokio::process::Command::new(bin);
@@ -303,7 +331,9 @@ impl DapDebugger {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = cmd.spawn().map_err(DapError::Io)?;
+        let child = cmd.spawn().map_err(|e| {
+            DapError::TunnelFailure(format!("Failed to connect to the debugger tunnel: {e}"))
+        })?;
         Ok(child)
     }
 
@@ -800,6 +830,123 @@ fn which_devtunnel() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Inspect the host child while holding the same mutex as the watcher, then
+/// begin intentional teardown. This closes the poll/sleep race where the host
+/// exited before finalization but the watcher had not reached its next tick.
+async fn prepare_tunnel_shutdown(core: &Arc<DebuggerCore>) {
+    use std::sync::atomic::Ordering;
+
+    let unexpected_exit = {
+        let mut child_guard = core.devtunnel_child.lock().await;
+        let status = child_guard.as_mut().map(|child| child.try_wait());
+        match status {
+            Some(Ok(Some(exit))) => {
+                // Reap the already-exited child from the shared slot before
+                // reporting; the watcher will observe `None` and stop.
+                let _ = child_guard.take();
+                Some(format!("devtunnel host exited ({exit})"))
+            }
+            Some(Err(error)) => {
+                let _ = child_guard.take();
+                Some(format!("devtunnel host wait failed: {error}"))
+            }
+            Some(Ok(None)) => {
+                // The child was observed alive while the watcher was excluded
+                // by the mutex. From this point on its exit is intentional.
+                core.tunnel_shutting_down.store(true, Ordering::SeqCst);
+                if let Some(mut child) = child_guard.take() {
+                    let _ = child.start_kill();
+                }
+                None
+            }
+            None => {
+                core.tunnel_shutting_down.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    };
+
+    if let Some(detail) = unexpected_exit {
+        report_tunnel_disconnected(core, &detail);
+    }
+}
+
+/// Poll the devtunnel host subprocess and report a tunnel failure when it
+/// exits unexpectedly. Mirrors upstream `ConnectionStatusChanged` →
+/// `HandleTunnelConnectionStatusChanged`: the Dev Tunnel SDK reconnects on
+/// transient drops, so only a settled exit means the relay is really gone.
+/// For the subprocess transport that means the host process has terminated.
+async fn watch_devtunnel(core: Arc<DebuggerCore>) {
+    loop {
+        let status = {
+            let mut child = core.devtunnel_child.lock().await;
+            match child.as_mut() {
+                // The handle is only removed by `stop`/`on_job_completed`,
+                // which take it to kill it — no failure to report.
+                None => return,
+                Some(child) => child.try_wait(),
+            }
+        };
+        match status {
+            // Still running — check again shortly.
+            Ok(None) => {}
+            Ok(Some(exit)) => {
+                report_tunnel_disconnected(&core, &format!("devtunnel host exited ({exit})"));
+                return;
+            }
+            Err(error) => {
+                report_tunnel_disconnected(&core, &format!("devtunnel host wait failed: {error}"));
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Fail the session when the debugger tunnel drops unexpectedly. Mirrors
+/// `DapDebugger.cs::ReportTunnelDisconnected`: without the tunnel the debug
+/// client can never resume the job, so anything waiting on a DAP pause would
+/// hang until the job timeout — fail fast instead.
+fn report_tunnel_disconnected(core: &Arc<DebuggerCore>, detail: &str) {
+    use std::sync::atomic::Ordering;
+    if core.tunnel_shutting_down.load(Ordering::SeqCst) {
+        debug!("devtunnel exited while shutting down — expected, ignoring.");
+        return;
+    }
+    if core.tunnel_failure_reported.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" {detail}")
+    };
+    let message = format!(
+        "The debugger lost its connection to the tunnel and the job cannot continue.{detail}"
+    );
+    error!("{message}");
+    *core.tunnel_failure.lock() = Some(message);
+    *core.state.lock() = DapSessionState::Terminated;
+    // Unblock anything waiting on the debug client so the job stops waiting:
+    // `wait_until_ready` polls `state`; `on_step_starting` awaits `resume_tx`.
+    let _ = core.resume_tx.send(());
+    // Wake the client transport so the connection task stops instead of
+    // lingering until the connection timeout.
+    if let Ok(cancel) = core.cancel.try_lock()
+        && let Some(tx) = cancel.as_ref()
+    {
+        let _ = tx.send(true);
+    }
+}
+
+/// The reported tunnel failure as a `DapError`, if the tunnel dropped.
+fn tunnel_failure_error(core: &DebuggerCore) -> Option<DapError> {
+    core.tunnel_failure
+        .lock()
+        .clone()
+        .map(DapError::TunnelFailure)
+}
+
 #[async_trait]
 impl IDapDebugger for DapDebugger {
     async fn start(&self, job_id: &str, _steps: &[SourceEntry]) -> Result<(), DapError> {
@@ -834,10 +981,22 @@ impl IDapDebugger for DapDebugger {
         }
 
         if matches!(self.core.config.transport, DebuggerTransportMode::DevTunnel) {
+            // Mirror `DapDebugger.cs::StartTunnelRelayAsync`: any tunnel
+            // establishment failure surfaces as `DebuggerTunnelException`,
+            // which the job layer reports as an infrastructure failure —
+            // it must not degrade to a generic startup error.
             match self.launch_devtunnel(&tunnel).await {
-                Ok(child) => *self.core.devtunnel_child.lock().await = Some(child),
+                Ok(child) => {
+                    *self.core.devtunnel_child.lock().await = Some(child);
+                    // Watch the host subprocess the way upstream watches
+                    // `ConnectionStatusChanged`: a relay that drops while
+                    // the session is live must fail fast instead of
+                    // hanging until the connection timeout.
+                    tokio::spawn(watch_devtunnel(Arc::clone(&self.core)));
+                }
                 Err(e) => {
-                    warn!("devtunnel host failed to start: {e}");
+                    *self.core.state.lock() = DapSessionState::Terminated;
+                    return Err(e);
                 }
             }
         } else {
@@ -864,6 +1023,12 @@ impl IDapDebugger for DapDebugger {
                         return Ok(());
                     }
                     if *self.core.state.lock() == DapSessionState::Terminated {
+                        // A tunnel drop terminates the session; surface it as
+                        // `TunnelFailure` so the job layer reports an
+                        // infrastructure failure, not a job error.
+                        if let Some(failure) = tunnel_failure_error(&self.core) {
+                            return Err(failure);
+                        }
                         return Err(DapError::Protocol("session terminated".into()));
                     }
                 }
@@ -873,7 +1038,14 @@ impl IDapDebugger for DapDebugger {
         if let Some(mut rx) = cancel_rx {
             tokio::select! {
                 r = state_check => r,
-                _ = rx.changed() => Err(DapError::Protocol("cancelled".into())),
+                _ = rx.changed() => {
+                    // The tunnel report also wakes this channel; a recorded
+                    // tunnel failure takes precedence over cancellation.
+                    if let Some(failure) = tunnel_failure_error(&self.core) {
+                        return Err(failure);
+                    }
+                    Err(DapError::Protocol("cancelled".into()))
+                }
                 _ = tokio::time::sleep(timeout_d) => Err(DapError::Protocol("configurationDone timeout".into())),
             }
         } else {
@@ -916,6 +1088,12 @@ impl IDapDebugger for DapDebugger {
         if !self.is_runnable() {
             return Ok(());
         }
+        // A tunnel drop that already happened while a previous step ran must
+        // not leave this step waiting on a `resume_tx` that can only be
+        // re-sent by a client that can no longer reach us.
+        if let Some(failure) = tunnel_failure_error(&self.core) {
+            return Err(failure);
+        }
         // Official runner only pauses at the first step (job entry).
         // Subsequent steps run without pause.
         let already_paused = self
@@ -950,13 +1128,28 @@ impl IDapDebugger for DapDebugger {
 
         let mut rx = self.core.resume_tx.subscribe();
         let _ = rx.borrow_and_update();
+        // A tunnel drop that landed between the earlier failure check and
+        // `subscribe()` left the stored `()` already current, so `changed()`
+        // below would never fire. Re-check now that the value is stable.
+        if let Some(failure) = tunnel_failure_error(&self.core) {
+            return Err(failure);
+        }
         rx.changed()
             .await
             .map_err(|_| DapError::Protocol("debugger resume channel closed".into()))?;
+        // The tunnel report also releases this wait; a recorded tunnel
+        // failure must surface as `TunnelFailure`, not a silent resume.
+        if let Some(failure) = tunnel_failure_error(&self.core) {
+            return Err(failure);
+        }
         *self.core.state.lock() = DapSessionState::Running;
         // continued event is sent by the dispatcher loop after the
         // continue response, matching official runner ordering.
         Ok(())
+    }
+
+    fn tunnel_failure(&self) -> Option<DapError> {
+        tunnel_failure_error(&self.core)
     }
 
     fn on_step_completed(&self, _step: &SourceEntry) {
@@ -966,6 +1159,9 @@ impl IDapDebugger for DapDebugger {
     }
 
     async fn on_job_completed(&self) -> Result<(), DapError> {
+        // Inspect the child before marking teardown intentional. The watcher
+        // may be between polls while the host has already exited.
+        prepare_tunnel_shutdown(&self.core).await;
         // Official runner sends terminated + exited directly — no final pause.
         let seq = self.next_seq_internal().await;
         let _ = self
@@ -978,9 +1174,6 @@ impl IDapDebugger for DapDebugger {
             Event::new(seq, EVENT_EXITED).with_body(json!({"exitCode": 0})),
         ));
         *self.core.state.lock() = DapSessionState::Terminated;
-        if let Some(mut child) = self.core.devtunnel_child.lock().await.take() {
-            let _ = child.start_kill();
-        }
         if let Some(tx) = self.core.cancel.lock().await.as_ref() {
             let _ = tx.send(true);
         }
@@ -989,9 +1182,9 @@ impl IDapDebugger for DapDebugger {
     }
 
     async fn stop(&self) -> Result<(), DapError> {
-        if let Some(mut child) = self.core.devtunnel_child.lock().await.take() {
-            let _ = child.start_kill();
-        }
+        // Inspect the child under the watcher mutex before making teardown
+        // intentional; an already-exited host is a real tunnel failure.
+        prepare_tunnel_shutdown(&self.core).await;
         if let Some(tx) = self.core.cancel.lock().await.as_ref() {
             let _ = tx.send(true);
         }
@@ -1210,6 +1403,99 @@ mod tests {
         assert_eq!(
             resolve_welcome_message(&dbg.core),
             Some(default_welcome_message())
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_drop_makes_wait_until_ready_fail_as_tunnel_failure() {
+        // Mirrors upstream `DapDebuggerL0`: a settled tunnel disconnect
+        // while waiting for the client surfaces `DebuggerTunnelException`,
+        // not a generic wait error or a hang.
+        let dbg = DapDebugger::new(sample_config());
+        report_tunnel_disconnected(&dbg.core, "devtunnel host exited (exit status: 1)");
+        let err = dbg.wait_until_ready().await.unwrap_err();
+        assert!(
+            matches!(&err, DapError::TunnelFailure(m) if m.contains("lost its connection")),
+            "expected TunnelFailure, got {err:?}"
+        );
+        assert_eq!(*dbg.core.state.lock(), DapSessionState::Terminated);
+    }
+
+    #[tokio::test]
+    async fn tunnel_drop_releases_step_pause_as_tunnel_failure() {
+        // A drop landing while a step is paused releases the pause and
+        // reports `TunnelFailure` — it must not read as a silent `continue`.
+        let dbg = DapDebugger::new(sample_config());
+        *dbg.core.state.lock() = DapSessionState::Ready;
+        let paused = tokio::spawn({
+            let dbg = DapDebugger {
+                core: Arc::clone(&dbg.core),
+            };
+            async move { dbg.on_step_starting(&step("Build")).await }
+        });
+        // Let the pause install itself before the drop lands.
+        for _ in 0..50 {
+            if *dbg.core.state.lock() == DapSessionState::Paused {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*dbg.core.state.lock(), DapSessionState::Paused);
+
+        report_tunnel_disconnected(&dbg.core, "");
+        let err = paused.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, DapError::TunnelFailure(_)),
+            "expected TunnelFailure, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_failure_is_reported_once() {
+        // `_tunnelFailureReported` parity: repeated drop observations (a
+        // watcher tick plus a late status) only record the first message.
+        let dbg = DapDebugger::new(sample_config());
+        report_tunnel_disconnected(&dbg.core, "first");
+        report_tunnel_disconnected(&dbg.core, "second");
+        assert_eq!(
+            dbg.core.tunnel_failure.lock().clone().as_deref(),
+            Some(
+                "The debugger lost its connection to the tunnel and the job \
+                 cannot continue. first"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_exit_during_shutdown_is_not_a_failure() {
+        // `_tunnelShuttingDown` parity: teardown kills the child itself;
+        // the exit that produces must not report an infra failure.
+        let dbg = DapDebugger::new(sample_config());
+        dbg.core
+            .tunnel_shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        report_tunnel_disconnected(&dbg.core, "devtunnel host exited (exit status: 9)");
+        assert!(dbg.core.tunnel_failure.lock().is_none());
+        assert!(
+            !dbg.core
+                .tunnel_failure_reported
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_devtunnel_binary_is_a_tunnel_failure() {
+        // Only meaningful where `devtunnel` is genuinely absent; on dev
+        // machines with the binary installed the lookup succeeds and this
+        // test has nothing to assert.
+        if which_devtunnel().is_some() {
+            return;
+        }
+        let dbg = DapDebugger::new(sample_config());
+        let err = dbg.launch_devtunnel(&sample_tunnel()).await.unwrap_err();
+        assert!(
+            matches!(err, DapError::TunnelFailure(_)),
+            "expected TunnelFailure, got {err:?}"
         );
     }
 }

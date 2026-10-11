@@ -7,6 +7,17 @@ use std::sync::{Arc, RwLock};
 use crate::worker::execution_types::Annotation;
 use crate::worker::matchers::MatcherRegistry;
 
+/// Mirrors `Constants.Runner.InfrastructureFailureCategories`: stable
+/// category strings the job's `completejob` reports as
+/// `infrastructureFailureCategory` so the server can tell a runner/host
+/// fault from a job error.
+pub mod infra_failure_categories {
+    /// The debugger's tunnel dropped or never established
+    /// (`Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure`,
+    /// actions/runner v2.338.0).
+    pub const DEBUGGER_TUNNEL_FAILURE: &str = "debugger_tunnel_failure";
+}
+
 /// The top-level job context holding all sub-contexts and accumulated state.
 #[derive(Clone)]
 pub struct JobContext {
@@ -39,6 +50,11 @@ pub struct JobContext {
     /// These are infrastructure-level issues (container failures, action download errors)
     /// that are not tied to a specific step.
     pub job_annotations: Vec<Annotation>,
+    /// The job's infrastructure failure category, reported on `completejob` as
+    /// `infrastructureFailureCategory`. Set once — the first
+    /// [`Self::infrastructure_error`] wins, mirroring upstream
+    /// `GlobalContext.InfrastructureFailureCategory`.
+    pub infrastructure_failure_category: Option<String>,
     /// Resolved action directories keyed by the original `uses:` reference.
     pub action_paths: HashMap<String, String>,
     /// Active problem matchers (cross-step, registered by actions like setup-node).
@@ -177,6 +193,7 @@ impl JobContext {
             job_status: JobStatus::Success,
             step_annotations: HashMap::new(),
             job_annotations: Vec::new(),
+            infrastructure_failure_category: None,
             state: HashMap::new(),
             action_paths: HashMap::new(),
             matchers: MatcherRegistry::new(),
@@ -375,6 +392,20 @@ impl JobContext {
 
     /// Add a job-level annotation (infrastructure issue).
     pub fn add_job_annotation(&mut self, annotation: Annotation) {
+        self.job_annotations.push(annotation);
+    }
+
+    /// Record an infrastructure-level error: a job annotation flagged
+    /// `isInfrastructureIssue` plus the job's failure category.
+    ///
+    /// Mirrors `ExecutionContext.InfrastructureError(message, category)`:
+    /// the first category recorded wins so a secondary failure cannot
+    /// overwrite the root cause.
+    pub fn infrastructure_error(&mut self, message: impl Into<String>, category: &str) {
+        let annotation = Annotation::infrastructure_error(message, category);
+        if self.infrastructure_failure_category.is_none() {
+            self.infrastructure_failure_category = annotation.category.clone();
+        }
         self.job_annotations.push(annotation);
     }
     /// Whether the runner should mirror step issues onto the job annotation list.

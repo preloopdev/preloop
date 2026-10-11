@@ -405,6 +405,9 @@ pub async fn run_steps(
         step_idx += 1;
         let step_number = (idx as u32) + step_offset;
 
+        if super::job_runner::consume_recorded_tunnel_failure(job) {
+            any_failed = true;
+        }
         let expr_ctx = job.build_expression_context();
         let mut resolved_display_name = {
             let evaluated =
@@ -752,6 +755,19 @@ pub async fn run_steps(
                 };
                 if let Err(e) = dbg.on_step_starting(&source_entry).await {
                     warn!("DAP OnStepStarting failed: {e}");
+                    // Mirror `DapDebugger.cs::ReportTunnelDisconnected` +
+                    // `JobExtension.cs` (v2.338.0): a tunnel that drops while
+                    // the job runs is an infrastructure failure — record the
+                    // `debugger_tunnel_failure` category and fail the job,
+                    // rather than hanging on a client that can never resume.
+                    if let preloop_dap::debugger::DapError::TunnelFailure(message) = &e {
+                        step_ctx.job.infrastructure_error(
+                            message.clone(),
+                            super::contexts::infra_failure_categories::DEBUGGER_TUNNEL_FAILURE,
+                        );
+                        step_ctx.job.job_status = JobStatus::Failure;
+                        any_failed = true;
+                    }
                 }
             }
 
@@ -1279,6 +1295,8 @@ pub async fn run_steps(
                     end_line: None,
                     col: None,
                     end_column: None,
+                    is_infrastructure_issue: false,
+                    category: None,
                 });
                 warn!("{msg}");
                 "".to_string()

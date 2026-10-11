@@ -3769,3 +3769,76 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
         assert_eq!(body, expected.as_bytes());
     }
 }
+
+#[tokio::test]
+async fn broker_completejob_persists_infrastructure_failure_category() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, listen_token) =
+        register_runner_with_token(&app, "category-runner", &["self-hosted"], None).await;
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "local/preloop",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let (plan_id, agent_job_id) = {
+        let inner = state.test_tx().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id.0.to_string() == run_id)
+            .expect("submitted run should have a queued attempt");
+        (request.plan_id.clone(), request.agent_job_id)
+    };
+
+    let (_session_status, session) = create_disttask_session(&app, &listen_token, runner_id).await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let _message = poll_message(&app, &listen_token, session_id).await;
+    let _acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({
+            "jobMessageId": agent_job_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &listen_token,
+    )
+    .await;
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &runtime_token,
+            Method::POST,
+            &format!("/broker/{runner_id}/completejob"),
+            json!({
+                "jobId": agent_job_id,
+                "planId": plan_id,
+                "conclusion": "failed",
+                "annotations": [{
+                    "level": "failure",
+                    "message": "debugger tunnel dropped",
+                    "isInfrastructureIssue": true
+                }],
+                "infrastructureFailureCategory": "debugger_tunnel_failure"
+            }),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let run = get_run_json(&app, &run_id).await;
+    let annotations = run["jobs_list"][0]["annotations"]
+        .as_array()
+        .expect("job annotations should be persisted");
+    assert_eq!(annotations[0]["isInfrastructureIssue"], true);
+    assert_eq!(
+        annotations[0]["category"], "debugger_tunnel_failure",
+        "completejob category must survive the broker/server boundary"
+    );
+}

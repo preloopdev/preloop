@@ -809,6 +809,14 @@ pub struct JobCompletion {
         skip_serializing_if = "Option::is_none"
     )]
     pub environment_url: Option<String>,
+    /// Official `CompleteJobRequest.InfrastructureFailureCategory`, retained
+    /// across the server completion boundary.
+    #[serde(
+        rename = "infrastructureFailureCategory",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub infrastructure_failure_category: Option<String>,
 }
 
 /// One entry of the `completejob` `stepResults` array.
