@@ -1841,7 +1841,7 @@ async fn refresh_remaining_needs_waits_for_every_matrix_leg() {
     )
     .await
     .unwrap();
-    assert!(!promotable, "test waits for every leg");
+    assert!(promotable.is_empty(), "test waits for every leg");
     let remaining: i32 = tx
         .query_one(
             "SELECT remaining_needs FROM jobs \
@@ -1868,7 +1868,11 @@ async fn refresh_remaining_needs_waits_for_every_matrix_leg() {
     )
     .await
     .unwrap();
-    assert!(promotable, "test is promotable once every leg is terminal");
+    assert_eq!(
+        promotable,
+        vec![JobId("test".to_owned())],
+        "test is promotable once every leg is terminal"
+    );
     tx.rollback().await.unwrap();
 }
 
@@ -1908,7 +1912,11 @@ async fn refresh_remaining_needs_reports_only_the_unblocked_dependent() {
     )
     .await
     .unwrap();
-    assert!(promotable, "test should unblock when build is terminal");
+    assert_eq!(
+        promotable,
+        vec![JobId("test".to_owned())],
+        "test should unblock when build is terminal"
+    );
     let deploy_remaining: i32 = tx
         .query_one(
             "SELECT remaining_needs FROM jobs \
@@ -1935,7 +1943,11 @@ async fn refresh_remaining_needs_reports_only_the_unblocked_dependent() {
     )
     .await
     .unwrap();
-    assert!(promotable, "deploy should unblock when test is terminal");
+    assert_eq!(
+        promotable,
+        vec![JobId("deploy".to_owned())],
+        "deploy should unblock when test is terminal"
+    );
     tx.rollback().await.unwrap();
 }
 

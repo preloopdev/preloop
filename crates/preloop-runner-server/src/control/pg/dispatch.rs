@@ -3242,8 +3242,8 @@ impl<'a> Sweep<'a> {
     }
 
     /// Recompute the `remaining_needs` fast-path counter for every job that
-    /// declares `job_id` or its matrix base as a need, and report whether any
-    /// of them is now promotable (`blocked`, zero remaining needs).
+    /// declares `job_id` or its matrix base as a need, and return the ones now
+    /// promotable (`blocked`, zero remaining needs), in job-id order.
     ///
     /// This is the targeted replacement for the in-memory decrement
     /// `Settle::settle_node` performed over the loaded graph: a declared need
@@ -3256,7 +3256,7 @@ impl<'a> Sweep<'a> {
         run_id: RunId,
         job_id: &JobId,
         base_id: &str,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Vec<JobId>, ControlError> {
         let rows = tx
             .query(
                 "UPDATE jobs d SET remaining_needs = COALESCE(( \
@@ -3280,14 +3280,18 @@ impl<'a> Sweep<'a> {
                      SELECT n.job_id FROM job_needs n \
                      WHERE n.run_id = $1::text::uuid \
                        AND (n.needs_job_id = $2 OR n.needs_job_id = $3)) \
-                 RETURNING d.queue_state, d.remaining_needs",
+                 RETURNING d.job_id, d.queue_state, d.remaining_needs",
                 &[&run_id.0.to_string(), &job_id.0, &base_id],
             )
             .await
             .map_err(db)?;
-        Ok(rows
+        let mut unblocked: Vec<JobId> = rows
             .iter()
-            .any(|row| row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0))
+            .filter(|row| row.get::<_, String>(1) == "blocked" && row.get::<_, i32>(2) <= 0)
+            .map(|row| JobId(row.get(0)))
+            .collect();
+        unblocked.sort();
+        Ok(unblocked)
     }
 
     /// Whether a settled leg freed a `max-parallel` slot that a parked leg of
@@ -6309,9 +6313,11 @@ struct SettleCoreOutcome {
     cancelled_siblings: Vec<JobId>,
     /// Reusable callers folded terminal by this completion, innermost first.
     folded_callers: Vec<JobId>,
-    /// A dependent just became promotable — the caller runs the promotion
-    /// sweep for the run.
-    promotable_dependents: bool,
+    /// Dependents this completion left `blocked` with no needs outstanding
+    /// (job-id order): the promotion step decides each one.
+    unblocked: Vec<JobId>,
+    /// Matrix cohorts with a parked leg a freed `max-parallel` slot can take.
+    admit_cohorts: Vec<String>,
     newly_terminal_success: bool,
     run_completed: bool,
     conclusion: Option<String>,
@@ -6325,7 +6331,8 @@ impl Default for SettleCoreOutcome {
             replayed: false,
             cancelled_siblings: Vec::new(),
             folded_callers: Vec::new(),
-            promotable_dependents: false,
+            unblocked: Vec::new(),
+            admit_cohorts: Vec::new(),
             newly_terminal_success: false,
             run_completed: false,
             conclusion: None,
@@ -6379,11 +6386,7 @@ impl PgBackend {
         let outcome = self
             .settle_job_targeted(&tx, run_id, &job_id, completion.status, &outputs, &[], None)
             .await?;
-        let scheduling = if outcome.promotable_dependents {
-            self.promote_unblocked(&tx, run_id).await?
-        } else {
-            crate::runtime_scheduling::SchedulingOutcome::default()
-        };
+        let scheduling = self.promote_after_settle(&tx, run_id, &outcome).await?;
         let queue_nonempty = Self::work_pending_on(&tx).await?;
         tx.commit().await.map_err(db)?;
         drop(client);
@@ -6467,11 +6470,7 @@ impl PgBackend {
             drop(client);
             return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
         }
-        let scheduling = if outcome.promotable_dependents {
-            self.promote_unblocked(&tx, run_id).await?
-        } else {
-            crate::runtime_scheduling::SchedulingOutcome::default()
-        };
+        let scheduling = self.promote_after_settle(&tx, run_id, &outcome).await?;
         if let Some(request_id) = attempt {
             settle_request_tx(&tx, request_id, outcome.effective_status).await?;
             // The attempt's step results land on its manifest.
@@ -6665,10 +6664,13 @@ impl PgBackend {
         // is what the promotion sweep below picks up. A parked leg names no
         // sibling in `job_needs`, so the refresh never reports it: the settled
         // leg's cohort is checked for a parked leg the freed slot can take.
-        let mut promotable = false;
         for (settled, settled_base) in &settled_bases {
-            promotable |= Sweep::refresh_remaining_needs(tx, run_id, settled, settled_base).await?;
+            outcome
+                .unblocked
+                .extend(Sweep::refresh_remaining_needs(tx, run_id, settled, settled_base).await?);
         }
+        outcome.unblocked.sort();
+        outcome.unblocked.dedup();
         let mut cohorts: Vec<&str> = settled_bases
             .iter()
             .map(|(_, cohort)| cohort.as_str())
@@ -6676,9 +6678,10 @@ impl PgBackend {
         cohorts.sort_unstable();
         cohorts.dedup();
         for cohort in cohorts {
-            promotable |= Sweep::cohort_has_admissible_leg(tx, run_id, cohort).await?;
+            if Sweep::cohort_has_admissible_leg(tx, run_id, cohort).await? {
+                outcome.admit_cohorts.push(cohort.to_owned());
+            }
         }
-        outcome.promotable_dependents = promotable;
         // 6. Run status via the DB aggregate; the caller holds the run lock.
         summarize_run_tx(tx, run_id).await?;
         let (run_status, conclusion): (String, Option<String>) = {
@@ -6747,10 +6750,23 @@ impl PgBackend {
         Ok(outcome)
     }
 
-    /// Promote whatever the targeted settle unblocked: the shared sweep over
-    /// the run's graph, so needs hydration, gates, cohorts and deferred
-    /// expansion behave exactly as they do on the submit/cancel paths. Only
-    /// called when the completion made a dependent promotable.
+    /// Promote whatever the targeted settle unblocked. Nothing to do when the
+    /// completion left no dependent or parked cohort leg promotable.
+    async fn promote_after_settle(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        outcome: &SettleCoreOutcome,
+    ) -> Result<crate::runtime_scheduling::SchedulingOutcome, ControlError> {
+        if outcome.unblocked.is_empty() && outcome.admit_cohorts.is_empty() {
+            return Ok(crate::runtime_scheduling::SchedulingOutcome::default());
+        }
+        self.promote_unblocked(tx, run_id).await
+    }
+
+    /// The shared sweep over the run's graph, so needs hydration, gates,
+    /// cohorts and deferred expansion behave exactly as they do on the
+    /// submit/cancel paths.
     async fn promote_unblocked<'a>(
         &'a self,
         tx: &'a Transaction<'a>,
