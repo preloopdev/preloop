@@ -2521,30 +2521,35 @@ async fn replay_flows_to_preloop_inner(
                     // calls must never fall back to the listener credential.
                     if path.ends_with("/acquirejob") && (200..300).contains(&status) {
                         let official_resp = flow.get("response_body_json").unwrap_or(&Value::Null);
-                        let (op, oj) = acquire_job_ids(official_resp).ok_or_else(|| {
-                            anyhow!("acquirejob response is missing planId/jobId")
-                        })?;
-                        let (lp, lj) = acquire_job_ids(&body_json).ok_or_else(|| {
-                            anyhow!("local acquirejob response is missing planId/jobId")
-                        })?;
-                        plan_ids
-                            .entry(op.to_owned())
-                            .or_insert_with(|| lp.to_owned());
-                        plan_job_ids
-                            .entry((op.to_owned(), oj.to_owned()))
-                            .or_insert_with(|| (lp.to_owned(), lj.to_owned()));
-                        broker_job_ids
-                            .entry(oj.to_owned())
-                            .or_insert_with(|| lj.to_owned());
-                        let token = extract_system_vss_access_token(&body_json)
-                            .map(str::to_owned)
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "acquirejob response is missing a SystemVssConnection runtime token"
-                                )
+                        // The golden can carry a failed acquirejob (e.g. a 409
+                        // job-assignment error racing fail-fast cancellation in
+                        // scenario 224) even though the local replay acquired
+                        // its own queued job. The status diff belongs in the
+                        // report; only map ids when the official flow carried a
+                        // real job payload.
+                        if let Some((op, oj)) = acquire_job_ids(official_resp) {
+                            let (lp, lj) = acquire_job_ids(&body_json).ok_or_else(|| {
+                                anyhow!("local acquirejob response is missing planId/jobId")
                             })?;
-                        runtime_tokens.insert(lp.to_owned(), lj.to_owned(), token.clone());
-                        runtime_token = Some(token);
+                            plan_ids
+                                .entry(op.to_owned())
+                                .or_insert_with(|| lp.to_owned());
+                            plan_job_ids
+                                .entry((op.to_owned(), oj.to_owned()))
+                                .or_insert_with(|| (lp.to_owned(), lj.to_owned()));
+                            broker_job_ids
+                                .entry(oj.to_owned())
+                                .or_insert_with(|| lj.to_owned());
+                            let token = extract_system_vss_access_token(&body_json)
+                                .map(str::to_owned)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "acquirejob response is missing a SystemVssConnection runtime token"
+                                    )
+                                })?;
+                            runtime_tokens.insert(lp.to_owned(), lj.to_owned(), token.clone());
+                            runtime_token = Some(token);
+                        }
                     }
                     if is_blob_create_endpoint(&path)
                         && let Some(upload_url) = body_json

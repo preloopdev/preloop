@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Rust reimplementation of the GitHub Actions runner.
 #[derive(Debug, Parser)]
 #[command(name = "preloop-runner")]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (protocol-compat 2.335.1)"))]
+#[command(version = crate::cli_version())]
 #[command(about = "GitHub Actions runner — Rust implementation")]
 pub struct Cli {
     #[command(subcommand)]
@@ -237,7 +237,10 @@ mod tests {
     #[test]
     fn version_string_contains_protocol_compat() {
         let version = Cli::command().get_version().unwrap().to_string();
-        assert!(version.contains("protocol-compat 2.335.1"));
+        assert!(version.contains(&format!(
+            "protocol-compat {}",
+            crate::PROTOCOL_COMPAT_VERSION
+        )));
     }
 
     #[test]

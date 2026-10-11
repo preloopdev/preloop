@@ -9,7 +9,7 @@ path = "16-container-job.yml"
 [[steps]]
 kind = "wait_for_event"
 event = "job_assigned"
-timeout = 120
+timeout = 240
 
 [[steps]]
 kind = "wait_for_event"

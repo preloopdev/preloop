@@ -1,0 +1,61 @@
+change_id = "debugger-tunnel-failure"
+upstream_version = "v2.338.0"
+category = "nit"
+tags = ["debugger", "runner", "telemetry"]
+ai_status = "manual-delta-analysis"
+
+[description]
+what = '''
+DAP debugger hardening for the dev-tunnel relay: DapDebugger tracks tunnel
+connection status (Connecting tolerated, settled Disconnected fails fast via
+ReportTunnelDisconnected), adds SanitizeConsoleText so server-supplied text
+cannot inject ANSI/control codes into the DAP console, and JobExtension maps
+DebuggerTunnelException to an infrastructure failure with category
+"debugger_tunnel_failure" (Constants.Runner.InfrastructureFailureCategories.
+DebuggerTunnelFailure) plus AddDebuggerConnectionTelemetry
+(Connected/Canceled/TunnelFailed).
+'''
+why = '''
+A dropped tunnel used to hang the job until timeout; now it fails fast as an
+infrastructure error rather than a job failure.
+'''
+runner_behavior = '''
+Job infra-fails (not job-fails) with category debugger_tunnel_failure when
+the debug tunnel drops or never establishes; cancelled-before-connect stays
+a cancellation; console text from server is ANSI-sanitized.
+'''
+failure_mode = '''
+preloop's own debug path (debug_sessions/DAP bridge) doesn't run an upstream
+dev tunnel, but if it has an equivalent readiness/attachment failure surface
+it should categorize as infrastructure failure, not job failure.
+'''
+
+[wire]
+request = "N/A — runner-internal categorization + console sanitization."
+expected_response = "Infrastructure-failure categorization on tunnel loss; sanitized console output"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/worker/debug_pause.rs", area = "debug wait/cancel/failure categorization" },
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/worker/job_extension.rs", area = "debug failure → infra error mapping" },
+]
+
+[implementation]
+approach = '''
+Audit our debug path: failures while waiting for the debug client must map
+to infrastructure error + a stable category string (mirror
+"debugger_tunnel_failure" naming if we emit categories), cancellation stays
+cancellation, and any server-supplied console text is sanitized of ANSI/
+control codes before display.
+'''
+test = "Unit: simulated tunnel/drop failure → infrastructure error path, not step failure; sanitize check on crafted console text."
+
+[[source_entries]]
+file = "src/Runner.Common/Constants.cs"
+change_type = "field_added"
+fields = ["InfrastructureFailureCategories.DebuggerTunnelFailure = debugger_tunnel_failure"]
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+fields = ["HandleTunnelConnectionStatusChanged", "ReportTunnelDisconnected", "SanitizeConsoleText", "TunnelRelayStarted"]

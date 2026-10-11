@@ -1,0 +1,55 @@
+change_id = "internal-node24-default"
+upstream_version = "v2.338.0"
+category = "concern"
+tags = ["runner", "node", "externals"]
+ai_status = "manual-delta-analysis"
+
+[description]
+what = '''
+NodeUtil: _defaultNodeVersion "node20" -> "node24";
+BuiltInNodeVersions now ["node20", "node24"]. This is the runner's INTERNAL
+node (NodeHandler housekeeping: internal actions like checkout internals,
+telemetry, any node-executed runner plumbing) — not the job-side JS-action
+migration (already gated by actions.runner.usenode24bydefault etc.).
+'''
+why = '''
+Upstream defaults internal execution to Node 24 now that node24 externals
+ship in every runner package.
+'''
+runner_behavior = '''
+Internal node resolves to externals/node24 by default;
+ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION still overrides;
+node20 remains a built-in fallback.
+'''
+failure_mode = '''
+If preloop-runner still resolves internal housekeeping to node20 it stays
+functional but diverges from official runner process behavior (and from any
+capture asserting the node path the runner execs for internal steps).
+'''
+
+[wire]
+request = "N/A — runner-internal process selection."
+expected_response = "externals/node24 used for internal node execution; env override honored"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/", area = "internal node resolution (find the GetInternalNodeVersion analogue)" },
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/node_externals.rs", area = "externals manifest/run selection" },
+]
+
+[implementation]
+approach = '''
+Locate our internal-node default (search for node20 literals outside the
+job-side migration machinery in worker/handlers/node.rs). Default internal
+node to node24 with node20 fallback; honor a forced-internal-version env var
+(the repo may already define an analogue — reuse rather than add).
+'''
+test = "Internal node resolution returns node24 by default; env override returns requested runtime."
+
+[[source_entries]]
+file = "src/Runner.Common/Util/NodeUtil.cs"
+change_type = "file_changed"
+snippet = '''
+private const string _defaultNodeVersion = "node24";
+public static readonly ReadOnlyCollection<string> BuiltInNodeVersions = new(new[] { "node20", "node24" });
+'''

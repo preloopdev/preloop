@@ -1,7 +1,10 @@
 {
-  "delta_entries": 299,
-  "deterministically_skipped_or_grouped": 127,
-  "no_agents": true,
-  "specs": 12,
-  "version": "v2.335.1"
+  "version": "v2.338.0",
+  "diff": "v2.336.0..v2.338.0",
+  "delta_entries": 57,
+  "specs": 11,
+  "deterministic_specs": 4,
+  "manual_specs": 6,
+  "deferred": 1,
+  "notes": "4 deterministic specs are re-fires of the v2.335.1 known-gap set; 3 already implemented on main (request-ack, server-enforced-runner-settings, v2-admin-broker-connection), dap-debugger-endpoint partially covered by native DAP. 6 manual specs implement the real v2.338.0 runner-side deltas. vsock-secret-notifier deferred (no vsock boundary). Verified-already-present: $-selfRepository uses refs (v2.336.0), server-side session delete accepts ?sessionId=, node24 job-side migration machinery, wss proxy plumbing TBD by implementer."
 }

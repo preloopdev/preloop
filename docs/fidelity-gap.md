@@ -24,7 +24,7 @@ Runner *provisioning* integrations live in separate repos/crates. The Rust runne
 
 protocol client (`preloop-runner`) lives in this workspace alongside the control plane.
 
-Upstream reference: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
+Upstream reference: `actions/runner` v2.338.0 (commit `197ca027b90de199464dee3bb9ff198a1db60967`)
 
 Previous baseline: `actions/runner` v2.335.1 (commit `7d737449ef346f6524f75688d0c9c95fa10ba10a`)
 
@@ -408,6 +408,46 @@ conformance scenario:
 | P3       | Action archive / resolve telemetry payloads            | v2.336.0         | ⚠️ info logs only                                                                                                                                         |
 
 
+
+## 1a.5 v2.338.0 conformance replay status (2026-10-10)
+
+runner-watch replays the reconstructed 27-scenario `gh-official` cell
+(`201-expression-edge-cases` through `227-composite-pre-post`, workflows
+synthesized from the v2.338.0 acquirejob captures — same provenance caveat as
+v2.337.0 in §1a.1). Reports live in `.runner-watch/conformance/v2.338.0/`.
+
+All 27 scenarios replay to completion — status codes and request bodies match
+on every endpoint except the uniform server-surface drift below. The strict
+schema gate records all 27 as failures; the corpus is retained for comparison
+and stays out of the green gate (`benchmarks/conformance/targets.toml` carries
+only v2.336.0) until a complete protocol-equivalent capture set exists.
+
+Uniform divergences (every scenario):
+
+| Endpoint | Official | preloop | Assessment |
+| --- | --- | --- | --- |
+| `GET /_apis/connectionData` | full location-service table (~1600 lines) | minimal mapping (~760 lines) | Known body-value gap; field subset, not a new 2.338.0 regression |
+| `POST /runner/session` | richer response schema | narrower schema | `response_schema_drops_fields`; session contract accepted by the official runner |
+| `POST /broker/{n}/acquirejob` | 200 plus a raced `409 MissingKey` (scenario 224 fail-fast) | 200 | Status diff reflects the official run's own cancellation race, not a local divergence |
+
+Isolated diffs (single scenario):
+
+- `GET …/messages` in 210-service-containers-health: golden carried a
+  transitional `200` poll body mid-run; preloop returned `202` for the same
+  in-flight window. Ordering artifact of the capture.
+- `POST /_apis/v1/AgentRequest` and `ArtifactService/ListArtifacts` in
+  206-cache-artifact-roundtrip: a `404`/`200` mixed window plus a field-drop on
+  the artifact listing response — scenario-specific, under investigation.
+
+Replay-harness fixes landed during this campaign:
+
+1. `acquirejob` id-mapping no longer aborts when the golden flow carries a
+   failed response (the 224 `409`); the status diff is recorded in the report
+   instead of failing the campaign.
+2. Scenarios whose reconstructed workflows flatten dynamic matrix fan-out into
+   `replay-extra-N` placeholder jobs (202, 224, 216) carry
+   `replay-lenient-job-count` markers so queued-more-than-delivered is treated
+   as reconstruction loss, not an engine regression.
 ---
 
 ## 1b. Real-world repo conformance (2026-08-05)
