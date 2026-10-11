@@ -11,7 +11,7 @@
 
 use super::codec::{self, from_json, json, now_us, ts};
 use super::graph::{self, Node, NodeKind, ReusableNodeSpec, RunGraph, queue_state_str};
-use super::{PgBackend, db, lookups};
+use super::{PgBackend, db, lookups, promote};
 use crate::concurrency;
 use crate::control::backend::{
     EnvironmentGateRead, ExpansionApply, JobCompletionInput, PollRequest, PromoteOutcome,
@@ -48,7 +48,7 @@ const CLAIM_ATTEMPTS: usize = 4;
 
 /// Persist the mutable columns of one node (`jobs` row). Spec columns are
 /// immutable after insert.
-async fn flush_node(
+pub(super) async fn flush_node(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
@@ -112,7 +112,7 @@ async fn flush_node(
     Ok(())
 }
 
-fn apply_resolved_runs_on(node: &mut Node, runs_on: Vec<String>) {
+pub(super) fn apply_resolved_runs_on(node: &mut Node, runs_on: Vec<String>) {
     if node.runs_on == runs_on {
         return;
     }
@@ -121,7 +121,7 @@ fn apply_resolved_runs_on(node: &mut Node, runs_on: Vec<String>) {
         crate::control::types::compute_pool_key(&node.runs_on, node.runner_group.as_deref());
 }
 
-async fn promotion_label_reason(
+pub(super) async fn promotion_label_reason(
     backend: &PgBackend,
     tx: &Transaction<'_>,
     runs_on: &[String],
@@ -720,14 +720,14 @@ pub(super) async fn queue_job_cancellation(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// A node became ready: status + queue_state + enqueue clock (caller flushes).
-fn mark_ready(node: &mut Node, now_us: i64) {
+pub(super) fn mark_ready(node: &mut Node, now_us: i64) {
     node.status = ExecutionStatus::Queued;
     node.queue_state = logic::QueueState::Ready;
     node.enqueued_at_us = Some(now_us);
 }
 
 /// A node settled terminal: status + queue_state + completion clock.
-fn mark_terminal(node: &mut Node, status: ExecutionStatus, now_us: i64) {
+pub(super) fn mark_terminal(node: &mut Node, status: ExecutionStatus, now_us: i64) {
     node.status = status;
     node.queue_state = logic::QueueState::None;
     node.completed_at_us = Some(now_us);
@@ -2962,29 +2962,22 @@ impl<'a> Sweep<'a> {
         {
             let environment_name = self.environment_name_for(run_id, job_id).await?;
             if let Some(env_name) = environment_name {
-                let resolver = self.backend.environment_resolver();
-                let (repository, git_ref) = {
-                    let graph = self.graphs.get(&run_id).expect("loaded");
-                    (
-                        graph.record.submission.repository.clone(),
-                        graph.record.submission.git_ref.clone(),
-                    )
-                };
-                let lookup = resolver.lookup_sync(&repository, &env_name);
                 let mut gate = self
                     .graphs
                     .get(&run_id)
                     .and_then(|g| g.nodes.get(job_id))
                     .and_then(|n| n.environment_gate.clone());
-                let verdict = crate::runtime_scheduling::evaluate_environment_gate(
-                    &lookup,
-                    &git_ref,
-                    run_id,
-                    job_id,
-                    &env_name,
-                    &mut gate,
-                    crate::models::now_unix_nanos(),
-                );
+                let verdict = {
+                    let graph = self.graphs.get(&run_id).expect("loaded");
+                    promote::evaluate_job_environment(
+                        self.backend,
+                        run_id,
+                        job_id,
+                        &env_name,
+                        &graph.record.submission,
+                        &mut gate,
+                    )
+                };
                 match verdict {
                     crate::runtime_scheduling::EnvironmentGateOutcome::Wait => {
                         // Armed gates stamp progress on the node; a `Pending`
@@ -3123,48 +3116,19 @@ impl<'a> Sweep<'a> {
         Ok(false)
     }
 
-    /// The environment name a job's gate evaluates against: the hydrated
-    /// message's `actions_environment` (deferred names resolved), else the
-    /// armed gate's stamp, else the spec literal. `None` for environment-less
-    /// jobs.
-    ///
-    /// The message wins over the stamp: a gate armed while the name was still
-    /// a `${{ needs.* }}` template stamped that text, and re-evaluating the
-    /// template after `hydrate_needs_context` resolved the real name would
-    /// decide against an environment nobody configured.
+    /// The environment name a job's gate evaluates against; see
+    /// [`promote::environment_name_of`].
     async fn environment_name_for(
         &mut self,
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<Option<String>, ControlError> {
-        let message_name = self.message(run_id, job_id).await?.and_then(|message| {
-            message
-                .actions_environment
-                .map(|environment| environment.name)
-        });
-        if let Some(name) = message_name
-            .as_deref()
-            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
-        {
-            return Ok(Some(name.to_owned()));
-        }
-        let node_gate = self
+        let message = self.message(run_id, job_id).await?;
+        Ok(self
             .graphs
             .get(&run_id)
             .and_then(|g| g.nodes.get(job_id))
-            .and_then(|n| n.environment_gate.clone());
-        if let Some(name) = node_gate.as_ref().and_then(|g| g.environment_name.clone()) {
-            return Ok(Some(name));
-        }
-        Ok(message_name.or_else(|| {
-            self.graphs
-                .get(&run_id)
-                .and_then(|g| g.nodes.get(job_id))
-                .and_then(|node| {
-                    crate::runtime_scheduling::environment_gate_name_of(node.environment.as_ref())
-                })
-                .map(str::to_owned)
-        }))
+            .and_then(|node| promote::environment_name_of(message.as_ref(), node)))
     }
 
     /// Hydrate + enqueue one promotable job.
@@ -3292,43 +3256,6 @@ impl<'a> Sweep<'a> {
             .collect();
         unblocked.sort();
         Ok(unblocked)
-    }
-
-    /// Whether a settled leg freed a `max-parallel` slot that a parked leg of
-    /// its cohort can take: the cohort has a `blocked` leg with zero remaining
-    /// needs and fewer active legs than its cap. A parked leg names no sibling
-    /// in `job_needs`, so `refresh_remaining_needs` never reports it; the caller
-    /// treats `true` as a promotion trigger. The sweep that trigger runs loads
-    /// the run graph, so every such completion pays that load; admitting the
-    /// leg on a leg-scoped view instead is the follow-up.
-    pub(super) async fn cohort_has_admissible_leg(
-        tx: &Transaction<'_>,
-        run_id: RunId,
-        base_id: &str,
-    ) -> Result<bool, ControlError> {
-        let row = tx
-            .query_one(
-                "SELECT \
-                   EXISTS (SELECT 1 FROM jobs j \
-                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
-                       AND j.queue_state='blocked' AND j.remaining_needs <= 0 \
-                       AND j.status NOT IN \
-                         ('success','failure','cancelled','skipped','timed_out')), \
-                   (SELECT s.max_parallel FROM job_specs s \
-                     JOIN jobs j ON j.run_id=s.run_id AND j.job_id=s.job_id \
-                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
-                       AND s.max_parallel IS NOT NULL LIMIT 1), \
-                   (SELECT count(*) FROM jobs a \
-                     WHERE a.run_id=$1::text::uuid AND a.base_id=$2 \
-                       AND (a.status='in_progress' OR a.queue_state IN ('ready','claimed')))",
-                &[&run_id.0.to_string(), &base_id],
-            )
-            .await
-            .map_err(db)?;
-        let parked: bool = row.get(0);
-        let cap: Option<i32> = row.get(1);
-        let active: i64 = row.get(2);
-        Ok(parked && cap.is_some_and(|cap| active < i64::from(cap)))
     }
 
     /// Try to fold a reusable workflow caller when one of its inner jobs
@@ -3882,65 +3809,33 @@ impl<'a> Sweep<'a> {
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<GateOutcome, ControlError> {
-        let (raw, matrix) = {
-            let Some(node) = self.graphs.get(&run_id).and_then(|g| g.nodes.get(job_id)) else {
-                return Ok(GateOutcome::Acquired);
-            };
-            (node.concurrency.clone(), node.matrix.clone())
-        };
-        let Some(raw) = raw else {
-            return Ok(GateOutcome::Acquired);
-        };
-        let (github, submission) = {
-            let graph = self.graphs.get(&run_id).expect("loaded");
-            (graph.github.clone(), graph.submission.clone())
-        };
-        let message = self.message(run_id, job_id).await?;
-        let strategy = message
-            .as_ref()
-            .and_then(|m| m.context_data.get("strategy"))
-            .map(azdo::PipelineContextData::to_json)
-            .unwrap_or_else(|| serde_json::json!({}));
-        let eval_ctx = concurrency::ConcurrencyContext {
-            scope: concurrency::ConcurrencyScope::Job,
-            github: &github,
-            vars: &submission.vars,
-            inputs: &submission.inputs,
-            matrix: Some(&matrix),
-            strategy: Some(&strategy),
-            needs: None,
-        };
-        let (group, cancel, queue) = match concurrency::evaluate_concurrency(&raw, &eval_ctx) {
-            Ok(v) => v,
-            Err(e) => {
-                concurrency::log_eval_error("job concurrency", &e);
-                return Ok(GateOutcome::Failed);
-            }
-        };
-        if group.trim().is_empty() {
-            return Ok(GateOutcome::Failed);
-        }
-        let key = concurrency::concurrency_key(&submission.repository, &group);
-        let namespace = self
+        if !self
             .graphs
             .get(&run_id)
-            .map(|g| g.namespace.clone())
-            .unwrap_or_else(|| "default".to_owned());
-        acquire_gate(
+            .and_then(|graph| graph.nodes.get(job_id))
+            .is_some_and(|node| node.concurrency.is_some())
+        {
+            return Ok(GateOutcome::Acquired);
+        }
+        let message = self.message(run_id, job_id).await?;
+        let Some(graph) = self.graphs.get(&run_id) else {
+            return Ok(GateOutcome::Acquired);
+        };
+        let Some(node) = graph.nodes.get(job_id) else {
+            return Ok(GateOutcome::Acquired);
+        };
+        promote::acquire_job_gate(
             self.backend,
             self.tx,
-            &namespace,
-            &key,
-            &group,
-            &GateHolder {
-                holder: concurrency::Holder::Job {
-                    run_id,
-                    job_id: job_id.clone(),
-                },
-                jobset_id: None,
+            promote::GateScope {
+                namespace: &graph.namespace,
+                submission: &graph.submission,
+                github: &graph.github,
             },
-            cancel,
-            queue,
+            run_id,
+            job_id,
+            node,
+            message.as_ref(),
         )
         .await
     }
@@ -3973,7 +3868,7 @@ fn set_status_in(graph: Option<&mut RunGraph>, job_id: &JobId, status: Execution
 }
 
 impl SchedulingOutcome {
-    fn push(&mut self, status: ExecutionStatus, run_id: RunId, job_id: JobId) {
+    pub(super) fn push(&mut self, status: ExecutionStatus, run_id: RunId, job_id: JobId) {
         match status {
             ExecutionStatus::Skipped => self.skipped.push((run_id, job_id)),
             ExecutionStatus::Failure | ExecutionStatus::Cancelled => {
@@ -6661,9 +6556,10 @@ impl PgBackend {
         }
         // 5. Refresh the dependents' `remaining_needs` for everything that just
         // turned terminal. A dependent that is now `blocked` with zero needs left
-        // is what the promotion sweep below picks up. A parked leg names no
-        // sibling in `job_needs`, so the refresh never reports it: the settled
-        // leg's cohort is checked for a parked leg the freed slot can take.
+        // is what the promotion step below picks up. A parked leg names no
+        // sibling in `job_needs`, so the refresh never reports it: every settled
+        // job's cohort is handed on, and admission takes the parked legs its
+        // freed slot allows.
         for (settled, settled_base) in &settled_bases {
             outcome
                 .unblocked
@@ -6671,17 +6567,12 @@ impl PgBackend {
         }
         outcome.unblocked.sort();
         outcome.unblocked.dedup();
-        let mut cohorts: Vec<&str> = settled_bases
+        outcome.admit_cohorts = settled_bases
             .iter()
-            .map(|(_, cohort)| cohort.as_str())
+            .map(|(_, cohort)| cohort.clone())
             .collect();
-        cohorts.sort_unstable();
-        cohorts.dedup();
-        for cohort in cohorts {
-            if Sweep::cohort_has_admissible_leg(tx, run_id, cohort).await? {
-                outcome.admit_cohorts.push(cohort.to_owned());
-            }
-        }
+        outcome.admit_cohorts.sort_unstable();
+        outcome.admit_cohorts.dedup();
         // 6. Run status via the DB aggregate; the caller holds the run lock.
         summarize_run_tx(tx, run_id).await?;
         let (run_status, conclusion): (String, Option<String>) = {
@@ -6750,18 +6641,25 @@ impl PgBackend {
         Ok(outcome)
     }
 
-    /// Promote whatever the targeted settle unblocked. Nothing to do when the
-    /// completion left no dependent or parked cohort leg promotable.
+    /// Promote whatever the targeted settle unblocked: first the parked legs
+    /// of the settled cohorts a freed `max-parallel` slot can take (over their
+    /// own rows), then the dependents that became promotable.
     async fn promote_after_settle(
         &self,
         tx: &Transaction<'_>,
         run_id: RunId,
         outcome: &SettleCoreOutcome,
     ) -> Result<crate::runtime_scheduling::SchedulingOutcome, ControlError> {
-        if outcome.unblocked.is_empty() && outcome.admit_cohorts.is_empty() {
-            return Ok(crate::runtime_scheduling::SchedulingOutcome::default());
+        let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
+        let mut unblocked = outcome.unblocked.clone();
+        unblocked.extend(
+            promote::admit_cohorts(self, tx, run_id, &outcome.admit_cohorts, &mut scheduling)
+                .await?,
+        );
+        if !unblocked.is_empty() {
+            scheduling.merge(self.promote_unblocked(tx, run_id).await?);
         }
-        self.promote_unblocked(tx, run_id).await
+        Ok(scheduling)
     }
 
     /// The shared sweep over the run's graph, so needs hydration, gates,
