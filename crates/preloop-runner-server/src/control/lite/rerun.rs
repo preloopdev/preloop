@@ -9,7 +9,8 @@
 //! reset — `run_history`/`job_history` keyed by `(run_id, run_attempt)`
 //! reproduce GitHub's per-attempt views.
 //!
-//! The classification loop mirrors `submit_run_tx` step for step: workflow
+//! The classification loop mirrors `submit_run`'s chunked per-job loop step
+//! for step: workflow
 //! concurrency is re-acquired first, then each selected job re-runs the
 //! `if:`/platform/environment/concurrency/max-parallel admission chain and
 //! mints a fresh `job_requests` attempt whose message template carries the
@@ -359,7 +360,7 @@ fn rerun_run_tx(
     let _ = prev_group; // the stored group is informational; re-acquired above.
 
     // ── Per-job reset + classification ─────────────────────────────────
-    // Mirrors `submit_run_tx`'s per-job chain: `if:` (needs-less jobs only —
+    // Mirrors `submit_run`'s per-job chain: `if:` (needs-less jobs only —
     // needs-gated `if:`s re-evaluate in the promotion sweep), platform and
     // pool-label checks, environment gate, concurrency gate, max-parallel.
     let templates: BTreeMap<&str, &RerunJobTemplate> =

@@ -832,6 +832,16 @@ pub struct ConfigFile {
     /// `PRELOOP_SECRETS_STORE` overrides this key.
     #[serde(default)]
     pub secrets_store: Option<String>,
+    /// Maximum jobs one run may expand to (after matrix expansion), a
+    /// fail-fast DoS guard for the submit path: a run expanding past this
+    /// is rejected with 400 before the insert transaction opens, so no
+    /// giant transaction ever pins the writer. Default 500; `0` disables
+    /// the cap (the operator accepts unbounded submits). The insert itself
+    /// is chunked (see `SUBMIT_JOB_CHUNK_SIZE`), so even a raised cap never
+    /// holds one writer transaction for the whole insert.
+    /// Env: `PRELOOP_MAX_JOBS_PER_RUN` wins over this key.
+    #[serde(default = "default_max_jobs_per_run")]
+    pub max_jobs_per_run: u64,
 }
 
 impl Default for ConfigFile {
@@ -856,6 +866,11 @@ pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES
 pub const RETENTION_DAYS_ENV: &str = "PRELOOP_RETENTION_DAYS";
 /// Default run retention, in days, following GitHub's Actions retention setting.
 pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+/// Env override for the per-run job cap; see [`ConfigFile::max_jobs_per_run`].
+pub const MAX_JOBS_PER_RUN_ENV: &str = "PRELOOP_MAX_JOBS_PER_RUN";
+/// Default cap on jobs per run (after matrix expansion). Bounds the submit
+/// transaction so one giant workflow cannot pin the writer for minutes.
+pub const DEFAULT_MAX_JOBS_PER_RUN: u64 = 500;
 
 /// Env override for the in-place re-run window (see
 /// [`rerun_window_days`]): how long a completed run with failed jobs stays
@@ -886,6 +901,25 @@ pub fn rerun_window_days() -> anyhow::Result<u64> {
 
 fn default_retention_days() -> u64 {
     DEFAULT_RETENTION_DAYS
+}
+
+fn default_max_jobs_per_run() -> u64 {
+    DEFAULT_MAX_JOBS_PER_RUN
+}
+
+/// Resolve the effective per-run job cap: `PRELOOP_MAX_JOBS_PER_RUN` wins
+/// over the config file key. An unparseable value is an error — a typo must
+/// fail closed rather than silently run uncapped (or capped at zero).
+pub fn max_jobs_per_run(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(MAX_JOBS_PER_RUN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {MAX_JOBS_PER_RUN_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.max_jobs_per_run)
 }
 
 /// Resolve the effective run retention: `PRELOOP_RETENTION_DAYS` wins over
@@ -1074,6 +1108,61 @@ mod retention_config_tests {
     #[test]
     fn retention_days_default_impl_is_90() {
         assert_eq!(ConfigFile::default().retention_days, 90);
+    }
+}
+
+#[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
+mod max_jobs_per_run_config_tests {
+    use super::*;
+
+    /// Absent key keeps the default cap of 500. This test never touches the
+    /// process env; see `max_jobs_per_run_env_handling`.
+    #[test]
+    fn max_jobs_per_run_defaults_to_500() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.max_jobs_per_run, 500);
+        assert_eq!(config.max_jobs_per_run, DEFAULT_MAX_JOBS_PER_RUN);
+    }
+
+    #[test]
+    fn max_jobs_per_run_custom_value_honored() {
+        // Field-level only: the resolver's env handling lives in
+        // `max_jobs_per_run_env_handling`, the one test that mutates the var.
+        let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
+        assert_eq!(config.max_jobs_per_run, 1000);
+        // 0 is the documented escape hatch: the cap stays off.
+        let disabled: ConfigFile = toml::from_str("max_jobs_per_run = 0").unwrap();
+        assert_eq!(disabled.max_jobs_per_run, 0);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error rather than silently running uncapped; with the var
+    /// unset the file value is used. These cases live in one test so the
+    /// process-wide env var is never mutated by two tests at once.
+    #[test]
+    fn max_jobs_per_run_env_handling() {
+        let prior = std::env::var(MAX_JOBS_PER_RUN_ENV).ok();
+        let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
+        unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "250") };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 250);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "   ") };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "many") };
+        assert!(max_jobs_per_run(&config).is_err());
+        match prior {
+            Some(value) => unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, value) },
+            None => unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) },
+        }
+    }
+
+    /// A missing config file still gets the default cap.
+    #[test]
+    fn max_jobs_per_run_default_impl_is_500() {
+        assert_eq!(ConfigFile::default().max_jobs_per_run, 500);
     }
 }
 
@@ -1822,6 +1911,7 @@ mod tests {
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
+            max_jobs_per_run: DEFAULT_MAX_JOBS_PER_RUN,
             golden: GoldenConfig::default(),
         }
     }
