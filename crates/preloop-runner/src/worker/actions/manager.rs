@@ -12,8 +12,10 @@
 //! reintroduce the TOCTOU that SHA pinning removes.
 
 use anyhow::{Context, Result};
+use rand::Rng;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
 
 use crate::client::actions_download::ArchiveDigestPin;
 
@@ -72,6 +74,204 @@ fn header_archive_digest(headers: &reqwest::header::HeaderMap) -> Option<String>
         tracing::warn!("ignoring malformed {ACTION_ARCHIVE_SHA256_HEADER} response header");
         None
     }
+}
+
+/// Result of a single action-archive fetch attempt: either the archive
+/// bytes plus the engine's attested digest header, or a throttling signal
+/// carrying the raw `Retry-After` header value to convert into a backoff.
+enum ArchiveFetch {
+    Downloaded(bytes::Bytes, Option<String>),
+    Throttled(Option<String>),
+}
+
+/// Official `UrlUtil.GetRetryAfter` (v2.338.0, Runner.Sdk/Util/UrlUtil.cs):
+/// the first `retry-after` response header value, or `None` when absent.
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Official `BackoffTimerHelper.GetRandomBackoff`: a uniform random delay in
+/// `[min, max)` measured in whole milliseconds.
+fn random_backoff(min: Duration, max: Duration) -> Duration {
+    Duration::from_millis(
+        rand::thread_rng().gen_range(min.as_millis() as u64..max.as_millis() as u64),
+    )
+}
+
+/// Official `VssNetworkHelper.ConvertRetryAfterToTimeSpan` (v2.338.0): the
+/// `Retry-After` header may be delta-seconds or an HTTP-date. Dates in the
+/// past are ignored (`None` → the caller's random backoff). A delay below
+/// `min` yields a random backoff in `[min, min+30s)`; above `max`, a random
+/// backoff in `[max, max+30s)` — the same random band the official helper
+/// returns rather than a hard clamp. Unparseable values yield `None`.
+fn parse_http_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // `DateTime::parse_from_rfc2822` accepts the IMF-fixdate-compatible
+    // numeric-offset form already used by the existing tests. The HTTP
+    // parser in .NET also accepts the three HTTP-date wire forms below:
+    // IMF-fixdate, obsolete RFC 850, and asctime-date.
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(date.with_timezone(&chrono::Utc));
+    }
+    [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ]
+    .into_iter()
+    .find_map(|format| {
+        chrono::NaiveDateTime::parse_from_str(value, format)
+            .ok()
+            .map(|date| date.and_utc())
+    })
+}
+
+fn convert_retry_after_to_duration(
+    retry_after: Option<&str>,
+    min: Duration,
+    max: Duration,
+) -> Option<Duration> {
+    let retry_after = retry_after?.trim();
+    if retry_after.is_empty() {
+        return None;
+    }
+    let delay = if let Ok(seconds) = retry_after.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else if let Some(date) = parse_http_date(retry_after) {
+        // Absolute HTTP-date → delay relative to now. A date in the past is
+        // ignored, matching the official guard against clock skew.
+        date.signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .ok()?
+    } else {
+        return None;
+    };
+    if delay < min {
+        return Some(random_backoff(min, min + Duration::from_secs(30)));
+    }
+    if delay > max {
+        return Some(random_backoff(max, max + Duration::from_secs(30)));
+    }
+    Some(delay)
+}
+
+/// One authenticated-or-anonymous archive fetch: the former
+/// `download_action` request bodies. `Throttled` carries the raw
+/// `Retry-After` header so the caller's retry loop can convert it; every
+/// other non-success status fails exactly as before.
+async fn fetch_archive(
+    client: &crate::client::http::HttpClient,
+    url: &str,
+    auth_token: Option<&str>,
+) -> Result<ArchiveFetch> {
+    if let Some(token) = auth_token {
+        // Authenticated download (GitHub codeload or private actions)
+        let resp = client
+            .client_for(url)
+            .get(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "preloop-runner")
+            .send()
+            .await
+            .with_context(|| format!("downloading action tarball from {url}"))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(ArchiveFetch::Throttled(retry_after_header(resp.headers())));
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("Action download failed: {} {}", resp.status(), url);
+        }
+        let attested = header_archive_digest(resp.headers());
+        let bytes = resp.bytes().await?;
+        Ok(ArchiveFetch::Downloaded(bytes, attested))
+    } else {
+        let resp = client
+            .client_for(url)
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(ArchiveFetch::Throttled(retry_after_header(resp.headers())));
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("GET {url} returned {}", resp.status());
+        }
+        let attested = header_archive_digest(resp.headers());
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("reading body of GET {url}"))?;
+        Ok(ArchiveFetch::Downloaded(bytes, attested))
+    }
+}
+
+/// `std::env::var` with a test-only thread-local override — the convention
+/// from `main.rs` (`env_or_test`): edition 2024 makes `std::env::set_var`
+/// unsafe and the workspace denies `unsafe`, so tests redirect reads.
+fn env_or_test(name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
+        // Blank override reads as unset, matching the empty-value filters the
+        // production callers apply.
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run `body` with `vars` visible to `env_or_test` on this thread only.
+/// Replaces `std::env::set_var`; the override survives `await` points because
+/// `#[tokio::test]` drives the whole future on one thread.
+#[cfg(test)]
+async fn with_test_env<T>(
+    vars: &[(&'static str, Option<String>)],
+    body: impl Future<Output = T>,
+) -> T {
+    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
+    TEST_ENV.with(|cell| {
+        let mut map = cell.borrow_mut();
+        for (name, value) in vars {
+            match value {
+                Some(value) => {
+                    map.insert(*name, value.clone());
+                }
+                None => {
+                    map.insert(*name, String::new());
+                }
+            }
+        }
+    });
+    let result = body.await;
+    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
+    result
+}
+
+/// Official `_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF` kill-switch: any non-empty
+/// value disables the inter-attempt sleep (the retry still happens).
+fn action_download_backoff_disabled() -> bool {
+    env_or_test("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF").is_some_and(|value| !value.is_empty())
+}
+
+/// Backoff before a throttled retry: the server's `Retry-After` converted to
+/// [10s, 10min] when usable, otherwise the official 10–30s random backoff —
+/// prefer the Retry-After header.
+fn action_download_backoff(retry_after_value: Option<&str>) -> Duration {
+    convert_retry_after_to_duration(
+        retry_after_value,
+        Duration::from_secs(10),
+        Duration::from_secs(600),
+    )
+    .unwrap_or_else(|| random_backoff(Duration::from_secs(10), Duration::from_secs(30)))
 }
 
 /// Remove a cached action tree and its digest sidecar. Fails closed: if the
@@ -209,25 +409,39 @@ pub async fn download_action(
     info!("Downloading action {owner}/{repo}@{git_ref} from {url}");
 
     let client = crate::client::http::HttpClient::new(None)?;
-    let (bytes, attested_digest) = if let Some(token) = auth_token {
-        // Authenticated download (GitHub codeload or private actions)
-        let resp = client
-            .client_for(&url)
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("User-Agent", "preloop-runner")
-            .send()
-            .await
-            .with_context(|| format!("downloading action tarball from {url}"))?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Action download failed: {} {}", resp.status(), url);
+    // Official `ActionManager.DownloadRepositoryArchive` (v2.338.0): an
+    // action download retried on HTTP 429 at most twice, preferring the
+    // server's `Retry-After` header (converted to [10s, 10min]) over the
+    // 10–30s random backoff; `_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF` disables
+    // the sleep. Other failures keep this runner's existing fail-fast
+    // semantics — they are not retried.
+    let (bytes, attested_digest) = {
+        let mut throttled_attempts = 0;
+        loop {
+            match fetch_archive(&client, &url, auth_token).await? {
+                ArchiveFetch::Downloaded(bytes, attested) => break (bytes, attested),
+                ArchiveFetch::Throttled(retry_after_value) => {
+                    throttled_attempts += 1;
+                    if throttled_attempts > 2 {
+                        anyhow::bail!("Action download failed: 429 Too Many Requests {url}");
+                    }
+                    if action_download_backoff_disabled() {
+                        continue;
+                    }
+                    // We are being throttled, use the Retry-After header (if
+                    // provided) to decide backoff time; otherwise the random
+                    // backoff — prefer the Retry-After header.
+                    // Action preparation runs before `run_steps` creates the
+                    // synthetic setup-step log, and this manager also serves
+                    // on-demand nested actions. Neither caller supplies an
+                    // ExecutionContext/StepContext or reporting sink, so
+                    // tracing is the only reachable warning channel here.
+                    let back_off = action_download_backoff(retry_after_value.as_deref());
+                    warn!("Back off {} seconds before retry.", back_off.as_secs_f64());
+                    tokio::time::sleep(back_off).await;
+                }
+            }
         }
-        let attested = header_archive_digest(resp.headers());
-        let bytes = resp.bytes().await?;
-        (bytes, attested)
-    } else {
-        let (bytes, headers) = client.get_bytes_with_headers(&url).await?;
-        (bytes, header_archive_digest(&headers))
     };
 
     // Extract tarball, stripping top-level directory (standard GitHub tarball layout)
@@ -1645,6 +1859,335 @@ mod tests {
             super::header_archive_digest(&headers),
             Some("a".repeat(64)),
             "uppercase attestation is normalized, matching pin comparison"
+        );
+    }
+
+    /// Serve a tarball endpoint that answers 429 (optionally carrying
+    /// `Retry-After`) until `throttle_until` requests have arrived, then
+    /// serves `tar_bytes` with 200. Any other `status` is served on every
+    /// request. Returns the tarball URL and the request counter.
+    async fn serve_throttled_tarball(
+        tar_bytes: Vec<u8>,
+        throttle_until: usize,
+        retry_after: Option<String>,
+        status: axum::http::StatusCode,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{Router, http::HeaderMap, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        /// (request counter, tarball bytes, hit# after which 200 is served,
+        /// `Retry-After` value, failure status) for the throttled test server.
+        type ThrottleState = (
+            Arc<AtomicUsize>,
+            Vec<u8>,
+            usize,
+            Option<String>,
+            axum::http::StatusCode,
+        );
+        let state: ThrottleState = (hits.clone(), tar_bytes, throttle_until, retry_after, status);
+        let app = Router::new().route(
+            "/tarball",
+            get(
+                |axum::extract::State((hits, tar, throttle_until, retry_after, status)): axum::extract::State<
+                    ThrottleState,
+                >| async move {
+                    let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if status == axum::http::StatusCode::TOO_MANY_REQUESTS
+                        && hit >= throttle_until
+                    {
+                        return (axum::http::StatusCode::OK, HeaderMap::new(), tar);
+                    }
+                    let mut headers = HeaderMap::new();
+                    if let Some(value) = retry_after {
+                        headers.insert(
+                            "retry-after",
+                            value.parse().expect("valid header value"),
+                        );
+                    }
+                    (status, headers, tar)
+                },
+            )
+            .with_state(state),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/tarball"), hits)
+    }
+
+    /// `convert_retry_after_to_duration` mirrors
+    /// `VssNetworkHelper.ConvertRetryAfterToTimeSpan`: an in-range
+    /// delta-seconds or HTTP-date is used verbatim; out-of-range values get
+    /// the official random band ([min, min+30s) / [max, max+30s), not a hard
+    /// clamp); unparseable or past-dated values yield `None` → random backoff.
+    #[test]
+    fn convert_retry_after_to_duration_clamps_to_random_band() {
+        let min = Duration::from_secs(10);
+        let max = Duration::from_secs(600);
+
+        assert_eq!(
+            convert_retry_after_to_duration(Some("120"), min, max),
+            Some(Duration::from_secs(120)),
+            "in-range delta-seconds are used as-is"
+        );
+        let below = convert_retry_after_to_duration(Some("1"), min, max).unwrap();
+        assert!(
+            below >= min && below < min + Duration::from_secs(30),
+            "sub-min delay takes the official random band [10s, 40s), got {below:?}"
+        );
+        let above = convert_retry_after_to_duration(Some("3600"), min, max).unwrap();
+        assert!(
+            above >= max && above < max + Duration::from_secs(30),
+            "over-max delay takes the official random band [600s, 630s), got {above:?}"
+        );
+        for empty in [None, Some(""), Some("   "), Some("not-a-date")] {
+            assert_eq!(
+                convert_retry_after_to_duration(empty, min, max),
+                None,
+                "{empty:?} must fall back to the random backoff"
+            );
+        }
+    }
+
+    #[test]
+    fn convert_retry_after_to_duration_parses_http_date_forms() {
+        let min = Duration::from_secs(10);
+        let max = Duration::from_secs(600);
+
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let imf_fixdate = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let rfc850 = future.format("%A, %d-%b-%y %H:%M:%S GMT").to_string();
+        let asctime = future.format("%a %b %e %H:%M:%S %Y").to_string();
+        for (label, value) in [
+            ("IMF-fixdate", imf_fixdate.as_str()),
+            ("RFC 850", rfc850.as_str()),
+            ("asctime-date", asctime.as_str()),
+        ] {
+            let delay = convert_retry_after_to_duration(Some(value), min, max).unwrap();
+            assert!(
+                delay > Duration::from_secs(100) && delay <= Duration::from_secs(120),
+                "{label} converts to a delay relative to now, got {delay:?}"
+            );
+        }
+
+        // Keep accepting the numeric-offset form accepted by the previous
+        // parser as well.
+        let rfc2822 = future.to_rfc2822();
+        let delay = convert_retry_after_to_duration(Some(&rfc2822), min, max).unwrap();
+        assert!(
+            delay > Duration::from_secs(100) && delay <= Duration::from_secs(120),
+            "RFC 2822 form converts to a delay relative to now, got {delay:?}"
+        );
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        assert_eq!(
+            convert_retry_after_to_duration(Some(&past.to_rfc2822()), min, max),
+            None,
+            "a past HTTP-date is ignored → random backoff"
+        );
+    }
+
+    /// The throttled backoff prefers the server's Retry-After (converted to
+    /// [10s, 10min]) over the 10–30s random range; a missing or unusable
+    /// header falls back to the random backoff.
+    #[test]
+    fn action_download_backoff_prefers_retry_after_header() {
+        assert_eq!(
+            action_download_backoff(Some("45")),
+            Duration::from_secs(45),
+            "in-range Retry-After is used verbatim"
+        );
+        for missing in [None, Some("not-a-date")] {
+            let backoff = action_download_backoff(missing);
+            assert!(
+                backoff >= Duration::from_secs(10) && backoff < Duration::from_secs(30),
+                "{missing:?} must fall back to the 10–30s random backoff, got {backoff:?}"
+            );
+        }
+    }
+
+    /// 429 + Retry-After: the loop must retry the download. The kill-switch
+    /// skips the real sleep; backoff selection is covered by the
+    /// `action_download_backoff_*` / `convert_retry_after_to_duration_*`
+    /// unit tests above.
+    #[tokio::test]
+    async fn download_action_retries_429_with_retry_after_backoff() {
+        let tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
+        let (url, hits) = serve_throttled_tarball(
+            tar,
+            2,
+            Some("45".to_string()),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let temp = TempDir::new().unwrap();
+
+        let (res, _) = with_test_env(
+            &[("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF", Some("1".to_string()))],
+            download_action(
+                "owner",
+                "repo",
+                "0123456789abcdef0123456789abcdef01234567",
+                &temp.path().join("actions"),
+                Some(&url),
+                None,
+                ArchiveDigestPin::Unsupported,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(res.exists());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one throttled attempt, one successful retry"
+        );
+    }
+
+    /// 429 without Retry-After: the loop must still retry.
+    #[tokio::test]
+    async fn download_action_retries_429_without_retry_after() {
+        let tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
+        let (url, hits) =
+            serve_throttled_tarball(tar, 2, None, axum::http::StatusCode::TOO_MANY_REQUESTS).await;
+        let temp = TempDir::new().unwrap();
+
+        let (res, _) = with_test_env(
+            &[("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF", Some("1".to_string()))],
+            download_action(
+                "owner",
+                "repo",
+                "0123456789abcdef0123456789abcdef01234567",
+                &temp.path().join("actions"),
+                Some(&url),
+                None,
+                ArchiveDigestPin::Unsupported,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(res.exists());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// `_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF` disables the sleep but keeps
+    /// the retry: the retry still happens even with the switch set.
+    #[tokio::test]
+    async fn download_action_no_backoff_env_skips_sleep() {
+        let tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
+        let (url, hits) = serve_throttled_tarball(
+            tar,
+            2,
+            Some("45".to_string()),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let temp = TempDir::new().unwrap();
+
+        let (res, _) = with_test_env(
+            &[("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF", Some("1".to_string()))],
+            download_action(
+                "owner",
+                "repo",
+                "0123456789abcdef0123456789abcdef01234567",
+                &temp.path().join("actions"),
+                Some(&url),
+                None,
+                ArchiveDigestPin::Unsupported,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(res.exists());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the retry still happens; only the sleep is skipped"
+        );
+    }
+
+    /// 429 on every attempt: at most two retries, then the error surfaces.
+    #[tokio::test]
+    async fn download_action_gives_up_after_two_throttled_retries() {
+        let tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
+        let (url, hits) = serve_throttled_tarball(
+            tar,
+            usize::MAX,
+            Some("10".to_string()),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        let temp = TempDir::new().unwrap();
+
+        let result = with_test_env(
+            &[("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF", Some("1".to_string()))],
+            download_action(
+                "owner",
+                "repo",
+                "0123456789abcdef0123456789abcdef01234567",
+                &temp.path().join("actions"),
+                Some(&url),
+                None,
+                ArchiveDigestPin::Unsupported,
+            ),
+        )
+        .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("429"),
+            "exhausted throttled retries surface the status: {error}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "initial attempt plus two retries"
+        );
+    }
+
+    /// Non-429 failures keep the existing semantics: a single attempt, the
+    /// error propagates immediately, no backoff, no retry.
+    #[tokio::test]
+    async fn download_action_non_429_fails_fast_without_retry() {
+        let tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
+        let (url, hits) = serve_throttled_tarball(
+            tar,
+            usize::MAX,
+            None,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let temp = TempDir::new().unwrap();
+
+        let result = download_action(
+            "owner",
+            "repo",
+            "0123456789abcdef0123456789abcdef01234567",
+            &temp.path().join("actions"),
+            Some(&url),
+            None,
+            ArchiveDigestPin::Unsupported,
+        )
+        .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("GET") && error.contains("500"),
+            "non-429 errors keep the existing error surface: {error}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-429 responses are not retried"
         );
     }
 }
