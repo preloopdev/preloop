@@ -829,3 +829,55 @@ fn job_annotation_aggregation_is_feature_gated_and_preserves_fields() {
     disabled.add_step_annotations_to_job(std::slice::from_ref(&annotation));
     assert!(disabled.job_annotations.is_empty());
 }
+
+#[test]
+fn add_mask_then_base64_echo_is_masked() {
+    // Round-3 §9 regression: `::add-mask::<secret>` followed by echoing the
+    // secret base64-encoded must mask the encoded form, not just the raw
+    // value (one `base64 -d` by any log reader recovered it before).
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    ctx.add_mask("pentest-mask-9f3k2");
+    let b64 = base64::engine::general_purpose::STANDARD.encode("pentest-mask-9f3k2");
+    let b64_nopad = base64::engine::general_purpose::STANDARD_NO_PAD.encode("pentest-mask-9f3k2");
+    for form in [&b64, &b64_nopad] {
+        let masked = ctx.mask_secrets(&format!("b64={form}"));
+        assert!(
+            !masked.contains(form.as_str()),
+            "encoded secret leaked: {masked}"
+        );
+        assert_eq!(masked, "b64=***");
+    }
+    // Raw still masked.
+    assert_eq!(ctx.mask_secrets("raw=pentest-mask-9f3k2"), "raw=***");
+}
+
+#[test]
+fn mask_secrets_is_case_insensitive() {
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    ctx.add_mask("SeCrEt-VaLuE");
+    assert_eq!(ctx.mask_secrets("leak secret-value here"), "leak *** here");
+    assert_eq!(ctx.mask_secrets("leak SECRET-VALUE here"), "leak *** here");
+}
+
+#[test]
+fn mask_secrets_masks_hex_and_percent_forms() {
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    ctx.add_mask("a+b");
+    assert_eq!(ctx.mask_secrets("pct=a%2Bb"), "pct=***");
+    assert_eq!(ctx.mask_secrets("hex=612b62"), "hex=***");
+}

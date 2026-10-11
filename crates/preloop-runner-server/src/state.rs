@@ -1976,6 +1976,24 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
+    /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
+    /// trailing-overlap buffer so a secret split across two appends is
+    /// matched on the reassembled stream, never per-chunk. The per-key mutex
+    /// serializes appends of one log without holding the global state lock
+    /// during the masking scan. Flushed and removed when the job finishes;
+    /// dropping an entry (memory-pressure eviction) discards at most the
+    /// withheld tail from the lossy in-memory preview.
+    ///
+    /// The masker is built from the secret list resolved at the log's first
+    /// append and never reseeded: run secrets are immutable, and the only
+    /// alternative first-append resolution (the negative-cache union) is a
+    /// superset of the real list, so the masker can only over-mask, never
+    /// under-mask.
+    pub log_stream_maskers: BTreeMap<
+        String,
+        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
+    >,
     /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job

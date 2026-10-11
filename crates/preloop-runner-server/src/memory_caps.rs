@@ -246,6 +246,13 @@ pub fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<String> {
         let live: std::collections::HashSet<String> = inner.logs.keys().cloned().collect();
         inner.log_order.retain(|k| live.contains(k));
     }
+    // Drop streaming maskers for evicted logs: their withheld tails can no
+    // longer be flushed into the (evicted) preview. At most the bounded
+    // overlap tail is lost from the lossy preview; published segments keep
+    // whatever was already emitted.
+    for key in &evicted {
+        inner.log_stream_maskers.remove(key);
+    }
     evicted
 }
 

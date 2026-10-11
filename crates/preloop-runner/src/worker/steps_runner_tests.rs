@@ -1560,3 +1560,25 @@ async fn post_step_executes_for_node_action_with_post_entrypoint() {
         "expected Post steps in queue updates, got {post_updates}"
     );
 }
+
+#[test]
+fn proxy_setup_line_strips_userinfo() {
+    // Round-3 §9 regression: an authenticated egress proxy's credentials must
+    // never reach the setup log; the sanitized host stays for diagnostics.
+    let line = proxy_setup_line(
+        "2026-10-10T00:00:00Z",
+        "HTTP",
+        "http://proxyuser:s3cret@proxy.example:8080",
+    );
+    assert!(
+        !line.contains("proxyuser") && !line.contains("s3cret"),
+        "credentials leaked: {line}"
+    );
+    assert_eq!(
+        line,
+        "2026-10-10T00:00:00Z Runner is running behind proxy server 'http://proxy.example:8080' for all HTTP requests."
+    );
+    // No userinfo: unchanged.
+    let plain = proxy_setup_line("ts", "HTTPS", "https://proxy.example:8443");
+    assert!(plain.contains("https://proxy.example:8443"), "{plain}");
+}

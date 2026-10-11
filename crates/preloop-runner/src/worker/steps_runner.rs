@@ -149,6 +149,16 @@ fn is_synthetic_step(step: &Step, declared_step_ids: &std::collections::HashSet<
     !declared_step_ids.contains(&step.id)
 }
 
+/// Render the "running behind proxy server" setup log line.
+///
+/// Any userinfo is stripped before the URL reaches the log: an authenticated
+/// egress proxy's credentials must never be visible to log readers
+/// (round-3 §9). Pure for testing; the caller reads the environment.
+fn proxy_setup_line(ts: &str, scheme: &str, proxy: &str) -> String {
+    let shown = preloop_gha_protocol::masking::strip_url_userinfo(proxy);
+    format!("{ts} Runner is running behind proxy server '{shown}' for all {scheme} requests.")
+}
+
 /// Run all steps sequentially, returning the job conclusion.
 ///
 /// Watches `cancel_rx` — when it becomes `true`, the current step is abandoned
@@ -248,14 +258,15 @@ pub async fn run_steps(
         setup_lines.push(format!("{ts} Secret source: Actions"));
         // The official runner records configured HTTP proxies in the setup
         // step. Reqwest reads these same environment variables for transport.
+        // Never log userinfo: an authenticated egress proxy's credentials
+        // would otherwise leak to every log reader (round-3 §9). The
+        // sanitized host is still useful for diagnosing proxy issues.
         for (scheme, names) in [
             ("HTTP", ["HTTP_PROXY", "http_proxy"]),
             ("HTTPS", ["HTTPS_PROXY", "https_proxy"]),
         ] {
             if let Some(proxy) = names.iter().find_map(|name| std::env::var(name).ok()) {
-                setup_lines.push(format!(
-                    "{ts} Runner is running behind proxy server '{proxy}' for all {scheme} requests."
-                ));
+                setup_lines.push(proxy_setup_line(&ts, scheme, &proxy));
             }
         }
         setup_lines.push(format!("{ts} Prepare workflow directory"));

@@ -3969,3 +3969,79 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
         "an un-narrowed mint leaves the declared wire permissions intact"
     );
 }
+
+/// Round-3 §9: the server runs a final transform-aware masking pass over log
+/// bytes BEFORE persisting them. A step-log upload whose bytes were never
+/// masked by the runner (runner bug, or a direct bearerless PUT to the signed
+/// URL) must still land on disk with the secret — raw and base64-encoded —
+/// redacted.
+#[tokio::test]
+async fn replay_step_log_upload_is_masked_before_persist() {
+    use base64::engine::Engine as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"MASK_ME": "pentest-mask-9f3k2"}
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+
+    // Bytes as a masking-buggy runner (or a direct PUT) would send them:
+    // the secret raw and base64-encoded, unredacted.
+    let secret = "pentest-mask-9f3k2";
+    let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+    let body = format!("raw={secret} b64={b64}\n");
+
+    let path = format!("/replay/results/{run_id}/job-1/step-abc.txt");
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sig = sign_replay_upload_ticket(&state, &path, expires_at);
+    let uri = format!("{path}?se={expires_at}&sig={sig}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let stored = tokio::fs::read(
+        temp.path()
+            .join("replay")
+            .join("results")
+            .join(run_id)
+            .join("job-1")
+            .join("step-abc.txt"),
+    )
+    .await
+    .expect("uploaded step log must be persisted");
+    let stored = String::from_utf8(stored).unwrap();
+    assert!(
+        !stored.contains(secret),
+        "raw secret persisted unmasked: {stored}"
+    );
+    assert!(
+        !stored.contains(&b64),
+        "base64 secret persisted unmasked: {stored}"
+    );
+    assert_eq!(stored, "raw=*** b64=***\n");
+}

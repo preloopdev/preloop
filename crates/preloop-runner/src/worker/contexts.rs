@@ -279,23 +279,7 @@ impl JobContext {
         added
     }
 
-    /// Mask using only newly-added values. Existing durable output already
-    /// contains the replacements for the older mask set, so this keeps a
-    /// retroactive add-mask pass proportional to the new command.
-    pub fn mask_secrets_with(&self, input: &str, secrets: &[String]) -> String {
-        let exclude: &[&str] = if self.dap_debugger.is_some() {
-            preloop_dap::DAP_PROTOCOL_KEYWORDS
-        } else {
-            &[]
-        };
-        preloop_gha_protocol::masking::mask_secrets(
-            input,
-            secrets.iter().map(String::as_str),
-            exclude,
-        )
-    }
-
-    /// Like [`Self::mask_secrets_with`], but a secret spanning N lines is
+    /// Like [`Self::mask_secrets`], but a secret spanning N lines is
     /// replaced with one `***` per line instead of a single marker, so the
     /// physical record count of the output is unchanged.
     ///
@@ -308,7 +292,7 @@ impl JobContext {
         } else {
             &[]
         };
-        preloop_gha_protocol::masking::mask_secrets_preserving_lines(
+        preloop_gha_protocol::masking::mask_secrets_preserving_lines_transform_aware(
             input,
             secrets.iter().map(String::as_str),
             exclude,
@@ -316,13 +300,18 @@ impl JobContext {
     }
 
     /// Mask secret values in a string (longest secrets first to prevent partial matches).
+    ///
+    /// Transform-aware: every secret is also matched by its encoded variants
+    /// (base64 standard/URL-safe, percent-encoding, hex) with ASCII
+    /// case-insensitive comparison, so `::add-mask::` secrets cannot leak
+    /// through trivial encodings.
     pub fn mask_secrets(&self, input: &str) -> String {
         let exclude: &[&str] = if self.dap_debugger.is_some() {
             preloop_dap::DAP_PROTOCOL_KEYWORDS
         } else {
             &[]
         };
-        preloop_gha_protocol::masking::mask_secrets(
+        preloop_gha_protocol::masking::mask_secrets_transform_aware(
             input,
             self.masks.iter().map(String::as_str),
             exclude,
