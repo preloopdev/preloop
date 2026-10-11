@@ -1736,7 +1736,13 @@ mod tests {
     async fn runner_settings_returns_default_wire_shape() {
         let Json(settings) = runner_settings().await;
         let wire = serde_json::to_value(settings).unwrap();
-        assert_eq!(wire, json!({"isHostedServer": false}));
+        assert_eq!(
+            wire,
+            json!({
+                "isHostedServer": false,
+                "agentDownloadUrls": {}
+            })
+        );
     }
 
     #[tokio::test]
@@ -1753,6 +1759,7 @@ mod tests {
         for path in [
             "/_apis/v1/settings/runner",
             "/acme/_apis/v1/settings/runner",
+            "/runner/server/_apis/v1/settings/runner",
         ] {
             let response = app
                 .clone()
@@ -1770,7 +1777,7 @@ mod tests {
                 serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                     .unwrap();
             assert_eq!(wire["isHostedServer"], false, "path={path}");
-            assert!(wire.get("agentDownloadUrls").is_none(), "path={path}");
+            assert_eq!(wire["agentDownloadUrls"], json!({}), "path={path}");
         }
     }
 
