@@ -1562,13 +1562,13 @@ impl PgBackend {
                 .map_err(db)?
                 .is_some();
             if !exists {
-                // Reuse the enqueue pairing logic against a minimal graph.
-                let mut sweep_graph = match PgBackend::load_graph(self, &tx, run_id).await? {
-                    Some(graph) => graph,
-                    None => continue,
+                // Pair from the job's own row; no whole-run graph.
+                let Some(target) =
+                    super::dispatch::EnqueueTarget::load(&tx, run_id, &job_id).await?
+                else {
+                    continue;
                 };
-                super::dispatch::on_job_enqueued(self, &tx, &sweep_graph, &job_id).await?;
-                let _ = &mut sweep_graph;
+                super::dispatch::on_job_enqueued(self, &tx, &target).await?;
             }
         }
         tx.commit().await.map_err(db)

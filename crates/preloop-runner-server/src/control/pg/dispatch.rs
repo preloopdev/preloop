@@ -2093,8 +2093,73 @@ async fn resume_held_node(
         },
     )
     .await?;
-    on_job_enqueued(backend, tx, graph, job_id).await?;
+    if let Some(target) = EnqueueTarget::of_node(graph, job_id) {
+        on_job_enqueued(backend, tx, &target).await?;
+    }
     Ok(())
+}
+
+/// What `on_job_enqueued` reads of a job it pairs with a runner: its
+/// namespace and the placement fields the runner match and the provision
+/// request carry. Built from the job's own row ([`EnqueueTarget::load`]) or,
+/// where the placement was just hydrated and not flushed yet, from the node
+/// in hand ([`EnqueueTarget::of_node`]).
+pub(super) struct EnqueueTarget {
+    pub(super) run_id: RunId,
+    pub(super) job_id: JobId,
+    pub(super) namespace: String,
+    pub(super) pool_key: String,
+    pub(super) runs_on: Vec<String>,
+    pub(super) runner_group: Option<String>,
+}
+
+impl EnqueueTarget {
+    /// The target of a node of a loaded graph (its unflushed placement
+    /// included).
+    pub(super) fn of_node(graph: &RunGraph, job_id: &JobId) -> Option<Self> {
+        let node = graph.nodes.get(job_id)?;
+        Some(Self {
+            run_id: graph.record.run_id,
+            job_id: job_id.clone(),
+            namespace: graph.namespace.clone(),
+            pool_key: node.pool_key.clone(),
+            runs_on: node.runs_on.clone(),
+            runner_group: node.runner_group.clone(),
+        })
+    }
+
+    /// The target of a job read from its row and its run's namespace: one
+    /// statement, no graph.
+    pub(super) async fn load(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<Self>, ControlError> {
+        let Some(row) = tx
+            .query_opt(
+                "SELECT r.namespace_id, j.pool_key, j.runs_on::text, j.runner_group \
+                 FROM jobs j JOIN runs r ON r.run_id = j.run_id \
+                 WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            run_id,
+            job_id: job_id.clone(),
+            namespace: row.get(0),
+            pool_key: row.get(1),
+            runs_on: row
+                .get::<_, Option<String>>(2)
+                .map(|text| codec::from_json(&text))
+                .transpose()?
+                .unwrap_or_default(),
+            runner_group: row.get(3),
+        }))
+    }
 }
 
 /// `on_job_enqueued` parity: pair the job with an idle registered runner
@@ -2102,14 +2167,14 @@ async fn resume_held_node(
 pub(super) async fn on_job_enqueued(
     backend: &PgBackend,
     tx: &Transaction<'_>,
-    graph: &RunGraph,
-    job_id: &JobId,
+    target: &EnqueueTarget,
 ) -> Result<(), ControlError> {
     let (pool_assignments, require_assignments, _liveness) = backend.config();
     if !pool_assignments && !require_assignments {
         return Ok(());
     }
-    let run_id = graph.record.run_id.0.to_string();
+    let run_id = target.run_id.0.to_string();
+    let job_id = &target.job_id;
     let exists = tx
         .query_opt(
             "SELECT 1 FROM job_assignments WHERE run_id=$1::text::uuid AND job_id=$2",
@@ -2127,10 +2192,6 @@ pub(super) async fn on_job_enqueued(
     )
     .await
     .map_err(db)?;
-    let node = match graph.nodes.get(job_id) {
-        Some(node) => node.clone(),
-        None => return Ok(()),
-    };
     // Busy runners: assigned or holding a live request.
     let busy_rows = tx
         .query(
@@ -2158,7 +2219,7 @@ pub(super) async fn on_job_enqueued(
                       $2::text AS pool_key) j)",
                 crate::control::types::NAMESPACE_ADMITS_CLAIM
             ),
-            &[&graph.namespace, &node.pool_key],
+            &[&target.namespace, &target.pool_key],
         )
         .await
         .map_err(db)?;
@@ -2189,8 +2250,8 @@ pub(super) async fn on_job_enqueued(
         };
         // Capability match uses the two shared predicates directly: a
         // `QueuedJob` needs a full message, which dispatch pairing never reads.
-        if sched_helpers::job_matches_runner(&node.runs_on, &caps.labels)
-            && sched_helpers::job_matches_runner_group(node.runner_group.as_deref(), &caps)
+        if sched_helpers::job_matches_runner(&target.runs_on, &caps.labels)
+            && sched_helpers::job_matches_runner_group(target.runner_group.as_deref(), &caps)
         {
             tx.execute(
                 "INSERT INTO job_assignments (run_id, job_id, runner_id) \
@@ -2209,9 +2270,9 @@ pub(super) async fn on_job_enqueued(
             &[
                 &run_id,
                 &job_id.0,
-                &graph.namespace,
-                &node.pool_key,
-                &serde_json::to_string(&node.runs_on).unwrap_or_else(|_| "[]".into()),
+                &target.namespace,
+                &target.pool_key,
+                &serde_json::to_string(&target.runs_on).unwrap_or_else(|_| "[]".into()),
             ],
         )
         .await
@@ -3141,7 +3202,10 @@ impl<'a> Sweep<'a> {
         )
         .await?;
         let graph = self.graphs.get(&run_id).expect("loaded");
-        on_job_enqueued(self.backend, self.tx, graph, job_id).await
+        let Some(target) = EnqueueTarget::of_node(graph, job_id) else {
+            return Ok(());
+        };
+        on_job_enqueued(self.backend, self.tx, &target).await
     }
 
     /// Park a promotable node behind concurrency (`held` state).
