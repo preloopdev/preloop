@@ -94,6 +94,48 @@ pub fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
     claims.get("job").and_then(|v| v.as_str())
 }
 
+/// Decode a blob JWT's claims verifying the signature but NOT the expiry.
+///
+/// For the upload-URL refresh path: the presented token is expected to be
+/// expired (that is why the caller is refreshing), but it must still be a
+/// server-minted blob JWT — signature, `sub`, and `kind` are all verified.
+/// The returned claims are an identifier for a pending upload session, not
+/// an authorization grant: refresh callers re-verify pending membership,
+/// job ownership, and liveness independently.
+pub fn decode_blob_token_claims_unchecked_exp(
+    state: &AppState,
+    kind: &str,
+    token: &str,
+) -> Option<serde_json::Value> {
+    let claims = state.verify_local_jwt_claims_unchecked_exp(token)?;
+    if claims.get("sub").and_then(|v| v.as_str()) != Some("preloop-blob") {
+        return None;
+    }
+    if claims.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+        return None;
+    }
+    Some(claims)
+}
+
+/// Mint a fresh upload (write-op) blob JWT for a pending upload session.
+///
+/// Uses the exact claims shape and TTL the create endpoints mint with
+/// (`blob_jwt_claims` + `SIGNED_BLOB_URL_TTL`), so a refreshed URL carries
+/// the same 20-minute bound, write-only op, and job binding as the
+/// original. The `jti` names the existing on-disk staging directory —
+/// refresh never creates a new session, it only re-credentials the live one.
+pub fn mint_upload_blob_token(
+    state: &AppState,
+    kind: &str,
+    job_owner: &str,
+    jti: &str,
+) -> Result<String, ApiError> {
+    state.local_jwt_with_lifetime(
+        blob_jwt_claims(kind, BLOB_OP_WRITE, job_owner, jti),
+        crate::memory_caps::SIGNED_BLOB_URL_TTL,
+    )
+}
+
 /// The exact operation a blob JWT authorizes: `"write"` for upload URLs
 /// (PUT), `"read"` for download URLs (GET). Serve-time enforcement binds the
 /// HTTP method to this claim — cross-operation use is 403 (round-3

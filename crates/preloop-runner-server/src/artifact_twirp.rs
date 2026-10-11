@@ -247,14 +247,11 @@ pub async fn twirp_artifact_v2_create(
     // The upload token is bound to `write` and to the minting job (the
     // `system` owner for control-plane-minted URLs, never empty); serve-time
     // enforcement rejects any GET against it (round-3 finding 3).
-    let token = shared.state.local_jwt_with_lifetime(
-        crate::blob_store::blob_jwt_claims(
-            "artifact",
-            crate::blob_store::BLOB_OP_WRITE,
-            &crate::blob_store::blob_owner_for_job(job_backend_id),
-            &jti,
-        ),
-        crate::memory_caps::SIGNED_BLOB_URL_TTL,
+    let token = crate::blob_store::mint_upload_blob_token(
+        &shared.state,
+        "artifact",
+        &crate::blob_store::blob_owner_for_job(job_backend_id),
+        &jti,
     )?;
     let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
     info!(

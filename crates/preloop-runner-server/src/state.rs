@@ -56,6 +56,26 @@ impl AppState {
     }
 
     pub fn verify_local_jwt_claims(&self, token: &str) -> Option<serde_json::Value> {
+        self.verify_local_jwt_claims_inner(token, true)
+    }
+
+    /// Verify a local JWT's signature and decode its claims WITHOUT checking
+    /// expiry.
+    ///
+    /// For the upload-URL refresh path: the presented token is expected to be
+    /// expired (that is why the caller is refreshing), but it must still be
+    /// server-minted. Callers must NOT treat the returned claims as an
+    /// authorization grant — only as an identifier for a pending upload
+    /// session whose ownership and liveness they re-verify independently.
+    pub fn verify_local_jwt_claims_unchecked_exp(&self, token: &str) -> Option<serde_json::Value> {
+        self.verify_local_jwt_claims_inner(token, false)
+    }
+
+    fn verify_local_jwt_claims_inner(
+        &self,
+        token: &str,
+        check_exp: bool,
+    ) -> Option<serde_json::Value> {
         let parts: Vec<&str> = token.splitn(3, '.').collect();
         if parts.len() != 3 {
             return None;
@@ -67,11 +87,13 @@ impl AppState {
         }
         let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
         let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-        let exp = payload.get("exp").and_then(|value| value.as_u64())?;
-        let nbf = payload.get("nbf").and_then(|value| value.as_u64());
-        if exp <= now || nbf.is_some_and(|value| value > now + 30) {
-            return None;
+        if check_exp {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            let exp = payload.get("exp").and_then(|value| value.as_u64())?;
+            let nbf = payload.get("nbf").and_then(|value| value.as_u64());
+            if exp <= now || nbf.is_some_and(|value| value > now + 30) {
+                return None;
+            }
         }
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key).ok()?;
         mac.update(format!("{}.{}", parts[0], parts[1]).as_bytes());

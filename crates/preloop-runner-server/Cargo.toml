@@ -136,6 +136,11 @@ path = "tests/blob_url_binding.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "blob_refresh"
+path = "tests/blob_refresh.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "execution_protection_api"
 path = "tests/execution_protection_api.rs"
 required-features = ["test-support"]
