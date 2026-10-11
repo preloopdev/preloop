@@ -93,6 +93,47 @@ pub async fn sample_loop(url: String, metrics: Arc<Metrics>, deadline: Instant) 
     }
 }
 
+/// A terminal run that still has a failed job and can be re-run in place.
+#[derive(Debug, Clone)]
+pub struct RerunCandidate {
+    pub run_id: String,
+    pub failed_job_id: String,
+}
+
+/// Read a bounded candidate set for the open-loop rerun driver. The query is
+/// intentionally read-only and leaves selection/integrity authority to the
+/// control-plane endpoint.
+pub async fn rerun_candidates(url: &str, limit: i64) -> Vec<RerunCandidate> {
+    let Ok((client, conn)) = tokio_postgres::connect(url, tokio_postgres::NoTls).await else {
+        return Vec::new();
+    };
+    tokio::spawn(conn);
+    let Ok(rows) = client
+        .query(
+            "SELECT r.run_id::text, j.job_id
+             FROM control.runs r
+             JOIN LATERAL (
+                 SELECT job_id FROM control.jobs
+                 WHERE run_id = r.run_id AND status IN ('failure','cancelled','timed_out')
+                 ORDER BY job_order LIMIT 1
+             ) j ON true
+             WHERE r.status = 'completed' AND r.run_attempt = 1
+             ORDER BY r.completed_at, r.run_id
+             LIMIT $1",
+            &[&limit],
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .map(|row| RerunCandidate {
+            run_id: row.get(0),
+            failed_job_id: row.get(1),
+        })
+        .collect()
+}
+
 /// Top statements by total time, when `pg_stat_statements` is loaded.
 pub async fn top_statements(url: &str) -> serde_json::Value {
     let Ok((client, conn)) = tokio_postgres::connect(url, tokio_postgres::NoTls).await else {

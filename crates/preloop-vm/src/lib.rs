@@ -371,6 +371,21 @@ pub trait VmProvider: Send + Sync {
         let _ = name;
         Ok(false)
     }
+    /// Remove `pack/` intermediates left by a `create` that failed before the
+    /// machine registered.
+    ///
+    /// A `machine create --from` that dies mid-extraction (the ENOSPC path a
+    /// full host produces) leaves its data dir — and the multi-GB `pack/`
+    /// inside it — owned by no registry row. `machine data-dir` cannot resolve
+    /// it, `delete` is a no-op on it, and the orphan sweep waits out a grace
+    /// window before claiming it, so retries stack the residue. Unlike
+    /// [`VmProvider::prune_pack_intermediates`], this path must not require a
+    /// finished `storage.raw`: the disk is exactly what a failed unpack never
+    /// wrote. Returns how many pack trees were removed. Providers without
+    /// host-visible data dirs keep the default no-op.
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        Ok(0)
+    }
     /// Remove machine data directories the provider's registry no longer
     /// knows about.
     ///
@@ -474,6 +489,9 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     }
     async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
         (**self).sweep_orphaned_data_dirs().await
+    }
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        (**self).prune_failed_unpack_residue().await
     }
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
         (**self).exec(name, argv).await
@@ -983,6 +1001,14 @@ fn prune_pack_dir(data_dir: &Path) -> Result<bool, VmError> {
     if !data_dir.join("storage.raw").is_file() {
         return Ok(false);
     }
+    prune_pack_dir_in(data_dir)
+}
+
+/// [`prune_pack_dir`] without the `storage.raw` requirement: a `create` that
+/// failed mid-extraction never wrote the disk, and that residue is exactly
+/// what [`VmProvider::prune_failed_unpack_residue`] exists to reclaim. The
+/// same real-directory, strictly-inside checks still apply.
+fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
     let pack = data_dir.join("pack");
     // Refuse symlinks outright: the removal must never follow a link.
     if std::fs::symlink_metadata(&pack)
@@ -1012,6 +1038,84 @@ fn prune_pack_dir(data_dir: &Path) -> Result<bool, VmError> {
         "removed pack/ build intermediates beside finished disk"
     );
     Ok(true)
+}
+
+/// Remove `pack/` intermediates inside machine data dirs no registry row
+/// owns — the residue a `machine create --from` leaves when it dies before
+/// registration.
+///
+/// Caller holds the lifecycle write lock, so no `create` can be mid-flight
+/// while this scans: `create` holds the write side for its whole run, which
+/// also means a young unregistered dir found here belongs to an already-dead
+/// create, not one in progress (the orphan sweep's grace window exists for
+/// the lock-free fork case; this runs after a returned failure). No `age`
+/// check, no `storage.raw` check — the disk is what the failed unpack never
+/// wrote — and only real directories under a canonicalized root match: a
+/// hex-named symlink could point anywhere, `known_dirs` are compared by
+/// canonical path, and [`prune_pack_dir_in`] still refuses symlink `pack/`
+/// entries.
+/// Returns how many pack trees were removed.
+fn prune_unregistered_pack_dirs(
+    roots: &[PathBuf],
+    known_dirs: &std::collections::BTreeSet<PathBuf>,
+) -> Result<usize, VmError> {
+    let mut pruned = 0usize;
+    // `data-dir` answers with whatever path SmolVM resolved, which need not
+    // byte-match a scanned root (`/tmp` vs `/private/tmp` on macOS): compare
+    // on canonical spellings so a registered dir never reads as residue.
+    let known: std::collections::BTreeSet<PathBuf> = known_dirs
+        .iter()
+        .map(|dir| dir.canonicalize().unwrap_or_else(|_| dir.clone()))
+        .collect();
+    for root in roots {
+        let Ok(root_canonical) = root.canonicalize() else {
+            warn!(root = %root.display(), "pack-residue scan root does not resolve");
+            continue;
+        };
+        let entries = match std::fs::read_dir(&root_canonical) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    root = %root_canonical.display(),
+                    %error,
+                    "pack-residue scan could not read this root; residue there survives"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                warn!("pack-residue scan skipped an unreadable directory entry");
+                continue;
+            };
+            let path = entry.path();
+            // A symlinked machine dir could point outside the root: only real
+            // directories are machine data dirs.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !is_machine_data_dir_name(&entry.file_name()) || !meta.is_dir() {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(&root_canonical) || known.contains(&canonical) {
+                continue;
+            }
+            match prune_pack_dir_in(&canonical) {
+                Ok(true) => pruned += 1,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    machine_dir = %canonical.display(),
+                    %error,
+                    "failed to prune pack/ intermediates from unregistered machine dir"
+                ),
+            }
+        }
+    }
+    Ok(pruned)
 }
 
 #[async_trait]
@@ -1238,6 +1342,33 @@ impl VmProvider for SmolVmProvider {
         tokio::task::spawn_blocking(move || prune_pack_dir(&data_dir))
             .await
             .map_err(|error| VmError::Protocol(format!("pack prune task failed: {error}")))?
+    }
+
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        // The write side, not the read side: this runs after a `create`
+        // returned an error, and the lock guarantees no *other* create is
+        // mid-extraction while the scan decides which unregistered dirs hold
+        // its `pack/` residue. `machine data-dir` cannot resolve an
+        // unregistered machine, so the name's dir is found by exclusion:
+        // every 16-hex machine dir the registry does not own.
+        let _lifecycle = self.lifecycle_lock.write().await;
+        let registered = self.list().await?;
+        let mut known_dirs = std::collections::BTreeSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for name in &registered {
+            let dir = self.machine_data_dir_direct(name).await?;
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+            known_dirs.insert(dir);
+        }
+        if let Some(root) = machine_data_root() {
+            roots.insert(root);
+        }
+        let roots: Vec<PathBuf> = roots.into_iter().collect();
+        tokio::task::spawn_blocking(move || prune_unregistered_pack_dirs(&roots, &known_dirs))
+            .await
+            .map_err(|error| VmError::Protocol(format!("failed-unpack prune failed: {error}")))?
     }
 
     async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
@@ -1932,18 +2063,24 @@ fn effective_preloop_home() -> Option<PathBuf> {
 }
 
 /// Directory SmolVM keeps per-machine data dirs under for the active registry
-/// configuration: `$SMOLVM_DATA_DIR/vms`, else the isolated Preloop home's
-/// platform cache layout. This is where golden and job-VM disks land, so it is
-/// the filesystem disk-space checks must measure.
+/// configuration. On macOS SmolVM derives it from `HOME`
+/// (`<isolated smolvm-home>/Library/Caches/smolvm/vms`) and ignores
+/// `SMOLVM_DATA_DIR` — see `smolvm_runtime_env`, which is why the isolated home
+/// is pushed unconditionally on that platform. Everywhere else
+/// `$SMOLVM_DATA_DIR/vms` wins over the isolated home's `smolvm/vms`.
+/// This is where golden and job-VM disks land, so it is the filesystem
+/// disk-space checks must measure.
+#[cfg(target_os = "macos")]
+pub fn machine_data_root() -> Option<PathBuf> {
+    Some(effective_preloop_home()?.join("smolvm-home/Library/Caches/smolvm/vms"))
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn machine_data_root() -> Option<PathBuf> {
     if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
         return Some(data_dir.join("vms"));
     }
-    let home = effective_preloop_home()?;
-    #[cfg(target_os = "macos")]
-    return Some(home.join("smolvm-home/Library/Caches/smolvm/vms"));
-    #[cfg(not(target_os = "macos"))]
-    return Some(home.join("smolvm/vms"));
+    effective_preloop_home().map(|home| home.join("smolvm/vms"))
 }
 
 /// Bytes available to an unprivileged writer on the filesystem holding
@@ -2043,39 +2180,224 @@ enum MachineDataState {
     Unknown,
 }
 
-/// Classify a `ps` line by the machine state its argv names.
+/// The [`machine_data_root`] in both the configured and the canonical form.
+///
+/// Everything that identifies this home's machines — `_boot-vm` argv, the
+/// mount table — is matched against a *complete path prefix* of one of these
+/// roots, never as a substring: `/tmp` and `/private/tmp` name the same
+/// directory on macOS, an argv carries whichever the caller passed, and
+/// `mount` prints the canonical one, while a neighboring home whose name
+/// merely shares a prefix (`/homes/smolvm` vs `/homes/smolvm-vm-other`) must
+/// never be claimed as ours.
+fn machine_data_roots() -> Vec<PathBuf> {
+    let Some(root) = machine_data_root() else {
+        return Vec::new();
+    };
+    let mut roots = vec![root.clone()];
+    if let Ok(canonical) = root.canonicalize()
+        && canonical != root
+    {
+        roots.push(canonical);
+    }
+    roots
+}
+
+/// Machine data directory one token's argv names, when it names the boot
+/// config of a machine under one of `roots`.
 ///
 /// The boot config is handed to `_boot-vm` as a path, either bare or behind a
-/// flag (`--boot-config=<path>`), so the path starts at the data-root marker
-/// inside whichever token carries it. The marker may be the shorter `smolvm`
-/// prefix of the macOS `smolvm-home` root, so the earliest occurrence bounds
-/// the path. Only a token that names `boot-config.json` decides anything; an
-/// argv shape this cannot parse yields [`MachineDataState::Unknown`].
-fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
-    let mut state = MachineDataState::Unknown;
-    for token in line.split_whitespace() {
-        let Some(start) = markers
-            .iter()
-            .filter_map(|marker| token.find(marker.as_str()))
-            .min()
-        else {
-            continue;
-        };
-        let path = token[start..].trim_matches(['"', '\'']);
-        // The boot config itself is gone once the machine booted, so the
-        // directory is what proves the machine exists.
-        if !path.starts_with('/') || !path.ends_with(BOOT_CONFIG_FILE) {
-            continue;
-        }
-        let Some(dir) = Path::new(path).parent() else {
-            continue;
-        };
-        if dir.exists() {
-            return MachineDataState::Present;
-        }
-        state = MachineDataState::Removed;
+/// flag (`--boot-config=<path>`), optionally quoted. Only a token whose path
+/// is a `boot-config.json` beneath this home's data root decides anything — a
+/// path under any other home (even one whose name this root is a string
+/// prefix of) is not ours to reap.
+fn token_boot_config_dir(token: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = vec![token];
+    if let Some((_, value)) = token.split_once('=') {
+        candidates.push(value);
     }
-    state
+    for candidate in candidates {
+        let path = Path::new(candidate.trim_matches(['"', '\'']));
+        if !path.is_absolute()
+            || path.file_name().and_then(|name| name.to_str()) != Some(BOOT_CONFIG_FILE)
+        {
+            continue;
+        }
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        if roots.iter().any(|root| dir.starts_with(root)) {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Machine data directories a `ps` line's argv names, one per token that
+/// carries a boot config under one of `roots`. An argv shape this cannot
+/// parse yields nothing.
+fn boot_config_dirs(line: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
+    line.split_whitespace()
+        .filter_map(|token| token_boot_config_dir(token, roots))
+        .collect()
+}
+
+/// Classify a `ps` line by the machine state its argv names.
+///
+/// The boot config itself is gone once the machine booted, so the directory
+/// is what proves the machine exists.
+fn machine_data_state(line: &str, roots: &[PathBuf]) -> MachineDataState {
+    let dirs = boot_config_dirs(line, roots);
+    if dirs.iter().any(|dir| dir.exists()) {
+        return MachineDataState::Present;
+    }
+    if dirs.is_empty() {
+        MachineDataState::Unknown
+    } else {
+        MachineDataState::Removed
+    }
+}
+
+/// Filesystem form of a path for cross-checking argv against the mount
+/// table: both sides are canonicalized so `/tmp/...` and `/private/tmp/...`
+/// compare equal. A path that cannot be canonicalized (a fixture, an
+/// already-removed directory) is compared as written.
+#[cfg(any(target_os = "macos", test))]
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Suffix of a SmolVM layer-store mount point: the machine data directory
+/// plus `pack/layers-cs`.
+#[cfg(any(target_os = "macos", test))]
+const LAYER_STORE_MOUNT_SUFFIX: &str = "/pack/layers-cs";
+
+/// Layer-store mounts under one of this home's machine data roots, each with
+/// the machine data directory it belongs to.
+///
+/// macOS mounts a packed machine's `pack/layers-cs` APFS sparseimage inside
+/// the machine's data directory while the machine runs (`machine start`) and
+/// detaches it on `stop`/`delete`. `mount` prints
+/// `<device> on <mount point> (<options>)`; a mount point that is not a layer
+/// store beneath one of the roots (a nested home, a neighboring home whose
+/// name overlaps at a path component) is not ours to touch.
+#[cfg(any(target_os = "macos", test))]
+fn layer_store_mounts(roots: &[PathBuf], mount_table: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut mounts = Vec::new();
+    for line in mount_table.lines() {
+        let Some((_, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((path, _)) = rest.rsplit_once(" (") else {
+            continue;
+        };
+        let path = path.trim();
+        if !path.starts_with('/') {
+            continue;
+        }
+        let Some(dir) = path.strip_suffix(LAYER_STORE_MOUNT_SUFFIX) else {
+            continue;
+        };
+        let dir = Path::new(dir);
+        if !roots.iter().any(|root| dir.starts_with(root)) {
+            continue;
+        }
+        mounts.push((PathBuf::from(path), dir.to_path_buf()));
+    }
+    mounts
+}
+
+/// Layer-store mounts no live hypervisor is using.
+///
+/// What remains after a hypervisor died without a `stop`/`delete`: an engine
+/// killed mid-teardown, a mutation that deleted the smolvm registry out from
+/// under a running VM, or a SIGKILL purge. A mount whose machine data
+/// directory still has a `_boot-vm` process is live and must be left alone.
+#[cfg(any(target_os = "macos", test))]
+fn orphan_layer_store_mounts(
+    roots: &[PathBuf],
+    ps_output: &str,
+    mount_table: &str,
+) -> Vec<PathBuf> {
+    let live: std::collections::BTreeSet<PathBuf> = ps_output
+        .lines()
+        .filter(|line| line.contains(BOOT_VM_PROCESS))
+        .flat_map(|line| boot_config_dirs(line, roots))
+        .map(|dir| canonical_path(&dir))
+        .collect();
+    layer_store_mounts(roots, mount_table)
+        .into_iter()
+        .filter(|(_, dir)| !live.contains(&canonical_path(dir)))
+        .map(|(mount, _)| mount)
+        .collect()
+}
+
+/// Detach layer-store mounts this Preloop home's machines left behind.
+///
+/// A hypervisor killed out-of-band — the crash-purge's SIGKILL, an engine
+/// that exited mid-teardown — leaves its `pack/layers-cs` sparseimage
+/// mounted: the mount outlives the process that made it, and `machine
+/// delete` can no longer reach a machine whose registry row is gone. The
+/// directory then cannot be removed (`Resource busy`), so the documented way
+/// to reset a home fails.
+///
+/// Safe to call while the engine serves: a mount with a live hypervisor is
+/// skipped, and `hdiutil` refuses to detach a busy volume, so a running
+/// machine is never disturbed. A mount `hdiutil` refuses is left in place
+/// (its hypervisor may have started between the scan and the detach). No-op
+/// where the layer store is not a host mount.
+pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let roots = machine_data_roots();
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let ps = std::process::Command::new("ps")
+            .args(["ax", "-o", "pid=,command="])
+            .output()
+            .map_err(|source| VmError::Launch {
+                program: "ps".to_owned(),
+                source,
+            })?;
+        let mounts = std::process::Command::new("mount")
+            .output()
+            .map_err(|source| VmError::Launch {
+                program: "mount".to_owned(),
+                source,
+            })?;
+        let mut detached = 0usize;
+        for mount in orphan_layer_store_mounts(
+            &roots,
+            &String::from_utf8_lossy(&ps.stdout),
+            &String::from_utf8_lossy(&mounts.stdout),
+        ) {
+            match std::process::Command::new("hdiutil")
+                .args(["detach", "-quiet"])
+                .arg(&mount)
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    detached += 1;
+                    info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
+                }
+                Ok(status) => warn!(
+                    mount = %mount.display(),
+                    %status,
+                    "hdiutil detach refused; leaving the layer mount in place"
+                ),
+                Err(error) => warn!(
+                    mount = %mount.display(),
+                    %error,
+                    "hdiutil detach failed to start"
+                ),
+            }
+        }
+        Ok(detached)
+    }
 }
 
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
@@ -2100,7 +2422,7 @@ pub enum OrphanPurge {
 }
 
 /// Kill any lingering SmolVM `_boot-vm` hypervisor processes whose machine
-/// state lives under this Preloop home.
+/// state lives under this Preloop home's machine data root.
 ///
 /// A server death (crash, OOM, SIGKILL) orphans the detached `_boot-vm`
 /// processes: the CLI flow detaches them (the parent-death watchdog is
@@ -2111,24 +2433,17 @@ pub enum OrphanPurge {
 /// keeps the storage file descriptors open and the unlinked blocks leak
 /// until the process exits. The `_boot-vm` argv names its
 /// `boot-config.json` under the data dir, so orphaned processes are
-/// identifiable by path.
+/// identifiable by path: only a token naming a boot config under one of
+/// [`machine_data_roots`] makes a process ours — a neighboring home whose
+/// path merely shares a prefix is never matched.
 ///
 /// `scope` decides which of those processes may be killed; see
 /// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
 /// interval while the pool serves (`RemovedDataDir`). Returns the number of
 /// processes killed.
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
-    let Some(preloop_home) = effective_preloop_home() else {
-        return Ok(0);
-    };
-    let markers: Vec<String> = [
-        preloop_home.join("smolvm"),
-        preloop_home.join("smolvm-home"),
-    ]
-    .iter()
-    .filter_map(|path| path.to_str().map(str::to_owned))
-    .collect();
-    if markers.is_empty() {
+    let roots = machine_data_roots();
+    if roots.is_empty() {
         return Ok(0);
     }
     let output = std::process::Command::new("ps")
@@ -2144,16 +2459,13 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
         if !line.contains(BOOT_VM_PROCESS) {
             continue;
         }
-        if !markers.iter().any(|marker| line.contains(marker.as_str())) {
-            continue;
-        }
         // Anything whose machine data directory still exists may be live:
         // spare it rather than kill a machine that is registered, running a
         // job, or still being created. See `OrphanPurge::RemovedDataDir`.
-        if scope == OrphanPurge::RemovedDataDir
-            && machine_data_state(line, &markers) != MachineDataState::Removed
-        {
-            continue;
+        match machine_data_state(line, &roots) {
+            MachineDataState::Unknown => continue,
+            MachineDataState::Present if scope == OrphanPurge::RemovedDataDir => continue,
+            MachineDataState::Present | MachineDataState::Removed => {}
         }
         let Some(pid) = line
             .split_whitespace()
@@ -2189,19 +2501,21 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     let data_dir = explicit_data_dir
         .clone()
         .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
+    // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its registry
+    // from HOME. Keep each Preloop home isolated whether or not
+    // SMOLVM_DATA_DIR is set, so every engine finds its own machines under
+    // `<home>/smolvm-home` and never a foreign registry — `machine_data_root`
+    // resolves the same directory on that platform.
+    #[cfg(target_os = "macos")]
+    if let Some(preloop_home) = effective_preloop_home() {
+        env.push((
+            "HOME".to_owned(),
+            preloop_home.join("smolvm-home").into_os_string(),
+        ));
+    }
     if explicit_data_dir.is_none()
         && let Some(data_dir) = &data_dir
     {
-        // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
-        // registry from HOME. Keep each Preloop home isolated while still
-        // leaving an explicit operator registry untouched.
-        #[cfg(target_os = "macos")]
-        if let Some(preloop_home) = effective_preloop_home() {
-            env.push((
-                "HOME".to_owned(),
-                preloop_home.join("smolvm-home").into_os_string(),
-            ));
-        }
         env.push((
             "SMOLVM_DATA_DIR".to_owned(),
             data_dir.clone().into_os_string(),
@@ -2288,7 +2602,12 @@ fn runtime_dirs_to_create() -> Vec<PathBuf> {
         && let Some(home) = effective_preloop_home()
     {
         dirs.push(home.join("smolvm"));
-        #[cfg(target_os = "macos")]
+    }
+    // SmolVM derives its registry from HOME on macOS regardless of
+    // SMOLVM_DATA_DIR (see `smolvm_runtime_env`), so the isolated smolvm home
+    // must always exist.
+    #[cfg(target_os = "macos")]
+    if let Some(home) = effective_preloop_home() {
         dirs.push(home.join("smolvm-home"));
     }
     dirs
@@ -2834,6 +3153,52 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A `create` that failed before registering leaves its data dir — and
+    /// the `pack/` intermediates inside it — invisible to `machine data-dir`
+    /// and `delete`. The residue sweep finds it by exclusion (16-hex name,
+    /// no registry row) and removes `pack/` without requiring `storage.raw`,
+    /// while leaving registered dirs, pack-less dirs, and SmolVM's own
+    /// node state alone.
+    #[test]
+    fn prune_unregistered_pack_dirs_reclaims_failed_unpack_residue() {
+        let root = std::env::temp_dir().join(format!("preloop-residue-{}", uuid::Uuid::new_v4()));
+        let registered = root.join("0123456789abcdef");
+        let residue = root.join("59cc3c416f4b6d5e");
+        let bare_orphan = root.join("aaaabbbbccccdddd");
+        let shared_store = root.join("_shared");
+        for dir in [&registered, &residue, &bare_orphan, &shared_store] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // The failed unpack: pack/ exists, storage.raw does not.
+        std::fs::create_dir_all(residue.join("pack")).unwrap();
+        std::fs::write(residue.join("pack").join("storage.ext4"), b"part").unwrap();
+        // The registered machine: pack/ beside its finished disk stays.
+        std::fs::create_dir_all(registered.join("pack")).unwrap();
+        std::fs::write(registered.join("pack").join("storage.ext4"), b"keep").unwrap();
+        std::fs::write(registered.join("storage.raw"), b"disk").unwrap();
+        let known_dirs = std::collections::BTreeSet::from([registered.clone()]);
+
+        let pruned = super::prune_unregistered_pack_dirs(std::slice::from_ref(&root), &known_dirs)
+            .expect("sweep");
+
+        assert_eq!(pruned, 1);
+        assert!(
+            !residue.join("pack").exists(),
+            "unregistered pack/ is removed"
+        );
+        assert!(
+            residue.is_dir(),
+            "the residue dir itself is left for the orphan sweep"
+        );
+        assert!(
+            registered.join("pack").is_dir(),
+            "registered pack/ survives"
+        );
+        assert!(bare_orphan.is_dir(), "a dir with no pack/ is untouched");
+        assert!(shared_store.is_dir(), "shared pack store survives");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn df_available_column_survives_spaces_in_names() {
         // Linux: plain layout.
@@ -2931,12 +3296,15 @@ mod tests {
     fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
         let _guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
-        let marker = home.join("smolvm-home/Library/Caches/smolvm/vms/deadbeef/boot-config.json");
-        // A process that looks like an orphaned _boot-vm for this home: the
-        // argv carries the marker path, so `ps` shows it in the command line.
-        let mut child = spawn_fake_boot_vm(&[marker.to_str().unwrap()]);
-        let pid = child.id() as i32;
         let _home = PreloopHomeGuard::set(&home);
+        let boot_config = super::machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("deadbeef/boot-config.json");
+        // A process that looks like an orphaned _boot-vm for this home: the
+        // argv carries the boot-config path, so `ps` shows it in the command
+        // line.
+        let mut child = spawn_fake_boot_vm(&[boot_config.to_str().unwrap()]);
+        let pid = child.id() as i32;
         let killed = purge_orphaned_vms(OrphanPurge::All).expect("purge");
         assert!(killed >= 1, "purge should have killed the matching process");
         // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
@@ -2945,18 +3313,56 @@ mod tests {
         assert!(!process_alive(pid), "matching _boot-vm must be dead");
     }
 
+    /// A hypervisor is ours only when its argv names a boot config under one
+    /// of this home's machine data roots. A neighboring home whose path the
+    /// data root is a *string prefix* of (`…/smolvm` vs `…/smolvm-vm-other`)
+    /// shares no path component with it; killing that home's VM would take
+    /// down a different engine's running job.
+    #[test]
+    fn purge_never_touches_a_neighboring_homes_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home =
+            std::env::temp_dir().join(format!("preloop-purge-neighbor-{}", uuid::Uuid::new_v4()));
+        // The neighbor's home is spelled so that this home's data root prefix
+        // is a string prefix of its machine paths, but not a path-component
+        // prefix: exactly the shape old substring matches claimed as ours.
+        let neighbor_boot_config = {
+            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
+            super::machine_data_root()
+                .expect("the neighbor home resolves to a data root")
+                .join("deadbeef/boot-config.json")
+        };
+        let mut neighbor_child = spawn_fake_boot_vm(&[neighbor_boot_config.to_str().unwrap()]);
+        let neighbor_pid = neighbor_child.id() as i32;
+        let _home = PreloopHomeGuard::set(&home);
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            0,
+            "a neighboring home's hypervisor is not ours to kill"
+        );
+        assert!(
+            process_alive(neighbor_pid),
+            "the neighboring home's VM must survive this home's purge"
+        );
+        let _ = neighbor_child.kill();
+        let _ = neighbor_child.wait();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// The mid-flight scope must spare every hypervisor whose machine data
     /// directory still exists — a registered machine, a running job VM, a
-    /// golden, or a create in flight all keep theirs — spare an argv shape it
-    /// cannot classify, and still reclaim one whose data directory was
-    /// removed from under it. `All` kills every survivor, which is what makes
-    /// the scope, not the process match, the protection.
+    /// golden, or a create in flight all keep theirs — and still reclaim one
+    /// whose data directory was removed from under it. `All` kills every
+    /// hypervisor this home owns, which is what makes the scope, not the
+    /// process match, the protection for live machines.
     #[test]
-    fn removed_data_dir_purge_spares_live_and_unknown_data_dirs() {
+    fn removed_data_dir_purge_spares_live_data_dirs_and_unowned_argvs() {
         let _guard = PRELOOP_HOME_LOCK.lock();
         let home =
             std::env::temp_dir().join(format!("preloop-purge-live-{}", uuid::Uuid::new_v4()));
-        let vms = home.join("smolvm-home/Library/Caches/smolvm/vms");
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
         // A live machine's directory, in the shape a running machine leaves on
         // disk: smolvm consumes `boot-config.json` at boot, so only the
         // directory — not that file — is durable evidence of the machine.
@@ -2966,8 +3372,9 @@ mod tests {
         let live = live_dir.join("boot-config.json");
         // Same home, no data directory: the failed-delete leak.
         let gone = vms.join("gone/boot-config.json");
-        // The data root itself, in an argv shape that names no boot config:
-        // nothing can be concluded about that process, so it must be spared.
+        // A `_boot-vm` whose argv names no boot config under this home: no
+        // machine can be concluded from it, so neither scope may kill it —
+        // ownership is a parsed path, never a mention of the home.
         let unclassified = home.join("smolvm-home");
         let mut live_child = spawn_fake_boot_vm(&[live.to_str().unwrap()]);
         let mut gone_child = spawn_fake_boot_vm(&[gone.to_str().unwrap()]);
@@ -2975,7 +3382,6 @@ mod tests {
         let live_pid = live_child.id() as i32;
         let gone_pid = gone_child.id() as i32;
         let unknown_pid = unknown_child.id() as i32;
-        let _home = PreloopHomeGuard::set(&home);
 
         assert_eq!(
             purge_orphaned_vms(OrphanPurge::RemovedDataDir).expect("purge"),
@@ -2988,7 +3394,7 @@ mod tests {
         );
         assert!(
             process_alive(unknown_pid),
-            "an unclassifiable argv must survive the mid-flight purge"
+            "an argv that names no boot config must survive the mid-flight purge"
         );
         let _ = gone_child.wait();
         assert!(
@@ -2998,13 +3404,164 @@ mod tests {
 
         assert_eq!(
             purge_orphaned_vms(OrphanPurge::All).expect("purge"),
-            2,
-            "the startup scope kills the hypervisors the mid-flight scope spared"
+            1,
+            "the startup scope kills the hypervisor the mid-flight scope spared"
         );
         let _ = live_child.wait();
-        let _ = unknown_child.wait();
         assert!(!process_alive(live_pid), "only the scope spared it");
-        assert!(!process_alive(unknown_pid), "only the scope spared it");
+        assert!(
+            process_alive(unknown_pid),
+            "an argv that names no boot config is not ours under any scope"
+        );
+        let _ = unknown_child.kill();
+        let _ = unknown_child.wait();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Serializes the tests that rewrite `PATH`: fake `mount`/`hdiutil`
+    /// stand-ins resolve through it, and `PATH` is process-global.
+    #[cfg(target_os = "macos")]
+    static PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Prepends `directory` to `PATH` for the test's scope, restoring the
+    /// previous value on drop.
+    #[cfg(target_os = "macos")]
+    struct PathPrependGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PathPrependGuard {
+        fn prepend(directory: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            let mut path = directory.as_os_str().to_owned();
+            path.push(":");
+            if let Some(previous) = &previous {
+                path.push(previous);
+            }
+            // SAFETY: serialized by `PATH_LOCK`.
+            unsafe { std::env::set_var("PATH", path) };
+            Self { previous }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PathPrependGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by `PATH_LOCK`.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// A layer-store mount belongs to this home when it hangs off this home's
+    /// machine data root — in either the raw or the canonical form of the path
+    /// (`mount` prints `/private/tmp/...` for a `/tmp/...` home) — and only
+    /// the mounts no live hypervisor claims may be detached. A neighboring
+    /// home's mount that this home's root is a string prefix of, and any
+    /// mount that is not a layer store, must never be selected.
+    #[test]
+    fn orphan_layer_store_mounts_spare_machines_with_a_live_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        // Under `/tmp` on purpose: on macOS that is a path *through a
+        // symlink*, so the argv form and the mount-table form differ unless
+        // the scan canonicalizes both sides.
+        let home = std::path::PathBuf::from("/tmp")
+            .join(format!("preloop-layer-mounts-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
+        let live = vms.join("aaaaaaaaaaaaaaaa");
+        let orphan = vms.join("bbbbbbbbbbbbbbbb");
+        for dir in [&live, &orphan] {
+            std::fs::create_dir_all(dir.join("pack/layers-cs")).unwrap();
+        }
+        let roots = super::machine_data_roots();
+        let canonical_vms = std::fs::canonicalize(&vms).unwrap();
+        // A neighboring home whose path shares this home's data-root prefix
+        // as a *string* but not as a path component (`…/smolvm` vs
+        // `…/smolvm-vm-other`): its mount is not ours to detach.
+        let neighbor_mount = {
+            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
+            super::machine_data_root()
+                .expect("the neighbor home resolves to a data root")
+                .join("cccccccccccccccc/pack/layers-cs")
+        };
+        let mount_table = format!(
+            "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
+             /dev/disk11s1 on {live}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
+             /dev/disk9s1 on {orphan}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
+             /dev/disk10s1 on {neighbor} (apfs, local)\n\
+             /dev/disk12s1 on {orphan}/storage (apfs, local)\n",
+            live = canonical_vms.join("aaaaaaaaaaaaaaaa").display(),
+            orphan = canonical_vms.join("bbbbbbbbbbbbbbbb").display(),
+            neighbor = neighbor_mount.display(),
+        );
+        // The live _boot-vm's argv names its machine's boot config in the raw
+        // form of the path (the file itself is consumed at boot; only the
+        // directory is durable).
+        let ps_output = format!(
+            "  501 /Users/x/.smolvm/smolvm-bin _boot-vm {}/boot-config.json\n\
+             502 /usr/bin/unrelated\n",
+            live.display()
+        );
+
+        assert_eq!(
+            orphan_layer_store_mounts(&roots, &ps_output, &mount_table),
+            vec![canonical_vms.join("bbbbbbbbbbbbbbbb/pack/layers-cs")],
+            "only the mount whose hypervisor is gone may be detached"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The detach pass shells out to `mount` and `hdiutil`; a fake pair on
+    /// `PATH` records the exact argv, so the whole scan → decide → detach
+    /// path is covered without attaching a disk image.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detach_orphaned_layer_mounts_detaches_each_mount_without_a_hypervisor() {
+        let _path_guard = PATH_LOCK.lock();
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-detach-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let orphan = super::machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("bbbbbbbbbbbbbbbb");
+        std::fs::create_dir_all(orphan.join("pack/layers-cs")).unwrap();
+        let log = home.join("hdiutil.log");
+        let bin = home.join("fake-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let canonical = std::fs::canonicalize(&orphan).unwrap();
+        let mount = bin.join("mount");
+        std::fs::write(
+            &mount,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \\\n  '/dev/disk3s5 on / (apfs, local, read-only, sealed)' \\\n  '/dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)'\n",
+                canonical.display()
+            ),
+        )
+        .unwrap();
+        let hdiutil = bin.join("hdiutil");
+        std::fs::write(
+            &hdiutil,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for tool in [&mount, &hdiutil] {
+            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = PathPrependGuard::prepend(&bin);
+
+        // The real `ps` runs: no `_boot-vm` names this fixture home, so the
+        // mount is provably orphaned.
+        let detached = detach_orphaned_layer_mounts().expect("detach");
+        assert_eq!(detached, 1, "the orphaned layer mount must be detached");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("fake hdiutil log"),
+            format!("detach -quiet {}/pack/layers-cs\n", canonical.display()),
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
