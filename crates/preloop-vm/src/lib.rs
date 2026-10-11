@@ -371,6 +371,21 @@ pub trait VmProvider: Send + Sync {
         let _ = name;
         Ok(false)
     }
+    /// Remove `pack/` intermediates left by a `create` that failed before the
+    /// machine registered.
+    ///
+    /// A `machine create --from` that dies mid-extraction (the ENOSPC path a
+    /// full host produces) leaves its data dir — and the multi-GB `pack/`
+    /// inside it — owned by no registry row. `machine data-dir` cannot resolve
+    /// it, `delete` is a no-op on it, and the orphan sweep waits out a grace
+    /// window before claiming it, so retries stack the residue. Unlike
+    /// [`VmProvider::prune_pack_intermediates`], this path must not require a
+    /// finished `storage.raw`: the disk is exactly what a failed unpack never
+    /// wrote. Returns how many pack trees were removed. Providers without
+    /// host-visible data dirs keep the default no-op.
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        Ok(0)
+    }
     /// Remove machine data directories the provider's registry no longer
     /// knows about.
     ///
@@ -474,6 +489,9 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     }
     async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
         (**self).sweep_orphaned_data_dirs().await
+    }
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        (**self).prune_failed_unpack_residue().await
     }
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
         (**self).exec(name, argv).await
@@ -983,6 +1001,14 @@ fn prune_pack_dir(data_dir: &Path) -> Result<bool, VmError> {
     if !data_dir.join("storage.raw").is_file() {
         return Ok(false);
     }
+    prune_pack_dir_in(data_dir)
+}
+
+/// [`prune_pack_dir`] without the `storage.raw` requirement: a `create` that
+/// failed mid-extraction never wrote the disk, and that residue is exactly
+/// what [`VmProvider::prune_failed_unpack_residue`] exists to reclaim. The
+/// same real-directory, strictly-inside checks still apply.
+fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
     let pack = data_dir.join("pack");
     // Refuse symlinks outright: the removal must never follow a link.
     if std::fs::symlink_metadata(&pack)
@@ -1012,6 +1038,84 @@ fn prune_pack_dir(data_dir: &Path) -> Result<bool, VmError> {
         "removed pack/ build intermediates beside finished disk"
     );
     Ok(true)
+}
+
+/// Remove `pack/` intermediates inside machine data dirs no registry row
+/// owns — the residue a `machine create --from` leaves when it dies before
+/// registration.
+///
+/// Caller holds the lifecycle write lock, so no `create` can be mid-flight
+/// while this scans: `create` holds the write side for its whole run, which
+/// also means a young unregistered dir found here belongs to an already-dead
+/// create, not one in progress (the orphan sweep's grace window exists for
+/// the lock-free fork case; this runs after a returned failure). No `age`
+/// check, no `storage.raw` check — the disk is what the failed unpack never
+/// wrote — and only real directories under a canonicalized root match: a
+/// hex-named symlink could point anywhere, `known_dirs` are compared by
+/// canonical path, and [`prune_pack_dir_in`] still refuses symlink `pack/`
+/// entries.
+/// Returns how many pack trees were removed.
+fn prune_unregistered_pack_dirs(
+    roots: &[PathBuf],
+    known_dirs: &std::collections::BTreeSet<PathBuf>,
+) -> Result<usize, VmError> {
+    let mut pruned = 0usize;
+    // `data-dir` answers with whatever path SmolVM resolved, which need not
+    // byte-match a scanned root (`/tmp` vs `/private/tmp` on macOS): compare
+    // on canonical spellings so a registered dir never reads as residue.
+    let known: std::collections::BTreeSet<PathBuf> = known_dirs
+        .iter()
+        .map(|dir| dir.canonicalize().unwrap_or_else(|_| dir.clone()))
+        .collect();
+    for root in roots {
+        let Ok(root_canonical) = root.canonicalize() else {
+            warn!(root = %root.display(), "pack-residue scan root does not resolve");
+            continue;
+        };
+        let entries = match std::fs::read_dir(&root_canonical) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    root = %root_canonical.display(),
+                    %error,
+                    "pack-residue scan could not read this root; residue there survives"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                warn!("pack-residue scan skipped an unreadable directory entry");
+                continue;
+            };
+            let path = entry.path();
+            // A symlinked machine dir could point outside the root: only real
+            // directories are machine data dirs.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !is_machine_data_dir_name(&entry.file_name()) || !meta.is_dir() {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(&root_canonical) || known.contains(&canonical) {
+                continue;
+            }
+            match prune_pack_dir_in(&canonical) {
+                Ok(true) => pruned += 1,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    machine_dir = %canonical.display(),
+                    %error,
+                    "failed to prune pack/ intermediates from unregistered machine dir"
+                ),
+            }
+        }
+    }
+    Ok(pruned)
 }
 
 #[async_trait]
@@ -1238,6 +1342,33 @@ impl VmProvider for SmolVmProvider {
         tokio::task::spawn_blocking(move || prune_pack_dir(&data_dir))
             .await
             .map_err(|error| VmError::Protocol(format!("pack prune task failed: {error}")))?
+    }
+
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        // The write side, not the read side: this runs after a `create`
+        // returned an error, and the lock guarantees no *other* create is
+        // mid-extraction while the scan decides which unregistered dirs hold
+        // its `pack/` residue. `machine data-dir` cannot resolve an
+        // unregistered machine, so the name's dir is found by exclusion:
+        // every 16-hex machine dir the registry does not own.
+        let _lifecycle = self.lifecycle_lock.write().await;
+        let registered = self.list().await?;
+        let mut known_dirs = std::collections::BTreeSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for name in &registered {
+            let dir = self.machine_data_dir_direct(name).await?;
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+            known_dirs.insert(dir);
+        }
+        if let Some(root) = machine_data_root() {
+            roots.insert(root);
+        }
+        let roots: Vec<PathBuf> = roots.into_iter().collect();
+        tokio::task::spawn_blocking(move || prune_unregistered_pack_dirs(&roots, &known_dirs))
+            .await
+            .map_err(|error| VmError::Protocol(format!("failed-unpack prune failed: {error}")))?
     }
 
     async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
@@ -3019,6 +3150,52 @@ mod tests {
         assert!(shared_store.is_dir(), "shared pack store survives");
         assert!(restore_base.is_dir(), "restore base survives");
         assert!(not_a_hash.is_dir(), "non-machine names are never swept");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `create` that failed before registering leaves its data dir — and
+    /// the `pack/` intermediates inside it — invisible to `machine data-dir`
+    /// and `delete`. The residue sweep finds it by exclusion (16-hex name,
+    /// no registry row) and removes `pack/` without requiring `storage.raw`,
+    /// while leaving registered dirs, pack-less dirs, and SmolVM's own
+    /// node state alone.
+    #[test]
+    fn prune_unregistered_pack_dirs_reclaims_failed_unpack_residue() {
+        let root = std::env::temp_dir().join(format!("preloop-residue-{}", uuid::Uuid::new_v4()));
+        let registered = root.join("0123456789abcdef");
+        let residue = root.join("59cc3c416f4b6d5e");
+        let bare_orphan = root.join("aaaabbbbccccdddd");
+        let shared_store = root.join("_shared");
+        for dir in [&registered, &residue, &bare_orphan, &shared_store] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // The failed unpack: pack/ exists, storage.raw does not.
+        std::fs::create_dir_all(residue.join("pack")).unwrap();
+        std::fs::write(residue.join("pack").join("storage.ext4"), b"part").unwrap();
+        // The registered machine: pack/ beside its finished disk stays.
+        std::fs::create_dir_all(registered.join("pack")).unwrap();
+        std::fs::write(registered.join("pack").join("storage.ext4"), b"keep").unwrap();
+        std::fs::write(registered.join("storage.raw"), b"disk").unwrap();
+        let known_dirs = std::collections::BTreeSet::from([registered.clone()]);
+
+        let pruned = super::prune_unregistered_pack_dirs(std::slice::from_ref(&root), &known_dirs)
+            .expect("sweep");
+
+        assert_eq!(pruned, 1);
+        assert!(
+            !residue.join("pack").exists(),
+            "unregistered pack/ is removed"
+        );
+        assert!(
+            residue.is_dir(),
+            "the residue dir itself is left for the orphan sweep"
+        );
+        assert!(
+            registered.join("pack").is_dir(),
+            "registered pack/ survives"
+        );
+        assert!(bare_orphan.is_dir(), "a dir with no pack/ is untouched");
+        assert!(shared_store.is_dir(), "shared pack store survives");
         std::fs::remove_dir_all(&root).ok();
     }
 

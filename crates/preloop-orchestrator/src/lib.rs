@@ -759,20 +759,71 @@ fn ensure_disk_for_golden_build(root: &Path, builder_storage_gib: u32) -> Result
     )
 }
 
-/// Warn, never refuse, when the volume holding `path` has under `required`
-/// bytes free.
-fn warn_if_disk_below(path: &Path, required: u64, purpose: &str) {
-    if let Ok(free) = preloop_vm::filesystem_available_bytes(path)
-        && free < required
-    {
-        warn!(
-            path = %path.display(),
-            free = %format_gib(free),
-            needed = %format_gib(required),
-            purpose,
-            "low disk space: this volume may fill before the golden and job VMs settle"
-        );
+/// Conservative multiple of a pack's compressed size used to bound the
+/// transient disk a golden unpack writes.
+///
+/// smolvm's own preflight runs only when it materializes the image layers,
+/// after `machine create --from` has already written ~3x the pack's size of
+/// intermediates (`pack/`, `storage.ext4`) unchecked. The official golden
+/// pack (~9.6 GB) peaked near 59 GB: 29 GB of intermediates plus ~30 GB of
+/// extracted layers mid-flight. Six times the pack bounds that shape;
+/// `PRELOOP_GOLDEN_UNPACK_FACTOR` overrides the multiple for denser packs.
+/// An underestimate costs an ENOSPC failure whose residue is pruned, never a
+/// leak; an overestimate stalls the unpack until space frees.
+const GOLDEN_UNPACK_HEADROOM_FACTOR: u64 = 6;
+/// Escape hatch for packs whose intermediates exceed the default multiple:
+/// `PRELOOP_GOLDEN_UNPACK_FACTOR`.
+const GOLDEN_UNPACK_FACTOR_ENV: &str = "PRELOOP_GOLDEN_UNPACK_FACTOR";
+
+fn golden_unpack_factor() -> u64 {
+    std::env::var(GOLDEN_UNPACK_FACTOR_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|factor| *factor >= 1)
+        .unwrap_or(GOLDEN_UNPACK_HEADROOM_FACTOR)
+}
+
+/// Bytes the volume must have free before a pack `pack_bytes` large is
+/// unpacked into it.
+fn golden_unpack_required_bytes(pack_bytes: u64) -> u64 {
+    pack_bytes.saturating_mul(golden_unpack_factor())
+}
+
+/// Wait until the volume holding the VM data root has room to unpack `pack`,
+/// the same stall-instead-of-fill discipline as [`wait_for_vm_disk`].
+///
+/// Returns `false` when `shutdown` fired first; the caller then aborts the
+/// preparation as a clean stop. Skipped entirely by
+/// [`DISK_PREFLIGHT_OVERRIDE`], and a pack whose size cannot be read proceeds
+/// on the warning: the ENOSPC path prunes its own residue, so the gate exists
+/// to stall before the write, never to block a pack it cannot size.
+async fn wait_for_golden_unpack_disk(
+    config: &RunnerPoolConfig,
+    pack: &Path,
+    shutdown: &CancellationToken,
+) -> bool {
+    if disk_preflight_overridden() {
+        return true;
     }
+    let pack_bytes = match std::fs::metadata(pack) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            warn!(
+                pack = %pack.display(),
+                %error,
+                "pack size unreadable; unpacking without the free-space gate"
+            );
+            return true;
+        }
+    };
+    wait_for_disk_free(
+        config,
+        &golden_disk_root(config),
+        golden_unpack_required_bytes(pack_bytes),
+        "a golden unpack",
+        shutdown,
+    )
+    .await
 }
 
 /// Reserve kept free on the VM volume before a job VM is started.
@@ -916,11 +967,36 @@ async fn wait_for_vm_disk(config: &RunnerPoolConfig, shutdown: &CancellationToke
     if reserve == 0 {
         return true;
     }
-    let root = golden_disk_root(config);
+    wait_for_disk_free(
+        config,
+        &golden_disk_root(config),
+        reserve,
+        "a job VM",
+        shutdown,
+    )
+    .await
+}
+
+/// Wait until the volume holding `root` has `required` bytes free.
+///
+/// Shared body of the job-VM reserve and the golden-unpack gate: the wait
+/// re-measures on `job_vm_disk.probe_interval()` and repeats its shortfall
+/// warning at most once a minute, so a full host stalls the operation instead
+/// of being filled further. Returns `false` only when `shutdown` fires first;
+/// a volume the measurement cannot read never blocks — the checks exist to
+/// fail early on a host that is genuinely out of room, never to hold back one
+/// they cannot measure.
+async fn wait_for_disk_free(
+    config: &RunnerPoolConfig,
+    root: &Path,
+    required: u64,
+    purpose: &str,
+    shutdown: &CancellationToken,
+) -> bool {
     let mut warned_at: Option<tokio::time::Instant> = None;
     loop {
-        match config.job_vm_disk.free_bytes(&root) {
-            Ok(free) if free >= reserve => return true,
+        match config.job_vm_disk.free_bytes(root) {
+            Ok(free) if free >= required => return true,
             Ok(free) => {
                 let now = tokio::time::Instant::now();
                 if warned_at.is_none_or(|last| now.duration_since(last) >= DISK_WAIT_LOG_INTERVAL) {
@@ -928,11 +1004,13 @@ async fn wait_for_vm_disk(config: &RunnerPoolConfig, shutdown: &CancellationToke
                     warn!(
                         path = %root.display(),
                         free = %format_gib(free),
-                        reserve = %format_gib(reserve),
-                        "waiting for disk: {} free on {}, reserve {}",
+                        needed = %format_gib(required),
+                        purpose,
+                        "waiting for disk: {} free on {}, {} requires {}",
                         format_gib(free),
                         root.display(),
-                        format_gib(reserve),
+                        purpose,
+                        format_gib(required),
                     );
                 }
             }
@@ -940,7 +1018,8 @@ async fn wait_for_vm_disk(config: &RunnerPoolConfig, shutdown: &CancellationToke
                 warn!(
                     path = %root.display(),
                     %error,
-                    "free disk space unmeasurable; starting job VMs without the reserve"
+                    purpose,
+                    "free disk space unmeasurable; proceeding without the check"
                 );
                 return true;
             }
@@ -3721,16 +3800,6 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
 ) -> Result<(), OrchestratorError> {
     let payload = artifact_payload(&config.artifact_stem, &env_spec.base);
     ensure_golden_payload(provider, config, env_spec, &payload, shutdown).await?;
-    // Unpacking writes the golden's filesystem; its disk can grow to the
-    // configured storage ceiling, and job forks grow on top of it. Not a
-    // refusal: how much of the ceiling a given golden writes is image-specific
-    // and the disk is sparse, so only flag a host that could not hold one
-    // golden at its ceiling.
-    warn_if_disk_below(
-        &golden_disk_root(config),
-        u64::from(config.storage_gib) * GIB,
-        "golden unpack",
-    );
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
     // IS the pack at the stem; a locally built golden leaves the pack in the
@@ -3756,28 +3825,90 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
         dns: config.dns.clone(),
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
-    provider.create(&spec).await?;
-    provider.start(golden).await?;
-    vm_telemetry_register(config, golden, "golden", Some(&spec));
-    await_guest_ready(provider.as_ref(), golden).await?;
-    // Fatal for a packed golden: its jobs expect the multiarch shim, and a
-    // failed install leaves a reusable base that is adoptable on later
-    // restarts (amd64 arch added, loader missing).
-    prepare_rosetta_multiarch(provider.as_ref(), golden, true).await?;
-    // The published pack ships with apt's indices wiped (the runner-image dump
-    // does), and `sudo apt-get install <pkg>` with no `apt-get update` first is
-    // how real workflows install system packages. On Apple Silicon the
-    // multiarch step above already refreshed them; elsewhere nothing else
-    // would. Before the freeze, so every fork inherits them.
-    restore_apt_lists(provider.as_ref(), golden).await;
-    if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
-        warn!(
-            machine = golden.as_str(),
-            %error, "image preload failed; jobs will pull at run time"
-        );
+    let unpacked: Result<(), OrchestratorError> = async {
+        // Serialize the headroom check against the write that consumes it:
+        // `machine create --from` copies multiple times the pack's size, so a
+        // second unpack gated on the same free bytes would ENOSPC mid-write.
+        // Held only across the check and `create` — not the whole unpack — so
+        // a stalled host delays one unpack's start, never a running one.
+        {
+            static UNPACK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _permit = UNPACK.lock().await;
+            // Unpacking writes several times the pack's size before smolvm's
+            // own layer-extraction preflight ever runs, and a host it fills
+            // aborts the whole engine. Wait for room like the job-VM reserve
+            // does: a stall the operator can relieve beats an ENOSPC part-way
+            // through 30 GB of writes.
+            if !wait_for_golden_unpack_disk(config, &pack, shutdown).await {
+                return Err(OrchestratorError::Pool(
+                    "golden preparation cancelled by shutdown while waiting for disk".into(),
+                ));
+            }
+            provider.create(&spec).await?;
+        }
+        provider.start(golden).await?;
+        vm_telemetry_register(config, golden, "golden", Some(&spec));
+        await_guest_ready(provider.as_ref(), golden).await?;
+        // Fatal for a packed golden: its jobs expect the multiarch shim, and a
+        // failed install leaves a reusable base that is adoptable on later
+        // restarts (amd64 arch added, loader missing).
+        prepare_rosetta_multiarch(provider.as_ref(), golden, true).await?;
+        // The published pack ships with apt's indices wiped (the runner-image
+        // dump does), and `sudo apt-get install <pkg>` with no `apt-get
+        // update` first is how real workflows install system packages. On
+        // Apple Silicon the multiarch step above already refreshed them;
+        // elsewhere nothing else would. Before the freeze, so every fork
+        // inherits them.
+        restore_apt_lists(provider.as_ref(), golden).await;
+        if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await
+        {
+            warn!(
+                machine = golden.as_str(),
+                %error, "image preload failed; jobs will pull at run time"
+            );
+        }
+        provider.stop(golden).await?;
+        provider.start_forkable(golden).await?;
+        Ok(())
     }
-    provider.stop(golden).await?;
-    provider.start_forkable(golden).await?;
+    .await;
+    if let Err(error) = unpacked {
+        // A failed unpack leaves ~29 GB of `pack/` intermediates beside the
+        // partial disk, and the caller's `delete` cannot reclaim any of it
+        // when the create died before registering: the data dir exists, the
+        // registry row does not, so `machine data-dir` and `machine delete`
+        // both report no such machine. The residue then survives every retry
+        // until the orphan sweep's grace window passes, and retries fill the
+        // volume. Prune that unregistered residue first, then the named
+        // machine's copy for failures that happened after registration —
+        // `prune_pack_dir` still requires `storage.raw`, so a base that
+        // finished writing its disk keeps it for adoption.
+        match provider.prune_failed_unpack_residue().await {
+            Ok(reclaimed) if reclaimed > 0 => info!(
+                machine = golden.as_str(),
+                reclaimed, "pruned pack/ intermediates from unregistered machine dirs"
+            ),
+            Ok(_) => {}
+            Err(prune_error) => warn!(
+                machine = golden.as_str(),
+                %prune_error,
+                "failed to prune unregistered pack/ intermediates"
+            ),
+        }
+        match provider.prune_pack_intermediates(golden).await {
+            Ok(true) => info!(
+                machine = golden.as_str(),
+                "pruned pack/ build intermediates after failed golden unpack"
+            ),
+            Ok(false) => {}
+            Err(prune_error) => warn!(
+                machine = golden.as_str(),
+                %prune_error,
+                "failed to prune pack/ build intermediates after failed golden unpack"
+            ),
+        }
+        return Err(error);
+    }
     // Issue #295: smolvm's pack export leaves ~29 GB of intermediates
     // (`storage.ext4`, `layers/*.tar`) beside the finished `storage.raw`,
     // and every fork copies the golden's whole data directory. Prune them
@@ -4679,7 +4810,47 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             Ok(_) => {}
             Err(error) => warn!(%error, "orphaned data-dir sweep failed"),
         }
+        self.sweep_pack_intermediates().await;
         Ok(())
+    }
+
+    /// Reclaim `pack/` intermediates stranded inside this pool's registered
+    /// machines.
+    ///
+    /// A failed golden unpack or a crash mid-delete leaves `pack/` (tens of
+    /// GB) inside a registered machine's data dir, where neither the registry
+    /// deletes nor the orphan-dir sweep looks. Successful unpacks already
+    /// prune theirs; a surviving `pack/` here belongs to a machine whose disk
+    /// is written or abandoned, so reclaiming it at startup is safe. Runs
+    /// inside `remove_stale_machines`, after the runner deletes and orphan
+    /// sweeps, so a create in flight is out of reach. Factored out of
+    /// `remove_stale_machines` so the residue path is testable without that
+    /// method's host-wide hypervisor purge.
+    async fn sweep_pack_intermediates(&self) {
+        let Ok(names) = self.provider.list().await else {
+            warn!("pack-intermediate sweep skipped: machine list failed");
+            return;
+        };
+        for name in names {
+            if !name
+                .as_str()
+                .starts_with(&format!("{}-", self.config.name_prefix))
+            {
+                continue;
+            }
+            match self.provider.prune_pack_intermediates(&name).await {
+                Ok(true) => info!(
+                    machine = name.as_str(),
+                    "pruned pack/ build intermediates from machine"
+                ),
+                Ok(false) => {}
+                Err(error) => warn!(
+                    machine = name.as_str(),
+                    %error,
+                    "failed to prune pack/ build intermediates from machine"
+                ),
+            }
+        }
     }
 
     /// Collect golden-artifact garbage the success paths leave behind.
@@ -7241,6 +7412,20 @@ mod lifecycle_tests {
         suspends: bool,
         /// Names passed to `prune_pack_intermediates`, in call order.
         prune_pack_calls: Mutex<Vec<String>>,
+        /// Fail `create` outright, without registering the machine — the
+        /// shape of a `machine create --from` that dies mid-extraction: the
+        /// data dir and its `pack/` exist, the registry row does not.
+        fail_create: bool,
+        /// Calls to `prune_failed_unpack_residue`, the unregistered-dir
+        /// sweep a failed unpack runs before the named-machine prune.
+        failed_unpack_prunes: Mutex<u32>,
+        /// When set, `create` waits on this barrier before drawing — a test
+        /// that waits on the same barrier proves the extraction started, no
+        /// sleep or lost notification involved.
+        create_barrier: Option<Arc<tokio::sync::Barrier>>,
+        /// Bytes `create` draws from the scripted free-space counter before
+        /// registering — the pack intermediates it writes.
+        disk_draw: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
         /// When set, `exec` answers exit 1 for any argv whose debug form
         /// contains this marker — models a guest command that fails.
         fail_exec_containing: Mutex<Option<String>>,
@@ -7280,6 +7465,10 @@ mod lifecycle_tests {
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
                 suspends: false,
                 prune_pack_calls: Mutex::new(Vec::new()),
+                fail_create: false,
+                failed_unpack_prunes: Mutex::new(0),
+                create_barrier: None,
+                disk_draw: None,
                 fail_exec_containing: Mutex::new(None),
                 file_packs: true,
             }
@@ -7289,6 +7478,26 @@ mod lifecycle_tests {
         /// prepared in the guest instead of unpacked from an artifact.
         fn no_packs(mut self) -> Self {
             self.file_packs = false;
+            self
+        }
+
+        /// A provider whose `create` fails before the machine registers.
+        fn failing_create(mut self) -> Self {
+            self.fail_create = true;
+            self
+        }
+
+        /// `create` waits on `barrier` with the test, then draws `bytes` from
+        /// the free-space counter — an extraction in progress the test can
+        /// hold until a second unpack is queued behind the permit.
+        fn gating_create(
+            mut self,
+            barrier: Arc<tokio::sync::Barrier>,
+            counter: Arc<std::sync::atomic::AtomicU64>,
+            bytes: u64,
+        ) -> Self {
+            self.create_barrier = Some(barrier);
+            self.disk_draw = Some((counter, bytes));
             self
         }
 
@@ -10235,7 +10444,7 @@ done
             overlay_gib: None,
             // Tests that must not depend on the host's free space start with
             // the check disabled; the reserve tests script their own.
-            job_vm_disk: JobVmDiskReserve::new(0, |_| Ok(0)),
+            job_vm_disk: JobVmDiskReserve::new(0, |_| Ok(u64::MAX)),
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
@@ -10275,6 +10484,17 @@ done
         }
 
         async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
+            if let Some(barrier) = &self.create_barrier {
+                // Rendezvous with the test, then commit the draw: after this
+                // returns the extraction's bytes are spent.
+                barrier.wait().await;
+            }
+            if let Some((counter, bytes)) = &self.disk_draw {
+                counter.fetch_sub(*bytes, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.fail_create {
+                return Err(test_error("create-failure"));
+            }
             self.machines
                 .lock()
                 .await
@@ -10315,6 +10535,11 @@ done
                 .await
                 .push(name.as_str().to_owned());
             Ok(true)
+        }
+
+        async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+            *self.failed_unpack_prunes.lock().await += 1;
+            Ok(0)
         }
 
         /// Records each reconcile sweep instead of removing anything, so a
@@ -11165,10 +11390,12 @@ done
         );
     }
 
-    /// The prune hook must not fire when the golden never becomes forkable:
-    /// `prepare_fork_base` returns before the hook on any earlier failure.
+    /// A failed unpack still prunes: smolvm's own delete is a no-op for a
+    /// machine whose create died before registration, so without the
+    /// best-effort prune the ~29 GB of `pack/` intermediates would survive
+    /// every retry until a restart's stale-machine sweep claimed them.
     #[tokio::test]
-    async fn golden_prepare_skips_prune_on_start_failure() {
+    async fn golden_prepare_prunes_pack_intermediates_on_unpack_failure() {
         let provider = Arc::new(TestProvider::new(true, false, false, false, false));
         let scratch = tempfile::tempdir().expect("scratch dir");
         let mut config = packed_fork_config();
@@ -11189,10 +11416,247 @@ done
         .await
         .expect_err("start failure aborts golden preparation");
 
-        assert!(
-            provider.prune_pack_calls.lock().await.is_empty(),
-            "prune hook must not fire when the golden never started"
+        assert_eq!(
+            *provider.prune_pack_calls.lock().await,
+            vec![golden.as_str().to_owned()],
+            "a failed unpack prunes the partial extraction before returning"
         );
+    }
+    /// Startup prunes `pack/` intermediates from every surviving pool
+    /// machine — a failed unpack's residue lives inside a registered data dir
+    /// the orphan sweep cannot see — and leaves foreign machines alone.
+    #[tokio::test]
+    async fn startup_sweep_prunes_pack_intermediates_of_pool_machines_only() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = test_config(false);
+        config.artifact_stem = scratch.path().join("artifact");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool =
+            RunnerPool::new(provider.clone(), config.clone()).expect("pool config validates");
+        let spec = |name: &MachineName| MachineSpec {
+            name: name.clone(),
+            image: "pack".to_owned(),
+            cpus: config.cpus,
+            memory_mib: config.memory_mib,
+            storage_gib: config.storage_gib,
+            overlay_gib: None,
+            network: NetworkPolicy::PublicOnly,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        };
+        let surviving = MachineName::new("lifecycle-test-golden").unwrap();
+        let foreign = MachineName::new("foreign-vm").unwrap();
+        provider.create(&spec(&surviving)).await.unwrap();
+        provider.create(&spec(&foreign)).await.unwrap();
+
+        pool.sweep_pack_intermediates().await;
+
+        assert_eq!(
+            *provider.prune_pack_calls.lock().await,
+            vec![surviving.as_str().to_owned()],
+            "the sweep prunes pool machines and skips foreign ones"
+        );
+    }
+
+    /// The unpack gate stalls `machine create` until the pack's headroom is
+    /// free, so a full host waits instead of filling to ENOSPC; and the same
+    /// wait exits as a clean stop when the pool shuts down.
+    #[tokio::test]
+    async fn golden_unpack_waits_for_pack_headroom() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        // A 13-byte pack gates on 78 bytes of free space: easy to script both
+        // sides of the boundary with one measure.
+        std::fs::write(&payload, b"packed-golden").unwrap();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+
+        // Full volume: the unpack waits, no machine is created, and shutdown
+        // reports a clean stop instead of a failed bake.
+        let starving = Arc::new(TestProvider::new(false, false, false, false, false));
+        let mut starving_config = config.clone();
+        starving_config.job_vm_disk =
+            JobVmDiskReserve::new(0, |_| Ok(0)).with_probe_interval(Duration::from_millis(5));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let provider = starving.clone();
+            let config = starving_config.clone();
+            let env_spec = env_spec.clone();
+            let golden = golden.clone();
+            let shutdown = shutdown.clone();
+            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            starving.created_image(&golden).await.is_none(),
+            "machine create must wait behind the disk gate"
+        );
+        shutdown.cancel();
+        let error = handle.await.unwrap().expect_err("shutdown stops the wait");
+        assert!(
+            error.to_string().contains("cancelled by shutdown"),
+            "waiting unpack reports a clean stop: {error}"
+        );
+
+        // Room for the pack: the gate falls through to a normal unpack.
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        config.job_vm_disk = JobVmDiskReserve::new(0, |_| Ok(u64::MAX))
+            .with_probe_interval(Duration::from_millis(5));
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("unpack proceeds once the pack fits");
+        assert!(
+            provider.created_image(&golden).await.is_some(),
+            "a host with room for the pack unpacks it"
+        );
+    }
+
+    /// A `create` that fails before registering leaves `pack/` residue the
+    /// named-machine prune cannot reach (no registry row for `data-dir` to
+    /// resolve, and `delete` is a no-op), so the failure path sweeps
+    /// unregistered residue first, then prunes the named machine anyway —
+    /// the create could equally have failed after registering.
+    #[tokio::test]
+    async fn golden_prepare_sweeps_unregistered_residue_on_create_failure() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_create());
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"packed-golden").unwrap();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a create that never registers still fails preparation");
+
+        assert_eq!(
+            *provider.failed_unpack_prunes.lock().await,
+            1,
+            "the failure path sweeps pack/ residue a pre-registration create left"
+        );
+        assert!(
+            provider.created_image(&golden).await.is_none(),
+            "the create died before registering"
+        );
+    }
+
+    /// Two environment goldens that prepare together cannot both gate on the
+    /// same free bytes: the check and the extraction it covers serialize, so
+    /// the second unpack re-measures after the first has drawn its headroom
+    /// and stalls instead of ENOSPC-ing mid-write.
+    #[tokio::test]
+    async fn concurrent_golden_unpacks_serialize_against_the_disk_gate() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        // 13-byte pack → 78 bytes of headroom; the scripted volume holds 137,
+        // enough for exactly one unpack: the first create draws 60 mid-flight
+        // and leaves 77, one byte short of what the second needs.
+        std::fs::write(&payload, b"packed-golden").unwrap();
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(137));
+        // Two parties: A's create and the test. When the test's wait returns,
+        // A is proven inside `create` holding the unpack permit; it then draws
+        // 60 bytes and finishes, so B's own measurement sees the spent room.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).gating_create(
+                barrier.clone(),
+                free.clone(),
+                60,
+            ),
+        );
+        {
+            let scripted = free.clone();
+            config.job_vm_disk = JobVmDiskReserve::new(0, move |_| {
+                Ok(scripted.load(std::sync::atomic::Ordering::SeqCst))
+            })
+            .with_probe_interval(Duration::from_millis(5));
+        }
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let golden_a = MachineName::new("lifecycle-test-golden").unwrap();
+        let golden_b = MachineName::new("lifecycle-test-other").unwrap();
+
+        let unpack_a = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let env_spec = env_spec.clone();
+            let golden = golden_a.clone();
+            async move {
+                prepare_fork_base(
+                    &provider,
+                    &config,
+                    &golden,
+                    &env_spec,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        // Returns only once A's create has rendezvoused — A is mid-extraction
+        // with the permit held.
+        barrier.wait().await;
+        let shutdown_b = CancellationToken::new();
+        let unpack_b = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let shutdown = shutdown_b.clone();
+            let golden = golden_b.clone();
+            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+        });
+
+        unpack_a
+            .await
+            .unwrap()
+            .expect("the first unpack has room and completes");
+        // B re-measures against the drawn-down volume — 77 free < 78 required
+        // — and stalls. Cancel it and confirm it never reached create.
+        shutdown_b.cancel();
+        unpack_b
+            .await
+            .unwrap()
+            .expect_err("the second unpack waits out the disk gate");
+        assert!(
+            provider.created_image(&golden_b).await.is_none(),
+            "the second unpack must not start against free space the first already drew"
+        );
+    }
+
+    /// The unpack gate sizes on the pack, not the configured disk ceiling:
+    /// the intermediates a real unpack writes track the pack's compressed
+    /// size, and the ceiling would stall hosts the write never reaches.
+    #[test]
+    fn golden_unpack_required_bytes_scales_with_the_pack() {
+        assert_eq!(
+            golden_unpack_required_bytes(GIB),
+            GOLDEN_UNPACK_HEADROOM_FACTOR * GIB
+        );
+        // Saturates instead of wrapping for a maliciously sized pack.
+        assert_eq!(golden_unpack_required_bytes(u64::MAX), u64::MAX);
     }
 
     /// A spent fork base with no surviving clones is re-armed (stop, start

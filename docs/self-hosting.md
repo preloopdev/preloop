@@ -260,6 +260,7 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_RUNNER_STORAGE_GB` | `80` | Writable guest disk ceiling (sparse — not allocated until written). The packed OCI golden needs ~80 GiB uncompressed |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free space kept on the VM data volume before a job VM is started; below it the pool holds the slot (`waiting for disk: …`) and jobs wait rather than fail. `0` disables |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | — | Proceed past the golden disk check with a warning. Without it, a golden download that cannot fit is refused before it starts, and a golden build is refused below builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB pack staging |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | `6` | Free space the golden unpack waits for, as a multiple of the pack's compressed size. smolvm writes several times the pack before its own layer preflight runs; the engine stalls the unpack rather than ENOSPC mid-write, and a failed attempt prunes its `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses the wait |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | `true` | Run the pool as forks of the golden rather than one boot per job |
