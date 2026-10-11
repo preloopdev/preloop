@@ -823,7 +823,7 @@ fn debug_session_scalars(inner: &InnerState) -> (u32, Option<f64>) {
 struct WebhookConditionInputs {
     stats: Option<crate::models::WebhookQueueStats>,
     watchdog: crate::webhook_status::WatchdogStatus,
-    breaker: crate::github_breaker::BreakerSnapshot,
+    breaker: Vec<crate::github_breaker::GithubBucketSnapshot>,
     app_config: Vec<crate::webhook_status::AppWebhookConfigStatus>,
 }
 
@@ -879,14 +879,15 @@ fn webhook_conditions(
             ));
         }
     }
-    if inputs.breaker.open {
+    for bucket in inputs.breaker.iter().filter(|row| row.breaker.open) {
         conditions.push(condition(
             "github_unavailable",
             "warning",
             format!(
-                "GitHub calls are circuit-broken for another {}s ({}): queued deliveries are parked, not failing",
-                inputs.breaker.retry_in_seconds.unwrap_or_default(),
-                inputs
+                "GitHub calls for credential bucket `{}` are circuit-broken for another {}s ({}): queued deliveries are parked, not failing",
+                bucket.bucket,
+                bucket.breaker.retry_in_seconds.unwrap_or_default(),
+                bucket
                     .breaker
                     .last_error
                     .clone()
@@ -1278,7 +1279,7 @@ fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs 
     WebhookConditionInputs {
         stats: state.webhook_status.queue_stats(),
         watchdog: state.webhook_status.watchdog(),
-        breaker: state.github_breaker.snapshot(),
+        breaker: state.github_breakers.snapshot(),
         app_config: state.webhook_status.app_config_snapshot().0,
     }
 }

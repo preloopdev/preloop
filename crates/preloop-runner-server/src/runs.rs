@@ -821,6 +821,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // workflow fetches: private `uses: owner/repo/...` references must
     // resolve without a separately exported token.
     crate::remote_workflows::resolve_remote_workflows(
+        shared,
         &mut submission,
         &workflow,
         shared.state.static_github_pat().as_deref(),

@@ -747,11 +747,19 @@ pub struct AppState {
     /// this (see [`wake_waiters`]); only the sampler listens on it.
     pub sampler_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
-    /// Circuit breaker for durable webhook delivery work. Check-run updates
-    /// go through the sender's per-installation budgets instead, so an
-    /// ingress outage cannot suppress status transitions for runs already in
-    /// progress.
-    pub github_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Circuit breakers for durable webhook delivery work, partitioned by the
+    /// calling credential's rate-limit identity (installation, PAT, App JWT,
+    /// anonymous). Check-run updates resolve their installation's bucket, so
+    /// an ingress outage cannot suppress status transitions for runs already
+    /// in progress, and one throttled credential never parks another's
+    /// traffic.
+    pub github_breakers: Arc<crate::github_breaker::GithubBreakerRegistry>,
+    /// Per-subsystem consumption accounting for outbound GitHub traffic
+    /// (requests, bytes, rate limits, breaker-blocked attempts). Only the
+    /// labeled sender ([`crate::github_breaker::send_observed_labeled`])
+    /// records here; the unlabeled [`crate::github_breaker::send_observed`]
+    /// covers only pre-`AppState` bootstrap reads and records nothing.
+    pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
     pub webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
@@ -1516,7 +1524,8 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
+            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             observability: preloop_observability::Observability::noop(),

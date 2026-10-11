@@ -452,6 +452,7 @@ pub async fn create_workspace_snapshot(
 struct CacheUpstreamCredential {
     upstream_token: Option<String>,
     credential_domain: String,
+    bucket: crate::github_breaker::GithubCredentialBucket,
 }
 
 /// Select the forge credential the control plane uses on a repository's
@@ -479,6 +480,9 @@ async fn resolve_cache_upstream_credential(
         return Ok(Some(CacheUpstreamCredential {
             upstream_token: Some(token),
             credential_domain: format!("app-{}-installation-{}", app.app_id, entry.installation_id),
+            bucket: crate::github_breaker::GithubCredentialBucket::Installation(
+                entry.installation_id,
+            ),
         }));
     }
     if let Some(token) = shared.state.static_github_pat() {
@@ -486,12 +490,14 @@ async fn resolve_cache_upstream_credential(
         return Ok(Some(CacheUpstreamCredential {
             upstream_token: Some(token),
             credential_domain: format!("pat-{fingerprint}"),
+            bucket: crate::github_breaker::GithubCredentialBucket::Pat,
         }));
     }
     if !repository_private {
         return Ok(Some(CacheUpstreamCredential {
             upstream_token: None,
             credential_domain: "public".to_owned(),
+            bucket: crate::github_breaker::GithubCredentialBucket::Anonymous,
         }));
     }
     Ok(None)
@@ -558,10 +564,22 @@ async fn resolve_canonical_upstream_slug(
     if let Some(token) = credential.upstream_token.as_deref() {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let response = match request.send().await {
+    let response = match crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        credential.bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Snapshots,
+        request,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(_) => return stored_slug.to_owned(),
     };
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Snapshots, &response);
     if !response.status().is_success() {
         return stored_slug.to_owned();
     }
@@ -633,11 +651,21 @@ async fn fetch_lfs_object_into_cache(
     if let Some(token) = credential.upstream_token.as_deref() {
         batch = batch.basic_auth("x-access-token", Some(token));
     }
-    let batch = batch
-        .body(request_body.to_string())
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("forge LFS batch request failed: {error}")))?;
+    // The batch endpoint is always the forge, so it is GitHub traffic and
+    // goes through the shared breaker with snapshots accounting.
+    let batch = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        credential.bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Snapshots,
+        batch.body(request_body.to_string()),
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("forge LFS batch request failed: {error}")))?;
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Snapshots, &batch);
     if !batch.status().is_success() {
         return Ok(false);
     }
@@ -679,10 +707,30 @@ async fn fetch_lfs_object_into_cache(
             download_request = download_request.basic_auth("x-access-token", Some(token));
         }
     }
-    let mut response = download_request
-        .send()
+    // The blob URL is forge-supplied and may point anywhere (presigned
+    // cross-host URLs download anonymously): only same-host downloads are
+    // GitHub traffic and go through the breaker. Cross-host downloads spend
+    // no GitHub budget, so they bypass it — the trust boundary above already
+    // keeps the credential off those hosts. The same condition gates byte
+    // accounting below: cross-host bytes are real bandwidth but not GitHub
+    // budget, so they go to the cross-host counter instead.
+    let via_github = same_host && http_scheme;
+    let mut response = if via_github {
+        crate::github_breaker::send_observed_labeled(
+            &shared.state.github_breakers,
+            credential.bucket,
+            &shared.state.github_consumption,
+            crate::github_breaker::GithubSubsystem::Snapshots,
+            download_request,
+        )
         .await
-        .map_err(|error| ApiError::internal(format!("forge LFS download failed: {error}")))?;
+        .map_err(|error| ApiError::internal(format!("forge LFS download failed: {error}")))?
+    } else {
+        download_request
+            .send()
+            .await
+            .map_err(|error| ApiError::internal(format!("forge LFS download failed: {error}")))?
+    };
     if !response.status().is_success() {
         return Ok(false);
     }
@@ -710,6 +758,19 @@ async fn fetch_lfs_object_into_cache(
                 %oid,
                 "LFS object exceeds the per-object cache cap; leaving uncached"
             );
+            // Cross-host bytes are not GitHub budget: they go to the
+            // cross-host counter, never the GitHub byte total.
+            if via_github {
+                shared
+                    .state
+                    .github_consumption
+                    .record_bytes(crate::github_breaker::GithubSubsystem::Snapshots, written);
+            } else {
+                shared.state.github_consumption.record_cross_host_bytes(
+                    crate::github_breaker::GithubSubsystem::Snapshots,
+                    written,
+                );
+            }
             return Ok(false);
         }
         hasher.update(&chunk);
@@ -721,6 +782,20 @@ async fn fetch_lfs_object_into_cache(
         ApiError::internal(format!("failed to flush staged LFS object: {error}"))
     })?;
     drop(file);
+    // Exact byte count off the stream — the one true number for LFS
+    // bandwidth accounting. Same-host downloads spent GitHub budget;
+    // cross-host downloads did not, so they are accounted separately.
+    if via_github {
+        shared
+            .state
+            .github_consumption
+            .record_bytes(crate::github_breaker::GithubSubsystem::Snapshots, written);
+    } else {
+        shared
+            .state
+            .github_consumption
+            .record_cross_host_bytes(crate::github_breaker::GithubSubsystem::Snapshots, written);
+    }
     if format!("{:x}", hasher.finalize()) != oid {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Ok(false);
@@ -777,6 +852,7 @@ pub async fn create_remote_checkout_snapshot(
     let CacheUpstreamCredential {
         upstream_token,
         credential_domain,
+        ..
     } = credential;
 
     let namespace = CheckoutCacheNamespace {
@@ -6409,5 +6485,211 @@ mod object_cache_tests {
             .unwrap();
 
         assert!(cache_has(&healed, &detached));
+    }
+}
+
+#[cfg(test)]
+mod lfs_accounting_tests {
+    use super::*;
+    use crate::github_breaker::GithubCredentialBucket;
+
+    /// Blob bytes served with a SHA-256 oid naming them, so the fetch's
+    /// integrity check passes and the object is cached.
+    struct LfsFixture {
+        blob: &'static [u8],
+        oid: String,
+        batch_base: String,
+        batch_body_len: usize,
+        _servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    fn blob_response(blob: &'static [u8]) -> axum::http::Response<axum::body::Body> {
+        axum::http::Response::builder()
+            .header("content-length", blob.len().to_string())
+            .body(axum::body::Body::from(blob))
+            .unwrap()
+    }
+
+    fn batch_response(batch_body: &str) -> axum::http::Response<axum::body::Body> {
+        axum::http::Response::builder()
+            .header("content-type", "application/vnd.git-lfs+json")
+            .header("content-length", batch_body.len().to_string())
+            .body(axum::body::Body::from(batch_body.to_owned()))
+            .unwrap()
+    }
+
+    impl LfsFixture {
+        /// `same_host = false` serves the blob from a different port than
+        /// the batch endpoint: a presigned cross-host URL for the
+        /// `url_download_host` comparison. `true` serves both from one
+        /// listener, i.e. a same-host forge download.
+        async fn new(blob: &'static [u8], same_host: bool) -> Self {
+            use sha2::Digest;
+            let oid = format!("{:x}", sha2::Sha256::digest(blob));
+            let mut servers = Vec::new();
+
+            // Bind first so the batch body can name the final href.
+            let blob_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let blob_base = format!("http://{}", blob_listener.local_addr().unwrap());
+
+            let (batch_base, batch_body_len) = if same_host {
+                let blob_href = format!("{blob_base}/blob");
+                let batch_body = serde_json::json!({
+                    "objects": [{
+                        "oid": oid,
+                        "size": blob.len(),
+                        "actions": { "download": { "href": blob_href } },
+                    }],
+                })
+                .to_string();
+                let batch_body_len = batch_body.len();
+                let app = axum::Router::new()
+                    .route(
+                        "/blob",
+                        axum::routing::get(move || async move { blob_response(blob) }),
+                    )
+                    .route(
+                        "/*path",
+                        axum::routing::post(move || async move { batch_response(&batch_body) }),
+                    );
+                servers.push(tokio::spawn(async move {
+                    axum::serve(blob_listener, app).await.unwrap()
+                }));
+                (blob_base, batch_body_len)
+            } else {
+                servers.push(tokio::spawn(async move {
+                    let app = axum::Router::new().route(
+                        "/blob",
+                        axum::routing::get(move || async move { blob_response(blob) }),
+                    );
+                    axum::serve(blob_listener, app).await.unwrap()
+                }));
+                let blob_href = format!("{blob_base}/blob");
+                let batch_body = serde_json::json!({
+                    "objects": [{
+                        "oid": oid,
+                        "size": blob.len(),
+                        "actions": { "download": { "href": blob_href } },
+                    }],
+                })
+                .to_string();
+                let batch_body_len = batch_body.len();
+                let batch_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let batch_base = format!("http://{}", batch_listener.local_addr().unwrap());
+                servers.push(tokio::spawn(async move {
+                    let app = axum::Router::new().route(
+                        "/*path",
+                        axum::routing::post(move || async move { batch_response(&batch_body) }),
+                    );
+                    axum::serve(batch_listener, app).await.unwrap()
+                }));
+                (batch_base, batch_body_len)
+            };
+            Self {
+                blob,
+                oid,
+                batch_base,
+                batch_body_len,
+                _servers: servers,
+            }
+        }
+    }
+
+    async fn lfs_shared(batch_base: &str) -> (tempfile::TempDir, std::sync::Arc<SharedState>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().join("state").to_path_buf())
+            .await
+            .unwrap();
+        state.github_urls = crate::state::GitHubUrls {
+            server_url: batch_base.to_owned(),
+            api_url: batch_base.to_owned(),
+            graphql_url: batch_base.to_owned(),
+        };
+        (
+            temp,
+            std::sync::Arc::new(SharedState {
+                state,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            }),
+        )
+    }
+
+    fn lfs_credential() -> CacheUpstreamCredential {
+        CacheUpstreamCredential {
+            upstream_token: None,
+            credential_domain: "public".to_owned(),
+            bucket: GithubCredentialBucket::Anonymous,
+        }
+    }
+
+    fn snapshots_usage(shared: &SharedState) -> crate::github_breaker::GithubSubsystemUsage {
+        shared
+            .state
+            .github_consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == "snapshots")
+            .expect("snapshots subsystem must be in the snapshot")
+    }
+
+    async fn fetch(
+        fixture: &LfsFixture,
+        shared: &std::sync::Arc<SharedState>,
+        temp: &tempfile::TempDir,
+    ) -> bool {
+        fetch_lfs_object_into_cache(
+            &crate::shared_http::CLIENT,
+            shared,
+            temp.path(),
+            "o/r",
+            &lfs_credential(),
+            &fixture.oid,
+            fixture.blob.len() as u64,
+        )
+        .await
+        .expect("fetch must not error")
+    }
+
+    /// A presigned cross-host LFS download bypasses the breaker and must not
+    /// charge its bytes to the GitHub total; they land on the cross-host
+    /// counter instead.
+    #[tokio::test]
+    async fn cross_host_lfs_bytes_are_not_github_bytes() {
+        let fixture = LfsFixture::new(b"cross-host lfs payload", false).await;
+        let (temp, shared) = lfs_shared(&fixture.batch_base).await;
+        assert!(fetch(&fixture, &shared, &temp).await, "object must cache");
+
+        let usage = snapshots_usage(&shared);
+        assert_eq!(
+            usage.requests, 1,
+            "only the batch call is a GitHub exchange"
+        );
+        assert_eq!(
+            usage.bytes, fixture.batch_body_len as u64,
+            "GitHub bytes are the batch response only"
+        );
+        assert_eq!(
+            usage.cross_host_bytes,
+            fixture.blob.len() as u64,
+            "cross-host blob bytes go to the cross-host counter"
+        );
+    }
+
+    /// A same-host LFS download is GitHub traffic: breaker, request count,
+    /// and the GitHub byte total all see it.
+    #[tokio::test]
+    async fn same_host_lfs_bytes_are_github_bytes() {
+        let fixture = LfsFixture::new(b"same-host lfs payload", true).await;
+        let (temp, shared) = lfs_shared(&fixture.batch_base).await;
+        assert!(fetch(&fixture, &shared, &temp).await, "object must cache");
+
+        let usage = snapshots_usage(&shared);
+        assert_eq!(usage.requests, 2, "batch + download are GitHub exchanges");
+        assert_eq!(usage.cross_host_bytes, 0);
+        assert_eq!(
+            usage.bytes,
+            (fixture.batch_body_len + fixture.blob.len()) as u64,
+            "same-host blob bytes are GitHub bytes"
+        );
     }
 }
