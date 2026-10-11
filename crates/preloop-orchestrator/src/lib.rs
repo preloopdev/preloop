@@ -880,6 +880,28 @@ impl std::fmt::Debug for JobVmDiskReserve {
     }
 }
 
+/// Run `step` unless `shutdown` fires first; `None` means the pool is
+/// stopping and the caller must go straight to teardown.
+///
+/// The provisioning phases — environment golden bakes and runner boots — run
+/// for minutes. Without this, a shutdown signal could not reach the pool's
+/// teardown until they finished, and the CLI's bounded stop would abort the
+/// whole pool mid-flight, stranding the machines those phases had already
+/// created (and, on macOS, their mounted layer images).
+///
+/// Dropping `step` is safe because every machine it may have created is
+/// deleted by the same teardown: it carries this pool's name prefix.
+async fn unless_shutdown<F, T>(shutdown: &CancellationToken, step: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        value = step => Some(value),
+    }
+}
+
 /// Wait until the VM volume has the configured reserve free.
 ///
 /// Returns `false` when `shutdown` fired first: the caller then abandons the
@@ -4086,6 +4108,9 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             armed: true,
         };
         ensure_host_externals(&self.config)?;
+        // Every machine the phases below create before a shutdown is torn
+        // down by `teardown`, so the cache exists from the first one on.
+        let golden_cache = Arc::new(GoldenCache::new(self.config.name_prefix.clone()));
         // A backend whose packs are not host files (AgentENV keeps them as
         // server-side snapshots) has no artifact to build, download, or
         // relocate: its golden is prepared directly from the base image by
@@ -4095,8 +4120,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // multi-gigabyte download at all; the caller only needs the pool to
         // stop, and the next start resumes from the same point.
         if shutdown.is_cancelled() {
-            self.remove_stale_machines().await?;
-            return Ok(());
+            return self.teardown(&golden_cache).await;
         }
         if self.provider.capabilities().file_packs
             && let Err(error) = self.prepare_artifact(&shutdown).await
@@ -4106,13 +4130,27 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // payload is only renamed into place once complete.
             if shutdown.is_cancelled() {
                 info!(%error, "shutdown during artifact preparation; stopping the pool");
-                self.remove_stale_machines().await?;
-                return Ok(());
+                return self.teardown(&golden_cache).await;
+            }
+            // The builder is a machine this pool owns, booted before most of
+            // the steps that can fail. The error exit must not strand it: the
+            // CLI's exit guard reaps SmolVM hypervisors, but not the layer
+            // mounts they hold or AgentENV sandboxes.
+            if let Err(teardown) = self.teardown(&golden_cache).await {
+                warn!(%teardown, "pool teardown after the artifact build failed");
             }
             return Err(error);
         }
         self.sweep_stale_artifacts().await;
-        self.remove_stale_machines().await?;
+        if let Err(error) = self.remove_stale_machines().await {
+            // A sweep that failed halfway may have left machines behind; give
+            // the teardown a chance to finish the cleanup before reporting
+            // the failure.
+            if let Err(teardown) = self.teardown(&golden_cache).await {
+                warn!(%teardown, "pool teardown after the startup sweep failed");
+            }
+            return Err(error);
+        }
 
         // Reconcile leaked VM state for the whole time the pool serves. The
         // startup pass above cannot see a delete that fails later, and an
@@ -4130,8 +4168,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             },
         };
 
-        let golden_cache = Arc::new(GoldenCache::new(self.config.name_prefix.clone()));
-
         // Fork mode needs its golden before any job can run, and there is no
         // fallback that could serve one: without a fork base a slot would have
         // to boot a raw image, which is neither the official golden nor a
@@ -4147,22 +4183,38 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // restarting the engine should not sit through either. The warm is
             // idempotent (an interrupted payload is never adopted, and the
             // next start resumes the download), so abandoning it is safe.
-            if let Err(error) = prepare_fork_base(
-                &self.provider,
-                &self.config,
-                &golden,
-                &environment,
+            // Dropping the preparation mid-boot leaves its machine to the
+            // teardown, which deletes everything carrying the pool's prefix.
+            let Some(prepared) = unless_shutdown(
                 &shutdown,
+                prepare_fork_base(
+                    &self.provider,
+                    &self.config,
+                    &golden,
+                    &environment,
+                    &shutdown,
+                ),
             )
             .await
-            {
+            else {
+                info!(
+                    machine = golden.as_str(),
+                    "shutdown during golden preparation; stopping the pool"
+                );
+                return self.teardown(&golden_cache).await;
+            };
+            if let Err(error) = prepared {
                 if shutdown.is_cancelled() {
                     info!(
                         machine = golden.as_str(),
-                        "shutdown during golden preparation; leaving it for the next start"
+                        "shutdown during golden preparation; stopping the pool"
                     );
-                    self.remove_stale_machines().await?;
-                    return Ok(());
+                    return self.teardown(&golden_cache).await;
+                }
+                // A failed bake may have booted the golden: it carries the
+                // pool's prefix, so the teardown deletes it.
+                if let Err(teardown) = self.teardown(&golden_cache).await {
+                    warn!(%teardown, "pool teardown after the golden preparation failed");
                 }
                 return Err(error);
             }
@@ -4259,30 +4311,55 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             });
         }
 
-        tokio::select! {
+        let slot_failure = tokio::select! {
             biased;
-            _ = shutdown.cancelled() => {}
+            _ = shutdown.cancelled() => None,
             result = slots.join_next() => {
                 shutdown.cancel();
-                match result {
+                Some(match result {
                     Some(Ok(Err(error))) => {
                         error!(%error, "runner slot failed; tearing down pool");
-                        return Err(error);
+                        error
                     }
                     Some(Err(error)) => {
                         error!(%error, "runner slot task panicked; tearing down pool");
-                        return Err(OrchestratorError::Pool(error.to_string()));
+                        OrchestratorError::Pool(error.to_string())
                     }
                     Some(Ok(Ok(()))) => {
                         error!("runner slot exited without shutdown; tearing down pool");
-                        return Err(OrchestratorError::Pool("runner slot exited".into()));
+                        OrchestratorError::Pool("runner slot exited".into())
                     }
-                    None => return Err(OrchestratorError::Pool("runner pool had no slots".into())),
-                }
+                    None => OrchestratorError::Pool("runner pool had no slots".into()),
+                })
             }
-        }
+        };
 
+        // Every slot observes the cancellation at its own await points (a
+        // provision in flight included), so this drains instead of waiting
+        // out a boot.
         while slots.join_next().await.is_some() {}
+        let teardown = self.teardown(&golden_cache).await;
+        match slot_failure {
+            // The failure is why the pool is stopping: report it rather than
+            // a teardown failure it may also have caused.
+            Some(error) => {
+                if let Err(teardown) = teardown {
+                    warn!(%teardown, "pool teardown after a slot failure failed");
+                }
+                Err(error)
+            }
+            None => teardown,
+        }
+    }
+
+    /// Stop the golden fork bases and delete every machine this pool owns.
+    ///
+    /// Runs on every exit path: the normal shutdown, a shutdown that arrives
+    /// during preparation, a preparation failure, and a slot failure. Deleting
+    /// a machine detaches its layer image, and the stale-machine sweep detaches
+    /// the mounts a killed hypervisor left behind, so the host home is
+    /// removable as soon as the engine exits.
+    async fn teardown(&self, golden_cache: &GoldenCache) -> Result<(), OrchestratorError> {
         // Stop, don't delete, every environment-specific golden fork base: the
         // machine directory (fork snapshot) must survive so the next engine
         // start can adopt it instead of rebaking. `remove_stale_machines`
@@ -4297,8 +4374,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 );
             }
         }
-        self.remove_stale_machines().await?;
-        Ok(())
+        self.remove_stale_machines().await
     }
 
     /// Golden slots the host can still afford alongside `runners` live VMs.
@@ -4459,28 +4535,20 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 }
             }
             if !failure_backoff.is_zero() {
-                tokio::time::sleep(failure_backoff).await;
+                // Up to 30 s of backoff; a shutdown must cut it short rather
+                // than hold the pool's teardown behind it.
+                if unless_shutdown(&shutdown, tokio::time::sleep(failure_backoff))
+                    .await
+                    .is_none()
+                {
+                    break;
+                }
             }
         }
 
         // Drain remaining runners on shutdown.
         while slots.join_next().await.is_some() {}
-        // Stop, don't delete, golden fork bases: the machine directory (fork
-        // snapshot) must survive so the next engine start can adopt the golden
-        // instead of rebaking it. `remove_stale_machines` spares recorded
-        // goldens; the fingerprint record gates adoption.
-        for golden in golden_cache.all_names().await {
-            vm_telemetry_deregister(&self.config, &golden);
-            if let Err(error) = self.provider.stop(&golden).await {
-                warn!(
-                    machine = golden.as_str(),
-                    %error,
-                    "failed to stop golden on shutdown; the next start will rebake it"
-                );
-            }
-        }
-        self.remove_stale_machines().await?;
-        Ok(())
+        self.teardown(&golden_cache).await
     }
 
     /// Build a fresh packed artifact from the configured image, ignoring any
@@ -4585,6 +4653,20 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
             _ => {}
+        }
+        // Killing a hypervisor releases its storage but not its layer mount:
+        // the `pack/layers-cs` sparseimage stays attached to the host, and
+        // the machine's data directory cannot be removed (`Resource busy`)
+        // until it is detached. Run after the purge, so a mount whose
+        // hypervisor just died is collectable in the same pass. A mount whose
+        // hypervisor is still alive is skipped (a spared golden), and
+        // `hdiutil` refuses a busy volume, so a running machine is safe.
+        match preloop_vm::detach_orphaned_layer_mounts() {
+            Ok(detached) if detached > 0 => {
+                info!(detached, "detached orphaned SmolVM layer mounts")
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "orphaned layer-mount detach failed"),
         }
         // The registry sweep above cannot see a machine whose registry row is
         // gone but whose data dir survived (smolvm's delete drops the row
@@ -5351,9 +5433,15 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         config.pool_status.clone(),
     );
     // Resolve the golden for the queued job's environment.
-    let resolved =
-        resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown)
-            .await?;
+    let Some(resolved) = unless_shutdown(
+        &shutdown,
+        resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let resolved = resolved?;
     let SlotEnvironment {
         source,
         environment,
@@ -5366,20 +5454,30 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // flight exactly as a warm slot does, so `preloop status` sees on-demand
     // boots as builds rather than as a pool that is idle while it forks.
     let generation = 1_u64;
-    let Some(runner) = ({
+    // Booting can run for minutes (image pull, guest installs, fork
+    // retries); the shutdown token aborts the provision instead of holding the
+    // pool's teardown behind it. Whatever the dropped future created carries
+    // this pool's name prefix and is deleted by the teardown.
+    let Some(provisioned) = ({
         let _building = BuildingGuard::enter(building, config.pool_status.clone());
-        provision_slot(
-            &provider,
-            &config,
-            slot,
-            generation,
-            golden.as_ref(),
-            &keys,
-            environment.clone(),
+        unless_shutdown(
             &shutdown,
+            provision_slot(
+                &provider,
+                &config,
+                slot,
+                generation,
+                golden.as_ref(),
+                &keys,
+                environment.clone(),
+                &shutdown,
+            ),
         )
-        .await?
+        .await
     }) else {
+        return Ok(());
+    };
+    let Some(runner) = provisioned? else {
         return Ok(());
     };
     // `provision_slot` returns only after runner registration succeeds. From
@@ -5457,15 +5555,18 @@ async fn run_slot<P: VmProvider + 'static>(
             config.preparing_signal.clone(),
             config.pool_status.clone(),
         );
-        let resolved = match resolve_slot_environment(
-            &provider,
-            &config,
-            &golden_cache,
-            &golden_budget,
+        // Baking an environment golden boots a VM and can run for minutes;
+        // the shutdown token aborts it, and the pool's teardown deletes the
+        // half-baked machine with the rest.
+        let Some(resolution) = unless_shutdown(
             &shutdown,
+            resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown),
         )
         .await
-        {
+        else {
+            break;
+        };
+        let resolved = match resolution {
             Ok(resolved) => {
                 golden_backoff = None;
                 resolved
@@ -5512,18 +5613,29 @@ async fn run_slot<P: VmProvider + 'static>(
         generation += 1;
         let runner = {
             let _building = BuildingGuard::enter(building.clone(), config.pool_status.clone());
-            match provision_slot(
-                &provider,
-                &config,
-                slot,
-                generation,
-                golden.as_ref(),
-                &keys,
-                environment.clone(),
+            // Booting can run for minutes (image pull, guest installs, fork
+            // retries); the shutdown token aborts the provision instead of
+            // holding the pool's teardown behind it. Whatever the dropped
+            // future created carries this pool's name prefix and is deleted
+            // by the teardown.
+            let Some(provisioned) = unless_shutdown(
                 &shutdown,
+                provision_slot(
+                    &provider,
+                    &config,
+                    slot,
+                    generation,
+                    golden.as_ref(),
+                    &keys,
+                    environment.clone(),
+                    &shutdown,
+                ),
             )
             .await
-            {
+            else {
+                break;
+            };
+            match provisioned {
                 Ok(Some(runner)) => runner,
                 // The disk reserve held the start until shutdown.
                 Ok(None) => break,

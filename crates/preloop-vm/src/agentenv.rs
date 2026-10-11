@@ -515,6 +515,79 @@ impl AgentEnvProvider {
         Ok(sandbox)
     }
 
+    /// Run [`Self::start_sandbox`] to completion even if the caller is
+    /// cancelled, and make the server-assigned sandbox id survive it.
+    ///
+    /// The pool cancels a slot's provisioning (and a golden's preparation)
+    /// when a shutdown arrives, and dropping this future with it would kill
+    /// the local `aenv` client before it can read the id — the server-side
+    /// sandbox would then run on, recorded nowhere, until its TTL. The
+    /// command therefore runs in a detached task that outlives the caller:
+    /// on success it hands the id back when the caller is still there, and
+    /// [`Self::finish_start`] records it when it is not.
+    async fn start_sandbox_supervised(
+        &self,
+        name: &MachineName,
+        target: &str,
+        cold: Option<&MachineSpec>,
+        operation: &'static str,
+    ) -> Result<String, VmError> {
+        let provider = self.clone();
+        let machine = name.clone();
+        let target = target.to_owned();
+        let cold = cold.cloned();
+        let handle = tokio::spawn(async move {
+            let result = provider
+                .start_sandbox(&target, cold.as_ref(), operation)
+                .await;
+            if let Ok(sandbox) = &result {
+                provider.finish_start(&machine, sandbox).await;
+            }
+            result
+        });
+        match handle.await {
+            Ok(result) => result,
+            Err(error) => Err(VmError::Protocol(format!(
+                "AgentENV {operation} task failed: {error}"
+            ))),
+        }
+    }
+
+    /// Keep the sandbox a completed start created deletable.
+    ///
+    /// The caller normally records the id itself; when it was cancelled
+    /// mid-start it never will, so the record is written here. A machine
+    /// whose record is already gone was torn down while the start was in
+    /// flight — nothing will ever delete the sandbox it created, so delete
+    /// it outright. The record is persisted, so even an engine that exits
+    /// before its teardown reaches this machine leaves the next engine the
+    /// id it needs.
+    async fn finish_start(&self, name: &MachineName, sandbox: &str) {
+        if self
+            .update(name, |record| record.sandbox = Some(sandbox.to_owned()))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        warn!(
+            machine = name.as_str(),
+            sandbox, "machine was torn down while its start ran; deleting the unrecorded sandbox"
+        );
+        if let Err(error) = self
+            .checked("delete", &["delete".into(), sandbox.to_owned()])
+            .await
+            && !matches!(&error, VmError::Command { message, .. } if is_absent(message))
+        {
+            warn!(
+                machine = name.as_str(),
+                sandbox,
+                %error,
+                "failed to delete the stranded AgentENV sandbox; it will expire with its TTL"
+            );
+        }
+    }
+
     /// Block until the guest agent answers an exec, or fail with the reason.
     ///
     /// A freshly created sandbox is reachable before `envd` is ready; upstream's
@@ -922,9 +995,12 @@ impl VmProvider for AgentEnvProvider {
             }
         }
         let sandbox = match start_target(&record.spec.image) {
-            StartTarget::Artifact(artifact) => self.start_sandbox(&artifact, None, "start").await?,
+            StartTarget::Artifact(artifact) => {
+                self.start_sandbox_supervised(name, &artifact, None, "start")
+                    .await?
+            }
             StartTarget::Image(image) => {
-                self.start_sandbox(&image, Some(&record.spec), "start")
+                self.start_sandbox_supervised(name, &image, Some(&record.spec), "start")
                     .await?
             }
         };
@@ -1005,21 +1081,21 @@ impl VmProvider for AgentEnvProvider {
                 }
             }
         };
-        // A retry with an already-used clone name must not silently orphan the
-        // previous sandbox: the insert below would drop its id without ever
-        // deleting it. Mirror `create` and reject instead.
-        if let Ok(existing) = self.record(clone).await
-            && existing.sandbox.is_some()
-        {
-            return Err(VmError::Command {
-                operation: "fork",
-                exit_code: 1,
-                message: format!("machine `{}` already exists", clone.as_str()),
-            });
-        }
-        let sandbox = self.start_sandbox(&snapshot, None, "fork").await?;
+        // Insert the clone's record before starting it: the start runs in a
+        // detached task that hands the server-assigned sandbox id back even
+        // when the caller is cancelled (see `start_sandbox_supervised`), and
+        // that task can only tell "torn down while starting" apart from
+        // "not inserted yet" when the record exists up front. The row also
+        // makes the sandbox deletable by name the moment it exists.
         {
             let mut registry = self.registry.lock().await;
+            if registry.machines.contains_key(clone.as_str()) {
+                return Err(VmError::Command {
+                    operation: "fork",
+                    exit_code: 1,
+                    message: format!("machine `{}` already exists", clone.as_str()),
+                });
+            }
             registry.machines.insert(
                 clone.as_str().to_owned(),
                 MachineRecord {
@@ -1029,7 +1105,7 @@ impl VmProvider for AgentEnvProvider {
                         image: format!("agentenv-snapshot:{snapshot}"),
                         ..golden_record.spec.clone()
                     },
-                    sandbox: Some(sandbox.clone()),
+                    sandbox: None,
                     fork_snapshot: None,
                     golden: Some(golden.as_str().to_owned()),
                     // Inherited from the golden's filesystem via the snapshot.
@@ -1038,6 +1114,20 @@ impl VmProvider for AgentEnvProvider {
             );
             self.persist(&registry);
         }
+        let sandbox = match self
+            .start_sandbox_supervised(clone, &snapshot, None, "fork")
+            .await
+        {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                // Nothing was started: drop the placeholder so a retry can
+                // fork the same name.
+                let _ = self.delete(clone).await;
+                return Err(error);
+            }
+        };
+        self.update(clone, |record| record.sandbox = Some(sandbox.clone()))
+            .await?;
         self.await_guest(&sandbox).await?;
         self.spawn_keepalive(clone, &sandbox).await;
         Ok(())
@@ -1091,16 +1181,40 @@ impl VmProvider for AgentEnvProvider {
             }
         }
         let mut registry = self.registry.lock().await;
+        // A detached start still running when the record above was read may
+        // have recorded its sandbox since: it is live and about to lose its
+        // only reference, so delete it with the row. (A start that records
+        // *after* this removal observes the missing row and deletes its own
+        // sandbox — see `finish_start` — so no interleaving leaks.)
+        let late = registry
+            .machines
+            .get(name.as_str())
+            .and_then(|record| record.sandbox.clone())
+            .filter(|sandbox| Some(sandbox) != record.sandbox.as_ref());
         registry.machines.remove(name.as_str());
         // Deleting a golden orphans its clones' start artifact, but the clones
         // themselves keep running until their own delete; only the parent link
         // is dropped so a recreated golden cannot inherit stale children.
-        for record in registry.machines.values_mut() {
-            if record.golden.as_deref() == Some(name.as_str()) {
-                record.golden = None;
+        for machine in registry.machines.values_mut() {
+            if machine.golden.as_deref() == Some(name.as_str()) {
+                machine.golden = None;
             }
         }
         self.persist(&registry);
+        drop(registry);
+        if let Some(sandbox) = late
+            && let Err(error) = self
+                .checked("delete", &["delete".into(), sandbox.clone()])
+                .await
+            && !matches!(&error, VmError::Command { message, .. } if is_absent(message))
+        {
+            warn!(
+                machine = name.as_str(),
+                sandbox,
+                %error,
+                "failed to delete a sandbox recorded while the machine was being deleted"
+            );
+        }
         Ok(())
     }
 
@@ -1595,5 +1709,178 @@ mod tests {
         assert!(!is_disk_too_small(
             "failed to start sandbox: no capacity for a new microVM"
         ));
+    }
+
+    /// Write an executable fake `aenv` where `start` blocks until `release`
+    /// exists (a server-side start in flight) and then prints `sandbox`, and
+    /// every `delete <id>` is appended to `log`.
+    fn fake_aenv(
+        dir: &std::path::Path,
+        sandbox: &str,
+        started: &std::path::Path,
+        release: &std::path::Path,
+        log: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("aenv");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 start)\n\
+                   : > '{started}'\n\
+                   while [ ! -f '{release}' ]; do sleep 0.02; done\n\
+                   echo '{sandbox}'\n\
+                   ;;\n\
+                 delete)\n\
+                   printf 'delete %s\\n' \"$2\" >> '{log}'\n\
+                   ;;\n\
+                 ls) echo '[]' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                started = started.display(),
+                release = release.display(),
+                log = log.display(),
+            ),
+        )
+        .expect("write fake aenv");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake aenv");
+        binary
+    }
+
+    fn cancellation_spec(name: &MachineName) -> MachineSpec {
+        MachineSpec {
+            name: name.clone(),
+            image: "ubuntu:24.04".into(),
+            cpus: 2,
+            memory_mib: 2048,
+            storage_gib: 8,
+            overlay_gib: None,
+            network: NetworkPolicy::Unrestricted,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        }
+    }
+
+    /// Wait (bounded) for `path` to exist.
+    async fn wait_for_path(path: &std::path::Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait (bounded) for `needle` to appear in `path`.
+    async fn wait_for_log(path: &std::path::Path, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::read_to_string(path).is_ok_and(|text| text.contains(needle)) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`{needle}` never appeared in {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A start cancelled mid-flight must not strand the server-side sandbox:
+    /// the id is only known from the command's output, and dropping the
+    /// caller's future kills the local client that would have read it. The
+    /// detached start task records the id regardless, so the pool's teardown
+    /// (which deletes machines from what the registry says) can reach it.
+    #[tokio::test]
+    async fn cancelled_start_still_records_the_server_assigned_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let log = dir.path().join("delete.log");
+        let binary = fake_aenv(dir.path(), "s1", &started, &release, &log);
+        let provider = AgentEnvProvider::new(binary)
+            .with_registry_path(dir.path().join("agentenv-machines.json"));
+        let name = MachineName::new("runner-0").unwrap();
+        provider.create(&cancellation_spec(&name)).await.unwrap();
+
+        let start = {
+            let provider = provider.clone();
+            let name = name.clone();
+            tokio::spawn(async move { provider.start(&name).await })
+        };
+        wait_for_path(&started).await;
+        // The pool cancels provisioning on shutdown; the caller's future is
+        // dropped while `aenv start` is still running.
+        start.abort();
+        let _ = start.await;
+
+        // The server-side start now completes. Its id must be recorded even
+        // though nobody waited for it.
+        std::fs::write(&release, b"").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(record) = provider.record(&name).await
+                && record.sandbox.as_deref() == Some("s1")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cancelled start's sandbox was never recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // And teardown deletes it like any recorded machine.
+        provider.delete(&name).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().trim(),
+            "delete s1",
+            "teardown must reach the sandbox the cancelled start created"
+        );
+    }
+
+    /// A start that completes after its machine was torn down must not leave
+    /// the sandbox orphaned: the row it would have been recorded into is
+    /// gone, so the detached task deletes the sandbox outright.
+    #[tokio::test]
+    async fn start_completing_after_teardown_deletes_the_unrecorded_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let log = dir.path().join("delete.log");
+        let binary = fake_aenv(dir.path(), "s1", &started, &release, &log);
+        let provider = AgentEnvProvider::new(binary)
+            .with_registry_path(dir.path().join("agentenv-machines.json"));
+        let name = MachineName::new("runner-0").unwrap();
+        provider.create(&cancellation_spec(&name)).await.unwrap();
+
+        let start = {
+            let provider = provider.clone();
+            let name = name.clone();
+            tokio::spawn(async move { provider.start(&name).await })
+        };
+        wait_for_path(&started).await;
+        // Teardown: the machine record is deleted while its start is in
+        // flight, when there is no sandbox id to delete yet.
+        provider.delete(&name).await.unwrap();
+        std::fs::write(&release, b"").unwrap();
+
+        wait_for_log(&log, "delete s1").await;
+        // The caller is still waiting on the start; it now fails because its
+        // machine is gone, instead of adopting a deleted sandbox.
+        assert!(
+            start.await.unwrap().is_err(),
+            "a start whose machine was torn down must report the failure"
+        );
     }
 }

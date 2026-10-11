@@ -55,6 +55,12 @@ struct RecordingVmProvider {
     /// A backend without host-side packs has no artifact to unpack, so its
     /// golden is baked in the guest instead.
     file_packs: bool,
+    /// When set, `start` records the machine as running and then blocks until
+    /// notified, so a test can observe the pool mid-provision.
+    start_gate: Option<Arc<Notify>>,
+    /// When set, `pack` fails: the artifact build leaves its builder behind,
+    /// which is what the pool's error path must clean up.
+    fail_pack: bool,
 }
 
 impl RecordingVmProvider {
@@ -71,6 +77,8 @@ impl RecordingVmProvider {
             run_actions: Mutex::new(run_actions),
             changed: Notify::new(),
             file_packs: true,
+            start_gate: None,
+            fail_pack: false,
         }
     }
 
@@ -78,6 +86,20 @@ impl RecordingVmProvider {
     /// artifact to unpack, so the pool prepares its golden in the guest.
     fn no_packs(mut self) -> Self {
         self.file_packs = false;
+        self
+    }
+
+    /// Block `start` until the gate is released, so a shutdown can be sent
+    /// while a machine is booting.
+    fn with_start_gate(mut self, gate: Arc<Notify>) -> Self {
+        self.start_gate = Some(gate);
+        self
+    }
+
+    /// Fail `pack`, standing in for a packaging error after the builder
+    /// booted.
+    fn with_failing_pack(mut self) -> Self {
+        self.fail_pack = true;
         self
     }
 
@@ -169,6 +191,9 @@ impl VmProvider for RecordingVmProvider {
         state.events.push(Event::Start(name.as_str().to_owned()));
         drop(state);
         self.notify_changed();
+        if let Some(gate) = &self.start_gate {
+            gate.notified().await;
+        }
         Ok(())
     }
 
@@ -295,6 +320,15 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
+        {
+            let mut state = self.state.lock().await;
+            state.pack_calls += 1;
+            state.events.push(Event::Pack(name.as_str().to_owned()));
+        }
+        self.notify_changed();
+        if self.fail_pack {
+            return Err(provider_error("pack"));
+        }
         // Mirror the smolvm 1.7.2 pack contract: `<output>` is an ELF
         // launcher stub and `<output>.smolmachine` carries the packed VM
         // data. The orchestrator consumes the sidecar; the stub is discarded.
@@ -302,11 +336,6 @@ impl VmProvider for RecordingVmProvider {
         let sidecar = PathBuf::from(format!("{}.smolmachine", output.display()));
         fs::write(&stub, b"elf-launcher-stub").map_err(|_| provider_error("pack"))?;
         fs::write(&sidecar, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
-        let mut state = self.state.lock().await;
-        state.pack_calls += 1;
-        state.events.push(Event::Pack(name.as_str().to_owned()));
-        drop(state);
-        self.notify_changed();
         Ok(())
     }
 }
@@ -637,6 +666,46 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
             .filter(|event| matches!(event, Event::Create(name) if name.ends_with("-builder")))
             .count(),
         1
+    );
+}
+
+/// An artifact build that fails after the builder booted must not strand the
+/// builder: the pool's error path tears its machines down like every other
+/// exit. The CLI's exit guard only reaps hypervisor processes — not the
+/// layer mounts a killed hypervisor holds, and not AgentENV sandboxes.
+#[tokio::test]
+async fn artifact_build_failure_tears_the_builder_down() {
+    let fixture = Fixture::new("artifact-fail", false);
+    let provider = Arc::new(RecordingVmProvider::with_machines(&[], vec![]).with_failing_pack());
+    let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
+    let error = pool
+        .run(CancellationToken::new())
+        .await
+        .expect_err("a failed pack must fail the pool");
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("pack"),
+        "the pack failure must be reported: {error}"
+    );
+
+    let builder = format!("{}-builder", fixture.config.name_prefix);
+    let snapshot = provider.snapshot().await;
+    assert!(
+        snapshot.events.contains(&Event::Start(builder.clone())),
+        "the fixture must have booted the builder: {:?}",
+        snapshot.events
+    );
+    assert!(
+        !snapshot.machines.contains_key(&builder),
+        "the failed build's builder must be deleted: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &builder)),
+        "the teardown must delete the builder: {:?}",
+        snapshot.events
     );
 }
 
@@ -1068,6 +1137,107 @@ async fn stale_owned_machines_are_removed_without_touching_unrelated_machines() 
             .iter()
             .any(|event| matches!(event, Event::Delete(name) if name == unrelated))
     );
+}
+
+/// A shutdown that arrives while a slot is booting a runner must stop the
+/// pool — and delete the half-built machine — instead of waiting the boot
+/// out until the CLI's bounded stop aborts the whole pool and strands the VM
+/// (with its hypervisor and mounted layer image) on the host.
+#[tokio::test]
+async fn cancellation_during_runner_boot_deletes_the_half_built_machine() {
+    let fixture = Fixture::new("cancel-boot", true);
+    let name_prefix = fixture.config.name_prefix.clone();
+    let gate = Arc::new(Notify::new());
+    let provider = Arc::new(
+        RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
+            .with_start_gate(gate.clone()),
+    );
+    let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    let slot_prefix = format!("{name_prefix}-0-");
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Start(name) if name.starts_with(&slot_prefix)))
+        })
+        .await;
+    let runner = first_slot_machine(&provider.snapshot().await.events, &name_prefix);
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+        .await
+        .expect("a shutdown must stop the pool while a runner is booting");
+    result.unwrap().unwrap();
+
+    let snapshot = provider.snapshot().await;
+    assert!(
+        !snapshot.machines.contains_key(&runner),
+        "the teardown must delete the half-built machine: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+    );
+    gate.notify_waiters();
+}
+
+/// A shutdown that arrives while the golden fork base is being prepared must
+/// stop the pool and remove the half-prepared golden: nothing adopts a golden
+/// without its fingerprint record, so leaving the machine behind only leaks
+/// its VM and layer image.
+#[tokio::test]
+async fn cancellation_during_golden_prepare_removes_the_golden_machine() {
+    let fixture = Fixture::new("cancel-golden", true);
+    let mut config = fixture.config.clone();
+    config.use_fork = true;
+    config.control_socket = Some(fixture.root.join("engine.sock"));
+    let golden = format!("{}-golden", config.name_prefix);
+    let gate = Arc::new(Notify::new());
+    let provider = Arc::new(
+        RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
+            .with_start_gate(gate.clone()),
+    );
+    let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Start(name) if name == &golden))
+        })
+        .await;
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+        .await
+        .expect("a shutdown must stop the pool while the golden is booting");
+    result.unwrap().unwrap();
+
+    let snapshot = provider.snapshot().await;
+    assert!(
+        !snapshot.machines.contains_key(&golden),
+        "the teardown must delete the half-prepared golden: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &golden))
+    );
+    gate.notify_waiters();
 }
 
 #[tokio::test]

@@ -2038,29 +2038,130 @@ async fn cmd_engine(
         Err(_) => None,
     };
 
-    if let Some(pool_task) = pool.as_mut() {
-        tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            result = pool_task => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
-        }
-    } else {
-        tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
-        }
-    }
+    // Every way out of this process — the normal shutdown below, a slot
+    // failure that ends the pool, an error return — must not leave VMs
+    // running: see `VmTeardownOnExit`.
+    let _vm_teardown = VmTeardownOnExit;
+
+    let stop = wait_for_stop(&mut server, &mut pool, engine_shutdown_signal()).await;
+    let result = match stop {
+        Stop::Server(result) | Stop::Pool(result) => Some(result),
+        Stop::Signal => None,
+    };
+
     shutdown.cancel();
-    if let Some(pool_task) = pool.as_mut()
-        && tokio::time::timeout(Duration::from_secs(30), &mut *pool_task)
-            .await
-            .is_err()
-    {
-        pool_task.abort();
-    }
+    settle_pool(&mut pool, Duration::from_secs(30)).await;
     server.abort();
     let _ = std::fs::remove_file(socket);
-    Ok(())
+    match result {
+        Some(result) => result,
+        None => Ok(()),
+    }
+}
+
+/// Why the engine is stopping; each result is handled *after* the pool has
+/// settled, never by an early return past its teardown.
+enum Stop {
+    Server(anyhow::Result<()>),
+    Pool(anyhow::Result<()>),
+    Signal,
+}
+
+fn flatten_task_result<E: Into<anyhow::Error>>(
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    result.map_err(anyhow::Error::from)?.map_err(Into::into)
+}
+
+/// Wait for the first reason the engine must stop.
+///
+/// When the pool task is the one that ended the race, its handle is consumed
+/// out of `pool`: a finished `JoinHandle` panics if it is polled again, and
+/// the shutdown sequence that follows would otherwise wait on it.
+async fn wait_for_stop<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: impl Future<Output = ()>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let stop = {
+        let pool_ended = async {
+            match pool.as_mut() {
+                Some(task) => flatten_task_result(task.await),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = &mut *server => Stop::Server(flatten_task_result(result)),
+            result = pool_ended => Stop::Pool(result),
+            _ = signal => Stop::Signal,
+        }
+    };
+    if matches!(stop, Stop::Pool(_)) {
+        *pool = None;
+    }
+    stop
+}
+
+/// Give the pool `grace` to reach its own teardown after the shutdown token
+/// fired, then abort and join it.
+///
+/// The join matters: a pool that did not finish inside the window can be
+/// stuck in a provider call that never observes the token, and the exit guard
+/// scans for VMs next — a slot must not be able to boot one after that scan,
+/// or it is stranded on the host.
+async fn settle_pool<P>(
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    grace: Duration,
+) {
+    if let Some(task) = pool.as_mut()
+        && tokio::time::timeout(grace, &mut *task).await.is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+    *pool = None;
+}
+
+/// Stop every VM this engine owns as the process exits.
+///
+/// SmolVM's `_boot-vm` hypervisor is detached from the CLI that spawned it —
+/// it survives the parent by design — and each packed machine's
+/// `pack/layers-cs` APFS sparseimage stays mounted for the life of the VM. An
+/// engine that exits with a machine still running leaves a hypervisor and a
+/// mount nothing can reach: the next engine cannot adopt them, and the home
+/// cannot be removed (`rm -rf` → `Resource busy`) until the host reboots.
+///
+/// The pool runs its own teardown on every path it reaches; this is the
+/// backstop for the paths it does not. Both steps are safe against a live
+/// machine: the purge keys on this home's boot-config paths (and `All` is
+/// sound because by now this process is exiting, so nothing of ours can be
+/// running), and a mount whose hypervisor still exists is skipped.
+struct VmTeardownOnExit;
+
+impl Drop for VmTeardownOnExit {
+    fn drop(&mut self) {
+        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+            Ok(killed) if killed > 0 => {
+                tracing::info!(
+                    killed,
+                    "purged orphaned SmolVM hypervisor processes at exit"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "orphaned hypervisor purge at exit failed"),
+        }
+        match preloop_vm::detach_orphaned_layer_mounts() {
+            Ok(detached) if detached > 0 => {
+                tracing::info!(detached, "detached orphaned SmolVM layer mounts at exit")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "orphaned layer-mount detach at exit failed"),
+        }
+    }
 }
 
 async fn engine_shutdown_signal() {
@@ -4933,6 +5034,73 @@ fn find_debug_machine(
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(std::future::pending())
+    }
+
+    /// A pool that ends the race (a failed slot) is consumed by
+    /// `wait_for_stop`: the shutdown sequence that follows must neither
+    /// re-poll the finished handle (tokio panics: "JoinHandle polled after
+    /// completion") nor lose the pool's own error.
+    #[tokio::test]
+    async fn pool_that_ends_the_engine_is_settled_without_repolling() {
+        let mut server = never_ending_server();
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let stop = wait_for_stop(&mut server, &mut pool, std::future::pending()).await;
+        let Stop::Pool(Err(error)) = stop else {
+            panic!("the pool's failure must be reported as the stop reason");
+        };
+        assert_eq!(error.to_string(), "slot failed");
+
+        settle_pool(&mut pool, Duration::from_millis(50)).await;
+        assert!(pool.is_none());
+        server.abort();
+    }
+
+    /// A pool stuck past the grace window is aborted *and joined* before
+    /// `settle_pool` returns, so no slot can boot a VM after the exit guard's
+    /// scan.
+    #[tokio::test]
+    async fn stuck_pool_is_aborted_and_joined_after_the_grace_window() {
+        let alive = std::sync::Arc::new(());
+        let held = alive.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(std::sync::Arc::strong_count(&alive), 2);
+
+        settle_pool(&mut pool, Duration::from_millis(20)).await;
+
+        assert!(pool.is_none());
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "the aborted pool task must be joined, dropping everything it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_stops_the_engine_while_the_pool_keeps_its_handle() {
+        let mut server = never_ending_server();
+        let mut pool: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+            Some(tokio::spawn(std::future::pending()));
+
+        let stop = wait_for_stop(&mut server, &mut pool, std::future::ready(())).await;
+
+        assert!(matches!(stop, Stop::Signal));
+        assert!(
+            pool.is_some(),
+            "a still-running pool must stay joinable for the settle step"
+        );
+        settle_pool(&mut pool, Duration::from_millis(20)).await;
+        server.abort();
+    }
 
     /// Serializes tests that mutate process-global env vars read by
     /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
