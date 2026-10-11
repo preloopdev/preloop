@@ -380,6 +380,12 @@ pub async fn ws_live_logs(
         // messages would reveal whether the job UUID resolves.
         crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())
             .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
+        // Liveness: the results plane already rejects writes for settled
+        // jobs; a stale job credential must not reopen the closed live-log
+        // feed either — fresh input from a dead job reopens the feed and
+        // wipes the retained tail. The system credential bypasses, matching
+        // the results-plane rule.
+        crate::auth::require_live_job(&shared.state, agent_job_id).await?;
     }
     Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
 }

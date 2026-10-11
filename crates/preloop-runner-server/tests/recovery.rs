@@ -3272,3 +3272,311 @@ jobs:
         );
     }
 }
+
+/// Round-3 §7: a settled job's runtime token must not reopen its live-log
+/// feed. The liveness gate the Twirp results writes carry applies to the
+/// legacy WS ingest upgrade too: a dead job gets no 101, and its retained
+/// tail survives the attempt.
+#[tokio::test]
+async fn live_log_websocket_rejects_stale_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A live job streams fine.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_a}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let payload = json!({
+        "stepId": "step-1",
+        "startLine": 1,
+        "count": 1,
+        "value": ["original-line"]
+    });
+    futures::SinkExt::send(
+        &mut ws,
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_a)
+                    && job_lines.lock().await.lines.len() == 1
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(ws);
+
+    // The job settles: its runtime token is now stale.
+    complete_job(&state, run_id, &logical_a, ExecutionStatus::Success).await;
+
+    // The stale token must not get a 101 upgrade.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_a}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        result.is_err(),
+        "a settled job's token must not upgrade the live-log WS"
+    );
+
+    // The retained tail is intact and still marked closed: no forged line
+    // could have reopened and wiped it.
+    {
+        let inner = state.inner.lock().await;
+        let job_lines = inner
+            .live_log_lines
+            .get(&agent_a)
+            .expect("original history must survive");
+        let wrappers = job_lines.lock().await;
+        assert_eq!(wrappers.lines.len(), 1);
+        assert_eq!(wrappers.lines[0].value, vec!["original-line"]);
+        assert!(inner.live_log_closed.contains(&agent_a));
+    }
+
+    server.abort();
+}
+
+/// Round-3 §7: the legacy timeline PATCH carries the same liveness gate as
+/// the Twirp results writes — a settled job's token gets 403, a live job's
+/// token still succeeds.
+#[tokio::test]
+async fn legacy_timeline_patch_rejects_stale_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (logical, plan_id, timeline_id, agent_job_id) = {
+        let inner = state.test_tx().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("submitted run owns a request");
+        (
+            request.job_id.0.clone(),
+            request.plan_id.clone(),
+            request.timeline_id.to_string(),
+            request.agent_job_id.to_string(),
+        )
+    };
+    let credential = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_job_id}"),
+            "scp": format!("Actions.Results:{plan_id}:{agent_job_id}"),
+        }))
+        .unwrap();
+
+    let patch = || {
+        app.clone().oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!(
+                    "/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "count": 0, "value": [] }).to_string()))
+                .unwrap(),
+        )
+    };
+
+    let response = patch().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a live job's token must still PATCH its timeline"
+    );
+
+    complete_job(&state, run_id, &logical, ExecutionStatus::Success).await;
+
+    let response = patch().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a settled job's token must not PATCH its timeline"
+    );
+}
+
+/// Round-3 §7: the legacy log create/append endpoints carry the same
+/// liveness gate — a settled job's token gets 403, a live job's token still
+/// succeeds.
+#[tokio::test]
+async fn legacy_log_append_rejects_stale_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (logical, plan_id, agent_job_id) = {
+        let inner = state.test_tx().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("submitted run owns a request");
+        (
+            request.job_id.0.clone(),
+            request.plan_id.clone(),
+            request.agent_job_id.to_string(),
+        )
+    };
+    let credential = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_job_id}"),
+            "scp": format!("Actions.Results:{plan_id}:{agent_job_id}"),
+        }))
+        .unwrap();
+
+    // Create a log while the job is live.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/s/h/{plan_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "path": "step.log" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let log_id = created["id"].as_i64().expect("created log has an id");
+
+    let append = || {
+        app.clone().oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/s/h/{plan_id}/{log_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .body(Body::from("a live line\n"))
+                .unwrap(),
+        )
+    };
+
+    let response = append().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "a live job's token must still append logs"
+    );
+
+    complete_job(&state, run_id, &logical, ExecutionStatus::Success).await;
+
+    let response = append().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a settled job's token must not append logs"
+    );
+}
+
+/// Round-3 §7: the `TimeLineWebConsoleLog` live-console feed carries the same
+/// liveness gate — a settled job's token gets 403 (it used to reopen the
+/// closed feed and wipe the retained tail), a live job's token still
+/// succeeds.
+#[tokio::test]
+async fn legacy_console_log_rejects_stale_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (logical, plan_id, timeline_id, agent_job_id) = {
+        let inner = state.test_tx().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("submitted run owns a request");
+        (
+            request.job_id.0.clone(),
+            request.plan_id.clone(),
+            request.timeline_id.to_string(),
+            request.agent_job_id.to_string(),
+        )
+    };
+    let credential = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_job_id}"),
+            "scp": format!("Actions.Results:{plan_id}:{agent_job_id}"),
+        }))
+        .unwrap();
+
+    let console = || {
+        app.clone().oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/_apis/v1/TimeLineWebConsoleLog/s/h/{plan_id}/{timeline_id}/step-1"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stepId": "step-1",
+                        "startLine": 1,
+                        "count": 1,
+                        "value": ["a live line"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let response = console().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a live job's token must still stream console lines"
+    );
+
+    complete_job(&state, run_id, &logical, ExecutionStatus::Success).await;
+
+    let response = console().await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a settled job's token must not stream console lines"
+    );
+}
