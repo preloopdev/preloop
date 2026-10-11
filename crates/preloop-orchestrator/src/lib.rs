@@ -7419,10 +7419,10 @@ mod lifecycle_tests {
         /// Calls to `prune_failed_unpack_residue`, the unregistered-dir
         /// sweep a failed unpack runs before the named-machine prune.
         failed_unpack_prunes: Mutex<u32>,
-        /// When set, `create` blocks after recording its start until
-        /// notified — models a multi-minute pack extraction, and lets a test
-        /// hold one unpack mid-write while another is staged.
-        create_gate: Option<Arc<tokio::sync::Notify>>,
+        /// When set, `create` waits on this barrier before drawing — a test
+        /// that waits on the same barrier proves the extraction started, no
+        /// sleep or lost notification involved.
+        create_barrier: Option<Arc<tokio::sync::Barrier>>,
         /// Bytes `create` draws from the scripted free-space counter before
         /// registering — the pack intermediates it writes.
         disk_draw: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
@@ -7467,7 +7467,7 @@ mod lifecycle_tests {
                 prune_pack_calls: Mutex::new(Vec::new()),
                 fail_create: false,
                 failed_unpack_prunes: Mutex::new(0),
-                create_gate: None,
+                create_barrier: None,
                 disk_draw: None,
                 fail_exec_containing: Mutex::new(None),
                 file_packs: true,
@@ -7487,15 +7487,16 @@ mod lifecycle_tests {
             self
         }
 
-        /// `create` blocks on `gate` after starting and draws `bytes` from the
-        /// free-space counter while it parks — an extraction in progress.
+        /// `create` waits on `barrier` with the test, then draws `bytes` from
+        /// the free-space counter — an extraction in progress the test can
+        /// hold until a second unpack is queued behind the permit.
         fn gating_create(
             mut self,
-            gate: Arc<tokio::sync::Notify>,
+            barrier: Arc<tokio::sync::Barrier>,
             counter: Arc<std::sync::atomic::AtomicU64>,
             bytes: u64,
         ) -> Self {
-            self.create_gate = Some(gate);
+            self.create_barrier = Some(barrier);
             self.disk_draw = Some((counter, bytes));
             self
         }
@@ -10483,10 +10484,10 @@ done
         }
 
         async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
-            if let Some(gate) = &self.create_gate {
-                // Hold the draw while parked: the extraction's bytes are
-                // committed before the create completes.
-                gate.notified().await;
+            if let Some(barrier) = &self.create_barrier {
+                // Rendezvous with the test, then commit the draw: after this
+                // returns the extraction's bytes are spent.
+                barrier.wait().await;
             }
             if let Some((counter, bytes)) = &self.disk_draw {
                 counter.fetch_sub(*bytes, std::sync::atomic::Ordering::SeqCst);
@@ -11578,10 +11579,13 @@ done
         // and leaves 77, one byte short of what the second needs.
         std::fs::write(&payload, b"packed-golden").unwrap();
         let free = Arc::new(std::sync::atomic::AtomicU64::new(137));
-        let gate = Arc::new(tokio::sync::Notify::new());
+        // Two parties: A's create and the test. When the test's wait returns,
+        // A is proven inside `create` holding the unpack permit; it then draws
+        // 60 bytes and finishes, so B's own measurement sees the spent room.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let provider = Arc::new(
             TestProvider::new(false, false, false, false, false).gating_create(
-                gate.clone(),
+                barrier.clone(),
                 free.clone(),
                 60,
             ),
@@ -11597,8 +11601,6 @@ done
         let golden_a = MachineName::new("lifecycle-test-golden").unwrap();
         let golden_b = MachineName::new("lifecycle-test-other").unwrap();
 
-        // Unpack A acquires the serialization permit and parks inside create,
-        // holding the extraction's draw while B waits behind the permit.
         let unpack_a = tokio::spawn({
             let provider = provider.clone();
             let config = config.clone();
@@ -11615,7 +11617,9 @@ done
                 .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Returns only once A's create has rendezvoused — A is mid-extraction
+        // with the permit held.
+        barrier.wait().await;
         let shutdown_b = CancellationToken::new();
         let unpack_b = tokio::spawn({
             let provider = provider.clone();
@@ -11624,9 +11628,6 @@ done
             let golden = golden_b.clone();
             async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
         });
-        // Let B reach the permit, then let A's create finish and draw.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        gate.notify_waiters();
 
         unpack_a
             .await

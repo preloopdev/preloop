@@ -1050,34 +1050,65 @@ fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
 /// create, not one in progress (the orphan sweep's grace window exists for
 /// the lock-free fork case; this runs after a returned failure). No `age`
 /// check, no `storage.raw` check — the disk is what the failed unpack never
-/// wrote, and [`prune_pack_dir_in`] still refuses symlink `pack/` entries.
+/// wrote — and only real directories under a canonicalized root match: a
+/// hex-named symlink could point anywhere, `known_dirs` are compared by
+/// canonical path, and [`prune_pack_dir_in`] still refuses symlink `pack/`
+/// entries.
 /// Returns how many pack trees were removed.
 fn prune_unregistered_pack_dirs(
     roots: &[PathBuf],
     known_dirs: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<usize, VmError> {
     let mut pruned = 0usize;
+    // `data-dir` answers with whatever path SmolVM resolved, which need not
+    // byte-match a scanned root (`/tmp` vs `/private/tmp` on macOS): compare
+    // on canonical spellings so a registered dir never reads as residue.
+    let known: std::collections::BTreeSet<PathBuf> = known_dirs
+        .iter()
+        .map(|dir| dir.canonicalize().unwrap_or_else(|_| dir.clone()))
+        .collect();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
+        let Ok(root_canonical) = root.canonicalize() else {
+            warn!(root = %root.display(), "pack-residue scan root does not resolve");
             continue;
         };
-        for entry in entries.flatten() {
+        let entries = match std::fs::read_dir(&root_canonical) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    root = %root_canonical.display(),
+                    %error,
+                    "pack-residue scan could not read this root; residue there survives"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                warn!("pack-residue scan skipped an unreadable directory entry");
+                continue;
+            };
             let path = entry.path();
-            if !is_machine_data_dir_name(&entry.file_name()) || !path.is_dir() {
+            // A symlinked machine dir could point outside the root: only real
+            // directories are machine data dirs.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !is_machine_data_dir_name(&entry.file_name()) || !meta.is_dir() {
                 continue;
             }
-            // `data-dir` answers with whatever path SmolVM resolved, which need
-            // not byte-match a configured root (`/tmp` vs `/private/tmp` on
-            // macOS): match registered dirs on either spelling.
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if known_dirs.contains(&path) || known_dirs.contains(&canonical) {
+            let canonical = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(&root_canonical) || known.contains(&canonical) {
                 continue;
             }
-            match prune_pack_dir_in(&path) {
+            match prune_pack_dir_in(&canonical) {
                 Ok(true) => pruned += 1,
                 Ok(false) => {}
                 Err(error) => warn!(
-                    machine_dir = %path.display(),
+                    machine_dir = %canonical.display(),
                     %error,
                     "failed to prune pack/ intermediates from unregistered machine dir"
                 ),
