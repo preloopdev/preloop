@@ -26,6 +26,7 @@ mod lifecycle;
 mod lookups;
 mod needs;
 mod outbox;
+mod promote;
 mod reaper;
 mod rerun;
 mod runners;

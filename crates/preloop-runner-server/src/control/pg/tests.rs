@@ -2066,6 +2066,77 @@ async fn max_parallel_cohort_releases_its_dependent_after_the_last_leg() {
     );
 }
 
+/// A leg admitted into a freed `max-parallel` slot that settles at a gate
+/// (here: labels no runner can serve) never held the slot, so the same
+/// completion admits the next parked leg, and the failure is reported once.
+#[tokio::test]
+async fn max_parallel_admission_continues_past_a_leg_that_fails_its_gate() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    let mut submit = submit_run(
+        run,
+        vec![
+            submit_job(run, "gen", 1),
+            submit_job(run, "m1", 2),
+            submit_job(run, "m2", 3),
+            submit_job(run, "m3", 4),
+            submit_job(run, "after", 5),
+        ],
+    );
+    for job in &mut submit.jobs {
+        if job.queued.job_id.0.starts_with('m') {
+            job.queued.base_id = "m".to_owned();
+            job.queued.max_parallel = Some(1);
+            job.queued.needs = vec![JobId("gen".to_owned())];
+        }
+        // No windows runner is registered: m2's labels are unhostable at
+        // promotion (a needs-less job would be rejected at submit instead).
+        if job.queued.job_id.0 == "m2" {
+            job.queued.runs_on = vec!["windows-latest".to_owned()];
+        }
+    }
+    submit.jobs[4].queued.needs = ["m1", "m2", "m3"].map(|id| JobId(id.to_owned())).to_vec();
+    node.submit_run(submit).await.unwrap();
+
+    complete_ok(&node, run, "gen").await;
+    assert_eq!(queue_state(&node, run, "m1").await, "ready");
+    assert_eq!(queue_state(&node, run, "m2").await, "blocked");
+    assert_eq!(queue_state(&node, run, "m3").await, "blocked");
+
+    let outcome = node
+        .complete_job(JobCompletionInput {
+            run_id: run,
+            job_id: JobId("m1".to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: BTreeMap::new(),
+            runner_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.scheduling.failed,
+        vec![(run, JobId("m2".to_owned()))],
+        "the unhostable leg fails exactly once"
+    );
+    assert_eq!(outcome.scheduling.promoted, 1, "{:?}", outcome.scheduling);
+    assert_eq!(queue_state(&node, run, "m2").await, "none");
+    assert_eq!(
+        queue_state(&node, run, "m3").await,
+        "ready",
+        "the failed leg freed the slot within the same completion"
+    );
+    assert_eq!(queue_state(&node, run, "after").await, "blocked");
+    complete_ok(&node, run, "m3").await;
+    assert_eq!(
+        queue_state(&node, run, "after").await,
+        "none",
+        "every leg is terminal and one failed: the dependent is skipped, not queued"
+    );
+}
+
 /// Nested reusable callers share inner job ids: `outer` waits on `outer/inner`
 /// and its leaf, and `outer/inner` waits on the leaf too. When the leaf
 /// completes, `outer` is still incomplete and visited first; the fold must keep
