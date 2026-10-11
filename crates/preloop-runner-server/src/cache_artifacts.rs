@@ -110,7 +110,7 @@ pub fn ensure_pending_cache_bytes_fit(
         .pending_caches
         .values()
         .filter(|pending| pending.job_backend_id == job_backend_id)
-        .map(|pending| pending.bytes.len() as u64)
+        .map(|pending| pending.staging_len)
         .sum();
     if job_bytes + chunk_bytes > max_bytes {
         return Err(ApiError::payload_too_large(format!(
@@ -201,6 +201,17 @@ pub async fn cache_reserve(
             "job is not live; writes are rejected for completed or unknown jobs",
         ));
     }
+    // Stage upload chunks to disk as they arrive instead of buffering the
+    // whole blob in `PendingCache::bytes`: a 150 MB upload used to sit in
+    // server RAM for the reservation's lifetime. The staging file is
+    // consumed by `cache_commit` (moved into the entry directory) or
+    // deleted by the TTL sweeper when the reservation is abandoned.
+    // Created before the state lock: the parent directory is shared by all
+    // reservations, so no per-reservation I/O happens under the lock.
+    let staging_dir = shared.state.state_dir.join("cache-staging");
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|error| ApiError::internal(format!("cache staging dir: {error}")))?;
     let mut inner = shared.state.inner.lock().await;
     // Bound in-flight legacy reservations per job, mirroring the v2
     // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
@@ -219,6 +230,7 @@ pub async fn cache_reserve(
     }
     inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
+    let staging_path = staging_dir.join(format!("{cache_id}.part"));
     inner.pending_caches.insert(
         cache_id,
         PendingCache {
@@ -228,7 +240,8 @@ pub async fn cache_reserve(
             // key namespace.
             namespace: ref_scoped_namespace(repository, git_ref),
             version: request.version,
-            bytes: Vec::new(),
+            staging_path,
+            staging_len: 0,
             job_backend_id,
             // Stamp the reservation so the TTL sweeper can free it if
             // the job never commits (previously abandoned reservations held
@@ -272,12 +285,12 @@ pub async fn cache_upload(
             ));
         }
         // Cap each in-flight upload's running total. Without this
-        // check a job could grow server RAM without bound by PATCHing
+        // check a job could grow server disk/RAM without bound by PATCHing
         // chunks forever (~500 requests/GiB at the 2 MiB default body
-        // limit). The check runs before the vector grows so the refusal
+        // limit). The check runs before the file grows so the refusal
         // itself allocates nothing.
         ensure_cache_chunk_fits(
-            pending.bytes.len() as u64,
+            pending.staging_len,
             bytes.len() as u64,
             MAX_CACHE_UPLOAD_BYTES,
         )?;
@@ -299,7 +312,28 @@ pub async fn cache_upload(
         .pending_caches
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
-    pending.bytes.extend_from_slice(&bytes);
+    // Stream the chunk straight to the staging file: the full blob is never
+    // buffered in server RAM. The append runs under the state lock so the
+    // running total above cannot be raced past; a chunk is at most 2 MiB, so
+    // the page-cache write is fast.
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut staged = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&pending.staging_path)
+            .await
+            .map_err(|error| ApiError::internal(format!("cache staging write: {error}")))?;
+        staged
+            .write_all(&bytes)
+            .await
+            .map_err(|error| ApiError::internal(format!("cache staging write: {error}")))?;
+        staged
+            .flush()
+            .await
+            .map_err(|error| ApiError::internal(format!("cache staging write: {error}")))?;
+    }
+    pending.staging_len += bytes.len() as u64;
     // Refresh the activity stamp: the TTL sweeper frees reservations idle
     // past PENDING_UPLOAD_TTL, and an active chunked upload must not be
     // reaped between PATCHes.
@@ -348,23 +382,36 @@ pub async fn cache_commit(
     };
 
     if let Some(size) = request.size {
-        let actual = pending.bytes.len() as u64;
+        let actual = pending.staging_len;
         if size != actual {
+            let _ = tokio::fs::remove_file(&pending.staging_path).await;
             return Err(ApiError::bad_request(format!(
                 "cache size mismatch: expected {size}, got {actual}"
             )));
         }
     }
-    let entry = shared
+    // Commit the staged file into the cache store without ever loading it
+    // into RAM: the store moves it into the entry directory and enforces
+    // the quota (LRU eviction) on the way in.
+    let entry = match shared
         .state
         .cache
-        .put_scoped(
+        .commit_file_scoped(
             &pending.namespace,
             &pending.key,
             &pending.version,
-            &pending.bytes,
+            &pending.staging_path,
         )
-        .await?;
+        .await
+    {
+        Ok(entry) => entry,
+        Err(error) => {
+            // The store consumed nothing on failure (duplicate key, I/O):
+            // the staging file is ours to clean up.
+            let _ = tokio::fs::remove_file(&pending.staging_path).await;
+            return Err(error.into());
+        }
+    };
     Ok(Json(CacheLookupResponse {
         hit: true,
         key: Some(entry.key),

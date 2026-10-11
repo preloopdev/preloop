@@ -137,7 +137,7 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
 }
 
 pub async fn reap_once(shared: &Arc<SharedState>) {
-    let (expired_cache_tokens, expired_artifact_tokens) = {
+    let (expired_cache_tokens, expired_artifact_tokens, swept_staging_files) = {
         let mut inner = shared.state.inner.lock().await;
         // Migrate legacy pending entries that restored with `created_unix == 0`
         // (pre-cap state) so they don't live forever. Give them `now` once
@@ -172,9 +172,9 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             })
             .map(|(k, _)| k.clone())
             .collect();
-        sweep_pending_uploads(&mut inner, now_u);
+        let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
         // Release lock before doing I/O.
-        (expired_cache, expired_artifact)
+        (expired_cache, expired_artifact, swept_staging_files)
     };
     // Delete staging directories for expired reservations — otherwise they
     // accumulate on disk forever.
@@ -195,6 +195,12 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .join("artifact")
             .join(token);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    // Staging files of swept legacy cache reservations: chunks were streamed
+    // to disk as they arrived, so abandoning the reservation must free the
+    // file too, not just the map entry.
+    for staged in swept_staging_files {
+        let _ = tokio::fs::remove_file(staged).await;
     }
     // Fork-PR workflow policy: fail closed runs whose 24h approval window
     // expired while waiting for operator approval. The fail-closed mutation

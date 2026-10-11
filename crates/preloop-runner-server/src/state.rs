@@ -1158,7 +1158,7 @@ impl AppState {
         // parameter is already `Option<&str>` (clippy::needless-option-as-deref).
         #[cfg(any(test, feature = "test-support"))]
         let store_url = store_url.as_deref();
-        let cache = CacheStore::new(state_dir.join("cache")).await?;
+        let mut cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
         let oidc_state_dir = state_dir.clone();
@@ -1270,6 +1270,16 @@ impl AppState {
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
         let checkout_cache = crate::config::checkout_cache_config(&config)?;
+        // Actions-cache quota: operator-overridable, 10 GiB default.
+        // Enforced at startup too, so entries committed under a larger quota
+        // are evicted LRU-first on the next boot.
+        let cache_quota_bytes = crate::config::cache_config(&config)?.total_quota_bytes;
+        cache.set_quota_bytes(cache_quota_bytes);
+        cache.enforce_quota().await?;
+        // In-flight chunked uploads never survive a restart (`pending_caches`
+        // is in-memory only), so staging files left by a crashed server are
+        // debris, not resumable uploads.
+        let _ = tokio::fs::remove_dir_all(state_dir.join("cache-staging")).await;
         let retention_days = crate::config::retention_days(&config)?;
         let github_apps = crate::github_app::load_from(&config)?;
         let github_app = github_apps

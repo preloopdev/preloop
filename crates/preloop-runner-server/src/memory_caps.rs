@@ -809,7 +809,14 @@ pub fn trim_artifact_registry(inner: &mut InnerState) {
 /// artifactcache reservations (`pending_caches`) are in-memory only and were
 /// never swept — an abandoned reservation held its bytes forever — so they
 /// are covered by the same TTL.
-pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
+///
+/// Returns the on-disk staging files of swept legacy reservations; the
+/// caller deletes them after releasing the state lock (this function is
+/// synchronous and must not do I/O).
+pub fn sweep_pending_uploads(
+    inner: &mut InnerState,
+    now_unix_secs: i64,
+) -> Vec<std::path::PathBuf> {
     let cutoff = now_unix_secs.saturating_sub(PENDING_UPLOAD_TTL.as_secs() as i64);
     let stale_cache: Vec<String> = inner
         .cache_v2_pending
@@ -831,14 +838,18 @@ pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
     }
     // Legacy reservations are freed too; only `cache_commit` removed
     // them before, so abandoned uploads accumulated RAM without bound.
-    let stale_legacy: Vec<i64> = inner
+    // Their staged chunks live on disk now: collect the staging files so
+    // the caller can delete them after releasing the lock.
+    let stale_legacy: Vec<(i64, std::path::PathBuf)> = inner
         .pending_caches
         .iter()
         .filter(|(_, pending)| pending.created_unix > 0 && pending.created_unix < cutoff)
-        .map(|(cache_id, _)| *cache_id)
+        .map(|(cache_id, pending)| (*cache_id, pending.staging_path.clone()))
         .collect();
-    for cache_id in stale_legacy {
+    let mut staged_files: Vec<std::path::PathBuf> = Vec::new();
+    for (cache_id, staging_path) in stale_legacy {
         inner.pending_caches.remove(&cache_id);
+        staged_files.push(staging_path);
     }
     let stale_dl: Vec<String> = inner
         .cache_v2_dl_tokens_created
@@ -868,6 +879,7 @@ pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
             inner.cache_v2_dl_tokens.keys().cloned().collect();
         inner.cache_v2_dl_tokens_order.retain(|k| live.contains(k));
     }
+    staged_files
 }
 
 #[cfg(test)]
