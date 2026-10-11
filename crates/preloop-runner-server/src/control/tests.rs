@@ -1238,6 +1238,320 @@ pub(crate) mod suite {
         );
     }
 
+    /// `gen` feeds a deferred matrix `fan` (two legs, applied) and `dependents`
+    /// hang off it. `fan`'s own `needs: gen` mirrors the production shape.
+    async fn fan_out(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        dependents: Vec<SubmitJob>,
+    ) {
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut jobs = vec![submit_job(run_id, "gen", 1), fan];
+        jobs.extend(dependents);
+        backend.submit_run(submit_run(run_id, jobs)).await.unwrap();
+        settle_job(
+            backend,
+            run_id,
+            "gen",
+            ExecutionStatus::Success,
+            BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+        )
+        .await;
+        expand_deferred_matrix(
+            backend,
+            "fan",
+            vec![
+                built_matrix_leg(run_id, "fan-1", "fan", 1, 2),
+                built_matrix_leg(run_id, "fan-2", "fan", 2, 2),
+            ],
+        )
+        .await;
+    }
+
+    /// A dependent of `base`/`id` that declares `needs` and an optional `if:`.
+    fn dependent(
+        run_id: RunId,
+        job_id: &str,
+        request_id: i64,
+        needs: &[&str],
+        if_condition: Option<&str>,
+    ) -> SubmitJob {
+        let mut job = submit_job(run_id, job_id, request_id);
+        job.queued.needs = needs.iter().map(|need| JobId((*need).to_owned())).collect();
+        job.queued.if_condition = if_condition.map(str::to_owned);
+        job
+    }
+
+    async fn settle_job(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &str,
+        status: ExecutionStatus,
+        outputs: BTreeMap<String, serde_json::Value>,
+    ) {
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId(job_id.to_owned()),
+                agent_job_id: None,
+                status,
+                outputs,
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn status_of(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &str,
+    ) -> Option<ExecutionStatus> {
+        backend
+            .run_record(run_id)
+            .await
+            .unwrap()
+            .jobs
+            .get(&JobId(job_id.to_owned()))
+            .copied()
+    }
+
+    /// Claims the one job that is ready and returns its hydrated `needs`
+    /// context, asserting it is `job_id`.
+    async fn claim_needs_context(
+        backend: &dyn ControlBackend,
+        job_id: &str,
+    ) -> serde_json::Value {
+        let runner = backend
+            .register_runner(register_runner("dependent-runner"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("{job_id} must be ready, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId(job_id.to_owned()));
+        claimed
+            .queued
+            .message
+            .context_data
+            .get("needs")
+            .map(preloop_gha_protocol::azdo::PipelineContextData::to_json)
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// A dependent of a matrix base waits for every leg, then is promoted with
+    /// the legs' outputs merged into its `needs.<base>` context.
+    pub(crate) async fn matrix_base_dependent_runs_after_every_leg(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        fan_out(
+            backend,
+            run_id,
+            vec![dependent(run_id, "after", 3, &["fan"], None)],
+        )
+        .await;
+
+        settle_job(
+            backend,
+            run_id,
+            "fan-1",
+            ExecutionStatus::Success,
+            BTreeMap::from([("a".to_owned(), serde_json::json!("1"))]),
+        )
+        .await;
+        assert_eq!(
+            backend.queue_stats().await.unwrap().ready,
+            1,
+            "only the unfinished leg is ready: one finished leg must not release the dependent"
+        );
+
+        settle_job(
+            backend,
+            run_id,
+            "fan-2",
+            ExecutionStatus::Success,
+            BTreeMap::from([("b".to_owned(), serde_json::json!("2"))]),
+        )
+        .await;
+        let needs = claim_needs_context(backend, "after").await;
+        assert_eq!(
+            needs,
+            serde_json::json!({"fan": {"result": "success", "outputs": {"a": "1", "b": "2"}}})
+        );
+    }
+
+    /// A failed leg skips the dependent whose `if:` is the default
+    /// `success()`, and that skip skips the dependent's own dependent in the
+    /// same completion; the run then finalizes as failed.
+    pub(crate) async fn failed_leg_skips_dependents_transitively(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        fan_out(
+            backend,
+            run_id,
+            vec![
+                dependent(run_id, "after", 3, &["fan"], None),
+                dependent(run_id, "last", 4, &["after"], None),
+            ],
+        )
+        .await;
+
+        settle_job(
+            backend,
+            run_id,
+            "fan-1",
+            ExecutionStatus::Failure,
+            BTreeMap::new(),
+        )
+        .await;
+
+        let record = backend.run_record(run_id).await.unwrap();
+        for job in ["after", "last"] {
+            assert_eq!(
+                record.jobs.get(&JobId(job.to_owned())),
+                Some(&ExecutionStatus::Skipped),
+                "{job} must be skipped by the failed leg"
+            );
+        }
+        assert!(record.status.is_terminal(), "got {:?}", record.status);
+        assert_eq!(record.conclusion.as_deref(), Some("failure"));
+    }
+
+    /// `if: always()` runs after a failed leg and sees the failure in its
+    /// `needs` context; a default dependent behind it still runs once it
+    /// succeeds.
+    pub(crate) async fn always_dependent_runs_after_a_failed_leg(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        fan_out(
+            backend,
+            run_id,
+            vec![
+                dependent(run_id, "after", 3, &["fan"], Some("always()")),
+                dependent(run_id, "last", 4, &["after"], None),
+            ],
+        )
+        .await;
+
+        settle_job(
+            backend,
+            run_id,
+            "fan-1",
+            ExecutionStatus::Failure,
+            BTreeMap::new(),
+        )
+        .await;
+        let needs = claim_needs_context(backend, "after").await;
+        assert_eq!(needs["fan"]["result"], serde_json::json!("failure"));
+
+        settle_job(
+            backend,
+            run_id,
+            "after",
+            ExecutionStatus::Success,
+            BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(
+            status_of(backend, run_id, "last").await,
+            Some(ExecutionStatus::Skipped),
+            "last has the default success() and the failed leg is its ancestor"
+        );
+    }
+
+    /// `failure()` aggregates over the dependent's ancestors, not only its
+    /// direct needs: `leaf` needs `mid`, which succeeded, but `mid` needs the
+    /// matrix base `fan` whose leg failed. The ancestor is only reachable
+    /// through the base id.
+    pub(crate) async fn if_reads_an_ancestor_through_a_matrix_base(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        fan_out(
+            backend,
+            run_id,
+            vec![
+                dependent(run_id, "mid", 3, &["fan"], Some("always()")),
+                dependent(run_id, "leaf", 4, &["mid"], Some("failure()")),
+            ],
+        )
+        .await;
+
+        settle_job(
+            backend,
+            run_id,
+            "fan-1",
+            ExecutionStatus::Failure,
+            BTreeMap::new(),
+        )
+        .await;
+        settle_job(
+            backend,
+            run_id,
+            "mid",
+            ExecutionStatus::Success,
+            BTreeMap::new(),
+        )
+        .await;
+        let needs = claim_needs_context(backend, "leaf").await;
+        assert_eq!(
+            needs["mid"]["result"],
+            serde_json::json!("success"),
+            "failure() must see the failed leg two levels up"
+        );
+    }
+
+    /// A reusable caller that depends on another job joins the expansion
+    /// queue when its need succeeds and is skipped (with its own dependent)
+    /// when the need fails.
+    pub(crate) async fn reusable_caller_dependent_follows_its_needs(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut submit = deferred_caller_run(run_id, &[], vec![submit_job(run_id, "gen", 3)]);
+        submit.jobs[0].queued.needs = vec![JobId("gen".to_owned())];
+        backend.submit_run(submit).await.unwrap();
+        assert!(
+            backend.claim_expansion().await.unwrap().is_none(),
+            "the caller waits for gen"
+        );
+        settle_job(
+            backend,
+            run_id,
+            "gen",
+            ExecutionStatus::Success,
+            BTreeMap::new(),
+        )
+        .await;
+        lease_deferred_caller(backend).await;
+
+        let skipped_run = RunId::new();
+        let mut submit =
+            deferred_caller_run(skipped_run, &[], vec![submit_job(skipped_run, "gen", 3)]);
+        submit.jobs[0].queued.needs = vec![JobId("gen".to_owned())];
+        backend.submit_run(submit).await.unwrap();
+        settle_job(
+            backend,
+            skipped_run,
+            "gen",
+            ExecutionStatus::Failure,
+            BTreeMap::new(),
+        )
+        .await;
+        let record = backend.run_record(skipped_run).await.unwrap();
+        for job in ["caller", "after"] {
+            assert_eq!(
+                record.jobs.get(&JobId(job.to_owned())),
+                Some(&ExecutionStatus::Skipped),
+                "{job} follows the failed need"
+            );
+        }
+        assert!(record.status.is_terminal(), "got {:?}", record.status);
+    }
+
     /// A cancellation that lands between `claim_expansion` and
     /// `apply_expansion` invalidates the lease: the build's subtree must be
     /// discarded and the run must stay cancelled.
@@ -8778,6 +9092,46 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn matrix_base_dependent_runs_after_every_leg() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::matrix_base_dependent_runs_after_every_leg(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn failed_leg_skips_dependents_transitively() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::failed_leg_skips_dependents_transitively(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn always_dependent_runs_after_a_failed_leg() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::always_dependent_runs_after_a_failed_leg(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn if_reads_an_ancestor_through_a_matrix_base() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::if_reads_an_ancestor_through_a_matrix_base(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_dependent_follows_its_needs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_dependent_follows_its_needs(&backend).await;
+    }
+
+    #[tokio::test]
     async fn cancelled_run_discards_in_flight_expansion() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10555,6 +10909,31 @@ mod lite {
     #[tokio::test]
     async fn matrix_fail_fast_settles_dependent_and_run() {
         suite::matrix_fail_fast_settles_dependent_and_run(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_base_dependent_runs_after_every_leg() {
+        suite::matrix_base_dependent_runs_after_every_leg(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn failed_leg_skips_dependents_transitively() {
+        suite::failed_leg_skips_dependents_transitively(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn always_dependent_runs_after_a_failed_leg() {
+        suite::always_dependent_runs_after_a_failed_leg(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn if_reads_an_ancestor_through_a_matrix_base() {
+        suite::if_reads_an_ancestor_through_a_matrix_base(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_dependent_follows_its_needs() {
+        suite::reusable_caller_dependent_follows_its_needs(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
