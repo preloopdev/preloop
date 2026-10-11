@@ -826,7 +826,10 @@ pub struct ArtifactV2Pending {
 /// The diag blob token is minted per call and handed to the runner, which
 /// PUTs to `/twirp-blob/diag/{token}` bearerless (Azure SDK compat). The
 /// registry binds the token to the owning job so the blob gate can reject
-/// writes from any other job. In-memory only: diag uploads happen
+/// writes from any other job. Eviction invalidates: the gate rejects PUTs
+/// for tokens no longer in the map (evicted by the per-job cap, TTL-swept,
+/// or never registered), so a re-mint loop cannot accumulate unbounded
+/// staging directories. In-memory only: diag uploads happen
 /// immediately after minting, and the TTL sweeper bounds the map.
 #[derive(Debug, Clone)]
 pub struct DiagUploadToken {

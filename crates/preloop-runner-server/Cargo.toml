@@ -131,6 +131,11 @@ path = "tests/concurrency.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "diag_reaping"
+path = "tests/diag_reaping.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "execution_protection_api"
 path = "tests/execution_protection_api.rs"
 required-features = ["test-support"]
