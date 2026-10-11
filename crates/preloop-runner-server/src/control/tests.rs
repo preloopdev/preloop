@@ -1240,11 +1240,7 @@ pub(crate) mod suite {
 
     /// `gen` feeds a deferred matrix `fan` (two legs, applied) and `dependents`
     /// hang off it. `fan`'s own `needs: gen` mirrors the production shape.
-    async fn fan_out(
-        backend: &dyn ControlBackend,
-        run_id: RunId,
-        dependents: Vec<SubmitJob>,
-    ) {
+    async fn fan_out(backend: &dyn ControlBackend, run_id: RunId, dependents: Vec<SubmitJob>) {
         let mut fan = submit_job(run_id, "fan", 2);
         fan.queued.needs = vec![JobId("gen".to_owned())];
         fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
@@ -1320,10 +1316,7 @@ pub(crate) mod suite {
 
     /// Claims the one job that is ready and returns its hydrated `needs`
     /// context, asserting it is `job_id`.
-    async fn claim_needs_context(
-        backend: &dyn ControlBackend,
-        job_id: &str,
-    ) -> serde_json::Value {
+    async fn claim_needs_context(backend: &dyn ControlBackend, job_id: &str) -> serde_json::Value {
         let runner = backend
             .register_runner(register_runner("dependent-runner"))
             .await
@@ -2677,6 +2670,51 @@ pub(crate) mod suite {
             Some(("none".to_owned(), "failure".to_owned())),
             "an unhostable job never queues"
         );
+    }
+
+    /// A dependent that fails at promotion (its resolved platform cannot be
+    /// hosted) never runs, so the job behind it is skipped in the same
+    /// completion and the run finalizes: nothing is left blocked on a job that
+    /// already ended.
+    pub(crate) async fn promotion_failure_settles_the_failed_jobs_dependents(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut build = submit_job(run_id, "build", 2);
+        build.queued.needs = vec![JobId("gen".to_owned())];
+        build.queued.runs_on = vec!["windows-latest".to_owned()];
+        let mut deploy = submit_job(run_id, "deploy", 3);
+        deploy.queued.needs = vec![JobId("build".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), build, deploy],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.scheduling.failed,
+            vec![(run_id, JobId("build".to_owned()))]
+        );
+        assert_eq!(
+            outcome.scheduling.skipped,
+            vec![(run_id, JobId("deploy".to_owned()))],
+            "the job behind the failed one is skipped by the same completion"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert!(record.status.is_terminal(), "got {:?}", record.status);
+        assert_eq!(record.conclusion.as_deref(), Some("failure"));
     }
 
     /// The TOML rules map for `owner/repo` carrying one environment's rule.
@@ -9132,6 +9170,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn promotion_failure_settles_the_failed_jobs_dependents() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::promotion_failure_settles_the_failed_jobs_dependents(&backend).await;
+    }
+
+    #[tokio::test]
     async fn cancelled_run_discards_in_flight_expansion() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10933,7 +10979,16 @@ mod lite {
 
     #[tokio::test]
     async fn reusable_caller_dependent_follows_its_needs() {
-        suite::reusable_caller_dependent_follows_its_needs(&LiteBackend::in_memory().unwrap()).await;
+        suite::reusable_caller_dependent_follows_its_needs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn promotion_failure_settles_the_failed_jobs_dependents() {
+        suite::promotion_failure_settles_the_failed_jobs_dependents(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]
