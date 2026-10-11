@@ -200,6 +200,17 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **Postgres completions no longer load the run graph**: `settle_job` and
+  `complete_job` write the terminal transition, retire the attempt, fail-fast
+  the siblings, fold reusable callers, refresh the dependents'
+  `remaining_needs` and summarize the run with targeted statements. The graph
+  is materialized only when a completion actually makes a dependent
+  promotable — promotion (needs hydration, gates, max-parallel cohorts,
+  deferred expansion) still runs the shared sweep — so a leg of a large
+  fan-out settles without touching the rest of the run. Fail-fast now cancels
+  every non-terminal sibling of the base, releasing its concurrency hold and
+  queueing the runner cancellation, matching the SQLite path.
+
 - Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
   ready-queue priority over older automatic jobs; Pullfrog reviews run only on
   explicit comments or manual dispatches instead of every pull request update.

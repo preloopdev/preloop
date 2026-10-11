@@ -475,7 +475,12 @@ impl PgBackend {
                     ts!("$3"),
                     " WHERE request_id = $1 AND result IS NULL"
                 ),
-                &[&request_id, &status_str(result), &now_us()],
+                // Only terminal statuses are valid for result (CHECK constraint).
+                &[
+                    &request_id,
+                    &result.is_terminal().then(|| status_str(result)),
+                    &now_us(),
+                ],
             )
             .await
             .map_err(db)?;
@@ -520,7 +525,11 @@ impl PgBackend {
                     " WHERE request_id = $1 AND result IS NULL \
                      RETURNING run_id::text, job_id, agent_job_id::text"
                 ),
-                &[&request_id, &status_str(result), &now_us()],
+                &[
+                    &request_id,
+                    &result.is_terminal().then(|| status_str(result)),
+                    &now_us(),
+                ],
             )
             .await
             .map_err(db)?
