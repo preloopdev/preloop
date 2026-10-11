@@ -1947,7 +1947,10 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     // config keeps plaintext for the running process.
     let mut sealed = config.clone();
     if let Some(dir) = path.parent() {
-        seal_config_secrets(&mut sealed, dir, &OsCredentialStore)
+        // Same store selection as `load_config_from`; sealing with a different
+        // backend than unsealing makes the file unreadable.
+        let store = crate::credential_store::store_from_env(dir);
+        seal_config_secrets(&mut sealed, dir, store.as_ref())
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
     let text = toml::to_string_pretty(&sealed).context("serializing config")?;
