@@ -137,7 +137,12 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
 }
 
 pub async fn reap_once(shared: &Arc<SharedState>) {
-    let (expired_cache_tokens, expired_artifact_tokens, swept_staging_files) = {
+    let (
+        expired_cache_tokens,
+        expired_artifact_tokens,
+        swept_staging_files,
+        expired_diag_tokens,
+    ) = {
         let mut inner = shared.state.inner.lock().await;
         // Migrate legacy pending entries that restored with `created_unix == 0`
         // (pre-cap state) so they don't live forever. Give them `now` once
@@ -173,8 +178,20 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .map(|(k, _)| k.clone())
             .collect();
         let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
+        // Diag upload tokens: the map key is the JWT `jti`, which is also
+        // the staging directory name under `blobs/diag/`. Sweeping the map
+        // entry without the directory would leak the staged bytes — the
+        // same accumulation the TTL sweep fixes for cache/artifact.
+        let expired_diag: Vec<String> = inner
+            .diag_upload_tokens
+            .iter()
+            .filter(|(_, p)| {
+                p.created_unix > 0 && p.created_unix < now_u - PENDING_UPLOAD_TTL.as_secs() as i64
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         // Release lock before doing I/O.
-        (expired_cache, expired_artifact, swept_staging_files)
+        (expired_cache, expired_artifact, swept_staging_files, expired_diag)
     };
     // Delete staging directories for expired reservations — otherwise they
     // accumulate on disk forever.
@@ -201,6 +218,26 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // file too, not just the map entry.
     for staged in swept_staging_files {
         let _ = tokio::fs::remove_file(staged).await;
+    }
+    for jti in expired_diag_tokens {
+        let dir = shared.state.state_dir.join("blobs").join("diag").join(jti);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    // Age-based backstop for orphaned diag staging directories: anything
+    // the token sweep cannot see (a crash between staging and registration,
+    // leftovers from before eviction invalidated PUTs). Runs on the reaper
+    // tick, which is every 10s; the walk only touches `blobs/diag/`, whose
+    // live population is bounded by the per-job token cap.
+    if shared.state.diag_staging_max_age_seconds > 0 {
+        let swept = crate::blob_store::sweep_diag_staging(
+            &shared.state.state_dir,
+            Duration::from_secs(shared.state.diag_staging_max_age_seconds),
+            SystemTime::now(),
+        )
+        .await;
+        if swept > 0 {
+            debug!(swept, "swept aged diag staging dirs");
+        }
     }
     // Fork-PR workflow policy: fail closed runs whose 24h approval window
     // expired while waiting for operator approval. The fail-closed mutation

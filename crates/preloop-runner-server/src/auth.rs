@@ -142,6 +142,14 @@ pub async fn require_results_bearer(
 ///      presented bearer is verified and must match the `job` claim. The
 ///      `system` owner (control-plane-minted URLs) skips the liveness check,
 ///      as it did when empty owners meant "system".
+///   5. diag uploads additionally require the token's `jti` to still be
+///      registered in `diag_upload_tokens`: the per-job cap evicts the
+///      oldest token, and eviction must invalidate — a signature alone
+///      cannot see eviction, so without this a live job could re-mint
+///      forever and accumulate unbounded staging directories. (Consequence:
+///      diag URLs no longer survive an engine restart; the map is
+///      in-memory only. Diag uploads happen immediately after minting, so a
+///      restart in between was already a lost upload.)
 ///
 /// Reads stay bearer-optional - the unguessable, server-minted URL is the
 /// credential, the same SAS-style model as `/replay/results/*` - because the
@@ -178,6 +186,28 @@ async fn authorize_blob_request(
         return Err(ApiError::forbidden(
             "blob token is not valid for this operation",
         ));
+    }
+
+    // Diag upload tokens are bearerless single-job reservations: the mint
+    // handler records the token's `jti` in `diag_upload_tokens` and evicts
+    // the oldest per job at the cap. A signature alone cannot see eviction,
+    // so an evicted (or never-registered) diag token's PUT must not upload —
+    // otherwise a live job could re-mint forever and accumulate unbounded
+    // staging directories. Membership in the live map is the credential for
+    // diag PUTs, on top of the signature and owner-job liveness checks.
+    if is_write && kind == "diag" {
+        let jti = crate::blob_store::blob_token_jti(&claims)
+            .ok_or_else(|| ApiError::bad_request("malformed blob token"))?;
+        let registered = state
+            .inner
+            .lock()
+            .await
+            .diag_upload_tokens
+            .contains_key(&jti);
+        if !registered {
+            warn!(jti, "rejected diag PUT for evicted or unknown upload token");
+            return Err(ApiError::not_found("blob not found"));
+        }
     }
 
     match bearer_from_headers(request.headers()) {

@@ -291,6 +291,27 @@ chunk at most, never the whole insert. If a chunk fails after the run row
 committed, the run is marked completed/failed so a partial submit can
 never dispatch or wedge a concurrency group.
 
+### Diagnostic-log staging
+
+Diagnostic logs upload bearerless to signed per-job URLs
+(`/twirp-blob/diag/{token}`, Azure SDK compat). Each token is a single-job
+reservation recorded in memory: the per-job cap (32) evicts the oldest
+token, and an evicted or unknown token's PUT is rejected, so a re-mint loop
+cannot accumulate unbounded staging directories. The reaper deletes a
+token's staging directory when its reservation expires (1h TTL), and an
+age-based sweep removes any orphaned staging directory older than:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` | `24` | Max age of a `<state_dir>/blobs/diag/` staging directory before the reaper deletes it. `0` disables the age-based sweep (TTL-expired token directories are still reaped) |
+
+The same key lives at the top level of the config file as
+`diag_staging_max_age_hours`; the environment wins. Note the trade-off this
+buys: diag upload URLs are valid only while the engine that minted them is
+running — the token registry is in-memory, so a restart invalidates
+outstanding diag URLs (a runner that minted just before a restart re-mints
+on its next attempt).
+
 ### Runner pool
 
 | Variable | Default | Meaning |
