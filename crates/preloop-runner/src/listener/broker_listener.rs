@@ -323,6 +323,7 @@ pub async fn run_broker_loop(
                     "provisioningState": serde_json::Value::Null,
                 },
                 "useFipsEncryption": require_fips_cryptography(&config),
+                "brokerSession": true,
             });
 
             match client.create_session(&token, &session_body).await {
@@ -1150,8 +1151,8 @@ mod tests {
 
         assert!(session_id.is_empty());
         let request = request_task.await.unwrap();
-        assert!(request.starts_with("DELETE /session HTTP/1.1"));
-        assert!(request.contains("x-actions-session: session-123"));
+        assert!(request.starts_with("DELETE /session?sessionId=session-123 HTTP/1.1"));
+        assert!(!request.to_lowercase().contains("x-actions-session"));
     }
 
     #[test]
