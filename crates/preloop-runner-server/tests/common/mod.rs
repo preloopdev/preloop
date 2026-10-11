@@ -1630,7 +1630,7 @@ pub async fn register_live_job_in(
     job_uuid: uuid::Uuid,
     _plan_id: &str,
     repository: &str,
-) {
+) -> String {
     let accepted = crate::submit_run_inner(
         &state.shared(),
         preloop_gha_protocol::WorkflowSubmission {
@@ -1676,6 +1676,7 @@ pub async fn register_live_job_in(
         .await
         .expect("re-key the seed attempt");
     assert_eq!(updated, 1, "the seed run has exactly one attempt");
+    run_key
 }
 
 /// Register a live job attempt (see [`register_live_job_in`]) under a
@@ -1702,8 +1703,14 @@ pub async fn complete_live_job(state: &AppState, job_uuid: uuid::Uuid) {
 
 /// Register a live job whose run belongs to `test-org/test-repo`: the legacy
 /// cache path resolves job → attempt → run → submission repository.
-pub async fn register_live_job_with_run(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
-    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await;
+/// Returns the run key (a UUID string) so tests can bind legacy
+/// `/_apis/pipelines/workflows/:run_id/…` paths to the job's own run.
+pub async fn register_live_job_with_run(
+    state: &AppState,
+    job_uuid: uuid::Uuid,
+    plan_id: &str,
+) -> String {
+    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await
 }
 
 /// Claim the next queued job through the real broker path — register the
