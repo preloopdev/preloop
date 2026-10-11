@@ -426,7 +426,7 @@ pub async fn agent_request_ack(
             "agent request belongs to another runner".to_owned(),
         )));
     }
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.

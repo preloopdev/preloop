@@ -8,6 +8,42 @@ mod common;
 
 use common::*;
 
+#[tokio::test]
+async fn agent_request_ack_returns_no_content_for_all_aliases() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state, CancellationToken::new());
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "request-ack-runner", &["self-hosted"], None).await;
+
+    for (uri, body) in [
+        ("/_apis/v1/AgentRequest/1/1", Value::Null),
+        ("/runner/server/_apis/v1/AgentRequest/1/1", json!({})),
+        (
+            "/acme/_apis/v1/AgentRequest/1/1",
+            json!({"status": "accepted"}),
+        ),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(&app, Method::POST, uri, body, &runner_token).await,
+            StatusCode::NO_CONTENT,
+            "ack route {uri} should return 204",
+        );
+    }
+
+    assert_eq!(
+        request_status_without_bearer(
+            &app,
+            Method::POST,
+            "/_apis/v1/AgentRequest/1/1",
+            Value::Null,
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "ack route must retain runner bearer authentication",
+    );
+}
+
 /// A worker that stops renewing while its session keeps polling is hung, not
 /// disconnected: the live session proves the guest is reachable, so the stale
 /// lease can only mean the renew task died. The reaper must fail the job on

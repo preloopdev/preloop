@@ -2582,7 +2582,7 @@ jobs:
         )
         .await
         .unwrap();
-    assert_eq!(ack.status(), StatusCode::OK);
+    assert_eq!(ack.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
