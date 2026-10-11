@@ -2776,17 +2776,33 @@ async fn action_download_info_returns_batch_download_collection() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // The endpoint resolves the run from the plan id in the URL and mints
+    // tickets only for actions the run's workflow declares.
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: owner/repo/sub/dir@main
+      - uses: actions/setup-node.js@v4
+"#,
+    )
+    .await;
 
     // Official runner batch shape: `ActionReferenceList` of
     // `{nameWithOwner, ref, path}`. Local (`./`) and docker refs are dropped.
     let response = request_json(
         &app,
         Method::POST,
-        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
         json!({
             "actions": [
                 {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""},
@@ -2858,15 +2874,27 @@ async fn action_download_info_returns_null_auth_when_token_unset() {
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
 
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
 
     let response = request_json(
         &app,
         Method::POST,
-        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
         json!({
             "actions": [
                 {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
@@ -2896,15 +2924,27 @@ async fn action_download_info_discards_malformed_or_abbreviated_sha() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
 
     let response = request_json(
         &app,
         Method::POST,
-        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
         json!({
             "actions": [
                 {"nameWithOwner": "actions/checkout", "ref": "v4", "path": ""}
@@ -2957,15 +2997,27 @@ async fn action_download_info_rejects_all_zero_sha() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
 
     let response = request_json(
         &app,
         Method::POST,
-        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
         json!({
             "actions": [
                 {"nameWithOwner": "actions/checkout", "ref": zero, "path": ""}
@@ -3094,15 +3146,27 @@ async fn resolve_ref_to_sha_sends_pat_to_the_configured_origin_over_http() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
 
     let response = request_json(
         &app,
         Method::POST,
-        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
         json!({ "actions": [{"nameWithOwner": "actions/checkout", "ref": "v4"}] }),
     )
     .await;
@@ -3138,15 +3202,30 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
-        CancellationToken::new(),
-    );
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // runnerresolve keys the run off the (orchestration_id, job_id) path
+    // pair and mints only for declared actions.
+    let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: owner/repo/path@main
+"#,
+    )
+    .await;
 
     let response = request_json(
         &app,
         Method::POST,
-        "/actions/build/plan/jobs/job/runnerresolve/actions",
+        &format!("/actions/build/{plan_id}/jobs/{agent_job_id}/runnerresolve/actions"),
         json!({
             "actions": [
                 {"action": "actions/checkout", "version": "v4"},
@@ -3181,6 +3260,373 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
             ),
         "{}",
         response["actions"]["owner/repo/path@main"]["tar_url"]
+    );
+}
+
+/// The action-download oracle is closed: tickets are minted only for actions
+/// declared in the run's workflow `uses:`. A batch naming an undeclared
+/// `owner/repo` — alone or mixed with declared actions — is a 403 that
+/// mints nothing, and an unknown plan fails closed too.
+#[tokio::test]
+async fn action_download_info_denies_undeclared_action() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Full SHAs short-circuit ref resolution, so the mock only needs to 404
+    // the manifest probe the transitive closure makes for undeclared
+    // requests (axum returns 404 for unrouted paths).
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
+    let sha = "abc123def456abc123def456abc123def456abc1";
+    let uri = format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}");
+    let declared =
+        || json!({"actions": [{"nameWithOwner": "actions/checkout", "ref": sha, "path": ""}]});
+    let undeclared =
+        || json!({"actions": [{"nameWithOwner": "someother/repo", "ref": sha, "path": ""}]});
+
+    // Declared action: ticket minted.
+    let response = request_json(&app, Method::POST, &uri, declared()).await;
+    let actions = response["actions"].as_object().unwrap();
+    let key = format!("actions/checkout@{sha}");
+    assert!(actions.contains_key(&key), "{actions:?}");
+    assert!(
+        actions[&key]["tarballUrl"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("actions/checkout/{sha}?exp=")),
+        "{actions:?}"
+    );
+
+    // Undeclared owner/repo: 403.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            undeclared(),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an undeclared repo must not mint a ticket"
+    );
+
+    // A batch mixing declared and undeclared fails the whole batch: no
+    // ticket is minted for either entry.
+    let mut mixed = declared();
+    mixed["actions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"nameWithOwner": "someother/repo", "ref": sha, "path": ""}));
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            mixed,
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "one undeclared entry poisons the whole batch"
+    );
+
+    // Unknown plan: fail closed, not fail open.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/00000000-0000-0000-0000-000000000000",
+            declared(),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an unresolvable plan must not mint tickets"
+    );
+}
+
+/// The exact finding vector: a live job runtime token (the credential
+/// workflow code can read) gets a 403 for an undeclared repo and a ticket
+/// for a declared one.
+#[tokio::test]
+async fn action_download_info_job_token_cannot_mint_undeclared() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
+    // The real per-job credential: `sub=preloop-job-<agent_job_id>`.
+    let job_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let sha = "abc123def456abc123def456abc123def456abc1";
+    let uri = format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}");
+
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            json!({"actions": [{"nameWithOwner": "someother/repo", "ref": sha, "path": ""}]}),
+            &job_token,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "a job token must not mint tickets for repos outside its workflow"
+    );
+
+    let response = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &uri,
+        json!({"actions": [{"nameWithOwner": "actions/checkout", "ref": sha, "path": ""}]}),
+        &job_token,
+    )
+    .await;
+    assert!(
+        response["actions"]
+            .as_object()
+            .unwrap()
+            .contains_key(&format!("actions/checkout@{sha}")),
+        "{response:?}"
+    );
+}
+
+/// runnerresolve enforces the same allowlist: it is the endpoint the
+/// preloop runner (and the official runner's launch flow) actually calls.
+#[tokio::test]
+async fn runnerresolve_denies_undeclared_action() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#,
+    )
+    .await;
+    let sha = "abc123def456abc123def456abc123def456abc1";
+    let uri = format!("/actions/build/{plan_id}/jobs/{agent_job_id}/runnerresolve/actions");
+
+    // Declared: resolves.
+    let response = request_json(
+        &app,
+        Method::POST,
+        &uri,
+        json!({"actions": [{"action": "actions/checkout", "version": sha}]}),
+    )
+    .await;
+    assert!(
+        response["actions"]
+            .as_object()
+            .unwrap()
+            .contains_key(&format!("actions/checkout@{sha}")),
+        "{response:?}"
+    );
+
+    // Undeclared: 403. Unknown job: 403.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            json!({"actions": [{"action": "someother/repo", "version": sha}]}),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            "/actions/build/plan/jobs/00000000-0000-0000-0000-000000000000/runnerresolve/actions",
+            json!({"actions": [{"action": "actions/checkout", "version": sha}]}),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "an unresolvable job must not resolve actions"
+    );
+}
+
+/// Composite actions stage their nested `uses:` in later waves, after the
+/// parent's own download — those nested repos are not in the workflow's
+/// direct set. The transitive closure admits them (via the parent's
+/// manifest) while still denying unrelated repos.
+#[tokio::test]
+async fn action_download_allows_transitive_composite_nested() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // The mock forge serves a composite manifest for myorg/composite whose
+    // only nested remote action is nested/dep.
+    let manifest = "name: composite\ndescription: test composite\nruns:\n  using: composite\n  steps:\n    - uses: nested/dep@v2\n    - run: echo hi\n";
+    let encoded = base64::engine::general_purpose::STANDARD.encode(manifest);
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock =
+        axum::Router::new()
+            .route(
+                "/repos/:owner/:repo/commits/:git_ref",
+                axum::routing::get(|| async {
+                    axum::Json(
+                        serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}),
+                    )
+                }),
+            )
+            .route(
+                "/repos/:owner/:repo/contents/:manifest",
+                axum::routing::get(move || {
+                    let encoded = encoded.clone();
+                    async move {
+                        axum::Json(serde_json::json!({"content": encoded, "encoding": "base64"}))
+                    }
+                }),
+            );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: myorg/composite@9f86d081884c7d659a2feaa0c55ad015a3bf4f1b
+"#,
+    )
+    .await;
+    let parent_sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b";
+    let nested_sha = "d4735e3a265e16eee03f59718b9b5d03019c07d8b";
+    let uri = format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}");
+
+    // Wave 1: the declared composite parent resolves.
+    let wave1 = request_json(
+        &app,
+        Method::POST,
+        &uri,
+        json!({"actions": [{"nameWithOwner": "myorg/composite", "ref": parent_sha, "path": ""}]}),
+    )
+    .await;
+    assert!(
+        wave1["actions"]
+            .as_object()
+            .unwrap()
+            .contains_key(&format!("myorg/composite@{parent_sha}")),
+        "{wave1:?}"
+    );
+
+    // Wave 2: the nested action — not in the workflow — resolves through the
+    // transitive closure over the parent's manifest.
+    let wave2 = request_json(
+        &app,
+        Method::POST,
+        &uri,
+        json!({"actions": [{"nameWithOwner": "nested/dep", "ref": nested_sha, "path": ""}]}),
+    )
+    .await;
+    assert!(
+        wave2["actions"]
+            .as_object()
+            .unwrap()
+            .contains_key(&format!("nested/dep@{nested_sha}")),
+        "nested composite action must resolve transitively: {wave2:?}"
+    );
+
+    // An unrelated repo is still denied.
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            json!({"actions": [{"nameWithOwner": "evil/other", "ref": nested_sha, "path": ""}]}),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "the transitive closure must not admit arbitrary repos"
     );
 }
 
