@@ -1665,3 +1665,142 @@ fn step_timeout_is_read_from_a_number_token() {
     assert_eq!(built.len(), 1);
     assert_eq!(built[0].timeout_minutes, Some(1));
 }
+
+// ---- Broker long-poll websocket probe (v2.338.0) ----
+
+fn job_ctx_with_probe_variable(url: Option<&str>) -> JobContext {
+    let variables = match url {
+        Some(url) => serde_json::json!({
+            "system.runner.brokerwebsocketprobeurl": {"value": url}
+        }),
+        None => serde_json::json!({}),
+    };
+    JobContext::new("j1".into(), "Job".into(), variables, serde_json::json!({}))
+}
+
+#[test]
+fn ws_probe_is_inert_without_the_variable() {
+    assert!(
+        BrokerWsProbe::spawn(&job_ctx_with_probe_variable(None), Some("token".into())).is_none()
+    );
+}
+
+#[test]
+fn ws_probe_is_inert_with_empty_probe_url() {
+    assert!(
+        BrokerWsProbe::spawn(&job_ctx_with_probe_variable(Some("")), Some("token".into()))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn ws_probe_connects_holds_and_cancels_on_job_end() {
+    use futures::{SinkExt, StreamExt};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // The probe echoes text frames back like the official runner. Signal
+    // after the echo arrives: the probe is then provably inside its hold
+    // loop, so cancellation lands as `job_completed` rather than racing an
+    // in-flight connect.
+    let (echo_tx, echo_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        use tokio_tungstenite::tungstenite::Message;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::Text("ping".into())).await.unwrap();
+        let echoed = ws.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(_)));
+        let _ = echo_tx.send(());
+        while ws.next().await.is_some() {}
+    });
+
+    let probe = BrokerWsProbe::spawn(
+        &job_ctx_with_probe_variable(Some(&format!("ws://{address}/probe"))),
+        Some("token".into()),
+    )
+    .expect("probe task starts when the variable is present");
+    echo_rx.await.unwrap();
+
+    let telemetry = Arc::new(Mutex::new(Vec::new()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe.finish(&telemetry))
+        .await
+        .expect("probe finishes promptly once cancelled");
+    server.await.unwrap();
+
+    let entries = telemetry.lock().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["type"], "ConnectivityCheck");
+    let message = entries[0]["message"].as_str().unwrap();
+    let payload = message
+        .strip_prefix("broker_websocket_telemetry:")
+        .expect("probe telemetry carries the upstream prefix");
+    let result: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(result["connected"], true);
+    assert_eq!(result["connectCount"], 1);
+    assert_eq!(result["pingsReceived"], 1);
+    assert_eq!(result["lastCloseReason"], "job_completed");
+}
+
+#[tokio::test]
+async fn ws_probe_records_connect_failure_when_unreachable() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // Bind then drop: the port is almost certainly closed now.
+    let address = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+
+    let probe = BrokerWsProbe::spawn(
+        &job_ctx_with_probe_variable(Some(&format!("ws://{address}/probe"))),
+        Some("token".into()),
+    )
+    .unwrap();
+
+    let telemetry = Arc::new(Mutex::new(Vec::new()));
+    // The probe is inside its 10–300 s reconnect backoff when we cancel;
+    // `finish` must still return promptly.
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe.finish(&telemetry))
+        .await
+        .expect("probe finishes promptly once cancelled");
+
+    let entries = telemetry.lock().await;
+    assert_eq!(entries.len(), 1);
+    let message = entries[0]["message"].as_str().unwrap();
+    let payload = message.strip_prefix("broker_websocket_telemetry:").unwrap();
+    let result: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(result["connected"], false);
+    assert_eq!(result["connectFailures"], 1);
+    assert_eq!(result["lastCloseReason"], "connect_failed");
+}
+
+#[tokio::test]
+async fn ws_probe_reports_endpoint_missing_without_service_token() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let probe = BrokerWsProbe::spawn(
+        &job_ctx_with_probe_variable(Some("ws://127.0.0.1:1/probe")),
+        None,
+    )
+    .unwrap();
+    let telemetry = Arc::new(Mutex::new(Vec::new()));
+    probe.finish(&telemetry).await;
+
+    let entries = telemetry.lock().await;
+    let message = entries[0]["message"].as_str().unwrap();
+    let payload = message.strip_prefix("broker_websocket_telemetry:").unwrap();
+    let result: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(result["connected"], false);
+    assert!(
+        result["errors"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap()
+            .contains("SystemVssConnection")
+    );
+}
