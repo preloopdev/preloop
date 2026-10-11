@@ -578,20 +578,32 @@ pub(crate) async fn report_completion(
 }
 
 /// Build a synthetic script Step for a job hook (ACTIONS_RUNNER_HOOK_JOB_STARTED
-/// / ACTIONS_RUNNER_HOOK_JOB_COMPLETED). The hook path is a shell script on the
-/// runner host, executed with the default shell exactly like a `run:` step.
+/// / ACTIONS_RUNNER_HOOK_JOB_COMPLETED). The hook variable carries a path on the
+/// runner host. Upstream `HostContext.GetDefaultShellForScript` routes `.js`
+/// hook scripts through `GetInternalNodeVersion()` (node24 by default,
+/// overridable via `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION`) and
+/// everything else through the default shell — mirrored here by emitting a
+/// POSIX wrapper for `.js` paths that execs the bundled internal node (or the
+/// `/__e` container mount inside container jobs), and leaving the path string
+/// for the default shell otherwise.
 pub(crate) fn make_hook_step(
     id: &str,
     context_name: &str,
     script_path: &str,
+    workspace: &str,
 ) -> super::steps_runner::Step {
+    let mut script = script_path.to_string();
+    let shell: Option<String> = None;
+    if script_path.to_ascii_lowercase().ends_with(".js") {
+        script = js_hook_wrapper(script_path, std::path::Path::new(workspace));
+    }
     super::steps_runner::Step {
         id: id.to_string(),
         context_name: context_name.to_string(),
         display_name: context_name.replace('_', " ").trim().to_string(),
         step_type: super::steps_runner::StepType::Script {
-            script: script_path.to_string(),
-            shell: None,
+            script,
+            shell,
             working_directory: None,
         },
         condition: Some("always()".to_string()),
@@ -601,6 +613,59 @@ pub(crate) fn make_hook_step(
         raw: serde_json::json!({}),
         is_background: false,
     }
+}
+
+/// POSIX wrapper emitted for a `.js` job hook: pick the internal Node
+/// appropriate to where the step runs, then `require()` the hook file so a
+/// missing/unreadable path fails through node's own error instead of
+/// executing the path string as source. Mirrors upstream
+/// `HostContext.GetDefaultShellForScript`'s `.js` branch, which runs the
+/// script under `GetInternalNodeVersion()`.
+fn js_hook_wrapper(script_path: &str, workspace: &std::path::Path) -> String {
+    let version = internal_node_version();
+    let host_node = bundled_node_path(workspace, version).unwrap_or_else(|| "node".to_owned());
+    let escaped = script_path.replace('\\', "\\\\").replace('\'', "\\'");
+    // Container jobs mount the runner's externals at /__e (the same path the
+    // action handler uses); use that node when the mount is visible. Host
+    // jobs exec the bundled binary directly, falling back to whatever `node`
+    // is on PATH (--no-externals installs).
+    format!(
+        "if [ -x /__e/{version}/bin/node ]; then \\\n\
+         \x20 exec /__e/{version}/bin/node -e \"require('{escaped}')\" \\\n\
+         \x20 else \\\n\
+         \x20 exec {host_node} -e \"require('{escaped}')\" \\\n\
+         \x20 fi\n"
+    )
+}
+
+/// `GetInternalNodeVersion` selection: node24 by default in v2.338.0,
+/// `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION` forces a built-in version
+/// when it names one.
+fn internal_node_version() -> &'static str {
+    match std::env::var("ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION") {
+        Ok(v) if v == "node20" => "node20",
+        _ => "node24",
+    }
+}
+
+/// The bundled node binary under the runner root found by walking up from
+/// the workspace, if present.
+fn bundled_node_path(workspace: &std::path::Path, version: &str) -> Option<String> {
+    let runner_root = workspace
+        .ancestors()
+        .find(|dir| dir.join("externals").is_dir())?;
+    let bundled = if cfg!(target_os = "windows") {
+        runner_root.join("externals").join(version).join("node.exe")
+    } else {
+        runner_root
+            .join("externals")
+            .join(version)
+            .join("bin")
+            .join("node")
+    };
+    bundled
+        .is_file()
+        .then(|| bundled.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

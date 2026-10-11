@@ -351,7 +351,12 @@ pub async fn run_job(
         info!("Injecting ACTIONS_RUNNER_HOOK_JOB_STARTED: {hook}");
         ordered_steps.insert(
             0,
-            make_hook_step("__hook_job_started", "__hook_job_started", &hook),
+            make_hook_step(
+                "__hook_job_started",
+                "__hook_job_started",
+                &hook,
+                &workspace,
+            ),
         );
     }
     if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_COMPLETED")
@@ -362,6 +367,7 @@ pub async fn run_job(
             "__hook_job_completed",
             "__hook_job_completed",
             &hook,
+            &workspace,
         ));
     }
     {

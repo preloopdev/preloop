@@ -120,6 +120,25 @@ fn required_major_from_version_extracts_correctly() {
     assert_eq!(required_major_from_version("python3"), None);
 }
 
+/// Job-side Node version resolution — the analogue of upstream
+/// `NodeUtil.DetermineActionsNodeVersion` (invoked from `HandlerFactory`).
+///
+/// Upstream v2.338.0 raised the *internal* node default to `node24`
+/// (`NodeUtil.GetInternalNodeVersion`: `_defaultNodeVersion` node20 → node24,
+/// `BuiltInNodeVersions` now `[node20, node24]`). Almost every upstream
+/// `GetInternalNodeVersion` caller is absent or node-free here: the `--check`
+/// extensions (`CheckUtil`/`NodeJsCheck`, no `check` subcommand exists), the
+/// node-executed `hashFiles` expression (ours is native Rust in
+/// `preloop-gha-expressions`), and the macOS `DYLD_INSERT_LIBRARIES` invoker
+/// in `ScriptHandler.cs`. The one internal-node consumer that does exist —
+/// `.js` job/container hook shell resolution
+/// (`HostContext.GetDefaultShellForScript`) — lives in
+/// `completion.rs::internal_node_for_hook`, which honors
+/// `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION` and defaults to `node24`.
+/// Every *action* node binary this runner execs is still selected by this
+/// function, driven by `runs_using` plus the job-variable/flag inputs read in
+/// `run()`; node20 stays the phase-1 default for `node20` actions, matching
+/// upstream `useNode24ByDefault=false`.
 #[allow(clippy::too_many_arguments)]
 fn resolve_node_version(
     runs_using: &str,
@@ -711,6 +730,22 @@ mod tests {
 
         assert_eq!(selection.version, "node24");
         assert!(selection.warnings.is_empty());
+    }
+
+    /// Regression: job-side `resolve` keeps the upstream phase-1 default
+    /// (`useNode24ByDefault=false`) — `using: node20` selects node20 with no
+    /// warning. This function takes no environment input; the internal-node
+    /// analogue that *does* honor `ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION`
+    /// lives in `completion.rs` for `.js` job hooks (v2.338.0
+    /// `GetInternalNodeVersion`: `_defaultNodeVersion` node20 → node24). Any
+    /// further internal consumer (a `check` command, node-executed
+    /// `hashFiles`) must resolve through a dedicated analogue, not this
+    /// function — env mutation belongs in a child-process test for it.
+    #[test]
+    fn node20_action_keeps_phase_one_default() {
+        let plain = resolve("node20", &[], None, None, false, false, "linux", "x64");
+        assert_eq!(plain.version, "node20");
+        assert!(plain.warnings.is_empty());
     }
 
     #[test]
