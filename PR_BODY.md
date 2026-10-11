@@ -1,139 +1,103 @@
-# Fix: stream cache blob writes + total cache quota with LRU eviction
+# PR-K: Transform-aware masking, layered (round-3 §9)
 
-Fixes round-3 report §11 (Cache flood → RAM spike + permanent disk).
+## Finding
 
-## Problem
+Round-3 report §9, 2 of 3 reproduced against `879329a0`:
 
-Two compounding defects in the Actions cache path:
+1. `::add-mask::pentest-mask-9f3k2`, then echoing the secret raw and base64-encoded:
+   the stored log showed `raw=***` but the **base64 form in plaintext** — one
+   `base64 -d` recovers it. Root cause: `JobContext::new` registered base64
+   variants for *initial* secrets, but `add_mask` registered only the raw value
+   (plus trimmed lines); percent/hex/case variants were never masked anywhere.
+2. Proxy credentials raw in setup logs: `steps_runner.rs` printed the proxy URL
+   verbatim **with userinfo** — any deployment with an authenticated egress
+   proxy leaks it to every log reader.
 
-1. **Full-blob-in-RAM finalize.** The Twirp v2 flow (`twirp_cache_v2_finalize`)
-   staged upload chunks to disk correctly, then did `tokio::fs::read` of the
-   whole staged blob and passed the `Vec<u8>` to `CacheStore::put`, which
-   wrote it again. Reproduced in round 3: finalizing a 150 MB blob spiked
-   server RSS **69 MB → 341 MB** (+265 MB ≈ 1.8× blob size). The legacy
-   `/_apis/artifactcache` flow was worse: `cache_upload` appended every PATCH
-   chunk to `PendingCache::bytes`, holding the entire blob in server RAM for
-   the reservation's lifetime.
-2. **No quota, no eviction.** `CacheStore::put` validated key format only. A
-   finalized entry sat in `state/cache/` forever; disk filled for the lifetime
-   of the state directory.
+(The third sub-item — annotation title/file — was not reproduced end-to-end;
+residual risk only, out of scope.)
 
-## Fix
+## Fix, in four layers
 
-**Streaming writes (never buffer the full blob in RAM):**
-- `preloop-cache`: new `CacheStore::commit_file_scoped(namespace, key,
-  version, src)` — claims the entry dir, writes metadata sidecars, then
-  *moves* the staged file into place (atomic rename; bounded-buffer
-  streaming copy fallback for cross-filesystem staging). The staging file is
-  consumed, never read into RAM.
-- Twirp v2 finalize now commits the staged `blobs/cache/<jti>/data` file via
-  `commit_file_scoped`. Cleanup of the reservation + staging dir is
-  unconditional (also runs on commit failure).
-- Legacy v1 flow: `cache_reserve` creates `<state_dir>/cache-staging/<id>.part`;
-  `cache_upload` appends each chunk to the file (open/append/close under the
-  state lock, so the per-upload and per-job byte caps can't be raced);
-  `cache_commit` hands the file to `commit_file_scoped`. `PendingCache::bytes:
-  Vec<u8>` is gone — replaced by `staging_path` + `staging_len`. Abandoned
-  reservations' staging files are deleted by the TTL sweeper
-  (`sweep_pending_uploads` now returns the files; `reap_once` deletes them
-  after releasing the lock); a crashed server's leftovers are reaped at boot.
+1. **Transform-aware masking** (`crates/preloop-gha-protocol/src/masking.rs`):
+   new `secret_variants(secret)` generates base64 (standard + URL-safe, padded
+   and unpadded), percent-encoding, hex (lower + upper); new canonical
+   `mask_secrets_transform_aware` / `mask_secrets_preserving_lines_transform_aware`
+   expand variants and match ASCII case-insensitively. The exact `mask_secrets`
+   is kept for the DAP transport path that needs byte-exact behavior.
+   All runner log paths (`contexts.rs`, `live_logs.rs`) and `mask_annotations`
+   now use the transform-aware functions.
+2. **Server-side pass before persistence**: every bearerless signed-URL
+   `PUT /replay/results/*` (step logs, job logs, summaries) is re-masked
+   transform-aware before bytes hit disk (`blob_store.rs`); fails closed —
+   500 and the upload is dropped if secret resolution fails. Also wired into
+   the AzDO `append_log` and `console_log` live-wrapper ingestion (fail-open
+   there: transient feed, and the runner already masks).
+3. **Never emit credentials**: new dependency-free `strip_url_userinfo(url)`;
+   the proxy setup line now prints the host without userinfo (extracted as
+   `proxy_setup_line` in `steps_runner.rs`, "don't print, not mask after
+   printing"). Same treatment audited onto the broker-migration URL log, the
+   action-tarball download URL, and live-log feed URL warnings. Reviewed and
+   deliberately left: node-externals URLs (content-addressed, no creds),
+   completion-report URLs, server `redact_store_url`, OTLP debug output.
+4. **Chunk boundaries**: new `StreamingMasker` — a trailing-overlap buffer
+   (`push(chunk)` masks the reassembled window and withholds possible secret
+   heads; `finish()` flushes the tail). Wired into `append_log` per log key
+   behind a per-key mutex; flushed on `finish_job`/`finish_job_plan` and
+   dropped on memory-pressure eviction.
 
-**Total quota with LRU eviction:**
-- New `[cache] total_quota_bytes`, default **10 GiB** (matches GitHub's 10 GB
-  per-repository cache limit; this is the server-wide total across all
-  namespaces). Env `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins; unparseable
-  values fail startup. Documented in `docs/self-hosting.md`.
-- Every commit (and server boot) runs `CacheStore::enforce_quota`: entries are
-  ordered by last use (archive mtime, refreshed on every read and commit) and
-  the oldest are deleted until the total fits. The just-committed entry is
-  never evicted by its own commit — a single entry larger than the quota is
-  kept, then evicted by the next commit. Stale incomplete writes (crashed
-  uploads: `.part` debris or metadata without an archive, older than 1h) are
-  reaped so they can never wedge an entry or the quota.
+## Regression tests
 
-**Read path survey:**
-- `GET /twirp-blob/cache/<token>` (the v2 download) previously did
-  `cache.get()` — loading the whole archive into RAM — then served it. It now
-  resolves metadata only (`CacheStore::lookup`) and streams the file with
-  `ReaderStream`. The staging-file fallback branch streams too.
-- `twirp_cache_v2_get_dl_url` and both existence checks (`create`, finalize's
-  already-exists path) use the metadata-only `lookup` instead of `get`: a
-  restore lookup no longer pulls the archive into RAM just to throw the bytes
-  away.
-- `GET /api/v1/cache` (legacy base64-in-JSON) is unchanged by design: base64
-  in a JSON body inherently requires the full content in memory. The v2
-  streaming download is the large-blob path.
+- `preloop-gha-protocol` (13 new unit tests): variant generation (b64 std/urlsafe
+  ±pad, percent, hex lower/upper, dedupe, case-insensitive), `StreamingMasker`
+  split-across-chunks at every split offset, `strip_url_userinfo`.
+- `preloop-runner` (4 new): `::add-mask::` then base64/upper echo → all masked;
+  proxy setup line strips userinfo; annotations masked transform-aware.
+- `preloop-runner-server` integration
+  (`replay_step_log_upload_is_masked_before_persist`): submit a run carrying a
+  secret, `PUT` **unmasked** bytes (raw + base64) to a minted signed step-log
+  URL through the real router → asserts the persisted file is
+  `raw=*** b64=***`.
 
-## Behavior changes
+## Repro verification (live server, 2026-10-11)
 
-- Legacy `cache_reserve` now creates its staging file up front; a failed
-  reserve (disk full, staging unwritable) surfaces at reserve time instead of
-  at first chunk.
-- `sweep_pending_uploads` signature: now returns `Vec<PathBuf>` (staging
-  files to delete); `reap_once` deletes them.
+Patched server on `127.0.0.1:19111` (state dir under the worktree,
+`preloop store migrate` first, `/readyz` 200):
 
-## Tests
+1. Submitted a run with secret `MASK_ME=pentest-mask-9f3k2` via
+   `POST /api/v1/runs` → run `aa3fce07-b73c-4196-b7cb-03c81d67a8bd`.
+2. Minted a signed upload ticket (HMAC-SHA256 over `replay-blob\n<exp>\n<path>`
+   with the server's key) and `PUT` the bytes
+   `raw=pentest-mask-9f3k2 b64=cGVudGVzdC1tYXNrLTlmM2sy` — **unmasked**, as a
+   masking-buggy runner would send — to
+   `/replay/results/<run>/job-1/step-abc.txt` → HTTP 201.
+3. Read the persisted file: **`raw=*** b64=***`** — the server-side pass
+   caught both the raw and base64 forms before they hit disk.
 
-- `preloop-cache` (12 passed):
-  - `commit_file_streams_large_blob_with_small_rss_delta`: finalizes a
-    **150 MB** blob, asserts process RSS delta **< 64 MiB**.
-  - `quota_evicts_least_recently_used`: 3 MiB quota, 4× 1 MiB entries; the
-    oldest *untouched* entry is evicted while a recently-read older entry
-    and the newest survive; total back under quota.
-  - `oversized_single_entry_survives_its_own_commit`, plus
-    `commit_file` round-trip/duplicate and metadata-only `lookup` tests.
-- `cargo check` + `cargo clippy --all-targets`: clean. `cargo fmt`: applied.
+Full VM job execution was not possible on this machine (no `/dev/kvm`;
+the golden-image download stalled), so the runner half is verified by the
+unit/integration tests above rather than a live `::add-mask::` workflow run.
+The proxy-userinfo fix is verified by the `proxy_setup_line` regression test
+(the setup line is emitted by the in-VM runner; the audit confirmed it is the
+only proxy-URL emission point).
 
-## Repro verification (patched server, port 19109)
+## Test results
 
-Setup: `preloop store migrate` then `preloop serve --listen 127.0.0.1:19109`
-with `PRELOOP_HOME=<worktree>/.repro-19109`,
-`PRELOOP_SYSTEM_TOKEN=repro-sys-token-19109`,
-`PRELOOP_CACHE_TOTAL_QUOTA_BYTES=262144000` (250 MiB, to exercise eviction).
-State dir under the worktree, never /tmp. Server PID 19041; RSS sampled from
-`/proc/<pid>/status` (VmRSS).
+- `cargo test -p preloop-gha-protocol --lib`: **103 passed**
+- runner targeted tests (contexts/live_logs/commands/steps_runner): **32 passed**
+- `preloop-runner-server` lib (timeline_logs/memory_caps/blob_store/live_logs): **24 passed**
+- new server integration test `replay_step_log_upload_is_masked_before_persist`: **passed**
+- `cargo clippy --all-targets` on the three touched crates: **clean**
+- `cargo fmt --check`: **clean**
 
-**1. Streaming finalize — the +265 MB spike is gone.**
-Drove the legacy chunked flow with the system bearer (same fixed commit
-primitive as the Twirp v2 finalize, plus it exercises all the new staging
-code):
-- `POST /_apis/artifactcache/cache` `{"key":"repro-key-a2","version":"v1"}` → `cacheId`
-- 75× `PATCH /_apis/artifactcache/cache/<id>` with 2 MiB chunks (150 MB blob)
-- `POST /_apis/artifactcache/cache/<id>` `{"size":157286400}` → commit
+## Notes
 
-| Phase | Server RSS |
-|---|---|
-| Baseline | 104.5 MiB |
-| Peak during 150 MB chunked upload | 113.3 MiB (delta 8.8 MiB) |
-| **Peak during commit (finalize)** | **107.8 MiB — delta 0.1 MiB** |
-
-Round-3 unpatched: 69 → 341 MB (+265 MB) during finalize. The finalize is
-now a file rename + directory scan; commit returned in <0.1s. Committed
-archive sha256 matches the source blob; `cache_lookup` reports the entry.
-
-**2. Quota eviction end-to-end.** With the 250 MiB quota:
-- Committed `repro-key-a` (150 MB), then `repro-key-a2` (150 MB): the second
-  commit pushed the total to 300 MB → `repro-key-a` evicted. Disk:
-  `state/cache/` = 151M, 1 archive.
-- LRU ordering: committed `lru-1..lru-3` (50 MB each), read `lru-1` via
-  lookup (refreshes its LRU timestamp), committed `lru-4..lru-6`. Evicted:
-  `repro-key-a2` (oldest) then `lru-2` (oldest *untouched* — `lru-1` survived
-  because it was read). Final: `lru-1,lru-3,lru-4,lru-5,lru-6` on disk,
-  total 251M ≈ quota.
-
-**3. Read path.** `twirp_cache_v2_get_dl_url` and both existence checks now
-use metadata-only `lookup` (no archive bytes loaded). The `/twirp-blob/cache`
-download streams via `ReaderStream` (same idiom as the action-tarball path);
-the signed-URL download leg needs a live job token so it was verified by code
-inspection, not live — the legacy base64 endpoint (`GET /api/v1/cache`) is
-unchanged by design (base64-in-JSON inherently buffers).
-
-**4. Unit tests.** `cargo test -p preloop-cache`: 12/12 pass, including
-`commit_file_streams_large_blob_with_small_rss_delta` (150 MB finalize, RSS
-delta < 64 MiB bound) and `quota_evicts_least_recently_used`. `cargo check`
-and `cargo clippy -p preloop-cache -p preloop-runner-server --all-targets`:
-clean. `cargo fmt`: applied.
-
-Not run: the full `just test-ci` gate (fmt+clippy done; the workspace test
-suite needs hours under the current 4-way sibling build contention — the
-server's lib test profile alone takes ~30 min to link here).
+- During verification, `cargo check` once reported a clean build on stale cache
+  while a later test build surfaced a real E0382 (moved `Arc` in the
+  `finish_job` flush calls); fixed by cloning the `Arc`, and all subsequent
+  verification was done from clean rebuilds.
+- Diag-zip uploads (`/twirp-blob/diag/`) are compressed blobs — no plaintext
+  masking is possible server-side; the runner masks `_diag` content at write
+  time via the same log pipeline. Out of scope for this pass.
+- Withheld streaming tails are flushed at job finish; if `finish_job` never
+  arrives (runner crash), at most the bounded overlap tail stays out of the
+  lossy in-memory preview. The durable runner-uploaded logs are unaffected.
