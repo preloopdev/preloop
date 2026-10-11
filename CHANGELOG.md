@@ -33,8 +33,12 @@ Releases before v0.27.0 predate the changelog.
   fill a volume at 100% on a loop. The unpack now stalls behind the same
   disk-wait discipline as job VMs when the volume lacks
   `PRELOOP_GOLDEN_UNPACK_FACTOR` (default 6) times the pack's compressed
-  size, prunes `pack/` on any failure, and the startup sweep prunes the
-  residue a crashed delete left inside registered machines.
+  size, and the check serializes against the extraction it gates so two
+  goldens cannot commit the same free bytes. Failure cleanup reaches the
+  unregistered data dir a create that died mid-extraction leaves (no
+  `storage.raw`, no registry row, invisible to `delete`), then the named
+  machine's own `pack/`; the startup sweep prunes residue a crashed delete
+  left inside registered machines.
 
 ## [0.34.0] - 2026-10-09
 

@@ -3805,15 +3805,6 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     // IS the pack at the stem; a locally built golden leaves the pack in the
     // `.smolmachine` sidecar. Centralized in [`packed_golden_path`].
     let pack = packed_golden_path(&payload);
-    // Unpacking writes several times the pack's size before smolvm's own
-    // layer-extraction preflight ever runs, and a host it fills aborts the
-    // whole engine. Wait for room like the job-VM reserve does: a stall the
-    // operator can relieve beats an ENOSPC part-way through 30 GB of writes.
-    if !wait_for_golden_unpack_disk(config, &pack, shutdown).await {
-        return Err(OrchestratorError::Pool(
-            "golden preparation cancelled by shutdown while waiting for disk".into(),
-        ));
-    }
     let spec = MachineSpec {
         name: golden.clone(),
         image: pack.display().to_string(),
@@ -3835,7 +3826,26 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
         rosetta: cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64",
     };
     let unpacked: Result<(), OrchestratorError> = async {
-        provider.create(&spec).await?;
+        // Serialize the headroom check against the write that consumes it:
+        // `machine create --from` copies multiple times the pack's size, so a
+        // second unpack gated on the same free bytes would ENOSPC mid-write.
+        // Held only across the check and `create` — not the whole unpack — so
+        // a stalled host delays one unpack's start, never a running one.
+        {
+            static UNPACK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _permit = UNPACK.lock().await;
+            // Unpacking writes several times the pack's size before smolvm's
+            // own layer-extraction preflight ever runs, and a host it fills
+            // aborts the whole engine. Wait for room like the job-VM reserve
+            // does: a stall the operator can relieve beats an ENOSPC part-way
+            // through 30 GB of writes.
+            if !wait_for_golden_unpack_disk(config, &pack, shutdown).await {
+                return Err(OrchestratorError::Pool(
+                    "golden preparation cancelled by shutdown while waiting for disk".into(),
+                ));
+            }
+            provider.create(&spec).await?;
+        }
         provider.start(golden).await?;
         vm_telemetry_register(config, golden, "golden", Some(&spec));
         await_guest_ready(provider.as_ref(), golden).await?;
@@ -3864,12 +3874,27 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     .await;
     if let Err(error) = unpacked {
         // A failed unpack leaves ~29 GB of `pack/` intermediates beside the
-        // partial disk. The caller deletes the machine, but smolvm's delete
-        // is a no-op when the create died before it registered — the residue
-        // then survives every retry until a restart's stale-machine sweep
-        // happens to claim it, and retries fill the volume. Prune first:
-        // `prune_pack_dir` only removes a `pack/` sitting next to a
-        // `storage.raw`, so a base that finished writing its disk keeps it.
+        // partial disk, and the caller's `delete` cannot reclaim any of it
+        // when the create died before registering: the data dir exists, the
+        // registry row does not, so `machine data-dir` and `machine delete`
+        // both report no such machine. The residue then survives every retry
+        // until the orphan sweep's grace window passes, and retries fill the
+        // volume. Prune that unregistered residue first, then the named
+        // machine's copy for failures that happened after registration —
+        // `prune_pack_dir` still requires `storage.raw`, so a base that
+        // finished writing its disk keeps it for adoption.
+        match provider.prune_failed_unpack_residue().await {
+            Ok(reclaimed) if reclaimed > 0 => info!(
+                machine = golden.as_str(),
+                reclaimed, "pruned pack/ intermediates from unregistered machine dirs"
+            ),
+            Ok(_) => {}
+            Err(prune_error) => warn!(
+                machine = golden.as_str(),
+                %prune_error,
+                "failed to prune unregistered pack/ intermediates"
+            ),
+        }
         match provider.prune_pack_intermediates(golden).await {
             Ok(true) => info!(
                 machine = golden.as_str(),
@@ -7387,6 +7412,20 @@ mod lifecycle_tests {
         suspends: bool,
         /// Names passed to `prune_pack_intermediates`, in call order.
         prune_pack_calls: Mutex<Vec<String>>,
+        /// Fail `create` outright, without registering the machine — the
+        /// shape of a `machine create --from` that dies mid-extraction: the
+        /// data dir and its `pack/` exist, the registry row does not.
+        fail_create: bool,
+        /// Calls to `prune_failed_unpack_residue`, the unregistered-dir
+        /// sweep a failed unpack runs before the named-machine prune.
+        failed_unpack_prunes: Mutex<u32>,
+        /// When set, `create` blocks after recording its start until
+        /// notified — models a multi-minute pack extraction, and lets a test
+        /// hold one unpack mid-write while another is staged.
+        create_gate: Option<Arc<tokio::sync::Notify>>,
+        /// Bytes `create` draws from the scripted free-space counter before
+        /// registering — the pack intermediates it writes.
+        disk_draw: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
         /// When set, `exec` answers exit 1 for any argv whose debug form
         /// contains this marker — models a guest command that fails.
         fail_exec_containing: Mutex<Option<String>>,
@@ -7426,6 +7465,10 @@ mod lifecycle_tests {
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
                 suspends: false,
                 prune_pack_calls: Mutex::new(Vec::new()),
+                fail_create: false,
+                failed_unpack_prunes: Mutex::new(0),
+                create_gate: None,
+                disk_draw: None,
                 fail_exec_containing: Mutex::new(None),
                 file_packs: true,
             }
@@ -7435,6 +7478,25 @@ mod lifecycle_tests {
         /// prepared in the guest instead of unpacked from an artifact.
         fn no_packs(mut self) -> Self {
             self.file_packs = false;
+            self
+        }
+
+        /// A provider whose `create` fails before the machine registers.
+        fn failing_create(mut self) -> Self {
+            self.fail_create = true;
+            self
+        }
+
+        /// `create` blocks on `gate` after starting and draws `bytes` from the
+        /// free-space counter while it parks — an extraction in progress.
+        fn gating_create(
+            mut self,
+            gate: Arc<tokio::sync::Notify>,
+            counter: Arc<std::sync::atomic::AtomicU64>,
+            bytes: u64,
+        ) -> Self {
+            self.create_gate = Some(gate);
+            self.disk_draw = Some((counter, bytes));
             self
         }
 
@@ -10421,6 +10483,17 @@ done
         }
 
         async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
+            if let Some(gate) = &self.create_gate {
+                // Hold the draw while parked: the extraction's bytes are
+                // committed before the create completes.
+                gate.notified().await;
+            }
+            if let Some((counter, bytes)) = &self.disk_draw {
+                counter.fetch_sub(*bytes, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.fail_create {
+                return Err(test_error("create-failure"));
+            }
             self.machines
                 .lock()
                 .await
@@ -10461,6 +10534,11 @@ done
                 .await
                 .push(name.as_str().to_owned());
             Ok(true)
+        }
+
+        async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+            *self.failed_unpack_prunes.lock().await += 1;
+            Ok(0)
         }
 
         /// Records each reconcile sweep instead of removing anything, so a
@@ -11442,6 +11520,128 @@ done
         assert!(
             provider.created_image(&golden).await.is_some(),
             "a host with room for the pack unpacks it"
+        );
+    }
+
+    /// A `create` that fails before registering leaves `pack/` residue the
+    /// named-machine prune cannot reach (no registry row for `data-dir` to
+    /// resolve, and `delete` is a no-op), so the failure path sweeps
+    /// unregistered residue first, then prunes the named machine anyway —
+    /// the create could equally have failed after registering.
+    #[tokio::test]
+    async fn golden_prepare_sweeps_unregistered_residue_on_create_failure() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_create());
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"packed-golden").unwrap();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+
+        prepare_fork_base(
+            &provider,
+            &config,
+            &golden,
+            &env_spec,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a create that never registers still fails preparation");
+
+        assert_eq!(
+            *provider.failed_unpack_prunes.lock().await,
+            1,
+            "the failure path sweeps pack/ residue a pre-registration create left"
+        );
+        assert!(
+            provider.created_image(&golden).await.is_none(),
+            "the create died before registering"
+        );
+    }
+
+    /// Two environment goldens that prepare together cannot both gate on the
+    /// same free bytes: the check and the extraction it covers serialize, so
+    /// the second unpack re-measures after the first has drawn its headroom
+    /// and stalls instead of ENOSPC-ing mid-write.
+    #[tokio::test]
+    async fn concurrent_golden_unpacks_serialize_against_the_disk_gate() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let payload = config.artifact_payload();
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        // 13-byte pack → 78 bytes of headroom; the scripted volume holds 137,
+        // enough for exactly one unpack: the first create draws 60 mid-flight
+        // and leaves 77, one byte short of what the second needs.
+        std::fs::write(&payload, b"packed-golden").unwrap();
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(137));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            TestProvider::new(false, false, false, false, false).gating_create(
+                gate.clone(),
+                free.clone(),
+                60,
+            ),
+        );
+        {
+            let scripted = free.clone();
+            config.job_vm_disk = JobVmDiskReserve::new(0, move |_| {
+                Ok(scripted.load(std::sync::atomic::Ordering::SeqCst))
+            })
+            .with_probe_interval(Duration::from_millis(5));
+        }
+        let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
+        let golden_a = MachineName::new("lifecycle-test-golden").unwrap();
+        let golden_b = MachineName::new("lifecycle-test-other").unwrap();
+
+        // Unpack A acquires the serialization permit and parks inside create,
+        // holding the extraction's draw while B waits behind the permit.
+        let unpack_a = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let env_spec = env_spec.clone();
+            let golden = golden_a.clone();
+            async move {
+                prepare_fork_base(
+                    &provider,
+                    &config,
+                    &golden,
+                    &env_spec,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let shutdown_b = CancellationToken::new();
+        let unpack_b = tokio::spawn({
+            let provider = provider.clone();
+            let config = config.clone();
+            let shutdown = shutdown_b.clone();
+            let golden = golden_b.clone();
+            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+        });
+        // Let B reach the permit, then let A's create finish and draw.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.notify_waiters();
+
+        unpack_a
+            .await
+            .unwrap()
+            .expect("the first unpack has room and completes");
+        // B re-measures against the drawn-down volume — 77 free < 78 required
+        // — and stalls. Cancel it and confirm it never reached create.
+        shutdown_b.cancel();
+        unpack_b
+            .await
+            .unwrap()
+            .expect_err("the second unpack waits out the disk gate");
+        assert!(
+            provider.created_image(&golden_b).await.is_none(),
+            "the second unpack must not start against free space the first already drew"
         );
     }
 

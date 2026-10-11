@@ -717,8 +717,10 @@ one produced so a regression is recognizable.
   and holds new job VMs below `PRELOOP_RUNNER_MIN_FREE_DISK_GB`. The golden
   unpack follows the same discipline: it stalls until the volume has
   `PRELOOP_GOLDEN_UNPACK_FACTOR` (default 6) times the pack's compressed size
-  free, and a failed attempt prunes its `pack/` intermediates itself — the
-  startup sweep reclaims whatever a crashed delete left. If the host
+  free (serialized so concurrent goldens cannot spend the same free bytes),
+  and a failed attempt prunes its `pack/` intermediates itself — including
+  the unregistered data dir a create that died mid-extraction leaves — while
+  the startup sweep reclaims whatever a crashed delete left. If the host
   still reports "No space left on device", check what is growing with
   `du -sh <preloop home>/smolvm-home/Library/Caches/smolvm/vms/*` and verify
   free space with `df -h /System/Volumes/Data`.
