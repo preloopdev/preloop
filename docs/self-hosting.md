@@ -210,6 +210,23 @@ rather than refusing to boot — off retains nothing, so a typo costs caching,
 never startup. `GET /api/v1/config/checkout-cache` (native bearer) returns
 the effective policy.
 
+### Actions cache
+
+`actions/cache` entries are finalized into `<state_dir>/cache/` and bounded
+by a total quota with least-recently-used eviction: when a commit pushes the
+total over the quota, the least recently used entries are deleted until the
+total fits again. Uploads stream to disk chunk-by-chunk — a large blob is
+never buffered in server RAM — and downloads stream off disk the same way.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` | `10 GiB` | Total bytes of finalized cache entries kept on disk, across all namespaces; LRU entries are evicted past it |
+
+The same key lives under `[cache]` in the config file (`total_quota_bytes`);
+the environment wins, and an unparseable value fails startup rather than
+silently keeping or dropping cached entries. A single entry larger than the
+quota is kept by the commit that created it and evicted by the next commit.
+
 Objects are namespaced by forge origin, the credential that fetched them (App
 installation, or a PAT fingerprint), and the repository's numeric id — never by
 `owner/repo` or commit sha, so a rename cannot cross namespaces and two

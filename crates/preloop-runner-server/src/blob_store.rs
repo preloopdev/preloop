@@ -497,13 +497,25 @@ pub async fn blob_get(
             .map(|(key, version)| (key.to_owned(), version.to_owned()));
         if let Some((key, version)) = kv {
             let empty: Vec<String> = Vec::new();
-            return match shared.state.cache.get(&key, &version, &empty).await {
-                Ok(Some((_entry, bytes))) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    bytes,
-                )
-                    .into_response(),
+            return match shared.state.cache.lookup(&key, &version, &empty).await {
+                // Stream the archive straight off disk: the old code loaded
+                // the whole entry into RAM (`cache.get`) before serving it,
+                // so every large restore spiked server memory.
+                Ok(Some(entry)) => match tokio::fs::File::open(&entry.path).await {
+                    Ok(file) => {
+                        let stream = tokio_util::io::ReaderStream::new(file);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            Body::from_stream(stream),
+                        )
+                            .into_response()
+                    }
+                    Err(e) => {
+                        warn!(key, version, "cache archive open error: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                },
                 Ok(None) => StatusCode::NOT_FOUND.into_response(),
                 Err(e) => {
                     warn!(key, version, "cache read error: {e}");
@@ -526,38 +538,40 @@ pub async fn blob_get(
         .join(&stage_name)
         .join("data");
 
-    match tokio::fs::read(&data_path).await {
-        Ok(bytes) => {
-            if kind == "artifact" {
-                let name = {
-                    let inner = shared.state.inner.lock().await;
-                    inner
-                        .artifact_v2_registry
-                        .values()
-                        .find(|e| e.blob_token == stage_name)
-                        .map(|e| e.name.clone())
-                };
-                let filename = name.unwrap_or_else(|| "artifact".to_owned());
-                let content_disposition = format!("attachment; filename=\"{filename}.zip\"");
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "application/zip"),
-                        (header::CONTENT_DISPOSITION, &content_disposition),
-                    ],
-                    bytes,
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    bytes,
-                )
-                    .into_response()
-            }
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    // Stream the staged blob straight off disk rather than loading it whole
+    // into RAM: an assembled blob may be up to MAX_ASSEMBLED_BYTES.
+    let file = match tokio::fs::File::open(&data_path).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    if kind == "artifact" {
+        let name = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .artifact_v2_registry
+                .values()
+                .find(|e| e.blob_token == stage_name)
+                .map(|e| e.name.clone())
+        };
+        let filename = name.unwrap_or_else(|| "artifact".to_owned());
+        let content_disposition = format!("attachment; filename=\"{filename}.zip\"");
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip"),
+                (header::CONTENT_DISPOSITION, &content_disposition),
+            ],
+            body,
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            body,
+        )
+            .into_response()
     }
 }
 

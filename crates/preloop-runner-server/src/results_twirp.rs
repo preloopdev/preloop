@@ -739,7 +739,7 @@ pub async fn twirp_cache_v2_create(
     if shared
         .state
         .cache
-        .get(&storage_key, &version, &[])
+        .lookup(&storage_key, &version, &[])
         .await
         .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
         .is_some()
@@ -926,7 +926,7 @@ pub async fn twirp_cache_v2_finalize(
         if shared
             .state
             .cache
-            .get(&storage_key, &version, &[])
+            .lookup(&storage_key, &version, &[])
             .await
             .map_err(|error| ApiError::internal(format!("cache lookup error: {error}")))?
             .is_some()
@@ -952,11 +952,16 @@ pub async fn twirp_cache_v2_finalize(
         .join("cache")
         .join(&token)
         .join("data");
-    let t_read = std::time::Instant::now();
-    let bytes = tokio::fs::read(&blob_path).await.map_err(|e| {
-        ApiError::not_found(format!("cache blob not found (not yet uploaded?): {e}"))
-    })?;
-    let read_ms = t_read.elapsed().as_millis();
+    // The staged blob was streamed to disk chunk-by-chunk during upload;
+    // commit it into the cache store the same way — moved, never read into
+    // RAM. (The old code did `fs::read` of the whole blob here: finalizing
+    // a 150 MB blob spiked server RSS by ~265 MB.)
+    if !tokio::fs::try_exists(&blob_path).await.unwrap_or(false) {
+        return Err(ApiError::not_found(
+            "cache blob not found (not yet uploaded?)",
+        ));
+    }
+    let t_commit = std::time::Instant::now();
 
     let (key, version) = {
         let inner = shared.state.inner.lock().await;
@@ -967,19 +972,22 @@ pub async fn twirp_cache_v2_finalize(
         (pending.key.clone(), pending.version.clone())
     };
 
-    shared
+    let entry = shared
         .state
         .cache
-        .put(&key, &version, &bytes)
-        .await
-        .map_err(|e| ApiError::internal(format!("cache store error: {e}")))?;
+        .commit_file_scoped("", &key, &version, &blob_path)
+        .await;
+    let commit_ms = t_commit.elapsed().as_millis();
 
     {
         let mut inner = shared.state.inner.lock().await;
         inner.cache_v2_pending.remove(&token);
     }
 
-    // Clean up staging directory.
+    // Clean up staging directory (the `data` file was moved into the cache
+    // entry by a successful commit; `blocks/` was already removed at
+    // blocklist commit). Runs on commit failure too, so a failed finalize
+    // never leaks the reservation or its staged bytes.
     let _ = tokio::fs::remove_dir_all(
         shared
             .state
@@ -989,6 +997,7 @@ pub async fn twirp_cache_v2_finalize(
             .join(&token),
     )
     .await;
+    let entry = entry.map_err(|e| ApiError::internal(format!("cache store error: {e}")))?;
 
     let total_ms = t0.elapsed().as_millis();
     // Match the create record: log the digest + length, never the raw
@@ -997,8 +1006,8 @@ pub async fn twirp_cache_v2_finalize(
     tracing::info!(
         cache_id = %cache_id,
         version_len = version.len(),
-        size = bytes.len(),
-        read_ms,
+        size = entry.size,
+        commit_ms,
         total_ms,
         "cache v2 finalized"
     );
@@ -1028,7 +1037,7 @@ pub async fn twirp_cache_v2_get_dl_url(
     // the client-supplied scopes; with none supplied, the unscoped default
     // is tried once.
     let primary_scopes = resolve_cache_read_scopes(&shared.state, &headers, &scopes).await?;
-    let mut hit: Option<(preloop_cache::CacheEntry, Vec<u8>)> = None;
+    let mut hit: Option<preloop_cache::CacheEntry> = None;
     let mut lookup_ms: u128 = 0;
     for primary in &primary_scopes {
         let storage_key = scoped_cache_key(&key, primary.as_deref(), Some(repository.as_str()));
@@ -1040,7 +1049,7 @@ pub async fn twirp_cache_v2_get_dl_url(
         let result = shared
             .state
             .cache
-            .get(&storage_key, &version, &storage_restore_keys)
+            .lookup(&storage_key, &version, &storage_restore_keys)
             .await
             .map_err(|e| ApiError::internal(format!("cache lookup error: {e}")))?;
         lookup_ms = t_lookup.elapsed().as_millis();
@@ -1049,7 +1058,7 @@ pub async fn twirp_cache_v2_get_dl_url(
             break;
         }
     }
-    let Some((entry, _bytes)) = hit else {
+    let Some(entry) = hit else {
         tracing::info!(
             key = %key,
             version = %version,

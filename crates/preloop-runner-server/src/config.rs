@@ -400,6 +400,35 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// Actions cache (`actions/cache`) retention. Finalized cache entries live in
+/// `<state_dir>/cache/`; without a quota they accumulate for the lifetime of
+/// the state directory (round-3 §11: a 150 MB blob finalized into a permanent
+/// 151 MB entry, no eviction at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Total bytes of finalized cache entries the server keeps on disk,
+    /// across all namespaces. When a commit pushes the total over this
+    /// quota, the least-recently-used entries are evicted until the total
+    /// fits again. A single entry larger than the quota is kept by the
+    /// commit that created it and evicted by the next commit.
+    /// Default 10 GiB, matching GitHub's 10 GB per-repository cache limit.
+    /// Env: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins over this key.
+    pub total_quota_bytes: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            total_quota_bytes: DEFAULT_CACHE_TOTAL_QUOTA_BYTES,
+        }
+    }
+}
+
+/// Default total Actions-cache quota: 10 GiB, matching GitHub's 10 GB
+/// per-repository cache limit (this is the server-wide total).
+pub const DEFAULT_CACHE_TOTAL_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 /// One GitHub-configured deployment reviewer (`User` or `Team`), as
 /// `GET /repos/{o}/{r}/environments/{name}` reports inside a
 /// `required_reviewers` protection rule. Identity is what GitHub uses: a
@@ -764,6 +793,10 @@ pub struct ConfigFile {
     /// direct per-job forge checkout.
     #[serde(default)]
     pub checkout_cache: CheckoutCacheConfig,
+    /// Actions cache (`actions/cache`) retention (`[cache]`). Quota-bounded
+    /// with LRU eviction; default 10 GiB total across all namespaces.
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// Stored job secrets injected into every trusted job, mirroring
     /// GitHub's org-level secrets.
     #[serde(default)]
@@ -958,6 +991,73 @@ pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCach
         }
     }
     Ok(effective)
+}
+
+pub const CACHE_TOTAL_QUOTA_BYTES_ENV: &str = "PRELOOP_CACHE_TOTAL_QUOTA_BYTES";
+
+/// Resolve the Actions-cache quota: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins
+/// over the `[cache] total_quota_bytes` key; an unparseable value is an
+/// error rather than silently keeping or dropping cached entries.
+pub fn cache_config(config: &ConfigFile) -> anyhow::Result<CacheConfig> {
+    let mut effective = config.cache;
+    if let Some(raw) = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        effective.total_quota_bytes = raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {CACHE_TOTAL_QUOTA_BYTES_ENV} (`{raw}`)")
+        })?;
+    }
+    Ok(effective)
+}
+
+#[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
+mod cache_quota_config_tests {
+    use super::*;
+
+    /// Absent section keeps the 10 GiB default.
+    #[test]
+    fn cache_quota_defaults_to_10gib() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.cache.total_quota_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.cache.total_quota_bytes,
+            DEFAULT_CACHE_TOTAL_QUOTA_BYTES
+        );
+        assert_eq!(
+            cache_config(&config).unwrap().total_quota_bytes,
+            DEFAULT_CACHE_TOTAL_QUOTA_BYTES
+        );
+    }
+
+    #[test]
+    fn cache_quota_file_value_honored() {
+        let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
+        assert_eq!(config.cache.total_quota_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error. These cases live in one test so the process-wide
+    /// env var is never mutated by two tests at once.
+    #[test]
+    fn cache_quota_env_handling() {
+        let prior = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV).ok();
+        let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
+        unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "5368709120") };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 5368709120);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "   ") };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "ten-gib") };
+        assert!(cache_config(&config).is_err());
+        match prior {
+            Some(value) => unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, value) },
+            None => unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1821,6 +1921,7 @@ mod tests {
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
+            cache: CacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
             golden: GoldenConfig::default(),
         }
