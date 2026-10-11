@@ -484,7 +484,7 @@ impl CacheStore {
             return Ok(());
         }
         // Oldest use first.
-        entries.sort_by(|a, b| a.2.cmp(&b.2));
+        entries.sort_by_key(|entry| entry.2);
         for (archive, size, _) in entries {
             if total <= self.quota_bytes {
                 break;

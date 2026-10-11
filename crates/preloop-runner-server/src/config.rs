@@ -1921,6 +1921,7 @@ mod tests {
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
+            cache: CacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
             golden: GoldenConfig::default(),
         }
