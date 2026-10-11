@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Fixed
+
+- **Expression depth no longer rejects sibling-heavy expressions**: the
+  nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
+  against one counter that was never unwound, so `format('{0}', github.ref, …)`
+  with 128 arguments failed with `TooDeep`. Depth is now tracked per subtree
+  (a leaf is 1; every node is one deeper than its deepest child), so siblings
+  add nothing, and a node over the ceiling is refused before it is built —
+  including a call wrapped around a deep index chain, which previously slipped
+  through.
+- **Needs cycle detection and `on:` filter matching no longer recurse per
+  job or per character**: `detect_needs_cycle` walks an explicit stack, and
+  glob matching is an iterative NFA in O(pattern × value) instead of recursive
+  backtracking whose work grows exponentially with the number of `*`.
+- **Composite actions carry nesting depth through every re-entry**: `./`
+  fallbacks and remote composite references restarted the depth at zero, so a
+  self-referencing composite was not stopped by the 10-level cap.
+
 ## [0.34.0] - 2026-10-09
 
 ### Changed
