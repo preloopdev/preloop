@@ -29,32 +29,38 @@ settle_job(run_id, job_id, status):
   7. Retry the cohort waiters that `promote_waiter` re-parked at max-parallel,
      on each free gate holding one of the settled legs' cohort waiters (FIFO)
   8. Refresh `remaining_needs` for the dependents of everything that just
-     turned terminal (one indexed UPDATE per settled job), and check each
-     settled job's cohort for a parked leg a freed slot can take; both report
-     whether promotion is needed
+     turned terminal (one indexed UPDATE per settled job; it returns the
+     dependents left `blocked` with no needs outstanding), and note each
+     settled job's cohort for parked-leg admission
   9. Summarize the run from the DB aggregate; on the first terminal
      transition release the workflow-level hold and emit run.completed.v1
  10. Emit job.completed.v1 for every job this completion concluded (the job,
      its fail-fast siblings, the folded callers)
- 11. If step 8 reported promotion: run the shared promotion sweep over the
-     loaded graph
+ 11. Promote, over the rows of the jobs involved: admit the parked legs of the
+     settled cohorts a freed slot can take, then decide and promote every
+     dependent step 8 left unblocked
 ```
 
-Step 11 is the only part of a completion that still loads the run graph.
-Promotion is the one step whose decisions — needs hydration into the runner
-message, job/JobSet gate admission, max-parallel cohorts, deferred matrix
-expansion, unhostable `runs-on` rejection — are not expressible as
-conditional writes, and `Sweep::promote` is the single implementation of
-them. It runs only when the completion actually unblocked something: a
-dependent became promotable, or a parked leg of the settled leg's cohort can
-take the freed slot. A matrix leg that frees no slot, or any completion with
-no dependents, never materializes the run.
+No step of a completion loads the run graph. Promotion's decisions — needs
+hydration into the runner message, job/JobSet gate admission, max-parallel
+cohorts, deferred matrix expansion, unhostable `runs-on` rejection — are not
+conditional writes, but each reads only the promoted job's own rows
+(`jobs`, `job_specs`, `job_messages`, `job_needs`), the run's submission when a
+gate or environment needs it, and, for the job's `needs`, a `NeedsView`: the
+rows its declared needs reach. `Sweep::promote` stays the implementation for
+submit, rerun, cancel and expansion, which do build the whole run; the
+completion path shares its pure decisions (environment name and verdict, gate
+evaluation, `dependency_decision`) through `promote.rs` and `runtime_scheduling`.
 
-A capped cohort is the exception that remains. While a parked leg and a free
-slot coexist, every completion of that cohort runs the sweep and so loads the
-run. Admitting the parked leg on a leg-scoped view, without that load, is the
-follow-up. Porting the whole promotion to targeted writes (the way lite's
-`promote_run` does it) is the longer one.
+A dependent is handled by a work queue inside the completion's transaction:
+its `if:` decides `Run`, `Skip` or `Error`. A skip or error settles the
+dependent without running it (the same writes a settled job gets, through
+`settle_unrun`), which may unblock its own dependents; those form the next
+pass, so a skip cascade finishes in the completion that started it. A job that
+ends during promotion (unservable labels, denied environment, failed gate)
+cascades the same way. `Run` hands a reusable caller (after its JobSet gates)
+or a deferred matrix to the expansion queue and everything else to
+`promote_one`.
 
 ## Lock Scope Decision
 
@@ -213,22 +219,25 @@ WHERE n.run_id=$1 AND n.job_id=$2
 Group by `needs_job_id` in code; aggregate with existing `aggregate_need_status()`;
 merge outputs with `extend()` (later legs overwrite — matches current behavior).
 
-**Q3** — transitive ancestor statuses (for `success()`/`failure()`/`cancelled()`):
-```sql
-WITH RECURSIVE ancestors(need_id) AS (
-  SELECT needs_job_id FROM job_needs WHERE run_id=$1 AND job_id=$2
-  UNION
-  SELECT n.needs_job_id FROM job_needs n
-    JOIN ancestors a ON n.job_id=a.need_id WHERE n.run_id=$1
-)
-SELECT DISTINCT j.status FROM jobs j
-JOIN ancestors a ON (j.job_id=a.need_id OR j.base_id=a.need_id)
-WHERE j.run_id=$1
-```
+**Q3** — transitive ancestor statuses (for `success()`/`failure()`/`cancelled()`).
+The recursion must follow the *matched rows*, not the declared need ids: a need
+names a job or every job with that base id, and an ancestor reached through a
+matrix base is the base's legs' own needs. Recursing on need ids alone loses
+every ancestor behind a matrix base (`leaf needs mid`, `mid needs fan`, a leg of
+`fan` failed: `failure()` in `leaf` must be true). `NeedsView::load` does it in
+one recursive query over `jobs` joined to `job_needs` by `job_id = needs_job_id
+OR base_id = needs_job_id`, excluding an expanded matrix parent (its legs speak
+for it), and returns each reached row's status, base id, outputs and own needs.
+Q2's direct statuses and outputs and Q3's ancestors come out of that one view;
+`dependency_decision_of` and `hydrate_needs_context` read it through the
+`NeedsSource` trait exactly as they read a whole `RunRecord`.
 
-Then call the existing `dependency_decision()` with the built context.
-Outcomes: `Run` → enqueue; `Skip` → mark Skipped (terminal, flows through
-unblock); `Error` → mark Failure (triggers fail-fast check).
+Then call `dependency_decision_of` with the dependent's own node (needs, `if:`,
+condition context) and the view. Outcomes: `Run` → hand off (reusable caller
+through its JobSet gates, deferred matrix to expansion, anything else to
+`promote_one`); `Skip` → settle Skipped; `Error` → settle Failure. A settle
+unblocks the dependent's own dependents, which the work queue decides in the
+next pass.
 
 ## Run Status (Short Lock)
 
@@ -263,8 +272,18 @@ only the trigger (per-job targeted instead of whole-run scan).
 - the in-memory `Sweep::complete_node` and its fail-fast helper, with
   `CompletionApplied` and the graph-based `enqueue_cancellation` (no callers
   once the targeted settle landed)
+- `PgBackend::promote_unblocked`, the sweep over the loaded graph a completion
+  ran to promote its dependents, with the graph load and flush it implied
 
-Still graph-backed: promotion of newly-unblocked dependents and of capped cohort legs (step 11 above).
+Promotion of newly-unblocked dependents and of capped cohort legs is
+job-scoped too: parked legs of the settled cohorts are admitted in job-id order
+over their own rows by `promote::admit_cohorts` (one candidate query per step; a
+leg that settles at its `if:`/label/environment/gate check frees the slot and
+admission continues), dependents go through the work queue in
+`pg/dependents.rs`, and `promote::promote_one` is the shared job-scoped
+hydrate → environment → gate → enqueue routine. Nothing on the completion path
+calls `Sweep` or `load_graph`; `Sweep` remains for submit, rerun, cancel,
+expansion and the reaper.
 
 ## What Stays Unchanged
 
@@ -295,6 +314,12 @@ Still graph-backed: promotion of newly-unblocked dependents and of capped cohort
 - The shared suite runs the deferred reusable caller scenarios (static callee,
   deferred matrix callee, pre-seeded placeholder, pre-populated control) on both
   backends.
+- The shared suite pins dependent promotion on both backends: a dependent of a
+  matrix base waits for every leg and reads the legs' merged outputs, a failed
+  leg skips its dependents transitively, `if: always()` runs after a failure,
+  `failure()` reads an ancestor reached only through a matrix base, a reusable
+  caller that depends on another job follows its needs, and a job that fails at
+  promotion skips the jobs behind it in the same completion.
 - Load-test A/B: confirm per-completion lock hold time drops and throughput
   rises on the 25 rps harness.
 
@@ -302,8 +327,8 @@ Still graph-backed: promotion of newly-unblocked dependents and of capped cohort
 
 1. Fail-fast flag — read off the base's legs (`job_specs.fail_fast`), default
    true, matching lite's `fail_fast_for_base`.
-2. Enqueue INSERT set — unchanged: promotion still goes through
-   `Sweep::promote`/`enqueue`, so the queue/request columns are untouched.
+2. Enqueue INSERT set — unchanged: `promote::promote_one` writes the same
+   queue/request columns the sweep's `enqueue` does, so they are untouched.
 3. `complete_job` (non-settle path) — ported to the same targeted core.
 4. Lite backend parity — the pg fold now emits `job.completed.v1` for folded
    callers and resolves outputs with the same expression context as

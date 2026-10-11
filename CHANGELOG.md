@@ -42,19 +42,22 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
-- **Postgres completions no longer load the run graph in the common case**:
+- **Postgres completions no longer load the run graph**:
   `settle_job` and `complete_job` write the terminal transition, retire the
   attempt, fail-fast the siblings, fold reusable callers, retry cohort waiters
   parked behind a gate, refresh the dependents' `remaining_needs` and summarize
-  the run with targeted statements. The graph is materialized only when a
-  completion makes a dependent promotable or a parked leg of the settled leg's
-  `max-parallel` cohort can take the freed slot. Promotion (needs hydration,
-  gates, deferred expansion) still runs the shared sweep, so a capped matrix
-  loads the run on each completion while a parked leg and a free slot coexist.
-  Fail-fast now cancels every non-terminal sibling of the base, releasing its
-  concurrency hold and queueing the runner cancellation, matching the SQLite
-  path. Deferred reusable callers record their expanded subtree, so they fold
-  on Postgres as they do on SQLite.
+  the run with targeted statements. Promotion reads only the rows of the jobs
+  involved: parked legs of a `max-parallel` cohort a freed slot can take are
+  admitted in job-id order, and each dependent the completion unblocked is
+  decided on its own node plus the rows its `needs:` reach (needs hydration,
+  `if:`, environment and `concurrency:` gates, deferred expansion). A skipped
+  or failed dependent cascades to its own dependents in the same transaction,
+  including a job that fails at promotion (unservable `runs-on`, denied
+  environment, failed gate), whose dependents previously waited for a later
+  sweep. Fail-fast now cancels every non-terminal sibling of the base,
+  releasing its concurrency hold and queueing the runner cancellation, matching
+  the SQLite path. Deferred reusable callers record their expanded subtree, so
+  they fold on Postgres as they do on SQLite.
 - A completion that reports a non-terminal status is rejected with a bad
   request before anything is written.
 
