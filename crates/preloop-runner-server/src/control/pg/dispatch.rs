@@ -2011,92 +2011,101 @@ async fn held_jobs_of_run(tx: &Transaction<'_>, run_id: RunId) -> Result<Vec<Job
         .collect())
 }
 
-/// A job-waiter promoted: hydrate, stamp, enqueue.
+/// A job-waiter promoted: the job takes the gate and enqueues.
+///
+/// Reads and writes only this job's rows. A job parks on a concurrency gate
+/// after its message was hydrated (`Sweep::promote` hydrates before the gate;
+/// a re-run hydrates before it parks, see `rerun.rs`), and its needs are
+/// terminal by then, so nothing in the stored message can change here.
 async fn resume_held_job(
     backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
 ) -> Result<(), ControlError> {
-    let mut graph = match backend.load_graph(tx, run_id).await? {
-        Some(graph) => graph,
-        None => return Ok(()),
-    };
-    resume_held_node(backend, tx, &mut graph, job_id, now_us()).await?;
-    graph.resummarize();
-    flush_run(tx, &graph).await?;
-    if let Some(node) = graph.nodes.get(job_id) {
-        flush_node(tx, run_id, job_id, node).await?;
-    }
-    Ok(())
-}
-
-/// One held node resuming: needs context hydrated, gate acquired-stamp,
-/// ready-queue entry, assignment pairing.
-async fn resume_held_node(
-    backend: &PgBackend,
-    tx: &Transaction<'_>,
-    graph: &mut RunGraph,
-    job_id: &JobId,
-    now: i64,
-) -> Result<(), ControlError> {
-    let Some(node) = graph.nodes.get_mut(job_id) else {
+    let run = run_id.0.to_string();
+    let Some(row) = tx
+        .query_opt(
+            "SELECT j.environment_gate::text, \
+                    COALESCE(jsonb_typeof(s.reusable_call->'call') <> 'null', false) \
+             FROM jobs j LEFT JOIN job_specs s \
+               ON s.run_id = j.run_id AND s.job_id = j.job_id \
+             WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?
+    else {
         return Ok(());
     };
-    // Hydrate needs + environment into the stored template.
-    if let Some(mut message) = PgBackend::node_message(tx, graph.record.run_id, job_id).await? {
-        let mut queued = graph::queued_of(job_id, graph.record.run_id, node, message);
-        sched_helpers::hydrate_needs_context(&mut queued, &graph.record);
-        apply_resolved_runs_on(node, queued.runs_on);
-        // Gate markers hydration stamps (an environment name that can never
-        // resolve) travel to the node, where the parked-gate sweep fails it.
-        node.environment_gate = queued.environment_gate.clone();
-        message = queued.message;
-        PgBackend::write_node_message(tx, graph.record.run_id, job_id, &message).await?;
-    }
-    let node = graph.nodes.get_mut(job_id).expect("node present");
-    let reusable = node
-        .reusable
-        .as_ref()
-        .is_some_and(|spec| spec.call.is_some());
+    // Fail closed, as `load_graph` does: an unreadable gate is the empty gate.
+    let environment_gate: Option<EnvironmentGateState> = row
+        .get::<_, Option<String>>(0)
+        .map(|text| serde_json::from_str(&text).unwrap_or_default());
+    let reusable: bool = row.get(1);
     if reusable {
         // Caller nodes park for expansion, not dispatch.
-        node.status = ExecutionStatus::Pending;
-        node.queue_state = logic::QueueState::Blocked;
-        return Ok(());
-    }
-    if node
-        .environment_gate
+        tx.execute(
+            "UPDATE jobs SET status=$3, queue_state=$4 \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[
+                &run,
+                &job_id.0,
+                &status_str(ExecutionStatus::Pending),
+                &queue_state_str(logic::QueueState::Blocked),
+            ],
+        )
+        .await
+        .map_err(db)?;
+    } else if environment_gate
         .as_ref()
         .is_some_and(|gate| gate.unresolvable_name.is_some())
     {
         // The environment name can never resolve: leave the node held — the
         // parked-gate sweep fails it closed instead of dispatching under a
         // template name.
-        return Ok(());
-    }
-    node.concurrency_acquired_at_us = Some(now);
-    mark_ready(node, now);
-    set_status(graph, job_id, ExecutionStatus::Queued);
-    emit_outbox(
-        tx,
-        Some(graph.record.run_id),
-        "job.queued.v1",
-        serde_json::json!({"job_id": job_id.0, "status": "queued"}),
-    )
-    .await?;
-    notify_wake(
-        tx,
-        crate::control::wake::Wake {
-            ready: 1,
-            broadcast: false,
-        },
-    )
-    .await?;
-    if let Some(target) = EnqueueTarget::of_node(graph, job_id) {
+    } else {
+        let now = now_us();
+        let placed = tx
+            .query_one(
+                concat!(
+                    "UPDATE jobs j SET status=$3, queue_state=$4, concurrency_acquired_at=",
+                    ts!("$5"),
+                    ", enqueued_at=",
+                    ts!("$5"),
+                    " FROM runs r WHERE j.run_id=$1::text::uuid AND j.job_id=$2 \
+                     AND r.run_id = j.run_id \
+                     RETURNING r.namespace_id, j.pool_key, j.runs_on::text, j.runner_group"
+                ),
+                &[
+                    &run,
+                    &job_id.0,
+                    &status_str(ExecutionStatus::Queued),
+                    &queue_state_str(logic::QueueState::Ready),
+                    &now,
+                ],
+            )
+            .await
+            .map_err(db)?;
+        emit_outbox(
+            tx,
+            Some(run_id),
+            "job.queued.v1",
+            serde_json::json!({"job_id": job_id.0, "status": "queued"}),
+        )
+        .await?;
+        notify_wake(
+            tx,
+            crate::control::wake::Wake {
+                ready: 1,
+                broadcast: false,
+            },
+        )
+        .await?;
+        let target = EnqueueTarget::from_row(run_id, job_id, &placed)?;
         on_job_enqueued(backend, tx, &target).await?;
     }
-    Ok(())
+    summarize_run_tx(tx, run_id).await
 }
 
 /// What `on_job_enqueued` reads of a job it pairs with a runner: its
@@ -2128,6 +2137,27 @@ impl EnqueueTarget {
         })
     }
 
+    /// The target of a row selected as `namespace_id, pool_key, runs_on::text,
+    /// runner_group`.
+    pub(super) fn from_row(
+        run_id: RunId,
+        job_id: &JobId,
+        row: &tokio_postgres::Row,
+    ) -> Result<Self, ControlError> {
+        Ok(Self {
+            run_id,
+            job_id: job_id.clone(),
+            namespace: row.get(0),
+            pool_key: row.get(1),
+            runs_on: row
+                .get::<_, Option<String>>(2)
+                .map(|text| codec::from_json(&text))
+                .transpose()?
+                .unwrap_or_default(),
+            runner_group: row.get(3),
+        })
+    }
+
     /// The target of a job read from its row and its run's namespace: one
     /// statement, no graph.
     pub(super) async fn load(
@@ -2147,18 +2177,7 @@ impl EnqueueTarget {
         else {
             return Ok(None);
         };
-        Ok(Some(Self {
-            run_id,
-            job_id: job_id.clone(),
-            namespace: row.get(0),
-            pool_key: row.get(1),
-            runs_on: row
-                .get::<_, Option<String>>(2)
-                .map(|text| codec::from_json(&text))
-                .transpose()?
-                .unwrap_or_default(),
-            runner_group: row.get(3),
-        }))
+        Self::from_row(run_id, job_id, &row).map(Some)
     }
 }
 
@@ -3056,7 +3075,11 @@ impl<'a> Sweep<'a> {
     /// Hydrate needs context (and the deferred environment name) into the
     /// node's stored message, applying resolved `runs-on` labels to the
     /// node. `true` when a message row existed to hydrate.
-    async fn hydrate_node(&mut self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+    pub(super) async fn hydrate_node(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
         let Some(message) = self.message(run_id, job_id).await? else {
             return Ok(false);
         };
