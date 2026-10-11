@@ -206,6 +206,7 @@ pub async fn webhook_health(
             "rate_limited": breaker.rate_limited,
             "last_error": breaker.last_error,
         },
+        "github_consumption": shared.state.github_consumption.snapshot(),
         "apps": apps,
         "app_config_checked_at": app_config_checked_at_us.and_then(rfc3339),
     })))

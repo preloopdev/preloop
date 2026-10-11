@@ -558,10 +558,21 @@ async fn resolve_canonical_upstream_slug(
     if let Some(token) = credential.upstream_token.as_deref() {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let response = match request.send().await {
+    let response = match crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breaker,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Snapshots,
+        request,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(_) => return stored_slug.to_owned(),
     };
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Snapshots, &response);
     if !response.status().is_success() {
         return stored_slug.to_owned();
     }
@@ -633,11 +644,20 @@ async fn fetch_lfs_object_into_cache(
     if let Some(token) = credential.upstream_token.as_deref() {
         batch = batch.basic_auth("x-access-token", Some(token));
     }
-    let batch = batch
-        .body(request_body.to_string())
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("forge LFS batch request failed: {error}")))?;
+    // The batch endpoint is always the forge, so it is GitHub traffic and
+    // goes through the shared breaker with snapshots accounting.
+    let batch = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breaker,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Snapshots,
+        batch.body(request_body.to_string()),
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("forge LFS batch request failed: {error}")))?;
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Snapshots, &batch);
     if !batch.status().is_success() {
         return Ok(false);
     }
@@ -679,10 +699,26 @@ async fn fetch_lfs_object_into_cache(
             download_request = download_request.basic_auth("x-access-token", Some(token));
         }
     }
-    let mut response = download_request
-        .send()
+    // The blob URL is forge-supplied and may point anywhere (presigned
+    // cross-host URLs download anonymously): only same-host downloads are
+    // GitHub traffic and go through the breaker. Cross-host downloads spend
+    // no GitHub budget, so they bypass it — the trust boundary above already
+    // keeps the credential off those hosts.
+    let mut response = if same_host && http_scheme {
+        crate::github_breaker::send_observed_labeled(
+            &shared.state.github_breaker,
+            &shared.state.github_consumption,
+            crate::github_breaker::GithubSubsystem::Snapshots,
+            download_request,
+        )
         .await
-        .map_err(|error| ApiError::internal(format!("forge LFS download failed: {error}")))?;
+        .map_err(|error| ApiError::internal(format!("forge LFS download failed: {error}")))?
+    } else {
+        download_request
+            .send()
+            .await
+            .map_err(|error| ApiError::internal(format!("forge LFS download failed: {error}")))?
+    };
     if !response.status().is_success() {
         return Ok(false);
     }
@@ -710,6 +746,10 @@ async fn fetch_lfs_object_into_cache(
                 %oid,
                 "LFS object exceeds the per-object cache cap; leaving uncached"
             );
+            shared
+                .state
+                .github_consumption
+                .record_bytes(crate::github_breaker::GithubSubsystem::Snapshots, written);
             return Ok(false);
         }
         hasher.update(&chunk);
@@ -721,6 +761,12 @@ async fn fetch_lfs_object_into_cache(
         ApiError::internal(format!("failed to flush staged LFS object: {error}"))
     })?;
     drop(file);
+    // Exact byte count off the stream — the one true number for LFS
+    // bandwidth accounting.
+    shared
+        .state
+        .github_consumption
+        .record_bytes(crate::github_breaker::GithubSubsystem::Snapshots, written);
     if format!("{:x}", hasher.finalize()) != oid {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Ok(false);

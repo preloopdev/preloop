@@ -226,8 +226,10 @@ async fn send_github_check_request(
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
-    let res = crate::github_breaker::send_observed(
+    let res = crate::github_breaker::send_observed_labeled(
         breaker,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::CheckRuns,
         client
             .request(method, &url)
             .header("User-Agent", "preloop")
@@ -236,11 +238,13 @@ async fn send_github_check_request(
             .json(body),
     )
     .await?;
-
-    // Honour the primary budget advertised on the response: once remaining
-    // hits zero, wait for the reset instead of spending the next call on a
-    // guaranteed 403.
-    breaker.observe_rate_budget(res.headers());
+    // The labeled sender already honours the primary budget advertised on
+    // the response (`x-ratelimit-remaining: 0` + `x-ratelimit-reset`), so
+    // the explicit `observe_rate_budget` call it replaces is gone.
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::CheckRuns, &res);
 
     if !res.status().is_success() {
         let status = res.status();

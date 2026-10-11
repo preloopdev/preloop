@@ -624,6 +624,33 @@ pub type ActionShaCache = std::sync::Mutex<
 pub type ActionArchiveSha256Pins =
     std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
 
+/// Nested `uses:` of a composite action's manifest: (`owner`, `repo`,
+/// `ref`) (owner/repo lowercased) → normalized `owner/repo` scopes nested
+/// inside the action's `action.yml`/`action.yaml`. Populated lazily from
+/// the forge contents API the first time a run asks to resolve an action
+/// that is not directly declared in its workflow (composite actions stage
+/// their nested `uses:` in later waves, after the parent's own download).
+/// Only definitive answers are cached — a 200 (even with no nested uses)
+/// or a 404 (no manifest). Transient failures are not cached, so the next
+/// adjudication retries instead of failing closed for the process lifetime.
+pub type ActionManifestNestedUses = std::sync::Mutex<
+    std::collections::HashMap<(String, String, String), std::collections::BTreeSet<String>>,
+>;
+
+/// Per-run action-resolution ledger: `RunId` → (`owner/repo`, `ref`)
+/// triples this run has already resolved tickets for. Lets the
+/// declared-action allowlist extend transitively: a composite action's
+/// nested `uses:` arrive in later resolution waves, after the parent's
+/// download, and are permitted when a manifest fetched for an already
+/// resolved parent names them. Bounded; a run resolving more distinct
+/// actions than the cap keeps only the most recent.
+pub type ActionResolvedUses =
+    std::sync::Mutex<std::collections::HashMap<RunId, Vec<(String, String)>>>;
+
+/// Maximum (`owner/repo`, `ref`) triples remembered per run in
+/// [`ActionResolvedUses`].
+pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -730,6 +757,11 @@ pub struct AppState {
     /// ingress outage cannot suppress status transitions for runs already in
     /// progress.
     pub github_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Per-subsystem consumption accounting for outbound GitHub traffic
+    /// (requests, bytes, rate limits, breaker-blocked attempts). Every
+    /// GitHub call goes through [`crate::github_breaker::send_observed`]
+    /// or its labeled variant, which record here next to the breaker.
+    pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
     pub webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
@@ -862,6 +894,13 @@ pub struct AppState {
     /// cache hit, so the first download after a restart is trusted —
     /// guarded by the engine's TLS fetch like any other download.
     pub action_archive_sha256_pins: Arc<ActionArchiveSha256Pins>,
+    /// Lazily populated composite-action manifest index for the
+    /// declared-action allowlist's transitive closure; see
+    /// [`ActionManifestNestedUses`].
+    pub action_manifest_nested_uses: Arc<ActionManifestNestedUses>,
+    /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
+    /// see [`ActionResolvedUses`].
+    pub action_resolved_uses: Arc<ActionResolvedUses>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1476,6 +1515,7 @@ impl AppState {
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             observability: preloop_observability::Observability::noop(),
@@ -1530,6 +1570,10 @@ impl AppState {
             action_archive_sha256_pins: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            action_manifest_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
