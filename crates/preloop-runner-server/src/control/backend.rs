@@ -153,6 +153,46 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// dedup key (webhook delivery / request identity): a replay returns
     /// `SubmitOutcome::existing` instead of a second run.
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError>;
+    /// Re-run a completed run as a new attempt — GitHub's "Re-run jobs".
+    ///
+    /// One write transaction: loads the run, refuses non-terminal runs
+    /// (`Conflict`) and missing runs (`NotFound`), and applies `rerun`'s
+    /// mode to select the jobs this attempt re-executes
+    /// ([`logic::rerun_set`]). Selected rows are reset to queue state,
+    /// their prior `job_requests` minted into a fresh attempt with a new
+    /// `jobId`/attempt-scoped message, and every gate (workflow concurrency,
+    /// `job concurrency:`, `environment:` protection) re-acquired exactly as
+    /// `submit_run` does for a fresh run. Jobs outside the selection keep
+    /// their results and outputs — dependents see the carried-forward
+    /// `needs` context.
+    ///
+    /// `runs.run_attempt` increments; the run reverts to non-terminal
+    /// (`queued`/`in_progress`) with `started_at`/`completed_at` cleared.
+    /// `git_ref` and `head_sha` are not re-resolved: GitHub re-runs the
+    /// recorded snapshot, not the moved ref.
+    ///
+    /// Errors: `NotFound` (run or `RerunMode::Job` id unknown), `Conflict`
+    /// (run still live, `Failed` mode with no failed/cancelled job, or the
+    /// attempt cap/30-day window exceeded).
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError>;
+
+    /// Read-side preview of a `rerun_run` call: the job set the mode
+    /// selects and which members lack a stored message template (they need
+    /// a `RerunJobTemplate` in `RerunRun::templates`). `NotFound`/`Conflict`
+    /// follow the same rules as `rerun_run` so a handler can surface them
+    /// before building templates.
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError>;
+
+    /// Test hook: overwrite a run's `completed_at` (µs since the epoch) so
+    /// the archiver's 60-second grace and the `PRELOOP_RERUN_WINDOW_DAYS`
+    /// hold can be exercised without sleeping. The shared suite uses it;
+    /// production never sees it.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError>;
 
     /// Allocate the next run number for a workflow path from the durable
     /// counter. Called before the job messages are built (the number is
@@ -443,7 +483,19 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// immutable job/attempt history in one transaction per batch. Returns
     /// the archived run ids. Their run-tier secrets outlive the move: an
     /// archived run can still be re-run.
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError>;
+    ///
+    /// `rerun_hold` keeps runs that a re-run can still use — completed runs
+    /// with at least one failed/cancelled/timed-out job — in the live tables
+    /// for that long, so `rerun_run` can reset them in place (GitHub accepts
+    /// re-runs for 30 days). `None` or zero archives them on the plain
+    /// policy. Retention is unaffected and still wins: a held run past
+    /// `retention_days` is deleted by [`ControlBackend::expired_terminal_runs`]
+    /// (which reads live and history rows alike).
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError>;
 
     /// Retention selection: ids of terminal runs whose completion (falling
     /// back to creation) is older than `cutoff_us`, oldest first, up to
@@ -1114,6 +1166,30 @@ pub(crate) trait ControlBackend: Send + Sync {
         &self,
         limit: usize,
     ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Unresolved repairs of one App that still have attempts left, in
+    /// retry order (see the storage implementations). App-scoped and capped
+    /// in SQL: another App's backlog, or rows already at the cap, can never
+    /// fill the retry window and starve this App's repairs.
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Atomically take one redelivery attempt for a repair row.
+    ///
+    /// Succeeds only when the stored row still looks exactly like `observed`
+    /// — same attempt count, same resolution state — and charges the attempt
+    /// and the last-attempt clock in the same statement, returning the
+    /// claimed row. A second claimant (a watchdog overlapping a restart, a
+    /// second server on the store) reads a row that no longer matches what it
+    /// read, gets `None`, and must not send the request: the winner's attempt
+    /// already covers the delivery.
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError>;
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,
@@ -1821,6 +1897,29 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.submit_run(submit).await,
         }
     }
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.rerun_run(rerun).await,
+            Self::Postgres(b) => b.rerun_run(rerun).await,
+        }
+    }
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.rerun_plan(run_id, mode).await,
+            Self::Postgres(b) => b.rerun_plan(run_id, mode).await,
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
+            Self::Postgres(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
+        }
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,
@@ -2144,10 +2243,14 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.terminal_jobs().await,
         }
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError> {
         match self {
-            Self::Sqlite(b) => b.archive_finished_runs(limit).await,
-            Self::Postgres(b) => b.archive_finished_runs(limit).await,
+            Self::Sqlite(b) => b.archive_finished_runs(limit, rerun_hold).await,
+            Self::Postgres(b) => b.archive_finished_runs(limit, rerun_hold).await,
         }
     }
     async fn expired_terminal_runs(
@@ -3026,6 +3129,33 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.open_webhook_redeliveries(limit).await,
             Self::Postgres(b) => b.open_webhook_redeliveries(limit).await,
+        }
+    }
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+        }
+    }
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.claim_webhook_redelivery(observed, claimed_at_us).await,
+            Self::Postgres(b) => b.claim_webhook_redelivery(observed, claimed_at_us).await,
         }
     }
     async fn resolve_webhook_redelivery(

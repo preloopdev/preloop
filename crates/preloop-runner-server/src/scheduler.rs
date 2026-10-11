@@ -752,6 +752,12 @@ async fn cron_loop(
             .get("after")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
+        let ref_protected = crate::github::resolve_ref_protected(
+            &shared,
+            &repository,
+            &format!("refs/heads/{default_branch}"),
+        )
+        .await;
         let submission = WorkflowSubmission {
             workflow_yaml: workflow_yaml.clone(),
             event: "schedule".to_owned(),
@@ -780,6 +786,7 @@ async fn cron_loop(
             changed_paths: vec![],
             changed_paths_known: true,
             filter_branch: None,
+            ref_protected,
             dispatch_inputs: Default::default(),
             dispatch_inputs_stringified: Default::default(),
             selected_jobs: vec![],

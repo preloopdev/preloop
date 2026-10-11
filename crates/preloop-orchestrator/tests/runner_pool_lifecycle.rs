@@ -4,8 +4,8 @@ use preloop_orchestrator::{
     artifact_payload, node_externals,
 };
 use preloop_vm::{
-    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
-    SocketMount, VmError, VmProvider, VolumeMount,
+    ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
+    ProviderCapabilities, SecretSource, SocketMount, VmError, VmProvider, VolumeMount,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -51,6 +51,10 @@ struct RecordingVmProvider {
     state: Mutex<ProviderState>,
     run_actions: Mutex<Vec<RunAction>>,
     changed: Notify,
+    /// Whether packs are host files (SmolVM) or live server-side (AgentENV).
+    /// A backend without host-side packs has no artifact to unpack, so its
+    /// golden is baked in the guest instead.
+    file_packs: bool,
     /// When set, `start` records the machine as running and then blocks until
     /// notified, so a test can observe the pool mid-provision.
     start_gate: Option<Arc<Notify>>,
@@ -72,9 +76,17 @@ impl RecordingVmProvider {
             }),
             run_actions: Mutex::new(run_actions),
             changed: Notify::new(),
+            file_packs: true,
             start_gate: None,
             fail_pack: false,
         }
+    }
+
+    /// Model a backend whose packs are not host files (AgentENV): there is no
+    /// artifact to unpack, so the pool prepares its golden in the guest.
+    fn no_packs(mut self) -> Self {
+        self.file_packs = false;
+        self
     }
 
     /// Block `start` until the gate is released, so a shutdown can be sent
@@ -150,6 +162,13 @@ fn provider_error(message: &'static str) -> VmError {
 
 #[async_trait]
 impl VmProvider for RecordingVmProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            file_packs: self.file_packs,
+            ..ProviderCapabilities::default()
+        }
+    }
+
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
         let mut state = self.state.lock().await;
         state
@@ -334,11 +353,12 @@ struct Fixture {
 /// restores the previous values on drop. The pool reads all of these from the
 /// process environment, so without the pins the tests depend on the host:
 ///
-/// - `PRELOOP_GOLDEN_URL` -> unreachable. The pool downloads a prebaked golden
-///   before building when one is reachable (`prepare_artifact` ->
-///   `download_prebaked_golden`); a host with egress to the release asset
-///   would skip the local build+pack these tests assert and hang
-///   `wait_until(Event::Pack)` forever.
+/// - `PRELOOP_GOLDEN_URL` -> unreachable. Configured-image fixtures bake
+///   their golden locally and never download; only the official sentinel does
+///   (`prepare_artifact` -> `download_prebaked_golden`), so the pin keeps
+///   that download off the network and failing fast in
+///   `official_golden_download_failure_is_a_startup_error` instead of
+///   fetching a real pack from GHCR or GitHub on a host with egress.
 /// - `PRELOOP_SKIP_DISK_PREFLIGHT` -> on. The golden build refuses when the
 ///   host volume lacks builder disk + pack staging (60 GiB for this fixture);
 ///   the provider here is a recording mock that writes nothing, so a host
@@ -385,6 +405,9 @@ impl Drop for HermeticEnvGuard {
 
 impl Fixture {
     fn new(label: &str, payload_exists: bool) -> Self {
+        // A configured custom image, not the official sentinel: the pool bakes
+        // it locally (as-is plus the runner contract), so no fixture here
+        // depends on the released official golden.
         const BASE_IMAGE: &str = "ghcr.io/preloop/base:latest";
         let env_guard = TEST_ENV_LOCK
             .lock()
@@ -417,11 +440,9 @@ impl Fixture {
         let config = RunnerPoolConfig {
             size: 1,
             use_fork: false,
-            use_packed_artifact: false,
             name_prefix: format!("pool-{label}-{id}"),
             pool_status: None,
             base_image: BASE_IMAGE.to_owned(),
-            workspace: None,
             artifact_stem,
             release_version: "9.9.9".to_owned(),
             runner_bundle: bundle,
@@ -564,8 +585,8 @@ where
 
 /// Name of the first machine slot 0 created.
 ///
-/// Slot machines carry a generation suffix so a replacement can be built while
-/// its predecessor is still alive, so tests resolve the name instead of
+/// Slot machines carry a generation suffix so consecutive runners get distinct
+/// names across the fork/delete cycle, so tests resolve the name instead of
 /// assuming one machine per slot.
 fn first_slot_machine(events: &[Event], name_prefix: &str) -> String {
     let slot_prefix = format!("{name_prefix}-0-");
@@ -600,8 +621,9 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
         vec![RunAction::Wait, RunAction::Wait],
     ));
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
-    // The builder machine's install steps count as `exec` calls, so a
-    // `run_calls` wait can cancel the pool between the builder's install and
+    // The builder machine's bake steps (guest readiness, the runner
+    // contract, the externals symlink) count as `exec` calls, so a
+    // `run_calls` wait can cancel the pool between the builder's start and
     // its pack on a loaded host — the pack never runs and the assertion
     // below fails with `pack_calls == 0`. Wait on the pack itself, which
     // only happens after the artifact is fully built, then cancel.
@@ -687,21 +709,64 @@ async fn artifact_build_failure_tears_the_builder_down() {
     );
 }
 
+/// The official golden is downloaded packed and is never baked locally.
+///
+/// The deleted stock-Ubuntu bake used to stand in when the official golden
+/// could not be fetched, which silently ran jobs on a different image than the
+/// one `runs-on: ubuntu-latest` names. There is no substitute now: an
+/// unreachable pack fails the pool at startup, and the error names the
+/// official golden so an operator knows to point
+/// `PRELOOP_GOLDEN_OCI_REF`/`PRELOOP_GOLDEN_URL` at a reachable one.
+#[tokio::test]
+async fn official_golden_download_failure_is_a_startup_error() {
+    let fixture = Fixture::new("official-fatal", false);
+    let mut config = fixture.config.clone();
+    config.base_image = preloop_orchestrator::environment::OFFICIAL_GOLDEN.to_owned();
+    let provider = Arc::new(RecordingVmProvider::with_machines(&[], vec![]));
+    let pool = RunnerPool::new(provider.clone(), config).unwrap();
+
+    let error = pool
+        .run(CancellationToken::new())
+        .await
+        .expect_err("an unreachable official golden must fail the pool, not bake a substitute");
+    let message = error.to_string();
+    assert!(
+        message.contains("official golden"),
+        "the error must name the official golden: {message}"
+    );
+    assert!(
+        provider.snapshot().await.events.is_empty(),
+        "no substitute golden may be created for the official sentinel"
+    );
+}
+
+/// A backend without host-side packs has no artifact to unpack: its golden is
+/// booted from the configured image, the runner contract is applied in the
+/// guest, and the result is frozen with `start_forkable`. The contract is
+/// applied once, on the golden — forks inherit it — so no runner pays for it.
 #[tokio::test]
 async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
-    let fixture = Fixture::new("fork-golden", true);
+    let fixture = Fixture::new("fork-golden", false);
     let mut config = fixture.config.clone();
     config.use_fork = true;
     config.control_socket = Some(fixture.root.join("engine.sock"));
-    let provider = Arc::new(RecordingVmProvider::with_machines(
-        &[],
-        vec![RunAction::Wait],
-    ));
+    let provider =
+        Arc::new(RecordingVmProvider::with_machines(&[], vec![RunAction::Wait]).no_packs());
     let pool = RunnerPool::new(provider.clone(), config).unwrap();
     run_until_cancelled(pool, &provider, CancellationToken::new(), 1).await;
 
-    let events = provider.snapshot().await.events;
+    let snapshot = provider.snapshot().await;
     let golden = format!("{}-golden", fixture.config.name_prefix);
+    // The golden boots the configured image itself: there is no packed
+    // artifact on this backend to unpack, and none may be built.
+    let spec = snapshot
+        .created_specs
+        .iter()
+        .find(|spec| spec.name.as_str() == golden)
+        .expect("golden machine specification");
+    assert_eq!(spec.image, fixture.config.base_image);
+
+    let events = &snapshot.events;
     let golden_starts = events
         .iter()
         .enumerate()
@@ -719,7 +784,8 @@ async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
     assert!(
         events[first_start + 1..stop]
             .iter()
-            .any(|event| matches!(event, Event::Exec(name, _) if name == &golden))
+            .any(|event| matches!(event, Event::Exec(name, _) if name == &golden)),
+        "the guest contract must be applied to the golden before it freezes: {events:?}"
     );
     assert!(stop < golden_starts[1]);
 }
@@ -786,19 +852,17 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
         .find(|spec| spec.name.as_str() == runner)
         .expect("runner machine specification");
     assert_eq!(spec.network, NetworkPolicy::PublicOnly);
+    // A packed machine reaches node through the artifact's baked symlink
+    // (`<root>/externals -> /opt/preloop/bin/externals`): the externals ride
+    // the bundle mount instead of a third virtiofs mount, which the packed
+    // launcher has no IRQ budget for. Only a machine booted from a raw image
+    // carries the separate externals mount.
     assert_eq!(
         &spec.volumes,
         &vec![
             VolumeMount {
                 host: fixture.root.join("runner-bundle"),
                 guest: PathBuf::from("/opt/preloop/bin"),
-                read_only: true,
-            },
-            VolumeMount {
-                // Node externals are mounted host-side, never baked into the
-                // machine image or downloaded per runner.
-                host: fixture.root.join("host-externals").join("externals"),
-                guest: PathBuf::from("/home/runner/externals"),
                 read_only: true,
             },
             VolumeMount {
@@ -820,11 +884,26 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     );
 
     // The guest is always told its own machine name: a debug session needs it
-    // to tell a controller which VM to open a shell into.
+    // to tell a controller which VM to open a shell into. The environment is
+    // applied by the launcher shell that sources the image's
+    // `/etc/environment`, so the argv is `sh -c <launcher>` followed by the
+    // `KEY=value` entries in the same order `env` receives them.
+    let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
+    let machine = format!("PRELOOP_MACHINE_NAME={runner}");
     let expected_prefix = vec![
-        "/usr/bin/env".to_owned(),
-        format!("PATH={}", preloop_orchestrator::guest_runner_path(&config)),
-        format!("PRELOOP_MACHINE_NAME={runner}"),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        [
+            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "exec /usr/bin/env ",
+            &format!("'{path}' '{machine}' "),
+            "'PRELOOP_CONTROL_ORIGIN=https://preloop.example' ",
+            "'PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock' ",
+            "\"$0\" \"$@\"",
+        ]
+        .concat(),
+        path.clone(),
+        machine.clone(),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
     ];
@@ -836,8 +915,11 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
             _ => None,
         })
         .expect("runner configure command");
+    // `runner_user: None`, so the launch is the pass-through wrapper
+    // (`sh -c '<stack raise>; exec "$@"' sh`): the env prefix follows the
+    // wrapper, untouched.
     assert_eq!(
-        &configure[..expected_prefix.len()],
+        &configure[4..4 + expected_prefix.len()],
         expected_prefix.as_slice()
     );
 
@@ -851,7 +933,35 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
             _ => None,
         })
         .expect("runner run command");
-    assert_eq!(&run[..expected_prefix.len()], expected_prefix.as_slice());
+    // This pool runs `runner_user: None`, so the launch is the pass-through
+    // wrapper: `sh -c '<limits>; exec "$@"' sh <argv…>`. The original
+    // argv follows the four wrapper elements untouched — that is the point of
+    // the `$@` form, so nothing here is re-quoted.
+    assert_eq!(run[0], "sh");
+    assert_eq!(run[1], "-c");
+    assert_pass_through_limits_wrapper(&run[2]);
+    assert_eq!(run[3], "sh");
+    assert_eq!(
+        &run[4..4 + expected_prefix.len()],
+        expected_prefix.as_slice()
+    );
+}
+
+/// The wrapper a `runner_user`-less launch runs: it carries the hosted limits,
+/// reports on stderr the ones it could not raise rather than failing the
+/// launch, and leaves the original argv to `$@`.
+///
+/// The exact sentence each raise prints is pinned by the orchestrator's own
+/// unit tests; what matters here is that the pool wraps a real launch with the
+/// hosted values and does not re-quote the argv it wraps.
+fn assert_pass_through_limits_wrapper(wrapper: &str) {
+    assert!(wrapper.contains("ulimit -Ss 16384"), "{wrapper}");
+    assert!(wrapper.contains("ulimit -Sn 65536"), "{wrapper}");
+    assert!(
+        !wrapper.contains("|| exit 1"),
+        "the pass-through launch must start even when it cannot raise a limit: {wrapper}"
+    );
+    assert!(wrapper.ends_with("exec \"$@\""), "{wrapper}");
 }
 
 /// Control-socket routing and failure-marker debugging are independent knobs.
@@ -905,75 +1015,98 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .clone();
 
         // The prefix is everything before the runner executable itself.
-        let prefix: Vec<&str> = configure
+        // `runner_user: None`, so the launch is the pass-through wrapper
+        // (`sh -c '<limits>; exec "$@"' sh`) and the original argv — env
+        // entries included — follows it untouched.
+        assert_eq!(configure[0], "sh");
+        assert_eq!(configure[1], "-c");
+        assert_pass_through_limits_wrapper(&configure[2]);
+        assert_eq!(configure[3], "sh");
+        let prefix: Vec<&str> = configure[4..]
             .iter()
             .take_while(|arg| !arg.ends_with(&config.runner_binary_name))
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
+        // The runner's fallback PATH is the system directories a hosted step
+        // shell sees; the launcher replaces it with the image's
+        // `/etc/environment` PATH whenever the image declares one. The deleted
+        // Rust/Go language installs (and their `/usr/local/cargo/bin` and
+        // `/usr/local/go/bin` entries) are gone.
         let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
-        let want_base = vec!["/usr/bin/env", path.as_str(), machine_name.as_str()];
-        // Unconditional toolchain homes come last in the prefix (fixed
-        // system addresses shared by root and switched runners).
-        let want_tail = [
-            "RUSTUP_HOME=/usr/local/rustup",
-            "CARGO_HOME=/usr/local/cargo",
-        ];
-        let mut want = want_base;
-        want.extend(expected);
-        want.extend(want_tail);
-        assert_eq!(prefix, want,);
+        let mut entries = vec![path.clone(), machine_name.clone()];
+        entries.extend(expected.iter().map(|entry| (*entry).to_owned()));
+        let pairs = entries
+            .iter()
+            .map(|entry| format!("'{entry}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let launcher = [
+            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "exec /usr/bin/env ",
+            &pairs,
+            " \"$0\" \"$@\"",
+        ]
+        .concat();
+        let mut want = vec!["sh".to_owned(), "-c".to_owned(), launcher];
+        want.extend(entries);
+        assert_eq!(prefix, want.iter().map(String::as_str).collect::<Vec<_>>());
+        // Nor may anything export the deleted Rust/Go install homes: a runner
+        // told RUSTUP_HOME/CARGO_HOME would point rustup at paths the golden
+        // no longer carries.
+        assert!(
+            configure
+                .iter()
+                .all(|argument| !argument.starts_with("RUSTUP_HOME=")
+                    && !argument.starts_with("CARGO_HOME=")),
+            "the deleted Rust/Go install homes must not be exported: {configure:?}"
+        );
     }
 }
 
-/// A slot must build its replacement while the current job is still running,
-/// and must still tear the finished runner down.
+/// A slot must hold at most one VM: the next runner is forked only after the
+/// finished job's machine was deleted.
 ///
-/// Waiting for the job to end before provisioning put a fork plus a full
-/// runner registration in front of every job that arrives while the pool is
-/// saturated — the cost a matrix workflow pays on every shard past the pool
-/// size.
+/// Fork-on-completion trades the successor's head start for half the VMs per
+/// slot; if a fork ever outlived the previous VM, the pool would neither get
+/// that saving nor the speedup.
 #[tokio::test]
-async fn slot_builds_its_replacement_while_the_job_runs() {
+async fn slot_never_holds_two_vms_at_once() {
     let fixture = Fixture::new("replenish", true);
     let provider = Arc::new(RecordingVmProvider::with_machines(
         &[],
-        vec![RunAction::Complete, RunAction::Wait],
+        vec![RunAction::Complete, RunAction::Complete, RunAction::Wait],
     ));
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
     run_until_cancelled(pool, &provider, CancellationToken::new(), 2).await;
 
     let events = provider.snapshot().await.events;
     let slot_prefix = fixture.config.name_prefix.clone() + "-0-";
-    let (first_run, first_runner) = events
-        .iter()
-        .enumerate()
-        .find_map(|(index, event)| match event {
-            Event::Exec(name, argv)
-                if name.starts_with(&slot_prefix) && argv.iter().any(|arg| arg == "run") =>
-            {
-                Some((index, name.clone()))
+    let mut live = std::collections::HashSet::new();
+    let mut created = 0usize;
+    for event in &events {
+        match event {
+            Event::Create(name) if name.starts_with(&slot_prefix) => {
+                created += 1;
+                // The live set, not the name: a slot that forked its
+                // successor before deleting its predecessor would create two
+                // *different* machines, and a name-uniqueness check alone
+                // would pass.
+                assert!(
+                    live.is_empty(),
+                    "{name} was created while the slot still held {live:?}: {events:?}"
+                );
+                live.insert(name.clone());
             }
-            _ => None,
-        })
-        .expect("the slot ran a runner");
-
-    let replacement_created = events
-        .iter()
-        .enumerate()
-        .position(|(index, event)| {
-            index > first_run
-                && matches!(event, Event::Create(name) if name.starts_with(&slot_prefix) && name != &first_runner)
-        })
-        .expect("the slot created a replacement runner");
-    let first_deleted = events
-        .iter()
-        .position(|event| matches!(event, Event::Delete(name) if name == &first_runner))
-        .expect("the finished runner was deleted");
-
+            Event::Delete(name) => {
+                live.remove(name);
+            }
+            _ => {}
+        }
+    }
     assert!(
-        replacement_created < first_deleted,
-        "replacement must be built before the finished runner is torn down, got {events:?}"
+        created >= 2,
+        "the slot must have replaced its VM after the first job: {events:?}"
     );
 }
 

@@ -922,38 +922,46 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     let _ = trusted.run_id;
 
     // The stored template carries no token; the broker fills it at claim.
-    // A fork-restricted job receives the job-scoped runtime token — never
-    // the repository-unscoped PAT.
+    // A fork-restricted job never receives the repository-unscoped PAT, and
+    // with no App there is no GitHub credential left for it at all: the token
+    // surface stays empty (the official runner's value when the message has no
+    // `system.github.token`) instead of carrying the engine's runtime token
+    // into a third-party API call.
     let fork_acquired = acquire_queued_job(&app, "fork-runner").await;
     let fork_job_id = fork_acquired["jobId"].as_str().expect("acquired job id");
     let fork_plan = fork_acquired["plan"]["planId"]
         .as_str()
         .expect("acquired plan id");
-    let runtime_token =
-        state.mint_runtime_token(fork_plan, &uuid::Uuid::parse_str(fork_job_id).unwrap());
-    // Compare token identity (`sub`), not token strings: JWT timestamps are
-    // second-granularity, so a comparison token minted across a clock tick
-    // differs textually from the identical token minted at acquire.
-    let expected_sub = jwt_sub(runtime_token.as_str());
-    assert!(
-        expected_sub.is_some(),
-        "the runtime token carries a subject"
-    );
     for name in ["system.github.token", "github_token"] {
-        assert_eq!(
-            wire_variable(&fork_acquired, name).and_then(jwt_sub),
-            expected_sub.clone(),
-            "fork job must carry the local runtime token, not the PAT ({name})"
-        );
+        let wire = wire_variable(&fork_acquired, name);
         assert_ne!(
-            wire_variable(&fork_acquired, name),
+            wire,
             Some(pat.as_str()),
             "the static PAT must not reach a fork-restricted job ({name})"
+        );
+        assert!(
+            wire.is_none_or(str::is_empty),
+            "a fork-restricted job must carry no GitHub token at all ({name}={wire:?})"
         );
     }
     assert!(
         wire_variable(&fork_acquired, "GITHUB_TOKEN").is_none(),
         "uppercase GITHUB_TOKEN is not part of the official acquire schema"
+    );
+    // Compare token identity (`sub`), not token strings: JWT timestamps are
+    // second-granularity, so a comparison token minted across a clock tick
+    // differs textually from the identical token minted at acquire.
+    let endpoint_token = service_endpoint_token(&fork_acquired)
+        .expect("the fork job still authenticates to this engine");
+    let expected_sub = jwt_sub(
+        state
+            .mint_runtime_token(fork_plan, &uuid::Uuid::parse_str(fork_job_id).unwrap())
+            .as_str(),
+    );
+    assert_eq!(
+        jwt_sub(&endpoint_token),
+        expected_sub,
+        "the engine credential travels on the service endpoint, not as GITHUB_TOKEN"
     );
 
     let trusted_acquired = acquire_queued_job(&app, "trusted-runner").await;
@@ -1124,6 +1132,155 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
         wire_variable(&acquired, "system.github.token.permissions"),
         Some(r#"{"Checks":"write","Metadata":"read"}"#),
         "trusted jobs keep declared writes and implicit metadata"
+    );
+}
+
+/// End-to-end through the `issue_comment` webhook adapter: a comment runs the
+/// workflow file from the default branch, so the run keeps default-branch
+/// authority — stored secrets are part of the job's secret surface, the
+/// declared permissions survive, and the OIDC request URL is present.
+///
+/// Regression: the adapter stamped `Untrusted`, which silently emptied
+/// `secrets.*` (and read-clamped the token, and dropped OIDC) for every
+/// comment-triggered workflow — the `@pullfrog review` path, which is a
+/// first-class github.com use case and never needs a fork's code to run.
+#[tokio::test]
+async fn issue_comment_webhook_jobs_receive_stored_secrets() {
+    // Same serialization as the fork test above: the webhook path takes its
+    // mock GitHub branch only while no process-global credential is visible.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    // The step references the secret by name, like the pullfrog workflow's
+    // step `env:` does; the spec carries referenced names (a `uses:` step
+    // marks the job dynamic and carries the whole scope).
+    tokio::fs::write(
+        ws_dir.join(".github/workflows/test.yml"),
+        "on: issue_comment\npermissions:\n  checks: write\n  id-token: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        env:\n          COMMENT_TRIGGER_TOKEN: ${{ secrets.COMMENT_TRIGGER_TOKEN }}\n",
+    )
+    .await
+    .unwrap();
+    commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir);
+    {
+        let mut secrets = state.secrets.write();
+        secrets.global.insert(
+            "COMMENT_TRIGGER_TOKEN".to_owned(),
+            "comment-trigger-value".to_owned(),
+        );
+        // Never referenced by the workflow: the spec must not name it.
+        secrets.global.insert(
+            "UNREFERENCED_TOKEN".to_owned(),
+            "unreferenced-value".to_owned(),
+        );
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "action": "created",
+        "comment": { "body": "@pullfrog review" },
+        "issue": { "number": 424, "pull_request": {} },
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main",
+        },
+        "sender": { "login": "alice" },
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let sig_hex = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "issue_comment")
+                .header("x-hub-signature-256", format!("sha256={sig_hex}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
+
+    let inner = state.test_tx().await;
+    let (_, run_record) = inner.runs.iter().next().unwrap();
+    assert_eq!(
+        run_record.submission.trust_tier.as_deref(),
+        Some("trusted"),
+        "a comment runs the default-branch workflow file and keeps its authority"
+    );
+    let run_id = run_record.run_id.to_string();
+    let message = queued_message_for(&inner, &run_id);
+    // The stored template names every secret in scope; the values are filled
+    // at acquire.
+    let spec = message
+        .preloop_secret_spec
+        .as_ref()
+        .expect("the stored template carries an explicit secret spec");
+    assert!(
+        spec.names.contains("COMMENT_TRIGGER_TOKEN"),
+        "issue_comment jobs must resolve stored secrets (spec: {spec:?})"
+    );
+    assert!(
+        !spec.names.contains("UNREFERENCED_TOKEN"),
+        "only names the workflow references are attached (spec: {spec:?})"
+    );
+    assert_eq!(
+        variable_value(&message, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
+        "declared writes survive: the token is not read-clamped"
+    );
+    let endpoint = message
+        .resources
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.eq_ignore_ascii_case("SystemVssConnection"))
+        .expect("SystemVssConnection endpoint present");
+    assert!(
+        endpoint
+            .data
+            .get("GenerateIdTokenUrl")
+            .is_some_and(|url| !url.is_empty()),
+        "id-token: write yields an OIDC request URL for a default-branch run"
+    );
+    drop(inner);
+
+    let acquired = acquire_queued_job(&app, "issue-comment-runner").await;
+    assert_eq!(
+        wire_variable(&acquired, "COMMENT_TRIGGER_TOKEN"),
+        Some("comment-trigger-value"),
+        "the stored secret is filled into the claimed job message"
+    );
+    assert_eq!(
+        wire_variable(&acquired, "system.github.token.permissions"),
+        Some(r#"{"Checks":"write","Metadata":"read"}"#),
+        "the claimed job keeps the declared permission set"
     );
 }
 
@@ -1717,7 +1874,9 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 #[tokio::test]
 async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // Up past the grace window: an unknown age measures from boot, not now.
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -1738,7 +1897,7 @@ async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window(
     let inner = state.test_tx().await;
     assert!(
         inner.ready().next().is_none(),
-        "a restored job with unknown age must not receive a fresh starvation grace window"
+        "a restored job with unknown age must not receive a grace window beyond boot"
     );
     assert_eq!(
         inner.runs.get(&run_id).unwrap().status,
@@ -2137,9 +2296,11 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         let app = app(state.clone(), CancellationToken::new());
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        // Queued for longer than the absolute ceiling before the restart:
+        // the restart killed the pool's runners, so that time must not count.
         state
             .test_db_mutate(|tx| {
-                let cutoff = crate::store::now_us() - 700_000_000;
+                let cutoff = crate::store::now_us() - 7_200_000_000;
                 tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
                     .unwrap();
             })
@@ -2224,7 +2385,8 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
 #[tokio::test]
 async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2286,7 +2448,8 @@ async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
 #[tokio::test]
 async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2379,7 +2542,8 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
 #[tokio::test]
 async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {

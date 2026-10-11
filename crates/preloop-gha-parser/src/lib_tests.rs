@@ -649,6 +649,53 @@ jobs:
     }));
     assert_eq!(jobs[0].env.get("GLOBAL"), Some(&"true".to_owned()));
 }
+
+/// An object-valued matrix axis names the job the way GitHub does.
+///
+/// valkey's ci.yml fans `test-ubuntu-latest-compatibility` out over
+/// `server: [{version, file}]`. GitHub's `JobNameBuilder` walks each cell with
+/// `Traverse(omitKeys: true)` and joins the scalar leaves, so the check name is
+/// `… (8.1.4, valkey-8.1.4-noble-x86_64.tar.gz)` — rendering the object as JSON
+/// put `{"version":"8.1.4","file":"…"}` on the commit status instead.
+#[test]
+fn object_matrix_axis_renders_github_display_name() {
+    let workflow = parse_workflow(
+        r#"
+name: CI
+on: [push]
+jobs:
+  test-ubuntu-latest-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        server:
+          - {version: "7.2.11", file: "valkey-7.2.11-noble-x86_64.tar.gz"}
+          - {version: "8.1.4", file: "valkey-8.1.4-noble-x86_64.tar.gz"}
+    steps:
+      - run: echo "${{ matrix.server.version }}"
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    assert_eq!(jobs.len(), 2);
+    let names: Vec<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "test-ubuntu-latest-compatibility (7.2.11, valkey-7.2.11-noble-x86_64.tar.gz)",
+            "test-ubuntu-latest-compatibility (8.1.4, valkey-8.1.4-noble-x86_64.tar.gz)",
+        ]
+    );
+    // Ids stay distinct: they key the run's jobs, so the object form is kept
+    // there and still resolves `needs` and `--job` lookups.
+    assert_ne!(jobs[0].id, jobs[1].id);
+    assert_eq!(
+        jobs[1].id.0,
+        "test-ubuntu-latest-compatibility ({\"version\":\"8.1.4\",\"file\":\"valkey-8.1.4-noble-x86_64.tar.gz\"})"
+    );
+}
 /// Run-record parity for the real uv CI workflow (astral-sh/uv, ci.yml,
 /// pull_request, golden run 30680325919: GitHub shows 33 jobs — 16 success +
 /// 17 skipped).
