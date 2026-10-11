@@ -20,6 +20,7 @@
 
 mod check_runs;
 mod codec;
+mod dependents;
 mod dispatch;
 mod graph;
 mod lifecycle;
