@@ -1234,7 +1234,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "api_url": shared.state.github_urls.api_url,
         "graphql_url": shared.state.github_urls.graphql_url,
         "ref_name": ref_name,
-        "ref_protected": false,
+        "ref_protected": submission.ref_protected,
         "ref_type": ref_type,
         "secret_source": "Actions",
         "event": submission.payload,
@@ -2082,6 +2082,11 @@ pub async fn submit_run(
     // request body to select the trust tier used by auto-PR and secret policy;
     // only the GitHub webhook adapters may stamp this field.
     submission.trust_tier = None;
+    // Same rule for branch protection: `ref_protected` is a claim about the
+    // forge's configuration, so only the adapters that resolve it against
+    // GitHub may set it. A body cannot assert it into `GITHUB_REF_PROTECTED`
+    // or the signed OIDC claim — consumers grant more to a protected ref.
+    submission.ref_protected = false;
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
@@ -5248,6 +5253,80 @@ mod tests {
             "GitHub reports a run whose every job was skipped as skipped"
         );
         assert_eq!(accepted.queued_jobs, 0, "nothing was queued to a runner");
+    }
+
+    /// `ref_protected` is a claim about the forge's configuration, so a native
+    /// request body cannot assert it: the endpoint clears it exactly the way it
+    /// clears `trust_tier`. Without that, a body could mint a signed OIDC
+    /// `ref_protected: "true"` claim — and a `GITHUB_REF_PROTECTED=true` job
+    /// environment — for a ref that has no protection at all.
+    #[tokio::test]
+    async fn native_submission_cannot_assert_ref_protected() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, header};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+        let app = crate::app(state, CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+                            "event": "push",
+                            "repository": "owner/repo",
+                            "git_ref": "refs/heads/main",
+                            "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                            "ref_protected": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the submission itself must be accepted, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let runs = shared
+            .state
+            .backend
+            .list_runs(crate::control::backend::RunListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "one run was submitted");
+        let run = &runs[0];
+        assert!(
+            !run.submission.ref_protected,
+            "a request body must not assert branch protection"
+        );
+        assert_eq!(
+            run.github["ref_protected"],
+            serde_json::json!(false),
+            "the run's github context must report the unprivileged value"
+        );
     }
 
     /// The same workless submission must not take the workflow's concurrency
