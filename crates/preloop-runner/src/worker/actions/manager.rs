@@ -206,7 +206,10 @@ pub async fn download_action(
     // SHA-pinned tarball URL, validated above; a missing URL fails closed.
     let url = url.to_string();
 
-    info!("Downloading action {owner}/{repo}@{git_ref} from {url}");
+    // The tarball URL is server-supplied; strip any userinfo before logging
+    // so a credential-bearing URL can never land in runner logs.
+    let shown_url = preloop_gha_protocol::masking::strip_url_userinfo(&url);
+    info!("Downloading action {owner}/{repo}@{git_ref} from {shown_url}");
 
     let client = crate::client::http::HttpClient::new(None)?;
     let (bytes, attested_digest) = if let Some(token) = auth_token {

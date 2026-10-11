@@ -864,9 +864,9 @@ where
 
 fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_json::Value {
     match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(masking::mask_secrets(&text, secrets.iter().copied(), &[]))
-        }
+        serde_json::Value::String(text) => serde_json::Value::String(
+            masking::mask_secrets_transform_aware(&text, secrets.iter().copied(), &[]),
+        ),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()

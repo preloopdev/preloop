@@ -642,6 +642,15 @@ async fn collect_plan_directories(
 
 /// Accept blob uploads (logs, summaries) at signed-URL paths.
 /// Stores them in a local replay directory for conformance inspection.
+///
+/// Server-side masking pass: the runner masks at write time, but this is the
+/// last line of defense before bytes are persisted — encoding tricks, runner
+/// bugs, or runner-generated output (e.g. setup logs) that slipped through
+/// are caught here, transform-aware (base64/percent/hex variants, ASCII
+/// case-insensitive). Every signed URL minted under `/replay/results/` names
+/// `{plan_id}/{job_id}/...`, so the plan's secrets are resolvable from the
+/// path. On a secret-resolution failure the upload is dropped rather than
+/// persisting possibly-unmasked bytes.
 pub async fn replay_results_put(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
@@ -656,6 +665,23 @@ pub async fn replay_results_put(
         tracing::warn!("Rejected path traversal attempt: {path}");
         return StatusCode::BAD_REQUEST;
     }
+
+    let plan_id = path.split('/').next().unwrap_or("");
+    let body = match crate::timeline_logs::resolve_plan_secret_list(&shared, plan_id).await {
+        Ok(secrets) => {
+            let text = String::from_utf8_lossy(&body);
+            preloop_gha_protocol::masking::mask_secrets_transform_aware(
+                &text,
+                secrets.iter().map(String::as_str),
+                &[],
+            )
+            .into_bytes()
+        }
+        Err(error) => {
+            tracing::warn!(?error, path = %path, "failed to resolve plan secrets for replay log; dropping upload");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
 
     let dest = shared
         .state

@@ -265,13 +265,37 @@ pub async fn append_log(
     // path does not touch the backend after the first chunk. On a backend
     // error we MUST NOT store the raw body — drop the append rather than
     // persist unmasked secrets.
-    let masked = match mask_log_bytes_cached(&shared, &plan_id, &body).await {
-        Ok(masked) => masked,
+    //
+    // Chunk-boundary safety: a secret split across two appends is matched on
+    // the reassembled stream. Each log key owns a StreamingMasker whose
+    // trailing-overlap buffer withholds bytes that could begin a secret
+    // continued by the next chunk; the withheld tail is flushed when the job
+    // finishes (see finish_job / finish_job_plan).
+    let secrets = match resolve_plan_secret_list(&shared, &plan_id).await {
+        Ok(secrets) => secrets,
         Err(error) => {
-            warn!(?error, key = %key, "failed to mask log body; dropping append");
+            warn!(?error, key = %key, "failed to resolve plan secrets; dropping append");
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
+    // The per-key mutex serializes appends of one log (the masking scan
+    // runs under it, not under the global state lock); different logs never
+    // block each other.
+    let masker = {
+        let mut inner = shared.state.inner.lock().await;
+        inner
+            .log_stream_maskers
+            .entry(key.clone())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    preloop_gha_protocol::masking::StreamingMasker::new(
+                        secrets.iter().map(String::as_str),
+                    ),
+                ))
+            })
+            .clone()
+    };
+    let masked = masker.lock().await.push(&body);
     if let Err(error) = shared
         .state
         .log_segments
@@ -326,29 +350,33 @@ pub fn log_key(plan_id: &str, log_id: &str) -> String {
     format!("{plan_id}/{log_id}")
 }
 
-/// Mask `body` against the run's secrets, resolving and caching the masker
-/// node-locally per `plan_id`. Run secrets are immutable for the life of the
-/// run, so after the first append for a plan the hot path never touches the
-/// backend.
+/// Resolve the secret list for `plan_id`, caching node-locally.
+///
+/// Run secrets are immutable for the life of the run, so after the first
+/// resolution for a plan the hot path never touches the backend.
 ///
 /// A cache miss does one scoped read (`job_requests` to resolve the run,
 /// `runs` for its repository and, via the stored template, the job's
 /// `environment:` — no queues, sessions, or concurrency families). The
-/// resolved masker is cached permanently. An *unresolved* plan (log chunk
-/// arrived before the run row exists) masks against every run's secrets but
-/// is NOT cached — caching the fallback would permanently mask against a set
-/// that lacks this run's secrets and leak them into the log. Instead a short
-/// negative-cache TTL bounds how often the unresolved plan re-probes the
-/// backend.
+/// resolved list is cached permanently. An *unresolved* plan (log bytes
+/// arrived before the run row exists) resolves against every run's secrets
+/// but is NOT cached — caching the fallback would permanently mask against a
+/// set that lacks this run's secrets and leak them into the log. Instead a
+/// short negative-cache TTL bounds how often the unresolved plan re-probes
+/// the backend.
 ///
-/// A SecretProvider failure is propagated, never cached and never masked
-/// over: the caller drops the append instead of persisting (and streaming)
-/// an unmasked body, and the retry is free to resolve a real masker.
-pub(crate) async fn mask_log_bytes_cached(
+/// A SecretProvider failure is propagated, never cached: the caller drops the
+/// log bytes instead of persisting (and streaming) unmasked output, and the
+/// retry is free to resolve a real secret list.
+///
+/// The returned list holds raw secret values; masking entry points
+/// ([`preloop_gha_protocol::masking::mask_secrets_transform_aware`],
+/// [`preloop_gha_protocol::masking::StreamingMasker`]) expand transformed
+/// variants themselves.
+pub(crate) async fn resolve_plan_secret_list(
     shared: &Arc<SharedState>,
     plan_id: &str,
-    body: &[u8],
-) -> Result<Vec<u8>, crate::control::ControlError> {
+) -> Result<Arc<Vec<String>>, crate::control::ControlError> {
     /// How long an unresolved plan_id waits before re-probing the backend for
     /// its run's secrets. Short enough that a run registered mid-stream picks
     /// up its real masker quickly; long enough to keep a chunk-per-append
@@ -370,13 +398,7 @@ pub(crate) async fn mask_log_bytes_cached(
             });
         if let Some(secrets) = cached {
             drop(inner);
-            let text = String::from_utf8_lossy(body);
-            return Ok(preloop_gha_protocol::masking::mask_secrets(
-                &text,
-                secrets.iter().map(String::as_str),
-                &[],
-            )
-            .into_bytes());
+            return Ok(secrets);
         }
     }
 
@@ -474,13 +496,57 @@ pub(crate) async fn mask_log_bytes_cached(
                 ),
             );
         }
-        let text = String::from_utf8_lossy(body);
-        Ok(preloop_gha_protocol::masking::mask_secrets(
-            &text,
-            secrets.iter().map(String::as_str),
-            &[],
-        )
-        .into_bytes())
+        Ok(secrets)
+    }
+}
+
+/// Flush the streaming-masker withheld tails for a plan's logs.
+///
+/// [`append_log`] withholds each log's trailing overlap (bytes that could
+/// begin a secret continued by the next chunk) instead of emitting them.
+/// When the job finishes, whatever is still withheld is masked one final
+/// time and appended to the in-memory preview and the published segments,
+/// then the maskers are dropped. Best-effort: a flush failure is logged,
+/// never fatal to job completion.
+pub(crate) async fn flush_log_stream_maskers(shared: &Arc<SharedState>, plan_id: &str) {
+    let prefix = format!("{plan_id}/");
+    let handles: Vec<(
+        String,
+        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
+    )> = {
+        let mut inner = shared.state.inner.lock().await;
+        let keys: Vec<String> = inner
+            .log_stream_maskers
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                inner
+                    .log_stream_maskers
+                    .remove(&key)
+                    .map(|handle| (key, handle))
+            })
+            .collect()
+    };
+    for (key, handle) in handles {
+        let tail = handle.lock().await.finish();
+        if tail.is_empty() {
+            continue;
+        }
+        let log_id = key.strip_prefix(&prefix).unwrap_or(&key);
+        if let Err(error) = shared
+            .state
+            .log_segments
+            .append(plan_id, log_id, &tail)
+            .await
+        {
+            warn!(?error, key = %key, "failed to flush log stream tail to segments");
+        }
+        let mut inner = shared.state.inner.lock().await;
+        inner.logs.entry(key).or_default().extend_from_slice(&tail);
+        inner.log_bytes_total = inner.log_bytes_total.saturating_add(tail.len());
     }
 }
 
@@ -500,6 +566,11 @@ pub async fn console_log(
     // query. Falling back to the plan id preserves compatibility for
     // callbacks that arrive before a request record exists.
     if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
+        // Defense in depth: the runner masks each batch before sending
+        // (holding the mask gate across the send), but a final
+        // transform-aware pass here catches static secrets that slipped
+        // through a runner bug on the transient live feed too.
+        let wrapper = mask_live_wrapper(&shared, &plan_id, wrapper).await;
         let resolved = shared
             .state
             .backend
@@ -518,6 +589,45 @@ pub async fn console_log(
         }
     }
     StatusCode::OK
+}
+
+/// Transform-aware server-side masking for one live-log batch.
+///
+/// The runner masks each batch before sending (holding the mask gate across
+/// the send), so this is purely defense-in-depth for static secrets the
+/// runner missed. On secret-resolution failure the batch passes through
+/// unchanged (fail-open): the live feed is transient, the runner already
+/// masked, and dropping live lines would break the feed for a backend
+/// hiccup. Durable persistence ([`replay_results_put`](crate::blob_store::replay_results_put),
+/// [`append_log`]) fails closed instead.
+async fn mask_live_wrapper(
+    shared: &Arc<SharedState>,
+    plan_id: &str,
+    mut wrapper: LiveLogFeedLinesWrapper,
+) -> LiveLogFeedLinesWrapper {
+    let secrets = match resolve_plan_secret_list(shared, plan_id).await {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            warn!(
+                ?error,
+                plan_id,
+                "failed to resolve plan secrets for live batch; passing through runner-masked lines"
+            );
+            return wrapper;
+        }
+    };
+    wrapper.value = wrapper
+        .value
+        .iter()
+        .map(|line| {
+            preloop_gha_protocol::masking::mask_secrets_transform_aware(
+                line,
+                secrets.iter().map(String::as_str),
+                &[],
+            )
+        })
+        .collect();
+    wrapper
 }
 
 /// The resolved URL out of an `actionsEnvironment.url` member.
@@ -622,7 +732,7 @@ pub async fn finish_job(
     );
 
     if let Some(completion) = completion {
-        let _ = complete_job_inner(shared, completion).await;
+        let _ = complete_job_inner(shared.clone(), completion).await;
     } else {
         warn!(
             plan_id,
@@ -631,6 +741,11 @@ pub async fn finish_job(
             "finish_job could not resolve callback to a run/job"
         );
     }
+
+    // Flush any bytes the streaming log maskers withheld at chunk
+    // boundaries, even when the completion itself could not be resolved:
+    // the log keys are plan-scoped either way.
+    flush_log_stream_maskers(&shared, &plan_id).await;
 
     Json(serde_json::Value::Null)
 }
@@ -830,8 +945,11 @@ pub async fn finish_job_plan(
         None
     };
     if let Some(c) = completion {
-        let _ = complete_job_inner(shared, c).await;
+        let _ = complete_job_inner(shared.clone(), c).await;
     }
+    // Flush any bytes the streaming log maskers withheld at chunk
+    // boundaries (see finish_job).
+    flush_log_stream_maskers(&shared, &plan_id).await;
     Json(serde_json::Value::Null)
 }
 
