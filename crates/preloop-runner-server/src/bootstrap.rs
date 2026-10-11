@@ -137,12 +137,7 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
 }
 
 pub async fn reap_once(shared: &Arc<SharedState>) {
-    let (
-        expired_cache_tokens,
-        expired_artifact_tokens,
-        swept_staging_files,
-        expired_diag_tokens,
-    ) = {
+    let (expired_cache_tokens, expired_artifact_tokens, swept_staging_files, expired_diag_tokens) = {
         let mut inner = shared.state.inner.lock().await;
         // Migrate legacy pending entries that restored with `created_unix == 0`
         // (pre-cap state) so they don't live forever. Give them `now` once
@@ -191,7 +186,12 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .map(|(k, _)| k.clone())
             .collect();
         // Release lock before doing I/O.
-        (expired_cache, expired_artifact, swept_staging_files, expired_diag)
+        (
+            expired_cache,
+            expired_artifact,
+            swept_staging_files,
+            expired_diag,
+        )
     };
     // Delete staging directories for expired reservations — otherwise they
     // accumulate on disk forever.
