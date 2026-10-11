@@ -150,6 +150,11 @@ name = "store_env"
 path = "tests/store_env.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "mint_liveness"
+path = "tests/mint_liveness.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true

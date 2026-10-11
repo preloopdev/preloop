@@ -7,22 +7,35 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// POST action download info — resolve action references to download URLs.
+///
+/// Action tickets are multi-hour bearerless URLs: a settled job's
+/// still-valid runtime token must not mint fresh ones (round-3 finding 8
+/// cascade). Callers that do not prove a Results job identity (the engine,
+/// runner listen and management tokens) are not jobs and bypass.
 pub async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::auth::require_live_mint_caller(&shared.state, &headers).await?;
     let collection = collect_action_download_infos(&shared.state, &request).await;
-    Json(serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })))
+    Ok(Json(
+        serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })),
+    ))
 }
 
 pub async fn runnerresolve_actions(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Same gate as `action_download_info`: this endpoint mints the same
+    // bearerless action download tickets.
+    crate::auth::require_live_mint_caller(&shared.state, &headers).await?;
     let mut actions = serde_json::Map::new();
     collect_runnerresolve_refs(&shared.state, &request, &mut actions).await;
 
-    Json(json!({ "actions": actions }))
+    Ok(Json(json!({ "actions": actions })))
 }
 
 /// Maximum archive-checksum pins held in memory. Pins are minted only by

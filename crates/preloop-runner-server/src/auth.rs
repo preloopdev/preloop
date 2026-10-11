@@ -268,6 +268,32 @@ pub async fn require_live_job(state: &AppState, job_uuid: uuid::Uuid) -> Result<
     }
 }
 
+/// Require the caller to still be live before minting a secondary
+/// credential.
+///
+/// Mint endpoints (OIDC tokens, signed download URLs, upload tickets,
+/// action download tickets) hand out credentials that outlive the caller's
+/// runtime token, so the liveness rule applies to the *mint* itself, not
+/// just to writes: a settled job's still-unexpired token must not be able
+/// to mint fresh bearerless credentials (round-3 finding 5 and the
+/// secondary-credential cascade). Uses the same authoritative
+/// backend-resolved lookup the write paths use.
+///
+/// Callers that do not prove a Results job identity (the engine/system
+/// token, runner listen and management tokens) are not jobs and bypass —
+/// control-plane callers keep working exactly as before.
+pub async fn require_live_mint_caller(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), ApiError> {
+    let identity =
+        bearer_from_headers(headers).and_then(|token| results_identity(state, token).ok());
+    match identity {
+        Some(ResultsIdentity::Job(job)) => require_live_job(state, job.job_id).await,
+        _ => Ok(()),
+    }
+}
+
 pub async fn require_test_api_token(
     State(expected): State<Arc<str>>,
     request: Request,

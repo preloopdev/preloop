@@ -293,7 +293,8 @@ pub async fn finish_job_org(
 pub async fn action_download_info_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, _scope, _hub, _plan_id)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    action_download_info(State(shared), Json(request)).await
+) -> Result<Json<serde_json::Value>, ApiError> {
+    action_download_info(State(shared), headers, Json(request)).await
 }

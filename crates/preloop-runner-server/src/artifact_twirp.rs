@@ -451,6 +451,18 @@ pub async fn twirp_artifact_v2_get_signed_url(
     Json(request): Json<ArtifactV2GetSignedUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // Minting a fresh download URL hands out a bearerless credential that
+    // outlives the call: settled jobs must not mint new ones (round-3 §5
+    // cascade). Mirrors the create/delete gate; the engine (system) identity
+    // bypasses.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run =
         artifact_v2_run_scope(&shared.state.backend, &request.workflow_run_backend_id, job).await?;
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);

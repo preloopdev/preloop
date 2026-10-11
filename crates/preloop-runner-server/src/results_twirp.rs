@@ -1017,6 +1017,11 @@ pub async fn twirp_cache_v2_get_dl_url(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    // The download URL is a bearerless credential that outlives the call: a
+    // settled job's still-valid runtime token must not mint fresh ones
+    // (round-3 §5 cascade). Uses the same authoritative lookup the write
+    // paths use; callers that are not jobs (the engine) bypass.
+    crate::auth::require_live_mint_caller(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let (key, version, restore_keys, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::GetDownloadUrl)?;
