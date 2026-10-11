@@ -460,7 +460,48 @@ pub async fn artifact_create(
         };
         auth::require_live_job(&shared.state, claims.job_id).await?;
     }
+    // A job token may only name its own run: without the binding, run A's
+    // live token could squat run B's artifact namespace through `:run_id`.
+    require_legacy_artifact_run_binding(&shared, &headers, run_id).await?;
     put_artifact(shared, run_id, request.name, request.file_name, Vec::new()).await
+}
+
+/// Bind the legacy `/_apis/pipelines/workflows/:run_id/artifacts` handlers
+/// to the caller's workflow run. The protocol-bearer gate accepts any valid
+/// job token, and the path's `:run_id` was never checked — so run A's live
+/// job token could create artifacts catalogued under run B (a cross-run
+/// squat), or list/read them. A job token may only touch the run its own job
+/// belongs to, resolved through its job request record. The system bearer
+/// manages the lifecycle itself and bypasses, mirroring the other legacy
+/// artifact checks; a request with no resolvable job claims cannot be
+/// attributed to a run and is rejected.
+async fn require_legacy_artifact_run_binding(
+    shared: &Arc<SharedState>,
+    headers: &axum::http::HeaderMap,
+    run_id: RunId,
+) -> Result<(), ApiError> {
+    if auth::system_bearer_authorized(&shared.state, headers) {
+        return Ok(());
+    }
+    let forbidden =
+        || ApiError::forbidden("artifact access requires a token for that workflow run");
+    let Some(claims) = auth::job_runtime_claims_from_headers(&shared.state, headers) else {
+        return Err(ApiError::unauthorized(
+            "job token required for artifact access",
+        ));
+    };
+    let record = shared
+        .state
+        .backend
+        .request(crate::control::backend::RequestKey::AgentJobId(
+            claims.job_id,
+        ))
+        .await
+        .map_err(|_| forbidden())?;
+    if record.run_id != run_id {
+        return Err(forbidden());
+    }
+    Ok(())
 }
 
 pub async fn put_artifact(
@@ -514,8 +555,10 @@ pub async fn artifact_get(
 
 pub async fn artifact_get_compat(
     State(shared): State<Arc<SharedState>>,
-    Path((_run_id, artifact_id)): Path<(RunId, String)>,
+    headers: axum::http::HeaderMap,
+    Path((run_id, artifact_id)): Path<(RunId, String)>,
 ) -> Result<Response, ApiError> {
+    require_legacy_artifact_run_binding(&shared, &headers, run_id).await?;
     read_artifact(shared, artifact_id).await
 }
 
@@ -555,8 +598,10 @@ pub async fn read_artifact(
 
 pub async fn artifact_list(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Path(run_id): Path<RunId>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_legacy_artifact_run_binding(&shared, &headers, run_id).await?;
     // Catalog first (durable, includes imported artifacts), then in-memory
     // records this process has not catalogued; ids de-duplicate.
     let mut seen = std::collections::HashSet::new();
@@ -564,11 +609,12 @@ pub async fn artifact_list(
     if let Ok(catalog) = shared.state.backend.artifact_catalog(Some(run_id)).await {
         for row in catalog {
             seen.insert(row.public_id.clone());
+            // The server-side storage path is deliberately omitted: it is a
+            // filesystem location clients never need and must not learn.
             value.push(json!({
                 "id": row.public_id,
                 "run_id": row.run_id,
                 "name": row.name,
-                "path": row.storage_key,
                 "size": row.size_bytes,
             }));
         }
@@ -584,15 +630,14 @@ pub async fn artifact_list(
                 "run_id": artifact.run_id,
                 "name": artifact.name,
                 "file_name": artifact.file_name,
-                "path": artifact.path,
                 "size": artifact.size,
             }));
         }
     }
-    Json(json!({
+    Ok(Json(json!({
         "count": value.len(),
         "value": value,
-    }))
+    })))
 }
 
 pub fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {

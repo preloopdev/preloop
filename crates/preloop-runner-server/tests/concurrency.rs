@@ -3539,9 +3539,8 @@ async fn legacy_artifact_create_rejects_stale_job_token() {
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-artifact", &job_id);
-    register_live_job_with_run(&state, job_id, "plan-artifact").await;
+    let run_id = register_live_job_with_run(&state, job_id, "plan-artifact").await;
     let bearer = format!("Bearer {token}");
-    let run_id = uuid::Uuid::new_v4();
 
     // Live: artifact creation succeeds.
     let live = app
@@ -3581,4 +3580,127 @@ async fn legacy_artifact_create_rejects_stale_job_token() {
         .await
         .unwrap();
     assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn legacy_artifact_handlers_bind_to_caller_run() {
+    // Repro (round-3 §6): the legacy `/_apis/pipelines/workflows/:run_id/artifacts`
+    // handlers never bound `:run_id` to the caller, so run A's LIVE job token
+    // could create artifacts catalogued under run B, and list/read run B's
+    // artifacts. The list response also leaked the server-side storage path.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let job_a = uuid::Uuid::new_v4();
+    let token_a = state.mint_runtime_token("plan-a", &job_a);
+    let run_a = register_live_job_with_run(&state, job_a, "plan-a").await;
+    let bearer_a = format!("Bearer {token_a}");
+
+    let job_b = uuid::Uuid::new_v4();
+    let token_b = state.mint_runtime_token("plan-b", &job_b);
+    let run_b = register_live_job_with_run(&state, job_b, "plan-b").await;
+    let bearer_b = format!("Bearer {token_b}");
+
+    let post_artifact = |app: &Router, run: &str, bearer: &str, name: &str| {
+        let app = app.clone();
+        let uri = format!("/_apis/pipelines/workflows/{run}/artifacts");
+        let bearer = bearer.to_owned();
+        let body =
+            serde_json::json!({"name": name, "file_name": format!("{name}.bin")}).to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, bearer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get = |app: &Router, uri: String, bearer: &str| {
+        let app = app.clone();
+        let bearer = bearer.to_owned();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Same-run flows still work for both tokens.
+    let created_b = post_artifact(&app, &run_b, &bearer_b, "b-art").await;
+    assert_eq!(created_b.status(), StatusCode::OK);
+    let created_b: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created_b.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let artifact_b_id = created_b["id"].as_str().unwrap().to_owned();
+
+    let created_a = post_artifact(&app, &run_a, &bearer_a, "a-art").await;
+    assert_eq!(created_a.status(), StatusCode::OK);
+
+    // Cross-run: run A's live token may not create under run B.
+    let squat = post_artifact(&app, &run_b, &bearer_a, "squat").await;
+    assert_eq!(squat.status(), StatusCode::FORBIDDEN);
+
+    // Cross-run: run A's live token may not list run B's artifacts.
+    let list_b = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_b}/artifacts"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(list_b.status(), StatusCode::FORBIDDEN);
+
+    // Cross-run: run A's live token may not read run B's artifact bytes.
+    let get_b = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_b}/artifacts/{artifact_b_id}"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(get_b.status(), StatusCode::FORBIDDEN);
+
+    // Same-run list works, and leaks no server-side storage path.
+    let list_a = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_a}/artifacts"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(list_a.status(), StatusCode::OK);
+    let list_a: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_a.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(list_a["count"].as_u64().unwrap(), 1);
+    let entry = &list_a["value"][0];
+    assert_eq!(entry["name"].as_str().unwrap(), "a-art");
+    assert!(
+        entry.get("path").is_none(),
+        "list response must not leak the storage path: {entry}"
+    );
+    assert!(
+        entry.get("storage_key").is_none(),
+        "list response must not leak the storage key: {entry}"
+    );
+
+    // Same-run get works.
+    let artifact_a_id = entry["id"].as_str().unwrap();
+    let get_a = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_a}/artifacts/{artifact_a_id}"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(get_a.status(), StatusCode::OK);
 }
