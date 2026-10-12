@@ -174,6 +174,7 @@ Reproduce: `scripts/bench-runner-compare.sh` (set `BENCH_RUNS=N`; needs
 | Protocol conformance | [docs/conformance.md](docs/conformance.md) |
 | Fidelity gaps and roadmap | [docs/fidelity-gap.md](docs/fidelity-gap.md) |
 | Contributing and CI requirements | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Pre-push checks for coding agents | [docs/agent-pre-push.md](docs/agent-pre-push.md) |
 
 ## License
 
