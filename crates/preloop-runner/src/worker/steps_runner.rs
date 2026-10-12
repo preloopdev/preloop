@@ -159,6 +159,10 @@ fn proxy_setup_line(ts: &str, scheme: &str, proxy: &str) -> String {
     format!("{ts} Runner is running behind proxy server '{shown}' for all {scheme} requests.")
 }
 
+/// Proxy variables whose URLs may carry a password.
+pub(crate) const PROXY_ENV_NAMES: [&str; 4] =
+    ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"];
+
 /// Mask values for the passwords of the authenticated proxies in the
 /// environment (ADR 0263: "A password provided for a proxy will be masked in
 /// the logs").
@@ -171,7 +175,7 @@ fn proxy_setup_line(ts: &str, scheme: &str, proxy: &str) -> String {
 /// inherit both. The environment sits behind `lookup` for tests.
 pub(crate) fn proxy_password_masks(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let mut masks = Vec::new();
-    for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+    for name in PROXY_ENV_NAMES {
         for mask in lookup(name)
             .as_deref()
             .map(preloop_gha_protocol::masking::url_password_masks)
@@ -183,6 +187,20 @@ pub(crate) fn proxy_password_masks(lookup: impl Fn(&str) -> Option<String>) -> V
         }
     }
     masks
+}
+
+/// Mask a container step's collected lines with the job masks, replay them
+/// to the runner log, and return the masked copy for the step log.
+///
+/// The lines echo `docker create` in full, including inlined `-e KEY=VALUE`
+/// env such as the proxy URLs, and the `docker logs` output of service
+/// containers, so no sink may see the raw lines.
+fn replay_container_log(job: &JobContext, lines: &[String]) -> String {
+    let masked = job.mask_secrets(&lines.join("\n"));
+    for line in masked.lines() {
+        info!("{line}");
+    }
+    masked
 }
 
 /// Run all steps sequentially, returning the job conclusion.
@@ -1483,14 +1501,13 @@ pub async fn run_steps(
 
         // Run cleanup
         let mut cleanup_log = Vec::new();
+        let mut cleanup_content = String::new();
         if let Some(state) = &job.container_state {
             if let Err(e) = super::container_ops::cleanup_containers(state, &mut cleanup_log).await
             {
                 warn!("Container cleanup failed: {e:#}");
             }
-            for line in &cleanup_log {
-                info!("{line}");
-            }
+            cleanup_content = replay_container_log(job, &cleanup_log);
         }
 
         let stop_end = crate::worker::helpers::iso_now();
@@ -1507,14 +1524,14 @@ pub async fn run_steps(
             });
             // Attach cleanup logs to synthetic step
             if !cleanup_log.is_empty() {
-                q.record_step_logs(&stop_step_id, &cleanup_log.join("\n"));
+                q.record_step_logs(&stop_step_id, &cleanup_content);
             }
         }
         if let Some(rpt) = reporting {
             // Upload cleanup logs
             if !cleanup_log.is_empty() {
-                let content = cleanup_log.join("\n");
-                crate::worker::reporting::upload_step_log(rpt, &stop_step_id, &content).await;
+                crate::worker::reporting::upload_step_log(rpt, &stop_step_id, &cleanup_content)
+                    .await;
             }
         }
     }
@@ -2001,9 +2018,7 @@ async fn initialize_containers(
         }
     }
 
-    for line in log.iter() {
-        info!("{line}");
-    }
+    replay_container_log(job, log);
 
     Ok(())
 }

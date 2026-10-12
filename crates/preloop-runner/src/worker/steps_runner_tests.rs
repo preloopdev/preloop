@@ -1608,3 +1608,63 @@ fn proxy_password_is_masked_in_job_logs() {
     let echoed = job.mask_secrets(&format!("proxy: {proxy}"));
     assert_eq!(echoed, "proxy: http://proxyuser:***@proxy.corp:8080");
 }
+
+/// Formatted tracing output, appended to a shared buffer.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn container_step_log_is_masked_for_every_sink() {
+    // #395: the "Initialize containers" and "Stop containers" lines carry the
+    // `docker create -e HTTPS_PROXY=<url>` command line and service
+    // `docker logs` output. The runner log replay and the step log content
+    // must both be the masked copy.
+    let proxy = "http://proxyuser:s3cr3t-pw@proxy.corp:8080";
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    for mask in proxy_password_masks(|name| (name == "HTTPS_PROXY").then(|| proxy.to_string())) {
+        job.add_mask(&mask);
+    }
+    let lines = vec![
+        format!("##[command]/usr/bin/docker create --name job -e HTTPS_PROXY={proxy} alpine"),
+        format!("HTTPS_PROXY={proxy}"),
+    ];
+
+    let captured = CapturedLog::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let step_log =
+        tracing::subscriber::with_default(subscriber, || replay_container_log(&job, &lines));
+    let runner_log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+
+    for sink in [&step_log, &runner_log] {
+        assert!(!sink.contains("s3cr3t-pw"), "{sink}");
+        assert!(
+            sink.contains("HTTPS_PROXY=http://proxyuser:***@proxy.corp:8080 alpine"),
+            "{sink}"
+        );
+        assert!(
+            sink.lines()
+                .any(|line| line.ends_with("HTTPS_PROXY=http://proxyuser:***@proxy.corp:8080")),
+            "{sink}"
+        );
+    }
+}
