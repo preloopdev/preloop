@@ -2285,6 +2285,8 @@ mod tests {
             webhook_secret: None,
             installation_id: None,
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            github_breakers: None,
+            github_consumption: None,
         };
         let permissions = BTreeMap::from([
             ("contents".to_owned(), "read".to_owned()),
