@@ -1033,13 +1033,16 @@ async fn fetch_action_manifest_nested_uses(
             percent_encode_path_segment(git_ref)
         );
         let mut request = crate::shared_http::CLIENT.get(&url);
+        let mut bucket = crate::github_breaker::GithubCredentialBucket::Anonymous;
         if let Some(pat) = state.static_github_pat()
             && url_targets_configured_github(&url, &state.github_urls)
         {
             request = request.bearer_auth(pat);
+            bucket = crate::github_breaker::GithubCredentialBucket::Pat;
         }
         let response = match crate::github_breaker::send_observed_labeled(
-            &state.github_breaker,
+            &state.github_breakers,
+            bucket,
             &state.github_consumption,
             crate::github_breaker::GithubSubsystem::Actions,
             request,

@@ -3087,9 +3087,18 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
         repository: "owner/repo".to_owned(),
         ..Default::default()
     };
-    crate::remote_workflows::resolve_remote_workflows(&mut submission, &workflow, None)
+    let temp = tempfile::tempdir().unwrap();
+    let state = crate::state::AppState::new(temp.path().to_path_buf())
         .await
         .unwrap();
+    crate::remote_workflows::resolve_remote_workflows(
+        &state.shared(),
+        &mut submission,
+        &workflow,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Content and identity are bound to the same validated revision.
     assert_eq!(
