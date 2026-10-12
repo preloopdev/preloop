@@ -1207,6 +1207,132 @@ jobs:
     );
 }
 
+/// Push-back deduplicates only what publishing itself causes. One
+/// `pull_request` delivery at a published head projects to a `pull_request`
+/// event (the echo of opening the PR: skipped) and a `pull_request_target`
+/// event, which runs the BASE branch's workflow: the published head run never
+/// exercised that, so it must still run.
+#[tokio::test]
+async fn publish_echo_dedup_skips_pull_request_but_not_pull_request_target() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    let workflow = "on:\n  push:\n  pull_request:\n  pull_request_target:\njobs:\n  build:\n    \
+                    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    tokio::fs::write(ws_dir.join(".github/workflows/test.yml"), workflow)
+        .await
+        .unwrap();
+    let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+    add_fixture_origin(temp.path(), &ws_dir);
+    let git = |args: &[&str]| -> String {
+        let output = Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
+            .args(args)
+            .current_dir(&ws_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["commit", "--allow-empty", "-m", "head commit"]);
+    let head_sha = git(&["rev-parse", "HEAD"]);
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    // The run push-back already tested and published for this head.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        serde_json::json!({
+            "workflow_yaml": workflow,
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feature-branch",
+            "sha": head_sha,
+            "workflow_path": ".github/workflows/test.yml",
+            "push": {"create_pr": false, "draft_pr": false, "dirty": false},
+            "push_tree": "b".repeat(40),
+        }),
+    )
+    .await;
+    let published_id = accepted["run_id"]
+        .as_str()
+        .unwrap()
+        .parse::<preloop_gha_protocol::RunId>()
+        .unwrap();
+    state
+        .test_db_mutate(|tx| {
+            tx.set_run_status(published_id, "completed", Some("success"))
+                .unwrap();
+        })
+        .await;
+
+    // GitHub opens the PR for the published head.
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "action": "opened",
+        "number": 42,
+        "pull_request": {
+            "head": { "ref": "feature-branch", "sha": head_sha },
+            "base": { "ref": "main", "sha": base_sha },
+        },
+        "repository": { "full_name": "owner/repo", "default_branch": "main" },
+    }))
+    .unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload);
+    let signature = format!(
+        "sha256={}",
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "pull_request")
+                .header("x-github-delivery", "echo-scoping")
+                .header("x-hub-signature-256", signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
+
+    let inner = state.test_tx().await;
+    let new_events: Vec<&str> = inner
+        .runs
+        .values()
+        .filter(|run| run.run_id != published_id)
+        .map(|run| run.submission.event.as_str())
+        .collect();
+    assert_eq!(
+        new_events,
+        ["pull_request_target"],
+        "the `pull_request` echo is deduplicated, the base-side `pull_request_target` run is not"
+    );
+}
+
 /// A fork-PR run under `require_approval` must hold even needs-empty jobs in
 /// `Pending`: the submit-time fast path used to enqueue them straight to the
 /// ready queue, letting a runner claim them before the operator approved.
