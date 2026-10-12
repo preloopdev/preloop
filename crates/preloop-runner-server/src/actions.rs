@@ -474,7 +474,7 @@ pub async fn download_action_tarball(
         Ok(response) => response,
         // A tripped breaker fails fast with 503 instead of queueing behind
         // the outage; runners retry the download on the next attempt.
-        Err(error) if shared.state.github_breakers.breaker_for(bucket).is_open() => {
+        Err(error) if error.downcast_ref::<crate::github_breaker::BreakerOpen>().is_some() => {
             return Err(ApiError::service_unavailable(format!(
                 "GitHub is temporarily unavailable: {error:#}"
             )));
@@ -499,17 +499,21 @@ pub async fn download_action_tarball(
         .map_err(|e| ApiError::internal(format!("failed to create temporary action file: {e}")))?;
 
     let mut hasher = Sha256::new();
-    let mut streamed_bytes: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
             ApiError::internal(format!("failed to read chunk from GitHub response: {e}"))
         })?;
+        // Account each chunk as it arrives, so a stream that dies mid-download
+        // still charges the bytes GitHub already sent.
+        shared.state.github_consumption.record_bytes(
+            crate::github_breaker::GithubSubsystem::Actions,
+            chunk.len() as u64,
+        );
         // Hash the archive bytes as they arrive, so the digest the engine
         // pins is computed over exactly the bytes written to the cache —
         // no second read, no TOCTOU between write and hash.
         hasher.update(&chunk);
-        streamed_bytes = streamed_bytes.saturating_add(chunk.len() as u64);
         tokio::io::copy(&mut &chunk[..], &mut temp_file)
             .await
             .map_err(|e| {
@@ -517,12 +521,6 @@ pub async fn download_action_tarball(
             })?;
     }
     let digest = format!("{:x}", hasher.finalize());
-    // Exact byte count, measured off the stream — the one true number for
-    // tarball bandwidth accounting.
-    shared.state.github_consumption.record_bytes(
-        crate::github_breaker::GithubSubsystem::Actions,
-        streamed_bytes,
-    );
 
     // Atomically rename to final target path. A concurrent request may have
     // published the same action first — then the cached file is the winner's
@@ -1800,6 +1798,11 @@ mod tests {
     /// Pre-fix this path had no breaker at all and hammered the 429.
     #[tokio::test]
     async fn tarball_download_429_engages_breaker() {
+        // Held for the whole test, with the PAT cleared before the state is
+        // built: `AppState::new` reads `PRELOOP_GITHUB_TOKEN`, and a concurrent
+        // test that sets it would move this download into the Pat bucket.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
         let reset = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1845,7 +1848,7 @@ mod tests {
             .expect_err("breaker-open must fail fast");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            err.message().contains("circuit breaker is open"),
+            err.message().starts_with("GitHub is temporarily unavailable"),
             "unexpected error: {}",
             err.message()
         );
@@ -1869,6 +1872,22 @@ mod tests {
         {
             assert_eq!(other.requests, 0, "{} must not be charged", other.subsystem);
         }
+    }
+
+    /// Only a breaker refusal is a 503. A transport failure that never reached
+    /// GitHub stays an internal error, even though it also counts against the
+    /// breaker.
+    #[tokio::test]
+    async fn tarball_transport_failure_is_internal_not_unavailable() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+        // Port 1 on loopback is closed: connection refused, no HTTP exchange.
+        let (shared, _temp) = tarball_shared("http://127.0.0.1:1").await;
+        let (state, path, query) = download_call(&shared);
+        let err = download_action_tarball(state, path, query)
+            .await
+            .expect_err("a refused connection must fail the download");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A successful tarball download accounts the exact streamed byte count

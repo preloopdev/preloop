@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::events::EffectiveEvent;
+use crate::github_breaker::{BreakerOpen, GithubCredentialBucket};
 use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use crate::{
     ControlBackend, ExecutionStatus, SharedState, changed_paths_from_payload,
@@ -618,7 +619,7 @@ impl CheckRunSender {
                 // Touching the row here would overwrite its lease state.
                 debug!(run_id=%update.run_id, job_id=%update.job_id, "check-run lease taken over by another sender; skipping");
             }
-            Err(error) if error.to_string().contains("circuit breaker is open") => {
+            Err(error) if error.downcast_ref::<BreakerOpen>().is_some() => {
                 // A breaker that opened between the budget check and the call
                 // is still a deferral, not a failure.
                 let remaining = breaker
@@ -3607,10 +3608,11 @@ enum WebhookOutcome {
         failures: Vec<WebhookFailure>,
     },
     Unreportable(String),
-    /// GitHub itself is unreachable. Distinct from `TransientError` because
-    /// the delivery did nothing wrong: it is returned to the queue with its
-    /// attempt refunded and retried after the breaker's window, instead of
-    /// spending one of six attempts on an outage it cannot influence.
+    /// A dependency the delivery cannot influence is down: GitHub itself is
+    /// unreachable, or the delivery's own credential is throttled. Distinct
+    /// from `TransientError` because the delivery did nothing wrong: it is
+    /// returned to the queue with its attempt refunded and retried after the
+    /// breaker's window, instead of spending one of six attempts on it.
     DependencyUnavailable {
         error: String,
         retry_after_secs: u64,
@@ -3873,6 +3875,16 @@ async fn drain_webhook_queue_with_heartbeat(
     }
 }
 
+/// The credential bucket a delivery's GitHub calls are charged to: the App
+/// installation its payload names, or the engine's PAT when the payload names
+/// none (or names it non-numerically).
+fn webhook_delivery_bucket(delivery: &WebhookDeliveryRecord) -> GithubCredentialBucket {
+    serde_json::from_slice::<Value>(&delivery.payload)
+        .ok()
+        .and_then(|payload| payload["installation"]["id"].as_u64())
+        .map_or(GithubCredentialBucket::Pat, GithubCredentialBucket::Installation)
+}
+
 /// Process one claimed delivery and update its state according to the failure taxonomy.
 pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookDeliveryRecord) {
     let Some(lease_token) = delivery.lease_token.as_deref() else {
@@ -3949,7 +3961,16 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
     // reason a step failed.
     let outcome = match outcome {
         WebhookOutcome::TransientError(error) => {
-            match shared.state.github_breakers.retry_after() {
+            // Park only when a breaker this delivery depends on is open: a
+            // GitHub-wide outage, or the delivery's own credential. An
+            // unrelated throttled installation must not turn every transient
+            // failure into a park, which would bypass the attempt cap. When
+            // both block, wait for the longer of the two.
+            let breakers = &shared.state.github_breakers;
+            let blocked_for = breakers
+                .unavailable_retry_after()
+                .max(breakers.retry_after_for(webhook_delivery_bucket(delivery)));
+            match blocked_for {
                 Some(retry_after) => WebhookOutcome::DependencyUnavailable {
                     error,
                     // Bounded: a long breaker window still gets re-examined
@@ -6745,6 +6766,70 @@ mod tests {
         assert!(breaker.is_open(), "breaker must be open");
     }
 
+    /// `payload` with `installation.id` set, the way a GitHub App delivery
+    /// names the installation whose token it runs under.
+    fn with_installation(payload: &[u8], installation_id: u64) -> Vec<u8> {
+        let mut value: Value = serde_json::from_slice(payload).unwrap();
+        value["installation"] = serde_json::json!({ "id": installation_id });
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    /// A fixture whose workspace is hidden, so workflow evaluation fails
+    /// transiently the way an unreachable dependency would.
+    async fn hidden_workspace_fixture(temp: &tempfile::TempDir) -> WebhookFixture {
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(temp, ws_dir.clone()).await;
+        std::fs::rename(&ws_dir, temp.path().join("hidden_ws")).unwrap();
+        fixture
+    }
+
+    /// Queue `payload` as a delivery that has already spent its whole attempt
+    /// budget, then claim it the way the drain loop would.
+    async fn claim_exhausted_delivery(
+        state: &AppState,
+        delivery_id: &str,
+        payload: Vec<u8>,
+    ) -> WebhookDeliveryRecord {
+        state
+            .backend
+            .enqueue_webhook_delivery(&WebhookDeliveryRecord {
+                delivery_id: delivery_id.to_owned(),
+                event: "push".to_owned(),
+                payload,
+                received_at_us: crate::store::now_us(),
+                state: WebhookDeliveryStatus::Received,
+                attempts: WEBHOOK_MAX_ATTEMPTS,
+                lease_until_us: None,
+                lease_token: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        state
+            .backend
+            .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("claimed the delivery")
+    }
+
+    async fn webhook_record(state: &AppState, delivery_id: &str) -> WebhookDeliveryRecord {
+        state
+            .backend
+            .get_webhook_delivery(delivery_id)
+            .await
+            .unwrap()
+            .expect("delivery row must exist")
+    }
+
     /// A known GitHub outage must stop the queue from claiming: every claim
     /// charges an attempt and would fail on the same dependency.
     #[tokio::test]
@@ -6782,57 +6867,23 @@ mod tests {
     #[tokio::test]
     async fn github_outage_parks_a_delivery_instead_of_dead_lettering_it() {
         let temp = tempfile::tempdir().unwrap();
-        let ws_dir = temp.path().join("ws");
-        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
-        std::fs::write(
-            ws_dir.join(".github/workflows/build.yml"),
-            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
-        )
-        .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
         // Make workflow evaluation fail the way an unreachable dependency
         // would, and start from an attempt count already past the cap.
-        let hidden_ws = temp.path().join("hidden_ws");
-        std::fs::rename(&ws_dir, &hidden_ws).unwrap();
-        fixture
-            .state
-            .backend
-            .enqueue_webhook_delivery(&WebhookDeliveryRecord {
-                delivery_id: "delivery-outage-park".to_owned(),
-                event: "push".to_owned(),
-                payload: fixture.payload_bytes.clone(),
-                received_at_us: crate::store::now_us(),
-                state: WebhookDeliveryStatus::Received,
-                attempts: WEBHOOK_MAX_ATTEMPTS,
-                lease_until_us: None,
-                lease_token: None,
-                last_error: None,
-            })
-            .await
-            .unwrap();
+        let fixture = hidden_workspace_fixture(&temp).await;
+        let delivery = claim_exhausted_delivery(
+            &fixture.state,
+            "delivery-outage-park",
+            fixture.payload_bytes.clone(),
+        )
+        .await;
+        open_breaker(&fixture.state);
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
             shutdown: CancellationToken::new(),
         });
-        let claimed = shared
-            .state
-            .backend
-            .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
-            .await
-            .unwrap();
-        let delivery = claimed.into_iter().next().expect("claimed the delivery");
-        assert_eq!(delivery.attempts, WEBHOOK_MAX_ATTEMPTS + 1);
-
-        open_breaker(&fixture.state);
         process_one_delivery(&shared, &delivery).await;
 
-        let record = fixture
-            .state
-            .backend
-            .get_webhook_delivery("delivery-outage-park")
-            .await
-            .unwrap()
-            .expect("delivery row must exist");
+        let record = webhook_record(&fixture.state, "delivery-outage-park").await;
         assert_eq!(
             record.state,
             WebhookDeliveryStatus::Received,
@@ -6847,6 +6898,152 @@ mod tests {
                 .lease_until_us
                 .is_some_and(|lease_until| lease_until > crate::store::now_us())
         );
+    }
+
+    /// A throttled installation must not make another installation's
+    /// transient failure look like an outage. It takes normal attempt
+    /// accounting, so a delivery already past the cap is dead-lettered.
+    #[tokio::test]
+    async fn throttled_unrelated_installation_does_not_park_transient_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = hidden_workspace_fixture(&temp).await;
+        fixture
+            .state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Installation(2))
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(Duration::from_secs(120)),
+                },
+                "429",
+            );
+        let delivery = claim_exhausted_delivery(
+            &fixture.state,
+            "delivery-unrelated",
+            with_installation(&fixture.payload_bytes, 9),
+        )
+        .await;
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        process_one_delivery(&shared, &delivery).await;
+
+        let record = webhook_record(&fixture.state, "delivery-unrelated").await;
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Failed,
+            "another installation's throttle must not park a failure past the cap"
+        );
+    }
+
+    /// A throttled installation parks its own deliveries' transient failures
+    /// even past the attempt cap: the throttle belongs to the credential, not
+    /// to the delivery.
+    #[tokio::test]
+    async fn throttled_own_installation_parks_transient_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = hidden_workspace_fixture(&temp).await;
+        fixture
+            .state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Installation(9))
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(Duration::from_secs(120)),
+                },
+                "429",
+            );
+        let delivery = claim_exhausted_delivery(
+            &fixture.state,
+            "delivery-own",
+            with_installation(&fixture.payload_bytes, 9),
+        )
+        .await;
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        process_one_delivery(&shared, &delivery).await;
+
+        let record = webhook_record(&fixture.state, "delivery-own").await;
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Received,
+            "the own credential's throttle must park the delivery"
+        );
+        assert_eq!(
+            record.attempts, WEBHOOK_MAX_ATTEMPTS,
+            "parking refunds the attempt the claim charged"
+        );
+        assert!(
+            record
+                .lease_until_us
+                .is_some_and(|retry_at| retry_at > crate::store::now_us())
+        );
+    }
+
+    /// A GitHub-wide outage parks every installation's transient failures:
+    /// the outage is nobody's delivery's fault, whichever credential it uses.
+    #[tokio::test]
+    async fn github_wide_outage_parks_any_installations_transient_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = hidden_workspace_fixture(&temp).await;
+        open_breaker(&fixture.state);
+        let delivery = claim_exhausted_delivery(
+            &fixture.state,
+            "delivery-wide",
+            with_installation(&fixture.payload_bytes, 9),
+        )
+        .await;
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        process_one_delivery(&shared, &delivery).await;
+
+        let record = webhook_record(&fixture.state, "delivery-wide").await;
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Received,
+            "a GitHub-wide outage must park, never dead-letter, a delivery"
+        );
+        assert_eq!(
+            record.attempts, WEBHOOK_MAX_ATTEMPTS,
+            "parking refunds the attempt the claim charged"
+        );
+    }
+
+    /// The delivery is charged to the App installation its payload names,
+    /// and to the PAT when it names none.
+    #[test]
+    fn webhook_delivery_bucket_follows_the_payload_installation() {
+        let bucket = |payload: &str| {
+            webhook_delivery_bucket(&WebhookDeliveryRecord {
+                delivery_id: "delivery".to_owned(),
+                event: "push".to_owned(),
+                payload: payload.as_bytes().to_vec(),
+                received_at_us: 0,
+                state: WebhookDeliveryStatus::Received,
+                attempts: 0,
+                lease_until_us: None,
+                lease_token: None,
+                last_error: None,
+            })
+        };
+        assert_eq!(
+            bucket(r#"{"installation":{"id":9}}"#),
+            GithubCredentialBucket::Installation(9)
+        );
+        assert_eq!(
+            bucket(r#"{"ref":"refs/heads/main"}"#),
+            GithubCredentialBucket::Pat
+        );
+        assert_eq!(
+            bucket(r#"{"installation":{"id":"9"}}"#),
+            GithubCredentialBucket::Pat
+        );
+        assert_eq!(bucket("not json"), GithubCredentialBucket::Pat);
     }
 
     /// A delivery whose ref SHA cannot be resolved is retried internally rather than dropped.

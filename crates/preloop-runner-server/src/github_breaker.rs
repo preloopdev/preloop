@@ -394,22 +394,6 @@ impl GithubBreakerRegistry {
         self.breaker_for(bucket).retry_after()
     }
 
-    /// Minimum remaining wait across all open buckets, if any.
-    ///
-    /// Used where the credential is not known up front and parking is always
-    /// safe (webhook outage reclassification): any open bucket means some
-    /// GitHub budget is exhausted, so a failed delivery is parked rather
-    /// than dead-lettered. Callers that gate *claiming* work should prefer
-    /// [`GithubBreakerRegistry::unavailable_retry_after`] so a
-    /// per-credential rate limit does not stall unrelated deliveries.
-    pub fn retry_after(&self) -> Option<Duration> {
-        self.breakers
-            .lock()
-            .values()
-            .filter_map(|breaker| breaker.retry_after())
-            .min()
-    }
-
     /// Minimum remaining wait across buckets open for non-rate-limit reasons.
     ///
     /// Unreachability (5xx, DNS, connect) is (almost) always GitHub-wide,
@@ -417,18 +401,16 @@ impl GithubBreakerRegistry {
     /// uses this to decide whether claiming work is worth it: a throttled
     /// installation must not stop other installations' deliveries from being
     /// claimed, but a GitHub outage means every claim would burn an attempt.
+    ///
+    /// A bucket whose window has elapsed but whose half-open probe is still
+    /// running is still down. [`GithubBreaker::retry_after`] covers the probe;
+    /// [`BreakerSnapshot::open`] covers only the window, so it cannot be used.
     pub fn unavailable_retry_after(&self) -> Option<Duration> {
         self.breakers
             .lock()
             .values()
-            .filter_map(|breaker| {
-                let snapshot = breaker.snapshot();
-                if snapshot.open && !snapshot.rate_limited {
-                    snapshot.retry_in_seconds.map(Duration::from_secs)
-                } else {
-                    None
-                }
-            })
+            .filter(|breaker| !breaker.snapshot().rate_limited)
+            .filter_map(|breaker| breaker.retry_after())
             .min()
     }
 
@@ -517,6 +499,28 @@ fn header_str<'headers>(headers: &'headers HeaderMap, name: &str) -> Option<&'he
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// A GitHub call refused by an open breaker before anything reached GitHub.
+///
+/// Typed so callers can tell a deferral (no budget spent; retry once the wait
+/// has passed) from a failure by downcasting, rather than matching on text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BreakerOpen {
+    /// How long until GitHub work is worth attempting again.
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for BreakerOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHub circuit breaker is open (retry after {}s)",
+            self.retry_after.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for BreakerOpen {}
+
 /// Send a GitHub request through the calling credential's breaker.
 ///
 /// Breaker coverage without consumption accounting, for the pre-`AppState`
@@ -535,10 +539,9 @@ pub async fn send_observed(
 ) -> anyhow::Result<reqwest::Response> {
     let breaker = registry.breaker_for(bucket);
     if let Err(remaining) = breaker.acquire() {
-        anyhow::bail!(
-            "GitHub circuit breaker is open (retry after {}s)",
-            remaining.as_secs_f64()
-        );
+        return Err(anyhow::Error::new(BreakerOpen {
+            retry_after: remaining,
+        }));
     }
     match request.send().await {
         Ok(response) => {
@@ -772,10 +775,9 @@ pub async fn send_observed_labeled(
             retry_in_secs = remaining.as_secs(),
             "GitHub request refused without touching GitHub: circuit breaker open"
         );
-        anyhow::bail!(
-            "GitHub circuit breaker is open (retry after {}s)",
-            remaining.as_secs_f64()
-        );
+        return Err(anyhow::Error::new(BreakerOpen {
+            retry_after: remaining,
+        }));
     }
     match request.send().await {
         Ok(response) => {
@@ -1082,15 +1084,21 @@ mod tests {
 
         // Second attempt: refused without touching GitHub — the hammering
         // the pre-fix code path did is exactly what the breaker now stops.
-        let blocked = send_observed_labeled(
+        let error = send_observed_labeled(
             &breaker,
             GithubCredentialBucket::Pat,
             &consumption,
             GithubSubsystem::Actions,
             crate::shared_http::CLIENT.get(format!("{}/repos/o/r/tarball/main", stub.base)),
         )
-        .await;
-        assert!(blocked.is_err(), "breaker-open must fail fast");
+        .await
+        .expect_err("breaker-open must fail fast");
+        assert!(
+            error
+                .downcast_ref::<BreakerOpen>()
+                .is_some_and(|open| open.retry_after > Duration::ZERO),
+            "a refusal must carry its typed wait, got: {error:#}"
+        );
         assert_eq!(
             stub.hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1367,6 +1375,56 @@ mod tests {
                 .snapshot()
                 .consecutive_failures,
             1
+        );
+    }
+
+    /// A bucket whose open window has elapsed but whose half-open probe is
+    /// still running is still down for claiming: the probe's verdict is
+    /// pending, and the window-only snapshot flag would miss it.
+    #[test]
+    fn unavailable_retry_after_covers_a_live_probe() {
+        let registry = GithubBreakerRegistry::new(test_config());
+        let bucket = GithubCredentialBucket::Installation(7);
+        let breaker = registry.breaker_for(bucket);
+        for _ in 0..3 {
+            breaker.record_failure(&GithubFailureKind::Unavailable, "502");
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(breaker.acquire().is_ok(), "the probe must be admitted");
+        assert!(
+            !breaker.snapshot().open,
+            "the window has elapsed, so the snapshot reports closed"
+        );
+        assert!(
+            registry.unavailable_retry_after().is_some(),
+            "a live probe must keep claiming paused"
+        );
+    }
+
+    /// Rate limits are per credential: a throttled installation must not
+    /// pause claiming for everyone else.
+    #[test]
+    fn unavailable_retry_after_ignores_rate_limited_buckets() {
+        let registry = GithubBreakerRegistry::new(test_config());
+        let bucket = GithubCredentialBucket::Installation(7);
+        registry.breaker_for(bucket).record_failure(
+            &GithubFailureKind::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            "429",
+        );
+        assert!(registry.breaker_for(bucket).is_open());
+        assert_eq!(registry.unavailable_retry_after(), None);
+    }
+
+    #[test]
+    fn breaker_refusal_keeps_its_message_text() {
+        let refusal = BreakerOpen {
+            retry_after: Duration::from_secs(30),
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "GitHub circuit breaker is open (retry after 30s)"
         );
     }
 }

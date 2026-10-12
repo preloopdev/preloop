@@ -493,11 +493,21 @@ mod observed_sender_tests {
         let error = resolve_remote_workflows(&shared, &mut submission, &workflow, Some("pat-x"))
             .await
             .expect_err("a parked PAT bucket must fail the fetch");
-        assert!(
-            error.message().contains("circuit breaker is open"),
-            "must fail fast on the open breaker, got: {}",
-            error.message()
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_GATEWAY);
+        // Refused by the breaker, not sent: no request reached GitHub, and the
+        // refusal is accounted to the workflows subsystem.
+        let usage = shared
+            .state
+            .github_consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == GithubSubsystem::Workflows.as_str())
+            .expect("workflows subsystem must be in the snapshot");
+        assert_eq!(
+            usage.breaker_blocked, 1,
+            "must fail fast on the open breaker"
         );
+        assert_eq!(usage.requests, 0, "no request may reach GitHub");
     }
 }
 
