@@ -63,8 +63,9 @@ Invariants worth keeping:
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.
-- The poll is skipped while the breaker is open — during a GitHub outage the
-  poll would fail anyway.
+- Each App's poll is skipped while that App's breaker is open — during a GitHub
+  outage the poll would fail anyway. Apps have separate breakers, so one App's
+  rate limit does not stall the others.
 - Per-GUID backoff (0, 5m, 15m, 1h, 6h) with a cap; a GUID that hits the cap
   stays **open** as a standing finding rather than disappearing.
 - An attempt is **claimed before the request**: the attempt count and the
@@ -101,6 +102,9 @@ misconfigured App on day one and nothing after. This re-reads `GET /app` and
 - missing trigger events (and the permission that gates each checkbox),
 - delivery-URL drift against `PRELOOP_PUBLIC_URL`,
 - read errors — never rendered as a clean bill of health.
+
+An App whose own breaker is open is not re-read: its last verdict stays published
+until the breaker closes, while the other Apps are checked as normal.
 
 GitHub exposes no API to change an App's event subscription, and no `active`
 flag on `/app/hook/config`: this layer pages a human, it cannot self-heal.

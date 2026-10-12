@@ -83,22 +83,31 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             .set_app_config(Vec::new(), now_us());
         return Vec::new();
     }
-    if let Some(retry_after) = shared
-        .state
-        .github_breakers
-        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
-    {
-        tracing::debug!(
-            retry_in_secs = retry_after.as_secs(),
-            "GitHub breaker open or probe in progress; skipping App webhook health check"
-        );
-        return shared.state.webhook_status.app_config_snapshot().0;
-    }
-
+    // The verdicts published last pass. An App held back by its breaker is not
+    // re-checked and keeps its previous verdict, so the published list still
+    // covers every App.
+    let previous = shared.state.webhook_status.app_config_snapshot().0;
     let api_base = crate::github::github_api_base();
     let expected_url = expected_webhook_url();
     let mut statuses = Vec::with_capacity(apps.len());
+    let mut checked = 0usize;
     for app in apps {
+        let bucket = crate::github_breaker::GithubCredentialBucket::for_app(&app.app_id);
+        if let Some(retry_after) = shared.state.github_breakers.retry_after_for(bucket) {
+            tracing::debug!(
+                app_id = %app.app_id,
+                retry_in_secs = retry_after.as_secs(),
+                "GitHub breaker open or probe in progress; skipping App webhook health check"
+            );
+            statuses.extend(
+                previous
+                    .iter()
+                    .filter(|status| status.app_id == app.app_id)
+                    .cloned(),
+            );
+            continue;
+        }
+        checked += 1;
         let mut status = AppWebhookConfigStatus {
             app_id: app.app_id.clone(),
             expected_url: expected_url.clone(),
@@ -110,7 +119,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some(&shared.state.github_breakers),
+            Some((&shared.state.github_breakers, &shared.state.github_consumption)),
         )
         .await
         {
@@ -140,7 +149,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some(&shared.state.github_breakers),
+            Some((&shared.state.github_breakers, &shared.state.github_consumption)),
         )
         .await
         {
@@ -154,6 +163,10 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
         statuses.push(status);
     }
 
+    if checked == 0 {
+        // Every App is held back by its breaker: publish nothing new.
+        return previous;
+    }
     shared
         .state
         .webhook_status
@@ -245,6 +258,49 @@ mod tests {
         )
     }
 
+    async fn shared_with_two_apps() -> (tempfile::TempDir, Arc<SharedState>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![
+                crate::github_app::GitHubAppCredentials::for_tests(
+                    "424",
+                    TEST_KEY.clone(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+                crate::github_app::GitHubAppCredentials::for_tests(
+                    "525",
+                    TEST_KEY.clone(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+            ],
+            default_index: 0,
+        });
+        (
+            temp,
+            Arc::new(SharedState {
+                state,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            }),
+        )
+    }
+
+    /// Trip one App's own breaker bucket the way a 429 would.
+    fn park_app(shared: &Arc<SharedState>, app_id: &str) {
+        shared
+            .state
+            .github_breakers
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app(app_id))
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(Duration::from_secs(60)),
+                },
+                "429",
+            );
+    }
+
     #[tokio::test]
     async fn reports_url_drift_against_the_public_url() {
         let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -304,5 +360,81 @@ mod tests {
         assert!(statuses[0].error.is_some(), "{statuses:?}");
         assert!(!statuses[0].healthy());
         assert!(statuses[0].hook_url.is_none());
+    }
+
+    /// Two Apps, the first behind an open breaker: only the second is checked,
+    /// and the published list holds only that App's verdict.
+    #[tokio::test]
+    async fn an_app_behind_an_open_breaker_is_not_checked_while_the_others_are() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
+        let (_temp, shared) = shared_with_two_apps().await;
+        park_app(&shared, "424");
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(statuses[0].app_id, "525");
+        assert!(statuses[0].healthy(), "{statuses:?}");
+    }
+
+    /// An App held back by its breaker is not re-checked, so the verdict it
+    /// published last pass stays in the list.
+    #[tokio::test]
+    async fn an_app_held_back_keeps_its_last_published_verdict() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
+        let (_temp, shared) = shared_with_two_apps().await;
+        let published = check_webhook_config_once(&shared).await;
+        park_app(&shared, "424");
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        let ids: Vec<&str> = statuses
+            .iter()
+            .map(|status| status.app_id.as_str())
+            .collect();
+        assert_eq!(ids, ["424", "525"], "{statuses:?}");
+        assert_eq!(statuses[0], published[0]);
+    }
+
+    /// When every App is held back the pass checks nothing, so it publishes
+    /// nothing and the publication time does not move.
+    #[tokio::test]
+    async fn every_app_held_back_leaves_the_published_snapshot_untouched() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
+        let (_temp, shared) = shared_with_two_apps().await;
+        let published = check_webhook_config_once(&shared).await;
+        let checked_at = shared.state.webhook_status.app_config_snapshot().1;
+        park_app(&shared, "424");
+        park_app(&shared, "525");
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        assert_eq!(statuses, published);
+        assert_eq!(
+            shared.state.webhook_status.app_config_snapshot().1,
+            checked_at,
+            "a pass that checked nothing must not move the publication time"
+        );
     }
 }

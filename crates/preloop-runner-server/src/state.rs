@@ -784,8 +784,7 @@ pub struct AppState {
     /// Per-subsystem consumption accounting for outbound GitHub traffic
     /// (requests, bytes, rate limits, breaker-blocked attempts). Only the
     /// labeled sender ([`crate::github_breaker::send_observed_labeled`])
-    /// records here; the unlabeled [`crate::github_breaker::send_observed`]
-    /// covers only pre-`AppState` bootstrap reads and records nothing.
+    /// records here.
     pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
@@ -1365,7 +1364,12 @@ impl AppState {
         let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let diag_staging_max_age_seconds =
             crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_apps = crate::github_app::load_from(&config)?;
+        let github_breakers = Arc::new(crate::github_breaker::GithubBreakerRegistry::default());
+        let github_consumption = Arc::new(crate::github_breaker::GithubConsumption::default());
+        // Attached before `github_app` is cloned from the registry, so the
+        // legacy field reports through the same breaker and accounting.
+        let github_apps = crate::github_app::load_from(&config)?
+            .map(|apps| apps.with_github_accounting(&github_breakers, &github_consumption));
         let github_app = github_apps
             .as_ref()
             .map(|registry| registry.default_app().clone());
@@ -1569,8 +1573,8 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
-            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
+            github_breakers,
+            github_consumption,
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             observability: preloop_observability::Observability::noop(),
