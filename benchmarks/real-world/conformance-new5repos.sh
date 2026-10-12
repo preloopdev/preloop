@@ -29,9 +29,17 @@ export PRELOOP_CLIENT_TIMEOUT_SECONDS="${PRELOOP_CLIENT_TIMEOUT_SECONDS:-3600}"
 SERVER_BIN="${PRELOOP_BIN:-$ROOT/target/debug/preloop}"
 CLIENT_BIN="${PRELOOP_CLIENT_BIN:-$ROOT/target/debug/preloop-runner-client}"
 GUEST_RUNNER_BUNDLE="${PRELOOP_RUNNER_BUNDLE:-$ROOT/target/aarch64-unknown-linux-gnu/debug}"
-OFFICIAL_GOLDEN_BASE="ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:a58990d6b6f8ca5861f33d77e1d3f0732d7d14261caacd6fba8c8f707c05b40e"
-OFFICIAL_GOLDEN_NAME="preloop-ghcr.io-preloopdev-runner-images-ubuntu24-arm64-runner-large-latest-sha256-a58990d6b6f8ca5861f33d77e1d3f0732d7d14261caacd6fba8c8f707c05b40e-aarch64"
-OFFICIAL_GOLDEN_ARTIFACT="${PRELOOP_GOLDEN_ARTIFACT:-$HOME/.config/preloop/vms/${OFFICIAL_GOLDEN_NAME}.smolmachine}"
+# The official sentinel: what a pool with no image configured resolves to,
+# and what `runs-on: ubuntu-latest`/`ubuntu-24.04` resolve to.  The engine
+# fetches the packed golden from the per-architecture OCI reference
+# (PRELOOP_GOLDEN_OCI_REF overrides it) and keys the payload by this
+# sentinel plus the environment fingerprint — ask `preloop golden-path`
+# for that path, never spell it here.
+OFFICIAL_GOLDEN_SENTINEL="preloop-official-golden"
+# Operator cache of the same ~9GB payload, symlinked into the campaign home
+# so a harness restart does not re-download it.  Point PRELOOP_GOLDEN_ARTIFACT
+# at a copy that lives elsewhere.
+OFFICIAL_GOLDEN_ARTIFACT="${PRELOOP_GOLDEN_ARTIFACT:-$HOME/.config/preloop/vms/${OFFICIAL_GOLDEN_SENTINEL}-aarch64.smolmachine}"
 SERVER_PID=""
 FAILED_TARGETS=""
 if [ "$(uname -s)" = Darwin ]; then
@@ -98,7 +106,7 @@ prepare_golden_home() {
   # Reimplementing EnvironmentSpec here drifted when runner-root and smolvm
   # inputs changed, silently causing a fresh multi-GiB image pull.
   expected="$(PRELOOP_HOME="$CAMPAIGN_HOME" \
-    PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_BASE" \
+    PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_SENTINEL" \
     "$SERVER_BIN" golden-path)" || fail "could not compute golden payload path"
   mkdir -p "$(dirname "$expected")"
   ln -sfn "$OFFICIAL_GOLDEN_ARTIFACT" "$expected"
@@ -148,10 +156,9 @@ start_server() {
   SMOLVM_DATA_DIR="${SMOLVM_DATA_DIR:-$CAMPAIGN_HOME/smolvm}" \
   SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$SMOLVM_HOME_DIR/agent-rootfs}" \
   SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$SMOLVM_HOME_DIR/lib}" \
-  PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_BASE" \
+  PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_SENTINEL" \
   PRELOOP_RUNNER_BUNDLE="$GUEST_RUNNER_BUNDLE" \
   PRELOOP_RUNNER_NAME_PREFIX="conformance-new5repos" \
-  PRELOOP_USE_PACKED_GOLDEN=1 \
   PRELOOP_RUNNER_POOL_ENABLED=1 \
   PRELOOP_RUNNER_POOL_SIZE="$POOL_SIZE" \
   PRELOOP_USE_FORK=1 \

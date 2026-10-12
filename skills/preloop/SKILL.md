@@ -125,13 +125,15 @@ the URL GitHub and remote runners can actually reach. Hidden alias: `engine`.
 | `PRELOOP_RUNNER_POOL_SIZE` | override warm runner pool size (memory-bounded, cap 8) |
 | `PRELOOP_RUNNER_STORAGE_GB` | persistent guest storage per runner; use `80` or more for full hosted-image OCI snapshots |
 | `PRELOOP_RUNNER_PACK_PROXY` / `PRELOOP_RUNNER_PACK_NO_PROXY` | proxy and bypass list for smolvm's registry export VM during golden packing |
-| `PRELOOP_RUNNER_BASE_IMAGE` / `PRELOOP_RUNNER_BUNDLE` / `PRELOOP_RUNNER_DNS` / `PRELOOP_RUNNER_OVERLAY_GB` / `PRELOOP_RUNNER_NAME_PREFIX` / `PRELOOP_RUNNER_POOL_ENABLED` / `PRELOOP_USE_FORK` / `PRELOOP_USE_PACKED_GOLDEN` / `PRELOOP_WORKSPACE` | runner pool / VM tuning knobs (full semantics in `crates/preloop-cli/src/main.rs`) |
+| `PRELOOP_RUNNER_BASE_IMAGE` / `PRELOOP_RUNNER_BUNDLE` / `PRELOOP_RUNNER_DNS` / `PRELOOP_RUNNER_OVERLAY_GB` / `PRELOOP_RUNNER_NAME_PREFIX` / `PRELOOP_RUNNER_POOL_ENABLED` / `PRELOOP_USE_FORK` | runner pool / VM tuning knobs (full semantics in `crates/preloop-cli/src/main.rs`) |
 
-Runner execution defaults: packed goldens enabled, warm pool disabled, one
-single-use VM provisioned per queued job, and concurrency capped by host CPU.
-Each VM receives 4 vCPUs and a 4096 MiB ballooned memory ceiling. Set
-`PRELOOP_RUNNER_POOL_ENABLED=true` to keep warm runners (size is memory-bounded,
-cap 8), or `PRELOOP_USE_PACKED_GOLDEN=false` to force cold OCI provisioning.
+Runner execution defaults: the official packed golden is downloaded once per
+environment and each job forks from it; the warm pool is off, and concurrency
+is capped by host CPU. Each VM receives 4 vCPUs and a 4096 MiB ballooned memory
+ceiling. Set `PRELOOP_RUNNER_POOL_ENABLED=true` to keep warm runners (size is
+memory-bounded, cap 8). A configured `PRELOOP_RUNNER_BASE_IMAGE` is baked as-is
+plus the GitHub-runner machinery; `runs-on: ubuntu-latest`/`ubuntu-24.04` and a
+pool with no image configured use the official golden.
 
 ## Failure classification (from `preloop/docs/09_agent_loop_retry_and_fork.md`)
 

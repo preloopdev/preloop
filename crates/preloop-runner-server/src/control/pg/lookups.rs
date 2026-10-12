@@ -462,8 +462,12 @@ impl PgBackend {
                 "SELECT display_name FROM job_specs \
                  WHERE run_id = $1::text::uuid AND job_id = $2 \
                  UNION ALL \
-                 SELECT display_name FROM job_history \
-                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 SELECT display_name FROM job_history h \
+                 WHERE h.run_id = $1::text::uuid AND h.job_id = $2 \
+                   AND NOT EXISTS (SELECT 1 FROM jobs live \
+                                   WHERE live.run_id = h.run_id AND live.job_id = h.job_id) \
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                                        WHERE run_id = h.run_id AND job_id = h.job_id) \
                  LIMIT 1",
                 &[&run_text(run_id), &job_id.0],
             )
@@ -489,8 +493,13 @@ impl PgBackend {
             .query_opt(
                 "SELECT check_run_id FROM jobs WHERE run_id = $1::text::uuid AND job_id = $2 \
                  UNION ALL \
-                 SELECT check_run_id FROM job_history \
-                 WHERE run_id = $1::text::uuid AND job_id = $2 LIMIT 1",
+                 SELECT check_run_id FROM job_history h \
+                 WHERE h.run_id = $1::text::uuid AND h.job_id = $2 \
+                   AND NOT EXISTS (SELECT 1 FROM jobs live \
+                                   WHERE live.run_id = h.run_id AND live.job_id = h.job_id) \
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                                        WHERE run_id = h.run_id AND job_id = h.job_id) \
+                 LIMIT 1",
                 &[&run_text(run_id), &job_id.0],
             )
             .await
@@ -505,9 +514,9 @@ impl PgBackend {
                  FROM run_submissions WHERE run_id = $1::text::uuid \
                  UNION ALL \
                  SELECT (record_details->'job_check_run_ids'->>$2)::bigint \
-                 FROM run_history WHERE run_id = $1::text::uuid \
-                   AND created_at = (SELECT MAX(created_at) FROM run_history \
-                                     WHERE run_id = $1::text::uuid) \
+                 FROM run_history h WHERE h.run_id = $1::text::uuid \
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                        WHERE run_id = h.run_id) \
                  LIMIT 1",
                 &[&run_text(run_id), &job_id.0],
             )
@@ -662,7 +671,8 @@ impl PgBackend {
                     us!("started_at"),
                     ", ",
                     us!("completed_at"),
-                    ", created_at, record_details::text FROM run_history WHERE run_id = $1::text::uuid"
+                    ", created_at, record_details::text FROM run_history \
+                     WHERE run_id = $1::text::uuid ORDER BY run_attempt DESC LIMIT 1"
                 ),
                 &[&run],
             )
@@ -678,7 +688,11 @@ impl PgBackend {
                  (j.kind IN ('matrix_parent','reusable_caller')) \
                  FROM job_history j JOIN run_history r \
                    ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
-                 WHERE j.run_id = $1::text::uuid ORDER BY j.job_id",
+                      AND r.run_attempt = j.run_attempt \
+                 WHERE j.run_id = $1::text::uuid \
+                   AND j.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                                        WHERE run_id = j.run_id) \
+                 ORDER BY j.job_id",
                 &[&run],
             )
             .await
@@ -803,7 +817,12 @@ impl PgBackend {
             client
                 .query(
                     "SELECT job_id, status FROM jobs WHERE run_id = $1::text::uuid \
-                     UNION ALL SELECT job_id, status FROM job_history WHERE run_id = $1::text::uuid \
+                     UNION ALL \
+                     SELECT h.job_id, h.status FROM job_history h \
+                     WHERE h.run_id = $1::text::uuid \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                                            WHERE run_id = h.run_id) \
+                       AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id) \
                      ORDER BY 1",
                     &[&run],
                 )
@@ -835,7 +854,11 @@ impl PgBackend {
         let run_status = client
             .query_opt(
                 "SELECT status = 'completed', false FROM runs WHERE run_id = $1::text::uuid \
-                 UNION ALL SELECT true, true FROM run_history WHERE run_id = $1::text::uuid \
+                 UNION ALL SELECT true, true FROM run_history h \
+                 WHERE h.run_id = $1::text::uuid \
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                        WHERE run_id = h.run_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id) \
                  LIMIT 1",
                 &[&run],
             )
@@ -934,7 +957,11 @@ impl PgBackend {
               UNION ALL \
               SELECT j.run_id, j.job_id, j.check_run_id, j.display_name FROM job_history j \
               JOIN run_history r ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
+                AND r.run_attempt = j.run_attempt \
               WHERE r.repository = $1 AND ($2::text IS NULL OR r.head_sha = $2) \
+                AND r.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                     WHERE run_id = r.run_id) \
+                AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = r.run_id) \
               UNION ALL \
               SELECT s.run_id, je.key, (je.value::text)::bigint, je.key \
               FROM run_submissions s \
@@ -947,8 +974,9 @@ impl PgBackend {
               FROM run_history h, \
               jsonb_each(h.record_details->'job_check_run_ids') je \
               WHERE h.repository = $1 AND ($2::text IS NULL OR h.head_sha = $2) \
-                AND h.created_at = (SELECT MAX(created_at) FROM run_history \
-                                    WHERE run_id = h.run_id)) c";
+                AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                     WHERE run_id = h.run_id) \
+                AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id)) c";
         let details = details_run_id.map(run_text);
         let client = self.reader().await?;
         let by_id = client
@@ -1347,8 +1375,11 @@ impl PgBackend {
             .query(
                 &format!(
                     "SELECT run_id::text, job_id FROM jobs WHERE status IN {TERMINAL_STATUSES} \
-                     UNION ALL SELECT run_id::text, job_id FROM job_history \
-                     WHERE status IN {TERMINAL_STATUSES}"
+                     UNION ALL SELECT h.run_id::text, h.job_id FROM job_history h \
+                     WHERE h.status IN {TERMINAL_STATUSES} \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                                            WHERE run_id = h.run_id) \
+                       AND NOT EXISTS (SELECT 1 FROM jobs live WHERE live.run_id = h.run_id)"
                 ),
                 &[],
             )
@@ -1505,7 +1536,11 @@ impl PgBackend {
                     us!("h.created_at"),
                     "), h.workflow_path, h.event, \
                          COALESCE(h.conclusion,'success') \
-                       FROM run_history h\
+                       FROM run_history h \
+                       WHERE h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                               WHERE run_id = h.run_id) \
+                         AND NOT EXISTS (SELECT 1 FROM runs live \
+                                         WHERE live.run_id = h.run_id)\
                      ) s \
                      WHERE ($1::text IS NULL OR position($1 in s.workflow_path) > 0) \
                        AND ($2::text IS NULL OR s.status = $2 OR \
@@ -1572,8 +1607,11 @@ impl PgBackend {
             .query(
                 "SELECT run_id::text, false FROM runs \
                  WHERE lower(repository) = lower($1) \
-                 UNION ALL SELECT run_id::text, true FROM run_history \
-                 WHERE lower(repository) = lower($1) \
+                 UNION ALL SELECT h.run_id::text, true FROM run_history h \
+                 WHERE lower(h.repository) = lower($1) \
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                        WHERE run_id = h.run_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id) \
                  ORDER BY run_id",
                 &[&repository],
             )
@@ -1664,11 +1702,15 @@ async fn archived_job_rows(
           WHERE a.run_id = j.run_id AND a.run_created_at = j.run_created_at \
             AND a.job_id = j.job_id ORDER BY a.request_id DESC LIMIT 1) \
          FROM job_history j WHERE j.run_id = $1::text::uuid \
-         AND j.run_created_at = (SELECT max(created_at) FROM run_history \
-                                 WHERE run_id = $1::text::uuid) \
+         AND j.run_created_at = (SELECT created_at FROM run_history \
+                                 WHERE run_id = $1::text::uuid \
+                                 ORDER BY run_attempt DESC LIMIT 1) \
+         AND j.run_attempt = (SELECT max(run_attempt) FROM run_history \
+                              WHERE run_id = $1::text::uuid) \
          AND NOT (j.kind IN ('matrix_parent','reusable_caller') AND EXISTS (\
               SELECT 1 FROM job_history c WHERE c.run_id = j.run_id \
               AND c.run_created_at = j.run_created_at \
+              AND c.run_attempt = j.run_attempt \
               AND c.parent_job_id = j.job_id)) \
          ORDER BY j.job_id",
         &[&run_text(run_id)],
@@ -1762,7 +1804,7 @@ pub(super) async fn archived_record_tx(
                  fork_approval_approved_at, fork_approval_note, \
                  reports_check_runs, record_details::text \
                  FROM run_history WHERE run_id = $1::text::uuid \
-                 ORDER BY created_at DESC LIMIT 1"
+                 ORDER BY run_attempt DESC LIMIT 1"
             ),
             &[&run],
         )
@@ -1783,11 +1825,15 @@ pub(super) async fn archived_record_tx(
         .query(
             "SELECT job_id, status, display_name, check_run_id FROM job_history \
              WHERE run_id = $1::text::uuid \
-             AND run_created_at = (SELECT max(created_at) FROM run_history \
-                                   WHERE run_id = $1::text::uuid) \
+             AND run_created_at = (SELECT created_at FROM run_history \
+                                   WHERE run_id = $1::text::uuid \
+                                   ORDER BY run_attempt DESC LIMIT 1) \
+             AND run_attempt = (SELECT max(run_attempt) FROM run_history \
+                                WHERE run_id = $1::text::uuid) \
              AND NOT (kind IN ('matrix_parent','reusable_caller') AND EXISTS (\
                   SELECT 1 FROM job_history c WHERE c.run_id = $1::text::uuid \
                   AND c.run_created_at = job_history.run_created_at \
+                  AND c.run_attempt = job_history.run_attempt \
                   AND c.parent_job_id = job_history.job_id)) \
              ORDER BY job_id",
             &[&run],

@@ -13,15 +13,18 @@ pub(crate) enum RunRowOp {
     LockRun,
     /// `UPDATE runs SET status ..` from a loaded run graph.
     FlushRun,
+    /// Complete in-place rerun transaction, including its run-row lock.
+    Rerun,
 }
 
 impl RunRowOp {
-    const ALL: [Self; 2] = [Self::LockRun, Self::FlushRun];
+    const ALL: [Self; 3] = [Self::LockRun, Self::FlushRun, Self::Rerun];
 
     fn label(self) -> &'static str {
         match self {
             Self::LockRun => "lock_run",
             Self::FlushRun => "flush_run",
+            Self::Rerun => "rerun",
         }
     }
 }
@@ -42,7 +45,7 @@ impl Totals {
     }
 }
 
-static TOTALS: [Totals; RunRowOp::ALL.len()] = [Totals::new(), Totals::new()];
+static TOTALS: [Totals; RunRowOp::ALL.len()] = [Totals::new(), Totals::new(), Totals::new()];
 
 pub(crate) fn record(op: RunRowOp, elapsed: Duration) {
     let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);

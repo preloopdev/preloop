@@ -5,7 +5,7 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
-use preloop_orchestrator::environment::{DEFAULT_BASE_IMAGE, is_stock_base_image};
+use preloop_orchestrator::environment::{OFFICIAL_GOLDEN, is_official_golden};
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
 use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;
@@ -724,6 +724,16 @@ enum Command {
     /// Cancel the current run.
     Cancel(CancelArgs),
 
+    /// Re-run a completed workflow run.
+    ///
+    /// Default re-runs every job as a new attempt on the same run (GitHub's
+    /// "Re-run all jobs": `github.run_attempt` increments, the previous
+    /// attempt stays in history). `--failed` re-runs failed/cancelled jobs
+    /// and their dependents; `--job` re-runs one job and its dependents.
+    /// A run the archiver already moved to history can only be re-run in
+    /// full, as a new run.
+    Rerun(RerunArgs),
+
     /// Manage the local secret store.
     Secret(github_setup::SecretArgs),
 
@@ -817,14 +827,16 @@ struct GoldenPathArgs {
     #[arg(long, env = "PRELOOP_HOME")]
     home: Option<PathBuf>,
 
-    /// OCI base image. Explicit CLI input overrides
-    /// PRELOOP_RUNNER_BASE_IMAGE.
+    /// Base image to key the packed-golden payload on: the official sentinel
+    /// or a configured image. Resolved like the pool — explicit CLI input
+    /// overrides PRELOOP_RUNNER_BASE_IMAGE, then `[golden] base_image`;
+    /// nothing configured means the official golden.
     #[arg(
-        long,
-        env = "PRELOOP_RUNNER_BASE_IMAGE",
-        default_value = DEFAULT_BASE_IMAGE
+        long = "base-image",
+        value_name = "REF",
+        env = "PRELOOP_RUNNER_BASE_IMAGE"
     )]
-    base_image: String,
+    base_image: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -833,26 +845,22 @@ struct BuildGoldenArgs {
     #[arg(long)]
     runner_bundle: PathBuf,
 
-    /// Workspace to detect toolchains from (rust-toolchain.toml, .nvmrc, …).
-    /// Defaults to the current directory, so the release-golden workflow —
-    /// which runs from the repo checkout — bakes the project's toolchains
-    /// into the artifact. Without them every fork of the packed golden
-    /// reinstalls rust per job.
-    #[arg(long)]
-    workspace: Option<PathBuf>,
-
     /// Destination path for the packed artifact.
     #[arg(long)]
     output: PathBuf,
 
-    /// OCI base image or packed artifact to use. Explicit CLI input overrides
-    /// PRELOOP_RUNNER_BASE_IMAGE.
+    /// Image to bake into a golden: a registry reference, a docker-save tar,
+    /// or a `.smolmachine`/rootfs path. Explicit CLI input overrides
+    /// PRELOOP_RUNNER_BASE_IMAGE and `[golden] base_image`; with neither set,
+    /// the configured image is baked. The image is used as-is plus the runner
+    /// contract — no packages or toolchains are added. The official golden is
+    /// published packed and cannot be built here.
     #[arg(
-        long,
-        env = "PRELOOP_RUNNER_BASE_IMAGE",
-        default_value = DEFAULT_BASE_IMAGE
+        long = "base-image",
+        value_name = "REF",
+        env = "PRELOOP_RUNNER_BASE_IMAGE"
     )]
-    base_image: String,
+    base_image: Option<String>,
 
     /// Persistent guest storage in GiB. Large official runner snapshots may
     /// need 80 GiB or more.
@@ -1061,6 +1069,21 @@ struct CancelArgs {
 }
 
 #[derive(Debug, Parser)]
+struct RerunArgs {
+    /// Run ID. Defaults to the most recent completed run.
+    run_id: Option<String>,
+
+    /// Re-run only failed/cancelled jobs and the jobs that depend on them.
+    #[arg(long, conflicts_with = "job")]
+    failed: bool,
+
+    /// Re-run one job (the id `preloop status <run-id>` shows) and the jobs
+    /// that depend on it.
+    #[arg(long, value_name = "JOB_ID")]
+    job: Option<String>,
+}
+
+#[derive(Debug, Parser)]
 struct ShellArgs {
     /// Run reference (e.g. "last-failed"). Defaults to last failed run.
     run_ref: Option<String>,
@@ -1132,6 +1155,7 @@ async fn main() -> anyhow::Result<()> {
                     Command::Status(args) => cmd_status(args).await,
                     Command::Logs(args) => cmd_logs(args).await,
                     Command::Cancel(args) => cmd_cancel(args).await,
+                    Command::Rerun(args) => cmd_rerun(args).await,
                     Command::Shell(args) => cmd_shell(args).await,
                     Command::Debug(args) => {
                         debug_session::run(args, build_client(), server_url(), api_token()).await
@@ -1178,18 +1202,25 @@ fn systemd_socket_activation_requested() -> bool {
 }
 
 async fn cmd_golden_path(args: GoldenPathArgs) -> anyhow::Result<()> {
-    // Same stem construction as the pool config: home/vms/preloop-<base>-<arch>.
+    // Same resolution and stem construction as the pool config:
+    // home/vms/preloop-<base>-<arch>, then the environment fingerprint.
     let home = args.home.map(Ok).unwrap_or_else(|| {
         std::env::var_os("PRELOOP_HOME")
             .map(PathBuf::from)
             .context("PRELOOP_HOME is not set (pass --home)")
     })?;
+    // An exported-but-blank PRELOOP_RUNNER_BASE_IMAGE behaves like an unset
+    // one, exactly as `serve` resolves it.
+    let base_image = match args.base_image.filter(|value| !value.trim().is_empty()) {
+        Some(base) => base,
+        None => configured_base_image()?,
+    };
     let stem = home.join("vms").join(format!(
         "preloop-{}-{}",
-        args.base_image.replace(['/', ':', '@'], "-"),
+        base_image.replace(['/', ':', '@'], "-"),
         std::env::consts::ARCH
     ));
-    println!("{}", artifact_payload(&stem, &args.base_image).display());
+    println!("{}", artifact_payload(&stem, &base_image).display());
     Ok(())
 }
 
@@ -1207,6 +1238,21 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     } else {
         std::env::current_dir()?.join(args.output)
     };
+    // `--base-image` (or PRELOOP_RUNNER_BASE_IMAGE) names the image to bake;
+    // with neither, bake the configured `[golden] base_image`, exactly like
+    // `serve` would (a blank variable behaves like an unset one). Nothing
+    // configured resolves to the official golden, which has no local build:
+    // bail instead of trying to fetch one.
+    let base_image = match args.base_image.filter(|value| !value.trim().is_empty()) {
+        Some(base) => base,
+        None => configured_base_image()?,
+    };
+    if is_official_golden(&base_image) {
+        anyhow::bail!(
+            "the official golden is published packed and cannot be built here; pass the image \
+             to bake (--base-image <ref>) or set PRELOOP_RUNNER_BASE_IMAGE"
+        );
+    }
     // Enterprise option: verify the base image's provenance before baking.
     // Dump-style base images carry a GitHub-signed SLSA attestation and a
     // cosign keyless signature from the publishing workflow; a golden should
@@ -1215,15 +1261,14 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     if std::env::var_os("PRELOOP_VERIFY_BASE_IMAGE")
         .is_some_and(|value| value != "0" && value != "false")
     {
-        verify_base_image(&args.base_image).await?;
+        verify_base_image(&base_image).await?;
     }
     if env_flag("PRELOOP_REQUIRE_BASE_DIGEST", false) {
-        require_digest_pinned_base(&args.base_image)?;
+        require_digest_pinned_base(&base_image)?;
     }
     let config = RunnerPoolConfig {
         size: 1,
         use_fork: false,
-        use_packed_artifact: false,
         // Unique per bake: smolvm keys a machine's data dir by a hash of its
         // name and reuses a dir left behind by a failed/interrupted run at its
         // old on-disk size (smolvm#956). A stale dir then boots with the
@@ -1239,8 +1284,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
                 // fresh-disk guarantee above. Per-invocation suffix instead.
                 format!("preloop-release-golden-{}", std::process::id())
             }),
-        base_image: args.base_image,
-        workspace: args.workspace.or_else(|| std::env::current_dir().ok()),
+        base_image,
         artifact_stem: output.clone(),
         release_version: env!("CARGO_PKG_VERSION").to_owned(),
         runner_bundle,
@@ -1976,62 +2020,271 @@ async fn cmd_engine(
         result = wait_for_engine_socket(&socket, listen) => result?,
     }
 
+    // Every way out of this process — the normal shutdown below, a pool that
+    // never recovers, an error return like a failed `vm_backend()` — must not
+    // leave VMs running: see `VmTeardownOnExit`. Armed before the first pool
+    // spawn so even those early returns run the exit scan.
+    let _vm_teardown = VmTeardownOnExit;
+
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match pool_config {
-        Ok(config) => {
-            if !pool_enabled {
-                if config.use_fork {
-                    tracing::info!(
-                        "warm runner pool disabled; forking one VM per queued job from the golden"
-                    );
-                } else {
-                    tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
-                }
+    let pool_config = pool_config.ok();
+    let mut backend = None;
+    if let Some(config) = &pool_config {
+        if !pool_enabled {
+            if config.use_fork {
+                tracing::info!(
+                    "warm runner pool disabled; forking one VM per queued job from the golden"
+                );
+            } else {
+                tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
             }
-            let pool_shutdown = shutdown.clone();
-            // Supervisor-side, once, before any VM boots: systemd's
-            // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
-            // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
-            // get no cpu/memory/pids limit files. This performs the same
-            // vacate-then-enable dance `smolvm serve` does. It is the only
-            // place Preloop writes to the cgroup hierarchy — the CLI paths
-            // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
-            // root read-only and never mutate it.
-            preloop_vm::init_vm_cgroup_delegation();
-            let backend = vm_backend()?;
-            tracing::info!(backend = backend.as_str(), "VM substrate selected");
-            Some(tokio::spawn(async move {
-                RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-                    .run(pool_shutdown)
-                    .await
-            }))
         }
-        Err(_) => None,
+        // Supervisor-side, once, before any VM boots: systemd's
+        // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+        // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+        // get no cpu/memory/pids limit files. This performs the same
+        // vacate-then-enable dance `smolvm serve` does. It is the only
+        // place Preloop writes to the cgroup hierarchy — the CLI paths
+        // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+        // root read-only and never mutate it.
+        preloop_vm::init_vm_cgroup_delegation();
+        let selected = vm_backend()?;
+        tracing::info!(backend = selected.as_str(), "VM substrate selected");
+        backend = Some(selected);
+    }
+
+    let spawn_pool = |config: &RunnerPoolConfig,
+                      pool_shutdown: tokio_util::sync::CancellationToken,
+                      backend: VmBackend| {
+        let config = config.clone();
+        tokio::spawn(async move {
+            RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
+                .run(pool_shutdown)
+                .await
+        })
+    };
+    // Each generation gets a fresh child token: `RunnerPool::run` cancels the
+    // token it is handed when a slot ends so its siblings drain, and reusing
+    // the same token would hand the replacement pool an already-fired
+    // cancellation that makes it exit `Ok` — and stop the engine — instantly.
+    let mut pool = pool_config.as_ref().map(|config| {
+        spawn_pool(
+            config,
+            shutdown.child_token(),
+            backend.expect("the backend is resolved when a pool config exists"),
+        )
+    });
+
+    // A pool task that returns an error ends only the pool, not the engine:
+    // `RunnerPool::run` ran its teardown on the way out, so nothing is left
+    // running, and the server must keep answering clients (including
+    // `preloop status`, which is how this failure is diagnosed). The pool is
+    // rebuilt on an exponential backoff; a run that reached steady state
+    // resets the backoff so a one-off failure retries quickly.
+    let mut signal = Box::pin(engine_shutdown_signal());
+    let stop = supervise_pool(
+        &mut server,
+        &mut pool,
+        signal.as_mut(),
+        |restart| {
+            tracing::error!(%restart, "runner pool exited; rebuilding it after a backoff");
+            pool_status.record_provision_failure();
+            !pool_preparing.load(std::sync::atomic::Ordering::Acquire)
+        },
+        || {
+            pool_config
+                .as_ref()
+                .zip(backend)
+                .map(|(config, backend)| spawn_pool(config, shutdown.child_token(), backend))
+        },
+    )
+    .await;
+    let result = match stop {
+        Stop::Server(result) | Stop::Pool(result) => Some(result),
+        Stop::Signal => None,
     };
 
-    if let Some(pool_task) = pool.as_mut() {
-        tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            result = pool_task => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
-        }
-    } else {
-        tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
-        }
-    }
     shutdown.cancel();
-    if let Some(pool_task) = pool.as_mut()
-        && tokio::time::timeout(Duration::from_secs(30), &mut *pool_task)
-            .await
-            .is_err()
-    {
-        pool_task.abort();
-    }
+    settle_pool(&mut pool, Duration::from_secs(30)).await;
     server.abort();
     let _ = std::fs::remove_file(socket);
-    Ok(())
+    match result {
+        Some(result) => result,
+        None => Ok(()),
+    }
+}
+
+/// First wait before rebuilding a pool whose task returned an error.
+const POOL_RESTART_MIN: Duration = Duration::from_secs(1);
+/// Longest wait between pool rebuilds; each consecutive failure doubles the
+/// previous wait.
+const POOL_RESTART_MAX: Duration = Duration::from_secs(300);
+/// A pool that finished preparing and then ran this long reached steady
+/// state; a later failure restarts from [`POOL_RESTART_MIN`] instead of
+/// inheriting a stale maximum.
+const POOL_STEADY_AFTER: Duration = Duration::from_secs(60);
+
+/// Why the engine is stopping; each result is handled *after* the pool has
+/// settled, never by an early return past its teardown.
+#[derive(Debug)]
+enum Stop {
+    Server(anyhow::Result<()>),
+    Pool(anyhow::Result<()>),
+    Signal,
+}
+
+fn flatten_task_result<E: Into<anyhow::Error>>(
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    result.map_err(anyhow::Error::from)?.map_err(Into::into)
+}
+
+/// Wait for the first reason the engine must stop.
+///
+/// `signal` is borrowed, not consumed: the caller loops over this function
+/// when it restarts a failed pool, and the pending signal future must
+/// survive between iterations.
+///
+/// When the pool task is the one that ended the race, its handle is consumed
+/// out of `pool`: a finished `JoinHandle` panics if it is polled again, and
+/// the shutdown sequence that follows would otherwise wait on it.
+async fn wait_for_stop<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let stop = {
+        let pool_ended = async {
+            match pool.as_mut() {
+                Some(task) => flatten_task_result(task.await),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = &mut *server => Stop::Server(flatten_task_result(result)),
+            result = pool_ended => Stop::Pool(result),
+            _ = signal => Stop::Signal,
+        }
+    };
+    if matches!(stop, Stop::Pool(_)) {
+        *pool = None;
+    }
+    stop
+}
+
+/// Run the server/pool race until the engine must stop, rebuilding a failed
+/// pool instead of ending the process.
+///
+/// A `RunnerPool::run` that returns an error has already torn every machine
+/// down, so the failure is survivable: `report` sees it (logging, status
+/// counters) and answers whether the dead pool had finished preparing —
+/// only a pool that reached steady state resets the backoff, because a slow
+/// persistent failure (a multi-GB unpack on a full disk) must keep doubling
+/// rather than hot-retry every second. `respawn` builds the next
+/// generation's handle; each generation must carry a fresh child token
+/// because `RunnerPool::run` cancels the token it is handed when a slot
+/// ends.
+///
+/// While the backoff sleeps the server and the shutdown signal stay in the
+/// race — a dead HTTP side stops the engine now instead of after the sleep
+/// spawning a pool for a dead server. `Stop::Server`, `Stop::Pool(Ok(..))`,
+/// and `Stop::Signal` end the loop untouched.
+async fn supervise_pool<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
+    mut report: impl FnMut(&anyhow::Error) -> bool,
+    mut respawn: impl FnMut() -> Option<tokio::task::JoinHandle<Result<(), P>>>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let mut restart_backoff = POOL_RESTART_MIN;
+    let mut signal = signal;
+    loop {
+        let pool_started = std::time::Instant::now();
+        match wait_for_stop(server, pool, signal.as_mut()).await {
+            Stop::Pool(Err(error)) => {
+                let reached_steady = report(&error) && pool_started.elapsed() >= POOL_STEADY_AFTER;
+                if reached_steady {
+                    restart_backoff = POOL_RESTART_MIN;
+                }
+                tokio::select! {
+                    result = &mut *server => {
+                        return Stop::Server(flatten_task_result(result));
+                    }
+                    _ = signal.as_mut() => return Stop::Signal,
+                    _ = tokio::time::sleep(restart_backoff) => {}
+                }
+                restart_backoff = restart_backoff.saturating_mul(2).min(POOL_RESTART_MAX);
+                *pool = respawn();
+            }
+            stop => return stop,
+        }
+    }
+}
+
+/// Give the pool `grace` to reach its own teardown after the shutdown token
+/// fired, then abort and join it.
+///
+/// The join matters: a pool that did not finish inside the window can be
+/// stuck in a provider call that never observes the token, and the exit guard
+/// scans for VMs next — a slot must not be able to boot one after that scan,
+/// or it is stranded on the host.
+async fn settle_pool<P>(
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    grace: Duration,
+) {
+    if let Some(task) = pool.as_mut()
+        && tokio::time::timeout(grace, &mut *task).await.is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+    *pool = None;
+}
+
+/// Stop every VM this engine owns as the process exits.
+///
+/// SmolVM's `_boot-vm` hypervisor is detached from the CLI that spawned it —
+/// it survives the parent by design — and each packed machine's
+/// `pack/layers-cs` APFS sparseimage stays mounted for the life of the VM. An
+/// engine that exits with a machine still running leaves a hypervisor and a
+/// mount nothing can reach: the next engine cannot adopt them, and the home
+/// cannot be removed (`rm -rf` → `Resource busy`) until the host reboots.
+///
+/// The pool runs its own teardown on every path it reaches; this is the
+/// backstop for the paths it does not. Both steps are safe against a live
+/// machine: the purge keys on this home's boot-config paths (and `All` is
+/// sound because by now this process is exiting, so nothing of ours can be
+/// running), and a mount whose hypervisor still exists is skipped.
+struct VmTeardownOnExit;
+
+impl Drop for VmTeardownOnExit {
+    fn drop(&mut self) {
+        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+            Ok(killed) if killed > 0 => {
+                tracing::info!(
+                    killed,
+                    "purged orphaned SmolVM hypervisor processes at exit"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "orphaned hypervisor purge at exit failed"),
+        }
+        match preloop_vm::detach_orphaned_layer_mounts() {
+            Ok(detached) if detached > 0 => {
+                tracing::info!(detached, "detached orphaned SmolVM layer mounts at exit")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "orphaned layer-mount detach at exit failed"),
+        }
+    }
 }
 
 async fn engine_shutdown_signal() {
@@ -2154,14 +2407,15 @@ fn truncate_reason(s: &str) -> String {
 /// Base image the runner pool boots its golden from.
 ///
 /// `PRELOOP_RUNNER_BASE_IMAGE` wins, then the `[golden]` section
-/// `preloop init` writes to the config file, then the engine's stock base —
-/// the digest-pinned Ubuntu pin whose packed official golden the pool
-/// downloads. Reading the file here is what makes one `preloop init` enough:
-/// `serve` and `server install` never needed a separate golden flag.
+/// `preloop init` writes to the config file, then [`OFFICIAL_GOLDEN`] — the
+/// packed official GitHub runner golden the engine downloads. Nothing is
+/// baked locally unless an image is configured. Reading the file here is what
+/// makes one `preloop init` enough: `serve` and `server install` never needed
+/// a separate golden flag.
 fn configured_base_image() -> anyhow::Result<String> {
     let config = preloop_runner_server::config::load_config()?;
     Ok(preloop_runner_server::config::golden_base_image(&config)
-        .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_owned()))
+        .unwrap_or_else(|| OFFICIAL_GOLDEN.to_owned()))
 }
 
 /// `serve` with no golden configured: offer the wizard when a human is
@@ -2282,19 +2536,6 @@ fn local_runner_pool_config(
     if backend == VmBackend::Agentenv {
         aenv_egress::ensure_engine_egress(&server_url)?;
     }
-    // AgentENV keeps packs as server-side snapshots, so there is no artifact
-    // file to build or reuse: its golden is prepared straight from the base
-    // image and forked per job, which is its fast path anyway.
-    let use_packed_artifact = backend == VmBackend::Smolvm
-        && env_flag("PRELOOP_USE_PACKED_GOLDEN", DEFAULT_USE_PACKED_GOLDEN);
-    // The workspace is scanned for toolchain version files (rust-toolchain.toml,
-    // .nvmrc, etc.) so the golden can be built with the project's toolchains
-    // pre-installed instead of installing them per job. PRELOOP_WORKSPACE
-    // overrides the current directory for daemon-style deployments.
-    let workspace = std::env::var_os("PRELOOP_WORKSPACE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
     // The mounted control socket only makes sense when the runner URL is
     // loopback (the VM reaches the host through the socket relay). With
     // `PRELOOP_RUNNER_URL` pointing at a host-reachable LAN address — the
@@ -2313,16 +2554,15 @@ fn local_runner_pool_config(
         control_socket
     };
     // The golden's base image: `PRELOOP_RUNNER_BASE_IMAGE`, else the choice
-    // `preloop init` persisted, else the stock pin.
+    // `preloop init` persisted, else the official golden.
     let base_image = configured_base_image()?;
-    // A custom base image (`.smolmachine` artifact or any non-stock OCI
-    // reference) serves every queued job itself, so environment-based runner
-    // replacement has nothing to switch to: the job's implied stock base
-    // (`ubuntu:24.04` from `ubuntu-latest` labels) will always differ from
-    // the configured image and idle runners would be replaced forever.
-    // Compare on the plain `repository:tag`, so the digest-pinned defaults
-    // (ubuntu:24.04@sha256:…) still count as stock Ubuntu images.
-    let custom_base = !is_stock_base_image(&base_image);
+    // A configured image serves every queued job itself, so environment-based
+    // runner replacement has nothing to switch to: a queued job's implied
+    // environment (`ubuntu-latest`/`ubuntu-24.04` resolve to the official
+    // golden) will always differ from the configured image, and idle runners
+    // would be replaced forever. Only the official golden takes part in that
+    // replacement.
+    let custom_base = !is_official_golden(&base_image);
     let cpus = runner_cpus();
     Ok(RunnerPoolConfig {
         // Size zero is the deliberate low-memory mode: keep the local
@@ -2335,14 +2575,11 @@ fn local_runner_pool_config(
         } else {
             0
         },
-        // Forking is safe whenever the packed artifact is enabled. The warm
-        // pool switch controls whether idle runners stay registered; size-zero
-        // mode still prepares one golden and forks a disposable VM per job.
-        use_packed_artifact,
-        // Forking is safe whenever the packed artifact is enabled, and always
-        // on AgentENV, whose snapshots are immutable and re-forkable.
-        use_fork: (use_packed_artifact || backend == VmBackend::Agentenv)
-            && env_flag("PRELOOP_USE_FORK", true),
+        // Forking is safe on every backend now: file-pack backends always
+        // restore the packed golden, and AgentENV keeps immutable,
+        // re-forkable snapshots. Size-zero mode still prepares one golden and
+        // forks a disposable VM per job.
+        use_fork: env_flag("PRELOOP_USE_FORK", true),
         // Multiple engines on one host must not share a namespace: smolvm
         // keys machines and persistent overlays by name, and cross-engine
         // reuse boots a runner whose persisted state points at the other
@@ -2351,6 +2588,10 @@ fn local_runner_pool_config(
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "preloop-runner".into()),
+        // The resolved base: the official sentinel when nothing is
+        // configured, else the configured image. `custom_base` decides
+        // whether idle runners may be replaced by a job's implied
+        // environment.
         base_image: base_image.clone(),
         // GitHub-hosted parity: guest runners run as a dedicated account
         // instead of root, so steps see the hosted user-session contract.
@@ -2365,12 +2606,12 @@ fn local_runner_pool_config(
             .ok()
             .and_then(|value| value.parse().ok())
             .or(Some(1001)),
-        workspace: Some(workspace),
-        // The packed artifact cache key includes the resolved base image
-        // (tag AND digest): the digest-pinned defaults are a golden's
-        // provenance. When the pin moves, a stale packed golden baked from
-        // the old digest must not be reused. Custom `.smolmachine` bases are
-        // filesystem paths, so separators are normalized out of the key.
+        // The packed artifact cache key is the resolved base image — the
+        // official sentinel or a configured image (tag AND digest). The
+        // payload filename appends the environment fingerprint, so a moved
+        // pin or a changed bake contract rotates the file instead of reusing
+        // a stale golden. Non-registry bases are filesystem paths, so
+        // separators are normalized out of the key.
         artifact_stem: home.join("vms").join(format!(
             "preloop-{}-{}",
             base_image.replace(['/', ':', '@'], "-"),
@@ -2443,8 +2684,6 @@ fn runner_pool_labels() -> Vec<String> {
 const RUNNER_CPUS: u16 = 8;
 /// Low-memory on-demand provisioning is the default; opt into idle warm VMs.
 const DEFAULT_RUNNER_POOL_ENABLED: bool = false;
-/// Published or locally cached packed images avoid cold OCI bootstrap per job.
-const DEFAULT_USE_PACKED_GOLDEN: bool = true;
 /// Memory given to each runner VM, in MiB. SmolVM balloons this, so an idle
 /// runner commits far less than its ceiling.
 const RUNNER_MEMORY_MIB: u32 = 4096;
@@ -2735,7 +2974,15 @@ fn usable_diff_base(base: &str) -> bool {
 
 /// Remotes configured for this repository, in git's order.
 fn git_remotes() -> Vec<String> {
-    std::process::Command::new("git")
+    git_remotes_in(None)
+}
+
+fn git_remotes_in(repository: Option<&std::path::Path>) -> Vec<String> {
+    let mut command = std::process::Command::new("git");
+    if let Some(repository) = repository {
+        command.arg("-C").arg(repository);
+    }
+    command
         .arg("remote")
         .output()
         .ok()
@@ -2917,8 +3164,14 @@ fn default_local_filter_branch(
 }
 
 fn local_default_branch() -> Option<String> {
-    for remote in git_remotes() {
-        let output = std::process::Command::new("git")
+    local_default_branch_in(std::path::Path::new("."))
+}
+
+fn local_default_branch_in(repository: &std::path::Path) -> Option<String> {
+    for remote in git_remotes_in(Some(repository)) {
+        let local = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
             .args([
                 "symbolic-ref",
                 "--quiet",
@@ -2926,14 +3179,35 @@ fn local_default_branch() -> Option<String> {
                 &format!("refs/remotes/{remote}/HEAD"),
             ])
             .output();
-        let Ok(output) = output else {
-            continue;
-        };
-        if output.status.success() {
+        if let Ok(output) = local
+            && output.status.success()
+        {
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if !branch.is_empty() {
                 return Some(branch);
             }
+        }
+
+        let advertised = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["ls-remote", "--symref", &remote, "HEAD"])
+            .output();
+        let Ok(output) = advertised else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let branch = output.lines().find_map(|line| {
+            let (reference, name) = line.split_once('\t')?;
+            (name == "HEAD")
+                .then(|| reference.strip_prefix("ref: refs/heads/"))
+                .flatten()
+        });
+        if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+            return Some(format!("{remote}/{branch}"));
         }
     }
     None
@@ -5029,6 +5303,46 @@ async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cmd_rerun(args: RerunArgs) -> anyhow::Result<()> {
+    let client = build_client();
+    let url = server_url();
+    let run_id = match args.run_id {
+        Some(id) => id,
+        None => latest_run_id(&client, &url, Some("completed"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no completed runs found"))?,
+    };
+    let body = if args.failed {
+        serde_json::json!({ "mode": "failed" })
+    } else if let Some(job_id) = &args.job {
+        serde_json::json!({ "mode": "job", "job_id": job_id })
+    } else {
+        serde_json::json!({ "mode": "all" })
+    };
+    let mut request = client
+        .post(format!("{url}/api/v1/runs/{run_id}/rerun"))
+        .json(&body);
+    if let Some(token) = api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+    let accepted: serde_json::Value = response.json().await?;
+    let new_run = accepted["run_id"].as_str().unwrap_or(run_id.as_str());
+    let queued = accepted["queued_jobs"].as_u64().unwrap_or(0);
+    if new_run == run_id {
+        println!("Run {run_id} re-queued ({queued} jobs).");
+    } else {
+        // The run was archived; a full re-run starts a new run.
+        println!("Archived run {run_id} re-queued as new run {new_run} ({queued} jobs).");
+    }
+    Ok(())
+}
+
 async fn latest_run_id(
     client: &reqwest::Client,
     url: &str,
@@ -5152,6 +5466,170 @@ fn find_debug_machine(
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(std::future::pending())
+    }
+
+    /// A pool that ends the race (a failed slot) is consumed by
+    /// `wait_for_stop`: the shutdown sequence that follows must neither
+    /// re-poll the finished handle (tokio panics: "JoinHandle polled after
+    /// completion") nor lose the pool's own error.
+    #[tokio::test]
+    async fn pool_that_ends_the_engine_is_settled_without_repolling() {
+        let mut server = never_ending_server();
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::pending()),
+        )
+        .await;
+        let Stop::Pool(Err(error)) = stop else {
+            panic!("the pool's failure must be reported as the stop reason");
+        };
+        assert_eq!(error.to_string(), "slot failed");
+
+        settle_pool(&mut pool, Duration::from_millis(50)).await;
+        assert!(pool.is_none());
+        server.abort();
+    }
+
+    /// A pool stuck past the grace window is aborted *and joined* before
+    /// `settle_pool` returns, so no slot can boot a VM after the exit guard's
+    /// scan.
+    #[tokio::test]
+    async fn stuck_pool_is_aborted_and_joined_after_the_grace_window() {
+        let alive = std::sync::Arc::new(());
+        let held = alive.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(std::sync::Arc::strong_count(&alive), 2);
+
+        settle_pool(&mut pool, Duration::from_millis(20)).await;
+
+        assert!(pool.is_none());
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "the aborted pool task must be joined, dropping everything it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_stops_the_engine_while_the_pool_keeps_its_handle() {
+        let mut server = never_ending_server();
+        let mut pool: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+            Some(tokio::spawn(std::future::pending()));
+
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::ready(())),
+        )
+        .await;
+
+        assert!(matches!(stop, Stop::Signal));
+        assert!(
+            pool.is_some(),
+            "a still-running pool must stay joinable for the settle step"
+        );
+        settle_pool(&mut pool, Duration::from_millis(20)).await;
+        server.abort();
+    }
+
+    /// A pool generation that fails after cancelling its own shutdown token
+    /// — exactly what `RunnerPool::run` does on a slot failure — must not
+    /// poison the replacement: the respawned generation gets a fresh child
+    /// token that is not already cancelled. This is the regression the
+    /// supervise loop exists for; without child tokens the engine would
+    /// observe an instant `Ok` exit and shut down.
+    #[tokio::test]
+    async fn restarted_pool_gets_an_uncancelled_shutdown_token() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut server = never_ending_server();
+
+        let generation_token = shutdown.child_token();
+        let first_token = generation_token.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            first_token.cancel();
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_respawn = seen.clone();
+        let parent = shutdown.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || {
+                    let token = parent.child_token();
+                    seen_respawn.lock().unwrap().push(token.clone());
+                    Some(tokio::spawn(async move {
+                        token.cancelled().await;
+                        Ok(())
+                    }))
+                },
+            )
+            .await
+        })
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the replacement pool must run until cancellation, not exit instantly"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one generation was respawned");
+        assert!(
+            !seen[0].is_cancelled(),
+            "the respawned pool's token must not inherit generation one's cancellation"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a pool's own cancellation must never reach the engine token"
+        );
+    }
+
+    /// If the HTTP server dies during the restart backoff the engine stops
+    /// immediately instead of sleeping to the ceiling and spawning a pool
+    /// for a dead server.
+    #[tokio::test]
+    async fn server_death_during_pool_backoff_stops_the_engine() {
+        let mut server = tokio::spawn(async { anyhow::bail!("listener died") });
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("golden unpack failed"))
+        }));
+
+        let stop = tokio::time::timeout(
+            Duration::from_millis(POOL_RESTART_MIN.as_millis() as u64 + 300),
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || None,
+            ),
+        )
+        .await
+        .expect("a dead server must stop the engine inside the backoff window");
+
+        let Stop::Server(Err(error)) = stop else {
+            panic!("server failure must be the stop reason, got {stop:?}");
+        };
+        assert_eq!(error.to_string(), "listener died");
+        // Whether the pool arm or the server arm won the first race is
+        // nondeterministic; the assertion that matters is above: the stop
+        // reason is the server error, inside the backoff window.
+    }
 
     /// Serializes tests that mutate process-global env vars read by
     /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
@@ -5430,10 +5908,22 @@ mod tests {
             panic!("expected build-golden command");
         };
         assert_eq!(
-            args.base_image,
-            "ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64"
+            args.base_image.as_deref(),
+            Some("ghcr.io/acme/runner-images:ubuntu24-runner-large-latest-arm64")
         );
         assert_eq!(args.storage_gib, Some(80));
+
+        // `--base-image` is optional: release automation names the image
+        // through PRELOOP_RUNNER_BASE_IMAGE (or the recorded `[golden]`
+        // choice), so parsing must succeed without the flag.
+        parse(&[
+            "build-golden",
+            "--runner-bundle",
+            "/tmp/runner",
+            "--output",
+            "/tmp/golden",
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -5526,10 +6016,7 @@ mod tests {
             "__PRELOOP_TEST_POOL_FLAG_UNSET__",
             DEFAULT_RUNNER_POOL_ENABLED
         ));
-        assert!(env_flag(
-            "__PRELOOP_TEST_GOLDEN_FLAG_UNSET__",
-            DEFAULT_USE_PACKED_GOLDEN
-        ));
+        assert!(env_flag("__PRELOOP_TEST_FORK_FLAG_UNSET__", true));
     }
 
     #[test]
@@ -5604,6 +6091,13 @@ mod tests {
         unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
         assert_eq!(configured_base_image().unwrap(), "ghcr.io/acme/base:1");
 
+        // Nothing recorded and no override: the pool boots the packed
+        // official golden — no stock Ubuntu default exists any more.
+        unsafe { std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV) };
+        let unconfigured = preloop_runner_server::config::ConfigFile::default();
+        preloop_runner_server::config::write_config_to(&config_path, &unconfigured).unwrap();
+        assert_eq!(configured_base_image().unwrap(), OFFICIAL_GOLDEN);
+
         unsafe {
             match previous_config {
                 Some(value) => {
@@ -5620,8 +6114,13 @@ mod tests {
         }
     }
 
+    /// Nothing configured boots the packed official golden, and only the
+    /// official golden takes part in environment-based runner replacement: a
+    /// configured image serves every queued job itself, so the job's implied
+    /// hosted environment (`ubuntu-latest`/`ubuntu-24.04`) would differ from
+    /// it forever and idle runners would be replaced forever.
     #[test]
-    fn custom_base_image_disables_environment_replacement() {
+    fn only_the_official_golden_keeps_environment_replacement() {
         let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
@@ -5632,17 +6131,27 @@ mod tests {
             [0x7f, b'E', b'L', b'F'],
         )
         .unwrap();
+        // Pin the config path to a file that does not exist, so an operator's
+        // real `[golden]` cannot leak into the unset case.
+        let previous_config = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV);
         unsafe {
             std::env::set_var("PRELOOP_RUNNER_BUNDLE", bundle.path());
             std::env::set_var("PRELOOP_RUNNER_STORAGE_GB", "80");
-            std::env::remove_var("PRELOOP_USE_PACKED_GOLDEN");
+            std::env::set_var(
+                preloop_runner_server::config::CONFIG_PATH_ENV,
+                home.path().join("config.toml"),
+            );
+            std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE");
         }
         let queue_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let next_job_runs_on =
             std::sync::Arc::new(std::sync::RwLock::new(vec!["ubuntu-latest".to_owned()]));
-        let config = |base: &str| {
+        let config = |base: Option<&str>| {
             unsafe {
-                std::env::set_var("PRELOOP_RUNNER_BASE_IMAGE", base);
+                match base {
+                    Some(base) => std::env::set_var("PRELOOP_RUNNER_BASE_IMAGE", base),
+                    None => std::env::remove_var("PRELOOP_RUNNER_BASE_IMAGE"),
+                }
             }
             let config = local_runner_pool_config(
                 home.path(),
@@ -5665,38 +6174,46 @@ mod tests {
             }
             config
         };
-        // Stock base: environment-based replacement stays enabled.
-        let stock = config("ubuntu:24.04");
-        assert!(stock.next_job_runs_on.is_some());
+        // Nothing configured: the official golden, replacement stays enabled.
+        let official = config(None);
+        assert_eq!(official.base_image, OFFICIAL_GOLDEN);
+        assert!(is_official_golden(&official.base_image));
+        assert!(official.next_job_runs_on.is_some());
         assert!(
-            stock.use_packed_artifact,
-            "packed golden use must be enabled by default"
+            official.use_fork,
+            "forking must remain enabled when the warm pool is off"
         );
-        assert!(
-            stock.use_fork,
-            "packed golden forks must remain enabled when the warm pool is off"
-        );
-        assert_eq!(stock.storage_gib, 80);
-        assert!(
-            config("mirror.gcr.io/library/ubuntu:24.04")
-                .next_job_runs_on
-                .is_some(),
-            "the mirrored pinned Ubuntu image is still a stock environment"
-        );
-        // Custom base (artifact): disabled, so idle runners are never
-        // replaced by the job's implied stock base.
-        assert!(config("/tmp/custom.smolmachine").next_job_runs_on.is_none());
-        unsafe {
-            std::env::set_var("PRELOOP_USE_PACKED_GOLDEN", "false");
+        assert_eq!(official.storage_gib, 80);
+        // The sentinel spelled out resolves to the same golden.
+        let explicit = config(Some(OFFICIAL_GOLDEN));
+        assert_eq!(explicit.base_image, OFFICIAL_GOLDEN);
+        assert!(explicit.next_job_runs_on.is_some());
+        // A configured image is used as-is and disables replacement, so idle
+        // runners are never replaced by the job's implied hosted environment.
+        for base in [
+            "ubuntu:24.04",
+            "mirror.gcr.io/library/ubuntu:24.04",
+            "ghcr.io/acme/base:1",
+            // A `.smolmachine` artifact, the old "custom base" spelling.
+            "/tmp/custom.smolmachine",
+        ] {
+            assert!(!is_official_golden(base));
+            let configured = config(Some(base));
+            assert_eq!(configured.base_image, base, "the image must not be rebased");
+            assert!(
+                configured.next_job_runs_on.is_none(),
+                "{base} must disable environment-based replacement"
+            );
         }
-        assert!(
-            !config("ubuntu:24.04").use_packed_artifact,
-            "operators can still disable packed golden use explicitly"
-        );
         unsafe {
-            std::env::remove_var("PRELOOP_USE_PACKED_GOLDEN");
             std::env::remove_var("PRELOOP_RUNNER_BUNDLE");
             std::env::remove_var("PRELOOP_RUNNER_STORAGE_GB");
+            match previous_config {
+                Some(value) => {
+                    std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, value)
+                }
+                None => std::env::remove_var(preloop_runner_server::config::CONFIG_PATH_ENV),
+            }
         }
     }
 
@@ -5872,6 +6389,84 @@ mod tests {
         assert!(
             default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn local_default_branch_uses_advertised_head_when_local_head_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("origin.git");
+        let seed = temp.path().join("seed");
+        let workspace = temp.path().join("workspace");
+        let run_git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git runs in local default-branch fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=main",
+                seed.to_str().unwrap(),
+            ],
+        );
+        run_git(&seed, &["config", "user.name", "Preloop Test"]);
+        run_git(&seed, &["config", "user.email", "test@example.test"]);
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        let remote_url = remote.to_str().unwrap();
+        run_git(&seed, &["remote", "add", "origin", remote_url]);
+        run_git(&seed, &["push", "--quiet", "origin", "main"]);
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=feature",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git(&workspace, &["remote", "add", "origin", remote_url]);
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/main")
+        );
+
+        run_git(
+            &workspace,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/local-default",
+            ],
+        );
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/local-default"),
+            "an existing local remote-HEAD symbolic ref remains preferred"
         );
     }
 
@@ -6469,6 +7064,41 @@ mod tests {
             panic!("expected Cancel");
         };
         assert_eq!(args.run_id.as_deref(), Some("run-42"));
+    }
+
+    #[test]
+    fn rerun_parses_modes() {
+        let cli = parse(&["rerun"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert!(args.run_id.is_none() && !args.failed && args.job.is_none());
+
+        let cli = parse(&["rerun", "run-42"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert_eq!(args.run_id.as_deref(), Some("run-42"));
+
+        let cli = parse(&["rerun", "run-42", "--failed"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert!(args.failed);
+
+        let cli = parse(&["rerun", "run-42", "--job", "build"]).unwrap();
+        let Command::Rerun(args) = cli.command else {
+            panic!("expected Rerun");
+        };
+        assert_eq!(args.job.as_deref(), Some("build"));
+
+        // `--failed` and `--job` select different modes; clap refuses both.
+        assert!(parse(&["rerun", "run-42", "--failed", "--job", "build"]).is_err());
+    }
+
+    #[test]
+    fn rerun_rejects_conflicting_flags() {
+        assert!(parse(&["rerun", "--failed", "--job", "build"]).is_err());
     }
 
     #[test]
