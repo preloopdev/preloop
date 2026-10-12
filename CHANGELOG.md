@@ -59,6 +59,14 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
+  process**: the env-selected backend handed each caller a fresh empty store,
+  so a config write sealed `[secrets]` under a key stored in a store instance
+  that vanished with the caller — the next read resolved a different key and
+  failed with `store envelope authentication failed`. The memory backend is
+  now one process-wide store, matching the shared `os`/`file` behavior;
+  explicit `MemoryCredentialStore::default()` instances stay per-instance for
+  test isolation.
 
 ## [0.34.0] - 2026-10-09
 
