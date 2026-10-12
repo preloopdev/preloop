@@ -686,7 +686,9 @@ fn mask_completion_payload(
         secrets.iter().map(String::as_str),
     );
     if let Some(url) = completion.environment_url.take() {
-        let masked = preloop_gha_protocol::masking::mask_secrets(
+        // Transform-aware: a URL embedding the secret base64/percent/hex
+        // encoded discloses it just as surely as the raw value.
+        let masked = preloop_gha_protocol::masking::mask_secrets_transform_aware(
             &url,
             secrets.iter().map(String::as_str),
             &[],

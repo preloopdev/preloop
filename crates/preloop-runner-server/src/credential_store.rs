@@ -891,7 +891,13 @@ pub fn store_from_env(state_dir: &Path) -> Arc<dyn CredentialStore> {
         "file" => Arc::new(FileCredentialStore::new(FileCredentialStore::default_dir(
             state_dir,
         ))),
-        "memory" => Arc::new(MemoryCredentialStore::default()),
+        // The memory backend is shared across `store_from_env` calls: a
+        // long-lived process (or a test that loads a config it just wrote)
+        // resolves and writes credentials through separate calls, and a
+        // fresh store per call would forget every credential the moment the
+        // caller's `Arc` drops — the write path would seal data under a key
+        // the read path can never recover.
+        "memory" => shared_memory_store(),
         _ => os_credential_store(),
     }
 }
@@ -903,6 +909,17 @@ fn os_credential_store() -> Arc<dyn CredentialStore> {
     static OS_STORE: std::sync::LazyLock<Arc<dyn CredentialStore>> =
         std::sync::LazyLock::new(|| Arc::new(CachedCredentialStore::new(OsCredentialStore)));
     OS_STORE.clone()
+}
+
+/// The process-wide memory credential store behind `PRELOOP_CREDENTIAL_STORE=memory`.
+///
+/// Direct `MemoryCredentialStore::default()` instances keep per-instance
+/// isolation for tests; only the env-selected backend shares state so the
+/// whole process sees one memory store, matching what `os`/`file` provide.
+fn shared_memory_store() -> Arc<dyn CredentialStore> {
+    static STORE: std::sync::LazyLock<Arc<dyn CredentialStore>> =
+        std::sync::LazyLock::new(|| Arc::new(MemoryCredentialStore::default()));
+    STORE.clone()
 }
 
 /// A backend that is reachable by nobody, standing in for a headless host.
@@ -1009,6 +1026,38 @@ mod tests {
         );
         store.delete(&reference).unwrap();
         assert_eq!(store.get(&reference).unwrap(), None);
+    }
+
+    /// `store_from_env("memory")` hands every caller the same process-wide
+    /// store: a value written through one selection must be readable through
+    /// the next. A fresh instance per call made the config-secrets key
+    /// written at seal time unrecoverable when the load path asked a
+    /// different empty store for it.
+    #[tokio::test]
+    async fn env_memory_store_shares_state_across_calls() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::set("PRELOOP_CREDENTIAL_STORE", "memory");
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference = CredentialRef::new("round-trip-across-store-from-env").unwrap();
+        let writer = store_from_env(dir.path());
+        writer
+            .set(&reference, &SecretString::new("shared-secret"))
+            .unwrap();
+
+        let reader = store_from_env(dir.path());
+        assert_eq!(
+            reader
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|secret| secret.expose()),
+            Some("shared-secret"),
+            "a second store_from_env call must see credentials written through the first"
+        );
+
+        // Cleanup for other tests that share the process-wide memory store.
+        reader.delete(&reference).unwrap();
     }
 
     #[test]

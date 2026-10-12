@@ -400,6 +400,35 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// Actions cache (`actions/cache`) retention. Finalized cache entries live in
+/// `<state_dir>/cache/`; without a quota they accumulate for the lifetime of
+/// the state directory (round-3 §11: a 150 MB blob finalized into a permanent
+/// 151 MB entry, no eviction at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Total bytes of finalized cache entries the server keeps on disk,
+    /// across all namespaces. When a commit pushes the total over this
+    /// quota, the least-recently-used entries are evicted until the total
+    /// fits again. A single entry larger than the quota is kept by the
+    /// commit that created it and evicted by the next commit.
+    /// Default 10 GiB, matching GitHub's 10 GB per-repository cache limit.
+    /// Env: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins over this key.
+    pub total_quota_bytes: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            total_quota_bytes: DEFAULT_CACHE_TOTAL_QUOTA_BYTES,
+        }
+    }
+}
+
+/// Default total Actions-cache quota: 10 GiB, matching GitHub's 10 GB
+/// per-repository cache limit (this is the server-wide total).
+pub const DEFAULT_CACHE_TOTAL_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 /// One GitHub-configured deployment reviewer (`User` or `Team`), as
 /// `GET /repos/{o}/{r}/environments/{name}` reports inside a
 /// `required_reviewers` protection rule. Identity is what GitHub uses: a
@@ -764,6 +793,10 @@ pub struct ConfigFile {
     /// direct per-job forge checkout.
     #[serde(default)]
     pub checkout_cache: CheckoutCacheConfig,
+    /// Actions cache (`actions/cache`) retention (`[cache]`). Quota-bounded
+    /// with LRU eviction; default 10 GiB total across all namespaces.
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// Stored job secrets injected into every trusted job, mirroring
     /// GitHub's org-level secrets.
     #[serde(default)]
@@ -832,6 +865,26 @@ pub struct ConfigFile {
     /// `PRELOOP_SECRETS_STORE` overrides this key.
     #[serde(default)]
     pub secrets_store: Option<String>,
+    /// Maximum jobs one run may expand to (after matrix expansion), a
+    /// fail-fast DoS guard for the submit path: a run expanding past this
+    /// is rejected with 400 before the insert transaction opens, so no
+    /// giant transaction ever pins the writer. Default 500; `0` disables
+    /// the cap (the operator accepts unbounded submits). The insert itself
+    /// is chunked (see `SUBMIT_JOB_CHUNK_SIZE`), so even a raised cap never
+    /// holds one writer transaction for the whole insert.
+    /// Env: `PRELOOP_MAX_JOBS_PER_RUN` wins over this key.
+    #[serde(default = "default_max_jobs_per_run")]
+    pub max_jobs_per_run: u64,
+    /// Maximum age, in hours, of a diagnostic-log staging directory under
+    /// `<state_dir>/blobs/diag/` before the reaper deletes it. Staging
+    /// directories whose upload token expired (TTL) or was evicted are
+    /// removed promptly on the next reaper tick regardless of this value;
+    /// this is the backstop for anything orphaned (a crash between staging
+    /// and registration, pre-fix leftovers). `0` disables the age-based
+    /// sweep. Default 24 follows the "a day of debug data" intuition.
+    /// Env: `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over this key.
+    #[serde(default = "default_diag_staging_max_age_hours")]
+    pub diag_staging_max_age_hours: u64,
 }
 
 impl Default for ConfigFile {
@@ -856,6 +909,11 @@ pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES
 pub const RETENTION_DAYS_ENV: &str = "PRELOOP_RETENTION_DAYS";
 /// Default run retention, in days, following GitHub's Actions retention setting.
 pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+/// Env override for the per-run job cap; see [`ConfigFile::max_jobs_per_run`].
+pub const MAX_JOBS_PER_RUN_ENV: &str = "PRELOOP_MAX_JOBS_PER_RUN";
+/// Default cap on jobs per run (after matrix expansion). Bounds the submit
+/// transaction so one giant workflow cannot pin the writer for minutes.
+pub const DEFAULT_MAX_JOBS_PER_RUN: u64 = 500;
 
 /// Env override for the in-place re-run window (see
 /// [`rerun_window_days`]): how long a completed run with failed jobs stays
@@ -888,6 +946,25 @@ fn default_retention_days() -> u64 {
     DEFAULT_RETENTION_DAYS
 }
 
+fn default_max_jobs_per_run() -> u64 {
+    DEFAULT_MAX_JOBS_PER_RUN
+}
+
+/// Resolve the effective per-run job cap: `PRELOOP_MAX_JOBS_PER_RUN` wins
+/// over the config file key. An unparseable value is an error — a typo must
+/// fail closed rather than silently run uncapped (or capped at zero).
+pub fn max_jobs_per_run(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(MAX_JOBS_PER_RUN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {MAX_JOBS_PER_RUN_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.max_jobs_per_run)
+}
+
 /// Resolve the effective run retention: `PRELOOP_RETENTION_DAYS` wins over
 /// the config file key. An unparseable value is an error — a typo must fail
 /// closed rather than silently keep (or drop) years of run history.
@@ -901,6 +978,32 @@ pub fn retention_days(config: &ConfigFile) -> anyhow::Result<u64> {
         });
     }
     Ok(config.retention_days)
+}
+
+/// Env override for the diag staging max age; see
+/// [`ConfigFile::diag_staging_max_age_hours`].
+pub const DIAG_STAGING_MAX_AGE_HOURS_ENV: &str = "PRELOOP_DIAG_STAGING_MAX_AGE_HOURS";
+/// Default diag staging max age, in hours.
+pub const DEFAULT_DIAG_STAGING_MAX_AGE_HOURS: u64 = 24;
+
+fn default_diag_staging_max_age_hours() -> u64 {
+    DEFAULT_DIAG_STAGING_MAX_AGE_HOURS
+}
+
+/// Resolve the effective diag staging max age, in hours:
+/// `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over the config file key. An
+/// unparseable value is an error — a typo must fail closed rather than
+/// silently keep (or delete) staging data on the wrong schedule.
+pub fn diag_staging_max_age_hours(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(DIAG_STAGING_MAX_AGE_HOURS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {DIAG_STAGING_MAX_AGE_HOURS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.diag_staging_max_age_hours)
 }
 
 /// Parse a checkout-cache mode. Unknown values are an error from the parser;
@@ -958,6 +1061,73 @@ pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCach
         }
     }
     Ok(effective)
+}
+
+pub const CACHE_TOTAL_QUOTA_BYTES_ENV: &str = "PRELOOP_CACHE_TOTAL_QUOTA_BYTES";
+
+/// Resolve the Actions-cache quota: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins
+/// over the `[cache] total_quota_bytes` key; an unparseable value is an
+/// error rather than silently keeping or dropping cached entries.
+pub fn cache_config(config: &ConfigFile) -> anyhow::Result<CacheConfig> {
+    let mut effective = config.cache;
+    if let Some(raw) = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        effective.total_quota_bytes = raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {CACHE_TOTAL_QUOTA_BYTES_ENV} (`{raw}`)")
+        })?;
+    }
+    Ok(effective)
+}
+
+#[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
+mod cache_quota_config_tests {
+    use super::*;
+
+    /// Absent section keeps the 10 GiB default.
+    #[test]
+    fn cache_quota_defaults_to_10gib() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.cache.total_quota_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.cache.total_quota_bytes,
+            DEFAULT_CACHE_TOTAL_QUOTA_BYTES
+        );
+        assert_eq!(
+            cache_config(&config).unwrap().total_quota_bytes,
+            DEFAULT_CACHE_TOTAL_QUOTA_BYTES
+        );
+    }
+
+    #[test]
+    fn cache_quota_file_value_honored() {
+        let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
+        assert_eq!(config.cache.total_quota_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error. These cases live in one test so the process-wide
+    /// env var is never mutated by two tests at once.
+    #[test]
+    fn cache_quota_env_handling() {
+        let prior = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV).ok();
+        let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
+        unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "5368709120") };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 5368709120);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "   ") };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "ten-gib") };
+        assert!(cache_config(&config).is_err());
+        match prior {
+            Some(value) => unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, value) },
+            None => unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1074,6 +1244,61 @@ mod retention_config_tests {
     #[test]
     fn retention_days_default_impl_is_90() {
         assert_eq!(ConfigFile::default().retention_days, 90);
+    }
+}
+
+#[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
+mod max_jobs_per_run_config_tests {
+    use super::*;
+
+    /// Absent key keeps the default cap of 500. This test never touches the
+    /// process env; see `max_jobs_per_run_env_handling`.
+    #[test]
+    fn max_jobs_per_run_defaults_to_500() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.max_jobs_per_run, 500);
+        assert_eq!(config.max_jobs_per_run, DEFAULT_MAX_JOBS_PER_RUN);
+    }
+
+    #[test]
+    fn max_jobs_per_run_custom_value_honored() {
+        // Field-level only: the resolver's env handling lives in
+        // `max_jobs_per_run_env_handling`, the one test that mutates the var.
+        let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
+        assert_eq!(config.max_jobs_per_run, 1000);
+        // 0 is the documented escape hatch: the cap stays off.
+        let disabled: ConfigFile = toml::from_str("max_jobs_per_run = 0").unwrap();
+        assert_eq!(disabled.max_jobs_per_run, 0);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error rather than silently running uncapped; with the var
+    /// unset the file value is used. These cases live in one test so the
+    /// process-wide env var is never mutated by two tests at once.
+    #[test]
+    fn max_jobs_per_run_env_handling() {
+        let prior = std::env::var(MAX_JOBS_PER_RUN_ENV).ok();
+        let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
+        unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "250") };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 250);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "   ") };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "many") };
+        assert!(max_jobs_per_run(&config).is_err());
+        match prior {
+            Some(value) => unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, value) },
+            None => unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) },
+        }
+    }
+
+    /// A missing config file still gets the default cap.
+    #[test]
+    fn max_jobs_per_run_default_impl_is_500() {
+        assert_eq!(ConfigFile::default().max_jobs_per_run, 500);
     }
 }
 
@@ -1722,7 +1947,10 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     // config keeps plaintext for the running process.
     let mut sealed = config.clone();
     if let Some(dir) = path.parent() {
-        seal_config_secrets(&mut sealed, dir, &OsCredentialStore)
+        // Same store selection as `load_config_from`; sealing with a different
+        // backend than unsealing makes the file unreadable.
+        let store = crate::credential_store::store_from_env(dir);
+        seal_config_secrets(&mut sealed, dir, store.as_ref())
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
     let text = toml::to_string_pretty(&sealed).context("serializing config")?;
@@ -1821,7 +2049,10 @@ mod tests {
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
+            cache: CacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
+            max_jobs_per_run: DEFAULT_MAX_JOBS_PER_RUN,
+            diag_staging_max_age_hours: DEFAULT_DIAG_STAGING_MAX_AGE_HOURS,
             golden: GoldenConfig::default(),
         }
     }

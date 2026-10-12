@@ -203,6 +203,35 @@ pub struct PushRequest {
     pub dirty: bool,
 }
 
+/// A self-built pull-request test merge the engine must check out for a run.
+///
+/// GitHub computes a pull request's test merge asynchronously and this engine
+/// cannot wait for it, so the merge is built locally: `sha` is a two-parent
+/// merge commit (first parent the base tip, second the pull request head)
+/// that exists only in the engine's mirror. Jobs therefore fetch from the
+/// engine, never the forge. The engine validates that the mirror belongs to
+/// the named repository and that the commit has the claimed parents and tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrebuiltMerge {
+    /// The two-parent merge commit the run tests.
+    pub sha: String,
+    /// The merge commit's tree.
+    pub tree: String,
+    /// First parent: the base tip the merge was built against.
+    pub base_sha: String,
+    /// Second parent: the pull request's head commit.
+    pub head_sha: String,
+    /// Repository whose cache mirror contains this merge.
+    pub repository: String,
+    /// State-directory-relative path of the bare mirror holding the merge and
+    /// its parents (for example `checkout-cache/repositories/<key>.git`).
+    pub mirror_repository: String,
+    /// Pull request number, when known; labels `refs/pull/<n>/merge` in the
+    /// served repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_number: Option<u64>,
+}
+
 /// Complete workflow request submitted to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
@@ -317,6 +346,14 @@ pub struct WorkflowSubmission {
     /// Explicit base ref for the run (populates `github.base_ref`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// GitHub's `github.ref_protected`: whether branch protection rules or
+    /// rulesets apply to `git_ref`. Resolved by the forge adapter at intake;
+    /// `false` for tags, pull-request refs and anything unresolvable. Engine-
+    /// resolved only: the native submission handler clears whatever a request
+    /// body sends, because the value feeds `GITHUB_REF_PROTECTED` and the
+    /// signed OIDC `ref_protected` claim.
+    #[serde(default)]
+    pub ref_protected: bool,
     /// Keep the failed job VM alive after the job ends for `preloop shell`.
     #[serde(default)]
     pub preserve_on_failure: bool,
@@ -333,6 +370,18 @@ pub struct WorkflowSubmission {
     /// commit it did not test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_tree: Option<String>,
+    /// Test the branch alone instead of the merge of the pull request's
+    /// current base tip into it. Only meaningful for `pull_request` events
+    /// (the CLI's `--no-merge`): the escape hatch when the base branch cannot
+    /// be fetched.
+    #[serde(default)]
+    pub no_merge: bool,
+    /// A self-built pull-request test merge the run must check out. Set when
+    /// the merge commit exists only in the engine (see [`PrebuiltMerge`]);
+    /// the engine serves it to the run's jobs regardless of checkout-cache
+    /// configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prebuilt_merge: Option<PrebuiltMerge>,
 }
 
 impl WorkflowSubmission {
@@ -856,9 +905,9 @@ where
 
 fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_json::Value {
     match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(masking::mask_secrets(&text, secrets.iter().copied(), &[]))
-        }
+        serde_json::Value::String(text) => serde_json::Value::String(
+            masking::mask_secrets_transform_aware(&text, secrets.iter().copied(), &[]),
+        ),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()

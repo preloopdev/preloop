@@ -53,6 +53,13 @@ pub(crate) const NAMESPACE_CLAIM_CAPPED: &str = "\
 /// (the `jobs_namespace_queued` partial index).
 pub(crate) const NAMESPACE_QUEUED_STATES: &str = "('blocked','held','ready','pending_expansion')";
 
+/// Jobs per submit transaction chunk. A submit inserts its jobs in chunks of
+/// this size, committing between chunks, so no single request pins the
+/// writer for the whole insert — a concurrent control write waits for one
+/// chunk at most. Both backends share the constant so their chunked submits
+/// stay identical.
+pub(crate) const SUBMIT_JOB_CHUNK_SIZE: usize = 250;
+
 /// Submit admission for a namespace in `state`.
 ///
 /// API/CLI submits need an `active` namespace: `draining` keeps claiming its
@@ -520,7 +527,6 @@ pub(crate) struct AcquireContext {
 /// handler must fan out (events, check-run effects, live-log close).
 #[derive(Debug)]
 pub(crate) struct CompleteOutcome {
-    pub(crate) record: RunRecord,
     /// The status actually stored (terminal-locked jobs keep their first
     /// verdict).
     pub(crate) effective_status: ExecutionStatus,

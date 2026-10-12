@@ -1273,20 +1273,21 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     };
     let run = RunId::new();
     // Cohort `m` (max-parallel 2): `a` holds gate `g1`, `aw` waits behind it,
-    // `bb` takes the free `g2`; `t1`/`t2` only drive promotion sweeps.
+    // `bb` takes `g2`, and `cc` fills the other slot.
     let mut submit = submit_run(
         run,
         vec![
             submit_job(run, "a", 1),
             submit_job(run, "aw", 2),
             submit_job(run, "bb", 3),
-            submit_job(run, "t1", 4),
-            submit_job(run, "t2", 5),
+            submit_job(run, "cc", 4),
+            submit_job(run, "t1", 5),
+            submit_job(run, "t2", 6),
         ],
     );
     for job in &mut submit.jobs {
         match job.queued.job_id.0.as_str() {
-            "a" | "aw" | "bb" => {
+            "a" | "aw" | "bb" | "cc" => {
                 job.queued.base_id = "m".to_owned();
                 job.queued.max_parallel = Some(2);
             }
@@ -1326,26 +1327,53 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         .await
         .unwrap()
         .get(0);
-    // Fill the cohort cap with `bb` so `aw`'s promotion finds it saturated.
+    // Fill both slots so `aw`'s promotion finds the cohort saturated.
     complete("t2").await;
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id IN ('bb','cc')",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
     // Completing `a` releases `g1` and re-parks `aw`.
     complete("a").await;
 
-    let hold: Option<i64> = node
+    let hold: Option<(String, Option<String>)> = node
         .writer()
         .await
         .unwrap()
         .query_opt(
-            "SELECT 1 FROM concurrency_holds \
+            "SELECT holder_kind, holder_job_id FROM concurrency_holds \
              WHERE repository='owner/repo' AND group_name='g1'",
             &[],
         )
         .await
         .unwrap()
-        .map(|row| row.get(0));
+        .map(|row| (row.get(0), row.get(1)));
+    let cohort: Vec<(String, String)> = node
+        .writer()
+        .await
+        .unwrap()
+        .query(
+            "SELECT j.job_id, j.status || '/' || j.queue_state || '/' || \
+                    COALESCE(s.max_parallel::text, 'null') \
+             FROM jobs j LEFT JOIN job_specs s \
+               ON s.run_id=j.run_id AND s.job_id=j.job_id \
+             WHERE j.run_id=$1::text::uuid AND j.base_id='m' ORDER BY j.job_order",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
     assert!(
         hold.is_none(),
-        "a re-parked waiter must not leave the finished holder's row behind"
+        "a re-parked waiter must not leave the finished holder's row behind; hold={hold:?}, cohort={cohort:?}"
     );
     let reparked: Option<i64> = node
         .writer()
@@ -1363,6 +1391,132 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         Some(wait_id),
         "the re-parked waiter must keep its FIFO position"
     );
+}
+
+/// The last terminal JobSet member releases the shared concurrency hold.
+#[tokio::test]
+async fn targeted_settle_releases_completed_jobset_hold() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(
+        run,
+        vec![
+            submit_job(run, "a", 1),
+            submit_job(run, "b", 2),
+            submit_job(run, "pending", 3),
+        ],
+    ))
+    .await
+    .unwrap();
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let ids = serde_json::json!(["a", "b"]).to_string();
+    let jobset_id: i64 = tx
+        .query_one(
+            "INSERT INTO jobsets (run_id, job_ids, state) \
+             VALUES ($1::text::uuid, $2::text::jsonb, 'ready') RETURNING jobset_id",
+            &[&run.0.to_string(), &ids],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    tx.execute(
+        "INSERT INTO concurrency_holds \
+         (namespace_id, repository, group_name, display_name, holder_kind, \
+          holder_run_id, holder_jobset_id) \
+         VALUES ('ns', 'owner/repo', 'shared', 'shared', 'jobset', $1::text::uuid, $2)",
+        &[&run.0.to_string(), &jobset_id],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE jobs SET status='in_progress', queue_state='claimed' \
+         WHERE run_id=$1::text::uuid AND job_id IN ('a','b')",
+        &[&run.0.to_string()],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    for (job, is_last) in [("a", false), ("b", true)] {
+        node.complete_job(JobCompletionInput {
+            run_id: run,
+            job_id: JobId(job.to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: BTreeMap::new(),
+            runner_id: None,
+        })
+        .await
+        .unwrap();
+        let hold: Option<i32> = node
+            .writer()
+            .await
+            .unwrap()
+            .query_opt(
+                "SELECT 1 FROM concurrency_holds WHERE group_name='shared'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
+        assert_eq!(
+            hold.is_some(),
+            !is_last,
+            "the shared hold remains only while a JobSet member is non-terminal"
+        );
+    }
+}
+
+/// A late skipped report cannot replace a job's earlier cancellation.
+#[tokio::test]
+async fn late_skipped_completion_preserves_cancellation() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(
+        run,
+        vec![
+            submit_job(run, "cancelled", 1),
+            submit_job(run, "pending", 2),
+        ],
+    ))
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    client
+        .execute(
+            "UPDATE jobs SET status='cancelled', queue_state='none' \
+             WHERE run_id=$1::text::uuid AND job_id='cancelled'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
+    drop(client);
+
+    node.complete_job(JobCompletionInput {
+        run_id: run,
+        job_id: JobId("cancelled".to_owned()),
+        agent_job_id: None,
+        status: ExecutionStatus::Skipped,
+        outputs: BTreeMap::new(),
+        runner_id: None,
+    })
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    let status: String = client
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='cancelled'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "cancelled");
 }
 
 /// A promotion that writes the promoted run's rows must take that run's row
@@ -1527,6 +1681,367 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
         after.is_empty(),
         "nothing past the last bookmark: {after:?}"
     );
+}
+
+/// `refresh_remaining_needs` waits for every leg of a matrix base: a need on
+/// the base is only met when all of its legs are terminal, and the expanded
+/// parent placeholder does not count.
+#[tokio::test]
+async fn refresh_remaining_needs_waits_for_every_matrix_leg() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    // build (parent) with two legs; test needs the base 'build'.
+    let build = submit_job(run_id, "build", 1);
+    let leg1 = submit_job(run_id, "build-0", 2);
+    let leg2 = submit_job(run_id, "build-1", 3);
+    let mut test = submit_job(run_id, "test", 4);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, leg1, leg2, test]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Shape the matrix via SQL: parent + legs with base_id.
+    tx.execute(
+        "UPDATE jobs SET kind='matrix_parent', base_id='build', queue_state='none' \
+         WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    for leg in ["build-0", "build-1"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+
+    // One leg done -> test stays counted against the remaining leg.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(!promotable, "test waits for every leg");
+    let remaining: i32 = tx
+        .query_one(
+            "SELECT remaining_needs FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='test'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 1, "one leg is still non-terminal");
+
+    // All legs done -> test is promotable (parent placeholder does not block).
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-1'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build-1".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "test is promotable once every leg is terminal");
+    tx.rollback().await.unwrap();
+}
+
+/// `refresh_remaining_needs` reports the dependent a completion unblocked and
+/// leaves the transitive ones alone: build <- test <- deploy.
+#[tokio::test]
+async fn refresh_remaining_needs_reports_only_the_unblocked_dependent() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let mut test = submit_job(run_id, "test", 2);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    let mut deploy = submit_job(run_id, "deploy", 3);
+    deploy.queued.needs = vec![JobId("test".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, test, deploy]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // build terminal -> test is promotable, deploy is not.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "test should unblock when build is terminal");
+    let deploy_remaining: i32 = tx
+        .query_one(
+            "SELECT remaining_needs FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='deploy'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(deploy_remaining, 1, "deploy still waits on test");
+
+    // test terminal -> deploy is promotable.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='test'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("test".to_owned()),
+        "test",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "deploy should unblock when test is terminal");
+    tx.rollback().await.unwrap();
+}
+
+/// `cancel_fail_fast_siblings` cancels non-terminal legs sharing the base.
+/// Idempotent and respects the `fail_fast=false` opt-out.
+#[tokio::test]
+async fn cancel_fail_fast_siblings_cancels_legs() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let leg0 = submit_job(run_id, "build-0", 2);
+    let leg1 = submit_job(run_id, "build-1", 3);
+    let leg2 = submit_job(run_id, "build-2", 4);
+    node.submit_run(submit_run(run_id, vec![build, leg0, leg1, leg2]))
+        .await
+        .unwrap();
+    let runner = node
+        .register_runner(register_runner("fail-fast"))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Shape the matrix via SQL.
+    tx.execute(
+        "UPDATE jobs SET kind='matrix_parent', base_id='build', queue_state='none' \
+         WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    for leg in ["build-0", "build-1", "build-2"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build', \
+                    status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // The in-flight siblings carry the live binding/pool rows a claimed leg
+    // accrues; fail-fast cancellation must clear them like `settle_node`.
+    for leg in ["build-1", "build-2"] {
+        tx.execute(
+            "INSERT INTO job_assignments (run_id, job_id, runner_id) \
+             VALUES ($1::text::uuid, $2, $3) \
+             ON CONFLICT (run_id, job_id) DO NOTHING",
+            &[&run, &leg, &runner.runner.id],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, labels) \
+             VALUES ($1::text::uuid, $2, 'ns', 'pk', '{}'::jsonb) \
+             ON CONFLICT (run_id, job_id) DO NOTHING",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // Mark leg0 as failed.
+    tx.execute(
+        "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    // `logic::matrix_fail_fast` selects every non-terminal row of the base:
+    // the two legs and the parent placeholder (still `pending` here — a real
+    // expansion terminalizes the parent when it expands).
+    assert_eq!(
+        cancelled.len(),
+        3,
+        "the base's non-terminal rows are cancelled"
+    );
+    assert!(cancelled.contains(&JobId("build-1".to_owned())));
+    assert!(cancelled.contains(&JobId("build-2".to_owned())));
+    assert!(cancelled.contains(&JobId("build".to_owned())));
+
+    // Verify DB state.
+    let st: String = tx
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='build-1'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(st, "cancelled");
+    let assignments: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM job_assignments WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(assignments, 0, "fail-fast cancellation clears assignments");
+    let provisions: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM provision_requests WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        provisions, 0,
+        "fail-fast cancellation clears provision requests"
+    );
+
+    // Idempotent: second call cancels nothing.
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(cancelled.is_empty(), "second call is a no-op");
+    tx.rollback().await.unwrap();
+}
+
+/// A `fail_fast: false` leg opts its base out: the siblings keep running.
+#[tokio::test]
+async fn cancel_fail_fast_siblings_respects_the_opt_out() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let leg0 = submit_job(run_id, "build-0", 2);
+    let leg1 = submit_job(run_id, "build-1", 3);
+    let mut submit = submit_run(run_id, vec![build, leg0, leg1]);
+    submit
+        .record
+        .job_fail_fast
+        .insert("build".to_owned(), false);
+    node.submit_run(submit).await.unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+    for leg in ["build-0", "build-1"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build', \
+                    status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // The base opted out: every spec row of the base carries the flag.
+    tx.execute(
+        "UPDATE job_specs SET fail_fast=false \
+         WHERE run_id=$1::text::uuid AND job_id IN ('build','build-0','build-1')",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(
+        cancelled.is_empty(),
+        "fail_fast=false must leave the siblings alone"
+    );
+    let st: String = tx
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='build-1'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(st, "in_progress");
+    tx.rollback().await.unwrap();
 }
 
 // ── claim-order plans ───────────────────────────────────────────────────

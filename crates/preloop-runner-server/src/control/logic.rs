@@ -1061,8 +1061,8 @@ pub(crate) struct CompletionDecision {
 }
 
 /// Decide first-result-wins, continue-on-error, workflow-hold release, and
-/// dependent promotion. Cancelled jobs remain cancelled against late success
-/// or failure reports.
+/// dependent promotion. A cancelled job remains cancelled after any terminal
+/// report.
 pub(crate) fn completion_decision(row: CompletionRow) -> CompletionDecision {
     let replayed = row.prior_status.is_terminal() && row.prior_status != ExecutionStatus::Cancelled;
     let reported = if row.continue_on_error && row.reported_status == ExecutionStatus::Failure {
@@ -1071,9 +1071,7 @@ pub(crate) fn completion_decision(row: CompletionRow) -> CompletionDecision {
         row.reported_status
     };
     let effective_status = match (row.prior_status, reported) {
-        (ExecutionStatus::Cancelled, ExecutionStatus::Success | ExecutionStatus::Failure) => {
-            ExecutionStatus::Cancelled
-        }
+        (ExecutionStatus::Cancelled, status) if status.is_terminal() => ExecutionStatus::Cancelled,
         _ if replayed => row.prior_status,
         _ => reported,
     };
@@ -1807,6 +1805,25 @@ mod decision_tests {
         assert!(
             decision.replayed && decision.release_workflow_hold && !decision.promote_dependents
         );
+    }
+
+    #[test]
+    fn cancelled_completion_stays_cancelled_for_every_terminal_report() {
+        for reported_status in [
+            ExecutionStatus::Success,
+            ExecutionStatus::Failure,
+            ExecutionStatus::Skipped,
+            ExecutionStatus::Cancelled,
+        ] {
+            let decision = completion_decision(CompletionRow {
+                job_id: jid("a"),
+                prior_status: ExecutionStatus::Cancelled,
+                reported_status,
+                continue_on_error: false,
+                run_will_be_terminal: false,
+            });
+            assert_eq!(decision.effective_status, ExecutionStatus::Cancelled);
+        }
     }
 
     #[test]

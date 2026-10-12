@@ -584,6 +584,8 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
         .unwrap();
     assert_eq!(upload.status(), StatusCode::CREATED);
 
+    // Op binding: the `write` diag URL must not serve GETs, even though the
+    // same bytes are on disk.
     let downloaded = app
         .oneshot(
             Request::builder()
@@ -594,9 +596,24 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
         )
         .await
         .unwrap();
-    assert_eq!(downloaded.status(), StatusCode::OK);
-    let downloaded_bytes = to_bytes(downloaded.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(downloaded_bytes.as_ref(), bytes);
+    assert_eq!(downloaded.status(), StatusCode::FORBIDDEN);
+
+    // The bytes did land: read them back from the staging dir (named by the
+    // token's `jti`).
+    let claims = state
+        .verify_local_jwt_claims(blob_token_clean)
+        .expect("diag token must be a valid blob JWT");
+    assert_eq!(claims["op"].as_str(), Some("write"));
+    let jti = claims["jti"].as_str().unwrap();
+    let staged = std::fs::read(
+        temp.path()
+            .join("blobs")
+            .join("diag")
+            .join(jti)
+            .join("data"),
+    )
+    .unwrap();
+    assert_eq!(staged.as_slice(), bytes);
 }
 
 /// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
@@ -612,7 +629,10 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
 
     // The blob gate requires a server-signed blob JWT whose `job`
     // claim matches the bearer's job on writes.
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string(), "write");
+    // The round-trip read goes through a `read` token for the same staging
+    // dir: the `write` upload token no longer serves GETs (op binding).
+    let read_jwt = mint_blob_jwt_for_jti(&state, "artifact", &job_id.to_string(), "read", &jti);
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
@@ -648,7 +668,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
+                .uri(format!("/twirp-blob/artifact/{read_jwt}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -674,7 +694,10 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
 
     // The blob gate requires a server-signed blob JWT whose `job`
     // claim matches the bearer's job on writes.
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string(), "write");
+    // The read-back goes through a `read` token for the same staging dir:
+    // the `write` upload token no longer serves GETs (op binding).
+    let read_jwt = mint_blob_jwt_for_jti(&state, "artifact", &job_id.to_string(), "read", &jti);
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
@@ -687,6 +710,7 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
         );
     }
     let put_uri = format!("/twirp-blob/artifact/{blob_jwt}");
+    let get_uri = format!("/twirp-blob/artifact/{read_jwt}");
 
     // Stage two 1 MiB blocks (ids are base64-safe, so they survive
     // blockid_to_filename unchanged and match the commit XML verbatim).
@@ -754,7 +778,7 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(put_uri)
+                .uri(get_uri)
                 .header(header::AUTHORIZATION, bearer)
                 .body(Body::empty())
                 .unwrap(),
@@ -794,8 +818,12 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
     // Blob PUTs with a job token require a live job record.
     register_live_job(&state, job_id, "plan-blob").await;
     let auth_header = format!("Bearer {token}");
-    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "write");
+    // The read-back goes through a `read` token for the same staging dir:
+    // the `write` upload token no longer serves GETs (op binding).
+    let read_jwt = mint_blob_jwt_for_jti(&state, "cache", &job_id.to_string(), "read", &jti);
     let put_uri = format!("/twirp-blob/cache/{blob_jwt}");
+    let get_uri = format!("/twirp-blob/cache/{read_jwt}");
 
     // 128 MiB in 2 x 64 MiB blocks, the block size the Azure SDK uses for
     // @actions/cache v6 (BlockBlobClient.uploadFile with uploadChunkSize).
@@ -846,7 +874,7 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(put_uri)
+                .uri(get_uri)
                 .header(header::AUTHORIZATION, auth_header)
                 .body(Body::empty())
                 .unwrap(),
@@ -869,7 +897,7 @@ async fn blob_block_upload_still_rejects_blocks_over_cap() {
     let token = state.mint_runtime_token("plan-blob", &job_id);
     register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
-    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "write");
 
     // One byte over the per-block cap: rejected before reading the body.
     let over_cap = memory_caps::MAX_BLOCK_BYTES + 1;
@@ -903,7 +931,7 @@ async fn blob_block_upload_midstream_cap_rejects_without_temp_file() {
     let token = state.mint_runtime_token("plan-blob", &job_id);
     register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string(), "write");
 
     let chunk_bytes = 1024 * 1024usize;
     let n_chunks = (memory_caps::MAX_BLOCK_BYTES + 1).div_ceil(chunk_bytes);
@@ -3964,4 +3992,80 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
         r#"{"Checks":"write","Metadata":"read"}"#,
         "an un-narrowed mint leaves the declared wire permissions intact"
     );
+}
+
+/// Round-3 §9: the server runs a final transform-aware masking pass over log
+/// bytes BEFORE persisting them. A step-log upload whose bytes were never
+/// masked by the runner (runner bug, or a direct bearerless PUT to the signed
+/// URL) must still land on disk with the secret — raw and base64-encoded —
+/// redacted.
+#[tokio::test]
+async fn replay_step_log_upload_is_masked_before_persist() {
+    use base64::engine::Engine as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"MASK_ME": "pentest-mask-9f3k2"}
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+
+    // Bytes as a masking-buggy runner (or a direct PUT) would send them:
+    // the secret raw and base64-encoded, unredacted.
+    let secret = "pentest-mask-9f3k2";
+    let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+    let body = format!("raw={secret} b64={b64}\n");
+
+    let path = format!("/replay/results/{run_id}/job-1/step-abc.txt");
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sig = sign_replay_upload_ticket(&state, &path, expires_at);
+    let uri = format!("{path}?se={expires_at}&sig={sig}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let stored = tokio::fs::read(
+        temp.path()
+            .join("replay")
+            .join("results")
+            .join(run_id)
+            .join("job-1")
+            .join("step-abc.txt"),
+    )
+    .await
+    .expect("uploaded step log must be persisted");
+    let stored = String::from_utf8(stored).unwrap();
+    assert!(
+        !stored.contains(secret),
+        "raw secret persisted unmasked: {stored}"
+    );
+    assert!(
+        !stored.contains(&b64),
+        "base64 secret persisted unmasked: {stored}"
+    );
+    assert_eq!(stored, "raw=*** b64=***\n");
 }

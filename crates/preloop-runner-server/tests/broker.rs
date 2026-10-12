@@ -1121,6 +1121,7 @@ jobs:
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
     let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+    add_fixture_origin(temp.path(), &ws_dir);
     git(&["commit", "--allow-empty", "-m", "head commit"]);
     let head_sha = git(&["rev-parse", "HEAD"]);
 
@@ -1192,12 +1193,21 @@ jobs:
     assert_eq!(run_record.submission.event, "pull_request");
     assert_eq!(run_record.submission.git_ref, "refs/pull/42/head");
     assert_eq!(run_record.job_check_run_ids.len(), 1);
-    // A pull_request payload has no `after`; the head sha must still reach
-    // the job. Falling through to all-zeros makes every checkout ask the
-    // server for `0000…` and fail as "not our ref".
+    // The local workspace now serves the merge commit as `github.sha`, while
+    // the pull-request event keeps the head SHA that GitHub supplied.
     assert_eq!(
+        run_record.github["event"]["pull_request"]["head"]["sha"],
+        serde_json::json!(head_sha),
+        "pull_request head sha must stay in the event payload",
+    );
+    assert_eq!(
+        run_record.github["sha"],
+        serde_json::json!(run_record.head_sha),
+        "github.sha must be the locally built merge commit",
+    );
+    assert_ne!(
         run_record.head_sha, head_sha,
-        "pull_request head sha must drive github.sha"
+        "the local pull-request run must check out the merge commit",
     );
 }
 
@@ -1227,6 +1237,7 @@ jobs:
         .unwrap();
 
     let head_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+    add_fixture_origin(temp.path(), &ws_dir);
     // The adapter also emits a pull_request_target event (base trust tier);
     // it needs a base SHA or it aborts the batch before our pull_request
     // event is processed.

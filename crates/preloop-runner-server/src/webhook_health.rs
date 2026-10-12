@@ -83,7 +83,11 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             .set_app_config(Vec::new(), now_us());
         return Vec::new();
     }
-    if let Some(retry_after) = shared.state.github_breaker.retry_after() {
+    if let Some(retry_after) = shared
+        .state
+        .github_breakers
+        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
+    {
         tracing::debug!(
             retry_in_secs = retry_after.as_secs(),
             "GitHub breaker open or probe in progress; skipping App webhook health check"
@@ -106,7 +110,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some(&shared.state.github_breaker),
+            Some(&shared.state.github_breakers),
         )
         .await
         {
@@ -136,7 +140,7 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some(&shared.state.github_breaker),
+            Some(&shared.state.github_breakers),
         )
         .await
         {

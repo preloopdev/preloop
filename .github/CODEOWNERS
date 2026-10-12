@@ -1,0 +1,7 @@
+# Default owner for everything in the repository.
+*                       @Bnjoroge1
+
+# Security-sensitive CI and automation definitions.
+/.github/workflows/     @Bnjoroge1
+/.github/actions/       @Bnjoroge1
+/.github/CODEOWNERS     @Bnjoroge1

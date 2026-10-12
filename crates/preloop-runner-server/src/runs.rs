@@ -821,6 +821,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // workflow fetches: private `uses: owner/repo/...` references must
     // resolve without a separately exported token.
     crate::remote_workflows::resolve_remote_workflows(
+        shared,
         &mut submission,
         &workflow,
         shared.state.static_github_pat().as_deref(),
@@ -1090,6 +1091,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
     }
 
+    // Server-wide submit cap, enforced after expansion (the count above is
+    // post-matrix-expansion and post-closure-filter) but before the build
+    // loop and the insert transaction: a rejected run never opens a giant
+    // transaction, so it can never pin the writer. Webhook deliveries
+    // bypass it — like the namespace submit quotas, a push is never
+    // refused; chunked inserts bound their writer hold instead.
+    if webhook_delivery_id.is_none() {
+        let max_jobs_per_run = shared.state.max_jobs_per_run;
+        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
+            return Err(ApiError::bad_request(format!(
+                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
+                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
+                jobs.len(),
+            )));
+        }
+    }
+
     let run_id = RunId::new();
     // Durable before the run commits: any node may acquire its jobs later.
     // Dropped again unless the submit commits a new run.
@@ -1234,7 +1252,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "api_url": shared.state.github_urls.api_url,
         "graphql_url": shared.state.github_urls.graphql_url,
         "ref_name": ref_name,
-        "ref_protected": false,
+        "ref_protected": submission.ref_protected,
         "ref_type": ref_type,
         "secret_source": "Actions",
         "event": submission.payload,
@@ -1244,42 +1262,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "triggering_actor": submission.actor
     });
 
-    let run_name = workflow.run_name.as_deref().map(|raw| {
-        let inputs = if submission.dispatch_inputs.is_empty() {
-            &submission.inputs
-        } else {
-            &submission.dispatch_inputs
-        };
-        evaluate_run_name(raw, &github, inputs, &submission.vars)
-    });
-
-    // Evaluate workflow-level concurrency before locking (pure).
-    let workflow_concurrency = workflow.concurrency.clone();
-    let mut empty_workflow_concurrency_group = false;
-    let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
-        let eval_ctx = concurrency::ConcurrencyContext {
-            scope: concurrency::ConcurrencyScope::Workflow,
-            github: &github,
-            vars: &submission.vars,
-            inputs: &submission.inputs,
-            matrix: None,
-            strategy: None,
-            needs: None,
-        };
-        let (group, cancel, queue) =
-            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
-                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
-            })?;
-        if group.trim().is_empty() {
-            empty_workflow_concurrency_group = true;
-            None
-        } else {
-            Some((group, cancel, queue, raw.clone()))
-        }
-    } else {
-        None
-    };
-
     // Capture one immutable source per run before any job is queued. Local
     // submissions snapshot the caller's working tree; opt-in remote modes
     // fetch the webhook commit once for every job in this run.
@@ -1288,27 +1270,83 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .as_deref()
         .map(std::path::Path::new)
         .or(shared.state.local_workspace.as_deref());
-    let workspace_snapshot = if let Some(workspace) = local_workspace {
+    // A local `pull_request` run tests the merge of the CURRENT base tip into
+    // the head (GitHub's `refs/pull/<n>/merge`), not the branch alone: the
+    // base has usually moved since the branch was cut, and testing the branch
+    // alone misses exactly the breakage the merge exists to catch. `--no-merge`
+    // and every non-pull_request event keep the branch-alone behaviour. A base
+    // that cannot be fetched fails the submission loudly — silently testing a
+    // different tree than the one the PR would merge is never acceptable.
+    let local_pull_request_merge = if submission.event == "pull_request"
+        && !submission.no_merge
+        && submission.prebuilt_merge.is_none()
+        && local_workspace.is_some()
+    {
+        let Some(base_branch) = pull_request_base_branch(&submission) else {
+            return Err(ApiError::bad_request(
+                "cannot determine the pull request's base branch: pass `--base <branch>`, \
+                 include `pull_request.base.ref` in `--payload`, or re-run with --no-merge \
+                 to test the branch alone",
+            ));
+        };
+        Some(crate::merge_builder::LocalPullRequestMerge {
+            repository: submission.repository.clone(),
+            pull_request_number: submission_pull_request_number(&submission.payload),
+            base_branch,
+        })
+    } else {
+        None
+    };
+    let workspace_snapshot = if let Some(prebuilt) = submission.prebuilt_merge.as_ref() {
+        if prebuilt.repository != submission.repository {
+            return Err(ApiError::bad_request(
+                "prebuilt merge repository does not match run repository",
+            ));
+        }
+        // A self-built merge whose commit exists only in the engine: the run's
+        // jobs must fetch it from here, so serving is not optional. The
+        // submission is validated against the mirror before anything is
+        // served, and a failure is fatal — falling back to a forge checkout
+        // would run the wrong tree.
+        match crate::merge_builder::attach_prebuilt_merge(shared, run_id, prebuilt).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return Err(error.into_api_error()),
+        }
+    } else if let Some(workspace) = local_workspace {
+        // The snapshot is a local submission's only copy of the tested tree:
+        // the synthetic commit exists nowhere else, so there is no other
+        // checkout to fall back to. Failing here reports the real reason (a
+        // full disk, a publish that could not be completed) to the person who
+        // submitted, instead of queueing jobs that can only die in setup.
         match create_workspace_snapshot(
             &shared.state.state_dir,
             workspace,
             run_id,
             Some(shared),
             shared.state.static_github_pat().as_deref(),
+            local_pull_request_merge.as_ref(),
         )
         .await
         {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
-                warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
-                None
+                error!(
+                    %run_id,
+                    workspace = %workspace.display(),
+                    message = error.message(),
+                    "Refusing local submission: workspace snapshot could not be created"
+                );
+                return Err(error);
             }
         }
     } else {
         match create_remote_checkout_snapshot(shared, &submission, run_id, &sha).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                warn!(%run_id, error = ?error, "Failed to populate remote checkout cache — falling back to normal checkout");
+                // The commit exists upstream, so jobs can still check out
+                // directly — degraded, never broken. Reported at error level
+                // because it is a full forge fetch per job, not a cache hit.
+                error!(%run_id, error = ?error, "Failed to populate remote checkout cache — jobs will fetch from the forge");
                 None
             }
         }
@@ -1356,6 +1394,13 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // missing from `github.event` for local runs.
         if !submission.payload.is_object() {
             submission.payload = serde_json::json!({});
+        }
+        let pull_request_base_ref = pull_request_base_branch(&submission);
+        if submission.event == "pull_request"
+            && let Some(base_ref) = pull_request_base_ref.as_ref()
+            && let Some(object) = github.as_object_mut()
+        {
+            object.insert("base_ref".to_owned(), serde_json::json!(base_ref));
         }
         if let Some(payload) = submission.payload.as_object_mut() {
             let (owner, name) = submission
@@ -1436,54 +1481,106 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     }),
                 );
             } else if submission.event == "pull_request" {
-                // Same synthetic-push shape for PR-family events: the head
-                // commit the runner checks out is the snapshot commit
-                // (`commit_sha` — the synthetic commit that carries the
-                // dirty tree), and `base.sha` is the base its changes are
-                // measured against (the workspace HEAD when the tree is
-                // dirty, HEAD^ when clean — see `WorkspaceSnapshot::before_sha`).
-                // Changed-file actions (`dorny/paths-filter`,
-                // `tj-actions/changed-files`) diff these two SHAs; without
-                // the refresh they would diff the caller-supplied head
-                // against itself and see nothing, and pointing `head.sha` at
-                // the real workspace HEAD diffed it against an identical
-                // tree (and a sha absent from the snapshot store).
-                let base_sha = snapshot
-                    .before_sha
-                    .clone()
-                    .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
-                if let Some(pr) = payload
-                    .get_mut("pull_request")
-                    .and_then(|v| v.as_object_mut())
-                {
-                    if let Some(base) = pr.get_mut("base").and_then(|v| v.as_object_mut()) {
-                        base.insert("sha".to_owned(), serde_json::json!(base_sha));
+                let (base_sha, head_sha) = match &snapshot.merge {
+                    Some(merge) => (merge.base_sha.clone(), merge.head_sha.clone()),
+                    None => (
+                        snapshot.before_sha.clone().unwrap_or_else(|| {
+                            "0000000000000000000000000000000000000000".to_owned()
+                        }),
+                        snapshot.commit_sha.clone(),
+                    ),
+                };
+                let pull_request = payload
+                    .entry("pull_request")
+                    .or_insert_with(|| serde_json::json!({}));
+                if !pull_request.is_object() {
+                    *pull_request = serde_json::json!({});
+                }
+                if let Some(pull_request) = pull_request.as_object_mut() {
+                    {
+                        let base = pull_request
+                            .entry("base")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if !base.is_object() {
+                            *base = serde_json::json!({});
+                        }
+                        if let Some(base) = base.as_object_mut() {
+                            if let Some(base_ref) = pull_request_base_ref.as_ref() {
+                                base.entry("ref")
+                                    .or_insert_with(|| serde_json::json!(base_ref));
+                            }
+                            base.insert("sha".to_owned(), serde_json::json!(base_sha));
+                        }
                     }
-                    if let Some(head) = pr.get_mut("head").and_then(|v| v.as_object_mut()) {
-                        head.insert("sha".to_owned(), serde_json::json!(snapshot.commit_sha));
+                    let head = pull_request
+                        .entry("head")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if !head.is_object() {
+                        *head = serde_json::json!({});
+                    }
+                    if let Some(head) = head.as_object_mut() {
+                        head.insert("sha".to_owned(), serde_json::json!(head_sha));
                     }
                 }
             }
         }
-        // The github context was built before the snapshot existed; refresh
-        // the pieces that now describe the local tree.
-        //
-        // `github.sha` is the workspace's real HEAD commit, not the
-        // synthetic snapshot commit: the snapshot commit exists only in
-        // this engine's store, so a workflow step that fetches
-        // `${{ github.sha }}` from the real remote (custom checkouts)
-        // would be answered "not our ref". The workspace HEAD is the
-        // identity the run is really based on. `sha` feeds every job's
-        // `job.workflow_sha` (what `$/` resolves against), so it moves too.
+    }
+    if let Some(snapshot) = &workspace_snapshot
+        && (snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace
+            || snapshot.merge.is_some())
+    {
         sha = snapshot
-            .head_sha
-            .clone()
-            .unwrap_or_else(|| snapshot.commit_sha.clone());
+            .merge
+            .as_ref()
+            .map(|merge| merge.sha.clone())
+            .unwrap_or_else(|| {
+                snapshot
+                    .head_sha
+                    .clone()
+                    .unwrap_or_else(|| snapshot.commit_sha.clone())
+            });
         if let Some(object) = github.as_object_mut() {
-            object.insert("event".to_owned(), submission.payload.clone());
+            if snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace {
+                object.insert("event".to_owned(), submission.payload.clone());
+            }
             object.insert("sha".to_owned(), serde_json::json!(sha));
         }
     }
+    let run_name = workflow.run_name.as_deref().map(|raw| {
+        let inputs = if submission.dispatch_inputs.is_empty() {
+            &submission.inputs
+        } else {
+            &submission.dispatch_inputs
+        };
+        evaluate_run_name(raw, &github, inputs, &submission.vars)
+    });
+
+    // Evaluate workflow-level concurrency before locking (pure).
+    let workflow_concurrency = workflow.concurrency.clone();
+    let mut empty_workflow_concurrency_group = false;
+    let workflow_concurrency_eval = if let Some(raw) = &workflow_concurrency {
+        let eval_ctx = concurrency::ConcurrencyContext {
+            scope: concurrency::ConcurrencyScope::Workflow,
+            github: &github,
+            vars: &submission.vars,
+            inputs: &submission.inputs,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let (group, cancel, queue) =
+            concurrency::evaluate_concurrency(raw, &eval_ctx).map_err(|error| {
+                ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
+            })?;
+        if group.trim().is_empty() {
+            empty_workflow_concurrency_group = true;
+            None
+        } else {
+            Some((group, cancel, queue, raw.clone()))
+        }
+    } else {
+        None
+    };
 
     // PATs are static and the token is minted at acquire. GitHub App
     // installation tokens are likewise minted later, when the broker
@@ -2082,6 +2179,11 @@ pub async fn submit_run(
     // request body to select the trust tier used by auto-PR and secret policy;
     // only the GitHub webhook adapters may stamp this field.
     submission.trust_tier = None;
+    // Same rule for branch protection: `ref_protected` is a claim about the
+    // forge's configuration, so only the adapters that resolve it against
+    // GitHub may set it. A body cannot assert it into `GITHUB_REF_PROTECTED`
+    // or the signed OIDC claim — consumers grant more to a protected ref.
+    submission.ref_protected = false;
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
@@ -2279,6 +2381,65 @@ pub fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>)
             .filter_map(|value| value.as_str())
             .map(str::to_owned),
     );
+}
+
+/// The branch a local `pull_request` run's test merge targets: the payload's
+/// `pull_request.base.ref` when present, then the submission's `--base`, then
+/// the branch the CLI derived for trigger filtering (which is the PR's target
+/// branch). Normalized to a plain branch name so `refs/heads/main` and
+/// `origin/main` all fetch `refs/heads/main`.
+fn pull_request_base_branch(submission: &WorkflowSubmission) -> Option<String> {
+    let payload_base = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .and_then(|value| value.as_str());
+    payload_base
+        .map(str::to_owned)
+        .or_else(|| submission.base_ref.clone())
+        .or_else(|| submission.filter_branch.clone())
+        .map(|raw| normalize_branch_name(&raw))
+        .filter(|branch| !branch.is_empty())
+}
+
+/// The pull request number a local `pull_request` submission refers to, for
+/// `refs/pull/<n>/merge` labelling.
+fn submission_pull_request_number(payload: &serde_json::Value) -> Option<u64> {
+    payload
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            payload
+                .get("pull_request")
+                .and_then(|pr| pr.get("number"))
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+/// Strip the remote-qualified spellings of a branch name.
+///
+/// Mirrors the CLI's own normalization: `refs/heads/main`, `refs/remotes/
+/// origin/main`, `origin/main`, and `upstream/main` all become `main`. A
+/// branch containing slashes (`feature/auth`) keeps them — only the known
+/// remote prefixes are stripped.
+fn normalize_branch_name(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix("refs/heads/") {
+        return rest.to_owned();
+    }
+    if let Some(rest) = raw.strip_prefix("refs/remotes/") {
+        return rest
+            .split_once('/')
+            .map(|(_, branch)| branch.to_owned())
+            .unwrap_or_else(|| rest.to_owned());
+    }
+    for remote in ["origin/", "upstream/"] {
+        if let Some(rest) = raw.strip_prefix(remote) {
+            return rest.to_owned();
+        }
+    }
+    raw.to_owned()
 }
 
 /// Per-job runner artifacts: agent message plus the correlation records the
@@ -2522,7 +2683,8 @@ pub(crate) fn build_job_artifacts(
     }
 
     // The request id is the `job_requests` primary key; it is minted inside
-    // the writer transaction (`submit_run_tx`/`register_expanded_jobs`) under
+    // the writer transaction (`submit_run`'s chunk transactions /
+    // `register_expanded_jobs`) under
     // the cross-process writer lock, not here — a process-local atomic would
     // let two engines sharing one database allocate the same id. Stamp the
     // placeholder the transaction overwrites on both the message and the
@@ -2550,22 +2712,27 @@ pub(crate) fn build_job_artifacts(
         }
         // Self-repository actions can use this snapshot even when the workflow
         // has no actions/checkout step. Preserve the marker for local workspace
-        // snapshots independently of checkout rewriting.
-        if redirected > 0 || snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace {
+        // snapshots and self-built merges (whose commit exists only here)
+        // independently of checkout rewriting.
+        if redirected > 0
+            || snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace
+            || snapshot.source == crate::snapshots::SnapshotSource::SelfBuiltMerge
+        {
             agent_msg.preloop_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
-        // Local-workspace runs test code the forge has never seen, so anything
-        // hardcoding github.com has to be rewritten or the job fails fetching
-        // its own sha. A cached remote checkout is the opposite case: the
-        // commit exists upstream, the cache holds only that commit, and
-        // rewriting the origin would break every legitimate fetch of anything
-        // else.
+        // Local workspaces and self-built merges contain engine-only commits.
+        // Redirect custom Git fetches for those sources to the served snapshot;
+        // cached remote checkouts keep fetching from their upstream.
         let repository = normalized_github
             .get("repository")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
-        if let (Some(repository), crate::snapshots::SnapshotSource::LocalWorkspace) =
-            (repository, snapshot.source)
+        if let Some(repository) = repository
+            && matches!(
+                snapshot.source,
+                crate::snapshots::SnapshotSource::LocalWorkspace
+                    | crate::snapshots::SnapshotSource::SelfBuiltMerge
+            )
         {
             let credentials = base64::engine::general_purpose::STANDARD
                 .encode(format!("x-access-token:{runtime_token}"));
@@ -4768,6 +4935,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
         let workspace = temp.path().join("workspace");
+        let origin = temp.path().join("origin.git");
         std::fs::create_dir_all(&workspace).unwrap();
         git_in(&workspace, &["init", "-q", "-b", "main"]);
         git_in(&workspace, &["config", "user.email", "test@example.com"]);
@@ -4775,9 +4943,25 @@ mod tests {
         std::fs::write(workspace.join("file.txt"), "one\n").unwrap();
         git_in(&workspace, &["add", "file.txt"]);
         git_in(&workspace, &["commit", "-qm", "initial"]);
-        let workspace_head = String::from_utf8(git_in(&workspace, &["rev-parse", "HEAD"])).unwrap();
-        // Dirty the tree: the uncommitted change must show up in the
-        // head..base diff, which it cannot when head is the workspace HEAD.
+        git_in(
+            &workspace,
+            &["init", "-q", "--bare", origin.to_str().unwrap()],
+        );
+        git_in(&workspace, &["checkout", "-q", "-b", "feature"]);
+        git_in(
+            &workspace,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&workspace, &["push", "-q", "origin", "main"]);
+        git_in(&workspace, &["push", "-q", "origin", "feature"]);
+        git_in(&workspace, &["checkout", "-q", "main"]);
+        std::fs::write(workspace.join("base-only.txt"), "base\n").unwrap();
+        git_in(&workspace, &["add", "base-only.txt"]);
+        git_in(&workspace, &["commit", "-qm", "base moved"]);
+        git_in(&workspace, &["push", "-q", "origin", "main"]);
+        git_in(&workspace, &["checkout", "-q", "feature"]);
+        // Dirty the tree: the uncommitted change must be carried by the
+        // synthetic head commit that the merge builder consumes.
         std::fs::write(workspace.join("file.txt"), "two (uncommitted)\n").unwrap();
 
         let mut state = AppState::new(state_dir.clone()).await.unwrap();
@@ -4813,41 +4997,32 @@ mod tests {
         let head_sha = pr["head"]["sha"].as_str().unwrap().to_owned();
         let base_sha = pr["base"]["sha"].as_str().unwrap().to_owned();
 
+        let merge = snapshot
+            .merge
+            .as_ref()
+            .expect("default local pull_request runs build a merge");
         assert_eq!(
-            head_sha, snapshot.commit_sha,
-            "PR head must be the snapshot commit carrying the dirty tree"
-        );
-        assert_ne!(
-            head_sha,
-            snapshot.head_sha.as_deref().unwrap(),
-            "PR head must not be the real workspace HEAD"
-        );
-        assert_ne!(
-            head_sha,
-            workspace_head.trim(),
-            "head must not be the workspace HEAD"
+            head_sha, merge.head_sha,
+            "PR head must be the dirty snapshot commit carried into the merge"
         );
         assert_eq!(
-            base_sha,
-            snapshot.before_sha.as_deref().unwrap(),
-            "PR base must be the base the dirty tree is measured against"
+            base_sha, merge.base_sha,
+            "PR base must be the fetched current base tip"
         );
-        assert_ne!(
-            base_sha, head_sha,
-            "a dirty tree must diff against its base"
+        assert_eq!(
+            run.github["sha"],
+            serde_json::json!(merge.sha),
+            "github.sha must identify the two-parent merge commit"
         );
-
-        // Both endpoints resolve inside the snapshot store, and the diff names
-        // exactly the uncommitted change.
         let snapshot_repository = state_dir.join(&snapshot.repository);
-        let changed = git_in(
-            &snapshot_repository,
-            &["diff", "--name-only", &base_sha, &head_sha],
-        );
         assert_eq!(
-            String::from_utf8(changed).unwrap().trim(),
-            "file.txt",
-            "changed-file actions must see the dirty tree's changes"
+            String::from_utf8(git_in(
+                &snapshot_repository,
+                &["log", "--format=%P", "-1", &merge.sha],
+            ))
+            .unwrap(),
+            format!("{} {}\n", merge.base_sha, merge.head_sha),
+            "the checked-out merge must have fetched base first and dirty head second"
         );
     }
 
@@ -5195,6 +5370,169 @@ mod tests {
         );
     }
 
+    /// The server-wide `max_jobs_per_run` cap fails a run fast: a 3-job
+    /// submit against a cap of 2 is rejected with 400 after expansion but
+    /// before the build loop and the insert transaction, while exactly 2
+    /// jobs are accepted.
+    #[tokio::test]
+    async fn submit_run_inner_enforces_max_jobs_per_run() {
+        fn three_job_submission() -> preloop_gha_protocol::WorkflowSubmission {
+            preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                    .to_owned(),
+                event: "push".to_owned(),
+                repository: "owner/repo".to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                workflow_file: Some("ci.yml".to_owned()),
+                actor: "alice".to_owned(),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                ..Default::default()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 2;
+        let shared = state.shared();
+
+        let error = submit_run_inner(&shared, three_job_submission())
+            .await
+            .expect_err("3 jobs over a cap of 2 must be rejected");
+        assert!(
+            error.message().contains("max_jobs_per_run"),
+            "rejection names the limit, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("3 jobs"),
+            "rejection names the expanded count, got: {}",
+            error.message()
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "an oversized submit is a 4xx"
+        );
+
+        // Exactly at the cap: accepted, both jobs recorded.
+        let mut two_jobs = three_job_submission();
+        two_jobs.workflow_yaml = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+            .to_owned();
+        let accepted = submit_run_inner(&shared, two_jobs).await.unwrap();
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(run.jobs.len(), 2, "a run at exactly the cap is accepted");
+    }
+
+    /// The cap counts expanded jobs, not declared ones: 2 declared matrix
+    /// jobs expanding to 400 legs are rejected by a cap of 300 and accepted
+    /// by a cap of 500 (the accepted run also exercises the chunked insert:
+    /// 400 > `SUBMIT_JOB_CHUNK_SIZE`).
+    #[tokio::test]
+    async fn submit_run_inner_cap_counts_expanded_jobs() {
+        fn matrix_submission(
+            jobs: usize,
+            cells: usize,
+        ) -> preloop_gha_protocol::WorkflowSubmission {
+            let values = (1..=cells)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut yaml = String::from("on: push\njobs:\n");
+            for j in 0..jobs {
+                yaml.push_str(&format!(
+                    "  m{j}:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        i: [{values}]\n    steps:\n      - run: echo hi\n"
+                ));
+            }
+            preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: yaml,
+                event: "push".to_owned(),
+                repository: "owner/repo".to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                workflow_file: Some("ci.yml".to_owned()),
+                actor: "alice".to_owned(),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                ..Default::default()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 300;
+        let shared = state.shared();
+
+        let error = submit_run_inner(&shared, matrix_submission(2, 200))
+            .await
+            .expect_err("400 expanded jobs over a cap of 300 must be rejected");
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "an oversized expanded submit is a 4xx"
+        );
+
+        // `shared()` snapshots the state, so re-snapshot after raising the cap.
+        state.max_jobs_per_run = 500;
+        let shared = state.shared();
+        let accepted = submit_run_inner(&shared, matrix_submission(2, 200))
+            .await
+            .expect("400 expanded jobs fit a cap of 500");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(
+            run.jobs.len(),
+            400,
+            "all 400 expanded legs persisted via chunked inserts"
+        );
+    }
+
+    /// Webhook deliveries bypass the cap — like the namespace submit quotas,
+    /// a push is never refused; chunked inserts bound its writer hold
+    /// instead.
+    #[tokio::test]
+    async fn webhook_delivery_bypasses_max_jobs_per_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 2;
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner_with_webhook_delivery(
+            &shared,
+            submission,
+            Some("delivery-cap-bypass"),
+        )
+        .await
+        .expect("webhook deliveries bypass the cap");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(run.jobs.len(), 3, "the push's run is recorded whole");
+    }
+
     /// A submission whose only job is gated off by its `if:` has no runner
     /// work to do, so it must finish at submit: terminal status, `completed_at`
     /// stamped, nothing reported as queued. A run that keeps a non-terminal
@@ -5248,6 +5586,80 @@ mod tests {
             "GitHub reports a run whose every job was skipped as skipped"
         );
         assert_eq!(accepted.queued_jobs, 0, "nothing was queued to a runner");
+    }
+
+    /// `ref_protected` is a claim about the forge's configuration, so a native
+    /// request body cannot assert it: the endpoint clears it exactly the way it
+    /// clears `trust_tier`. Without that, a body could mint a signed OIDC
+    /// `ref_protected: "true"` claim — and a `GITHUB_REF_PROTECTED=true` job
+    /// environment — for a ref that has no protection at all.
+    #[tokio::test]
+    async fn native_submission_cannot_assert_ref_protected() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, header};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+        let app = crate::app(state, CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+                            "event": "push",
+                            "repository": "owner/repo",
+                            "git_ref": "refs/heads/main",
+                            "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                            "ref_protected": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the submission itself must be accepted, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let runs = shared
+            .state
+            .backend
+            .list_runs(crate::control::backend::RunListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "one run was submitted");
+        let run = &runs[0];
+        assert!(
+            !run.submission.ref_protected,
+            "a request body must not assert branch protection"
+        );
+        assert_eq!(
+            run.github["ref_protected"],
+            serde_json::json!(false),
+            "the run's github context must report the unprivileged value"
+        );
     }
 
     /// The same workless submission must not take the workflow's concurrency
