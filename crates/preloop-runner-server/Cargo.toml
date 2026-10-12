@@ -126,6 +126,11 @@ path = "tests/webhooks.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "merge"
+path = "tests/merge.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "concurrency"
 path = "tests/concurrency.rs"
 required-features = ["test-support"]
