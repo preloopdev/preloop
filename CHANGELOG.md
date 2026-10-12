@@ -58,6 +58,19 @@ Releases before v0.27.0 predate the changelog.
   releasing its concurrency hold and queueing the runner cancellation, matching
   the SQLite path. Deferred reusable callers record their expanded subtree, so
   they fold on Postgres as they do on SQLite.
+- **Postgres deferred expansion no longer loads the run graph**: leasing a
+  reusable caller or a `fromJSON` matrix reads only the node's own rows, the
+  rows its `needs:` reach and the run's planning inputs, and applying the
+  built subtree writes the new rows and promotes only the jobs the subtree can
+  start (and what their skips and failures cascade to) instead of sweeping the
+  whole run. The run's status comes from the job rows after the apply.
+- Postgres deferred expansion fixes: matrix legs and callee jobs that
+  inherit a `needs:` already satisfied before the node expanded now start (the
+  expansion counted the settled need as outstanding, so they never ran); a
+  failed expansion build settles its dependents in the same apply instead of
+  leaving them pending; an unhostable leg no longer trips a debug assertion
+  at registration and settles after the rest of its subtree exists, so a
+  dependent registered later in the subtree sees it as terminal.
 - A completion that reports a non-terminal status is rejected with a bad
   request before anything is written.
 
