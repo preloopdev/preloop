@@ -470,11 +470,17 @@ impl PgBackend {
                     plan.concurrency_cancel_in_progress.as_deref(),
                     plan.concurrency_queue.as_deref(),
                 ),
-                reusable: plan.reusable_call.clone().map(|call| ReusableNodeSpec {
-                    call: Some(call),
-                    meta: None,
-                    plan: Some(plan.clone()),
-                }),
+                // Every node that expands later reads its own plan back: a
+                // caller's `call`, a deferred matrix's `workflow_file` and
+                // `inputs` (the callee YAML and `with` values it fans out
+                // with). Leaf nodes have no reader, so they store nothing.
+                reusable: (plan.reusable_call.is_some() || plan.deferred_matrix.is_some()).then(
+                    || ReusableNodeSpec {
+                        call: plan.reusable_call.clone(),
+                        meta: None,
+                        plan: Some(plan.clone()),
+                    },
+                ),
                 fail_fast: Some(plan.fail_fast),
                 continue_on_error: Some(plan.continue_on_error),
                 id_token_granted: artifacts.id_token_granted,

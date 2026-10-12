@@ -6111,6 +6111,99 @@ pub(crate) mod suite {
         assert_reusable_caller_folded(backend, run_id, &dispatched).await;
     }
 
+    /// A deferred matrix inside a reusable callee plans its fan-out from the
+    /// plan the caller's expansion materialized the node with: the callee's
+    /// `workflow_file` (so the build parses the callee YAML, not the root
+    /// workflow, where `caller/fan` does not exist) and the caller's `with`
+    /// values as the cells' `inputs`. The legs then run and fold the caller.
+    pub(crate) async fn deferred_matrix_in_a_callee_plans_from_its_stored_plan(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(deferred_caller_run(run_id, &[], Vec::new()))
+            .await
+            .unwrap();
+        let mut fan = deferred_callee_job(
+            run_id,
+            "caller/fan",
+            &["caller/gen"],
+            Some("${{ fromJSON(needs.gen.outputs.m) }}"),
+        );
+        fan.plan.workflow_file = Some("callee.yml".to_owned());
+        fan.plan.inputs = BTreeMap::from([("mode".to_owned(), serde_json::json!("plan"))]);
+        expand_deferred_caller(
+            backend,
+            vec![deferred_callee_job(run_id, "caller/gen", &[], None), fan],
+        )
+        .await;
+        finish_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            BTreeMap::from([
+                ("val".to_owned(), serde_json::json!("hi")),
+                (
+                    "m".to_owned(),
+                    serde_json::json!({"include": [{"n": 1}, {"n": 2}]}),
+                ),
+            ]),
+        )
+        .await;
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred callee matrix must be leased");
+        assert_eq!(claim.job.job_id, JobId("caller/fan".to_owned()));
+        match claim
+            .plan
+            .expect("a deferred matrix node must plan an expansion")
+        {
+            crate::control::logic::ExpansionPlan::Matrix(inputs) => {
+                assert_eq!(
+                    inputs.workflow_file.as_deref(),
+                    Some("callee.yml"),
+                    "the fan-out must be built from the callee workflow"
+                );
+                assert_eq!(
+                    inputs.scoped_inputs,
+                    BTreeMap::from([("mode".to_owned(), serde_json::json!("plan"))]),
+                    "the cells must inherit the caller's with values"
+                );
+            }
+            crate::control::logic::ExpansionPlan::Reusable(_) => {
+                panic!("expected a matrix expansion plan")
+            }
+        }
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        built_matrix_leg(run_id, "caller/fan-1", "caller/fan", 1, 2),
+                        built_matrix_leg(run_id, "caller/fan-2", "caller/fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+        finish_callee(backend, run_id, "caller/fan-1", BTreeMap::new()).await;
+        finish_callee(backend, run_id, "caller/fan-2", BTreeMap::new()).await;
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_reusable_caller_folded(backend, run_id, &dispatched).await;
+    }
+
     /// The caller's recorded `inner_job_ids` already name a deferred matrix
     /// placeholder. Its expansion must splice the legs in for the placeholder
     /// id, as an expansion-time fill of the list would have.
@@ -9815,6 +9908,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn deferred_matrix_in_a_callee_plans_from_its_stored_plan() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::deferred_matrix_in_a_callee_plans_from_its_stored_plan(&backend).await;
+    }
+
+    #[tokio::test]
     async fn reusable_caller_folds_after_a_pre_seeded_matrix_placeholder() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -11733,6 +11834,14 @@ mod lite {
     #[tokio::test]
     async fn reusable_caller_folds_after_a_deferred_matrix_callee() {
         suite::reusable_caller_folds_after_a_deferred_matrix_callee(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deferred_matrix_in_a_callee_plans_from_its_stored_plan() {
+        suite::deferred_matrix_in_a_callee_plans_from_its_stored_plan(
             &LiteBackend::in_memory().unwrap(),
         )
         .await;

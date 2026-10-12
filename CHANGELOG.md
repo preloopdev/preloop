@@ -30,6 +30,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Postgres deferred matrix inside a reusable callee expands against the callee**:
+  a `strategy.matrix: ${{ fromJSON(needs.x.outputs.y) }}` job in a callee
+  workflow failed with "job `call/shard` not found in workflow" on Postgres,
+  because the expansion pass stored a node's plan only when the node was itself
+  a reusable caller, so the fan-out fell back to parsing the root workflow.
+  Every node that expands later (a caller or a deferred matrix) now keeps its
+  plan, as the SQLite backend does, so the build parses the callee YAML and
+  cells inherit the caller's `with` values.
+
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
