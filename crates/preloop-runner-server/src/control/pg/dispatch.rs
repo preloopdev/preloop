@@ -695,6 +695,16 @@ pub(super) async fn retire_node_requests(
             }
         }
     }
+    // The node's own row must not keep pointing at a request that is gone.
+    if !removed_logs.is_empty() {
+        tx.execute(
+            "UPDATE jobs SET request_id = NULL \
+             WHERE run_id = $1::text::uuid AND job_id = $2 AND request_id IS NOT NULL",
+            &[&run_id.0.to_string(), &node_id.0],
+        )
+        .await
+        .map_err(db)?;
+    }
     Ok(removed_logs)
 }
 
@@ -2325,13 +2335,14 @@ pub(super) async fn clear_assignment(
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `cancel_run_inner` parity: settle every non-terminal job, queue a
-/// cancellation for in-flight attempts, retire expandable-node requests,
-/// release every concurrency presence. Returns cancellations queued.
+/// cancellation for in-flight attempts, settle the requests of every job that
+/// never ran (and of expandable nodes), release every concurrency presence.
+/// Returns cancellations queued.
 ///
 /// Statements: `SELECT job_id, status FROM jobs .. FOR UPDATE`; per
 /// in-flight job one deduped `INSERT INTO job_cancellations`; one `UPDATE
 /// jobs .. SET status='cancelled'` over non-terminal rows; `UPDATE runs ..
-/// SET status='completed', conclusion='cancelled'`; per expandable node
+/// SET status='completed', conclusion='cancelled'`; per job that never ran
 /// `retire_node_requests`; `DELETE`s of `job_assignments` /
 /// `provision_requests` / `jobsets`; concurrency release+promotion; one
 /// `run.completed.v1` outbox row when the run newly went terminal.
@@ -2362,15 +2373,18 @@ async fn cancel_run_tx(
             cancellations += 1;
         }
     }
-    // Expandable nodes minted placeholder requests at submit/expansion;
-    // those settle with the node so no in-flight marker outlives it.
-    let expandable: Vec<JobId> = tx
+    // Expandable nodes minted placeholder requests at submit/expansion, and a
+    // job that never started minted one nothing will run; those settle with
+    // the job so no open request outlives it. A running attempt keeps its
+    // request: its runner settles it.
+    let unrun: Vec<JobId> = tx
         .query(
             "SELECT j.job_id FROM jobs j LEFT JOIN job_specs s \
              ON s.run_id = j.run_id AND s.job_id = j.job_id \
              WHERE j.run_id=$1::text::uuid \
             AND j.status NOT IN ('success','failure','cancelled','skipped','timed_out') \
-            AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
+            AND (j.status <> 'in_progress' \
+                  OR (s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
                   OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb) \
                   OR j.queue_state IN ('pending_expansion','expanding'))",
             &[&run_id.0.to_string()],
@@ -2397,7 +2411,7 @@ async fn cancel_run_tx(
     )
     .await
     .map_err(db)?;
-    for job_id in &expandable {
+    for job_id in &unrun {
         retire_node_requests(
             tx,
             run_id,
@@ -2488,8 +2502,9 @@ pub(super) async fn enqueue_cancellation_job(
 }
 
 /// `cancel_job_inner` parity: cancel one job plus its expanded subtree,
-/// queueing a cancellation for the in-flight attempt, retiring an
-/// expandable node's placeholder requests and releasing its gate presence.
+/// queueing a cancellation for the in-flight attempt, settling the requests of
+/// a job that never ran (an expandable node's placeholders included) and
+/// releasing its gate presence.
 /// Re-summarizes the run after the subtree settles.
 async fn cancel_job_tx(
     backend: &PgBackend,
@@ -2518,8 +2533,7 @@ async fn cancel_job_tx(
     let now = now_us();
     let mut count = 0;
     // Only a running attempt can be interrupted; queued/blocked jobs simply
-    // turn terminal (their placeholder request retires below when the node
-    // is expandable).
+    // turn terminal (their request settles below).
     if status == "in_progress" && enqueue_cancellation_job(tx, run_id, job_id).await? {
         count = 1;
     }
@@ -2543,7 +2557,7 @@ async fn cancel_job_tx(
         .await
         .map_err(db)?;
         clear_assignment(tx, run_id, job_id).await?;
-        if expandable {
+        if expandable || status != "in_progress" {
             retire_node_requests(
                 tx,
                 run_id,
@@ -3540,9 +3554,16 @@ impl<'a> Sweep<'a> {
             let sibling = JobId(row.get::<_, String>(0));
             let status: String = row.get(1);
             let request_id: Option<i64> = row.get(2);
-            if status == "in_progress"
-                && let Some(request_id) = request_id
-            {
+            if status != "in_progress" {
+                // Never claimed: no runner will settle its request.
+                retire_node_requests(
+                    tx,
+                    run_id,
+                    &sibling,
+                    Retirement::Settle(ExecutionStatus::Cancelled),
+                )
+                .await?;
+            } else if let Some(request_id) = request_id {
                 queue_job_cancellation(tx, request_id, Some("fail_fast")).await?;
             }
             tx.execute(
@@ -3580,14 +3601,7 @@ impl<'a> Sweep<'a> {
         set_status_in(self.graphs.get_mut(&run_id), job_id, status);
         self.mark(run_id, job_id);
         release_concurrency_for_job(self.backend, self.tx, run_id, job_id).await?;
-        let expandable = self
-            .graphs
-            .get(&run_id)
-            .and_then(|g| g.nodes.get(job_id))
-            .is_some_and(|node| node.expandable());
-        if expandable {
-            retire_node_requests(self.tx, run_id, job_id, Retirement::Settle(status)).await?;
-        }
+        retire_node_requests(self.tx, run_id, job_id, Retirement::Settle(status)).await?;
         clear_assignment(self.tx, run_id, job_id).await?;
         // Dependents' `remaining_needs` recompute. A declared need matches a
         // job id or its matrix base, and an expanded matrix parent is replaced
@@ -5108,7 +5122,11 @@ async fn submit_job_chunk(
         insert_spec_rows(tx, record.run_id, &node, &job_id, None).await?;
         // Mint the request correlation inside the writer transaction so
         // the id is allocated under the cross-process writer lock.
-        if let Some(request) = &request {
+        // A node that concluded at submit never runs, so it mints no request
+        // (lite parity): an unsettled one would stay open forever.
+        if !node.status.is_terminal()
+            && let Some(request) = &request
+        {
             let request_id = insert_request_row(
                 tx,
                 &graph.namespace,

@@ -588,20 +588,14 @@ impl PgBackend {
                 .map_err(db)?;
                 continue;
             }
-            // Expandable nodes (deferred matrix parents, reusable callers)
-            // minted placeholder requests at submit even though they never
-            // ran; settle them with the node so no in-flight marker outlives
-            // the run.
-            let expandable: Vec<JobId> = tx
+            // A held run's jobs never started, yet each minted a request at
+            // submit (expandable nodes included); settle them with the job so
+            // no open request outlives the run.
+            let unrun: Vec<JobId> = tx
                 .query(
-                    "SELECT j.job_id FROM jobs j LEFT JOIN job_specs s \
-                     ON s.run_id = j.run_id AND s.job_id = j.job_id \
-                     WHERE j.run_id = $1::text::uuid \
-                       AND j.status NOT IN \
-                           ('success','failure','cancelled','skipped','timed_out') \
-                       AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
-                            OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb) \
-                            OR j.queue_state IN ('pending_expansion','expanding'))",
+                    "SELECT job_id FROM jobs WHERE run_id = $1::text::uuid \
+                       AND status NOT IN \
+                           ('success','failure','cancelled','skipped','timed_out')",
                     &[&candidate],
                 )
                 .await
@@ -624,7 +618,7 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-            for job_id in &expandable {
+            for job_id in &unrun {
                 retire_node_requests(
                     &tx,
                     run_id,

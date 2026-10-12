@@ -1150,6 +1150,69 @@ pub(crate) mod suite {
         }
     }
 
+    /// A cancelled run settles the request of every job that never started,
+    /// but not the running attempt's: its runner still owns that one and
+    /// settles it on completion.
+    pub(crate) async fn cancelled_run_settles_the_requests_of_unstarted_jobs(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let mut later = submit_job(run_id, "later", 2);
+        later.queued.needs = vec![JobId("build".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "build", 1), later],
+            ))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        else {
+            panic!("build must be claimable");
+        };
+        backend.cancel_run(run_id, None).await.unwrap();
+
+        let results: BTreeMap<JobId, Option<ExecutionStatus>> = backend
+            .run_requests(run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| (request.job_id, request.result))
+            .collect();
+        assert_eq!(
+            results,
+            BTreeMap::from([
+                (JobId("build".to_owned()), None),
+                (JobId("later".to_owned()), Some(ExecutionStatus::Cancelled)),
+            ]),
+            "only the running attempt keeps its request open"
+        );
+
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Cancelled,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        assert_request_bookkeeping_clean(backend).await;
+    }
+
     /// A fail-fast matrix leg's failure cancels its pending siblings; the
     /// dependent that declared `needs: <matrix base>` must then compute as
     /// settled (skipped), not hang on a stale `remaining_needs` counter, and
@@ -1300,6 +1363,20 @@ pub(crate) mod suite {
             .unwrap();
     }
 
+    /// The control-load harness's two request-bookkeeping integrity numbers
+    /// (`inflight_requests` and `live_job_request_pointer_mismatches`) must be
+    /// zero: no settled job, completed run or purged job keeps a request open,
+    /// and no `jobs.request_id` names a request that is gone.
+    pub(crate) async fn assert_request_bookkeeping_clean(backend: &dyn ControlBackend) {
+        let integrity = backend.test_request_integrity().await.unwrap();
+        assert_eq!(
+            integrity,
+            crate::control::testview::RequestIntegrity::default(),
+            "request bookkeeping leaked: open requests of settled work and dangling \
+             `jobs.request_id` pointers must both be zero"
+        );
+    }
+
     async fn status_of(
         backend: &dyn ControlBackend,
         run_id: RunId,
@@ -1416,6 +1493,7 @@ pub(crate) mod suite {
         }
         assert!(record.status.is_terminal(), "got {:?}", record.status);
         assert_eq!(record.conclusion.as_deref(), Some("failure"));
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// `if: always()` runs after a failed leg and sees the failure in its
@@ -1543,6 +1621,7 @@ pub(crate) mod suite {
             );
         }
         assert!(record.status.is_terminal(), "got {:?}", record.status);
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// A cancellation that lands between `claim_expansion` and
@@ -1727,6 +1806,7 @@ pub(crate) mod suite {
             !record.jobs.contains_key(&JobId("fan".to_owned())),
             "the expanded parent leaves the run's status map"
         );
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// An empty matrix concludes its node as skipped, and the dependents
@@ -1745,6 +1825,7 @@ pub(crate) mod suite {
             );
         }
         assert!(record.status.is_terminal(), "got {:?}", record.status);
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// A build that fails settles its node and the dependents behind it in the
@@ -1777,6 +1858,7 @@ pub(crate) mod suite {
             "the dependent of a failed expansion is decided with it"
         );
         assert!(record.status.is_terminal(), "got {:?}", record.status);
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// A leg no registered runner can host fails at registration without
@@ -2643,6 +2725,7 @@ pub(crate) mod suite {
                 .is_empty(),
             "an expired run is not expired twice"
         );
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// An armed environment protection gate keeps its job parked until the
@@ -4825,6 +4908,7 @@ pub(crate) mod suite {
             "run must be terminal, got {:?}",
             record.status
         );
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// A cancel-in-progress submit that replaces a queued run must report
@@ -6012,6 +6096,7 @@ pub(crate) mod suite {
             ExecutionStatus::Success,
             "the run must complete"
         );
+        assert_request_bookkeeping_clean(backend).await;
     }
 
     /// A deferred reusable caller whose subtree is one static job. The apply
@@ -9280,6 +9365,13 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn cancelled_run_settles_the_requests_of_unstarted_jobs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::cancelled_run_settles_the_requests_of_unstarted_jobs(&backend).await;
+    }
+    #[tokio::test]
     async fn matrix_fail_fast_settles_dependent_and_run() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -11142,6 +11234,13 @@ mod lite {
         suite::cancel_run_queues_cancellation(&LiteBackend::in_memory().unwrap()).await;
     }
 
+    #[tokio::test]
+    async fn cancelled_run_settles_the_requests_of_unstarted_jobs() {
+        suite::cancelled_run_settles_the_requests_of_unstarted_jobs(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
     #[tokio::test]
     async fn matrix_fail_fast_settles_dependent_and_run() {
         suite::matrix_fail_fast_settles_dependent_and_run(&LiteBackend::in_memory().unwrap()).await;

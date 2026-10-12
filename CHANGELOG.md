@@ -30,6 +30,22 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A job that settles without running no longer leaves its request open, and
+  an expanded matrix parent no longer points at a purged request**: Postgres
+  minted a request for every job at submit but settled it only when the job
+  ran or was an expansion node, so a job skipped by a dependency or its `if:`,
+  failed at promotion, cancelled before it was claimed (a cancelled run, a
+  fail-fast sibling) or failed with a fork-approval hold kept its
+  `job_requests` row open for good (`inflight_requests` stayed above zero after
+  a drained run). A job that concludes at submit now mints no request, as on
+  SQLite, and every other never-run settle closes the request with the job's
+  status; a running attempt keeps its request for its runner. SQLite settled
+  the skip path already but shared the cancel, fail-fast, fork-hold and
+  starvation gaps. Separately, expanding a matrix purged the parent's request
+  row but left `jobs.request_id` pointing at it on both backends
+  (`live_job_request_pointer_mismatches` was 1 per run); the purge now clears
+  the pointer. The shared control suite asserts both numbers are zero after the
+  matrix, skip, reusable-caller and cancellation scenarios.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

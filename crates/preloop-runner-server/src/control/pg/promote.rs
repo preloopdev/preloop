@@ -211,9 +211,7 @@ pub(super) async fn settle_unrun(
     mark_terminal(node, status, now_us());
     flush_node(tx, run_id, job_id, node).await?;
     release_concurrency_for_job(backend, tx, run_id, job_id).await?;
-    if node.expandable() {
-        retire_node_requests(tx, run_id, job_id, Retirement::Settle(status)).await?;
-    }
+    retire_node_requests(tx, run_id, job_id, Retirement::Settle(status)).await?;
     clear_assignment(tx, run_id, job_id).await?;
     let unblocked = Sweep::refresh_remaining_needs(tx, run_id, job_id, &node.base_id).await?;
     out.push(status, run_id, job_id.clone());
