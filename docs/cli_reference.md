@@ -57,6 +57,7 @@ Submit a workflow and stream its events until terminal.
 | `--push` | After the run completes, push the tested commit and publish the result (pull request + check runs) |
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
 | `--pr-draft` | Create new pull requests as drafts (default true; `--pr-draft=false` opens them ready for review) |
+| `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it |
 
 Behavior notes:
 - **Pausing**: pausing is the SmolVM default in an interactive terminal so you
@@ -64,6 +65,18 @@ Behavior notes:
   Non-interactive runs (pipes, CI, `--detach`) never pause.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
+- **`pull_request` test merge**: like GitHub, a local `--event pull_request`
+  run tests the merge of the pull request's *current* base tip into the head
+  (the workspace `HEAD`, or the snapshot commit when the tree is dirty), not
+  the branch alone. The engine fetches the base branch from the workspace's
+  `origin`, so a base that moved since the branch was cut is picked up. The
+  run's `github.sha` is the merge commit and `github.ref` is
+  `refs/pull/<n>/merge`; the payload's `base.sha` is the fetched tip and
+  `head.sha` the merged head. A conflicted pull request fails the submission
+  with the conflicted files listed (GitHub runs no `pull_request` workflows on
+  a conflict), and an unfetchable base fails loudly — `--no-merge` tests the
+  branch alone in either case. `push` events are unaffected: they test the
+  commit itself.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
 - **Secret preflight**: before submitting, `preloop run` lists the secrets the
@@ -88,7 +101,7 @@ automatically, and an explicit `--payload` field always wins:
 |---|---|---|
 | changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
 | PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
-| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else local `remote/HEAD` or advertised `HEAD` (queried with `git ls-remote --symref` when needed) | GitHub applies PR branch filters to the **target** branch, not the head branch |
 | branch / tag | the current checkout | It is the ref being tested |
 
 The base for the diff is `--base` when given, otherwise the branch's tracking
@@ -515,6 +528,7 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 80 GiB) |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | Free space kept on the VM volume (`PRELOOP_RUNNER_STORAGE_GB`'s volume) before a job VM is forked or created (default 20 GiB; `0` disables). Below it the pool holds the slot and re-measures instead of starting a runner, logging `waiting for disk: …`; jobs wait, they are not failed. A volume that cannot be measured never blocks |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | Proceed past the golden disk check with a warning. Without it, a golden download is refused when the artifact cannot fit on its volume, and a golden build when the SmolVM data volume has less than the builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB of pack staging free |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | Free space the golden unpack waits for, as a multiple of the pack's compressed size (default 6). smolvm writes several times the pack before its own layer preflight runs, so the engine stalls the unpack rather than ENOSPC mid-write; a failed attempt prunes its own `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses this wait too |
 | `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |

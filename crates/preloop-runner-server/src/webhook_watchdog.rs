@@ -259,7 +259,11 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
         status.last_poll_at_us = Some(now);
     });
 
-    if let Some(retry_after) = shared.state.github_breaker.retry_after() {
+    if let Some(retry_after) = shared
+        .state
+        .github_breakers
+        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
+    {
         // Deliberately not an error, and deliberately does not touch
         // `last_success_at_us`: the poll did not happen, and staleness must
         // keep growing until one does.
@@ -698,8 +702,11 @@ async fn repair_delivery(
         api_base.trim_end_matches('/'),
         target.delivery_id
     );
-    let response = crate::github_breaker::send_observed(
-        &shared.state.github_breaker,
+    let response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        crate::github_breaker::GithubCredentialBucket::App,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Webhooks,
         crate::shared_http::CLIENT
             .clone()
             .post(&url)
@@ -761,8 +768,11 @@ async fn list_deliveries(
     if let Some(cursor) = cursor {
         url.push_str(&format!("&cursor={cursor}"));
     }
-    let response = crate::github_breaker::send_observed(
-        &shared.state.github_breaker,
+    let response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        crate::github_breaker::GithubCredentialBucket::App,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Webhooks,
         crate::shared_http::CLIENT
             .clone()
             .get(&url)

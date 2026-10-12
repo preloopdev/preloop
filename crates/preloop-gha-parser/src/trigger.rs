@@ -485,38 +485,109 @@ pub(crate) fn matches_filter_with_default(filter: &Value, value: &str, default: 
 }
 
 /// GitHub-style glob matching anchored to the whole value.
+///
+/// `*` matches a run of characters other than `/`, `**` matches a run that may
+/// contain `/`, and `?` matches one character other than `/`. Every other
+/// character matches only itself. Matching is iterative, so pattern length
+/// cannot exhaust the stack, and it takes O(|pattern| * |value|) time.
 pub fn glob_match(pattern: &str, value: &str) -> bool {
-    fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
-        if pi == pattern.len() {
-            return vi == value.len();
+    // Literal text before the first wildcard matches only itself, so peel it off
+    // rather than run it through the automaton.
+    let wildcard = pattern.find(['*', '?']).unwrap_or(pattern.len());
+    let Some(rest) = value.strip_prefix(&pattern[..wildcard]) else {
+        return false;
+    };
+    if wildcard == pattern.len() {
+        // No wildcard: the pattern was literal, so the value must end here too.
+        return rest.is_empty();
+    }
+    match_wildcards(&pattern[wildcard..], rest)
+}
+
+/// One element of a glob pattern. Stars pair from the left, so `**` is one
+/// `DoubleStar` and `***` is `DoubleStar` followed by `Star`.
+enum Token {
+    /// Exactly this character, including `/`.
+    Literal(char),
+    /// `?`: one character other than `/`.
+    AnyChar,
+    /// `*`: any run of characters other than `/`.
+    Star,
+    /// `**`: any run of characters, `/` included.
+    DoubleStar,
+}
+
+/// Matches `value` against a pattern that starts with a wildcard.
+///
+/// The pattern becomes tokens, and the set of live token positions advances one
+/// character at a time, as in a Thompson NFA. Position `tokens.len()` is the
+/// accept state. A greedy last-star backtrack would be wrong: a later `*` cannot
+/// cross `/`, so backtracking to it could discard an earlier `**` that has to
+/// absorb the separator.
+fn match_wildcards(pattern: &str, value: &str) -> bool {
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        tokens.push(match c {
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                Token::DoubleStar
+            }
+            '*' => Token::Star,
+            '?' => Token::AnyChar,
+            literal => Token::Literal(literal),
+        });
+    }
+
+    let accept = tokens.len();
+    // `seen[state] == generation` means `state` is already in the set being built.
+    let mut seen: Vec<usize> = vec![0; accept + 1];
+    let mut active: Vec<usize> = Vec::new();
+    let mut next: Vec<usize> = Vec::new();
+    let mut generation: usize = 1;
+    add_state(&tokens, 0, generation, &mut seen, &mut active);
+    for c in value.chars() {
+        generation += 1;
+        next.clear();
+        for &state in &active {
+            let target = match tokens.get(state) {
+                Some(Token::Literal(expected)) if *expected == c => Some(state + 1),
+                Some(Token::AnyChar) if c != '/' => Some(state + 1),
+                Some(Token::Star) if c != '/' => Some(state),
+                Some(Token::DoubleStar) => Some(state),
+                _ => None,
+            };
+            if let Some(target) = target {
+                add_state(&tokens, target, generation, &mut seen, &mut next);
+            }
         }
-        if pattern[pi] == '*' {
-            let double_star = pattern.get(pi + 1) == Some(&'*');
-            let next_pi = if double_star { pi + 2 } else { pi + 1 };
-            if matches(pattern, value, next_pi, vi) {
-                return true;
-            }
-            let mut next_vi = vi;
-            while next_vi < value.len() {
-                if !double_star && value[next_vi] == '/' {
-                    break;
-                }
-                next_vi += 1;
-                if matches(pattern, value, next_pi, next_vi) {
-                    return true;
-                }
-            }
+        std::mem::swap(&mut active, &mut next);
+        if active.is_empty() {
             return false;
         }
-        if pattern[pi] == '?' {
-            return vi < value.len() && value[vi] != '/' && matches(pattern, value, pi + 1, vi + 1);
-        }
-        vi < value.len() && pattern[pi] == value[vi] && matches(pattern, value, pi + 1, vi + 1)
     }
-    matches(
-        &pattern.chars().collect::<Vec<_>>(),
-        &value.chars().collect::<Vec<_>>(),
-        0,
-        0,
-    )
+    active.contains(&accept)
+}
+
+/// Adds `state` and every state reachable from it without consuming a character.
+///
+/// Only a star can be skipped, so those states are the run from `state` through
+/// the first non-star token, or through the accept state. A state already in
+/// `set` brings its whole run with it, so the walk stops there.
+fn add_state(
+    tokens: &[Token],
+    state: usize,
+    generation: usize,
+    seen: &mut [usize],
+    set: &mut Vec<usize>,
+) {
+    let mut index = state;
+    while seen[index] != generation {
+        seen[index] = generation;
+        set.push(index);
+        if !matches!(tokens.get(index), Some(Token::Star | Token::DoubleStar)) {
+            break;
+        }
+        index += 1;
+    }
 }

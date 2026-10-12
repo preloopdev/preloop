@@ -63,7 +63,7 @@ SmolVM runtime, verifying every artifact against the release's published
 `sha256`:
 
 ```sh
-ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+ver=v0.34.0   # latest release, others at https://github.com/preloopdev/preloop/releases
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sudo -H env PREFIX=/usr/local sh install.sh
@@ -168,6 +168,7 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_CREDENTIAL_STORE` | `os` | Credential backend for the engine token and GitHub App/PAT credentials. `os` uses the native keychain/secret-service; `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt — use for headless hosts, containers, and local iteration where repeated keychain prompts are unacceptable); `memory` is non-persistent (tests only) |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run (counted after matrix expansion). API submits expanding past it are rejected with 400 before the insert transaction opens; `0` disables the cap. Webhook deliveries bypass it (a push is never refused) — see [Submit limits](#submit-limits) |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
 Managed engines read their generated token from the OS credential store (or
@@ -210,6 +211,23 @@ rather than refusing to boot — off retains nothing, so a typo costs caching,
 never startup. `GET /api/v1/config/checkout-cache` (native bearer) returns
 the effective policy.
 
+### Actions cache
+
+`actions/cache` entries are finalized into `<state_dir>/cache/` and bounded
+by a total quota with least-recently-used eviction: when a commit pushes the
+total over the quota, the least recently used entries are deleted until the
+total fits again. Uploads stream to disk chunk-by-chunk — a large blob is
+never buffered in server RAM — and downloads stream off disk the same way.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` | `10 GiB` | Total bytes of finalized cache entries kept on disk, across all namespaces; LRU entries are evicted past it |
+
+The same key lives under `[cache]` in the config file (`total_quota_bytes`);
+the environment wins, and an unparseable value fails startup rather than
+silently keeping or dropping cached entries. A single entry larger than the
+quota is kept by the commit that created it and evicted by the next commit.
+
 Objects are namespaced by forge origin, the credential that fetched them (App
 installation, or a PAT fingerprint), and the repository's numeric id — never by
 `owner/repo` or commit sha, so a rename cannot cross namespaces and two
@@ -249,6 +267,51 @@ startup and hourly afterwards, from both memory and the durable store, so
 a restart cannot resurrect them. Workflows see the effective value as
 `github.retention_days`.
 
+### Submit limits
+
+One HTTP request used to mean one database transaction: a 20,000-job
+submit held the writer for over a minute (SQLite) or pinned a Postgres
+writer connection until the pool exhausted. Two guards now bound that:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run, counted **after** matrix expansion. An API submit expanding past it is rejected with `400` before the insert transaction opens, so no giant transaction ever starts. `0` disables the cap. |
+
+The same key lives at the top level of the config file as
+`max_jobs_per_run`; the environment wins. The per-namespace quotas
+(`namespace_limits.max_jobs_per_run`, `submit_rate_per_minute`,
+`max_queued_jobs`) remain the finer-grained, opt-in control — the server
+cap is the backstop that is always on.
+
+Webhook deliveries bypass the cap, like the namespace quotas: a push is
+never refused. Their protection is the second guard — the submit insert
+is chunked in slices of 250 jobs, committing between chunks, on both the
+SQLite and Postgres backends. A concurrent control write waits for one
+chunk at most, never the whole insert. If a chunk fails after the run row
+committed, the run is marked completed/failed so a partial submit can
+never dispatch or wedge a concurrency group.
+
+### Diagnostic-log staging
+
+Diagnostic logs upload bearerless to signed per-job URLs
+(`/twirp-blob/diag/{token}`, Azure SDK compat). Each token is a single-job
+reservation recorded in memory: the per-job cap (32) evicts the oldest
+token, and an evicted or unknown token's PUT is rejected, so a re-mint loop
+cannot accumulate unbounded staging directories. The reaper deletes a
+token's staging directory when its reservation expires (1h TTL), and an
+age-based sweep removes any orphaned staging directory older than:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` | `24` | Max age of a `<state_dir>/blobs/diag/` staging directory before the reaper deletes it. `0` disables the age-based sweep (TTL-expired token directories are still reaped) |
+
+The same key lives at the top level of the config file as
+`diag_staging_max_age_hours`; the environment wins. Note the trade-off this
+buys: diag upload URLs are valid only while the engine that minted them is
+running — the token registry is in-memory, so a restart invalidates
+outstanding diag URLs (a runner that minted just before a restart re-mints
+on its next attempt).
+
 ### Runner pool
 
 | Variable | Default | Meaning |
@@ -260,6 +323,7 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_RUNNER_STORAGE_GB` | `80` | Writable guest disk ceiling (sparse — not allocated until written). The packed OCI golden needs ~80 GiB uncompressed |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free space kept on the VM data volume before a job VM is started; below it the pool holds the slot (`waiting for disk: …`) and jobs wait rather than fail. `0` disables |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | — | Proceed past the golden disk check with a warning. Without it, a golden download that cannot fit is refused before it starts, and a golden build is refused below builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB pack staging |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | `6` | Free space the golden unpack waits for, as a multiple of the pack's compressed size. smolvm writes several times the pack before its own layer preflight runs; the engine stalls the unpack rather than ENOSPC mid-write, and a failed attempt prunes its `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses the wait |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | `true` | Run the pool as forks of the golden rather than one boot per job |
@@ -507,8 +571,20 @@ Also worth knowing:
 | `state/github-app.json` | GitHub App private key and installation details |
 | `state/blobs/`, `state/replay/` | Step logs and job artifacts |
 | `state/cache/` | Actions cache entries |
+| `state/snapshots/` | Per-run immutable workspace snapshots; in-flight captures stage under `state/snapshots/.staging/` |
 | `vms/` | Golden images and per-machine state |
 | `engine.token` | Private fallback for the generated native API token when no OS credential service is available |
+
+Keep the whole state directory on one filesystem. Everything the engine
+publishes — workspace snapshots, blob uploads, caches — is staged inside the
+directory it is published to and moved into place with an atomic `rename(2)`,
+which the kernel refuses across mounts; a state directory split over several
+devices by a bind mount turns those publishes into hard failures (a local
+submission is refused outright, since the snapshot is its only copy of the
+tested tree). The process temp directory (`TMPDIR`, `/tmp`) is never used for
+staging, so the common Linux layout — a tmpfs `/tmp` next to an LVM/ext4 state
+volume — is fine. Snapshot staging trees abandoned by a killed engine are
+collected at startup.
 
 Back up at least the database and `github-app.json`. Losing the database strands
 any check run GitHub is still waiting on; losing the key means re-keying the App.
@@ -539,6 +615,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
 | Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
+| `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 
 ---
 

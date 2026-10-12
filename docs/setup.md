@@ -14,9 +14,9 @@ Linux and macOS, not native Windows. Inside WSL2, everything works like Linux:
 brew install preloopdev/tap/preloop
 npm install -g @preloop-dev/cli
 
-# Or fetch the installer at a release tag, read it, then run it — it downloads
-# the release binaries and verifies every artifact's sha256.
-ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+# Or fetch the installer at a release tag, read it, then run it. It downloads
+# the release binaries and verifies the sha256 of each one.
+ver=v0.34.0   # latest release, others at https://github.com/preloopdev/preloop/releases
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sh install.sh
@@ -41,10 +41,13 @@ It behaves **exactly like the official runner**:
 
 ### 1. Installation
 
-Install with one command:
+Fetch the installer at a release tag, read it, then run it with `--runner`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+ver=v0.34.0   # latest release; --runner needs v0.33.7 or newer
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sh install.sh --runner
 ```
 
 This detects your platform, downloads `preloop-runner`, verifies the sha256 checksum,

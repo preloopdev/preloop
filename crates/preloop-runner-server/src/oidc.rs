@@ -218,6 +218,10 @@ pub struct OidcClaimsInput {
     pub head_ref: Option<String>,
     /// Target branch for pull requests (`None` for non-PR events).
     pub base_ref: Option<String>,
+    /// GitHub's `ref_protected`: whether branch protection rules or rulesets
+    /// apply to `git_ref`. Reported as the string `"true"`/`"false"`, the
+    /// shape GitHub's own OIDC tokens use.
+    pub ref_protected: bool,
     /// Environment name if the job references an environment (`None` otherwise).
     pub environment: Option<String>,
     /// `"private"`, `"internal"`, or `"public"`.
@@ -321,7 +325,7 @@ pub fn build_claims(
         "repository_visibility": input.repository_visibility,
         "ref": input.git_ref,
         "ref_type": ref_type(&input.git_ref),
-        "ref_protected": "false",
+        "ref_protected": if input.ref_protected { "true" } else { "false" },
         "event_name": input.event_name,
         "sha": input.sha,
         "run_id": input.run_id,
@@ -787,6 +791,7 @@ jobs:
                 run_attempt: "1".to_string(),
                 head_ref: None,
                 base_ref: None,
+            ref_protected: false,
                 environment: None,
                 repository_visibility: "private".to_string(),
                 workflow_ref: None,
@@ -822,6 +827,7 @@ jobs:
                 run_attempt: "1".to_string(),
                 head_ref: None,
                 base_ref: None,
+            ref_protected: false,
                 environment: None,
                 repository_visibility: "private".to_string(),
                 workflow_ref: None,
@@ -857,6 +863,7 @@ jobs:
                 run_attempt: "1".to_string(),
                 head_ref: None,
                 base_ref: None,
+            ref_protected: false,
                 environment: Some(env.clone()),
                 repository_visibility: "private".to_string(),
                 workflow_ref: None,
@@ -891,6 +898,7 @@ jobs:
                 run_attempt: "1".to_string(),
                 head_ref: None,
                 base_ref: None,
+            ref_protected: false,
                 environment: None,
                 repository_visibility: "private".to_string(),
                 workflow_ref: None,
@@ -957,6 +965,7 @@ jobs:
                 run_attempt: "1".to_string(),
                 head_ref: None,
                 base_ref: None,
+            ref_protected: false,
                 environment: Some(env),
                 repository_visibility: "private".to_string(),
                 workflow_ref: None,
@@ -1025,6 +1034,7 @@ jobs:
             run_attempt: "1".to_string(),
             head_ref: None,
             base_ref: None,
+            ref_protected: false,
             environment: env.map(|s| s.to_string()),
             repository_visibility: "private".to_string(),
             repository_id: "1285198891".to_string(),
@@ -1057,6 +1067,7 @@ mod lie_github_tests {
             run_attempt: "1".to_string(),
             head_ref: None,
             base_ref: None,
+            ref_protected: false,
             environment: env.map(|s| s.to_string()),
             repository_visibility: "private".to_string(),
             repository_id: "1285198891".to_string(),
@@ -1121,6 +1132,7 @@ mod lie_github_tests {
             run_attempt: "1".to_string(),
             head_ref: None,
             base_ref: None,
+            ref_protected: false,
             environment: None,
             repository_visibility: "private".to_string(),
             repository_id: "1285198891".to_string(),
@@ -1173,6 +1185,21 @@ mod lie_github_tests {
 
         // jti must be a valid UUID.
         assert!(uuid::Uuid::parse_str(claims["jti"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn ref_protected_is_claimed_in_githubs_string_form() {
+        let mut input = test_input("refs/heads/main", "push", None);
+        input.ref_protected = true;
+        let claims = build_claims(&input, "api://preloop", GITHUB_OIDC_ISSUER, 1_782_835_521);
+        assert_eq!(
+            claims["ref_protected"], "true",
+            "a protected ref must be claimed as the string GitHub uses"
+        );
+
+        input.ref_protected = false;
+        let claims = build_claims(&input, "api://preloop", GITHUB_OIDC_ISSUER, 1_782_835_521);
+        assert_eq!(claims["ref_protected"], "false");
     }
 
     #[test]

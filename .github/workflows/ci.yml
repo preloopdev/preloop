@@ -77,6 +77,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
       - run: cargo fmt --all --check
       - run: |
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
@@ -177,6 +181,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
       - name: Install cargo-nextest
         run: |
           # `cargo install` built nextest from source on every cold cache
@@ -311,6 +319,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Verify property filters match tests
         run: |
@@ -432,6 +444,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Verify property filters match tests
         run: |

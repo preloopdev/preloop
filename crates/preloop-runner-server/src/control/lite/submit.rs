@@ -20,11 +20,114 @@ impl LiteBackend {
     /// Insert a submitted run and its jobs. Idempotent on
     /// `(webhook_delivery_id, workflow_path)`: a replay returns the existing
     /// run instead of a duplicate.
+    ///
+    /// The insert is chunked: phase 1 commits admission plus the run row,
+    /// each [`SUBMIT_JOB_CHUNK_SIZE`](crate::control::types::SUBMIT_JOB_CHUNK_SIZE)
+    /// job slice commits on its own, and a final transaction promotes and
+    /// summarizes. No single request holds the writer for the whole insert —
+    /// a concurrent control write waits for one chunk at most. A failure
+    /// after phase 1 commits poisons the run (completed/failure) so a
+    /// partial submit can never dispatch or wedge a concurrency group.
     pub(crate) async fn submit_run(
         &self,
         submit: SubmitRun,
     ) -> Result<SubmitOutcome, ControlError> {
-        self.write(|tx| submit_run_tx(tx, self, submit))
+        let (proceed, mut submit_jobs) = match self.write(|tx| submit_run_head(tx, self, submit))? {
+            SubmitHead::Done(outcome) => return Ok(outcome),
+            SubmitHead::Proceed(proceed, submit_jobs) => (proceed, submit_jobs),
+        };
+        let mut chunks = SubmitChunks::default();
+        let mut job_offset = 0usize;
+        while !submit_jobs.is_empty() {
+            let take = submit_jobs
+                .len()
+                .min(crate::control::types::SUBMIT_JOB_CHUNK_SIZE);
+            let chunk: Vec<SubmitJob> = submit_jobs.drain(..take).collect();
+            match self.write(|tx| submit_run_chunk(tx, self, &proceed, chunks, job_offset, chunk)) {
+                Ok(returned) => chunks = returned,
+                Err(error) => {
+                    poison_partial_submit(self, proceed.run_id, &proceed.namespace);
+                    return Err(error);
+                }
+            }
+            job_offset += take;
+        }
+        match self.write(|tx| submit_run_finalize(tx, self, &proceed, chunks)) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                poison_partial_submit(self, proceed.run_id, &proceed.namespace);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Phase-1 state for a chunked submit: everything the job chunks and the
+/// finalize step need after admission, the run row, and the workflow
+/// concurrency gate have committed.
+struct SubmitProceed {
+    namespace: String,
+    record: crate::models::RunRecord,
+    run_id: RunId,
+    run_order: i64,
+    display_order: BTreeMap<String, i64>,
+    platforms: Vec<&'static str>,
+    pool_labels: Vec<String>,
+    runner_labels: Vec<Vec<String>>,
+    check_hostable: bool,
+    held: bool,
+}
+
+/// What [`submit_run_head`] hands back: either a finished outcome (replay,
+/// empty concurrency group, arrival-cancelled) or the state to continue
+/// with.
+#[allow(clippy::large_enum_variant)]
+// Both variants are large (`RunRecord` dominates); the enum is built and
+// matched once per submit, so boxing would buy nothing.
+enum SubmitHead {
+    Done(SubmitOutcome),
+    Proceed(SubmitProceed, Vec<SubmitJob>),
+}
+
+/// Per-chunk accumulators carried across the job-insert transactions.
+#[derive(Default)]
+struct SubmitChunks {
+    active_by_base: BTreeMap<String, u64>,
+    concluded: Vec<(JobId, ExecutionStatus, Option<String>)>,
+    inserted: usize,
+    queued: usize,
+}
+
+/// Best-effort poison for a submit that failed after phase 1 committed:
+/// release the workflow-gate hold the run may own, then mark the run
+/// terminal so dispatchers never pick up its partial jobs. Runs in its own
+/// transaction; a poison failure is logged, never propagated — the original
+/// error is already on its way to the caller.
+fn poison_partial_submit(backend: &LiteBackend, run_id: RunId, namespace: &str) {
+    let poisoned = backend.write(|tx| {
+        settle::release_concurrency_for_run(tx, backend, run_id)?;
+        tx.prepare_cached("UPDATE runs SET concurrency_group = NULL WHERE run_id = ?1")
+            .map_err(db)?
+            .execute([codec::run_key(run_id)])
+            .map_err(db)?;
+        tx.prepare_cached(
+            "UPDATE runs SET status = 'completed', conclusion = 'failure', completed_at = ?2 \
+             WHERE run_id = ?1 AND status <> 'completed'",
+        )
+        .map_err(db)?
+        .execute(params![codec::run_key(run_id), now_us()])
+        .map_err(db)?;
+        jobs::emit_outbox(
+            tx,
+            namespace,
+            Some(run_id),
+            "run.completed.v1",
+            serde_json::json!({"conclusion": "failure", "reason": "submit aborted mid-insert"}),
+        )?;
+        Ok(())
+    });
+    if let Err(error) = poisoned {
+        tracing::warn!(%run_id, ?error, "failed to poison partially submitted run");
     }
 }
 
@@ -159,11 +262,15 @@ fn admit_submit(
     Ok(())
 }
 
-fn submit_run_tx(
+/// Phase 1 of [`LiteBackend::submit_run`]: the idempotent-replay check,
+/// run-number allocation, namespace admission, the run row, and the workflow
+/// concurrency gate. Commits on its own so the job chunks that follow never
+/// redo it; early-return outcomes carry no partial state.
+fn submit_run_head(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     submit: SubmitRun,
-) -> Result<SubmitOutcome, ControlError> {
+) -> Result<SubmitHead, ControlError> {
     let SubmitRun {
         namespace,
         mut record,
@@ -190,7 +297,7 @@ fn submit_run_tx(
         if let Some(existing) = existing
             && let Some(existing) = jobs::run_record(tx, codec::run_id(&existing))?
         {
-            return Ok(SubmitOutcome {
+            return Ok(SubmitHead::Done(SubmitOutcome {
                 run_id: existing.run_id,
                 run_number: existing.run_number,
                 queued_jobs: 0,
@@ -201,13 +308,13 @@ fn submit_run_tx(
                 existing: Some(Box::new(existing)),
                 next_runs_on: jobs::next_ready_labels(tx)?,
                 events: Vec::new(),
-            });
+            }));
         }
     }
 
     // ── Empty workflow concurrency group: reject without inserting ──────
     if empty_concurrency_group {
-        return Ok(SubmitOutcome {
+        return Ok(SubmitHead::Done(SubmitOutcome {
             run_id,
             run_number: record.run_number,
             queued_jobs: 0,
@@ -222,7 +329,7 @@ fn submit_run_tx(
             existing: None,
             next_runs_on: jobs::next_ready_labels(tx)?,
             events: Vec::new(),
-        });
+        }));
     }
 
     // ── The run row (FK target for jobs and the gate's event ordering) ──
@@ -274,8 +381,6 @@ fn submit_run_tx(
     // monotonic per submit and needs no table scan (`job_order` orders
     // within the run).
     let run_order = record.created_at.timestamp_micros();
-    // Legs of one matrix already handed a slot in this submit (max-parallel).
-    let mut active_by_base: BTreeMap<String, u64> = BTreeMap::new();
     let display_order: BTreeMap<String, i64> = record
         .jobs_list
         .iter()
@@ -423,7 +528,7 @@ fn submit_run_tx(
                     "run.completed.v1",
                     serde_json::json!({"status": "cancelled"}),
                 )?;
-                return Ok(SubmitOutcome {
+                return Ok(SubmitHead::Done(SubmitOutcome {
                     run_id,
                     run_number: record.run_number,
                     queued_jobs: submit_jobs.len(),
@@ -434,7 +539,7 @@ fn submit_run_tx(
                     existing: None,
                     next_runs_on: jobs::next_ready_labels(tx)?,
                     events: Vec::new(),
-                });
+                }));
             }
             cg::AcqOutcome::Failed => {
                 return Err(ControlError::backend(anyhow::anyhow!(
@@ -444,13 +549,59 @@ fn submit_run_tx(
         }
     }
 
+    Ok(SubmitHead::Proceed(
+        SubmitProceed {
+            namespace,
+            record,
+            run_id,
+            run_order,
+            display_order,
+            platforms,
+            pool_labels,
+            runner_labels,
+            check_hostable,
+            held,
+        },
+        submit_jobs,
+    ))
+}
+
+/// Insert one [`SUBMIT_JOB_CHUNK_SIZE`](crate::control::types::SUBMIT_JOB_CHUNK_SIZE)-sized
+/// slice of the submit's jobs: classification, job/message/request rows, the
+/// per-job gate, and the ready enqueue. Commits on its own so one chunk never
+/// pins the writer for the whole insert; `chunks` carries the cross-chunk
+/// accumulators (`max-parallel` slots, conclusions, counts).
+fn submit_run_chunk(
+    tx: &Transaction<'_>,
+    backend: &LiteBackend,
+    proceed: &SubmitProceed,
+    chunks: SubmitChunks,
+    job_offset: usize,
+    submit_jobs: Vec<SubmitJob>,
+) -> Result<SubmitChunks, ControlError> {
+    // Borrow the phase-1 state through plain references so the
+    // classification body below — moved verbatim from the single-transaction
+    // submit — reads unchanged (call sites pass the references directly,
+    // never `&`-of-`&`).
+    let namespace: &str = &proceed.namespace;
+    let record: &crate::models::RunRecord = &proceed.record;
+    let run_id = proceed.run_id;
+    let run_order = proceed.run_order;
+    let display_order: &BTreeMap<String, i64> = &proceed.display_order;
+    let platforms: &[&'static str] = &proceed.platforms;
+    let pool_labels: &[String] = &proceed.pool_labels;
+    let runner_labels: &[Vec<String>] = &proceed.runner_labels;
+    let check_hostable = proceed.check_hostable;
+    let held = proceed.held;
+    let SubmitChunks {
+        mut active_by_base,
+        mut concluded,
+        mut inserted,
+        mut queued,
+    } = chunks;
     // ── Per-job classification ──────────────────────────────────────────
-    let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
-    // `inserted` counts `jobs` rows (outbox detail); `queued` counts
-    // dispatchable jobs — `RunAccepted.queued_jobs` and the waiter wake.
-    let mut inserted = 0usize;
-    let mut queued = 0usize;
-    for (job_order, submit_job) in submit_jobs.into_iter().enumerate() {
+    for (index, submit_job) in submit_jobs.into_iter().enumerate() {
+        let job_order = job_offset + index;
         let SubmitJob {
             queued: job,
             request,
@@ -465,7 +616,7 @@ fn submit_run_tx(
             .get(&job_id.0)
             .copied()
             .unwrap_or(job_order as i64);
-        let spec = spec_extras(&record, &job, id_token_granted, oidc_context.as_ref());
+        let spec = spec_extras(record, &job, id_token_granted, oidc_context.as_ref());
 
         // Unhostable platform: no registered runner can ever take this job.
         // Deferred for needs-gated jobs — they park until their `if:` can be
@@ -480,7 +631,7 @@ fn submit_run_tx(
         if let Some(platform) = unhostable {
             insert_classified_job(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job,
                 &job_id,
@@ -507,7 +658,7 @@ fn submit_run_tx(
         if initially_skipped {
             insert_classified_job(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job,
                 &job_id,
@@ -533,7 +684,7 @@ fn submit_run_tx(
             && job.needs.is_empty()
             && let Some(reason) = crate::control::logic::unschedulable_reason(
                 &job.runs_on,
-                &pool_labels,
+                pool_labels,
                 runner_labels.iter().any(|labels| {
                     crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                 }),
@@ -548,7 +699,7 @@ fn submit_run_tx(
             );
             insert_classified_job(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job,
                 &job_id,
@@ -573,7 +724,7 @@ fn submit_run_tx(
         if held || record.fork_approval_pending || job.environment_gate.is_some() {
             insert_classified_job(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job,
                 &job_id,
@@ -587,7 +738,7 @@ fn submit_run_tx(
             jobs::insert_job_message(tx, run_id, &job_id, &job.message, &job.condition_context)?;
             mint_request(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job_id,
                 request,
@@ -615,7 +766,7 @@ fn submit_run_tx(
             };
             insert_classified_job(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job,
                 &job_id,
@@ -632,7 +783,7 @@ fn submit_run_tx(
             jobs::insert_job_message(tx, run_id, &job_id, &job.message, &job.condition_context)?;
             mint_request(
                 tx,
-                &namespace,
+                namespace,
                 run_id,
                 &job_id,
                 request,
@@ -647,7 +798,7 @@ fn submit_run_tx(
         // Ready path: evaluate the job gate, then enqueue.
         insert_classified_job(
             tx,
-            &namespace,
+            namespace,
             run_id,
             &job,
             &job_id,
@@ -696,7 +847,7 @@ fn submit_run_tx(
         // to the allocated id (the runner echoes it back on acquire).
         mint_request(
             tx,
-            &namespace,
+            namespace,
             run_id,
             &job_id,
             request,
@@ -706,6 +857,37 @@ fn submit_run_tx(
         inserted += 1;
         queued += 1;
     }
+
+    Ok(SubmitChunks {
+        active_by_base,
+        concluded,
+        inserted,
+        queued,
+    })
+}
+
+/// Phase 3 of [`LiteBackend::submit_run`]: the whole-run fixups that must
+/// see every committed chunk — terminal-job edge recompute, submit-time
+/// outputs, the promotion sweep, run status, outbox rows, and the persisted
+/// events the handler replays.
+fn submit_run_finalize(
+    tx: &Transaction<'_>,
+    backend: &LiteBackend,
+    proceed: &SubmitProceed,
+    chunks: SubmitChunks,
+) -> Result<SubmitOutcome, ControlError> {
+    let namespace: &str = &proceed.namespace;
+    let record: &crate::models::RunRecord = &proceed.record;
+    let run_id = proceed.run_id;
+    let mut held = proceed.held;
+    // `inserted` counts `jobs` rows (outbox detail); `queued` counts
+    // dispatchable jobs — `RunAccepted.queued_jobs` and the waiter wake.
+    let SubmitChunks {
+        mut concluded,
+        inserted,
+        queued,
+        ..
+    } = chunks;
 
     // Jobs inserted terminal (initially_skipped / unhostable) settle their
     // dependents' edges before promotion reads `remaining_needs = 0`. One
@@ -773,7 +955,7 @@ fn submit_run_tx(
     .map_err(db)?;
     jobs::emit_outbox(
         tx,
-        &namespace,
+        namespace,
         Some(run_id),
         "run.created.v1",
         serde_json::json!({"status": status_str(status), "jobs": inserted}),
@@ -781,7 +963,7 @@ fn submit_run_tx(
     if status.is_terminal() && !sweep_settled {
         jobs::emit_outbox(
             tx,
-            &namespace,
+            namespace,
             Some(run_id),
             "run.completed.v1",
             serde_json::json!({"status": status_str(status)}),

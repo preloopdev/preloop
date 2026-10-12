@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::expand::coerce_value;
-use crate::trigger::glob_match;
+use crate::trigger::{glob_match, matches_filter};
 use preloop_gha_protocol::JobId;
 
 #[test]
@@ -61,6 +61,180 @@ fn glob_match_single_star_does_not_cross_separators() {
     assert!(glob_match("docs/*.md", "docs/cli_reference.md"));
     assert!(!glob_match("docs/*.md", "docs/adr/0001-title.md"));
     assert!(glob_match("docs/**", "docs/adr/0001-title.md"));
+}
+
+/// Matching does not recurse per character, so a pattern of this length runs on a
+/// 2 MiB stack.
+#[test]
+fn glob_match_handles_very_long_patterns_on_a_small_stack() {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let literal = "a".repeat(30_000);
+            assert!(glob_match(&literal, &literal));
+            assert!(!glob_match(&literal, &literal[1..]));
+            assert!(!glob_match(&literal, &format!("{literal}b")));
+            assert!(glob_match(&format!("{literal}*"), &format!("{literal}bc")));
+            assert!(glob_match(&"?".repeat(30_000), &"é".repeat(30_000)));
+            assert!(!glob_match(&"?".repeat(30_000), &"x".repeat(29_999)));
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("glob_match panicked on a long pattern");
+}
+
+/// `**` may absorb any run, so a backtracking matcher would try exponentially many
+/// splits here before ruling out the missing `z`.
+#[test]
+fn glob_match_rejects_repeated_double_stars_without_exponential_search() {
+    assert!(glob_match(&"**a".repeat(32), &"a".repeat(64)));
+    assert!(!glob_match(
+        &format!("{}z", "**a".repeat(32)),
+        &"a".repeat(64)
+    ));
+}
+
+/// Wildcard-heavy patterns over long values stay polynomial.
+#[test]
+fn glob_match_wildcard_heavy_patterns_stay_polynomial() {
+    assert!(glob_match(&"*a".repeat(100), &"a".repeat(1_000)));
+    assert!(!glob_match(
+        &"*a".repeat(100),
+        &format!("{}b", "a".repeat(1_000))
+    ));
+}
+
+/// A `*` that cannot cross `/` must not make the matcher give up on an earlier
+/// `**` that can absorb the separator.
+#[test]
+fn glob_match_keeps_double_star_when_a_later_star_cannot_cross_slashes() {
+    assert!(glob_match("**/*c", "a/b/c"));
+    assert!(glob_match("**/*x", "a/b/c/x"));
+    assert!(glob_match("**/*/x", "a/b/c/x"));
+    assert!(glob_match("*/**/x", "a/b/x"));
+    assert!(!glob_match("*/**/x", "a/x"));
+    assert!(!glob_match("**/*c", "c"));
+    assert!(!glob_match("**/*c", "a/b/cd"));
+}
+
+/// Zero-length runs satisfy `*` and `**`, while `?` always consumes one character.
+#[test]
+fn glob_match_zero_width_wildcards() {
+    assert!(glob_match("", ""));
+    assert!(!glob_match("", "a"));
+    assert!(glob_match("*", ""));
+    assert!(glob_match("**", ""));
+    assert!(glob_match("a*b", "ab"));
+    assert!(glob_match("a**b", "ab"));
+    assert!(glob_match("a**", "a"));
+    assert!(glob_match("*a", "a"));
+    assert!(!glob_match("?", ""));
+    assert!(!glob_match("a?b", "ab"));
+}
+
+/// `?` stops at a separator the way `*` does, while `**` spans it.
+#[test]
+fn glob_match_question_mark_does_not_cross_separators() {
+    assert!(glob_match("a?b", "axb"));
+    assert!(!glob_match("a?b", "a/b"));
+    assert!(glob_match("a**b", "a/x/b"));
+}
+
+/// Matching compares Unicode scalar values, not bytes: `é` is one character to
+/// both `?` and a literal, and a literal `e` does not match it.
+#[test]
+fn glob_match_compares_unicode_scalar_values() {
+    assert!(glob_match("caf?", "café"));
+    assert!(!glob_match("caf??", "café"));
+    assert!(glob_match("?", "🙂"));
+    assert!(glob_match("*é", "cafeé"));
+    assert!(!glob_match("cafe*", "café"));
+    assert!(glob_match("ü/*", "ü/x"));
+}
+
+/// Include and `!` exclude patterns apply in order; the last pattern that matches
+/// decides.
+#[test]
+fn ordered_negation_lets_the_last_matching_pattern_decide() {
+    let filter = json!(["feature/**", "!feature/wip/**", "feature/wip/ready"]);
+    assert!(matches_filter(&filter, "feature/auth"));
+    assert!(!matches_filter(&filter, "feature/wip/draft"));
+    assert!(matches_filter(&filter, "feature/wip/ready"));
+
+    let filter = json!(["**", "!docs/**"]);
+    assert!(!matches_filter(&filter, "docs/readme.md"));
+    assert!(matches_filter(&filter, "src/lib.rs"));
+
+    let reordered = json!(["!docs/**", "**"]);
+    assert!(matches_filter(&reordered, "docs/readme.md"));
+}
+
+/// The recursive matcher that `glob_match` replaced, kept as a test oracle. It is
+/// exponential in the number of stars, so only tiny inputs go through it.
+fn glob_match_reference(pattern: &str, value: &str) -> bool {
+    fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
+        if pi == pattern.len() {
+            return vi == value.len();
+        }
+        if pattern[pi] == '*' {
+            let double_star = pattern.get(pi + 1) == Some(&'*');
+            let next_pi = if double_star { pi + 2 } else { pi + 1 };
+            if matches(pattern, value, next_pi, vi) {
+                return true;
+            }
+            let mut next_vi = vi;
+            while next_vi < value.len() {
+                if !double_star && value[next_vi] == '/' {
+                    break;
+                }
+                next_vi += 1;
+                if matches(pattern, value, next_pi, next_vi) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if pattern[pi] == '?' {
+            return vi < value.len() && value[vi] != '/' && matches(pattern, value, pi + 1, vi + 1);
+        }
+        vi < value.len() && pattern[pi] == value[vi] && matches(pattern, value, pi + 1, vi + 1)
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    matches(&pattern, &value, 0, 0)
+}
+
+/// Every pattern of up to five characters from `*`, `?`, `/` and `a`, against every
+/// value of up to five characters from `a`, `/` and `é`.
+#[test]
+fn glob_match_agrees_with_the_recursive_reference_on_small_inputs() {
+    fn strings_up_to(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..max_len {
+            let mut longer = Vec::with_capacity(layer.len() * alphabet.len());
+            for prefix in &layer {
+                for &c in alphabet {
+                    longer.push(format!("{prefix}{c}"));
+                }
+            }
+            all.extend_from_slice(&longer);
+            layer = longer;
+        }
+        all
+    }
+
+    let patterns = strings_up_to(&['*', '?', '/', 'a'], 5);
+    let values = strings_up_to(&['a', '/', 'é'], 5);
+    for pattern in &patterns {
+        for value in &values {
+            assert_eq!(
+                glob_match(pattern, value),
+                glob_match_reference(pattern, value),
+                "pattern {pattern:?} against value {value:?}"
+            );
+        }
+    }
 }
 
 /// `match_event` is the single source of truth; `matches_with_context` is its

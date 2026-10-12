@@ -8,6 +8,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+
+### Added
+
+- **Self-built pull-request test merges**: a local `preloop run --event
+  pull_request` now tests the merge of the pull request's *current* base tip
+  into the workspace head (the synthetic snapshot commit when the tree is
+  dirty), exactly like GitHub's `refs/pull/<n>/merge`, instead of the branch
+  alone. The engine fetches the base branch from the workspace's `origin`,
+  builds the merge with `git merge-tree`/`git commit-tree`, and serves it to
+  the run's jobs from an engine-served snapshot repository (the commit exists
+  only here). `github.sha` is the merge commit, `github.ref` stays
+  `refs/pull/<n>/merge`, and the payload's `base.sha`/`head.sha` carry the
+  fetched base tip and the merged head, so changed-file actions keep diffing
+  the user's changes. A conflicted pull request fails the submission (409)
+  listing the conflicted files, exactly where GitHub refuses to run
+  `pull_request` workflows; an unreachable base fails loudly instead of
+  testing a different tree. `--no-merge` restores testing the branch alone,
+  and `push` events are unchanged (they test the commit itself). The server
+  also validates and serves prebuilt merges for other submission paths.
+
+### Fixed
+
+- **Expression depth no longer rejects sibling-heavy expressions**: the
+  nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
+  against one counter that was never unwound, so `format('{0}', github.ref, …)`
+  with 128 arguments failed with `TooDeep`. Depth is now tracked per subtree
+  (a leaf is 1; every node is one deeper than its deepest child), so siblings
+  add nothing, and a node over the ceiling is refused before it is built —
+  including a call wrapped around a deep index chain, which previously slipped
+  through.
+- **Needs cycle detection and `on:` filter matching no longer recurse per
+  job or per character**: `detect_needs_cycle` walks an explicit stack, and
+  glob matching is an iterative NFA in O(pattern × value) instead of recursive
+  backtracking whose work grows exponentially with the number of `*`.
+- **Composite actions carry nesting depth through every re-entry**: `./`
+  fallbacks and remote composite references restarted the depth at zero, so a
+  self-referencing composite was not stopped by the 10-level cap.
+- **Golden unpacks wait for disk instead of filling it, and failed unpacks
+  clean up after themselves**: unpacking a packed golden writes several times
+  the pack's size before smolvm's own layer preflight runs, and a failed
+  attempt left ~29 GB of `pack/` intermediates that survived every retry
+  until a restart's stale-machine sweep happened to claim them — enough to
+  fill a volume at 100% on a loop. The unpack now stalls behind the same
+  disk-wait discipline as job VMs when the volume lacks
+  `PRELOOP_GOLDEN_UNPACK_FACTOR` (default 6) times the pack's compressed
+  size, and the check serializes against the extraction it gates so two
+  goldens cannot commit the same free bytes. Failure cleanup reaches the
+  unregistered data dir a create that died mid-extraction leaves (no
+  `storage.raw`, no registry row, invisible to `delete`), then the named
+  machine's own `pack/`; the startup sweep prunes residue a crashed delete
+  left inside registered machines.
+- **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
+  process**: the env-selected backend handed each caller a fresh empty store,
+  so a config write sealed `[secrets]` under a key stored in a store instance
+  that vanished with the caller — the next read resolved a different key and
+  failed with `store envelope authentication failed`. The memory backend is
+  now one process-wide store, matching the shared `os`/`file` behavior;
+  explicit `MemoryCredentialStore::default()` instances stay per-instance for
+  test isolation.
+
+- **A pool failure no longer takes the engine down**: `RunnerPool::run`
+  already tears every machine down on the way out, so when its task returned
+  an error the engine now rebuilds the pool on an exponential backoff (1 s,
+  doubling to a 5-minute ceiling) instead of exiting. Each generation runs
+  on a fresh child shutdown token — the pool cancels the token it is handed
+  when a slot ends, which would otherwise kill the replacement instantly —
+  the backoff only resets after a run that finished preparing and reached
+  steady state, and the HTTP server and shutdown signal stay in the backoff
+  race so a dead server stops the engine instead of spawning a pool for
+  nothing.
+- **A refused machine delete no longer leaves a live VM**: `smolvm machine
+  delete -f` declines to stop a guest whose agent cannot confirm a safe
+  shutdown ("left the VM alive for retry"), which stranded the detached
+  hypervisor holding `storage.raw`/`overlay.raw` open — and on macOS its
+  `pack/layers-cs` mount — until the next orphan purge happened to reach it.
+  The delete path now SIGKILLs only that machine's hypervisor (attributed by
+  the boot-config path in its argv, never a neighboring machine's), retries
+  the delete, and detaches an orphaned layer mount if one remains.
+
 ## [0.34.0] - 2026-10-09
 
 ### Changed
@@ -136,7 +215,6 @@ Releases before v0.27.0 predate the changelog.
   Rerun context updates `github.triggering_actor` while retaining the
   original `github.actor`; migration `V2026100508__job_request_links` carries
   the nullable columns forward.
-
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
   `environment:` are read from the repository's environments API —
@@ -181,6 +259,17 @@ Releases before v0.27.0 predate the changelog.
   last request.
 
 ### Changed
+
+- **Postgres completions no longer load the run graph**: `settle_job` and
+  `complete_job` write the terminal transition, retire the attempt, fail-fast
+  the siblings, fold reusable callers, refresh the dependents'
+  `remaining_needs` and summarize the run with targeted statements. The graph
+  is materialized only when a completion actually makes a dependent
+  promotable — promotion (needs hydration, gates, max-parallel cohorts,
+  deferred expansion) still runs the shared sweep — so a leg of a large
+  fan-out settles without touching the rest of the run. Fail-fast now cancels
+  every non-terminal sibling of the base, releasing its concurrency hold and
+  queueing the runner cancellation, matching the SQLite path.
 
 - Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
   ready-queue priority over older automatic jobs; Pullfrog reviews run only on
@@ -227,6 +316,15 @@ Releases before v0.27.0 predate the changelog.
   `namespace_limits.max_job_timeout_minutes`/`priority_tier`/
   `run_history_retention_days`, `namespace_policies`) stay and are marked
   platform-owned in the schema.
+
+### Fixed
+
+- Local pull-request base selection now queries `git ls-remote --symref` when
+  the local remote-`HEAD` symbolic ref is absent. The resolved target is
+  reflected in both `github.base_ref` and the synthetic event payload; an
+  explicit base remains the override. Valid prebuilt merges bypass local base
+  discovery, and fetch-by-SHA merges resolve the requested commit instead of
+  the mirror's shared `FETCH_HEAD`.
 
 ### Security
 
@@ -295,6 +393,33 @@ Releases before v0.27.0 predate the changelog.
   arrives without CI, because GitHub starts no workflow runs for events the
   workflow's own token creates; the PR body says how to run the checks.
 
+- **Workspace snapshots publish again when `/tmp` is a different filesystem**:
+  the snapshot was staged in the process temp directory and published into the
+  state directory with `rename(2)`, which the kernel refuses across mounts
+  (`EXDEV`). On the common production layout — tmpfs `/tmp` over an LVM/ext4
+  state volume — every local submission's snapshot failed to publish, so the
+  run fell back to a checkout of a commit the forge has never seen and its jobs
+  died in setup (exit 2). Staging now lives under `state/snapshots/.staging`,
+  on the destination's own filesystem by construction; a publish that still
+  crosses devices copies into the destination directory and renames from there
+  (keeping the publish atomic); a failed publish is logged at error level with
+  the OS error and both paths; and a local submission whose snapshot cannot be
+  created is refused with that reason instead of being queued. Abandoned
+  staging trees are collected at startup.
+- **Engine shutdown stops the VMs it owns and never leaves a layer image
+  mounted**: a shutdown signal that arrived while the runner pool was still
+  preparing its golden or provisioning a runner did not reach the pool's
+  teardown, so the CLI's bounded stop aborted the pool mid-flight and exited
+  with the microVM still running — and, on macOS, its `pack/layers-cs` APFS
+  image still mounted, which made the Preloop home impossible to remove
+  (`rm -rf` → `Resource busy`) until the host rebooted. The pool now observes
+  the shutdown token at every preparation and provisioning await and tears
+  down on every exit path (slot failures and a failed artifact build
+  included); startup, shutdown, and process exit reap orphaned `_boot-vm`
+  hypervisors and detach the layer mounts no live hypervisor claims, matching
+  this home's machine data root by path component so a neighboring home is
+  never touched; and an AgentENV start cancelled mid-flight records or
+  deletes the server-assigned sandbox instead of leaving it to its TTL.
 - **A push to a pull request no longer piles up golden bakes**:
   `official-golden.yml` now runs under a per-PR concurrency group with
   `cancel-in-progress` for `pull_request` runs only, so a superseded push
@@ -608,6 +733,20 @@ Releases before v0.27.0 predate the changelog.
   its own stub. The action-resolution test now pins the behavior
   `#351` introduced: the PAT follows the *configured* GitHub origin, and never
   follows a request to an unconfigured origin.
+- **`github.ref_protected` reports the real branch, not a constant**: the
+  webhook, dispatch and scheduler adapters now resolve branch protection
+  (rulesets included) through the forge API and carry it into the runner's
+  `GITHUB_REF_PROTECTED` environment variable and the OIDC `ref_protected`
+  claim. Previously every run reported `false`, so a protected-branch push
+  looked unprotected to tools that key on it — kache, for one, publishes
+  remote cache entries only from protected-branch pushes, which left its
+  remote cache unwritten and every later lookup a miss. Non-branch refs
+  (tags — even ones a tag ruleset protects — and `refs/pull/*`) stay `false`
+  and are never looked up; an unresolved lookup falls back to `false`, the
+  unprivileged answer. The value is engine-resolved only — a native
+  submission cannot assert it — and a branch is looked up under its exact,
+  URL-encoded name, so `release#test` never answers with `release`'s
+  protection.
 
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
@@ -694,6 +833,24 @@ Releases before v0.27.0 predate the changelog.
 - **Empty broker polls are no longer read as messages**: a `200` with a
   `null` body was treated as a message with id 0 and type `unknown`. It is
   now an empty poll, as in the official listener.
+
+### Changed
+
+- **Control-plane CI stops installing lld and PostgreSQL with apt**: the
+  three `control` jobs now link against the runner image's own `ld.lld-18`
+  (only the unversioned `ld.lld` name expected by `-fuse-ld=lld` was missing)
+  and run PostgreSQL from a container —
+  `mirror.gcr.io/library/postgres:<major>`, `--network host`, trust auth on
+  loopback, `max_connections=400` for the two-node race tests. Both
+  `apt-get update` passes and the pgdg repository are gone: measured on the
+  engine, the lld link plus container start takes 13–26 s per `control` job,
+  where the apt install plus cluster start took 33–38 s.
+
+- **Read-only kache jobs skip the remote push**: kache publishes only from
+  protected-branch pushes, so a pull-request job's post step listed all
+  27,090 remote keys and uploaded nothing — 17–19 s per job. `save-cache` is
+  now tied to `github.event_name == 'push'` in every kache step (`ci.yml`'s
+  four jobs and the server-conformance job).
 
 ## [0.33.9] - 2026-10-02
 
