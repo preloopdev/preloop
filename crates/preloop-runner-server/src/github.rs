@@ -2613,8 +2613,7 @@ enum MergeProbe {
 /// head.
 async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget) -> MergeProbe {
     let api_base = github_api_base();
-    let (token, bucket) = match crate::github_app::select_app_for_repo(shared, &target.repo).await
-    {
+    let (token, bucket) = match crate::github_app::select_app_for_repo(shared, &target.repo).await {
         Some(app) => {
             let permissions = BTreeMap::from([
                 ("contents".to_owned(), "read".to_owned()),
@@ -2631,14 +2630,15 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
                 Ok(token) => {
                     // The installation id is the rate-limit identity; never
                     // invent one (same convention as check runs).
-                    let bucket = match crate::github_app::installation_for_repo(&app, &target.repo)
-                        .await
-                    {
-                        Ok(installation) if installation != 0 => {
-                            crate::github_breaker::GithubCredentialBucket::Installation(installation)
-                        }
-                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
-                    };
+                    let bucket =
+                        match crate::github_app::installation_for_repo(&app, &target.repo).await {
+                            Ok(installation) if installation != 0 => {
+                                crate::github_breaker::GithubCredentialBucket::Installation(
+                                    installation,
+                                )
+                            }
+                            _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                        };
                     (Some(token), bucket)
                 }
                 Err(error) => {
