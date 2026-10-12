@@ -27,6 +27,23 @@ Releases before v0.27.0 predate the changelog.
   testing a different tree. `--no-merge` restores testing the branch alone,
   and `push` events are unchanged (they test the commit itself). The server
   also validates and serves prebuilt merges for other submission paths.
+- **Hosted dirty submits**: `preloop run --push` on a dirty working tree now
+  creates a real commit C in a private index (the branch, index and working
+  tree never move; a tracked file that an ignore rule now matches stays in
+  C), uploads it to the engine as a git bundle and tests exactly C — or, for
+  `--event pull_request`, the merge of C with the freshly fetched base tip.
+  After success C is published, its checks attach to C, and `--create-pr`
+  opens the pull request. The bundle carries only C and, for a pull request,
+  the base tip (never every local ref), streams to disk under a 512 MiB cap,
+  is single-use, and is deleted as soon as the submission is accepted or
+  refused; unsubmitted uploads are swept after an hour. Webhook echoes of the
+  publish (the branch `push`, and the `pull_request` that opening or updating
+  its PR emits) are deduplicated against the published head, while
+  `pull_request_target`, manual dispatches and other later events at the same
+  head still run. Auto-PR requires webhook delivery provenance, so a native
+  submission cannot trigger it. The local branch moves only after a
+  successful push, on confirmation, when the working tree still matches the
+  submitted tree by content.
 
 ### Fixed
 
