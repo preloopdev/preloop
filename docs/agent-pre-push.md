@@ -59,21 +59,24 @@ Install a tagged release and verify it before an agent uses it:
    preloop run -f <file> --job <job> --event pull_request --base <target> --strict-secrets < /dev/null
    ```
 
-   `<target>` is the branch the pull request will target, for example
-   `origin/main`. It sets the diff for `paths:` filters and the branch for
-   `branches:` filters, so a wrong base runs the wrong set of checks.
-   `< /dev/null` keeps the run non-interactive: with a terminal on stdin, a
-   failed job pauses for a debug session and the command waits for a verdict.
-   `--job` also runs the job's `needs:` closure, so check the plan for deploy
-   jobs in that closure too. Use `--event push` for workflows that only
-   trigger on push. A local run does not invent pull request fields such as
-   the number, labels, or review state. If the job or its steps read them in
-   an `if:`, pass a payload with `--payload <file>` or leave that job to CI;
-   otherwise a skipped step can turn the job green. `--strict-secrets` fails the run before it starts when the
-   workflow reads a secret this engine has not stored. The check reads every
-   job in the file, including jobs that `--job` leaves out. When it fails on a
-   secret that only a skipped job reads, run the check job without
-   `--strict-secrets` and read the warning it prints.
+   - `<target>` is the branch the pull request will target, for example
+     `origin/main`. It sets the diff for `paths:` filters and the branch for
+     `branches:` filters, so a wrong base runs the wrong set of checks.
+   - `< /dev/null` keeps the run non-interactive. With a terminal on stdin, a
+     failed job pauses for a debug session and the command waits for a
+     verdict.
+   - `--job` also runs the job's `needs:` closure, so check the plan for
+     deploy jobs in that closure too.
+   - Use `--event push` for workflows that only trigger on push.
+   - A local run does not invent pull request fields such as the number,
+     labels, or review state. If the job or its steps read them in an `if:`,
+     pass a payload with `--payload <file>` or leave that job to CI.
+     Otherwise a skipped step can turn the job green.
+   - `--strict-secrets` fails the run before it starts when the workflow reads
+     a secret this engine has not stored. The check reads every job in the
+     file, including jobs that `--job` leaves out. When it fails on a secret
+     that only a skipped job reads, run the check job without
+     `--strict-secrets` and read the warning it prints.
 5. **On a failure:**
    - Read the failed job's log: `preloop logs --job <job>`.
    - To inspect the failed VM, run the job again with `--preserve-on-failure`
