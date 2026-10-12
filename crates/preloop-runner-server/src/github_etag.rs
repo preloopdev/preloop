@@ -136,7 +136,9 @@ pub async fn send_conditional_get(
     let key = (bucket, built.url().as_str().to_owned());
     let cached = cache.get(&key);
     if let Some(entry) = &cached {
-        built.headers_mut().insert(IF_NONE_MATCH, entry.etag.clone());
+        built
+            .headers_mut()
+            .insert(IF_NONE_MATCH, entry.etag.clone());
     }
     let response = send_observed_labeled(
         registry,
@@ -274,9 +276,17 @@ mod tests {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (base, seen) = serve(|if_none_match, _| {
             if if_none_match.as_deref() == Some("\"v1\"") {
-                (304, vec![("content-length", "4096".to_owned())], String::new())
+                (
+                    304,
+                    vec![("content-length", "4096".to_owned())],
+                    String::new(),
+                )
             } else {
-                (200, vec![("etag", "\"v1\"".to_owned())], String::from_utf8_lossy(BODY).into_owned())
+                (
+                    200,
+                    vec![("etag", "\"v1\"".to_owned())],
+                    String::from_utf8_lossy(BODY).into_owned(),
+                )
             }
         })
         .await;
@@ -426,7 +436,10 @@ mod tests {
         assert!(!b.from_cache);
         assert_eq!(b.body, Bytes::from_static(b"body for b"));
         let last = seen.lock().last().cloned().flatten();
-        assert_eq!(last, None, "the PAT bucket must not reuse installation 1's validator");
+        assert_eq!(
+            last, None,
+            "the PAT bucket must not reuse installation 1's validator"
+        );
 
         let again = harness.get(installation, &url, "token-a").await;
         assert!(again.from_cache);
@@ -480,12 +493,19 @@ mod tests {
     #[test]
     fn oversized_bodies_are_not_kept_and_drop_the_stale_copy() {
         let cache = EtagCache::default();
-        let key = (GithubCredentialBucket::Pat, "https://api.example/big".to_owned());
+        let key = (
+            GithubCredentialBucket::Pat,
+            "https://api.example/big".to_owned(),
+        );
         let etag = HeaderValue::from_static("\"v\"");
         cache.store(key.clone(), etag.clone(), Bytes::from_static(b"small"));
         assert!(cache.get(&key).is_some());
 
-        cache.store(key.clone(), etag, Bytes::from(vec![0u8; MAX_BODY_BYTES + 1]));
+        cache.store(
+            key.clone(),
+            etag,
+            Bytes::from(vec![0u8; MAX_BODY_BYTES + 1]),
+        );
         assert!(
             cache.get(&key).is_none(),
             "a stale copy must not outlive a 200 that cannot be kept"

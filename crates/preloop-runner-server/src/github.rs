@@ -868,17 +868,9 @@ async fn send_queued_check_run(
         // check from another workflow or app.
         let external_id = check_run_external_id(update);
         let app_id = check_run_app_id(shared, repo, token).await;
-        check_run_id = find_existing_check_run(
-            shared,
-            bucket,
-            token,
-            repo,
-            sha,
-            name,
-            app_id,
-            &external_id,
-        )
-        .await?;
+        check_run_id =
+            find_existing_check_run(shared, bucket, token, repo, sha, name, app_id, &external_id)
+                .await?;
         if let Some(id) = check_run_id {
             persist_check_run_id(shared, owner, update, id).await?;
         }
@@ -6316,7 +6308,11 @@ jobs:
                 );
             }
             if method == "GET" && path.starts_with("/app/installations/") {
-                return (200, vec![], serde_json::json!({"account": {"login": "owner"}}));
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"account": {"login": "owner"}}),
+                );
             }
             if method == "GET" && path.contains("commits/") {
                 let existing = serde_json::json!({"total_count": 1, "check_runs": [{
