@@ -1582,3 +1582,29 @@ fn proxy_setup_line_strips_userinfo() {
     let plain = proxy_setup_line("ts", "HTTPS", "https://proxy.example:8443");
     assert!(plain.contains("https://proxy.example:8443"), "{plain}");
 }
+
+#[test]
+fn proxy_password_is_masked_in_job_logs() {
+    // #395, ADR 0263: "A password provided for a proxy will be masked in the
+    // logs." Job start registers the password as the official `HostContext`
+    // does, so neither the setup line nor a step echoing the inherited proxy
+    // URL carries it in cleartext.
+    let proxy = "http://proxyuser:s3cr3t-pw@proxy.corp:8080";
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    for mask in proxy_password_masks(|name| (name == "https_proxy").then(|| proxy.to_string())) {
+        job.add_mask(&mask);
+    }
+
+    let setup = job.mask_secrets(&proxy_setup_line("ts", "HTTPS", proxy));
+    assert_eq!(
+        setup,
+        "ts Runner is running behind proxy server 'http://proxy.corp:8080' for all HTTPS requests."
+    );
+    let echoed = job.mask_secrets(&format!("proxy: {proxy}"));
+    assert_eq!(echoed, "proxy: http://proxyuser:***@proxy.corp:8080");
+}

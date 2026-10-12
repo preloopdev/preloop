@@ -1218,11 +1218,24 @@ pub(crate) async fn wait_for_daemon_ready(log: &mut Vec<String>) -> Result<()> {
     }
 }
 
+/// Mask proxy passwords in a docker command line bound for the runner's own
+/// diagnostic log. `docker create` inlines `-e HTTPS_PROXY=<url>` (see
+/// [`inject_proxy_env`]), and tracing output does not pass through the job
+/// masks the step log gets.
+fn mask_proxy_passwords(command_line: &str) -> String {
+    let masks = super::steps_runner::proxy_password_masks(|name| std::env::var(name).ok());
+    preloop_gha_protocol::masking::mask_secrets_transform_aware(
+        command_line,
+        masks.iter().map(String::as_str),
+        &[],
+    )
+}
+
 /// Run a docker command, logging the command line, and return stdout lines.
 async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
     let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
     log.push(format!("##[command]{cmd_line}"));
-    debug!("docker {}", args.join(" "));
+    debug!("docker {}", mask_proxy_passwords(&args.join(" ")));
 
     let result = process::invoke(
         "docker",
@@ -1263,7 +1276,7 @@ async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>>
 async fn docker_cmd_stdout(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
     let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
     log.push(format!("##[command]{cmd_line}"));
-    debug!("docker {}", args.join(" "));
+    debug!("docker {}", mask_proxy_passwords(&args.join(" ")));
 
     let result = process::invoke(
         "docker",
@@ -2008,6 +2021,38 @@ mod tests {
         assert_eq!(
             env_arg_values(&args, "HTTP_PROXY"),
             ["http://proxy.example:3128"]
+        );
+    }
+
+    /// #395: the `docker create` command line echoed into the "Initialize
+    /// containers" log inlines the host proxy URL. With the password
+    /// registered as a job mask it reads `user:***@host`, the official
+    /// runner's masked shape.
+    #[test]
+    fn docker_create_command_line_masks_the_proxy_password() {
+        let proxy = "http://proxyuser:s3cr3t-pw@proxy.corp:8080";
+        let lookup = |name: &str| (name == "HTTPS_PROXY").then(|| proxy.to_string());
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        for mask in super::super::steps_runner::proxy_password_masks(lookup) {
+            job.add_mask(&mask);
+        }
+        let mut args = vec!["create".to_string(), "--name".into(), "job".into()];
+        inject_proxy_env_lookup(&mut args, &HashMap::new(), None, lookup);
+
+        let command = job.mask_secrets(&format!("##[command]/usr/bin/docker {}", args.join(" ")));
+        assert!(!command.contains("s3cr3t-pw"), "{command}");
+        assert!(
+            command.contains("-e HTTPS_PROXY=http://proxyuser:***@proxy.corp:8080"),
+            "{command}"
+        );
+        assert!(
+            command.contains("-e https_proxy=http://proxyuser:***@proxy.corp:8080"),
+            "{command}"
         );
     }
 

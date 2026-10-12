@@ -159,6 +159,32 @@ fn proxy_setup_line(ts: &str, scheme: &str, proxy: &str) -> String {
     format!("{ts} Runner is running behind proxy server '{shown}' for all {scheme} requests.")
 }
 
+/// Mask values for the passwords of the authenticated proxies in the
+/// environment (ADR 0263: "A password provided for a proxy will be masked in
+/// the logs").
+///
+/// The official runner registers `HttpProxyPassword`/`HttpsProxyPassword`
+/// with its secret masker at host start (`HostContext`). Every job log line
+/// that carries the proxy URL, such as the `docker create -e HTTPS_PROXY=…`
+/// command line or a step echoing `$HTTPS_PROXY`, then reads
+/// `user:***@host`. Both casings are read because steps and containers
+/// inherit both. The environment sits behind `lookup` for tests.
+pub(crate) fn proxy_password_masks(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut masks = Vec::new();
+    for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+        for mask in lookup(name)
+            .as_deref()
+            .map(preloop_gha_protocol::masking::url_password_masks)
+            .unwrap_or_default()
+        {
+            if !masks.contains(&mask) {
+                masks.push(mask);
+            }
+        }
+    }
+    masks
+}
+
 /// Run all steps sequentially, returning the job conclusion.
 ///
 /// Watches `cancel_rx` — when it becomes `true`, the current step is abandoned
@@ -273,7 +299,7 @@ pub async fn run_steps(
         setup_lines.push(format!("{ts} Prepare all required actions"));
         setup_lines.push(format!("{ts} Complete job name: {}", job.job_name));
 
-        let setup_content = setup_lines.join("\n");
+        let setup_content = job.mask_secrets(&setup_lines.join("\n"));
         {
             let mut q = queue.lock().await;
             q.record_step_logs(&setup_step_id, &setup_content);
@@ -326,6 +352,11 @@ pub async fn run_steps(
             init_logs.push(format!("##[error]{error:#}"));
         }
 
+        // The `##[command]` lines echo `docker create` in full, including
+        // inlined `-e KEY=VALUE` env such as the proxy URLs, so the step log
+        // goes through the job masks like every other log path.
+        let init_content = job.mask_secrets(&init_logs.join("\n"));
+
         let init_end = crate::worker::helpers::iso_now();
         let init_conclusion = if init_result.is_ok() {
             step_conclusion::SUCCEEDED
@@ -348,14 +379,13 @@ pub async fn run_steps(
             });
             // Attach init logs to synthetic step
             if !init_logs.is_empty() {
-                q.record_step_logs(&init_step_id, &init_logs.join("\n"));
+                q.record_step_logs(&init_step_id, &init_content);
             }
         }
         if let Some(rpt) = reporting {
             // Upload init container logs
             if !init_logs.is_empty() {
-                let content = init_logs.join("\n");
-                crate::worker::reporting::upload_step_log(rpt, &init_step_id, &content).await;
+                crate::worker::reporting::upload_step_log(rpt, &init_step_id, &init_content).await;
             }
         }
 
