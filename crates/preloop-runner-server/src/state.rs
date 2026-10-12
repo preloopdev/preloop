@@ -787,6 +787,9 @@ pub struct AppState {
     /// records here; the unlabeled [`crate::github_breaker::send_observed`]
     /// covers only pre-`AppState` bootstrap reads and records nothing.
     pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
+    /// Validators and bodies of recent GitHub `200`s for conditional reads
+    /// (`If-None-Match`). Keyed by credential bucket; see [`crate::github_etag`].
+    pub github_etags: Arc<crate::github_etag::EtagCache>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
     pub webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
@@ -1571,6 +1574,7 @@ impl AppState {
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
             github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
+            github_etags: Arc::new(crate::github_etag::EtagCache::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             observability: preloop_observability::Observability::noop(),
