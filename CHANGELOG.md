@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+
+### Added
+
+- **Self-built pull-request test merges**: a local `preloop run --event
+  pull_request` now tests the merge of the pull request's *current* base tip
+  into the workspace head (the synthetic snapshot commit when the tree is
+  dirty), exactly like GitHub's `refs/pull/<n>/merge`, instead of the branch
+  alone. The engine fetches the base branch from the workspace's `origin`,
+  builds the merge with `git merge-tree`/`git commit-tree`, and serves it to
+  the run's jobs from an engine-served snapshot repository (the commit exists
+  only here). `github.sha` is the merge commit, `github.ref` stays
+  `refs/pull/<n>/merge`, and the payload's `base.sha`/`head.sha` carry the
+  fetched base tip and the merged head, so changed-file actions keep diffing
+  the user's changes. A conflicted pull request fails the submission (409)
+  listing the conflicted files, exactly where GitHub refuses to run
+  `pull_request` workflows; an unreachable base fails loudly instead of
+  testing a different tree. `--no-merge` restores testing the branch alone,
+  and `push` events are unchanged (they test the commit itself). The server
+  also validates and serves prebuilt merges for other submission paths.
+
 ### Fixed
 
 - **Expression depth no longer rejects sibling-heavy expressions**: the
@@ -39,6 +59,33 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
+  process**: the env-selected backend handed each caller a fresh empty store,
+  so a config write sealed `[secrets]` under a key stored in a store instance
+  that vanished with the caller — the next read resolved a different key and
+  failed with `store envelope authentication failed`. The memory backend is
+  now one process-wide store, matching the shared `os`/`file` behavior;
+  explicit `MemoryCredentialStore::default()` instances stay per-instance for
+  test isolation.
+
+- **A pool failure no longer takes the engine down**: `RunnerPool::run`
+  already tears every machine down on the way out, so when its task returned
+  an error the engine now rebuilds the pool on an exponential backoff (1 s,
+  doubling to a 5-minute ceiling) instead of exiting. Each generation runs
+  on a fresh child shutdown token — the pool cancels the token it is handed
+  when a slot ends, which would otherwise kill the replacement instantly —
+  the backoff only resets after a run that finished preparing and reached
+  steady state, and the HTTP server and shutdown signal stay in the backoff
+  race so a dead server stops the engine instead of spawning a pool for
+  nothing.
+- **A refused machine delete no longer leaves a live VM**: `smolvm machine
+  delete -f` declines to stop a guest whose agent cannot confirm a safe
+  shutdown ("left the VM alive for retry"), which stranded the detached
+  hypervisor holding `storage.raw`/`overlay.raw` open — and on macOS its
+  `pack/layers-cs` mount — until the next orphan purge happened to reach it.
+  The delete path now SIGKILLs only that machine's hypervisor (attributed by
+  the boot-config path in its argv, never a neighboring machine's), retries
+  the delete, and detaches an orphaned layer mount if one remains.
 
 ### Changed
 
@@ -211,7 +258,6 @@ Releases before v0.27.0 predate the changelog.
   Rerun context updates `github.triggering_actor` while retaining the
   original `github.actor`; migration `V2026100508__job_request_links` carries
   the nullable columns forward.
-
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
   `environment:` are read from the repository's environments API —
@@ -303,6 +349,15 @@ Releases before v0.27.0 predate the changelog.
   `run_history_retention_days`, `namespace_policies`) stay and are marked
   platform-owned in the schema.
 
+### Fixed
+
+- Local pull-request base selection now queries `git ls-remote --symref` when
+  the local remote-`HEAD` symbolic ref is absent. The resolved target is
+  reflected in both `github.base_ref` and the synthetic event payload; an
+  explicit base remains the override. Valid prebuilt merges bypass local base
+  discovery, and fetch-by-SHA merges resolve the requested commit instead of
+  the mirror's shared `FETCH_HEAD`.
+
 ### Security
 
 - **A job never receives the control-plane runtime token as its
@@ -370,6 +425,19 @@ Releases before v0.27.0 predate the changelog.
   arrives without CI, because GitHub starts no workflow runs for events the
   workflow's own token creates; the PR body says how to run the checks.
 
+- **Workspace snapshots publish again when `/tmp` is a different filesystem**:
+  the snapshot was staged in the process temp directory and published into the
+  state directory with `rename(2)`, which the kernel refuses across mounts
+  (`EXDEV`). On the common production layout — tmpfs `/tmp` over an LVM/ext4
+  state volume — every local submission's snapshot failed to publish, so the
+  run fell back to a checkout of a commit the forge has never seen and its jobs
+  died in setup (exit 2). Staging now lives under `state/snapshots/.staging`,
+  on the destination's own filesystem by construction; a publish that still
+  crosses devices copies into the destination directory and renames from there
+  (keeping the publish atomic); a failed publish is logged at error level with
+  the OS error and both paths; and a local submission whose snapshot cannot be
+  created is refused with that reason instead of being queued. Abandoned
+  staging trees are collected at startup.
 - **Engine shutdown stops the VMs it owns and never leaves a layer image
   mounted**: a shutdown signal that arrived while the runner pool was still
   preparing its golden or provisioning a runner did not reach the pool's
