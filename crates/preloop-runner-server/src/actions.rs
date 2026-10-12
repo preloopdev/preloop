@@ -474,7 +474,11 @@ pub async fn download_action_tarball(
         Ok(response) => response,
         // A tripped breaker fails fast with 503 instead of queueing behind
         // the outage; runners retry the download on the next attempt.
-        Err(error) if error.downcast_ref::<crate::github_breaker::BreakerOpen>().is_some() => {
+        Err(error)
+            if error
+                .downcast_ref::<crate::github_breaker::BreakerOpen>()
+                .is_some() =>
+        {
             return Err(ApiError::service_unavailable(format!(
                 "GitHub is temporarily unavailable: {error:#}"
             )));
@@ -1848,7 +1852,8 @@ mod tests {
             .expect_err("breaker-open must fail fast");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            err.message().starts_with("GitHub is temporarily unavailable"),
+            err.message()
+                .starts_with("GitHub is temporarily unavailable"),
             "unexpected error: {}",
             err.message()
         );

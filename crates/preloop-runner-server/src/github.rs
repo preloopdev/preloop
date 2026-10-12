@@ -3882,7 +3882,10 @@ fn webhook_delivery_bucket(delivery: &WebhookDeliveryRecord) -> GithubCredential
     serde_json::from_slice::<Value>(&delivery.payload)
         .ok()
         .and_then(|payload| payload["installation"]["id"].as_u64())
-        .map_or(GithubCredentialBucket::Pat, GithubCredentialBucket::Installation)
+        .map_or(
+            GithubCredentialBucket::Pat,
+            GithubCredentialBucket::Installation,
+        )
 }
 
 /// Process one claimed delivery and update its state according to the failure taxonomy.
