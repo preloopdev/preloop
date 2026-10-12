@@ -189,6 +189,40 @@ fn finalize_reusable_callers(
     Ok(finalized)
 }
 
+/// [`finalize_reusable_callers`] for jobs that settled without a completion (a
+/// promotion cascade, a failed or empty expansion): the last open inner job of
+/// a caller's subtree may be one of them. A caller folded here may itself
+/// complete the run, so the run is re-summarized and concluded like any other
+/// settle does. Returns whether a caller folded; its dependents are then left
+/// for the next promotion pass.
+pub(super) fn fold_settled_callers(
+    tx: &Transaction<'_>,
+    backend: &LiteBackend,
+    run_id: RunId,
+) -> Result<bool, ControlError> {
+    if finalize_reusable_callers(tx, backend, run_id)?.is_empty() {
+        return Ok(false);
+    }
+    let status_before: Option<String> = tx
+        .prepare_cached("SELECT status FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| row.get(0))
+        .optional()
+        .map_err(db)?;
+    let summary = jobs::summarize_run_row(tx, run_id)?;
+    if summary.is_terminal() && status_before.as_deref() != Some("completed") {
+        settle::release_concurrency_for_run(tx, backend, run_id)?;
+        jobs::emit_outbox(
+            tx,
+            jobs::namespace_of(tx, run_id)?.as_str(),
+            Some(run_id),
+            "run.completed.v1",
+            serde_json::json!({"status": status_str(summary)}),
+        )?;
+    }
+    Ok(true)
+}
+
 /// `complete_node` (pg dispatch.rs): apply one terminal completion —
 /// first-verdict rule, outputs/annotations, request retirement, gate
 /// release, fail-fast siblings, caller folding, dependent promotion —

@@ -14,8 +14,8 @@
 //!
 //! Callers hold the run lock. A job that settles without running goes through
 //! [`settle_unrun`], which writes the job's terminal row, releases what it
-//! held, refreshes its dependents' counters and stamps the run through
-//! `summarize_run_tx`.
+//! held, folds the reusable callers it completes, refreshes its dependents'
+//! counters and stamps the run through `summarize_run_tx`.
 
 use super::codec::now_us;
 use super::dispatch::{
@@ -194,11 +194,13 @@ pub(super) async fn acquire_job_gate(
 /// Settle a job that never ran: its terminal row (with whatever the caller
 /// changed on `node` — hydrated placement, an environment gate's progress),
 /// the concurrency it held, its requests and assignment, its dependents'
-/// `remaining_needs`, the run's status and the `job.completed.v1` /
-/// `run.completed.v1` outbox rows.
+/// `remaining_needs`, the reusable callers it was the last open inner job of
+/// (folded like a completion folds them), the run's status and the
+/// `job.completed.v1` / `run.completed.v1` outbox rows.
 ///
-/// Returns the dependents now `blocked` with no needs remaining, sorted by job
-/// id; the caller decides them (they may skip or fail in turn).
+/// Returns the dependents now `blocked` with no needs remaining (the job's and
+/// the folded callers'), sorted by job id; the caller decides them (they may
+/// skip or fail in turn).
 pub(super) async fn settle_unrun(
     backend: &PgBackend,
     tx: &Transaction<'_>,
@@ -215,7 +217,7 @@ pub(super) async fn settle_unrun(
         retire_node_requests(tx, run_id, job_id, Retirement::Settle(status)).await?;
     }
     clear_assignment(tx, run_id, job_id).await?;
-    let unblocked = Sweep::refresh_remaining_needs(tx, run_id, job_id, &node.base_id).await?;
+    let mut unblocked = Sweep::refresh_remaining_needs(tx, run_id, job_id, &node.base_id).await?;
     out.push(status, run_id, job_id.clone());
     emit_outbox(
         tx,
@@ -224,6 +226,11 @@ pub(super) async fn settle_unrun(
         serde_json::json!({"job_id": job_id.0, "status": status_str(status)}),
     )
     .await?;
+    // The fold reads the job's row, so it follows the terminal write above and
+    // precedes the run's status.
+    unblocked.extend(Sweep::settle_folded_callers(backend, tx, run_id, job_id).await?);
+    unblocked.sort();
+    unblocked.dedup();
     conclude_run(backend, tx, run_id, status_str(status)).await?;
     Ok(unblocked)
 }

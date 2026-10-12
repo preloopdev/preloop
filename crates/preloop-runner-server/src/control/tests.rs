@@ -5823,7 +5823,11 @@ pub(crate) mod suite {
     /// A deferred reusable caller `caller` and its dependent `after`, plus
     /// `extra` jobs. `inner` seeds the caller's recorded `inner_job_ids`: the
     /// parser leaves them empty until the subtree materializes.
-    fn deferred_caller_run(run_id: RunId, inner: &[&str], extra: Vec<SubmitJob>) -> SubmitRun {
+    pub(crate) fn deferred_caller_run(
+        run_id: RunId,
+        inner: &[&str],
+        extra: Vec<SubmitJob>,
+    ) -> SubmitRun {
         let mut caller = submit_job(run_id, "caller", 1);
         caller.request = None;
         caller.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
@@ -6205,6 +6209,439 @@ pub(crate) mod suite {
         let dispatched =
             drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
         assert_reusable_caller_folded(backend, run_id, &dispatched).await;
+    }
+
+    /// Completes a subtree job with `status`, as the runner would report it.
+    async fn settle_callee(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        job_id: &str,
+        status: ExecutionStatus,
+        outputs: BTreeMap<String, serde_json::Value>,
+    ) {
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId(job_id.to_owned()),
+                agent_job_id: None,
+                status,
+                outputs,
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The statuses of the `job.completed.v1` rows the outbox holds for
+    /// `job_id`, once at least one has become visible (a shared Postgres
+    /// server may hold a fresh commit back for a moment).
+    async fn job_completed_statuses(backend: &dyn ControlBackend, job_id: &str) -> Vec<String> {
+        let mut statuses = Vec::new();
+        for _ in 0..50 {
+            statuses = backend
+                .outbox_read(
+                    OutboxBookmark {
+                        txid: 0,
+                        event_id: 0,
+                    },
+                    10_000,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| {
+                    row.topic == "job.completed.v1"
+                        && row.payload.get("job_id").and_then(|id| id.as_str()) == Some(job_id)
+                })
+                .filter_map(|row| {
+                    row.payload
+                        .get("status")
+                        .and_then(|status| status.as_str())
+                        .map(str::to_owned)
+                })
+                .collect();
+            if !statuses.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        statuses
+    }
+
+    /// What the fold owes a caller whose last open inner job settled without a
+    /// completion: the caller is terminal with the aggregate of its inner
+    /// jobs, exactly one `job.completed.v1`, its dependent `after` followed it
+    /// (a failed or skipped caller skips its dependent) and the run finished.
+    async fn assert_caller_settled_without_a_completion(
+        backend: &dyn ControlBackend,
+        run_id: RunId,
+        caller_id: &str,
+        status: ExecutionStatus,
+    ) {
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId(caller_id.to_owned())),
+            Some(&status),
+            "the caller must fold once its last inner job settled"
+        );
+        assert_eq!(
+            job_completed_statuses(backend, caller_id).await,
+            vec![crate::control::types::status_str(status).to_owned()],
+            "the fold emits the caller's job.completed.v1 exactly once"
+        );
+        if caller_id == "caller" {
+            assert_eq!(
+                record.jobs.get(&JobId("after".to_owned())),
+                Some(&ExecutionStatus::Skipped),
+                "the caller's dependent must follow the caller"
+            );
+            assert!(
+                record.status.is_terminal(),
+                "the run must finish, got {:?}",
+                record.status
+            );
+        }
+    }
+
+    /// Callee job `caller/b` needs `caller/gen`; `gen` fails and the promotion
+    /// cascade skips `b`, the last open inner job. The caller must fold.
+    pub(crate) async fn reusable_caller_folds_when_the_cascade_skips_its_last_callee_job(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut b = submit_job(run_id, "caller/b", 4);
+        b.queued.needs = vec![JobId("caller/gen".to_owned())];
+        backend
+            .submit_run(deferred_caller_run(
+                run_id,
+                &["caller/gen", "caller/b"],
+                vec![submit_job(run_id, "caller/gen", 3), b],
+            ))
+            .await
+            .unwrap();
+        lease_deferred_caller(backend).await;
+        settle_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            ExecutionStatus::Failure,
+            BTreeMap::from([("val".to_owned(), serde_json::json!("hi"))]),
+        )
+        .await;
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/b".to_owned())),
+            Some(&ExecutionStatus::Skipped)
+        );
+        assert_eq!(
+            record.job_outputs.get(&JobId("caller".to_owned())),
+            Some(&BTreeMap::from([(
+                "out".to_owned(),
+                serde_json::json!("hi")
+            )])),
+            "the fold resolves the caller's output"
+        );
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Failure,
+        )
+        .await;
+        assert_eq!(record.status, ExecutionStatus::Failure);
+    }
+
+    /// The last open inner job fails its promotion (its `runs-on` names a
+    /// platform no registered runner can host). The caller must fold.
+    pub(crate) async fn reusable_caller_folds_when_its_last_callee_job_fails_at_promotion(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut b = submit_job(run_id, "caller/b", 4);
+        b.queued.needs = vec![JobId("caller/gen".to_owned())];
+        b.queued.runs_on = vec!["windows-latest".to_owned()];
+        backend
+            .submit_run(deferred_caller_run(
+                run_id,
+                &["caller/gen", "caller/b"],
+                vec![submit_job(run_id, "caller/gen", 3), b],
+            ))
+            .await
+            .unwrap();
+        lease_deferred_caller(backend).await;
+        settle_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            ExecutionStatus::Success,
+            BTreeMap::from([("val".to_owned(), serde_json::json!("hi"))]),
+        )
+        .await;
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/b".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Failure,
+        )
+        .await;
+        assert_eq!(record.status, ExecutionStatus::Failure);
+    }
+
+    /// A run whose caller holds `gen` and a deferred matrix `fan` that needs
+    /// it, with `gen` already finished and `fan` leased for expansion.
+    async fn lease_deferred_callee_matrix(backend: &dyn ControlBackend) -> (RunId, ExpansionClaim) {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "caller/fan", 4);
+        fan.queued.needs = vec![JobId("caller/gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(deferred_caller_run(
+                run_id,
+                &["caller/gen", "caller/fan"],
+                vec![submit_job(run_id, "caller/gen", 3), fan],
+            ))
+            .await
+            .unwrap();
+        lease_deferred_caller(backend).await;
+        settle_callee(
+            backend,
+            run_id,
+            "caller/gen",
+            ExecutionStatus::Success,
+            BTreeMap::from([
+                ("val".to_owned(), serde_json::json!("hi")),
+                (
+                    "m".to_owned(),
+                    serde_json::json!({"include": [{"n": 1}, {"n": 2}]}),
+                ),
+            ]),
+        )
+        .await;
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred matrix must be leased");
+        assert_eq!(claim.job.job_id, JobId("caller/fan".to_owned()));
+        (run_id, claim)
+    }
+
+    /// The expansion of the callee's last open job (a deferred matrix) fails.
+    /// The caller must fold.
+    pub(crate) async fn reusable_caller_folds_when_a_deferred_expansion_inside_it_fails(
+        backend: &dyn ControlBackend,
+    ) {
+        let (run_id, claim) = lease_deferred_callee_matrix(backend).await;
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Err(ExecutionStatus::Failure),
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/fan".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Failure,
+        )
+        .await;
+        assert_eq!(record.status, ExecutionStatus::Failure);
+    }
+
+    /// The callee's last open job expands to an empty matrix and settles
+    /// skipped. The caller must fold (a skipped inner job makes it skipped).
+    pub(crate) async fn reusable_caller_folds_when_a_deferred_matrix_inside_it_is_empty(
+        backend: &dyn ControlBackend,
+    ) {
+        let (run_id, claim) = lease_deferred_callee_matrix(backend).await;
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix { jobs: Vec::new() }),
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/fan".to_owned())),
+            Some(&ExecutionStatus::Skipped)
+        );
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Skipped,
+        )
+        .await;
+    }
+
+    /// Every leg of the callee's last open matrix is unhostable, so the whole
+    /// matrix settles at registration. The caller must fold.
+    pub(crate) async fn reusable_caller_folds_when_every_matrix_leg_inside_it_is_unhostable(
+        backend: &dyn ControlBackend,
+    ) {
+        let (run_id, claim) = lease_deferred_callee_matrix(backend).await;
+        let legs = (1..=2)
+            .map(|index| {
+                let mut leg = built_matrix_leg(
+                    run_id,
+                    &format!("caller/fan-{index}"),
+                    "caller/fan",
+                    index,
+                    2,
+                );
+                leg.plan.runs_on = vec!["windows-latest".to_owned()];
+                leg.plan.fail_fast = false;
+                leg
+            })
+            .collect();
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix { jobs: legs }),
+            })
+            .await
+            .unwrap();
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Failure,
+        )
+        .await;
+    }
+
+    /// The caller's own expansion registers a subtree no runner can host, so
+    /// every inner job settles at registration. The caller must fold.
+    pub(crate) async fn reusable_caller_folds_when_its_whole_subtree_is_unhostable(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(deferred_caller_run(run_id, &[], Vec::new()))
+            .await
+            .unwrap();
+        let mut gen_job = deferred_callee_job(run_id, "caller/gen", &[], None);
+        gen_job.plan.runs_on = vec!["windows-latest".to_owned()];
+        expand_deferred_caller(backend, vec![gen_job]).await;
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Failure,
+        )
+        .await;
+    }
+
+    /// A callee that is itself a caller: the cascade skips the inner caller's
+    /// last open job, the inner caller folds, and so does the outer caller
+    /// whose last open job it was.
+    pub(crate) async fn nested_reusable_callers_fold_when_the_cascade_skips_their_last_job(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut b = submit_job(run_id, "caller/inner/b", 6);
+        b.queued.needs = vec![JobId("caller/inner/gen".to_owned())];
+        let mut inner = submit_job(run_id, "caller/inner", 4);
+        inner.request = None;
+        inner.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
+            uses: "./.github/workflows/inner.yml".to_owned(),
+            workflow_file: "inner.yml".to_owned(),
+            workflow_sha: None,
+            workflow_repository: None,
+            depth: 2,
+        });
+        let mut submit = deferred_caller_run(
+            run_id,
+            &["caller/inner"],
+            vec![inner, submit_job(run_id, "caller/inner/gen", 5), b],
+        );
+        submit.record.caller_plans.insert(
+            JobId("caller/inner".to_owned()),
+            serde_json::from_value(serde_json::json!({
+                "id": "caller/inner",
+                "base_id": "caller/inner",
+                "name": "caller/inner",
+                "runs_on": ["self-hosted"],
+            }))
+            .expect("a minimal nested caller plan"),
+        );
+        submit
+            .record
+            .reusable_calls
+            .get_mut("caller")
+            .expect("the outer caller's metadata")
+            .output_definitions =
+            BTreeMap::from([("out".to_owned(), "${{ jobs.inner.outputs.val }}".to_owned())]);
+        submit.record.reusable_calls.insert(
+            "caller/inner".to_owned(),
+            preloop_gha_parser::ReusableCallMetadata {
+                caller_job_id: "caller/inner".to_owned(),
+                output_definitions: BTreeMap::from([(
+                    "val".to_owned(),
+                    "${{ jobs.gen.outputs.val }}".to_owned(),
+                )]),
+                inner_job_ids: vec!["caller/inner/gen".to_owned(), "caller/inner/b".to_owned()],
+                inputs: BTreeMap::new(),
+                caller_concurrency: None,
+                embedded_concurrency: None,
+                matrix: BTreeMap::new(),
+                if_condition: None,
+                workflow_sha: None,
+                workflow_repository: None,
+            },
+        );
+        backend.submit_run(submit).await.unwrap();
+        settle_callee(
+            backend,
+            run_id,
+            "caller/inner/gen",
+            ExecutionStatus::Failure,
+            BTreeMap::from([("val".to_owned(), serde_json::json!("hi"))]),
+        )
+        .await;
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller/inner/b".to_owned())),
+            Some(&ExecutionStatus::Skipped)
+        );
+        assert_eq!(
+            record.job_outputs.get(&JobId("caller".to_owned())),
+            Some(&BTreeMap::from([(
+                "out".to_owned(),
+                serde_json::json!("hi")
+            )])),
+            "the outer fold reads the inner caller's folded output"
+        );
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller/inner",
+            ExecutionStatus::Failure,
+        )
+        .await;
+        assert_caller_settled_without_a_completion(
+            backend,
+            run_id,
+            "caller",
+            ExecutionStatus::Failure,
+        )
+        .await;
+        assert_eq!(record.status, ExecutionStatus::Failure);
     }
 
     /// A workflow-held run's row reads `queued` — its `holder_kind = 'run'`
@@ -9830,6 +10267,62 @@ mod pg {
         suite::reusable_caller_folds_with_prepopulated_legs(&backend).await;
     }
 
+    #[tokio::test]
+    async fn reusable_caller_folds_when_the_cascade_skips_its_last_callee_job() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_when_the_cascade_skips_its_last_callee_job(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_its_last_callee_job_fails_at_promotion() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_when_its_last_callee_job_fails_at_promotion(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_a_deferred_expansion_inside_it_fails() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_when_a_deferred_expansion_inside_it_fails(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_a_deferred_matrix_inside_it_is_empty() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_when_a_deferred_matrix_inside_it_is_empty(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_every_matrix_leg_inside_it_is_unhostable() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_when_every_matrix_leg_inside_it_is_unhostable(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_its_whole_subtree_is_unhostable() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_when_its_whole_subtree_is_unhostable(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn nested_reusable_callers_fold_when_the_cascade_skips_their_last_job() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::nested_reusable_callers_fold_when_the_cascade_skips_their_last_job(&backend).await;
+    }
+
     /// Pool assignments on: the pairing path only runs in that mode.
     #[tokio::test]
     async fn pairing_marks_runner_pool_proven() {
@@ -11750,6 +12243,62 @@ mod lite {
     async fn reusable_caller_folds_with_prepopulated_legs() {
         suite::reusable_caller_folds_with_prepopulated_legs(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_the_cascade_skips_its_last_callee_job() {
+        suite::reusable_caller_folds_when_the_cascade_skips_its_last_callee_job(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_its_last_callee_job_fails_at_promotion() {
+        suite::reusable_caller_folds_when_its_last_callee_job_fails_at_promotion(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_a_deferred_expansion_inside_it_fails() {
+        suite::reusable_caller_folds_when_a_deferred_expansion_inside_it_fails(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_a_deferred_matrix_inside_it_is_empty() {
+        suite::reusable_caller_folds_when_a_deferred_matrix_inside_it_is_empty(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_every_matrix_leg_inside_it_is_unhostable() {
+        suite::reusable_caller_folds_when_every_matrix_leg_inside_it_is_unhostable(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_when_its_whole_subtree_is_unhostable() {
+        suite::reusable_caller_folds_when_its_whole_subtree_is_unhostable(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nested_reusable_callers_fold_when_the_cascade_skips_their_last_job() {
+        suite::nested_reusable_callers_fold_when_the_cascade_skips_their_last_job(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]

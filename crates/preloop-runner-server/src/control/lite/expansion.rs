@@ -569,6 +569,9 @@ impl LiteBackend {
                 Err(status) => {
                     settle::settle_node(tx, self, run_id, &node_id, status)?;
                     outcome.failed.push((run_id, node_id));
+                    // The settled node may have been its caller's last open
+                    // inner job.
+                    super::dispatch::fold_settled_callers(tx, self, run_id)?;
                     // Children materialize *after* the caller's own needs may have
                     // settled (they inherit them): recompute before promoting, same
                     // as the submit path.
@@ -663,6 +666,10 @@ impl LiteBackend {
                     )?;
                 }
             }
+            // Jobs settled while the subtree registered (an empty matrix, an
+            // unhostable job) may have been a caller's last open inner jobs;
+            // the caller's `inner_job_ids` name the subtree by now.
+            super::dispatch::fold_settled_callers(tx, self, run_id)?;
             // Children materialize *after* the caller's own needs may have
             // settled (they inherit them): recompute before promoting, same
             // as the submit path.

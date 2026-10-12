@@ -135,8 +135,10 @@ struct Registered {
     /// The registered jobs whose needs are all terminal (dependency-free ones
     /// included), in job-id order: the jobs the subtree can start.
     startable: Vec<JobId>,
-    /// Dependents the unhostable jobs' settles left startable.
-    unblocked: Vec<JobId>,
+    /// The jobs no registered runner can host: rows written, not yet settled.
+    /// They settle once the caller's `inner_job_ids` (or the matrix parent's
+    /// splice) name the subtree, so the settles can fold the caller.
+    unhostable: Vec<(JobId, Node)>,
 }
 
 impl PgBackend {
@@ -265,7 +267,7 @@ impl PgBackend {
             Ok(BuiltExpansion::Matrix { jobs }) => {
                 let leg_ids: Vec<String> = jobs.iter().map(|job| job.plan.id.0.clone()).collect();
                 let registered = self
-                    .register_expansion_jobs(&tx, run_id, &node_id, jobs, &mut out)
+                    .register_expansion_jobs(&tx, run_id, &node_id, jobs)
                     .await?;
                 splice_matrix_parent(&tx, run_id, &node_id, &leg_ids).await?;
                 // The parent leaves the run's status map (its legs have it as
@@ -288,7 +290,7 @@ impl PgBackend {
             }) => {
                 let inner_ids: Vec<String> = jobs.iter().map(|job| job.plan.id.0.clone()).collect();
                 let registered = self
-                    .register_expansion_jobs(&tx, run_id, &caller_id, jobs, &mut out)
+                    .register_expansion_jobs(&tx, run_id, &caller_id, jobs)
                     .await?;
                 write_reusable_meta(&tx, run_id, &caller_id, &inner_ids, &reusable_calls).await?;
                 // The caller is now executing inside its subtree.
@@ -332,9 +334,14 @@ impl PgBackend {
         self.promote_dependents(tx, run_id, &unblocked, out).await
     }
 
-    /// Promote what a registered subtree can start: the jobs whose needs are
-    /// all terminal and the dependents the unhostable jobs' settles unblocked,
-    /// in job-id order, with the skips and failures that cascade from them.
+    /// Promote what a registered subtree can start: settle its unhostable jobs
+    /// (which folds a caller whose whole subtree they were), then promote the
+    /// jobs whose needs are all terminal and the dependents those settles
+    /// unblocked, in job-id order, with the skips and failures that cascade
+    /// from them.
+    ///
+    /// Runs after the caller's `inner_job_ids` / the matrix parent's splice
+    /// name the subtree: a fold only sees the jobs that list names.
     async fn start_registered(
         &self,
         tx: &Transaction<'_>,
@@ -343,7 +350,20 @@ impl PgBackend {
         out: &mut SchedulingOutcome,
     ) -> Result<(), ControlError> {
         let mut ids = registered.startable;
-        ids.extend(registered.unblocked);
+        for (job_id, mut node) in registered.unhostable {
+            ids.extend(
+                settle_unrun(
+                    self,
+                    tx,
+                    run_id,
+                    &job_id,
+                    &mut node,
+                    ExecutionStatus::Failure,
+                    out,
+                )
+                .await?,
+            );
+        }
         ids.sort();
         ids.dedup();
         self.promote_dependents(tx, run_id, &ids, out).await
@@ -352,14 +372,14 @@ impl PgBackend {
     /// Register one built subtree's jobs: `jobs` + `job_specs` + `job_needs` +
     /// `job_messages` + `job_requests` (+ token request, step manifest).
     /// New nodes start `pending`/`blocked`; their `remaining_needs` is counted
-    /// once every row exists, and the unhostable ones settle `failure`.
+    /// once every row exists, and the unhostable ones are returned to settle
+    /// `failure` ([`Self::start_registered`]).
     async fn register_expansion_jobs(
         &self,
         tx: &Transaction<'_>,
         run_id: RunId,
         placeholder: &JobId,
         jobs: Vec<BuiltJob>,
-        out: &mut SchedulingOutcome,
     ) -> Result<Registered, ControlError> {
         let scope = PgBackend::load_run_scope(tx, run_id)
             .await?
@@ -548,24 +568,9 @@ impl PgBackend {
         // which settled before it expanded) or that name several legs; recount
         // from the rows now that every job of the subtree exists.
         let startable = Sweep::recount_remaining_needs(tx, run_id, &registered).await?;
-        let mut unblocked = Vec::new();
-        for (job_id, mut node) in unhostable_nodes {
-            unblocked.extend(
-                settle_unrun(
-                    self,
-                    tx,
-                    run_id,
-                    &job_id,
-                    &mut node,
-                    ExecutionStatus::Failure,
-                    out,
-                )
-                .await?,
-            );
-        }
         Ok(Registered {
             startable,
-            unblocked,
+            unhostable: unhostable_nodes,
         })
     }
 }
