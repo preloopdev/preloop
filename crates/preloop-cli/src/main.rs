@@ -3304,10 +3304,16 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     };
     let dirty_push = push_requested && !dirty.is_empty();
     let submit_commit = if dirty_push {
+        // A hosted pull-request merge is built against the base branch, so the
+        // base tip rides in the bundle; every other event tests C alone.
+        let base_branch = (event == "pull_request" && !args.no_merge)
+            .then_some(derived_filter_branch.as_deref())
+            .flatten();
         Some(create_submit_commit(
             args.message.as_deref(),
             &dirty,
             &detect_git_ref(),
+            base_branch,
         )?)
     } else {
         None
@@ -3400,7 +3406,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut request = client
         .post(format!("{url}/api/v1/runs"))
         .json(&submission.to_request_json()?);
-    if should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err()) {
+    // A bundled submission carries its own workspace; a workspace header would
+    // point the engine at the live checkout instead of the commit under test.
+    if submit_commit.is_none()
+        && should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err())
+    {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -3677,9 +3687,10 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // Push-back runs on any conclusion: a draft PR with red checks is
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
-        let tree_unchanged = submit_commit
-            .as_ref()
-            .is_none_or(|commit| submit_tree_unchanged(&dirty, commit));
+        let tree_unchanged = submit_commit.as_ref().is_none_or(submit_tree_unchanged);
+        // Only a push that actually succeeded may offer to move the branch: a
+        // declined or failed push has published nothing to move to.
+        let mut pushed = false;
         let push_error = if push_requested {
             if dirty_push && !tree_unchanged {
                 eprintln!(
@@ -3695,15 +3706,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     args.pr_draft,
                     status == ExecutionStatus::Success,
                 )? {
-                    Some(opts) => push::push_run(
-                        &client,
-                        &url,
-                        api_token(),
-                        &accepted.run_id.to_string(),
-                        Some(opts),
-                    )
-                    .await
-                    .err(),
+                    Some(opts) => {
+                        let result = push::push_run(
+                            &client,
+                            &url,
+                            api_token(),
+                            &accepted.run_id.to_string(),
+                            Some(opts),
+                        )
+                        .await;
+                        pushed = result.is_ok();
+                        result.err()
+                    }
                     None => {
                         eprintln!(
                             "not pushing (declined) — CI result was informational. \
@@ -3714,20 +3728,21 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                push::push_run(
+                let result = push::push_run(
                     &client,
                     &url,
                     api_token(),
                     &accepted.run_id.to_string(),
                     None,
                 )
-                .await
-                .err()
+                .await;
+                pushed = result.is_ok();
+                result.err()
             }
         } else {
             None
         };
-        if push_error.is_none()
+        if pushed
             && dirty_push
             && tree_unchanged
             && status == ExecutionStatus::Success
@@ -3958,43 +3973,126 @@ struct SubmitCommit {
     bundle_path: PathBuf,
 }
 
+/// A number unique to this process and call, so concurrent submissions in one
+/// process never share an index, message, bundle file or ref namespace.
+fn next_scratch_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A scratch file path in the temp directory, unique to this process and call.
+fn submit_scratch(label: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "preloop-{label}-{}-{}.{extension}",
+        std::process::id(),
+        next_scratch_id()
+    ))
+}
+
+/// `git -C <repo> <args>` with extra environment; returns trimmed stdout.
+fn git_in(
+    repo: &std::path::Path,
+    envs: &[(&str, &std::ffi::OsStr)],
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .envs(envs.iter().copied())
+        .args(args)
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The tree the working tree would commit: tracked changes plus untracked,
+/// non-ignored files, computed in a private index so the user's real index
+/// never moves. The index starts from HEAD, not empty: git keeps tracking a
+/// file that an ignore rule now matches only when the index already lists it,
+/// so an empty index would silently delete such a file from the submit.
+fn worktree_tree_in(repo: &std::path::Path) -> anyhow::Result<String> {
+    let index = submit_scratch("index", "tmp");
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    let tree = git_in(repo, &env, &["read-tree", "HEAD"])
+        .and_then(|_| git_in(repo, &env, &["add", "-A"]))
+        .and_then(|_| git_in(repo, &env, &["write-tree"]));
+    let _ = std::fs::remove_file(&index);
+    tree
+}
+
+/// The commit a hosted pull-request merge is built against: the freshest known
+/// tip of `origin/<base>`. A stale local branch of the same name is used only
+/// when there is no remote-tracking ref at all.
+fn resolve_base_tip_in(repo: &std::path::Path, base: &str) -> anyhow::Result<String> {
+    let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+    // The merge should test the base as it is now. Offline, fall back to the
+    // last fetched tip, and say so rather than testing it silently.
+    if git_in(repo, &[], &["fetch", "--quiet", "origin", base]).is_err() {
+        eprintln!("warning: could not fetch origin/{base}; merging against the last fetched tip");
+    }
+    for candidate in [
+        format!("refs/remotes/origin/{base}^{{commit}}"),
+        format!("refs/heads/{base}^{{commit}}"),
+    ] {
+        if let Ok(sha) = git_in(repo, &[], &["rev-parse", "--verify", "-q", &candidate]) {
+            return Ok(sha);
+        }
+    }
+    anyhow::bail!(
+        "base branch `{base}` was not found on `origin` or locally; fetch it, pass --base, \
+         or use --no-merge"
+    )
+}
+
 /// Create the immutable commit uploaded for a dirty hosted submit. Git
 /// `commit-tree` bypasses commit-msg hooks by design; only a private index is
-/// used, so the user's staging area and branch pointer never move.
+/// used, so the user's staging area and branch pointer never move. The editor
+/// opens only for a person at a terminal: a pipe or CI run must never hang on it.
 fn create_submit_commit(
     explicit_message: Option<&str>,
     dirty: &[String],
     git_ref: &str,
+    base_branch: Option<&str>,
 ) -> anyhow::Result<SubmitCommit> {
-    let parent = git_rev_parse("HEAD")?;
-    let index = std::env::temp_dir().join(format!("preloop-index-{}", std::process::id()));
-    let _ = std::fs::remove_file(&index);
-    let add = std::process::Command::new("git")
-        .env("GIT_INDEX_FILE", &index)
-        .args(["add", "-A"])
-        .output()
-        .context("git add (private submit index)")?;
-    if !add.status.success() {
-        anyhow::bail!(
-            "git add (private submit index): {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        );
-    }
-    let tree_output = std::process::Command::new("git")
-        .env("GIT_INDEX_FILE", &index)
-        .args(["write-tree"])
-        .output()
-        .context("git write-tree (private submit index)")?;
-    let _ = std::fs::remove_file(&index);
-    if !tree_output.status.success() {
-        anyhow::bail!(
-            "git write-tree (private submit index): {}",
-            String::from_utf8_lossy(&tree_output.stderr).trim()
-        );
-    }
-    let tree = String::from_utf8_lossy(&tree_output.stdout)
-        .trim()
-        .to_owned();
+    let editor = submit_editor(
+        std::env::var("EDITOR").ok(),
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    );
+    create_submit_commit_in(
+        std::path::Path::new("."),
+        explicit_message,
+        editor.as_deref(),
+        dirty,
+        git_ref,
+        base_branch,
+    )
+}
+
+/// The editor to compose the submit message in: `$EDITOR` when one is set and
+/// a person is at the terminal, never otherwise.
+fn submit_editor(editor_env: Option<String>, interactive: bool) -> Option<String> {
+    editor_env
+        .filter(|editor| !editor.trim().is_empty())
+        .filter(|_| interactive)
+}
+
+fn create_submit_commit_in(
+    repo: &std::path::Path,
+    explicit_message: Option<&str>,
+    editor: Option<&str>,
+    dirty: &[String],
+    git_ref: &str,
+    base_branch: Option<&str>,
+) -> anyhow::Result<SubmitCommit> {
+    let parent = git_in(repo, &[], &["rev-parse", "HEAD"])?;
+    let tree = worktree_tree_in(repo)?;
     let branch = git_ref
         .strip_prefix("refs/heads/")
         .unwrap_or(git_ref)
@@ -4003,26 +4101,9 @@ fn create_submit_commit(
         .map(str::to_owned)
         .unwrap_or_else(|| generated_submit_message(&branch, dirty));
     if explicit_message.is_none()
-        && let Ok(editor) = std::env::var("EDITOR")
-        && !editor.trim().is_empty()
+        && let Some(editor) = editor
     {
-        let path = std::env::temp_dir().join(format!("preloop-message-{}", std::process::id()));
-        std::fs::write(&path, &message).context("write prefilled submit message")?;
-        let status = std::process::Command::new("sh")
-            .args([
-                "-c",
-                &format!("{editor} \"$1\""),
-                "preloop",
-                &path.to_string_lossy(),
-            ])
-            .status()
-            .context("run $EDITOR for submit commit")?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&path);
-            anyhow::bail!("$EDITOR failed while composing the submit commit");
-        }
-        message = std::fs::read_to_string(&path).context("read submit message")?;
-        let _ = std::fs::remove_file(&path);
+        message = edit_submit_message(editor, &message)?;
     }
     if !message.contains("Preloop-Tested-Tree:") {
         if !message.ends_with('\n') {
@@ -4030,45 +4111,88 @@ fn create_submit_commit(
         }
         message.push_str(&format!("\nPreloop-Tested-Tree: {tree}\n"));
     }
-    let name = git_config_user_name()
+    let identity = |key: &str| {
+        git_in(repo, &[], &["config", key])
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    let name = identity("user.name")
         .ok_or_else(|| anyhow::anyhow!("git user.name is required for a dirty submit"))?;
-    let email = git_config_user_email()
+    let email = identity("user.email")
         .ok_or_else(|| anyhow::anyhow!("git user.email is required for a dirty submit"))?;
-    let commit = std::process::Command::new("git")
-        .env("GIT_AUTHOR_NAME", &name)
-        .env("GIT_AUTHOR_EMAIL", &email)
-        .env("GIT_COMMITTER_NAME", &name)
-        .env("GIT_COMMITTER_EMAIL", &email)
-        .args(["commit-tree", &tree, "-p", &parent, "-m", &message])
-        .output()
-        .context("git commit-tree (submit commit)")?;
-    if !commit.status.success() {
-        anyhow::bail!(
-            "git commit-tree (submit commit): {}",
-            String::from_utf8_lossy(&commit.stderr).trim()
-        );
+    let author = [
+        ("GIT_AUTHOR_NAME", std::ffi::OsStr::new(&name)),
+        ("GIT_AUTHOR_EMAIL", std::ffi::OsStr::new(&email)),
+        ("GIT_COMMITTER_NAME", std::ffi::OsStr::new(&name)),
+        ("GIT_COMMITTER_EMAIL", std::ffi::OsStr::new(&email)),
+    ];
+    let sha = git_in(
+        repo,
+        &author,
+        &["commit-tree", &tree, "-p", &parent, "-m", &message],
+    )?;
+
+    // Bundle exactly what the engine needs and nothing else: the submitted
+    // commit and, for a pull-request merge, the base tip. `--all` would ship
+    // every branch, stash and remote-tracking ref in the repository.
+    let namespace = format!(
+        "refs/preloop/submit/{}-{}",
+        std::process::id(),
+        next_scratch_id()
+    );
+    let mut refs = vec![format!("{namespace}/head")];
+    let bundle_path = submit_scratch("submit", "bundle");
+    let bundled = (|| -> anyhow::Result<()> {
+        git_in(repo, &[], &["update-ref", &refs[0], &sha])?;
+        if let Some(base) = base_branch {
+            let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+            let tip = resolve_base_tip_in(repo, base)?;
+            let base_ref = format!("{namespace}/base/{base}");
+            git_in(repo, &[], &["update-ref", &base_ref, &tip])?;
+            refs.push(base_ref);
+        }
+        let bundle_arg = bundle_path.to_string_lossy();
+        let mut args = vec!["bundle", "create", bundle_arg.as_ref()];
+        args.extend(refs.iter().map(String::as_str));
+        git_in(repo, &[], &args)?;
+        Ok(())
+    })();
+    // The refs only name the bundle's contents; the repository keeps none.
+    for name in &refs {
+        let _ = git_in(repo, &[], &["update-ref", "-d", name]);
     }
-    let sha = String::from_utf8_lossy(&commit.stdout).trim().to_owned();
-    let ref_name = format!("refs/preloop/submit/{}", std::process::id());
-    run_git_status(["update-ref", &ref_name, &sha])?;
-    let bundle_path =
-        std::env::temp_dir().join(format!("preloop-submit-{}.bundle", std::process::id()));
-    let bundle = std::process::Command::new("git")
-        .args(["bundle", "create", bundle_path.to_str().unwrap(), "--all"])
-        .output()
-        .context("git bundle create")?;
-    let _ = run_git_status(["update-ref", "-d", &ref_name]);
-    if !bundle.status.success() {
-        anyhow::bail!(
-            "git bundle create: {}",
-            String::from_utf8_lossy(&bundle.stderr).trim()
-        );
+    if let Err(error) = bundled {
+        let _ = std::fs::remove_file(&bundle_path);
+        return Err(error);
     }
     Ok(SubmitCommit {
         sha,
         tree,
         bundle_path,
     })
+}
+
+/// Let the user edit the commit message the way `git commit` does: the command
+/// goes through a shell so `EDITOR="code --wait"` works.
+fn edit_submit_message(editor: &str, initial: &str) -> anyhow::Result<String> {
+    let path = submit_scratch("message", "txt");
+    std::fs::write(&path, initial).context("write prefilled submit message")?;
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "preloop"])
+        .arg(&path)
+        .status()
+        .context("run $EDITOR for submit commit");
+    let edited = match status {
+        Ok(status) if status.success() => {
+            std::fs::read_to_string(&path).context("read submit message")
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "$EDITOR failed while composing the submit commit"
+        )),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(&path);
+    edited
 }
 
 fn generated_submit_message(branch: &str, dirty: &[String]) -> String {
@@ -4134,10 +4258,19 @@ async fn upload_git_bundle(
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("bundle upload response omitted bundle_id"))
 }
-fn submit_tree_unchanged(initial_dirty: &[String], commit: &SubmitCommit) -> bool {
-    let parent = git_rev_parse(&format!("{}^", commit.sha)).ok();
-    let head = git_rev_parse("HEAD").ok();
-    parent == head && git_porcelain().ok().as_deref() == Some(initial_dirty)
+/// Whether the working tree still holds exactly the submitted tree on top of
+/// the submitted parent. Compared by tree hash: `git status --porcelain` lists
+/// the same line for a file edited again after CI started, so it cannot tell.
+fn submit_tree_unchanged(commit: &SubmitCommit) -> bool {
+    submit_tree_unchanged_in(std::path::Path::new("."), commit)
+}
+
+fn submit_tree_unchanged_in(repo: &std::path::Path, commit: &SubmitCommit) -> bool {
+    let parent = git_in(repo, &[], &["rev-parse", &format!("{}^", commit.sha)]).ok();
+    let head = git_in(repo, &[], &["rev-parse", "HEAD"]).ok();
+    parent.is_some()
+        && parent == head
+        && worktree_tree_in(repo).ok().as_deref() == Some(commit.tree.as_str())
 }
 
 /// Moving the checked-out branch to C changes the user's worktree, so it is
@@ -4278,17 +4411,6 @@ fn git_config_user_name() -> Option<String> {
     }
     let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!name.is_empty()).then_some(name)
-}
-fn git_config_user_email() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["config", "user.email"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let email = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!email.is_empty()).then_some(email)
 }
 
 async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
@@ -7046,6 +7168,312 @@ mod tests {
         std::fs::remove_file(".git/hooks/pre-push").unwrap();
         mark_hook_declined();
         assert!(hook_decided(), "should be decided after declining");
+    }
+
+    /// A throwaway repository on `main` with a fixed identity, one tracked
+    /// file `src.txt`, and a tracked `dist/app.js`.
+    fn submit_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("work");
+        std::fs::create_dir_all(repo.join("dist")).unwrap();
+        git_in(&repo, &[], &["init", "-q", "-b", "main"]).unwrap();
+        git_in(&repo, &[], &["config", "user.name", "Submit Test"]).unwrap();
+        git_in(&repo, &[], &["config", "user.email", "submit@example.test"]).unwrap();
+        git_in(&repo, &[], &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "original\n").unwrap();
+        std::fs::write(repo.join("dist/app.js"), "built\n").unwrap();
+        git_in(&repo, &[], &["add", "-A"]).unwrap();
+        git_in(&repo, &[], &["commit", "-q", "-m", "init"]).unwrap();
+        (tmp, repo)
+    }
+
+    /// `submit_repo` plus a bare `origin` that already holds `main`.
+    fn submit_repo_with_origin() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, repo) = submit_repo();
+        let origin = tmp.path().join("origin.git");
+        git_in(
+            &repo,
+            &[],
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "--initial-branch=main",
+                origin.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git_in(
+            &repo,
+            &[],
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
+        git_in(&repo, &[], &["push", "-q", "origin", "main"]).unwrap();
+        (tmp, repo, origin)
+    }
+
+    #[test]
+    fn submit_tree_keeps_a_tracked_file_an_ignore_rule_now_matches() {
+        let (_tmp, repo) = submit_repo();
+        // The dirty change ignores `dist/`, which HEAD still tracks: the
+        // developer still has `dist/app.js`, so the submit must too.
+        std::fs::write(repo.join(".gitignore"), "dist/\n*.log\n").unwrap();
+        std::fs::write(repo.join("build.log"), "untracked and ignored\n").unwrap();
+        std::fs::write(repo.join("notes.txt"), "untracked and not ignored\n").unwrap();
+
+        let tree = worktree_tree_in(&repo).unwrap();
+        let files = git_in(&repo, &[], &["ls-tree", "-r", "--name-only", &tree]).unwrap();
+        let files: Vec<&str> = files.lines().collect();
+
+        assert!(
+            files.contains(&"dist/app.js"),
+            "a tracked file must not vanish because an ignore rule now matches it: {files:?}"
+        );
+        assert!(files.contains(&".gitignore") && files.contains(&"notes.txt"));
+        assert!(
+            !files.contains(&"build.log"),
+            "an untracked, ignored file stays out of the submit: {files:?}"
+        );
+        assert_eq!(
+            git_in(&repo, &[], &["diff", "--cached", "--name-only"]).unwrap(),
+            "",
+            "the user's own index must never be touched"
+        );
+    }
+
+    #[test]
+    fn submit_tree_unchanged_sees_an_edit_that_leaves_git_status_identical() {
+        let (_tmp, repo) = submit_repo();
+        std::fs::write(repo.join("src.txt"), "first edit\n").unwrap();
+        let dirty = vec![" M src.txt".to_owned()];
+        let commit =
+            create_submit_commit_in(&repo, Some("wip"), None, &dirty, "refs/heads/feat/x", None)
+                .unwrap();
+        assert!(submit_tree_unchanged_in(&repo, &commit));
+
+        let status = git_in(&repo, &[], &["status", "--porcelain"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "second edit\n").unwrap();
+        assert_eq!(
+            git_in(&repo, &[], &["status", "--porcelain"]).unwrap(),
+            status,
+            "the premise: git status cannot tell these two states apart"
+        );
+        assert!(
+            !submit_tree_unchanged_in(&repo, &commit),
+            "a file edited again after submission must not count as unchanged"
+        );
+
+        // Putting the content back restores the match; moving HEAD never does.
+        std::fs::write(repo.join("src.txt"), "first edit\n").unwrap();
+        assert!(submit_tree_unchanged_in(&repo, &commit));
+        git_in(&repo, &[], &["commit", "-q", "-a", "-m", "move head"]).unwrap();
+        assert!(!submit_tree_unchanged_in(&repo, &commit));
+    }
+
+    #[test]
+    fn submit_bundle_uploads_only_the_submit_commit_and_base_tip() {
+        let (_tmp, repo, _origin) = submit_repo_with_origin();
+        // Things that must never leave the machine.
+        git_in(&repo, &[], &["branch", "private-branch"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "stashed work\n").unwrap();
+        git_in(&repo, &[], &["stash", "push", "-q"]).unwrap();
+        git_in(&repo, &[], &["checkout", "-q", "-b", "feat/x"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "dirty\n").unwrap();
+
+        let commit = create_submit_commit_in(
+            &repo,
+            Some("wip"),
+            None,
+            &[" M src.txt".to_owned()],
+            "refs/heads/feat/x",
+            Some("main"),
+        )
+        .unwrap();
+
+        let listing = git_in(
+            &repo,
+            &[],
+            &["bundle", "list-heads", commit.bundle_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let refs: Vec<(&str, &str)> = listing
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .collect();
+        let base = git_in(&repo, &[], &["rev-parse", "refs/remotes/origin/main"]).unwrap();
+        assert_eq!(refs.len(), 2, "exactly the head and the base: {refs:?}");
+        assert!(
+            refs.iter()
+                .any(|(sha, name)| *sha == commit.sha && name.ends_with("/head")),
+            "the submitted commit travels: {refs:?}"
+        );
+        assert!(
+            refs.iter()
+                .any(|(sha, name)| *sha == base && name.ends_with("/base/main")),
+            "the base tip travels under its branch name: {refs:?}"
+        );
+        // The bundle must not drag the stash or the private branch along as
+        // objects either: nothing it holds is reachable from those refs.
+        let stash = git_in(&repo, &[], &["rev-parse", "refs/stash"]).unwrap();
+        let private = git_in(&repo, &[], &["rev-parse", "refs/heads/private-branch"]).unwrap();
+        assert_ne!(stash, commit.sha);
+        assert_ne!(private, commit.sha);
+        let unpack = tempfile::tempdir().unwrap();
+        git_in(unpack.path(), &[], &["init", "-q", "--bare", "."]).unwrap();
+        git_in(
+            unpack.path(),
+            &[],
+            &[
+                "fetch",
+                "-q",
+                commit.bundle_path.to_str().unwrap(),
+                "+refs/preloop/*:refs/preloop/*",
+            ],
+        )
+        .unwrap();
+        assert!(
+            git_in(unpack.path(), &[], &["cat-file", "-e", &stash]).is_err(),
+            "the stash commit's objects must not be in the bundle"
+        );
+        // The repository keeps none of the bookkeeping refs.
+        assert_eq!(
+            git_in(&repo, &[], &["for-each-ref", "refs/preloop"]).unwrap(),
+            ""
+        );
+        let _ = std::fs::remove_file(&commit.bundle_path);
+    }
+
+    #[test]
+    fn submit_base_tip_prefers_the_fetched_remote_branch_over_a_stale_local_one() {
+        let (tmp, repo, origin) = submit_repo_with_origin();
+        let stale_local = git_in(&repo, &[], &["rev-parse", "refs/heads/main"]).unwrap();
+
+        // Someone else advances `main` on origin; this checkout's local `main`
+        // and remote-tracking `origin/main` both still point at the old tip.
+        let other = tmp.path().join("other");
+        git_in(
+            tmp.path(),
+            &[],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git_in(&other, &[], &["config", "user.name", "Other"]).unwrap();
+        git_in(&other, &[], &["config", "user.email", "other@example.test"]).unwrap();
+        git_in(&other, &[], &["config", "commit.gpgsign", "false"]).unwrap();
+        git_in(
+            &other,
+            &[],
+            &["commit", "-q", "--allow-empty", "-m", "base moved"],
+        )
+        .unwrap();
+        git_in(&other, &[], &["push", "-q", "origin", "main"]).unwrap();
+        let moved = git_in(&other, &[], &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            resolve_base_tip_in(&repo, "main").unwrap(),
+            moved,
+            "the merge must be built against the base as it is now"
+        );
+        assert_eq!(
+            git_in(&repo, &[], &["rev-parse", "refs/heads/main"]).unwrap(),
+            stale_local,
+            "fetching the base must not move the user's local branch"
+        );
+
+        // Offline: the last fetched tip still wins over the stale local branch.
+        git_in(
+            &other,
+            &[],
+            &["commit", "-q", "--allow-empty", "-m", "moved again"],
+        )
+        .unwrap();
+        git_in(&other, &[], &["push", "-q", "origin", "main"]).unwrap();
+        git_in(
+            &repo,
+            &[],
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        )
+        .unwrap();
+        assert_eq!(resolve_base_tip_in(&repo, "main").unwrap(), moved);
+
+        let error = resolve_base_tip_in(&repo, "no-such-branch").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no-such-branch"),
+            "an unresolvable base fails loudly: {error:#}"
+        );
+    }
+
+    #[test]
+    fn submit_editor_opens_only_for_a_person_at_a_terminal() {
+        assert_eq!(
+            submit_editor(Some("vim".into()), true).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            submit_editor(Some("vim".into()), false),
+            None,
+            "a pipe or CI run must never hang on an editor"
+        );
+        assert_eq!(submit_editor(Some("  ".into()), true), None);
+        assert_eq!(submit_editor(None, true), None);
+    }
+
+    #[test]
+    fn submit_message_comes_from_the_editor_when_one_runs() {
+        let (tmp, repo) = submit_repo();
+        std::fs::write(repo.join("src.txt"), "dirty\n").unwrap();
+        let editor = tmp.path().join("editor.sh");
+        std::fs::write(&editor, "#!/bin/sh\nprintf 'edited subject\\n' > \"$1\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirty = [" M src.txt".to_owned()];
+
+        let edited = create_submit_commit_in(
+            &repo,
+            None,
+            Some(editor.to_str().unwrap()),
+            &dirty,
+            "refs/heads/feat/x",
+            None,
+        )
+        .unwrap();
+        let message = git_in(&repo, &[], &["log", "-1", "--format=%B", &edited.sha]).unwrap();
+        assert!(message.starts_with("edited subject"), "{message}");
+        assert!(message.contains(&format!("Preloop-Tested-Tree: {}", edited.tree)));
+
+        // Without an editor the generated message is used.
+        let generated =
+            create_submit_commit_in(&repo, None, None, &dirty, "refs/heads/feat/x", None).unwrap();
+        let message = git_in(&repo, &[], &["log", "-1", "--format=%B", &generated.sha]).unwrap();
+        assert!(
+            message.starts_with("wip(feat/x): 1 files in src.txt"),
+            "{message}"
+        );
+
+        // A failing editor aborts the submit instead of committing a stale message.
+        let failing = create_submit_commit_in(
+            &repo,
+            None,
+            Some("false"),
+            &dirty,
+            "refs/heads/feat/x",
+            None,
+        );
+        assert!(failing.is_err());
+        for commit in [&edited, &generated] {
+            let _ = std::fs::remove_file(&commit.bundle_path);
+        }
     }
 
     #[test]

@@ -2185,20 +2185,27 @@ pub async fn submit_run(
     // or the signed OIDC claim — consumers grant more to a protected ref.
     submission.ref_protected = false;
     // A hosted dirty submit uploads its commit as a git bundle, and the
-    // materialized bundle is the workspace under test. A workspace header
-    // would repoint the snapshot at the caller's live checkout (or any
-    // server-local path), so CI could test different bytes than the commit
-    // that is published afterwards. The two are mutually exclusive.
-    if let Some(bundle_id) = submission.git_bundle_id.clone() {
-        if headers.contains_key("x-preloop-local-workspace") {
-            return Err(ApiError::bad_request(
-                "git_bundle_id cannot be combined with x-preloop-local-workspace",
-            ));
+    // unpacked bundle is the workspace under test. A workspace header would
+    // repoint the snapshot at the caller's live checkout (or any server-local
+    // path), so CI could test different bytes than the commit that is
+    // published afterwards. The two are mutually exclusive, and a
+    // body-supplied `local_workspace` is replaced by the bundle's own. The
+    // guard reclaims the unpacked bundle when this submission finishes,
+    // however it ends.
+    let _bundle_workspace = match submission.git_bundle_id.clone() {
+        Some(bundle_id) => {
+            if headers.contains_key("x-preloop-local-workspace") {
+                return Err(ApiError::bad_request(
+                    "git_bundle_id cannot be combined with x-preloop-local-workspace",
+                ));
+            }
+            let workspace =
+                crate::bundles::materialize_bundle(&shared, &bundle_id, &submission.sha).await?;
+            submission.local_workspace = Some(workspace.path().to_string_lossy().into_owned());
+            Some(workspace)
         }
-        let workspace =
-            crate::bundles::materialize_bundle(&shared, &bundle_id, &submission.sha).await?;
-        submission.local_workspace = Some(workspace.to_string_lossy().into_owned());
-    }
+        None => None,
+    };
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
