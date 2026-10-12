@@ -2306,20 +2306,16 @@ enum MergeParentage {
     /// The commit is the test merge of the payload head into the API's
     /// current base tip.
     Current,
-    /// The merge has the payload head but a different first parent. It is
-    /// still accepted, and the observed parent is logged.
-    StaleBase { merge_parent: Option<String> },
-    /// The commit is not a merge of the payload head at all: the API pointer
-    /// still names a previous head's merge.
+    /// The commit is not a merge of the payload head into the current base.
     OtherHead,
 }
 
 /// Resolve how `merge_sha`'s parents line up with the payload `head` and the
 /// API's `base`.
 ///
-/// Never accept a merge commit without checking its second parent: the
-/// pointer lags exactly one push through a rapid sequence, so a sha that is
-/// still the live pointer can belong to the previous head.
+/// Never accept a merge commit without checking both parents: the pointer
+/// lags exactly one push through a rapid sequence, and its first parent must
+/// be the base tip observed in the same pull-request API response.
 async fn merge_parentage(
     shared: &Arc<SharedState>,
     api_base: &str,
@@ -2368,9 +2364,7 @@ async fn merge_parentage(
     if first_parent.is_some_and(|sha| sha.eq_ignore_ascii_case(base)) {
         Ok(MergeParentage::Current)
     } else {
-        Ok(MergeParentage::StaleBase {
-            merge_parent: first_parent.map(str::to_owned),
-        })
+        Ok(MergeParentage::OtherHead)
     }
 }
 
@@ -2427,8 +2421,9 @@ enum MergeProbe {
 
 /// Ask GitHub where this delivery's pull-request runs check out.
 ///
-/// The payload's merge sha can lag the push. Accept only a merge whose second
-/// parent is the payload head; log, but do not reject, a first-parent mismatch.
+/// The payload's merge sha can lag the push. Accept only a merge whose first
+/// parent matches the API's current base and whose second parent is the payload
+/// head.
 async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget) -> MergeProbe {
     let api_base = github_api_base();
     let token = match crate::github_app::select_app_for_repo(shared, &target.repo).await {
@@ -2508,17 +2503,6 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
         .await
         {
             Ok(MergeParentage::Current) => {
-                return MergeProbe::Resolved(FreshMergePlacement::Merge(merge.to_owned()));
-            }
-            Ok(MergeParentage::StaleBase { merge_parent }) => {
-                debug!(
-                    repository = %target.repo,
-                    pull_request = target.number,
-                    merge_commit = %merge,
-                    merge_parent = ?merge_parent,
-                    api_base = %base,
-                    "GitHub's test merge has an older base parent; accepting it"
-                );
                 return MergeProbe::Resolved(FreshMergePlacement::Merge(merge.to_owned()));
             }
             Ok(MergeParentage::OtherHead) => {}
@@ -5733,11 +5717,11 @@ mod tests {
         assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
     }
 
-    /// GitHub freezes a head's test merge when the base moves (it does not
-    /// rebuild it) and its own run for that push used the frozen commit: a
-    /// first parent older than the API's base is logged, not rejected.
+    /// A merge with the payload head but an older first parent is not a match
+    /// for the API's current base. Keep polling, then build the delivery's
+    /// exact head against the target branch's current tip in the engine.
     #[tokio::test]
-    async fn a_merge_against_an_older_base_is_accepted() {
+    async fn a_merge_against_an_older_base_is_rejected_and_rebuilt() {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
 
@@ -5746,7 +5730,9 @@ mod tests {
             &temp,
             "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         );
-        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+        let (head, stale_merge, _current_merge, old_base) = build_pull_request_graph(&ws_dir);
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
         let merge_state = serde_json::json!({
             "mergeable": true,
             "merge_commit_sha": stale_merge.clone(),
@@ -5755,11 +5741,12 @@ mod tests {
         });
         let merge_commit = serde_json::json!({
             "sha": stale_merge.clone(),
-            "parents": [{ "sha": current_base.clone() }, { "sha": head.clone() }],
+            "parents": [{ "sha": old_base }, { "sha": head.clone() }],
         });
         let commits_path = format!("/repos/owner/repo/commits/{stale_merge}");
         let (api, _requests) = start_github_stub(move |_method, path, _body| {
             if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return (200, vec![], merge_state.clone());
             }
             if path == commits_path.as_str() {
@@ -5773,7 +5760,18 @@ mod tests {
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        let current_base = git_output(&ws_dir, &["rev-parse", "main"]);
+
         let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
         assert_eq!(
             fixture
@@ -5783,18 +5781,49 @@ mod tests {
         );
         fixture.drain().await;
 
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "the stale-base candidate must be rejected and polled through the budget"
+        );
         let inner = fixture.state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
         let run = inner.runs.values().next().unwrap();
-        assert_eq!(
-            run.submission.sha, stale_merge,
-            "GitHub's frozen merge of this head is what GitHub itself ran"
-        );
         assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
         assert_eq!(
             run.submission.status_check_sha.as_deref(),
-            Some(head.as_str())
+            Some(head.as_str()),
+            "check runs remain pinned to the webhook head"
         );
+        let merge_sha = run.submission.sha.clone();
+        let served_repository = run
+            .workspace_snapshot
+            .as_ref()
+            .expect("the engine-built merge is attached to the run")
+            .repository
+            .clone();
+        drop(inner);
+        assert_ne!(
+            merge_sha, stale_merge,
+            "the old-base GitHub merge is rejected"
+        );
+        assert_ne!(merge_sha, head, "never fall back to the bare PR head");
+        assert_engine_merge(
+            &merge_mirror(&fixture.state),
+            &merge_sha,
+            &current_base,
+            &head,
+        );
+        let checkout = temp.path().join("engine-served-checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        git_output(&checkout, &["init", "-q"]);
+        let served_path = fixture.state.state_dir.join(served_repository);
+        git_output(
+            &checkout,
+            &["fetch", served_path.to_str().unwrap(), "refs/pull/42/merge"],
+        );
+        git_output(&checkout, &["checkout", "--detach", "FETCH_HEAD"]);
+        assert_eq!(git_output(&checkout, &["rev-parse", "HEAD"]), merge_sha);
+        assert_engine_merge(&checkout, &merge_sha, &current_base, &head);
     }
 
     /// The measured rapid-push race: the API reports a newer head while

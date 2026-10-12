@@ -443,10 +443,13 @@ Releases before v0.27.0 predate the changelog.
   back to `job_id`.
 
 - **Fresh pull-request merge resolution**: Webhook-delivered `pull_request` and
-  `pull_request_review` runs poll for GitHub's live test merge and accept it
-  only when its second parent matches the payload head. If unavailable, the
-  engine builds a merge of the current base and pinned payload head and serves
-  it from its mirror; it never falls back to the bare pull-request head.
+  `pull_request_review` runs accept GitHub's live test merge only when its first
+  parent matches the base SHA observed in the same API response and its second
+  parent matches the webhook payload head. Otherwise GitHub is polled within
+  the existing budget, then the engine builds a merge of the target branch's
+  current tip fetched at fallback time and the pinned payload head. Runs never
+  fall back to the bare pull-request head. The base is not guaranteed to remain
+  latest at job execution; base advancement does not automatically rerun jobs.
   Conflicted pull requests do not start `pull_request` runs.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
