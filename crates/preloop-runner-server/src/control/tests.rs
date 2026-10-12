@@ -6207,6 +6207,92 @@ pub(crate) mod suite {
         assert_reusable_caller_folded(backend, run_id, &dispatched).await;
     }
 
+    /// A static `strategy.matrix` job inside a reusable callee. The parser
+    /// expands the matrix at build time, so the subtree holds the legs
+    /// (`caller/build-1`, `caller/build-2`, each with `parent_job_id =
+    /// caller/build`) but no row for the parent. Registration must create the
+    /// parent the legs reference, and the caller folds once every leg finished.
+    pub(crate) async fn reusable_caller_folds_after_a_static_matrix_callee(
+        backend: &dyn ControlBackend,
+    ) {
+        static_matrix_callee(backend, false).await;
+    }
+
+    /// The static matrix has a dependent in the callee, whose `needs` name the
+    /// matrix's base id. The dependent waits for every leg.
+    pub(crate) async fn reusable_caller_folds_after_a_static_matrix_callee_with_a_dependent(
+        backend: &dyn ControlBackend,
+    ) -> RunId {
+        static_matrix_callee(backend, true).await
+    }
+
+    async fn static_matrix_callee(backend: &dyn ControlBackend, dependent: bool) -> RunId {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(deferred_caller_run(run_id, &[], Vec::new()))
+            .await
+            .unwrap();
+        // The parser stamps each leg with its matrix cell.
+        let mut subtree: Vec<_> = (1..=2)
+            .map(|n| {
+                let mut leg =
+                    built_matrix_leg(run_id, &format!("caller/build-{n}"), "caller/build", n, 2);
+                leg.plan.matrix.insert("n".to_owned(), serde_json::json!(n));
+                leg
+            })
+            .collect();
+        if dependent {
+            subtree.push(deferred_callee_job(
+                run_id,
+                "caller/pack",
+                &["caller/build"],
+                None,
+            ));
+        }
+        expand_deferred_caller(backend, subtree).await;
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        let leg = |n: u8| JobId(format!("caller/build-{n}"));
+        let mut expected = vec![leg(1), leg(2), JobId("after".to_owned())];
+        if dependent {
+            expected.push(JobId("caller/pack".to_owned()));
+        }
+        for id in &expected {
+            assert!(
+                dispatched.contains(id),
+                "{id} must dispatch; dispatched {dispatched:?}"
+            );
+        }
+        if dependent {
+            let position = |id: &JobId| dispatched.iter().position(|d| d == id).unwrap();
+            let pack = position(&JobId("caller/pack".to_owned()));
+            assert!(
+                pack > position(&leg(1)) && pack > position(&leg(2)),
+                "the dependent must wait for both legs; dispatched {dispatched:?}"
+            );
+        }
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("caller".to_owned())),
+            Some(&ExecutionStatus::Success),
+            "the caller must fold once its subtree finished"
+        );
+        assert_eq!(
+            record.status,
+            ExecutionStatus::Success,
+            "the run must complete"
+        );
+        run_id
+    }
+
     /// A workflow-held run's row reads `queued` — its `holder_kind = 'run'`
     /// wait row carries the logical `Pending` — so it counts with
     /// in-progress, and its parked jobs are not job-level concurrency
@@ -9830,6 +9916,63 @@ mod pg {
         suite::reusable_caller_folds_with_prepopulated_legs(&backend).await;
     }
 
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_static_matrix_callee() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reusable_caller_folds_after_a_static_matrix_callee(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_static_matrix_callee_with_a_dependent() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let run_id =
+            suite::reusable_caller_folds_after_a_static_matrix_callee_with_a_dependent(&backend)
+                .await;
+        let client = backend.writer().await.unwrap();
+        // job | kind | parent | base | status | queue_state | has a request
+        let rows: Vec<String> = client
+            .query(
+                "SELECT format('%s|%s|%s|%s|%s|%s|%s', job_id, kind, \
+                        COALESCE(parent_job_id, '-'), base_id, status, queue_state, \
+                        (request_id IS NOT NULL)::text) \
+                 FROM jobs WHERE run_id = $1::text::uuid AND job_id LIKE 'caller/%' \
+                 ORDER BY job_id",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "caller/build|matrix_parent|-|caller/build|pending|none|false",
+                "caller/build-1|matrix_leg|caller/build|caller/build|success|none|true",
+                "caller/build-2|matrix_leg|caller/build|caller/build|success|none|true",
+                "caller/pack|job|-|caller/pack|success|none|true",
+            ],
+            "the legs' parent row exists and is a request-less matrix parent"
+        );
+        let inner: String = client
+            .query_one(
+                "SELECT (reusable_call #> '{meta,inner_job_ids}')::text FROM job_specs \
+                 WHERE run_id = $1::text::uuid AND job_id = 'caller'",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            inner, r#"["caller/build-1", "caller/build-2", "caller/pack"]"#,
+            "the caller's subtree names the legs, never the parent that has no work"
+        );
+    }
+
     /// Pool assignments on: the pairing path only runs in that mode.
     #[tokio::test]
     async fn pairing_marks_runner_pool_proven() {
@@ -11750,6 +11893,22 @@ mod lite {
     async fn reusable_caller_folds_with_prepopulated_legs() {
         suite::reusable_caller_folds_with_prepopulated_legs(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_static_matrix_callee() {
+        suite::reusable_caller_folds_after_a_static_matrix_callee(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_folds_after_a_static_matrix_callee_with_a_dependent() {
+        suite::reusable_caller_folds_after_a_static_matrix_callee_with_a_dependent(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]

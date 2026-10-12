@@ -30,6 +30,12 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Postgres: a static `strategy.matrix` inside a reusable workflow no longer
+  fails the caller's expansion**: the callee's matrix is expanded when its
+  subtree is built, so the matrix parent never had a `jobs` row, and the legs'
+  `parent_job_id` and any dependent's `needs` edge on the matrix id broke their
+  foreign keys at commit. Registering a callee subtree now creates the missing
+  `matrix_parent` row, as the SQLite backend already did.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

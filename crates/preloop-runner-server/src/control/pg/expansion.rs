@@ -37,7 +37,7 @@ use crate::control::types::{ControlError, ExpansionClaim};
 use crate::models::QueuedJob;
 use crate::runtime_scheduling::SchedulingOutcome;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, WorkflowSubmission};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio_postgres::Transaction;
 
@@ -404,6 +404,7 @@ impl PgBackend {
                 .map_err(db)?;
             (row.get(0), row.get(1))
         };
+        insert_matrix_parents(tx, run_id, &scope.namespace, &jobs).await?;
         let mut registered: Vec<String> = Vec::with_capacity(jobs.len());
         let mut unhostable_nodes: Vec<(JobId, Node)> = Vec::new();
         for built in jobs {
@@ -669,6 +670,40 @@ async fn splice_matrix_parent(
             .splice(pos..=pos, leg_ids.iter().cloned());
         store_reusable_spec(tx, &run, &caller, &spec).await?;
     }
+    Ok(())
+}
+
+/// Create the `matrix_parent` row every built leg names as `parent_job_id`.
+/// A callee's static matrix was expanded when the subtree was built, so its
+/// parent never had a row; the legs' parent FK and a dependent's `needs` edge
+/// on the matrix id both reference it (lite's `register_built_jobs` does the
+/// same). The row never mints a request, and the run graph drops it as an
+/// expanded parent. A parent that already has a row (a deferred matrix's own
+/// placeholder) is left as it is.
+async fn insert_matrix_parents(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    namespace: &str,
+    jobs: &[BuiltJob],
+) -> Result<(), ControlError> {
+    let parents: Vec<String> = jobs
+        .iter()
+        .filter_map(|built| node_parent(&built.plan, &built.plan.id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if parents.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO jobs (run_id, job_id, namespace_id, kind, base_id, status, queue_state) \
+         SELECT $1::text::uuid, parent, $2, 'matrix_parent', parent, 'pending', 'none' \
+         FROM unnest($3::text[]) AS parent \
+         ON CONFLICT (run_id, job_id) DO NOTHING",
+        &[&run_id.0.to_string(), &namespace, &parents],
+    )
+    .await
+    .map_err(db)?;
     Ok(())
 }
 
