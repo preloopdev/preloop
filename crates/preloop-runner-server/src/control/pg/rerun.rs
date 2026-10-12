@@ -1359,8 +1359,14 @@ async fn mint_attempt(
         timeout_triggered: false,
         debug_token_issued: false,
     };
-    let request_id =
-        insert_request_row(tx, graph, &request, token_request.as_ref(), &manifest).await?;
+    let request_id = insert_request_row(
+        tx,
+        &graph.namespace,
+        &request,
+        token_request.as_ref(),
+        &manifest,
+    )
+    .await?;
     // The runner-facing stored message carries the allocated request id
     // (`submit_run` stamps it the same way).
     message.request_id = request_id;

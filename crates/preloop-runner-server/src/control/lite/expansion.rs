@@ -3,7 +3,7 @@
 //! snapshots its build inputs; `apply_expansion` folds the built subtree in
 //! iff the fence still matches, then promotes whatever unblocked.
 //!
-//! Translated from `control/pg/dispatch.rs` (`claim_expansion`,
+//! Translated from `control/pg/expansion.rs` (`claim_expansion`,
 //! `apply_expansion`, `register_expansion_jobs`, `expansion_plan`). On
 //! SQLite there is one writer: `FOR UPDATE SKIP LOCKED` and the run-row
 //! lock are implicit; the generation conditional stays the apply fence.

@@ -1664,6 +1664,164 @@ pub(crate) mod suite {
         );
     }
 
+    /// Builds a deferred fan-out run: `gen` produces the matrix, `fan` is the
+    /// deferred matrix that needs it, `after` needs `fan`. `gen` is already
+    /// complete when this returns, so `fan` waits in the expansion queue.
+    async fn submit_fan_run_with_generated_matrix(backend: &dyn ControlBackend) -> RunId {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut after = submit_job(run_id, "after", 3);
+        after.queued.needs = vec![JobId("fan".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), fan, after],
+            ))
+            .await
+            .unwrap();
+        finish_callee(
+            backend,
+            run_id,
+            "gen",
+            BTreeMap::from([("m".to_owned(), serde_json::json!({"n": [1, 2, 3]}))]),
+        )
+        .await;
+        run_id
+    }
+
+    /// A matrix leg inherits its node's `needs`, and those settled before the
+    /// node expanded: the legs must start anyway (a terminal need is not
+    /// outstanding) and `after` must wait for every one of them.
+    pub(crate) async fn expanded_legs_with_settled_needs_dispatch(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = submit_fan_run_with_generated_matrix(backend).await;
+        let legs = (1..=3)
+            .map(|n| {
+                let mut leg = built_matrix_leg(run_id, &format!("fan-{n}"), "fan", n, 3);
+                leg.plan.needs = vec![JobId("gen".to_owned())];
+                leg
+            })
+            .collect();
+        expand_deferred_matrix(backend, "fan", legs).await;
+
+        let mut dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        dispatched.sort();
+        assert_eq!(
+            dispatched,
+            ["after", "fan-1", "fan-2", "fan-3"].map(|id| JobId(id.to_owned())),
+            "every leg starts, then the dependent of the matrix"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(record.status, ExecutionStatus::Success);
+        assert!(
+            !record.jobs.contains_key(&JobId("fan".to_owned())),
+            "the expanded parent leaves the run's status map"
+        );
+    }
+
+    /// An empty matrix concludes its node as skipped, and the dependents
+    /// behind it are decided in the same apply.
+    pub(crate) async fn empty_deferred_matrix_skips_the_node_and_its_dependents(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = submit_fan_run_with_generated_matrix(backend).await;
+        expand_deferred_matrix(backend, "fan", Vec::new()).await;
+        let record = backend.run_record(run_id).await.unwrap();
+        for job in ["fan", "after"] {
+            assert_eq!(
+                record.jobs.get(&JobId(job.to_owned())),
+                Some(&ExecutionStatus::Skipped),
+                "{job} follows the empty matrix"
+            );
+        }
+        assert!(record.status.is_terminal(), "got {:?}", record.status);
+    }
+
+    /// A build that fails settles its node and the dependents behind it in the
+    /// same apply; nothing else would decide them.
+    pub(crate) async fn failed_deferred_expansion_skips_its_dependents(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = submit_fan_run_with_generated_matrix(backend).await;
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Err(ExecutionStatus::Failure),
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("fan".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("after".to_owned())),
+            Some(&ExecutionStatus::Skipped),
+            "the dependent of a failed expansion is decided with it"
+        );
+        assert!(record.status.is_terminal(), "got {:?}", record.status);
+    }
+
+    /// A leg no registered runner can host fails at registration without
+    /// stopping its siblings, and the dependent behind the matrix then skips
+    /// once the hostable leg finishes.
+    pub(crate) async fn unhostable_leg_fails_alone_at_expansion(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = submit_fan_run_with_generated_matrix(backend).await;
+        let mut windows = built_matrix_leg(run_id, "fan-1", "fan", 1, 2);
+        windows.plan.runs_on = vec!["windows-latest".to_owned()];
+        windows.plan.fail_fast = false;
+        let mut hostable = built_matrix_leg(run_id, "fan-2", "fan", 2, 2);
+        hostable.plan.fail_fast = false;
+        expand_deferred_matrix(backend, "fan", vec![windows, hostable]).await;
+
+        assert_eq!(
+            backend
+                .job_queue_state(run_id, &JobId("fan-1".to_owned()))
+                .await
+                .unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "the unhostable leg fails at registration"
+        );
+        let dispatched =
+            drain_dispatched(backend, run_id, &session.session_id, runner.runner.id).await;
+        assert_eq!(
+            dispatched,
+            vec![JobId("fan-2".to_owned())],
+            "only the hostable leg runs; the dependent skips"
+        );
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("after".to_owned())),
+            Some(&ExecutionStatus::Skipped)
+        );
+        assert_eq!(record.status, ExecutionStatus::Failure);
+    }
+
     /// A deferred matrix node fans out with its own scoped `inputs`: the
     /// caller's `with:` values when the node was materialized inside a
     /// reusable callee (its stored plan carries them), else the run's dispatch
@@ -9194,6 +9352,38 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn expanded_legs_with_settled_needs_dispatch() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::expanded_legs_with_settled_needs_dispatch(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn empty_deferred_matrix_skips_the_node_and_its_dependents() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::empty_deferred_matrix_skips_the_node_and_its_dependents(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn failed_deferred_expansion_skips_its_dependents() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::failed_deferred_expansion_skips_its_dependents(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn unhostable_leg_fails_alone_at_expansion() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unhostable_leg_fails_alone_at_expansion(&backend).await;
+    }
+
+    #[tokio::test]
     async fn deferred_matrix_expansion_scopes_its_inputs() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -11000,6 +11190,30 @@ mod lite {
     async fn failed_deferred_expansion_settles_the_node_once() {
         suite::failed_deferred_expansion_settles_the_node_once(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn expanded_legs_with_settled_needs_dispatch() {
+        suite::expanded_legs_with_settled_needs_dispatch(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn empty_deferred_matrix_skips_the_node_and_its_dependents() {
+        suite::empty_deferred_matrix_skips_the_node_and_its_dependents(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn failed_deferred_expansion_skips_its_dependents() {
+        suite::failed_deferred_expansion_skips_its_dependents(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unhostable_leg_fails_alone_at_expansion() {
+        suite::unhostable_leg_fails_alone_at_expansion(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
