@@ -39,6 +39,16 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **GitHub App manifest registration is off by default and bound to its
+  browser**: `/api/v1/github/register` and `/api/v1/github/callback` return
+  `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. The
+  registration page sets a signed, one-hour `preloop_app_manifest_state`
+  cookie, and the callback exchanges GitHub's one-time code only when the
+  echoed `state` matches that cookie, so a forged callback never reaches
+  GitHub. The credentials page is no longer cacheable, HTML-escapes every value
+  GitHub returns, shows the owning account to confirm, and hands the webhook
+  secret to `preloop setup github --via app --webhook-secret` rather than the
+  legacy `PRELOOP_WEBHOOK_SECRET` slot.
 
 ## [0.34.0] - 2026-10-09
 
