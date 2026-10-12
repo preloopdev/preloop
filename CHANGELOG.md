@@ -118,6 +118,15 @@ Releases before v0.27.0 predate the changelog.
   leaving them pending; an unhostable leg no longer trips a debug assertion
   at registration and settles after the rest of its subtree exists, so a
   dependent registered later in the subtree sees it as terminal.
+- **Reusable callers fold when their last inner job settles without a
+  completion**: a callee job skipped or failed by a promotion cascade, one that
+  fails its label, environment or gate check at promotion, an unhostable one, and
+  a failed or empty deferred expansion inside a callee never folded the caller,
+  so the caller never got its status and outputs, its dependents and the run
+  never finished, and its concurrency stayed held. Every settle now runs the
+  same fold (nested callers included), refreshes the folded callers' dependents
+  and emits their `job.completed.v1`; SQLite folds after each promotion pass
+  and expansion apply likewise.
 - A completion that reports a non-terminal status is rejected with a bad
   request before anything is written.
 

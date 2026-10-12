@@ -1092,6 +1092,10 @@ pub(super) fn promote_run(
         if !settled {
             return Ok(());
         }
+        // A job this pass settled may have been the last open job of a reusable
+        // caller's subtree; the fold unblocks the caller's dependents, which
+        // the next pass decides.
+        super::dispatch::fold_settled_callers(tx, backend, run_id)?;
     }
 }
 

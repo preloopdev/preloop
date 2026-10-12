@@ -193,6 +193,19 @@ and a deferred matrix parent named in a caller's list is replaced by its legs
 when it expands. These are lite's `write_reusable_meta` and
 `splice_matrix_parents`. Without them a deferred caller never folds on PG.
 
+The fold runs for every settle that turns an inner job terminal, not only a
+completion: `settle_unrun` (a skip or error cascade, a job that fails its label,
+environment or gate check at promotion, a failed or empty expansion, an
+unhostable job) walks up the callers right after the job's own terminal write
+(`Sweep::settle_folded_callers`), refreshes the folded callers' dependents and
+emits their `job.completed.v1`, so a caller whose last open inner job settled
+that way folds in the same transaction, and the dependents it unblocks join the
+promotion queue. An expansion registers its unhostable jobs only after the
+caller's `inner_job_ids` / the matrix splice name the subtree, so their settles
+can fold it. The fold stays idempotent: resolved `outputs` mark a folded caller.
+Lite folds after each promotion pass and after an expansion apply
+(`fold_settled_callers`).
+
 ## If: Condition Evaluation (Per Newly-Unblocked Job)
 
 When the conditional UPDATE unblocks a dependent, evaluate its `if:` before
@@ -320,7 +333,9 @@ Registration inserts every row of the subtree first, then counts
 dependents). A leg inherits its node's `needs:`, which settled before the node
 expanded, and a need may name several legs, so the count at insert time
 (`needs.len()`) is not the outstanding count. Jobs no runner can host settle
-`failure` after that, so a later job of the subtree sees them as terminal.
+`failure` after that — once the caller's `inner_job_ids` or the matrix splice
+name the subtree, so a later job of the subtree sees them as terminal and a
+subtree that is entirely unhostable folds its caller.
 
 The jobs the subtree can start — those with no outstanding needs, plus the
 dependents the unhostable settles unblocked — go through `promote_dependents`

@@ -1572,6 +1572,83 @@ async fn targeted_settle_releases_completed_jobset_hold() {
     }
 }
 
+/// A reusable caller folded by a promotion cascade (its last inner job is
+/// skipped when the job it needs fails, no completion involved) releases its
+/// JobSet hold, exactly as one folded by a completion does.
+#[tokio::test]
+async fn promotion_fold_releases_the_callers_jobset_hold() {
+    use crate::control::tests::{submit_job as shared_job, suite::deferred_caller_run};
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    let mut b = shared_job(run, "caller/b", 4);
+    b.queued.needs = vec![JobId("caller/gen".to_owned())];
+    node.submit_run(deferred_caller_run(
+        run,
+        &["caller/gen", "caller/b"],
+        vec![shared_job(run, "caller/gen", 3), b],
+    ))
+    .await
+    .unwrap();
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let ids = serde_json::json!(["caller"]).to_string();
+    let jobset_id: i64 = tx
+        .query_one(
+            "INSERT INTO jobsets (run_id, job_ids, state) \
+             VALUES ($1::text::uuid, $2::text::jsonb, 'ready') RETURNING jobset_id",
+            &[&run.0.to_string(), &ids],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    tx.execute(
+        "INSERT INTO concurrency_holds \
+         (namespace_id, repository, group_name, display_name, holder_kind, \
+          holder_run_id, holder_jobset_id) \
+         VALUES ('ns', 'owner/repo', 'shared', 'shared', 'jobset', $1::text::uuid, $2)",
+        &[&run.0.to_string(), &jobset_id],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    drop(client);
+
+    node.complete_job(JobCompletionInput {
+        run_id: run,
+        job_id: JobId("caller/gen".to_owned()),
+        agent_job_id: None,
+        status: ExecutionStatus::Failure,
+        outputs: BTreeMap::new(),
+        runner_id: None,
+    })
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    let caller: String = client
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='caller'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(caller, "failure", "the cascade folds the caller");
+    let hold: Option<i32> = client
+        .query_opt(
+            "SELECT 1 FROM concurrency_holds WHERE group_name='shared'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .map(|row| row.get(0));
+    assert!(
+        hold.is_none(),
+        "the folded caller's JobSet hold is released"
+    );
+}
+
 /// A late skipped report cannot replace a job's earlier cancellation.
 #[tokio::test]
 async fn late_skipped_completion_preserves_cancellation() {

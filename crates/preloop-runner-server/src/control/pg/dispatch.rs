@@ -3312,10 +3312,10 @@ impl<'a> Sweep<'a> {
     /// shared `reusable_workflows::propagate_reusable_outputs` semantics),
     /// sets the caller's aggregate status and marks it terminal.
     ///
-    /// Returns the caller ID if folded. The caller walks up the chain by
-    /// calling this repeatedly, so nested reusable workflows fold outermost-
-    /// last.
-    pub(super) async fn try_fold_reusable_caller(
+    /// Returns the caller ID if folded. [`Self::fold_reusable_callers`] walks
+    /// up the chain by calling this repeatedly, so nested reusable workflows
+    /// fold outermost-last.
+    async fn try_fold_reusable_caller(
         backend: &PgBackend,
         tx: &Transaction<'_>,
         run_id: RunId,
@@ -3481,6 +3481,70 @@ impl<'a> Sweep<'a> {
             return Ok(Some(JobId(caller_id)));
         }
         Ok(None)
+    }
+
+    /// Fold every reusable caller the settle of `settled` completes, walking
+    /// up nested callers (innermost first). Every path that turns a job
+    /// terminal runs this: a completion, a settle during promotion (skip and
+    /// error cascades, failed label / environment / gate checks) and an
+    /// expansion that settles a node without a subtree.
+    ///
+    /// The fold itself is idempotent (the resolved `outputs` mark a folded
+    /// caller), so a caller is never folded twice.
+    pub(super) async fn fold_reusable_callers(
+        backend: &PgBackend,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        settled: &JobId,
+    ) -> Result<Vec<JobId>, ControlError> {
+        let mut folded = Vec::new();
+        let mut current = settled.clone();
+        while let Some(caller) =
+            Self::try_fold_reusable_caller(backend, tx, run_id, &current).await?
+        {
+            current = caller.clone();
+            folded.push(caller);
+        }
+        Ok(folded)
+    }
+
+    /// [`Self::fold_reusable_callers`] for a settle that has no completion
+    /// bookkeeping of its own to extend (see `settle_job_targeted`): hand on
+    /// the cohort slot each folded caller frees, refresh its dependents'
+    /// counters and emit its `job.completed.v1`. Returns the dependents the
+    /// folds left `blocked` with no needs remaining, in job-id order; the
+    /// caller decides them (they may skip or fail in turn). The caller stamps
+    /// the run afterwards.
+    pub(super) async fn settle_folded_callers(
+        backend: &PgBackend,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        settled: &JobId,
+    ) -> Result<Vec<JobId>, ControlError> {
+        let mut unblocked = Vec::new();
+        for caller in Self::fold_reusable_callers(backend, tx, run_id, settled).await? {
+            let row = tx
+                .query_one(
+                    "SELECT base_id, status FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run_id.0.to_string(), &caller.0],
+                )
+                .await
+                .map_err(db)?;
+            let base_id: String = row.get(0);
+            let status = crate::control::types::status_parse(row.get::<_, String>(1).as_str());
+            retry_cohort_waiters(backend, tx, run_id, &caller, &base_id).await?;
+            unblocked.extend(Self::refresh_remaining_needs(tx, run_id, &caller, &base_id).await?);
+            emit_outbox(
+                tx,
+                Some(run_id),
+                "job.completed.v1",
+                serde_json::json!({"job_id": caller.0, "status": status_str(status)}),
+            )
+            .await?;
+        }
+        unblocked.sort();
+        unblocked.dedup();
+        Ok(unblocked)
     }
 
     /// Cancel a failed leg's matrix siblings (fail-fast). Returns the IDs of
@@ -6595,12 +6659,7 @@ impl PgBackend {
                 Sweep::cancel_fail_fast_siblings(self, tx, run_id, job_id, &base_id).await?;
         }
         // 4. Reusable caller fold, walking up nested callers.
-        let mut current = job_id.clone();
-        while let Some(caller) = Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await?
-        {
-            current = caller.clone();
-            outcome.folded_callers.push(caller);
-        }
+        outcome.folded_callers = Sweep::fold_reusable_callers(self, tx, run_id, job_id).await?;
         // The bases this completion turned terminal in: the job's own, and each
         // fail-fast sibling's and folded caller's.
         let mut settled_bases = vec![(job_id.clone(), base_id.clone())];
