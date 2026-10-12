@@ -121,7 +121,10 @@ async fn run_webhook_notifier(writers: Weak<Pool>, origin: String, dirty: Arc<No
             return;
         };
         if let Err(error) = send_hint(&pool, &origin).await {
-            tracing::warn!(?error, "webhook hint failed; workers fall back to their tick");
+            tracing::warn!(
+                ?error,
+                "webhook hint failed; workers fall back to their tick"
+            );
         }
     }
 }

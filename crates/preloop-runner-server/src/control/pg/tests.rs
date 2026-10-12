@@ -629,7 +629,10 @@ async fn enqueued_webhook_delivery_wakes_other_nodes() {
     let mut hints = node_b.subscribe_webhook_wakes();
     await_webhook_listener(&node_a, &mut hints).await;
 
-    let written = node_a.enqueue_webhook_delivery(&webhook_record("wake")).await.unwrap();
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("wake"))
+        .await
+        .unwrap();
     assert!(written);
     let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
         .await
@@ -652,7 +655,9 @@ async fn burst_of_webhook_enqueues_shares_notifications() {
         .map(|i| webhook_record(&format!("burst-{i}")))
         .collect();
     let written = futures::future::join_all(
-        records.iter().map(|record| node_a.enqueue_webhook_delivery(record)),
+        records
+            .iter()
+            .map(|record| node_a.enqueue_webhook_delivery(record)),
     )
     .await;
     assert!(
@@ -685,14 +690,21 @@ async fn own_webhook_enqueue_echoes_with_the_writers_origin() {
     await_webhook_listener(&node_b, &mut own).await;
     drain_hints(&mut other).await;
 
-    let written = node_a.enqueue_webhook_delivery(&webhook_record("echo")).await.unwrap();
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("echo"))
+        .await
+        .unwrap();
     assert!(written);
     for hints in [&mut own, &mut other] {
         let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
             .await
             .expect("both nodes hear the enqueue")
             .expect("the hint channel stays open");
-        assert_eq!(origin, node_a.origin(), "the echo carries the writer's origin");
+        assert_eq!(
+            origin,
+            node_a.origin(),
+            "the echo carries the writer's origin"
+        );
     }
 }
 
@@ -703,11 +715,16 @@ async fn webhook_enqueue_is_claimable_without_any_subscriber() {
     let Some((_pg, node_a, node_b)) = backend_pair().await else {
         return skip_no_postgres();
     };
-    let written = node_a.enqueue_webhook_delivery(&webhook_record("unhinted")).await.unwrap();
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("unhinted"))
+        .await
+        .unwrap();
     assert!(written);
     let claimed = node_b.claim_webhook_deliveries(10, 60).await.unwrap();
     assert!(
-        claimed.iter().any(|delivery| delivery.delivery_id == "unhinted"),
+        claimed
+            .iter()
+            .any(|delivery| delivery.delivery_id == "unhinted"),
         "polling must find the row even though no node took its hint"
     );
 }
@@ -718,14 +735,24 @@ async fn requeued_webhook_delivery_wakes_other_nodes() {
     let Some((_pg, node_a, node_b)) = backend_pair().await else {
         return skip_no_postgres();
     };
-    assert!(node_a.enqueue_webhook_delivery(&webhook_record("replay")).await.unwrap());
+    assert!(
+        node_a
+            .enqueue_webhook_delivery(&webhook_record("replay"))
+            .await
+            .unwrap()
+    );
     let claimed = node_a.claim_webhook_deliveries(1_000, 60).await.unwrap();
     let token = claimed
         .iter()
         .find(|delivery| delivery.delivery_id == "replay")
         .and_then(|delivery| delivery.lease_token.clone())
         .expect("the replayed row is claimable");
-    assert!(node_a.complete_webhook_delivery("replay", &token).await.unwrap());
+    assert!(
+        node_a
+            .complete_webhook_delivery("replay", &token)
+            .await
+            .unwrap()
+    );
 
     let mut hints = node_b.subscribe_webhook_wakes();
     await_webhook_listener(&node_a, &mut hints).await;
@@ -734,7 +761,11 @@ async fn requeued_webhook_delivery_wakes_other_nodes() {
         .await
         .expect("the requeue must wake node B well before its tick")
         .expect("the hint channel stays open");
-    assert_eq!(origin, node_a.origin(), "the requeue's hint names the writing node");
+    assert_eq!(
+        origin,
+        node_a.origin(),
+        "the requeue's hint names the writing node"
+    );
 }
 
 fn timeline_record(id: u128, name: &str) -> azdo::TimelineRecord {

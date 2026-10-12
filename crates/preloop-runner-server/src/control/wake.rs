@@ -235,7 +235,10 @@ mod tests {
         let (hints, _) = broadcast::channel(16);
         let worker = forwarder(&hints, "node-a");
         hints.send("node-a".to_owned()).unwrap();
-        assert!(!woken(&worker).await, "a node's own echo must not wake its worker");
+        assert!(
+            !woken(&worker).await,
+            "a node's own echo must not wake its worker"
+        );
     }
 
     #[tokio::test]
@@ -263,7 +266,10 @@ mod tests {
         for _ in 0..4 {
             hints.send("node-a".to_owned()).unwrap();
         }
-        assert!(woken(&worker).await, "a lagged receiver may have missed a foreign hint");
+        assert!(
+            woken(&worker).await,
+            "a lagged receiver may have missed a foreign hint"
+        );
     }
 
     #[tokio::test]
