@@ -1725,13 +1725,13 @@ async fn promote_waiter(
 
 /// Advance a jobset through its remaining gates (the promoted gate counts as
 /// acquired). `Ready` when every gate row is `acquired`.
-enum JobsetAdvance {
+pub(super) enum JobsetAdvance {
     Ready,
     Blocked,
     Failed,
 }
 
-async fn advance_jobset(
+pub(super) async fn advance_jobset(
     backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
@@ -2011,92 +2011,101 @@ async fn held_jobs_of_run(tx: &Transaction<'_>, run_id: RunId) -> Result<Vec<Job
         .collect())
 }
 
-/// A job-waiter promoted: hydrate, stamp, enqueue.
+/// A job-waiter promoted: the job takes the gate and enqueues.
+///
+/// Reads and writes only this job's rows. A job parks on a concurrency gate
+/// after its message was hydrated (`Sweep::promote` hydrates before the gate;
+/// a re-run hydrates before it parks, see `rerun.rs`), and its needs are
+/// terminal by then, so nothing in the stored message can change here.
 async fn resume_held_job(
     backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
 ) -> Result<(), ControlError> {
-    let mut graph = match backend.load_graph(tx, run_id).await? {
-        Some(graph) => graph,
-        None => return Ok(()),
-    };
-    resume_held_node(backend, tx, &mut graph, job_id, now_us()).await?;
-    graph.resummarize();
-    flush_run(tx, &graph).await?;
-    if let Some(node) = graph.nodes.get(job_id) {
-        flush_node(tx, run_id, job_id, node).await?;
-    }
-    Ok(())
-}
-
-/// One held node resuming: needs context hydrated, gate acquired-stamp,
-/// ready-queue entry, assignment pairing.
-async fn resume_held_node(
-    backend: &PgBackend,
-    tx: &Transaction<'_>,
-    graph: &mut RunGraph,
-    job_id: &JobId,
-    now: i64,
-) -> Result<(), ControlError> {
-    let Some(node) = graph.nodes.get_mut(job_id) else {
+    let run = run_id.0.to_string();
+    let Some(row) = tx
+        .query_opt(
+            "SELECT j.environment_gate::text, \
+                    COALESCE(jsonb_typeof(s.reusable_call->'call') <> 'null', false) \
+             FROM jobs j LEFT JOIN job_specs s \
+               ON s.run_id = j.run_id AND s.job_id = j.job_id \
+             WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?
+    else {
         return Ok(());
     };
-    // Hydrate needs + environment into the stored template.
-    if let Some(mut message) = PgBackend::node_message(tx, graph.record.run_id, job_id).await? {
-        let mut queued = graph::queued_of(job_id, graph.record.run_id, node, message);
-        sched_helpers::hydrate_needs_context(&mut queued, &graph.record);
-        apply_resolved_runs_on(node, queued.runs_on);
-        // Gate markers hydration stamps (an environment name that can never
-        // resolve) travel to the node, where the parked-gate sweep fails it.
-        node.environment_gate = queued.environment_gate.clone();
-        message = queued.message;
-        PgBackend::write_node_message(tx, graph.record.run_id, job_id, &message).await?;
-    }
-    let node = graph.nodes.get_mut(job_id).expect("node present");
-    let reusable = node
-        .reusable
-        .as_ref()
-        .is_some_and(|spec| spec.call.is_some());
+    // Fail closed, as `load_graph` does: an unreadable gate is the empty gate.
+    let environment_gate: Option<EnvironmentGateState> = row
+        .get::<_, Option<String>>(0)
+        .map(|text| serde_json::from_str(&text).unwrap_or_default());
+    let reusable: bool = row.get(1);
     if reusable {
         // Caller nodes park for expansion, not dispatch.
-        node.status = ExecutionStatus::Pending;
-        node.queue_state = logic::QueueState::Blocked;
-        return Ok(());
-    }
-    if node
-        .environment_gate
+        tx.execute(
+            "UPDATE jobs SET status=$3, queue_state=$4 \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[
+                &run,
+                &job_id.0,
+                &status_str(ExecutionStatus::Pending),
+                &queue_state_str(logic::QueueState::Blocked),
+            ],
+        )
+        .await
+        .map_err(db)?;
+    } else if environment_gate
         .as_ref()
         .is_some_and(|gate| gate.unresolvable_name.is_some())
     {
         // The environment name can never resolve: leave the node held — the
         // parked-gate sweep fails it closed instead of dispatching under a
         // template name.
-        return Ok(());
-    }
-    node.concurrency_acquired_at_us = Some(now);
-    mark_ready(node, now);
-    set_status(graph, job_id, ExecutionStatus::Queued);
-    emit_outbox(
-        tx,
-        Some(graph.record.run_id),
-        "job.queued.v1",
-        serde_json::json!({"job_id": job_id.0, "status": "queued"}),
-    )
-    .await?;
-    notify_wake(
-        tx,
-        crate::control::wake::Wake {
-            ready: 1,
-            broadcast: false,
-        },
-    )
-    .await?;
-    if let Some(target) = EnqueueTarget::of_node(graph, job_id) {
+    } else {
+        let now = now_us();
+        let placed = tx
+            .query_one(
+                concat!(
+                    "UPDATE jobs j SET status=$3, queue_state=$4, concurrency_acquired_at=",
+                    ts!("$5"),
+                    ", enqueued_at=",
+                    ts!("$5"),
+                    " FROM runs r WHERE j.run_id=$1::text::uuid AND j.job_id=$2 \
+                     AND r.run_id = j.run_id \
+                     RETURNING r.namespace_id, j.pool_key, j.runs_on::text, j.runner_group"
+                ),
+                &[
+                    &run,
+                    &job_id.0,
+                    &status_str(ExecutionStatus::Queued),
+                    &queue_state_str(logic::QueueState::Ready),
+                    &now,
+                ],
+            )
+            .await
+            .map_err(db)?;
+        emit_outbox(
+            tx,
+            Some(run_id),
+            "job.queued.v1",
+            serde_json::json!({"job_id": job_id.0, "status": "queued"}),
+        )
+        .await?;
+        notify_wake(
+            tx,
+            crate::control::wake::Wake {
+                ready: 1,
+                broadcast: false,
+            },
+        )
+        .await?;
+        let target = EnqueueTarget::from_row(run_id, job_id, &placed)?;
         on_job_enqueued(backend, tx, &target).await?;
     }
-    Ok(())
+    summarize_run_tx(tx, run_id).await
 }
 
 /// What `on_job_enqueued` reads of a job it pairs with a runner: its
@@ -2128,6 +2137,27 @@ impl EnqueueTarget {
         })
     }
 
+    /// The target of a row selected as `namespace_id, pool_key, runs_on::text,
+    /// runner_group`.
+    pub(super) fn from_row(
+        run_id: RunId,
+        job_id: &JobId,
+        row: &tokio_postgres::Row,
+    ) -> Result<Self, ControlError> {
+        Ok(Self {
+            run_id,
+            job_id: job_id.clone(),
+            namespace: row.get(0),
+            pool_key: row.get(1),
+            runs_on: row
+                .get::<_, Option<String>>(2)
+                .map(|text| codec::from_json(&text))
+                .transpose()?
+                .unwrap_or_default(),
+            runner_group: row.get(3),
+        })
+    }
+
     /// The target of a job read from its row and its run's namespace: one
     /// statement, no graph.
     pub(super) async fn load(
@@ -2147,18 +2177,7 @@ impl EnqueueTarget {
         else {
             return Ok(None);
         };
-        Ok(Some(Self {
-            run_id,
-            job_id: job_id.clone(),
-            namespace: row.get(0),
-            pool_key: row.get(1),
-            runs_on: row
-                .get::<_, Option<String>>(2)
-                .map(|text| codec::from_json(&text))
-                .transpose()?
-                .unwrap_or_default(),
-            runner_group: row.get(3),
-        }))
+        Self::from_row(run_id, job_id, &row).map(Some)
     }
 }
 
@@ -2915,11 +2934,11 @@ impl<'a> Sweep<'a> {
                 }
                 Ok(gates) => {
                     if !gates.is_empty() {
-                        let jobset_id = self.ensure_jobset(run_id, job_id, &gates).await?;
+                        let jobset_id = ensure_jobset(self.tx, run_id, job_id, &gates).await?;
                         match advance_jobset(self.backend, self.tx, run_id, jobset_id, None).await?
                         {
                             JobsetAdvance::Ready => {
-                                self.set_jobset_ready(run_id, jobset_id).await?;
+                                set_jobset_ready(self.tx, jobset_id).await?;
                             }
                             JobsetAdvance::Blocked => {
                                 self.hold_node(run_id, job_id);
@@ -3056,7 +3075,11 @@ impl<'a> Sweep<'a> {
     /// Hydrate needs context (and the deferred environment name) into the
     /// node's stored message, applying resolved `runs-on` labels to the
     /// node. `true` when a message row existed to hydrate.
-    async fn hydrate_node(&mut self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+    pub(super) async fn hydrate_node(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
         let Some(message) = self.message(run_id, job_id).await? else {
             return Ok(false);
         };
@@ -3656,130 +3679,20 @@ impl<'a> Sweep<'a> {
         let Some(node) = graph.nodes.get(job_id) else {
             return Ok(Err(ExecutionStatus::Failure));
         };
-        let Some(meta) = node.reusable.as_ref().and_then(|spec| spec.meta.clone()) else {
+        let Some(meta) = node.reusable.as_ref().and_then(|spec| spec.meta.as_ref()) else {
             return Ok(Ok(Vec::new()));
         };
-        let submission = &graph.submission;
-        let mut gates = Vec::new();
-        for (raw, scope, label, inputs) in [
-            (
-                meta.caller_concurrency.as_ref(),
-                concurrency::ConcurrencyScope::Job,
-                "caller concurrency (JobSet)",
-                &submission.inputs,
-            ),
-            (
-                meta.embedded_concurrency.as_ref(),
-                concurrency::ConcurrencyScope::Workflow,
-                "embedded concurrency (JobSet)",
-                &meta.inputs,
-            ),
-        ] {
-            let Some(raw) = raw else { continue };
-            let eval_ctx = concurrency::ConcurrencyContext {
-                scope,
-                github: &graph.github,
-                vars: &submission.vars,
-                inputs,
-                matrix: Some(&node.matrix),
-                strategy: None,
-                needs: None,
-            };
-            match concurrency::evaluate_concurrency(raw, &eval_ctx) {
-                Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
-                    sched_merge_gate(
-                        &mut gates,
-                        JobSetGate {
-                            key: concurrency::concurrency_key(&submission.repository, &group),
-                            display_name: group,
-                            cancel_in_progress,
-                            queue,
-                        },
-                    );
-                }
-                Ok(_) => return Ok(Err(ExecutionStatus::Failure)),
-                Err(error) => {
-                    concurrency::log_eval_error(label, &error);
-                    return Ok(Err(ExecutionStatus::Failure));
-                }
-            }
-        }
-        Ok(Ok(gates))
+        Ok(caller_jobset_gates(
+            meta,
+            &node.matrix,
+            &graph.submission,
+            &graph.github,
+        ))
     }
 
     /// `merge_jobset_gate` parity.
     fn merge_gate(gates: &mut Vec<JobSetGate>, gate: JobSetGate) {
         sched_merge_gate(gates, gate)
-    }
-
-    /// Register (or find) the jobset row for a caller and its gate rows.
-    async fn ensure_jobset(
-        &mut self,
-        run_id: RunId,
-        job_id: &JobId,
-        gates: &[JobSetGate],
-    ) -> Result<i64, ControlError> {
-        let ids = serde_json::to_string(&[job_id.0.as_str()]).unwrap_or_default();
-        let row = self
-            .tx
-            .query_opt(
-                "SELECT jobset_id FROM jobsets WHERE run_id=$1::text::uuid \
-                 AND job_ids=$2::text::jsonb",
-                &[&run_id.0.to_string(), &ids],
-            )
-            .await
-            .map_err(db)?;
-        if let Some(row) = row {
-            return Ok(row.get(0));
-        }
-        let jobset_id: i64 = self
-            .tx
-            .query_one(
-                "INSERT INTO jobsets (run_id, job_ids, state) \
-                 VALUES ($1::text::uuid,$2::text::jsonb,'waiting') \
-                 RETURNING jobset_id",
-                &[&run_id.0.to_string(), &ids],
-            )
-            .await
-            .map_err(db)?
-            .get(0);
-        for (index, gate) in gates.iter().enumerate() {
-            self.tx
-                .execute(
-                    "INSERT INTO jobset_gates (jobset_id, gate_index, repository, \
-                     group_name, display_name, cancel_in_progress, queue_mode) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7)",
-                    &[
-                        &jobset_id,
-                        &(index as i32),
-                        &gate.key.0,
-                        &gate.key.1,
-                        &gate.display_name,
-                        &gate.cancel_in_progress,
-                        &concurrency::queue_mode_row(&gate.queue),
-                    ],
-                )
-                .await
-                .map_err(db)?;
-        }
-        Ok(jobset_id)
-    }
-
-    /// Mark a jobset fully admitted; members parked behind it resume.
-    async fn set_jobset_ready(
-        &mut self,
-        run_id: RunId,
-        jobset_id: i64,
-    ) -> Result<(), ControlError> {
-        self.tx
-            .execute(
-                "UPDATE jobsets SET state='ready' WHERE jobset_id=$1",
-                &[&jobset_id],
-            )
-            .await
-            .map_err(db)?;
-        let _ = run_id;
-        Ok(())
     }
 
     /// Whether the cohort of `base_id` legs is under `limit`: legs that are
@@ -3839,6 +3752,127 @@ impl<'a> Sweep<'a> {
         )
         .await
     }
+}
+
+/// The reusable caller's merged JobSet gates: its own `concurrency:` (job
+/// scope, against the submission's inputs) and the callee workflow's
+/// (workflow scope, against the call's `with:` inputs). `Err` carries the
+/// terminal status the caller must settle with when a gate cannot evaluate.
+pub(super) fn caller_jobset_gates(
+    meta: &preloop_gha_parser::ReusableCallMetadata,
+    matrix: &BTreeMap<String, serde_json::Value>,
+    submission: &preloop_gha_protocol::WorkflowSubmission,
+    github: &serde_json::Value,
+) -> Result<Vec<JobSetGate>, ExecutionStatus> {
+    let mut gates = Vec::new();
+    for (raw, scope, label, inputs) in [
+        (
+            meta.caller_concurrency.as_ref(),
+            concurrency::ConcurrencyScope::Job,
+            "caller concurrency (JobSet)",
+            &submission.inputs,
+        ),
+        (
+            meta.embedded_concurrency.as_ref(),
+            concurrency::ConcurrencyScope::Workflow,
+            "embedded concurrency (JobSet)",
+            &meta.inputs,
+        ),
+    ] {
+        let Some(raw) = raw else { continue };
+        let eval_ctx = concurrency::ConcurrencyContext {
+            scope,
+            github,
+            vars: &submission.vars,
+            inputs,
+            matrix: Some(matrix),
+            strategy: None,
+            needs: None,
+        };
+        match concurrency::evaluate_concurrency(raw, &eval_ctx) {
+            Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
+                sched_merge_gate(
+                    &mut gates,
+                    JobSetGate {
+                        key: concurrency::concurrency_key(&submission.repository, &group),
+                        display_name: group,
+                        cancel_in_progress,
+                        queue,
+                    },
+                );
+            }
+            Ok(_) => return Err(ExecutionStatus::Failure),
+            Err(error) => {
+                concurrency::log_eval_error(label, &error);
+                return Err(ExecutionStatus::Failure);
+            }
+        }
+    }
+    Ok(gates)
+}
+
+/// Register (or find) the jobset row for a caller and its gate rows.
+pub(super) async fn ensure_jobset(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    gates: &[JobSetGate],
+) -> Result<i64, ControlError> {
+    let ids = serde_json::to_string(&[job_id.0.as_str()]).unwrap_or_default();
+    let row = tx
+        .query_opt(
+            "SELECT jobset_id FROM jobsets WHERE run_id=$1::text::uuid \
+             AND job_ids=$2::text::jsonb",
+            &[&run_id.0.to_string(), &ids],
+        )
+        .await
+        .map_err(db)?;
+    if let Some(row) = row {
+        return Ok(row.get(0));
+    }
+    let jobset_id: i64 = tx
+        .query_one(
+            "INSERT INTO jobsets (run_id, job_ids, state) \
+             VALUES ($1::text::uuid,$2::text::jsonb,'waiting') \
+             RETURNING jobset_id",
+            &[&run_id.0.to_string(), &ids],
+        )
+        .await
+        .map_err(db)?
+        .get(0);
+    for (index, gate) in gates.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO jobset_gates (jobset_id, gate_index, repository, \
+                 group_name, display_name, cancel_in_progress, queue_mode) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            &[
+                &jobset_id,
+                &(index as i32),
+                &gate.key.0,
+                &gate.key.1,
+                &gate.display_name,
+                &gate.cancel_in_progress,
+                &concurrency::queue_mode_row(&gate.queue),
+            ],
+        )
+        .await
+        .map_err(db)?;
+    }
+    Ok(jobset_id)
+}
+
+/// Mark a jobset fully admitted; members parked behind it resume.
+pub(super) async fn set_jobset_ready(
+    tx: &Transaction<'_>,
+    jobset_id: i64,
+) -> Result<(), ControlError> {
+    tx.execute(
+        "UPDATE jobsets SET state='ready' WHERE jobset_id=$1",
+        &[&jobset_id],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
 }
 
 /// `merge_jobset_gate` parity: same-key gates merge (stricter cancel/queue).
@@ -6406,12 +6440,10 @@ impl PgBackend {
     /// dependents' counters and stamp the run — all without loading the run
     /// graph.
     ///
-    /// Promotion is the one step that still needs the graph (needs hydration,
-    /// job/JobSet gates, max-parallel cohorts, deferred expansion are not
-    /// expressible as conditional writes), so it stays with the shared
-    /// [`Sweep`] — but only when this completion actually made a dependent
-    /// promotable (`promotable_dependents`). A leg of a large fan-out
-    /// therefore settles without ever materializing the run.
+    /// It reports the dependents it left promotable (`unblocked`) and the
+    /// cohorts it freed a slot in (`admit_cohorts`); `promote_after_settle`
+    /// decides and promotes them over their own rows. No part of a completion
+    /// loads the run graph.
     async fn settle_job_targeted(
         &self,
         tx: &Transaction<'_>,
@@ -6641,9 +6673,11 @@ impl PgBackend {
         Ok(outcome)
     }
 
-    /// Promote whatever the targeted settle unblocked: first the parked legs
-    /// of the settled cohorts a freed `max-parallel` slot can take (over their
-    /// own rows), then the dependents that became promotable.
+    /// Promote whatever the targeted settle unblocked, over the rows of the
+    /// jobs involved and never the run's graph: first the parked legs of the
+    /// settled cohorts a freed `max-parallel` slot can take, then the
+    /// dependents that became promotable (including those the first step's
+    /// settled legs unblocked), which may skip or fail in turn.
     async fn promote_after_settle(
         &self,
         tx: &Transaction<'_>,
@@ -6656,28 +6690,10 @@ impl PgBackend {
             promote::admit_cohorts(self, tx, run_id, &outcome.admit_cohorts, &mut scheduling)
                 .await?,
         );
-        if !unblocked.is_empty() {
-            scheduling.merge(self.promote_unblocked(tx, run_id).await?);
-        }
-        Ok(scheduling)
-    }
-
-    /// The shared sweep over the run's graph, so needs hydration, gates,
-    /// cohorts and deferred expansion behave exactly as they do on the
-    /// submit/cancel paths.
-    async fn promote_unblocked<'a>(
-        &'a self,
-        tx: &'a Transaction<'a>,
-        run_id: RunId,
-    ) -> Result<crate::runtime_scheduling::SchedulingOutcome, ControlError> {
-        let mut sweep = Sweep::new(self, tx).await?;
-        let graph = PgBackend::load_graph(self, tx, run_id)
-            .await?
-            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
-        sweep.graphs.insert(run_id, graph);
-        sweep.sweep().await?;
-        let scheduling = std::mem::take(&mut sweep.outcome);
-        sweep.flush().await?;
+        unblocked.sort();
+        unblocked.dedup();
+        self.promote_dependents(tx, run_id, &unblocked, &mut scheduling)
+            .await?;
         Ok(scheduling)
     }
 

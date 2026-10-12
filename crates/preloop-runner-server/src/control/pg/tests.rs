@@ -2535,3 +2535,336 @@ async fn claim_order_is_served_by_the_global_ready_index() {
         "the front read must not sort:\n{plan}"
     );
 }
+
+/// A `queue: max` job-level gate: waiters line up FIFO instead of replacing
+/// each other.
+fn fifo_gate(group: &str) -> preloop_gha_parser::Concurrency {
+    preloop_gha_parser::Concurrency {
+        queue: preloop_gha_parser::ConcurrencyQueue::Max,
+        ..gate(group)
+    }
+}
+
+/// Everything a promoted job waiter leaves behind, read straight from rows.
+#[derive(Debug, PartialEq)]
+struct EnqueuedRows {
+    status: String,
+    queue_state: String,
+    acquired: bool,
+    enqueued: bool,
+    message: serde_json::Value,
+    provisions: i64,
+    assignments: i64,
+    queued_events: i64,
+    waits: i64,
+}
+
+async fn enqueued_rows(node: &PgBackend, run: RunId, job: &str) -> EnqueuedRows {
+    let client = node.writer().await.unwrap();
+    let run = run.0.to_string();
+    let row = client
+        .query_one(
+            "SELECT j.status, j.queue_state, j.concurrency_acquired_at IS NOT NULL, \
+                    j.enqueued_at IS NOT NULL, m.message_template::text \
+             FROM jobs j JOIN job_messages m USING (run_id, job_id) \
+             WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
+            &[&run, &job],
+        )
+        .await
+        .unwrap();
+    let count = |sql: &'static str| {
+        let client = &client;
+        let (run, job) = (&run, job);
+        async move {
+            client
+                .query_one(sql, &[run, &job])
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        }
+    };
+    EnqueuedRows {
+        status: row.get(0),
+        queue_state: row.get(1),
+        acquired: row.get(2),
+        enqueued: row.get(3),
+        message: serde_json::from_str(row.get::<_, String>(4).as_str()).unwrap(),
+        provisions: count(
+            "SELECT count(*) FROM provision_requests WHERE run_id=$1::text::uuid AND job_id=$2",
+        )
+        .await,
+        assignments: count(
+            "SELECT count(*) FROM job_assignments WHERE run_id=$1::text::uuid AND job_id=$2",
+        )
+        .await,
+        queued_events: count(
+            "SELECT count(*) FROM outbox_events WHERE run_id=$1::text::uuid \
+             AND topic='job.queued.v1' AND payload->>'job_id'=$2",
+        )
+        .await,
+        waits: count(
+            "SELECT count(*) FROM concurrency_waits WHERE holder_run_id=$1::text::uuid \
+             AND holder_job_id=$2",
+        )
+        .await,
+    }
+}
+
+/// `contextData[key]` of a message, or the entry `key` of a serialized
+/// context dictionary (`{"d": [{"k": .., "v": ..}], "t": 2}`).
+fn context_entry(value: &serde_json::Value, key: &str) -> serde_json::Value {
+    let dict = value.get("contextData").unwrap_or(value);
+    let dict = dict.get("d").and_then(|d| d.as_array());
+    match dict {
+        Some(entries) => entries
+            .iter()
+            .find(|entry| entry["k"] == key)
+            .map(|entry| entry["v"].clone())
+            .unwrap_or(serde_json::Value::Null),
+        None => value
+            .get("contextData")
+            .and_then(|data| data.get(key))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    }
+}
+
+async fn run_status(node: &PgBackend, run: RunId) -> String {
+    node.writer()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT status FROM runs WHERE run_id=$1::text::uuid",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Job waiters (one in the holder's own run, others in other runs) promote in
+/// FIFO order as the gate's holder changes, and each ends exactly as a job
+/// enqueued without waiting: `ready`/`queued`, acquired and enqueue stamps, its
+/// stored message untouched, one `job.queued.v1`, a pool provision request,
+/// and no wait row; the run's status follows its jobs.
+#[tokio::test]
+async fn job_waiters_promote_fifo_across_runs_with_enqueue_effects() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    node.set_config(true, false, std::time::Duration::from_secs(30));
+
+    let first = RunId::new();
+    let second = RunId::new();
+    // `first` holds the gate with `h`, its own `w` waits behind it, and `second`'s `w`
+    // queues after that.
+    let mut h = submit_job(first, "h", 1);
+    h.queued.concurrency = Some(fifo_gate("g"));
+    let mut own = submit_job(first, "w", 2);
+    own.queued.concurrency = Some(fifo_gate("g"));
+    node.submit_run(submit_run(first, vec![h, own]))
+        .await
+        .unwrap();
+    let mut other = submit_job(second, "w", 3);
+    other.queued.concurrency = Some(fifo_gate("g"));
+    node.submit_run(submit_run(second, vec![other]))
+        .await
+        .unwrap();
+
+    assert_eq!(queue_state(&node, first, "h").await, "ready");
+    assert_eq!(queue_state(&node, first, "w").await, "held");
+    assert_eq!(queue_state(&node, second, "w").await, "held");
+    let own_parked = enqueued_rows(&node, first, "w").await;
+    let other_parked = enqueued_rows(&node, second, "w").await;
+    assert_eq!((own_parked.waits, other_parked.waits), (1, 1));
+    assert_eq!((own_parked.queued_events, own_parked.provisions), (0, 0));
+
+    // The holder finishes: the older waiter, in the same run, takes the gate.
+    complete_ok(&node, first, "h").await;
+    let promoted = enqueued_rows(&node, first, "w").await;
+    assert_eq!(
+        promoted,
+        EnqueuedRows {
+            status: "queued".to_owned(),
+            queue_state: "ready".to_owned(),
+            acquired: true,
+            enqueued: true,
+            message: own_parked.message.clone(),
+            provisions: 1,
+            assignments: 0,
+            queued_events: 1,
+            waits: 0,
+        }
+    );
+    let still_waiting = enqueued_rows(&node, second, "w").await;
+    assert_eq!(
+        still_waiting, other_parked,
+        "the younger waiter must keep waiting"
+    );
+    assert_eq!(run_status(&node, first).await, "queued");
+
+    // Its release hands the gate to the other run's waiter.
+    complete_ok(&node, first, "w").await;
+    let promoted = enqueued_rows(&node, second, "w").await;
+    assert_eq!(
+        promoted,
+        EnqueuedRows {
+            status: "queued".to_owned(),
+            queue_state: "ready".to_owned(),
+            acquired: true,
+            enqueued: true,
+            message: other_parked.message.clone(),
+            provisions: 1,
+            assignments: 0,
+            queued_events: 1,
+            waits: 0,
+        }
+    );
+    assert_eq!(run_status(&node, first).await, "completed");
+    assert_eq!(run_status(&node, second).await, "queued");
+}
+
+/// A waiter that hydrated before parking (it has `needs`, one of them a
+/// deferred `runs-on` label) keeps that hydrated message and placement when
+/// it takes the gate, and its provision request carries the resolved labels.
+#[tokio::test]
+async fn hydrated_job_waiter_keeps_message_and_resolved_placement_on_promotion() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    node.set_config(true, false, std::time::Duration::from_secs(30));
+
+    let holder = RunId::new();
+    let run = RunId::new();
+    let mut h = submit_job(holder, "h", 1);
+    h.queued.concurrency = Some(fifo_gate("g"));
+    node.submit_run(submit_run(holder, vec![h])).await.unwrap();
+    let setup = submit_job(run, "a", 2);
+    let mut d = submit_job(run, "d", 3);
+    d.queued.needs = vec![JobId("a".to_owned())];
+    d.queued.runs_on = vec!["${{ needs.a.outputs.label }}".to_owned()];
+    d.queued.concurrency = Some(fifo_gate("g"));
+    node.submit_run(submit_run(run, vec![setup, d]))
+        .await
+        .unwrap();
+
+    node.complete_job(JobCompletionInput {
+        run_id: run,
+        job_id: JobId("a".to_owned()),
+        agent_job_id: None,
+        status: ExecutionStatus::Success,
+        outputs: BTreeMap::from([("label".to_owned(), serde_json::json!("self-hosted"))]),
+        runner_id: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(queue_state(&node, run, "d").await, "held");
+    let parked = enqueued_rows(&node, run, "d").await;
+    assert_eq!(
+        context_entry(
+            &context_entry(&context_entry(&parked.message, "needs"), "a"),
+            "outputs"
+        ),
+        serde_json::json!({"d": [{"k": "label", "v": "self-hosted"}], "t": 2}),
+        "the promotion sweep hydrates before the job parks: {}",
+        parked.message
+    );
+
+    complete_ok(&node, holder, "h").await;
+    let promoted = enqueued_rows(&node, run, "d").await;
+    assert_eq!(
+        (&promoted.status[..], &promoted.queue_state[..]),
+        ("queued", "ready")
+    );
+    assert_eq!(promoted.message, parked.message);
+    assert_eq!((promoted.provisions, promoted.queued_events), (1, 1));
+    let (runs_on, pool_key, labels): (String, String, String) = {
+        let row = node
+            .writer()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT j.runs_on::text, j.pool_key, p.labels::text FROM jobs j \
+                 JOIN provision_requests p USING (run_id, job_id) \
+                 WHERE j.run_id=$1::text::uuid AND j.job_id='d'",
+                &[&run.0.to_string()],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2))
+    };
+    assert_eq!(runs_on, r#"["self-hosted"]"#);
+    assert_eq!(labels, r#"["self-hosted"]"#);
+    assert_eq!(
+        pool_key,
+        crate::control::types::compute_pool_key(&["self-hosted".to_owned()], None)
+    );
+}
+
+/// A re-run's job parks on a busy gate and promotes from its own rows when
+/// the gate releases: whatever the stored template carried (here: a template
+/// whose needs context was never stamped), the enqueued message has the
+/// hydrated (empty) needs context, stamped exactly once, and the job enqueues
+/// like any other.
+#[tokio::test]
+async fn rerun_job_waiter_enqueues_hydrated_when_the_gate_releases() {
+    use crate::control::types::{RerunMode, RerunRun};
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    node.set_config(true, false, std::time::Duration::from_secs(30));
+
+    let rerun = RunId::new();
+    let mut deploy = submit_job(rerun, "deploy", 1);
+    deploy.queued.concurrency = Some(fifo_gate("g"));
+    node.submit_run(submit_run(rerun, vec![deploy]))
+        .await
+        .unwrap();
+    complete_ok(&node, rerun, "deploy").await;
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE job_messages SET message_template = message_template #- '{contextData,needs}' \
+             WHERE run_id=$1::text::uuid AND job_id='deploy'",
+            &[&rerun.0.to_string()],
+        )
+        .await
+        .unwrap();
+
+    let holder = RunId::new();
+    let mut h = submit_job(holder, "h", 2);
+    h.queued.concurrency = Some(fifo_gate("g"));
+    node.submit_run(submit_run(holder, vec![h])).await.unwrap();
+    assert_eq!(queue_state(&node, holder, "h").await, "ready");
+
+    node.rerun_run(RerunRun {
+        run_id: rerun,
+        mode: RerunMode::All,
+        triggering_actor: None,
+        workflow_concurrency: None,
+        environment_rules: crate::config::EnvironmentRulesMap::default(),
+        templates: Vec::new(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(queue_state(&node, rerun, "deploy").await, "held");
+    let parked = enqueued_rows(&node, rerun, "deploy").await;
+    assert_eq!(parked.waits, 1);
+
+    complete_ok(&node, holder, "h").await;
+    let promoted = enqueued_rows(&node, rerun, "deploy").await;
+    assert_eq!(
+        (&promoted.status[..], &promoted.queue_state[..]),
+        ("queued", "ready")
+    );
+    assert!(promoted.acquired && promoted.enqueued);
+    assert_eq!(
+        context_entry(&promoted.message, "needs"),
+        serde_json::json!({"d": [], "t": 2}),
+        "the enqueued message carries the hydrated needs context: {}",
+        promoted.message
+    );
+    assert_eq!((promoted.provisions, promoted.waits), (1, 0));
+    assert_eq!(promoted.queued_events, parked.queued_events + 1);
+}
