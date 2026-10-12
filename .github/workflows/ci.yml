@@ -45,7 +45,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
@@ -77,6 +77,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
       - run: cargo fmt --all --check
       - run: |
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
@@ -98,8 +102,8 @@ jobs:
     env:
       # 4 GiB runner guests OOM (SIGKILL) when too many rustc/linker jobs run
       # at once — the preloop-runner-server lib test is the largest unit and
-      # was killed on shard 1 while the other three passed. 6 jobs was tuned
-      # for a bigger box; 4 keeps parallel peak memory inside the guest.
+      # is the first to go. 6 jobs was tuned for a bigger box; 4 keeps
+      # parallel peak memory inside the guest.
       CARGO_BUILD_JOBS: "4"
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
@@ -145,7 +149,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
           components: rustfmt,clippy
@@ -177,6 +181,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
       - name: Install cargo-nextest
         run: |
           # `cargo install` built nextest from source on every cold cache
@@ -239,7 +247,7 @@ jobs:
           free -m 2>/dev/null | head -3 || true
           echo "::endgroup::"
       # The preloop-runner-server integration tests were split out of the lib
-      # into separate tests/*.rs crates (the single ~27k-line unit OOMed the
+      # into separate tests/*.rs crates (the single large unit did not fit the
       # 4 GiB guest). They need the `test-support` feature for the deterministic
       # hooks, so they run under `cargo test` here — nextest can't scope a
       # feature to one package in a --workspace run. Partition by test-file
@@ -248,7 +256,7 @@ jobs:
         run: |
           set -euo pipefail
           shard=${{ matrix.shard }}
-          crates="recovery runs_api logs registration broker security webhooks concurrency execution_protection_api runner_deprecations"
+          crates="recovery runs_api logs registration broker security webhooks concurrency execution_protection_api runner_deprecations store_env"
           selected=""
           for c in $crates; do
             h=$(printf '%s' "$c" | md5sum | cut -c1-8)
@@ -285,7 +293,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
       - name: Select Rust toolchain binaries
@@ -311,6 +319,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Verify property filters match tests
         run: |
@@ -405,7 +417,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
       - name: Select Rust toolchain binaries
@@ -432,6 +444,10 @@ jobs:
           # Stats land in the job summary; PR comments would need
           # pull-requests: write, which this workflow deliberately withholds.
           pr-comment: false
+          # Kache publishes to the remote only from protected-branch pushes:
+          # a read-only job would run the post-step push, list the whole
+          # bucket and upload nothing. Skip that work instead.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Verify property filters match tests
         run: |

@@ -99,11 +99,27 @@ pub type ChunkCallback<'a> = Box<dyn FnMut(&[u8]) + Send + 'a>;
 /// `actions_runner_…`) is lower-case, while the runner's legitimate
 /// `ACTIONS_*` plumbing (`ACTIONS_RUNTIME_URL`, `ACTIONS_STEP_DEBUG`, …) is
 /// something steps are entitled to see, matching GitHub.
+///
+/// The guest's terminal identity is filtered with them. A hosted runner's step
+/// environment has no `TERM` and no `COLORTERM`: the runner is a systemd
+/// service with no tty, and the `dumb` a bash step prints for `$TERM` is
+/// bash's own default for an *unset* `TERM` (`variables.c`'s
+/// `set_if_not ("TERM", "dumb")`) rather than an exported variable — a probe
+/// of a real hosted runner reads `printenv TERM` unset and no `TERM` in `env`
+/// or `/proc/self/environ`, while `bash -lc` prints `dumb` there too. A
+/// preloop runner is started through the VM's exec channel instead, which
+/// carries the terminal the guest booted with (`TERM=linux` from the smolvm
+/// init, and from `envd` on AgentENV), and [`invoke`] inherits the runner's
+/// machine environment into every step; without this the channel's terminal
+/// rode into every step's environment. A workflow that declares
+/// `TERM`/`COLORTERM` itself still wins: explicit job/step variables are
+/// applied after the inherited set.
 pub(crate) fn is_internal_step_env(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     lower.starts_with("system.")
         || lower.starts_with("distributedtask.")
         || key.starts_with("actions_")
+        || matches!(lower.as_str(), "term" | "colorterm")
 }
 
 /// Invoke a process with the given environment.
@@ -1090,10 +1106,13 @@ mod tests {
     #[tokio::test]
     async fn invoke_filters_inherited_job_bookkeeping() {
         const CHILD_MARKER: &str = "PRELOOP_STEP_ENV_FILTER_CHILD";
-        const SEEDED: [(&str, &str); 5] = [
+        const SEEDED: [(&str, &str); 8] = [
             ("system.leak.test", "1"),
             ("DistributedTask.LeakTest", "1"),
             ("actions_leak_test", "1"),
+            ("TERM", "linux"),
+            ("COLORTERM", "truecolor"),
+            ("term", "xterm-256color"),
             ("ACTIONS_PLUMBING_KEEP", "1"),
             ("PRELOOP_HOST_ENV_KEEP", "1"),
         ];
@@ -1135,18 +1154,60 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         let output = result.lines.join("\n");
-        for (leaked, _) in &SEEDED[..3] {
+        for (leaked, _) in &SEEDED[..6] {
             assert!(
                 !output.contains(&format!("{leaked}=")),
-                "inherited job bookkeeping {leaked} leaked into the step environment"
+                "inherited job bookkeeping or terminal identity {leaked} leaked into \
+                 the step environment"
             );
         }
-        for (kept, _) in &SEEDED[3..] {
+        for (kept, _) in &SEEDED[6..] {
             assert!(
                 output.contains(&format!("{kept}=1")),
                 "ordinary inherited env {kept} was dropped"
             );
         }
+    }
+
+    /// A workflow that declares `TERM` (or `COLORTERM`) itself keeps it: the
+    /// filter only drops the *inherited* terminal identity, and explicit
+    /// job/step variables are applied after the inherited set.
+    #[tokio::test]
+    async fn invoke_keeps_a_workflow_declared_terminal_identity() {
+        const CHILD_MARKER: &str = "PRELOOP_STEP_ENV_TERM_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let status = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "process::tests::invoke_keeps_a_workflow_declared_terminal_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("TERM", "linux")
+                .status()
+                .expect("spawning the seeded test subprocess");
+            assert!(status.success(), "seeded subprocess failed ({status})");
+            return;
+        }
+
+        let declared = HashMap::from([
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("COLORTERM".to_owned(), "truecolor".to_owned()),
+        ]);
+        let result = invoke("env", &[], Path::new("."), &declared, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        let output = result.lines.join("\n");
+        assert!(
+            output.contains("TERM=xterm-256color"),
+            "a workflow-declared TERM must reach the step: {output}"
+        );
+        assert!(
+            output.contains("COLORTERM=truecolor"),
+            "a workflow-declared COLORTERM must reach the step: {output}"
+        );
     }
 
     #[tokio::test]

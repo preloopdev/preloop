@@ -201,6 +201,7 @@ fn complete_node(
     reported: ExecutionStatus,
     outputs: &BTreeMap<String, serde_json::Value>,
     annotations: &[serde_json::Value],
+    environment_url: Option<&str>,
     explicit_attempt: Option<uuid::Uuid>,
 ) -> Result<CompletionApplied, ControlError> {
     let Some(job) = jobs::job(tx, run_id, job_id)? else {
@@ -242,6 +243,14 @@ fn complete_node(
                 job_id.0,
                 serde_json::to_string(annotations).map_err(ControlError::backend)?
             ])
+            .map_err(db)?;
+    }
+    // The runner evaluated `environment.url` after its steps ran; the value
+    // rides the completion and is what the deployment status reports.
+    if let Some(url) = environment_url.filter(|url| !url.is_empty()) {
+        tx.prepare_cached("UPDATE jobs SET environment_url = ?3 WHERE run_id = ?1 AND job_id = ?2")
+            .map_err(db)?
+            .execute(params![codec::run_key(run_id), job_id.0, url])
             .map_err(db)?;
     }
     // Terminal transition + gate release + dependents' needs (settle_node
@@ -328,6 +337,9 @@ impl LiteBackend {
                 completion.status,
                 &completion.outputs,
                 &[],
+                // The legacy `complete_job` shape carries no runner-reported
+                // environment URL; the broker settle path does.
+                None,
                 completion.agent_job_id,
             )?;
             if !applied.replayed {
@@ -343,10 +355,7 @@ impl LiteBackend {
             let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
             promote::promote_run(tx, self, run_id, &mut scheduling)?;
             let (_next_runs_on, queue_nonempty) = queue_gauges(tx)?;
-            let record = jobs::run_record(tx, run_id)?
-                .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
             Ok(CompleteOutcome {
-                record,
                 effective_status: applied.effective_status,
                 newly_terminal_success: applied.newly_terminal_success,
                 cancelled_siblings: applied.cancelled_siblings,
@@ -421,6 +430,7 @@ impl LiteBackend {
                 comp.status,
                 &outputs,
                 &annotations,
+                comp.environment_url.as_deref(),
                 comp.agent_job_id,
             )?;
             if applied.replayed {

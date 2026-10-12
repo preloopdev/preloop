@@ -43,6 +43,11 @@ pub(crate) struct PromoteOutcome {
     pub(crate) promoted: usize,
     /// Jobs failed closed by a denied or expired environment gate.
     pub(crate) failed: usize,
+    /// The jobs the pass failed, for callers that need per-job resolution
+    /// (e.g. the approval handler reporting whether *its* job concluded).
+    pub(crate) failed_jobs: Vec<JobId>,
+    /// Global ready-queue depth after the pass.
+    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the ready-queue front after the pass.
     pub(crate) next_runs_on: Vec<String>,
 }
@@ -148,6 +153,46 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// dedup key (webhook delivery / request identity): a replay returns
     /// `SubmitOutcome::existing` instead of a second run.
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError>;
+    /// Re-run a completed run as a new attempt — GitHub's "Re-run jobs".
+    ///
+    /// One write transaction: loads the run, refuses non-terminal runs
+    /// (`Conflict`) and missing runs (`NotFound`), and applies `rerun`'s
+    /// mode to select the jobs this attempt re-executes
+    /// ([`logic::rerun_set`]). Selected rows are reset to queue state,
+    /// their prior `job_requests` minted into a fresh attempt with a new
+    /// `jobId`/attempt-scoped message, and every gate (workflow concurrency,
+    /// `job concurrency:`, `environment:` protection) re-acquired exactly as
+    /// `submit_run` does for a fresh run. Jobs outside the selection keep
+    /// their results and outputs — dependents see the carried-forward
+    /// `needs` context.
+    ///
+    /// `runs.run_attempt` increments; the run reverts to non-terminal
+    /// (`queued`/`in_progress`) with `started_at`/`completed_at` cleared.
+    /// `git_ref` and `head_sha` are not re-resolved: GitHub re-runs the
+    /// recorded snapshot, not the moved ref.
+    ///
+    /// Errors: `NotFound` (run or `RerunMode::Job` id unknown), `Conflict`
+    /// (run still live, `Failed` mode with no failed/cancelled job, or the
+    /// attempt cap/30-day window exceeded).
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError>;
+
+    /// Read-side preview of a `rerun_run` call: the job set the mode
+    /// selects and which members lack a stored message template (they need
+    /// a `RerunJobTemplate` in `RerunRun::templates`). `NotFound`/`Conflict`
+    /// follow the same rules as `rerun_run` so a handler can surface them
+    /// before building templates.
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError>;
+
+    /// Test hook: overwrite a run's `completed_at` (µs since the epoch) so
+    /// the archiver's 60-second grace and the `PRELOOP_RERUN_WINDOW_DAYS`
+    /// hold can be exercised without sleeping. The shared suite uses it;
+    /// production never sees it.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError>;
 
     /// Allocate the next run number for a workflow path from the durable
     /// counter. Called before the job messages are built (the number is
@@ -266,23 +311,84 @@ pub(crate) trait ControlBackend: Send + Sync {
         approval: EnvironmentApproval,
     ) -> Result<EnvironmentApprovalOutcome, ControlError>;
 
-    /// Re-run scheduler admission for the jobs a run parked at submit — the
-    /// fork-PR approval hold and armed environment protection gates — then
-    /// promote whatever the release unblocked. One transaction per run.
+    /// Re-run scheduler admission for the jobs a run parked — the fork-PR
+    /// approval hold and armed environment protection gates — then promote
+    /// whatever the release unblocked. One transaction per run.
     ///
     /// `Some(run_id)` is the approve/release path (approve-fork, approve-job,
     /// a hold lifting). `None` sweeps every run currently parking a
     /// gate-armed job: wait timers and approval windows close on wall-clock
-    /// time, so the reaper drives that sweep. A parked job whose run is still
+    /// time, so the reaper drives that sweep (after refreshing the
+    /// environment-rules resolver). Environment rules come from the
+    /// backend's own resolver — the same `EnvironmentResolver` `AppState`
+    /// installs — so a `Pending` lookup holds the job fail-closed until the
+    /// reaper's refresh fills it. A parked job whose run is still
     /// fork-approval-pending stays parked; a job whose gate fails closed
-    /// (deployment-branch mismatch, approval window expired) is concluded
-    /// `Failure`. Returns the promoted/failed counts and the post-pass queue
-    /// gauges the caller stores on its wake atomics.
-    async fn promote_ready_jobs(
+    /// (deployment-branch mismatch, approval window expired, rejection) is
+    /// concluded `Failure`. Returns the promoted/failed counts, the failed
+    /// job ids, and the post-pass queue gauges the caller stores.
+    async fn promote_ready_jobs(&self, run: Option<RunId>) -> Result<PromoteOutcome, ControlError>;
+
+    /// Install the environment-rules resolver the gate evaluation consults
+    /// inside its transactions. AppState's resolver is the same object, so
+    /// `Pending` lookups the backend triggers surface in the shared pending
+    /// set the reaper drains. Tests install a TOML-only resolver.
+    fn set_environment_resolver(
         &self,
-        run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
-    ) -> Result<PromoteOutcome, ControlError>;
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
+    );
+
+    /// The durable review-decision audit rows for one job, oldest first
+    /// (`environment_approvals`). These outlive the gate and the run: the
+    /// table is deliberately never archived or pruned with the run row.
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError>;
+
+    /// The jobs still parked on an armed required-reviewer gate (the gate's
+    /// `approval_requested_at` is set and no approval satisfies it yet),
+    /// with the GitHub side-channel ids the announce/approve paths PATCH.
+    /// `Some(run_id)` narrows to one run; `None` scans every run (the reaper
+    /// sweep + the check-run webhook lookup).
+    async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError>;
+
+    /// One held approval-gated job by its GitHub check run id — the
+    /// `check_run.requested_action` webhook's join key.
+    async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError>;
+
+    /// Stamp `approval_announced` on the job's gate: the Approve/Reject
+    /// check-run PATCH was delivered (or the job reports no check run and
+    /// nothing would show). In-place update — concurrent approvals survive.
+    async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError>;
+
+    /// The job's GitHub deployment id (`jobs.deployment_id`), when the
+    /// reporting path created one for a job with `environment:`.
+    async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError>;
+
+    /// Record the GitHub deployment id the reporting path created for the
+    /// job's `environment:`.
+    async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError>;
 
     /// One job's stored `environment:` value, its armed environment gate and
     /// its current status — the approve-job handler's read before it records
@@ -292,6 +398,15 @@ pub(crate) trait ControlBackend: Send + Sync {
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<Option<EnvironmentGateRead>, ControlError>;
+
+    /// One job's GitHub deployment side-channel row: check run, deployment
+    /// id, resolved environment name/url, head sha. `Ok(None)` for jobs
+    /// without `environment:` or whose name no source resolves.
+    async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError>;
 
     /// Renew a claimed request's lease. Returns the record on success;
     /// `Stale` if the runner no longer owns it, `NotFound` if unknown.
@@ -368,7 +483,19 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// immutable job/attempt history in one transaction per batch. Returns
     /// the archived run ids. Their run-tier secrets outlive the move: an
     /// archived run can still be re-run.
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError>;
+    ///
+    /// `rerun_hold` keeps runs that a re-run can still use — completed runs
+    /// with at least one failed/cancelled/timed-out job — in the live tables
+    /// for that long, so `rerun_run` can reset them in place (GitHub accepts
+    /// re-runs for 30 days). `None` or zero archives them on the plain
+    /// policy. Retention is unaffected and still wins: a held run past
+    /// `retention_days` is deleted by [`ControlBackend::expired_terminal_runs`]
+    /// (which reads live and history rows alike).
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError>;
 
     /// Retention selection: ids of terminal runs whose completion (falling
     /// back to creation) is older than `cutoff_us`, oldest first, up to
@@ -432,6 +559,31 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Queue pressure snapshot for status/metrics.
     async fn queue_stats(&self) -> Result<QueueStats, ControlError>;
+
+    /// Durable run events from the outbox in `event_id` (commit) order: the
+    /// initial snapshot for `GET /api/v1/runs/:id/events`, including events
+    /// imported from a legacy store, so the feed survives a restart.
+    async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError>;
+
+    /// Finalized v1 artifact catalog rows (one run's, or every run's, in
+    /// insertion order). `storage_key` is the path holding the bytes.
+    async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError>;
+
+    /// One finalized v1 artifact row by its public id: the indexed lookup the
+    /// GET path uses. An id lookup must not read the whole catalog.
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError>;
+
+    /// Upsert a finalized v1 artifact row (native uploads and imports).
+    async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError>;
 
     // ── Live log recovery ─────────────────────────────────────────────
 
@@ -1014,6 +1166,30 @@ pub(crate) trait ControlBackend: Send + Sync {
         &self,
         limit: usize,
     ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Unresolved repairs of one App that still have attempts left, in
+    /// retry order (see the storage implementations). App-scoped and capped
+    /// in SQL: another App's backlog, or rows already at the cap, can never
+    /// fill the retry window and starve this App's repairs.
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    /// Atomically take one redelivery attempt for a repair row.
+    ///
+    /// Succeeds only when the stored row still looks exactly like `observed`
+    /// — same attempt count, same resolution state — and charges the attempt
+    /// and the last-attempt clock in the same statement, returning the
+    /// claimed row. A second claimant (a watchdog overlapping a restart, a
+    /// second server on the store) reads a row that no longer matches what it
+    /// read, gets `None`, and must not send the request: the winner's attempt
+    /// already covers the delivery.
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError>;
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,
@@ -1678,16 +1854,17 @@ impl Backend {
         }
     }
 
-    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
-    /// The backend evaluates these inside its promotion and reaper
+    /// Install the shared environment-rules resolver once bootstrap builds
+    /// it (`AppState`'s `EnvironmentResolver`: TOML fallback + GitHub fetch).
+    /// The backends consult it inside their promotion and reaper
     /// transactions, where the job rows live.
-    pub(crate) fn set_environment_rules(
+    pub(crate) fn set_environment_resolver(
         &self,
-        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     ) {
         match self {
-            Self::Sqlite(backend) => backend.set_environment_rules(rules),
-            Self::Postgres(backend) => backend.set_environment_rules(rules),
+            Self::Sqlite(backend) => backend.set_environment_resolver(resolver),
+            Self::Postgres(backend) => backend.set_environment_resolver(resolver),
         }
     }
 
@@ -1718,6 +1895,29 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.submit_run(submit).await,
             Self::Postgres(b) => b.submit_run(submit).await,
+        }
+    }
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.rerun_run(rerun).await,
+            Self::Postgres(b) => b.rerun_run(rerun).await,
+        }
+    }
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.rerun_plan(run_id, mode).await,
+            Self::Postgres(b) => b.rerun_plan(run_id, mode).await,
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
+            Self::Postgres(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
         }
     }
     async fn allocate_run_number(
@@ -1841,14 +2041,84 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.set_reports_check_runs(run_id, reported).await,
         }
     }
-    async fn promote_ready_jobs(
-        &self,
-        run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
-    ) -> Result<PromoteOutcome, ControlError> {
+    async fn promote_ready_jobs(&self, run: Option<RunId>) -> Result<PromoteOutcome, ControlError> {
         match self {
-            Self::Sqlite(b) => b.promote_ready_jobs(run, rules).await,
-            Self::Postgres(b) => b.promote_ready_jobs(run, rules).await,
+            Self::Sqlite(b) => b.promote_ready_jobs(run).await,
+            Self::Postgres(b) => b.promote_ready_jobs(run).await,
+        }
+    }
+    fn set_environment_resolver(
+        &self,
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
+    ) {
+        match self {
+            Self::Sqlite(b) => b.set_environment_resolver(resolver),
+            Self::Postgres(b) => b.set_environment_resolver(resolver),
+        }
+    }
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.environment_approvals(run_id, job_id).await,
+            Self::Postgres(b) => b.environment_approvals(run_id, job_id).await,
+        }
+    }
+    async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.pending_environment_approvals(run_id).await,
+            Self::Postgres(b) => b.pending_environment_approvals(run_id).await,
+        }
+    }
+    async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.pending_environment_approval_for_check_run(check_run_id)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.pending_environment_approval_for_check_run(check_run_id)
+                    .await
+            }
+        }
+    }
+    async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.mark_environment_approval_announced(run_id, job_id).await,
+            Self::Postgres(b) => b.mark_environment_approval_announced(run_id, job_id).await,
+        }
+    }
+    async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_deployment_id(run_id, job_id).await,
+            Self::Postgres(b) => b.job_deployment_id(run_id, job_id).await,
+        }
+    }
+    async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_job_deployment(run_id, job_id, deployment_id).await,
+            Self::Postgres(b) => b.set_job_deployment(run_id, job_id, deployment_id).await,
         }
     }
     async fn environment_gate(
@@ -1859,6 +2129,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.environment_gate(run_id, job_id).await,
             Self::Postgres(b) => b.environment_gate(run_id, job_id).await,
+        }
+    }
+    async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.environment_deployment(run_id, job_id).await,
+            Self::Postgres(b) => b.environment_deployment(run_id, job_id).await,
         }
     }
     async fn renew_request(
@@ -1963,10 +2243,14 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.terminal_jobs().await,
         }
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError> {
         match self {
-            Self::Sqlite(b) => b.archive_finished_runs(limit).await,
-            Self::Postgres(b) => b.archive_finished_runs(limit).await,
+            Self::Sqlite(b) => b.archive_finished_runs(limit, rerun_hold).await,
+            Self::Postgres(b) => b.archive_finished_runs(limit, rerun_hold).await,
         }
     }
     async fn expired_terminal_runs(
@@ -2847,6 +3131,33 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.open_webhook_redeliveries(limit).await,
         }
     }
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+                    .await
+            }
+        }
+    }
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.claim_webhook_redelivery(observed, claimed_at_us).await,
+            Self::Postgres(b) => b.claim_webhook_redelivery(observed, claimed_at_us).await,
+        }
+    }
     async fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,
@@ -3020,6 +3331,43 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.oidc_grant(plan_id, agent_job_id).await,
             Self::Postgres(b) => b.oidc_grant(plan_id, agent_job_id).await,
+        }
+    }
+
+    async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_event_snapshot(run_id).await,
+            Self::Postgres(b) => b.run_event_snapshot(run_id).await,
+        }
+    }
+
+    async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.artifact_catalog(run_id).await,
+            Self::Postgres(b) => b.artifact_catalog(run_id).await,
+        }
+    }
+
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.artifact_by_public_id(public_id).await,
+            Self::Postgres(b) => b.artifact_by_public_id(public_id).await,
+        }
+    }
+
+    async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.put_artifact_catalog(row).await,
+            Self::Postgres(b) => b.put_artifact_catalog(row).await,
         }
     }
 }

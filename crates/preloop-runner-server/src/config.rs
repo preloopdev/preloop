@@ -47,8 +47,9 @@ pub struct GoldenConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Base image `serve` boots its golden from: an OCI reference, a
-    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent means the
-    /// engine's stock base — the packed official GitHub runner golden.
+    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent selects the
+    /// packed official GitHub runner golden — the image `runs-on:
+    /// ubuntu-latest` means, downloaded and verified, never baked locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
     /// Dockerfile a `kind = "dockerfile"` tar was built from, so a re-run can
@@ -58,7 +59,7 @@ pub struct GoldenConfig {
 }
 
 /// Effective golden base image: [`BASE_IMAGE_ENV`] when set to a non-blank
-/// value, else the `[golden]` section. `None` means the engine's stock base.
+/// value, else the `[golden]` section. `None` means the packed official golden.
 ///
 /// An exported-but-blank variable behaves like an unset one — the same rule
 /// `PRELOOP_GOLDEN_URL` follows — so a shell that exports an empty value
@@ -399,6 +400,51 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// Actions cache (`actions/cache`) retention. Finalized cache entries live in
+/// `<state_dir>/cache/`; without a quota they accumulate for the lifetime of
+/// the state directory (round-3 §11: a 150 MB blob finalized into a permanent
+/// 151 MB entry, no eviction at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Total bytes of finalized cache entries the server keeps on disk,
+    /// across all namespaces. When a commit pushes the total over this
+    /// quota, the least-recently-used entries are evicted until the total
+    /// fits again. A single entry larger than the quota is kept by the
+    /// commit that created it and evicted by the next commit.
+    /// Default 10 GiB, matching GitHub's 10 GB per-repository cache limit.
+    /// Env: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins over this key.
+    pub total_quota_bytes: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            total_quota_bytes: DEFAULT_CACHE_TOTAL_QUOTA_BYTES,
+        }
+    }
+}
+
+/// Default total Actions-cache quota: 10 GiB, matching GitHub's 10 GB
+/// per-repository cache limit (this is the server-wide total).
+pub const DEFAULT_CACHE_TOTAL_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// One GitHub-configured deployment reviewer (`User` or `Team`), as
+/// `GET /repos/{o}/{r}/environments/{name}` reports inside a
+/// `required_reviewers` protection rule. Identity is what GitHub uses: a
+/// login for users, an org-scoped slug for teams. This field is never read
+/// from `[environment_rules]` — preloop's local fallback has no user
+/// identities to compare — so the serde surface skips it; it is populated
+/// only by the GitHub rules resolver (`environment_resolver`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentReviewer {
+    /// A GitHub user, matched by login (case-insensitive).
+    User(String),
+    /// A GitHub team: org login + team slug, expanded via
+    /// `GET /orgs/{org}/teams/{slug}/members` at approval time.
+    Team { org: String, slug: String },
+}
+
 /// Operator protection rules for one registered environment, mirroring
 /// GitHub's environment protection rules. Every field is optional and
 /// empty/zero by default: a missing `[environment_rules."owner/repo".env]`
@@ -406,15 +452,39 @@ pub struct CheckoutCacheConfig {
 /// Rules are enforced at scheduler admission, before environment secrets are
 /// injected — a job that fails the branch policy never sees the environment's
 /// secrets.
+///
+/// The same struct carries rules fetched from GitHub's environments API when
+/// a GitHub App is configured (`environment_resolver`); the GitHub-only
+/// fields are `skip`ped in serde so a config file cannot set them — the TOML
+/// surface stays the single-operator fallback.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentRules {
-    /// Git refs allowed to deploy to this environment. Compared against the
-    /// run's `git_ref` after stripping a leading `refs/heads/` from both
-    /// sides, so `main` matches `refs/heads/main`. Empty means any ref may
-    /// deploy. A run on a disallowed ref fails the job closed at admission.
+    /// Git branch patterns allowed to deploy to this environment. Compared
+    /// against the run's `git_ref` after stripping a leading `refs/heads/`
+    /// from both sides, so `main` matches `refs/heads/main`. GitHub treats
+    /// deployment branch policies as `File.fnmatch` patterns (a `*` never
+    /// crosses `/`), so matching goes through
+    /// `preloop_gha_parser::glob_match`. Empty means branches are
+    /// unrestricted only when *no* policy is configured — a configured
+    /// policy (a non-empty `deployment_branches`/`deployment_tags` or a
+    /// GitHub-side `deployment_branch_policy`, which sets
+    /// `branch_policy_restricted`) with an empty branch list deploys no
+    /// branch. Under GitHub's `protected_branches` mode the resolver expands
+    /// the repo's protected branches into this list and sets
+    /// `protected_branches_only`; an empty list there means the repository
+    /// has no branch protection rules, and GitHub lets every branch deploy.
+    /// A run on a disallowed ref fails the job closed at admission.
     #[serde(default)]
     pub deployment_branches: Vec<String>,
+    /// Git tag patterns allowed to deploy to this environment, matched
+    /// against `refs/tags/*` refs (GitHub's `type: "tag"` deployment branch
+    /// policies). Branches are never checked against tag patterns and vice
+    /// versa. Empty means tags are unrestricted only when *no* policy is
+    /// configured — a configured policy with an empty tag list deploys no
+    /// tag, and GitHub's `protected_branches` mode denies every tag.
+    #[serde(default)]
+    pub deployment_tags: Vec<String>,
     /// Minutes a job waits after becoming eligible before it may start.
     /// The wait is visible (job status `pending`) and cancellable. Zero
     /// means no wait.
@@ -426,13 +496,46 @@ pub struct EnvironmentRules {
     /// `preloop approve`. Zero means no approval gate. A job not approved
     /// within 24 hours of entering the gate fails closed.
     ///
-    /// Preloop has no user identities: every approval is authenticated with
-    /// the single operator system token, so an approval is a deliberate
-    /// operator confirmation, not a distinct human reviewer. Values above 1
-    /// would imply a separation-of-duties guarantee that cannot exist, so
-    /// config loading rejects them (fail closed).
+    /// Under the local TOML fallback there are no user identities: every
+    /// approval is authenticated with the single operator system token, so
+    /// values above 1 would imply a separation-of-duties guarantee that
+    /// cannot exist and config loading rejects them (fail closed). GitHub
+    /// sources this rule differently: its `required_reviewers` protection
+    /// rule is a *set* of up to six reviewers of which one approval suffices
+    /// (https://docs.github.com/en/rest/deployments/environments), so the
+    /// resolver writes `required_reviewers: 1` here and the reviewer list
+    /// into `reviewers`.
     #[serde(default)]
     pub required_reviewers: u32,
+    /// GitHub `required_reviewers` rule: the reviewers allowed to approve,
+    /// as GitHub reports them. Empty `reviewers` with
+    /// `required_reviewers > 0` means the local fallback (system-token
+    /// approval) — a GitHub-fetched rule always populates this.
+    #[serde(skip)]
+    pub reviewers: Vec<EnvironmentReviewer>,
+    /// GitHub `prevent_self_review`: the run's own actor may not approve.
+    #[serde(skip)]
+    pub prevent_self_review: bool,
+    /// GitHub `deployment_branch_policy` was set (`protected_branches` or
+    /// `custom_branch_policies`): deployment refs are restricted. Kept
+    /// separate from the pattern lists because GitHub denies *every* ref
+    /// when the policy is configured but matches nothing (e.g. a custom
+    /// policy with zero patterns).
+    #[serde(skip)]
+    pub branch_policy_restricted: bool,
+    /// GitHub `deployment_branch_policy.protected_branches`: only branches
+    /// carrying branch protection rules may deploy. The resolver expands
+    /// this to the repo's protected-branch list in `deployment_branches`;
+    /// exact matching applies (no globs), and non-branch refs are denied.
+    #[serde(skip)]
+    pub protected_branches_only: bool,
+    /// GitHub custom deployment protection rules enabled on this
+    /// environment (third-party App slugs). These are enforced by external
+    /// Apps over the `deployment_protection_rule` webhook + callback token —
+    /// a protocol preloop cannot impersonate — so a non-empty list fails the
+    /// job closed with an explicit message rather than bypass the rule.
+    #[serde(skip)]
+    pub custom_protection_rules: Vec<String>,
 }
 
 /// `[environment_rules]` table shape: `owner/repo` -> environment name ->
@@ -690,6 +793,10 @@ pub struct ConfigFile {
     /// direct per-job forge checkout.
     #[serde(default)]
     pub checkout_cache: CheckoutCacheConfig,
+    /// Actions cache (`actions/cache`) retention (`[cache]`). Quota-bounded
+    /// with LRU eviction; default 10 GiB total across all namespaces.
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// Stored job secrets injected into every trusted job, mirroring
     /// GitHub's org-level secrets.
     #[serde(default)]
@@ -705,16 +812,17 @@ pub struct ConfigFile {
     /// global secret of the same name for jobs in that environment.
     #[serde(default)]
     pub env_secrets: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
-    /// Registered environments (`[environments]` mapping `owner/repo` to a
-    /// list of environment names), mirroring GitHub's environment registry.
-    /// A job's `environment:` name must be registered for its repository, or
-    /// the job fails closed: no environment secrets are injected and no
-    /// environment OIDC subject is minted. Required reviewers, wait timers,
-    /// and deployment-branch policies are not enforced yet; the registry
-    /// currently gates existence. Protection rules (required reviewers, wait
-    /// timers, deployment-branch policies) live in the separate
-    /// `[environment_rules]` table, enforced at scheduler admission before
-    /// environment secrets are injected.
+    /// Removed environment registry (`[environments]` mapping `owner/repo` to
+    /// a list of environment names).
+    ///
+    /// GitHub accepts any `environment:` name, auto-creates it on first
+    /// reference, and applies whatever protection rules the repository
+    /// configured for it — preloop now behaves the same way (rules come from
+    /// `[environment_rules]` in local mode and from the repository's
+    /// environments API when a GitHub credential exists). A registry that
+    /// *rejects* unregistered names would diverge from GitHub, so it no
+    /// longer gates submissions; a non-empty table is rejected at config load
+    /// with a pointer to this change rather than silently ignored.
     #[serde(default)]
     pub environments: BTreeMap<String, BTreeSet<String>>,
     /// Token permissions ceiling (`[token_permissions_ceiling]`), mirroring
@@ -757,6 +865,26 @@ pub struct ConfigFile {
     /// `PRELOOP_SECRETS_STORE` overrides this key.
     #[serde(default)]
     pub secrets_store: Option<String>,
+    /// Maximum jobs one run may expand to (after matrix expansion), a
+    /// fail-fast DoS guard for the submit path: a run expanding past this
+    /// is rejected with 400 before the insert transaction opens, so no
+    /// giant transaction ever pins the writer. Default 500; `0` disables
+    /// the cap (the operator accepts unbounded submits). The insert itself
+    /// is chunked (see `SUBMIT_JOB_CHUNK_SIZE`), so even a raised cap never
+    /// holds one writer transaction for the whole insert.
+    /// Env: `PRELOOP_MAX_JOBS_PER_RUN` wins over this key.
+    #[serde(default = "default_max_jobs_per_run")]
+    pub max_jobs_per_run: u64,
+    /// Maximum age, in hours, of a diagnostic-log staging directory under
+    /// `<state_dir>/blobs/diag/` before the reaper deletes it. Staging
+    /// directories whose upload token expired (TTL) or was evicted are
+    /// removed promptly on the next reaper tick regardless of this value;
+    /// this is the backstop for anything orphaned (a crash between staging
+    /// and registration, pre-fix leftovers). `0` disables the age-based
+    /// sweep. Default 24 follows the "a day of debug data" intuition.
+    /// Env: `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over this key.
+    #[serde(default = "default_diag_staging_max_age_hours")]
+    pub diag_staging_max_age_hours: u64,
 }
 
 impl Default for ConfigFile {
@@ -781,9 +909,60 @@ pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES
 pub const RETENTION_DAYS_ENV: &str = "PRELOOP_RETENTION_DAYS";
 /// Default run retention, in days, following GitHub's Actions retention setting.
 pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+/// Env override for the per-run job cap; see [`ConfigFile::max_jobs_per_run`].
+pub const MAX_JOBS_PER_RUN_ENV: &str = "PRELOOP_MAX_JOBS_PER_RUN";
+/// Default cap on jobs per run (after matrix expansion). Bounds the submit
+/// transaction so one giant workflow cannot pin the writer for minutes.
+pub const DEFAULT_MAX_JOBS_PER_RUN: u64 = 500;
+
+/// Env override for the in-place re-run window (see
+/// [`rerun_window_days`]): how long a completed run with failed jobs stays
+/// in the live control tables so it can be re-run in place.
+pub const RERUN_WINDOW_DAYS_ENV: &str = "PRELOOP_RERUN_WINDOW_DAYS";
+/// Default in-place re-run window, in days, following GitHub's 30-day
+/// re-run limit.
+pub const DEFAULT_RERUN_WINDOW_DAYS: u64 = 30;
+
+/// Resolve the archiver's in-place re-run hold: `PRELOOP_RERUN_WINDOW_DAYS`
+/// (default [`DEFAULT_RERUN_WINDOW_DAYS`]), in days. A run whose completed
+/// attempt has at least one failed/cancelled/timed-out job stays live this
+/// long so a re-run can reset its jobs in place; `0` disables the hold and
+/// restores the plain 60-second archive policy. An unparseable value is an
+/// error — a typo must fail closed rather than hold (or drop) scheduler rows
+/// silently; callers warn and disable the hold.
+pub fn rerun_window_days() -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(RERUN_WINDOW_DAYS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {RERUN_WINDOW_DAYS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(DEFAULT_RERUN_WINDOW_DAYS)
+}
 
 fn default_retention_days() -> u64 {
     DEFAULT_RETENTION_DAYS
+}
+
+fn default_max_jobs_per_run() -> u64 {
+    DEFAULT_MAX_JOBS_PER_RUN
+}
+
+/// Resolve the effective per-run job cap: `PRELOOP_MAX_JOBS_PER_RUN` wins
+/// over the config file key. An unparseable value is an error — a typo must
+/// fail closed rather than silently run uncapped (or capped at zero).
+pub fn max_jobs_per_run(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(MAX_JOBS_PER_RUN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {MAX_JOBS_PER_RUN_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.max_jobs_per_run)
 }
 
 /// Resolve the effective run retention: `PRELOOP_RETENTION_DAYS` wins over
@@ -799,6 +978,32 @@ pub fn retention_days(config: &ConfigFile) -> anyhow::Result<u64> {
         });
     }
     Ok(config.retention_days)
+}
+
+/// Env override for the diag staging max age; see
+/// [`ConfigFile::diag_staging_max_age_hours`].
+pub const DIAG_STAGING_MAX_AGE_HOURS_ENV: &str = "PRELOOP_DIAG_STAGING_MAX_AGE_HOURS";
+/// Default diag staging max age, in hours.
+pub const DEFAULT_DIAG_STAGING_MAX_AGE_HOURS: u64 = 24;
+
+fn default_diag_staging_max_age_hours() -> u64 {
+    DEFAULT_DIAG_STAGING_MAX_AGE_HOURS
+}
+
+/// Resolve the effective diag staging max age, in hours:
+/// `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over the config file key. An
+/// unparseable value is an error — a typo must fail closed rather than
+/// silently keep (or delete) staging data on the wrong schedule.
+pub fn diag_staging_max_age_hours(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(DIAG_STAGING_MAX_AGE_HOURS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {DIAG_STAGING_MAX_AGE_HOURS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.diag_staging_max_age_hours)
 }
 
 /// Parse a checkout-cache mode. Unknown values are an error from the parser;
@@ -856,6 +1061,73 @@ pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCach
         }
     }
     Ok(effective)
+}
+
+pub const CACHE_TOTAL_QUOTA_BYTES_ENV: &str = "PRELOOP_CACHE_TOTAL_QUOTA_BYTES";
+
+/// Resolve the Actions-cache quota: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins
+/// over the `[cache] total_quota_bytes` key; an unparseable value is an
+/// error rather than silently keeping or dropping cached entries.
+pub fn cache_config(config: &ConfigFile) -> anyhow::Result<CacheConfig> {
+    let mut effective = config.cache;
+    if let Some(raw) = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        effective.total_quota_bytes = raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {CACHE_TOTAL_QUOTA_BYTES_ENV} (`{raw}`)")
+        })?;
+    }
+    Ok(effective)
+}
+
+#[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
+mod cache_quota_config_tests {
+    use super::*;
+
+    /// Absent section keeps the 10 GiB default.
+    #[test]
+    fn cache_quota_defaults_to_10gib() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.cache.total_quota_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.cache.total_quota_bytes,
+            DEFAULT_CACHE_TOTAL_QUOTA_BYTES
+        );
+        assert_eq!(
+            cache_config(&config).unwrap().total_quota_bytes,
+            DEFAULT_CACHE_TOTAL_QUOTA_BYTES
+        );
+    }
+
+    #[test]
+    fn cache_quota_file_value_honored() {
+        let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
+        assert_eq!(config.cache.total_quota_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error. These cases live in one test so the process-wide
+    /// env var is never mutated by two tests at once.
+    #[test]
+    fn cache_quota_env_handling() {
+        let prior = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV).ok();
+        let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
+        unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "5368709120") };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 5368709120);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "   ") };
+        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
+        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "ten-gib") };
+        assert!(cache_config(&config).is_err());
+        match prior {
+            Some(value) => unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, value) },
+            None => unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +1244,61 @@ mod retention_config_tests {
     #[test]
     fn retention_days_default_impl_is_90() {
         assert_eq!(ConfigFile::default().retention_days, 90);
+    }
+}
+
+#[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
+mod max_jobs_per_run_config_tests {
+    use super::*;
+
+    /// Absent key keeps the default cap of 500. This test never touches the
+    /// process env; see `max_jobs_per_run_env_handling`.
+    #[test]
+    fn max_jobs_per_run_defaults_to_500() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.max_jobs_per_run, 500);
+        assert_eq!(config.max_jobs_per_run, DEFAULT_MAX_JOBS_PER_RUN);
+    }
+
+    #[test]
+    fn max_jobs_per_run_custom_value_honored() {
+        // Field-level only: the resolver's env handling lives in
+        // `max_jobs_per_run_env_handling`, the one test that mutates the var.
+        let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
+        assert_eq!(config.max_jobs_per_run, 1000);
+        // 0 is the documented escape hatch: the cap stays off.
+        let disabled: ConfigFile = toml::from_str("max_jobs_per_run = 0").unwrap();
+        assert_eq!(disabled.max_jobs_per_run, 0);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error rather than silently running uncapped; with the var
+    /// unset the file value is used. These cases live in one test so the
+    /// process-wide env var is never mutated by two tests at once.
+    #[test]
+    fn max_jobs_per_run_env_handling() {
+        let prior = std::env::var(MAX_JOBS_PER_RUN_ENV).ok();
+        let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
+        unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "250") };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 250);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "   ") };
+        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
+        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "many") };
+        assert!(max_jobs_per_run(&config).is_err());
+        match prior {
+            Some(value) => unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, value) },
+            None => unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) },
+        }
+    }
+
+    /// A missing config file still gets the default cap.
+    #[test]
+    fn max_jobs_per_run_default_impl_is_500() {
+        assert_eq!(ConfigFile::default().max_jobs_per_run, 500);
     }
 }
 
@@ -1528,6 +1855,14 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
 fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
     /// Largest whole minutes representable as i64 nanoseconds.
     const MAX_WAIT_TIMER_MINUTES: u64 = (i64::MAX as u64) / 60_000_000_000;
+    anyhow::ensure!(
+        config.environments.is_empty(),
+        "the `[environments]` registry is no longer supported: GitHub accepts any \
+         `environment:` name and auto-creates it unprotected, so preloop no longer \
+         rejects unregistered names. Delete the table; environment secrets stay keyed \
+         by name under `[env_secrets]`, and protection rules come from the repository's \
+         environment configuration (or `[environment_rules]` in local mode)"
+    );
     for (repo, envs) in &config.environment_rules {
         for (env, rules) in envs {
             anyhow::ensure!(
@@ -1612,7 +1947,10 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     // config keeps plaintext for the running process.
     let mut sealed = config.clone();
     if let Some(dir) = path.parent() {
-        seal_config_secrets(&mut sealed, dir, &OsCredentialStore)
+        // Same store selection as `load_config_from`; sealing with a different
+        // backend than unsealing makes the file unreadable.
+        let store = crate::credential_store::store_from_env(dir);
+        seal_config_secrets(&mut sealed, dir, store.as_ref())
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
     let text = toml::to_string_pretty(&sealed).context("serializing config")?;
@@ -1704,14 +2042,17 @@ mod tests {
                     BTreeMap::from([("DEPLOY_KEY".into(), "env-secret".into())]),
                 )]),
             )]),
-            environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
+            environments: BTreeMap::new(),
             token_permissions_ceiling: None,
             environment_rules: BTreeMap::new(),
             fork_policy: ForkPolicyConfig::default(),
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
+            cache: CacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
+            max_jobs_per_run: DEFAULT_MAX_JOBS_PER_RUN,
+            diag_staging_max_age_hours: DEFAULT_DIAG_STAGING_MAX_AGE_HOURS,
             golden: GoldenConfig::default(),
         }
     }

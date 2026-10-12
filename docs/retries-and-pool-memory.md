@@ -1,9 +1,7 @@
 # Retry, backoff, and pool memory bounds
 
 How preloop retries failures, when it backs off, and how the runner pool
-keeps itself inside the host's memory budget. Written after the 2026-08-20
-outage, where a 22 GiB production host OOMed because on-demand fork
-concurrency was sized by CPU only.
+keeps itself inside the host's memory budget.
 
 ## Retry philosophy, in one line
 
@@ -92,8 +90,8 @@ No retry loops — single-shot submits with a reqwest timeout.
 
 1. **`run_on_demand_slot` provision failure retries at fixed 500 ms, unbounded.**
    The slot-supervisor exponential backoff above it does **not** damp this
-   inner loop — a broken smolvm spins ~2 attempts/s. Not the OOM cause, but
-   noisy; a per-slot attempt counter with escalation would be an improvement.
+   inner loop — a broken smolvm spins ~2 attempts/s. Noisy; a per-slot
+   attempt counter with escalation would be an improvement.
 2. **`wait_for_services_healthy` polls forever** (exp 2→32 s, no cap). Only
    the outer job timeout ends it. Matches the official runner, so changing
    it needs a fidelity note.
@@ -104,7 +102,7 @@ No retry loops — single-shot submits with a reqwest timeout.
 
 ## Pool memory bounds (the OOM guard)
 
-Before 2026-08-20, on-demand fork concurrency was sized **by CPU only**:
+Sizing on-demand fork concurrency **by CPU only** is not safe:
 
 ```
 (available_parallelism / cpus_per_runner) - 1   // floor 1
@@ -112,36 +110,71 @@ Before 2026-08-20, on-demand fork concurrency was sized **by CPU only**:
 
 On the 6-core / 22 GiB production host with `PRELOOP_RUNNER_MEMORY_MIB=8192`,
 that allowed enough 8 GiB forks to exhaust RAM and OOM the control plane —
-the golden alone commits 8 GiB, every fork inherits that footprint and grows
-toward the ceiling while its job runs, and warm mode provisions a successor
-mid-job (so `size + 1` VMs are live).
+the golden alone commits 8 GiB, and every fork inherits that footprint and
+grows toward the ceiling while its job runs. (Warm slots used to add to that
+by provisioning a successor mid-job; a slot now deletes its VM when the job
+ends and forks the next one, so only `size` VMs are live.)
 
-The guard, `on_demand_memory_cap`:
+The guard, `on_demand_memory_cap`, counts **VM ceilings** — every machine the
+pool keeps alive (each runner and each golden) commits one
+`memory_mib`-sized machine:
 
 ```
-runner_mib  = memory_mib.max(1)
-golden_mib  = runner_mib
-by_memory   = (host_total - golden_mib - 2048 MiB reserve) / runner_mib   // floor 1
-max_concurrent = min(cpu_term, by_memory)
+runner_mib   = memory_mib.max(1)
+capacity     = (host_total - 2048 MiB reserve) / runner_mib              // floor 1
+by_memory    = capacity - 1                                              // the fork base, floor 1
+max_concurrent = min(cpu_term, by_memory)                                // size=0
+warm_size      = min(configured size, by_memory)                         // warm
 ```
 
 - The 2 GiB reserve keeps the control plane, OS, and page cache alive —
   without it the host OOMs *after* the forks are up.
-- Applied in **both** pool modes:
-  - size=0 on-demand: `max_concurrent = min(by_cpu, by_memory)`
-  - warm mode: `warm_size = min(configured size, max(by_memory / 2, 1))`
-    (logged when reduced). `PRELOOP_RUNNER_POOL_SIZE` still wins as an explicit
-    override
-    only up to the memory cap — the cap is a safety floor, not a knob.
+- Applied in **both** pool modes. `PRELOOP_RUNNER_POOL_SIZE` still wins as an
+  explicit override only up to the memory cap — the cap is a safety floor, not
+  a knob.
 - A host whose memory can't be read (`/proc/meminfo` unavailable, non-Unix)
   falls back to CPU-only sizing rather than refusing to run.
 - Floors at 1 so a tiny host still runs a single job.
+
+### Environment goldens (`GoldenBudget`)
+
+A mixed `runs-on` queue bakes one golden per environment fingerprint
+(`ubuntu-24.04`, `ubuntu-22.04`, a custom base), and every golden stays
+forkable for the engine's lifetime — it is a resident VM, not a file. The
+pool therefore budgets them against the same `capacity`:
+
+```
+golden_slots = capacity - runners - retained_goldens
+```
+
+- A slot bakes a golden only when a slot is left. With none, it boots that
+  job's base image directly (`SlotSource::DirectFromJobBase`) and logs
+  `no memory budget for another environment golden`: a cold start instead of
+  a host above its budget while jobs run. The packed artifact only ever boots
+  the pool's *default* environment, so a refused environment is created from
+  its own OCI base image.
+- The reservation is taken before the bake and kept only when the golden
+  registers, so a failed bake does not cost the environment its fast path.
+- On the production 22 GiB / 8 GiB host (`capacity = 2`, `warm_size = 1`)
+  there is no slot for a second golden: 22.04 jobs cold-boot there. The
+  64 GiB host (`capacity = 7`) has one only when fewer than six slots run.
+
+### Teardown before the next fork
+
+A slot forks its next runner only after the finished job's machine is
+confirmed gone (`await_machine_gone`): the memory model counts one live VM per
+slot and one per on-demand permit, so an undeleted machine would sit above the
+budget indefinitely. `run_one_runner` retries the delete
+(`TEARDOWN_RETRY_ATTEMPTS` at `TEARDOWN_RETRY_MIN`); a machine still present
+after that is retried by the slot, with every failure logged and a widening
+pause, until it is gone or the pool stops (the next engine start sweeps
+leftover runner machines).
 
 ### Test vectors (`on_demand_memory_cap`)
 
 | Host | Runner ceiling | Cap |
 |---|---|---|
-| 22 GiB | 8 GiB | 1 (production case) |
+| 22 GiB | 8 GiB | 1 |
 | 64 GiB | 8 GiB | 6 |
 | 32 GiB | 4 GiB | 6 |
 | 8 GiB | 8 GiB | 1 (floor) |

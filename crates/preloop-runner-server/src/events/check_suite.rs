@@ -2,7 +2,9 @@
 //!
 //! Check-suite workflow runs execute from the repository default branch. The
 //! suite's head SHA remains in the payload for expressions, but is not the
-//! checkout revision for the workflow triggered by the event.
+//! checkout revision for the workflow triggered by the event — the executed
+//! code is the default branch's own workflow, so the run carries default
+//! branch (`Trusted`) authority, exactly as on github.com.
 
 use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
@@ -47,7 +49,7 @@ impl EventAdapter for Adapter {
             sha: None,
             status_check_sha: None,
             activity_type: Some(action.to_owned()),
-            trust_tier: Some(TrustTier::Untrusted),
+            trust_tier: Some(TrustTier::Trusted),
             skip: false,
             payload: payload.clone(),
             upstream_workflow_names: vec![],

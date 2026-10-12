@@ -137,7 +137,7 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
 }
 
 pub async fn reap_once(shared: &Arc<SharedState>) {
-    let (expired_cache_tokens, expired_artifact_tokens) = {
+    let (expired_cache_tokens, expired_artifact_tokens, swept_staging_files, expired_diag_tokens) = {
         let mut inner = shared.state.inner.lock().await;
         // Migrate legacy pending entries that restored with `created_unix == 0`
         // (pre-cap state) so they don't live forever. Give them `now` once
@@ -172,9 +172,26 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             })
             .map(|(k, _)| k.clone())
             .collect();
-        sweep_pending_uploads(&mut inner, now_u);
+        let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
+        // Diag upload tokens: the map key is the JWT `jti`, which is also
+        // the staging directory name under `blobs/diag/`. Sweeping the map
+        // entry without the directory would leak the staged bytes — the
+        // same accumulation the TTL sweep fixes for cache/artifact.
+        let expired_diag: Vec<String> = inner
+            .diag_upload_tokens
+            .iter()
+            .filter(|(_, p)| {
+                p.created_unix > 0 && p.created_unix < now_u - PENDING_UPLOAD_TTL.as_secs() as i64
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         // Release lock before doing I/O.
-        (expired_cache, expired_artifact)
+        (
+            expired_cache,
+            expired_artifact,
+            swept_staging_files,
+            expired_diag,
+        )
     };
     // Delete staging directories for expired reservations — otherwise they
     // accumulate on disk forever.
@@ -195,6 +212,32 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .join("artifact")
             .join(token);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    // Staging files of swept legacy cache reservations: chunks were streamed
+    // to disk as they arrived, so abandoning the reservation must free the
+    // file too, not just the map entry.
+    for staged in swept_staging_files {
+        let _ = tokio::fs::remove_file(staged).await;
+    }
+    for jti in expired_diag_tokens {
+        let dir = shared.state.state_dir.join("blobs").join("diag").join(jti);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    // Age-based backstop for orphaned diag staging directories: anything
+    // the token sweep cannot see (a crash between staging and registration,
+    // leftovers from before eviction invalidated PUTs). Runs on the reaper
+    // tick, which is every 10s; the walk only touches `blobs/diag/`, whose
+    // live population is bounded by the per-job token cap.
+    if shared.state.diag_staging_max_age_seconds > 0 {
+        let swept = crate::blob_store::sweep_diag_staging(
+            &shared.state.state_dir,
+            Duration::from_secs(shared.state.diag_staging_max_age_seconds),
+            SystemTime::now(),
+        )
+        .await;
+        if swept > 0 {
+            debug!(swept, "swept aged diag staging dirs");
+        }
     }
     // Fork-PR workflow policy: fail closed runs whose 24h approval window
     // expired while waiting for operator approval. The fail-closed mutation
@@ -237,7 +280,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         // raise `provisioning`, not `preparing`, so treat an in-flight
         // provision as preparing or those boots would go unprotected here.
         || pool_status.provisioning > 0;
-    let started_at = shared.state.started_at;
+    // Wall-clock boot instant, to compare with stored enqueue instants
+    // (`started_at` is monotonic).
+    let booted_at = now
+        .checked_sub(shared.state.started_at.elapsed())
+        .unwrap_or(std::time::UNIX_EPOCH);
 
     // ── Active attempts + the ready queue (from `inputs`) ────────────────
     let queued_jobs = inputs.ready.clone();
@@ -284,9 +331,10 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 .runner_labels
                 .iter()
                 .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
-            // An unmarked job measures from its enqueue instant (an unknown
-            // age — `enqueued_at` 0 after a restore — is not granted a fresh
-            // window); the verdict's `Mark` carries the instant to keep.
+            // An unmarked job measures from its enqueue instant or this
+            // node's boot, whichever is later (an unknown age — `enqueued_at`
+            // 0 after a restore — measures from boot); the verdict's `Mark`
+            // carries the instant to keep.
             let candidate = crate::control::logic::StarvationCandidate {
                 runs_on: &job.runs_on,
                 enqueued_at: std::time::UNIX_EPOCH
@@ -298,7 +346,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 &candidate,
                 now,
                 pool_preparing,
-                started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+                booted_at,
                 &pool_status.labels,
             ) {
                 crate::control::logic::StarvationVerdict::ClearMark => {
@@ -368,7 +416,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             active: inputs.active.clone(),
             paused: paused_credits,
             pool_preparing,
-            warm_window_open: started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            booted_at,
             pool_labels: pool_status.labels.clone(),
             first_seen,
         };
@@ -385,6 +433,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                         outputs: Default::default(),
                         annotations: Vec::new(),
                         step_results: Vec::new(),
+                        environment_url: None,
                     })
                     .collect();
                 (outcome.cancellations, completions, outcome.starved)
@@ -569,17 +618,21 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
     }
 
+    // Environment rules: refresh every key the resolver queued (first-seen
+    // misses on GitHub-sourced repos, TTL-expired entries) ahead of the gate
+    // sweep, so a `Pending` hold never outlives the fetch that unblocks it.
+    shared
+        .state
+        .environment_resolver
+        .refresh_stale(shared)
+        .await;
+
     // Environment protection gates: wait timers expire and approval windows
     // close on wall-clock time, not on scheduling events, so re-run admission
     // for every run parking a gate-armed job — newly-satisfied gates release
     // their jobs and expired approval windows fail closed. The command is a
     // no-op for runs with no parked gate, so the tick can always ask.
-    match shared
-        .state
-        .backend
-        .promote_ready_jobs(None, &shared.state.environment_rules)
-        .await
-    {
+    match shared.state.backend.promote_ready_jobs(None).await {
         Ok(outcome) => {
             // Post-commit: refresh the node-local mirrors the runner
             // supervisor and the pool read, then wake them if the sweep
@@ -595,6 +648,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
         Err(error) => warn!(?error, "environment gate promotion sweep failed"),
     }
+
+    // Post-commit: announce newly-armed gates on GitHub — the check run's
+    // Approve/Reject actions plus the deployment's `pending` status. Rows
+    // the announce fails on stay unannounced and retry on the next tick.
+    crate::github::announce_environment_gates(shared, None).await;
 }
 
 async fn run_background_reaper(shared: Arc<SharedState>) {
@@ -703,10 +761,35 @@ pub(crate) async fn prune_outbox_once(shared: &SharedState, older_than: Duration
 /// Drain one archive pass: move settled runs to history in batches until a
 /// short batch or an error, and return how many runs moved. Split out so a
 /// test can drive a pass deterministically instead of racing the interval.
+///
+/// Runs a re-run can still use (completed with a failed/cancelled/timed-out
+/// job) are held live for `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0`
+/// disables) so `rerun_run` can reset them in place; everything else archives
+/// on the 60-second policy.
 pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
+    // Resolved once: the value is static for the process's lifetime and the
+    // 5s pass must not re-parse (or re-warn about) an env var.
+    static RERUN_HOLD: std::sync::LazyLock<Option<std::time::Duration>> =
+        std::sync::LazyLock::new(|| match crate::config::rerun_window_days() {
+            Ok(0) => None,
+            Ok(days) => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "invalid PRELOOP_RERUN_WINDOW_DAYS; disabling the in-place rerun hold"
+                );
+                None
+            }
+        });
+    let rerun_hold = *RERUN_HOLD;
     let mut archived_total = 0;
     loop {
-        match shared.state.backend.archive_finished_runs(32).await {
+        match shared
+            .state
+            .backend
+            .archive_finished_runs(32, rerun_hold)
+            .await
+        {
             Ok(archived) => {
                 archived_total += archived.len();
                 // Run-tier secrets are NOT dropped here. Archiving only moves
@@ -777,7 +860,7 @@ fn debug_session_scalars(inner: &InnerState) -> (u32, Option<f64>) {
 struct WebhookConditionInputs {
     stats: Option<crate::models::WebhookQueueStats>,
     watchdog: crate::webhook_status::WatchdogStatus,
-    breaker: crate::github_breaker::BreakerSnapshot,
+    breaker: Vec<crate::github_breaker::GithubBucketSnapshot>,
     app_config: Vec<crate::webhook_status::AppWebhookConfigStatus>,
 }
 
@@ -833,14 +916,15 @@ fn webhook_conditions(
             ));
         }
     }
-    if inputs.breaker.open {
+    for bucket in inputs.breaker.iter().filter(|row| row.breaker.open) {
         conditions.push(condition(
             "github_unavailable",
             "warning",
             format!(
-                "GitHub calls are circuit-broken for another {}s ({}): queued deliveries are parked, not failing",
-                inputs.breaker.retry_in_seconds.unwrap_or_default(),
-                inputs
+                "GitHub calls for credential bucket `{}` are circuit-broken for another {}s ({}): queued deliveries are parked, not failing",
+                bucket.bucket,
+                bucket.breaker.retry_in_seconds.unwrap_or_default(),
+                bucket
                     .breaker
                     .last_error
                     .clone()
@@ -1232,7 +1316,7 @@ fn collect_webhook_condition_inputs(state: &AppState) -> WebhookConditionInputs 
     WebhookConditionInputs {
         stats: state.webhook_status.queue_stats(),
         watchdog: state.webhook_status.watchdog(),
-        breaker: state.github_breaker.snapshot(),
+        breaker: state.github_breakers.snapshot(),
         app_config: state.webhook_status.app_config_snapshot().0,
     }
 }
@@ -1485,13 +1569,18 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             config.require_job_assignments,
             runner_liveness_timeout,
         );
-        // Environment protection rules are pure config the backend evaluates
-        // inside its promotion and reaper transactions (where the job rows
-        // live). Hand the effective rules over now that the real server
-        // config is known; empty rules keep every gate open.
+        // Environment protection rules resolve through the shared resolver
+        // (TOML fallback + GitHub fetch): the backend consults it inside its
+        // promotion and reaper transactions, where the job rows live. GitHub
+        // sourcing engages when an App or `PRELOOP_GITHUB_TOKEN` is
+        // configured — flag that now so `lookup_sync` misses become pending
+        // fetches rather than silent TOML reads.
+        if state.github_apps.is_some() || state.github_pat.is_some() {
+            state.environment_resolver.set_github_configured();
+        }
         state
             .backend
-            .set_environment_rules(std::sync::Arc::new(state.environment_rules.clone()));
+            .set_environment_resolver(state.environment_resolver.clone());
         // Imported/persisted ready jobs were enqueued under the recovered
         // (default) config, so `on_job_enqueued` may not have run for them.
         // Now that the effective config is live, rebuild dispatch intent for

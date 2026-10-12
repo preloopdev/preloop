@@ -22,6 +22,7 @@ use crate::control::logic::{
     ReusableExpansionInputs,
 };
 use crate::control::txn_stats::RunRowOp;
+use crate::control::types::EnvironmentDeploymentRow;
 use crate::control::types::{
     AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
     ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
@@ -79,7 +80,7 @@ async fn flush_node(
             ", outputs=$14::text::jsonb, annotations=$15::text::jsonb, \
              check_run_id=$16, expand_generation=$17, \
              environment_gate=$18::text::jsonb, \
-             pool_key=$19, runs_on=$20::text::jsonb \
+             pool_key=$19, runs_on=$20::text::jsonb, request_id=$21 \
              WHERE run_id=$1::text::uuid AND job_id=$2"
         ),
         &[
@@ -103,6 +104,7 @@ async fn flush_node(
             &environment_gate_json,
             &node.pool_key,
             &serde_json::to_string(&node.runs_on).unwrap_or_else(|_| "[]".into()),
+            &node.request_id,
         ],
     )
     .await
@@ -307,7 +309,11 @@ async fn insert_job_row(
             &node.pool_key,
             &serde_json::to_string(&node.runs_on).unwrap_or_else(|_| "[]".into()),
             &node.runner_group,
-            &node.priority,
+            // The run's event decides queue priority (comment/dispatch runs
+            // first); one place for submit- and expansion-time rows.
+            &node
+                .priority
+                .max(logic::run_priority(&graph.record.submission.event)),
             &node.run_order,
             &node.job_order,
             &node.enqueued_at_us,
@@ -411,7 +417,7 @@ async fn insert_spec_rows(
 /// Mint a `job_requests` row (identity `request_id`) and the step manifest.
 /// No `job_leases` row: the schema's lease exists only while an attempt is
 /// claimed (`bind_claim` inserts it); the row is NOT NULL on runner/expiry.
-async fn insert_request_row(
+pub(super) async fn insert_request_row(
     tx: &Transaction<'_>,
     graph: &RunGraph,
     request: &TaskAgentJobRequestRecord,
@@ -430,7 +436,10 @@ async fn insert_request_row(
                 &graph.namespace,
                 &request.agent_job_id.to_string(),
                 &request.timeline_id.to_string(),
-                &request.result.map(status_str),
+                // Only terminal statuses are valid for job_requests.result
+                // (CHECK constraint). Non-terminal (pending/queued/in_progress)
+                // must be NULL.
+                &request.result.filter(|s| s.is_terminal()).map(status_str),
                 &request.debug_token_issued,
             ],
         )
@@ -438,6 +447,17 @@ async fn insert_request_row(
         .map_err(db)?
         .get(0);
 
+    tx.execute(
+        "UPDATE jobs SET request_id = $3 \
+         WHERE run_id = $1::text::uuid AND job_id = $2",
+        &[
+            &request.run_id.0.to_string(),
+            &request.job_id.0,
+            &request_id,
+        ],
+    )
+    .await
+    .map_err(db)?;
     if let Some(token) = token {
         tx.execute(
             "INSERT INTO github_token_requests (request_id, repository, \
@@ -523,7 +543,10 @@ async fn settle_request_tx(
     tx.execute(
         "UPDATE job_requests SET result=$2, finished_at=now(), session_id=NULL \
          WHERE request_id=$1 AND result IS NULL",
-        &[&request_id, &status_str(status)],
+        &[
+            &request_id,
+            &status.is_terminal().then(|| status_str(status)),
+        ],
     )
     .await
     .map_err(db)?;
@@ -698,6 +721,18 @@ pub(super) async fn enqueue_cancellation(
         return Ok(false);
     };
     let request_id: i64 = row.get(0);
+    queue_job_cancellation(tx, request_id, reason).await?;
+    Ok(true)
+}
+
+/// Queue the `job_cancellations` row for one attempt, deduplicated while an
+/// undelivered cancellation is already pending. The graph-free half of
+/// [`enqueue_cancellation`], for callers that already resolved the request.
+pub(super) async fn queue_job_cancellation(
+    tx: &Transaction<'_>,
+    request_id: i64,
+    reason: Option<&str>,
+) -> Result<(), ControlError> {
     tx.execute(
         "INSERT INTO job_cancellations (request_id, reason) \
          SELECT $1, $2 WHERE NOT EXISTS (\
@@ -707,7 +742,7 @@ pub(super) async fn enqueue_cancellation(
     )
     .await
     .map_err(db)?;
-    Ok(true)
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1380,13 +1415,21 @@ pub(super) async fn release_concurrency_for_job(
     // the bookkeeping that created it.
     let rows = tx
         .query(
-            "SELECT namespace_id, repository, group_name, holder_kind, \
-             holder_run_id::text, holder_job_id, holder_jobset_id \
-             FROM concurrency_holds \
-             WHERE holder_run_id=$1::text::uuid \
-             UNION SELECT namespace_id, repository, group_name, holder_kind, \
-             holder_run_id::text, holder_job_id, holder_jobset_id \
-             FROM concurrency_waits WHERE holder_run_id=$1::text::uuid",
+            "SELECT presence.namespace_id, presence.repository, presence.group_name, \
+                    presence.holder_kind, presence.holder_run_id::text, \
+                    presence.holder_job_id, presence.holder_jobset_id, \
+                    jobsets.job_ids::text \
+             FROM ( \
+                 SELECT namespace_id, repository, group_name, holder_kind, \
+                        holder_run_id, holder_job_id, holder_jobset_id \
+                 FROM concurrency_holds \
+                 WHERE holder_run_id=$1::text::uuid \
+                 UNION \
+                 SELECT namespace_id, repository, group_name, holder_kind, \
+                        holder_run_id, holder_job_id, holder_jobset_id \
+                 FROM concurrency_waits WHERE holder_run_id=$1::text::uuid \
+             ) presence \
+             LEFT JOIN jobsets ON jobsets.jobset_id=presence.holder_jobset_id",
             &[&run_id.0.to_string()],
         )
         .await
@@ -1394,10 +1437,11 @@ pub(super) async fn release_concurrency_for_job(
     for row in rows {
         let namespace: String = row.get(0);
         let key = (row.get::<_, String>(1), row.get::<_, String>(2));
-        let Some(holder) = holder_of(
+        let Some(holder) = concurrency::holder_from_row(
             row.get(3),
             row.get::<_, String>(4).as_str(),
             row.get::<_, Option<String>>(5).as_deref(),
+            row.get::<_, Option<String>>(7).as_deref().unwrap_or("[]"),
         ) else {
             continue;
         };
@@ -1982,6 +2026,9 @@ async fn resume_held_node(
         let mut queued = graph::queued_of(job_id, graph.record.run_id, node, message);
         sched_helpers::hydrate_needs_context(&mut queued, &graph.record);
         apply_resolved_runs_on(node, queued.runs_on);
+        // Gate markers hydration stamps (an environment name that can never
+        // resolve) travel to the node, where the parked-gate sweep fails it.
+        node.environment_gate = queued.environment_gate.clone();
         message = queued.message;
         PgBackend::write_node_message(tx, graph.record.run_id, job_id, &message).await?;
     }
@@ -1994,6 +2041,16 @@ async fn resume_held_node(
         // Caller nodes park for expansion, not dispatch.
         node.status = ExecutionStatus::Pending;
         node.queue_state = logic::QueueState::Blocked;
+        return Ok(());
+    }
+    if node
+        .environment_gate
+        .as_ref()
+        .is_some_and(|gate| gate.unresolvable_name.is_some())
+    {
+        // The environment name can never resolve: leave the node held — the
+        // parked-gate sweep fails it closed instead of dispatching under a
+        // template name.
         return Ok(());
     }
     node.concurrency_acquired_at_us = Some(now);
@@ -2654,11 +2711,11 @@ impl<'a> Sweep<'a> {
         }))
     }
 
-    fn mark(&mut self, run_id: RunId, job_id: &JobId) {
+    pub(super) fn mark(&mut self, run_id: RunId, job_id: &JobId) {
         self.dirty.insert((run_id, job_id.clone()));
     }
 
-    fn node_mut(&mut self, run_id: RunId, job_id: &JobId) -> Option<&mut Node> {
+    pub(super) fn node_mut(&mut self, run_id: RunId, job_id: &JobId) -> Option<&mut Node> {
         self.graphs.get_mut(&run_id)?.nodes.get_mut(job_id)
     }
 
@@ -2816,6 +2873,83 @@ impl<'a> Sweep<'a> {
         if self.hydrate_and_reject_labels(run_id, job_id).await? {
             return Ok(());
         }
+        // Environment protection rules run ahead of concurrency gating: a
+        // denied or waiting job never occupies a slot, and a gate failure
+        // is the reason the job ends, not "no runner could match".
+        {
+            let environment_name = self.environment_name_for(run_id, job_id).await?;
+            if let Some(env_name) = environment_name {
+                let resolver = self.backend.environment_resolver();
+                let (repository, git_ref) = {
+                    let graph = self.graphs.get(&run_id).expect("loaded");
+                    (
+                        graph.record.submission.repository.clone(),
+                        graph.record.submission.git_ref.clone(),
+                    )
+                };
+                let lookup = resolver.lookup_sync(&repository, &env_name);
+                let mut gate = self
+                    .graphs
+                    .get(&run_id)
+                    .and_then(|g| g.nodes.get(job_id))
+                    .and_then(|n| n.environment_gate.clone());
+                let verdict = crate::runtime_scheduling::evaluate_environment_gate(
+                    &lookup,
+                    &git_ref,
+                    run_id,
+                    job_id,
+                    &env_name,
+                    &mut gate,
+                    crate::models::now_unix_nanos(),
+                );
+                match verdict {
+                    crate::runtime_scheduling::EnvironmentGateOutcome::Wait => {
+                        // Armed gates stamp progress on the node; a `Pending`
+                        // hold (GitHub rules not fetched yet) records only
+                        // the resolved name — the reaper sweep re-evaluates
+                        // once the resolver fills the entry.
+                        if let Some(node) = self.node_mut(run_id, job_id) {
+                            node.environment_gate = gate;
+                            node.queue_state = logic::QueueState::Held;
+                            node.status = ExecutionStatus::Pending;
+                        }
+                        self.mark(run_id, job_id);
+                        let graph = self.graphs.get_mut(&run_id).expect("loaded");
+                        graph
+                            .record
+                            .jobs
+                            .insert(job_id.clone(), ExecutionStatus::Pending);
+                        return Ok(());
+                    }
+                    crate::runtime_scheduling::EnvironmentGateOutcome::Failed => {
+                        if let Some(node) = self.node_mut(run_id, job_id) {
+                            node.environment_gate = gate;
+                        }
+                        self.mark(run_id, job_id);
+                        // `settle_node` records the failure in the sweep's
+                        // outcome; pushing it a second time would count the
+                        // job twice and re-report its check run.
+                        self.settle_node(run_id, job_id, ExecutionStatus::Failure)
+                            .await?;
+                        return Ok(());
+                    }
+                    crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
+                        if gate.is_some()
+                            || self
+                                .graphs
+                                .get(&run_id)
+                                .and_then(|g| g.nodes.get(job_id))
+                                .is_some_and(|n| n.environment_gate.is_some())
+                        {
+                            if let Some(node) = self.node_mut(run_id, job_id) {
+                                node.environment_gate = gate;
+                            }
+                            self.mark(run_id, job_id);
+                        }
+                    }
+                }
+            }
+        }
         // Job-level gate.
         if has_gates {
             match self.job_gate(run_id, job_id).await? {
@@ -2843,6 +2977,36 @@ impl<'a> Sweep<'a> {
         self.enqueue(run_id, job_id).await
     }
 
+    /// Hydrate needs context (and the deferred environment name) into the
+    /// node's stored message, applying resolved `runs-on` labels to the
+    /// node. `true` when a message row existed to hydrate.
+    async fn hydrate_node(&mut self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+        let Some(message) = self.message(run_id, job_id).await? else {
+            return Ok(false);
+        };
+        let (mut queued, record) = {
+            let graph = self.graphs.get(&run_id).expect("loaded");
+            let node = graph.nodes.get(job_id).expect("loaded");
+            (
+                graph::queued_of(job_id, run_id, node, message),
+                graph.record.clone(),
+            )
+        };
+        sched_helpers::hydrate_needs_context(&mut queued, &record);
+        PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
+        let runs_on = queued.runs_on.clone();
+        let environment_gate = queued.environment_gate.clone();
+        self.messages
+            .insert((run_id, job_id.clone()), Some(queued.message));
+        self.hydrated.insert((run_id, job_id.clone()));
+        if let Some(node) = self.node_mut(run_id, job_id) {
+            node.environment_gate = environment_gate;
+            apply_resolved_runs_on(node, runs_on);
+            self.mark(run_id, job_id);
+        }
+        Ok(true)
+    }
+
     /// Hydrate needs/`runs-on` and fail the job when the resolved labels are
     /// unhostable or unsatisfiable. `true` means the node was settled.
     async fn hydrate_and_reject_labels(
@@ -2850,36 +3014,13 @@ impl<'a> Sweep<'a> {
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<bool, ControlError> {
-        let mut resolved = None;
-        if let Some(message) = self.message(run_id, job_id).await? {
-            let (mut queued, record) = {
-                let graph = self.graphs.get(&run_id).expect("loaded");
-                let node = graph.nodes.get(job_id).expect("loaded");
-                (
-                    graph::queued_of(job_id, run_id, node, message),
-                    graph.record.clone(),
-                )
-            };
-            sched_helpers::hydrate_needs_context(&mut queued, &record);
-            PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
-            resolved = Some(queued.runs_on.clone());
-            self.messages
-                .insert((run_id, job_id.clone()), Some(queued.message));
-            self.hydrated.insert((run_id, job_id.clone()));
-        }
-        if let Some(runs_on) = resolved.clone()
-            && let Some(node) = self.node_mut(run_id, job_id)
-        {
-            apply_resolved_runs_on(node, runs_on);
-            self.mark(run_id, job_id);
-        }
-        let runs_on = resolved.unwrap_or_else(|| {
-            self.graphs
-                .get(&run_id)
-                .and_then(|graph| graph.nodes.get(job_id))
-                .map(|node| node.runs_on.clone())
-                .unwrap_or_default()
-        });
+        self.hydrate_node(run_id, job_id).await?;
+        let runs_on = self
+            .graphs
+            .get(&run_id)
+            .and_then(|graph| graph.nodes.get(job_id))
+            .map(|node| node.runs_on.clone())
+            .unwrap_or_default();
         if let Some(reason) = promotion_label_reason(self.backend, self.tx, &runs_on).await? {
             tracing::warn!(
                 %run_id,
@@ -2889,37 +3030,67 @@ impl<'a> Sweep<'a> {
                 %reason,
                 "runs-on unsatisfiable by runner pool; failing the job"
             );
+            // `settle_node` records the failure in the sweep's outcome;
+            // pushing it a second time would count the job twice and
+            // re-report its check run.
             self.settle_node(run_id, job_id, ExecutionStatus::Failure)
                 .await?;
-            self.outcome
-                .push(ExecutionStatus::Failure, run_id, job_id.clone());
             return Ok(true);
         }
         Ok(false)
     }
 
-    /// Hydrate + enqueue one promotable job.
-    async fn enqueue(&mut self, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
-        // Hydrate needs context into the stored message template.
-        if let Some(message) = self.message(run_id, job_id).await? {
-            let (mut queued, record) = {
-                let graph = self.graphs.get(&run_id).expect("loaded");
-                let node = graph.nodes.get(job_id).expect("loaded");
-                (
-                    graph::queued_of(job_id, run_id, node, message),
-                    graph.record.clone(),
-                )
-            };
-            sched_helpers::hydrate_needs_context(&mut queued, &record);
-            PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
-            let runs_on = queued.runs_on.clone();
-            self.messages
-                .insert((run_id, job_id.clone()), Some(queued.message));
-            self.hydrated.insert((run_id, job_id.clone()));
-            if let Some(node) = self.node_mut(run_id, job_id) {
-                apply_resolved_runs_on(node, runs_on);
-            }
+    /// The environment name a job's gate evaluates against: the hydrated
+    /// message's `actions_environment` (deferred names resolved), else the
+    /// armed gate's stamp, else the spec literal. `None` for environment-less
+    /// jobs.
+    ///
+    /// The message wins over the stamp: a gate armed while the name was still
+    /// a `${{ needs.* }}` template stamped that text, and re-evaluating the
+    /// template after `hydrate_needs_context` resolved the real name would
+    /// decide against an environment nobody configured.
+    async fn environment_name_for(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<String>, ControlError> {
+        let message_name = self.message(run_id, job_id).await?.and_then(|message| {
+            message
+                .actions_environment
+                .map(|environment| environment.name)
+        });
+        if let Some(name) = message_name
+            .as_deref()
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+        {
+            return Ok(Some(name.to_owned()));
         }
+        let node_gate = self
+            .graphs
+            .get(&run_id)
+            .and_then(|g| g.nodes.get(job_id))
+            .and_then(|n| n.environment_gate.clone());
+        if let Some(name) = node_gate.as_ref().and_then(|g| g.environment_name.clone()) {
+            return Ok(Some(name));
+        }
+        Ok(message_name.or_else(|| {
+            self.graphs
+                .get(&run_id)
+                .and_then(|g| g.nodes.get(job_id))
+                .and_then(|node| {
+                    crate::runtime_scheduling::environment_gate_name_of(node.environment.as_ref())
+                })
+                .map(str::to_owned)
+        }))
+    }
+
+    /// Hydrate + enqueue one promotable job.
+    pub(super) async fn enqueue(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        self.hydrate_node(run_id, job_id).await?;
         let now = self.now;
         let graph = self.graph(run_id).await?;
         let Some(node) = graph.nodes.get_mut(job_id) else {
@@ -2952,7 +3123,7 @@ impl<'a> Sweep<'a> {
     }
 
     /// Park a promotable node behind concurrency (`held` state).
-    fn hold_node(&mut self, run_id: RunId, job_id: &JobId) {
+    pub(super) fn hold_node(&mut self, run_id: RunId, job_id: &JobId) {
         let now = self.now;
         if let Some(node) = self.node_mut(run_id, job_id) {
             node.status = ExecutionStatus::Pending;
@@ -2984,8 +3155,310 @@ impl<'a> Sweep<'a> {
         .await
     }
 
-    /// Settle a node terminal: status, release gates, retire requests, run
-    /// resummary, decrement dependent `remaining_needs` rows.
+    /// Recompute the `remaining_needs` fast-path counter for every job that
+    /// declares `job_id` or its matrix base as a need, and report whether any
+    /// of them is now promotable (`blocked`, zero remaining needs).
+    ///
+    /// This is the targeted replacement for the in-memory decrement
+    /// `Settle::settle_node` performed over the loaded graph: a declared need
+    /// matches a job id or its matrix base, and an expanded matrix parent is
+    /// replaced by its legs, so a base need stays counted until *every* leg is
+    /// terminal and a leg's own id never appears in the dependent's
+    /// `job_needs` row.
+    pub(super) async fn refresh_remaining_needs(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+        base_id: &str,
+    ) -> Result<bool, ControlError> {
+        let rows = tx
+            .query(
+                "UPDATE jobs d SET remaining_needs = COALESCE(( \
+                     SELECT SUM(need.remaining) FROM ( \
+                       SELECT (SELECT count(*) FROM jobs j \
+                               WHERE j.run_id = d.run_id \
+                                 AND (j.job_id = n.needs_job_id \
+                                      OR j.base_id = n.needs_job_id) \
+                                 AND j.status NOT IN \
+                                   ('success','failure','cancelled','skipped','timed_out') \
+                                 AND NOT (j.kind = 'matrix_parent' AND EXISTS ( \
+                                   SELECT 1 FROM jobs c WHERE c.run_id = j.run_id \
+                                     AND c.parent_job_id = j.job_id)))::int AS remaining \
+                       FROM job_needs n \
+                       WHERE n.run_id = d.run_id AND n.job_id = d.job_id \
+                     ) need), 0) \
+                 WHERE d.run_id = $1::text::uuid \
+                   AND d.status NOT IN \
+                     ('success','failure','cancelled','skipped','timed_out') \
+                   AND d.job_id IN ( \
+                     SELECT n.job_id FROM job_needs n \
+                     WHERE n.run_id = $1::text::uuid \
+                       AND (n.needs_job_id = $2 OR n.needs_job_id = $3)) \
+                 RETURNING d.queue_state, d.remaining_needs",
+                &[&run_id.0.to_string(), &job_id.0, &base_id],
+            )
+            .await
+            .map_err(db)?;
+        Ok(rows
+            .iter()
+            .any(|row| row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0))
+    }
+
+    /// Try to fold a reusable workflow caller when one of its inner jobs
+    /// completes. If every inner job of one of its callers is terminal,
+    /// resolves the caller's `outputs` from its `output_definitions` (the
+    /// shared `reusable_workflows::propagate_reusable_outputs` semantics),
+    /// sets the caller's aggregate status and marks it terminal.
+    ///
+    /// Returns the caller ID if folded. The caller walks up the chain by
+    /// calling this repeatedly, so nested reusable workflows fold outermost-
+    /// last.
+    pub(super) async fn try_fold_reusable_caller(
+        backend: &PgBackend,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        inner_job_id: &JobId,
+    ) -> Result<Option<JobId>, ControlError> {
+        let run = run_id.0.to_string();
+        // Candidate callers: every spec row whose reusable metadata lists the
+        // completed job as an inner job. The metadata (`inner_job_ids`) is the
+        // authoritative edge — a callee's job id carries no `parent_job_id`
+        // (only matrix legs do), and lite's fold reads the same list.
+        let candidates = tx
+            .query(
+                "SELECT job_id, reusable_call::text FROM job_specs \
+                 WHERE run_id=$1::text::uuid AND reusable_call IS NOT NULL \
+                   AND reusable_call <> 'null'::jsonb",
+                &[&run],
+            )
+            .await
+            .map_err(db)?;
+        for row in candidates {
+            let caller_id: String = row.get(0);
+            let spec: super::graph::ReusableNodeSpec = row
+                .get::<_, Option<String>>(1)
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .ok_or_else(|| {
+                    ControlError::backend(anyhow::anyhow!(
+                        "reusable caller {caller_id} has an undecodable spec"
+                    ))
+                })?;
+            let Some(meta) = spec.meta else {
+                continue;
+            };
+            if !meta.inner_job_ids.iter().any(|id| id == &inner_job_id.0) {
+                continue;
+            }
+            // Already folded (the resolved outputs are the fold's marker).
+            let folded: bool = tx
+                .query_one(
+                    "SELECT outputs IS NOT NULL FROM jobs \
+                     WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &caller_id],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            if folded {
+                continue;
+            }
+            // All inner jobs terminal? (`inner_job_ids` order is the GitHub
+            // evaluation order; statuses come from the rows.)
+            let rows = tx
+                .query(
+                    "SELECT job_id, status, outputs::text FROM jobs \
+                     WHERE run_id=$1::text::uuid AND job_id = ANY($2)",
+                    &[&run, &meta.inner_job_ids],
+                )
+                .await
+                .map_err(db)?;
+            let mut statuses = Vec::new();
+            let mut by_id: BTreeMap<String, (ExecutionStatus, Option<String>)> = BTreeMap::new();
+            for row in &rows {
+                let status = crate::control::types::status_parse(row.get::<_, String>(1).as_str());
+                by_id.insert(
+                    row.get::<_, String>(0),
+                    (status, row.get::<_, Option<String>>(2)),
+                );
+            }
+            let all_complete = !meta.inner_job_ids.is_empty()
+                && meta.inner_job_ids.iter().all(|id| {
+                    by_id
+                        .get(id)
+                        .is_some_and(|(status, _)| status.is_terminal())
+                });
+            if !all_complete {
+                return Ok(None);
+            }
+            // Expression context: `jobs.<inner-id-without-caller-prefix>
+            // .outputs.<name>` plus the call's `with:` inputs.
+            let mut jobs_map = serde_json::Map::new();
+            for inner_id in &meta.inner_job_ids {
+                let prefix = format!("{caller_id}/");
+                let short = inner_id.strip_prefix(&prefix).unwrap_or(inner_id);
+                let mut job_outputs_map = serde_json::Map::new();
+                if let Some(Some(outputs)) = by_id.get(inner_id).map(|(_, outputs)| outputs)
+                    && let Ok(serde_json::Value::Object(obj)) =
+                        serde_json::from_str::<serde_json::Value>(outputs)
+                {
+                    for (k, v) in obj {
+                        job_outputs_map.insert(k, v);
+                    }
+                }
+                let mut job_record = serde_json::Map::new();
+                job_record.insert(
+                    "outputs".to_owned(),
+                    serde_json::Value::Object(job_outputs_map),
+                );
+                jobs_map.insert(short.to_owned(), serde_json::Value::Object(job_record));
+            }
+            let mut context = preloop_gha_expressions::Context::default();
+            context.insert("jobs", serde_json::Value::Object(jobs_map));
+            let mut inputs_map = serde_json::Map::new();
+            for (k, v) in &meta.inputs {
+                inputs_map.insert(k.clone(), v.clone());
+            }
+            context.insert("inputs", serde_json::Value::Object(inputs_map));
+            let mut caller_outputs = BTreeMap::new();
+            for (name, expr) in &meta.output_definitions {
+                let resolved = preloop_gha_parser::eval::resolve_string(expr, &context)
+                    .unwrap_or_else(|_| expr.clone());
+                // Outputs are strings on GitHub: every `GITHUB_OUTPUT` value is
+                // text and `needs.<caller>.outputs.<name>` comparisons are
+                // string comparisons.
+                caller_outputs.insert(name.clone(), serde_json::Value::String(resolved));
+            }
+            // Aggregate status: failure > cancelled > skipped > success. A
+            // caller that already turned terminal (cancelled mid-flight) keeps
+            // its conclusion — the conditional UPDATE below only moves live
+            // callers.
+            for inner_id in &meta.inner_job_ids {
+                if let Some((status, _)) = by_id.get(inner_id) {
+                    statuses.push(*status);
+                }
+            }
+            let aggregate = crate::runtime_scheduling::aggregate_need_status(&statuses)
+                .unwrap_or(ExecutionStatus::Skipped);
+            let outputs_json =
+                serde_json::to_string(&caller_outputs).map_err(ControlError::backend)?;
+            let updated = tx
+                .execute(
+                    "UPDATE jobs SET outputs=$3::text::jsonb, status=$4, queue_state='none', \
+                            completed_at=COALESCE(completed_at, now()) \
+                     WHERE run_id=$1::text::uuid AND job_id=$2 \
+                       AND status NOT IN \
+                         ('success','failure','cancelled','skipped','timed_out')",
+                    &[&run, &caller_id, &outputs_json, &status_str(aggregate)],
+                )
+                .await
+                .map_err(db)?;
+            if updated == 0 {
+                // A caller cancelled between the checks keeps its conclusion;
+                // its outputs still land so dependents can read them.
+                tx.execute(
+                    "UPDATE jobs SET outputs=$3::text::jsonb \
+                     WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &caller_id, &outputs_json],
+                )
+                .await
+                .map_err(db)?;
+            }
+            // A terminal caller must not leave the placeholder attempts it
+            // minted in flight, and its own hold goes with it.
+            retire_node_requests(
+                tx,
+                run_id,
+                &JobId(caller_id.clone()),
+                Retirement::Settle(aggregate),
+            )
+            .await?;
+            release_concurrency_for_job(backend, tx, run_id, &JobId(caller_id.clone())).await?;
+            return Ok(Some(JobId(caller_id)));
+        }
+        Ok(None)
+    }
+
+    /// Cancel a failed leg's matrix siblings (fail-fast). Returns the IDs of
+    /// jobs actually cancelled. Idempotent: running it twice cancels nothing
+    /// the second time.
+    ///
+    /// Parity with lite's `apply_matrix_fail_fast`: the flag is read off the
+    /// base's legs (`job_specs.fail_fast`, default true when unset); every
+    /// non-terminal sibling of the base is cancelled, an in-flight one gets a
+    /// deduplicated runner cancellation, and its concurrency presence is
+    /// released (a leaked hold parks the whole group).
+    pub(super) async fn cancel_fail_fast_siblings(
+        backend: &PgBackend,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        failed: &JobId,
+        base_id: &str,
+    ) -> Result<Vec<JobId>, ControlError> {
+        // Fail-fast: the failed job's own spec flag (the in-memory path read
+        // `node.fail_fast`), falling back to any leg of the base (lite's
+        // `fail_fast_for_base`), default true when unset.
+        let fail_fast: bool = tx
+            .query_opt(
+                "SELECT COALESCE( \
+                     (SELECT s.fail_fast FROM job_specs s \
+                      WHERE s.run_id=$1::text::uuid AND s.job_id=$2), \
+                     (SELECT bool_or(s.fail_fast) FROM job_specs s \
+                      JOIN jobs j ON j.run_id = s.run_id AND j.job_id = s.job_id \
+                      WHERE s.run_id=$1::text::uuid AND j.base_id=$3 \
+                        AND s.fail_fast IS NOT NULL))",
+                &[&run_id.0.to_string(), &failed.0, &base_id],
+            )
+            .await
+            .map_err(db)?
+            .and_then(|row| row.get::<_, Option<bool>>(0))
+            .unwrap_or(true);
+        if !fail_fast {
+            return Ok(Vec::new());
+        }
+        let siblings = tx
+            .query(
+                "SELECT j.job_id, j.status, \
+                        (SELECT q.request_id FROM job_requests q \
+                         WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                           AND q.result IS NULL \
+                         ORDER BY q.request_id DESC LIMIT 1) \
+                 FROM jobs j \
+                 WHERE j.run_id=$1::text::uuid AND j.base_id=$2 AND j.job_id <> $3 \
+                   AND j.status IN ('pending','queued','in_progress') \
+                 ORDER BY j.job_order",
+                &[&run_id.0.to_string(), &base_id, &failed.0],
+            )
+            .await
+            .map_err(db)?;
+        let mut cancelled = Vec::new();
+        for row in &siblings {
+            let sibling = JobId(row.get::<_, String>(0));
+            let status: String = row.get(1);
+            let request_id: Option<i64> = row.get(2);
+            if status == "in_progress"
+                && let Some(request_id) = request_id
+            {
+                queue_job_cancellation(tx, request_id, Some("fail_fast")).await?;
+            }
+            tx.execute(
+                "UPDATE jobs SET status='cancelled', queue_state='none', \
+                        completed_at=COALESCE(completed_at, now()), \
+                        claimed_by_runner_id=NULL \
+                 WHERE run_id=$1::text::uuid AND job_id=$2 \
+                 AND status NOT IN \
+                   ('success','failure','cancelled','skipped','timed_out')",
+                &[&run_id.0.to_string(), &sibling.0],
+            )
+            .await
+            .map_err(db)?;
+            clear_assignment(tx, run_id, &sibling).await?;
+            release_concurrency_for_job(backend, tx, run_id, &sibling).await?;
+            cancelled.push(sibling);
+        }
+        Ok(cancelled)
+    }
+
     pub(super) async fn settle_node(
         &mut self,
         run_id: RunId,
@@ -3275,7 +3748,7 @@ impl<'a> Sweep<'a> {
     }
 
     /// Evaluate + acquire a job's own `concurrency:` gate.
-    async fn job_gate(
+    pub(super) async fn job_gate(
         &mut self,
         run_id: RunId,
         job_id: &JobId,
@@ -3776,7 +4249,10 @@ fn submit_node(
         runs_on: job.runs_on.clone(),
         runner_group: job.runner_group.clone(),
         priority: 0,
-        run_order: record.run_number as i64,
+        // The run's submit time, like SQLite: arrival order across workflows.
+        // (The workflow run number is a per-workflow counter, not comparable
+        // between workflows.)
+        run_order: record.created_at.timestamp_micros(),
         job_order: position as i32,
         enqueued_at_us: None,
         claimed_by_runner_id: None,
@@ -3785,6 +4261,7 @@ fn submit_node(
         outputs: None,
         annotations: None,
         check_run_id: record.job_check_run_ids.get(&job_id).map(|id| *id as i64),
+        request_id: None,
         created_at_us: now_us,
         deps_ready_at_us: job.needs.is_empty().then_some(now_us),
         concurrency_wait_at_us: None,
@@ -3917,10 +4394,85 @@ async fn admit_submit(
     Ok(())
 }
 
+/// Phase-1 state for a chunked pg submit: everything the job chunks and the
+/// finalize step need after the replay check, the run row, and the workflow
+/// concurrency gate have committed.
+struct PgSubmitProceed {
+    namespace: String,
+    record: RunRecord,
+    /// `record.run_id` rendered for SQL params.
+    run: String,
+    now: i64,
+    platforms: Vec<&'static str>,
+    pool_labels: Vec<String>,
+    runner_labels: Vec<Vec<String>>,
+    check_hostable: bool,
+    held: bool,
+}
+
+/// What [`PgBackend::submit_run_head`] hands back: either a finished outcome
+/// (replay, empty concurrency group, arrival-cancelled) or the state to
+/// continue with.
+#[allow(clippy::large_enum_variant)]
+// Both variants are large (`RunRecord` dominates); the enum is built and
+// matched once per submit, so boxing would buy nothing.
+enum PgSubmitHead {
+    Done(SubmitOutcome),
+    Proceed(PgSubmitProceed, Vec<SubmitJob>),
+}
+
+/// Best-effort poison for a submit that failed after phase 1 committed:
+/// release the workflow-gate hold the run may own, then mark the run
+/// terminal so dispatchers never pick up its partial jobs. Runs in its own
+/// transaction; a poison failure is logged, never propagated — the original
+/// error is already on its way to the caller.
+async fn poison_partial_submit(backend: &PgBackend, run_id: RunId) {
+    let result: Result<(), ControlError> = async {
+        let run = run_id.0.to_string();
+        let mut client = backend.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        release_concurrency_for_run(backend, &tx, run_id).await?;
+        tx.execute(
+            "UPDATE runs SET concurrency_group = NULL WHERE run_id = $1::text::uuid",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute(
+            "UPDATE runs SET status='completed', conclusion='failure', completed_at = now() \
+             WHERE run_id = $1::text::uuid AND status <> 'completed'",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+        emit_outbox(
+            &tx,
+            Some(run_id),
+            "run.completed.v1",
+            serde_json::json!({"conclusion": "failure", "reason": "submit aborted mid-insert"}),
+        )
+        .await?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%run_id, ?error, "failed to poison partially submitted run");
+    }
+}
+
 impl PgBackend {
-    /// `submit_run`: one transaction that records the run, its jobs and their
-    /// dispatch state, acquires the workflow-level gate, and runs the first
-    /// promotion sweep.
+    /// `submit_run`: records the run, its jobs and their dispatch state,
+    /// acquires the workflow-level gate, and runs the first promotion sweep.
+    ///
+    /// Chunked: phase 1 commits the replay check, the run row and the gates;
+    /// each [`SUBMIT_JOB_CHUNK_SIZE`](crate::control::types::SUBMIT_JOB_CHUNK_SIZE)
+    /// job slice commits on its own; a final transaction recounts
+    /// `remaining_needs`, sweeps, and summarizes. No single request pins the
+    /// writer (or its pooled connection) for the whole insert — a concurrent
+    /// control write waits for one chunk at most. A failure after phase 1
+    /// commits poisons the run (completed/failure) so a partial submit can
+    /// never dispatch or wedge a concurrency group.
     ///
     /// Statements: replay `SELECT run_id` (webhook delivery + path); namespace
     /// upsert; `INSERT INTO runs`; `run_submissions`; `run_push_states`;
@@ -3931,6 +4483,72 @@ impl PgBackend {
         &self,
         submit: SubmitRun,
     ) -> Result<SubmitOutcome, ControlError> {
+        // Phase 1 (one transaction): replay check, run row, gates.
+        let (proceed, mut jobs) = match self.submit_run_head(submit).await? {
+            PgSubmitHead::Done(outcome) => return Ok(outcome),
+            PgSubmitHead::Proceed(proceed, jobs) => (proceed, jobs),
+        };
+        let run_id = proceed.record.run_id;
+        let mut graph = RunGraph {
+            record: proceed.record.clone(),
+            namespace: proceed.namespace.clone(),
+            nodes: BTreeMap::new(),
+            submission: proceed.record.submission.clone(),
+            github: proceed.record.github.clone(),
+            touched: true,
+        };
+        // Jobs admitted (not concluded at submit) — `RunAccepted.queued_jobs`.
+        let mut accepted = 0usize;
+        let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
+        let mut position_offset = 0usize;
+        while !jobs.is_empty() {
+            let take = jobs.len().min(crate::control::types::SUBMIT_JOB_CHUNK_SIZE);
+            let chunk: Vec<SubmitJob> = jobs.drain(..take).collect();
+            // One transaction per chunk, and the pooled writer connection is
+            // checked back in between chunks.
+            let mut client = self.writer().await?;
+            let tx = client.transaction().await.map_err(db)?;
+            let chunk_result = submit_job_chunk(
+                &tx,
+                &mut graph,
+                &proceed,
+                &mut accepted,
+                &mut concluded,
+                position_offset,
+                chunk,
+            )
+            .await;
+            position_offset += take;
+            match chunk_result {
+                Ok(()) => {
+                    tx.commit().await.map_err(db)?;
+                    drop(client);
+                }
+                Err(error) => {
+                    drop(tx);
+                    drop(client);
+                    poison_partial_submit(self, run_id).await;
+                    return Err(error);
+                }
+            }
+        }
+        match self
+            .submit_run_finalize(&proceed, graph, accepted, concluded)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                poison_partial_submit(self, run_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Phase 1 of [`PgBackend::submit_run`]: the idempotent-replay check,
+    /// run-number allocation, namespace admission, the run row, and the
+    /// workflow concurrency gate. Commits on its own so the job chunks that
+    /// follow never redo it; early-return outcomes carry no partial state.
+    async fn submit_run_head(&self, submit: SubmitRun) -> Result<PgSubmitHead, ControlError> {
         let SubmitRun {
             namespace,
             mut record,
@@ -3952,12 +4570,12 @@ impl PgBackend {
                 drop(tx);
                 drop(client);
                 let existing = self.run_record(existing).await?;
-                return self.replay_outcome(existing).await;
+                return Ok(PgSubmitHead::Done(self.replay_outcome(existing).await?));
             }
         }
         // Reject outright on an empty concurrency group (nothing persists).
         if empty_concurrency_group {
-            return Ok(SubmitOutcome {
+            return Ok(PgSubmitHead::Done(SubmitOutcome {
                 run_id: record.run_id,
                 run_number: record.run_number,
                 queued_jobs: 0,
@@ -3972,7 +4590,7 @@ impl PgBackend {
                 existing: None,
                 next_runs_on: Vec::new(),
                 events: Vec::new(),
-            });
+            }));
         }
 
         let now = now_us();
@@ -4116,7 +4734,7 @@ impl PgBackend {
             drop(tx);
             drop(client);
             let existing = self.run_record(existing).await?;
-            return self.replay_outcome(existing).await;
+            return Ok(PgSubmitHead::Done(self.replay_outcome(existing).await?));
         }
         // The submission record. Secret values never reach the database
         // (the SecretProvider holds them); clear defensively at the boundary.
@@ -4244,7 +4862,7 @@ impl PgBackend {
                     .await?;
                     tx.commit().await.map_err(db)?;
                     drop(client);
-                    return Ok(SubmitOutcome {
+                    return Ok(PgSubmitHead::Done(SubmitOutcome {
                         run_id: record.run_id,
                         run_number: record.run_number,
                         queued_jobs: 0,
@@ -4255,154 +4873,201 @@ impl PgBackend {
                         existing: None,
                         next_runs_on: self.ready_front_labels().await?,
                         events: Vec::new(),
-                    });
+                    }));
                 }
             }
         }
 
-        // Jobs admitted (not concluded at submit) — `RunAccepted.queued_jobs`.
-        let mut accepted = 0usize;
-        let final_status;
-        let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
-        let mut graph = RunGraph {
-            record: record.clone(),
-            namespace: namespace.clone(),
-            nodes: BTreeMap::new(),
-            submission: record.submission.clone(),
-            github: record.github.clone(),
-            touched: true,
-        };
-        for (position, submit_job) in jobs.into_iter().enumerate() {
-            let SubmitJob {
-                queued,
-                request,
-                token_request,
-                id_token_granted,
-                oidc_context,
-                step_manifest,
-                initially_skipped,
-            } = submit_job;
-            let job_id = queued.job_id.clone();
-            let (mut node, mut message, _secret_names) =
-                submit_node(&record, queued.clone(), position, now);
-            node.id_token_granted = id_token_granted;
-            if let Some(oidc) = oidc_context {
-                node.oidc = oidc;
-            }
-            // Unhostable platform: conclude immediately. Deferred for
-            // needs-gated jobs — they park until their `if:` can be
-            // evaluated, and a job GitHub would skip must not fail here on
-            // labels it will never need; promotion re-runs this check.
-            if check_hostable
-                && queued.needs.is_empty()
-                && let Some(platform) =
-                    crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
-            {
-                node.status = ExecutionStatus::Failure;
-                node.queue_state = logic::QueueState::None;
-                node.completed_at_us = Some(now);
-                concluded.push((
-                    job_id.clone(),
-                    ExecutionStatus::Failure,
-                    Some(logic::unhostable_reason(platform, &node.runs_on)),
-                ));
-            }
-            if initially_skipped && node.status != ExecutionStatus::Failure {
-                node.status = ExecutionStatus::Skipped;
-                node.queue_state = logic::QueueState::None;
-                node.completed_at_us = Some(now);
-                concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
-            }
-            // Labels the co-hosted pool can never satisfy and no registered
-            // runner serves: conclude now instead of starving in the queue.
-            // Placeholders are skipped — expansion materializes their jobs.
-            // Needs-gated jobs defer too: they park until their `if:` can be
-            // evaluated, and the promotion path re-runs this check.
-            if !matches!(
+        tx.commit().await.map_err(db)?;
+        drop(client);
+        Ok(PgSubmitHead::Proceed(
+            PgSubmitProceed {
+                namespace,
+                record,
+                run,
+                now,
+                platforms,
+                pool_labels,
+                runner_labels,
+                check_hostable,
+                held,
+            },
+            jobs,
+        ))
+    }
+}
+
+/// Insert one [`SUBMIT_JOB_CHUNK_SIZE`](crate::control::types::SUBMIT_JOB_CHUNK_SIZE)-sized
+/// slice of the submit's jobs in its own transaction: node classification
+/// plus the `jobs` / `job_specs` / `job_needs` / `job_messages` /
+/// `job_requests` rows. The in-memory `graph` accumulates across chunks; the
+/// finalize step sweeps it once every chunk has committed.
+async fn submit_job_chunk(
+    tx: &Transaction<'_>,
+    graph: &mut RunGraph,
+    proceed: &PgSubmitProceed,
+    accepted: &mut usize,
+    concluded: &mut Vec<(JobId, ExecutionStatus, Option<String>)>,
+    position_offset: usize,
+    jobs: Vec<SubmitJob>,
+) -> Result<(), ControlError> {
+    let record = &proceed.record;
+    let run: &str = &proceed.run;
+    let now = proceed.now;
+    let platforms = &proceed.platforms;
+    let pool_labels = &proceed.pool_labels;
+    let runner_labels = &proceed.runner_labels;
+    let check_hostable = proceed.check_hostable;
+    let held = proceed.held;
+    for (index, submit_job) in jobs.into_iter().enumerate() {
+        let position = position_offset + index;
+        let SubmitJob {
+            queued,
+            request,
+            token_request,
+            id_token_granted,
+            oidc_context,
+            step_manifest,
+            initially_skipped,
+        } = submit_job;
+        let job_id = queued.job_id.clone();
+        let (mut node, mut message, _secret_names) =
+            submit_node(record, queued.clone(), position, now);
+        node.id_token_granted = id_token_granted;
+        if let Some(oidc) = oidc_context {
+            node.oidc = oidc;
+        }
+        // Unhostable platform: conclude immediately. Deferred for
+        // needs-gated jobs — they park until their `if:` can be
+        // evaluated, and a job GitHub would skip must not fail here on
+        // labels it will never need; promotion re-runs this check.
+        if check_hostable
+            && queued.needs.is_empty()
+            && let Some(platform) =
+                crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
+        {
+            node.status = ExecutionStatus::Failure;
+            node.queue_state = logic::QueueState::None;
+            node.completed_at_us = Some(now);
+            concluded.push((
+                job_id.clone(),
+                ExecutionStatus::Failure,
+                Some(logic::unhostable_reason(platform, &node.runs_on)),
+            ));
+        }
+        if initially_skipped && node.status != ExecutionStatus::Failure {
+            node.status = ExecutionStatus::Skipped;
+            node.queue_state = logic::QueueState::None;
+            node.completed_at_us = Some(now);
+            concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
+        }
+        // Labels the co-hosted pool can never satisfy and no registered
+        // runner serves: conclude now instead of starving in the queue.
+        // Placeholders are skipped — expansion materializes their jobs.
+        // Needs-gated jobs defer too: they park until their `if:` can be
+        // evaluated, and the promotion path re-runs this check.
+        if !matches!(
+            node.status,
+            ExecutionStatus::Failure | ExecutionStatus::Skipped
+        ) && queued.reusable_call.is_none()
+            && queued.deferred_matrix.is_none()
+            && queued.needs.is_empty()
+            && let Some(reason) = logic::unschedulable_reason(
+                &node.runs_on,
+                pool_labels,
+                runner_labels.iter().any(|labels| {
+                    crate::runtime_scheduling::job_matches_runner(&node.runs_on, labels)
+                }),
+            )
+        {
+            tracing::warn!(
+                run_id = %record.run_id,
+                job = %job_id.0,
+                labels = ?node.runs_on,
+                pool_labels = ?pool_labels,
+                "runs-on unsatisfiable by runner pool; failing the job at enqueue"
+            );
+            node.status = ExecutionStatus::Failure;
+            node.queue_state = logic::QueueState::None;
+            node.completed_at_us = Some(now);
+            concluded.push((job_id.clone(), ExecutionStatus::Failure, Some(reason)));
+        }
+        if !matches!(
+            node.status,
+            ExecutionStatus::Failure | ExecutionStatus::Skipped
+        ) {
+            *accepted += 1;
+        }
+        // A node that reaches admission behind a hold parks: the workflow
+        // gate is not this run's turn yet (`held`), the run is held by the
+        // fork-PR approval policy, or its environment protection gate is
+        // not satisfied. All three park identically — held, pending, no
+        // promotion candidate — and are released by `promote_ready_jobs`
+        // once the hold lifts.
+        if (held || record.fork_approval_pending || node.environment_gate.is_some())
+            && !matches!(
                 node.status,
                 ExecutionStatus::Failure | ExecutionStatus::Skipped
-            ) && queued.reusable_call.is_none()
-                && queued.deferred_matrix.is_none()
-                && queued.needs.is_empty()
-                && let Some(reason) = logic::unschedulable_reason(
-                    &node.runs_on,
-                    &pool_labels,
-                    runner_labels.iter().any(|labels| {
-                        crate::runtime_scheduling::job_matches_runner(&node.runs_on, labels)
-                    }),
-                )
-            {
-                tracing::warn!(
-                    run_id = %record.run_id,
-                    job = %job_id.0,
-                    labels = ?node.runs_on,
-                    pool_labels = ?pool_labels,
-                    "runs-on unsatisfiable by runner pool; failing the job at enqueue"
-                );
-                node.status = ExecutionStatus::Failure;
-                node.queue_state = logic::QueueState::None;
-                node.completed_at_us = Some(now);
-                concluded.push((job_id.clone(), ExecutionStatus::Failure, Some(reason)));
-            }
-            if !matches!(
-                node.status,
-                ExecutionStatus::Failure | ExecutionStatus::Skipped
-            ) {
-                accepted += 1;
-            }
-            // A node that reaches admission behind a hold parks: the workflow
-            // gate is not this run's turn yet (`held`), the run is held by the
-            // fork-PR approval policy, or its environment protection gate is
-            // not satisfied. All three park identically — held, pending, no
-            // promotion candidate — and are released by `promote_ready_jobs`
-            // once the hold lifts.
-            if (held || record.fork_approval_pending || node.environment_gate.is_some())
-                && !matches!(
-                    node.status,
-                    ExecutionStatus::Failure | ExecutionStatus::Skipped
-                )
-            {
-                node.queue_state = logic::QueueState::Held;
-                node.concurrency_wait_at_us = Some(now);
-            }
-            insert_job_row(&tx, &graph, &node, &job_id).await?;
-            insert_spec_rows(&tx, &graph, &node, &job_id, None).await?;
-            // Mint the request correlation inside the writer transaction so
-            // the id is allocated under the cross-process writer lock.
-            if let Some(request) = &request {
-                let request_id = insert_request_row(
-                    &tx,
-                    &graph,
-                    request,
-                    token_request.as_ref(),
-                    &step_manifest,
-                )
-                .await?;
-                message.request_id = request_id;
-                message.job_id = request.agent_job_id;
-            }
-            // Skipped nodes carry a placeholder message and mint nothing —
-            // `job_messages` (like the request row) exists only for
-            // dispatchable jobs.
-            if !initially_skipped {
-                tx.execute(
-                    "INSERT INTO job_messages (run_id, job_id, message_template, secret_names, \
+            )
+        {
+            node.queue_state = logic::QueueState::Held;
+            node.concurrency_wait_at_us = Some(now);
+        }
+        insert_job_row(tx, graph, &node, &job_id).await?;
+        insert_spec_rows(tx, graph, &node, &job_id, None).await?;
+        // Mint the request correlation inside the writer transaction so
+        // the id is allocated under the cross-process writer lock.
+        if let Some(request) = &request {
+            let request_id =
+                insert_request_row(tx, graph, request, token_request.as_ref(), &step_manifest)
+                    .await?;
+            node.request_id = Some(request_id);
+            message.request_id = request_id;
+            message.job_id = request.agent_job_id;
+        }
+        // Skipped nodes carry a placeholder message and mint nothing —
+        // `job_messages` (like the request row) exists only for
+        // dispatchable jobs.
+        if !initially_skipped {
+            tx.execute(
+                "INSERT INTO job_messages (run_id, job_id, message_template, secret_names, \
                      condition_context) VALUES ($1::text::uuid,$2,$3::text::jsonb,$4::text::jsonb,\
                      $5::text::jsonb)",
-                    &[
-                        &run,
-                        &job_id.0,
-                        &json(&message)?,
-                        &json(&node.secret_names)?,
-                        &json(&node.condition_context)?,
-                    ],
-                )
-                .await
-                .map_err(db)?;
-            }
-            graph.record.jobs.insert(job_id.clone(), node.status);
-            graph.nodes.insert(job_id, node);
+                &[
+                    &run,
+                    &job_id.0,
+                    &json(&message)?,
+                    &json(&node.secret_names)?,
+                    &json(&node.condition_context)?,
+                ],
+            )
+            .await
+            .map_err(db)?;
         }
+        graph.record.jobs.insert(job_id.clone(), node.status);
+        graph.nodes.insert(job_id, node);
+    }
+    Ok(())
+}
+
+impl PgBackend {
+    /// Phase 3 of [`PgBackend::submit_run`]: the whole-run fixups that must
+    /// see every committed chunk — `remaining_needs` recount, the promotion
+    /// sweep, run resummarize, outbox rows, and the persisted events the
+    /// handler replays.
+    async fn submit_run_finalize(
+        &self,
+        proceed: &PgSubmitProceed,
+        mut graph: RunGraph,
+        accepted: usize,
+        mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)>,
+    ) -> Result<SubmitOutcome, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let record = &proceed.record;
+        let now = proceed.now;
+        let held = proceed.held;
+        let final_status;
 
         // `remaining_needs` was initialized as `needs.len()` before submit-time
         // conclusions (unhostable, `if: false`) settled their parents, so it
@@ -4592,13 +5257,19 @@ impl PgBackend {
     }
 
     /// [`Self::ready_front_labels`] on a caller's connection or open transaction.
+    ///
+    /// The front is the queue head in the shared global dispatch order
+    /// (`priority DESC, run_order, job_order` — the `jobs_ready_global`
+    /// index), never the lexically first pool key: the pool key groups equal
+    /// label sets for pruning, it does not rank them, so ordering by it would
+    /// report a different job than the claim takes.
     pub(super) async fn ready_front_labels_on(
         client: &impl GenericClient,
     ) -> Result<Vec<String>, ControlError> {
         let row = client
             .query_opt(
                 "SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
-                 ORDER BY pool_key, priority DESC, run_order, job_order LIMIT 1",
+                 ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
                 &[],
             )
             .await
@@ -4793,16 +5464,29 @@ impl PgBackend {
     /// `claim_position`: the ready job this runner should take, using the
     /// shared four-tier preference over the current ready batch.
     ///
-    /// Statements: a read of the ready batch (`LIMIT 64` in queue order with
-    /// assignments and pool-pending rows joined in), then the preferred
-    /// candidate's claim. The claim locks the job row with `FOR UPDATE SKIP
-    /// LOCKED`: concurrent pollers collapse onto the same head candidate, and
-    /// a row another poller is claiming must be skipped at once — a plain
-    /// conditional `UPDATE` would queue on that row until the winner's whole
-    /// transaction commits, then match nothing. No lock is taken on the rest
-    /// of the batch. The batch is paged until a candidate matches or the
-    /// ready set is exhausted: a runner whose pool sorts past the first batch
-    /// must still see the jobs it can serve.
+    /// Statements: a read of the runner's own fresh bindings (the top two
+    /// preference tiers, wherever they sit in the queue), then a read of the
+    /// ready batch (`LIMIT 64` in queue order with assignments and
+    /// pool-pending rows joined in), then the preferred candidate's claim.
+    /// The claim locks the job row with `FOR UPDATE SKIP LOCKED`: concurrent
+    /// pollers collapse onto the same head candidate, and a row another
+    /// poller is claiming must be skipped at once — a plain conditional
+    /// `UPDATE` would queue on that row until the winner's whole transaction
+    /// commits, then match nothing. No lock is taken on the rest of the
+    /// batch. The batch is paged until a candidate matches or the ready set
+    /// is exhausted, so a runner whose labels match only jobs deep in the
+    /// queue still finds them.
+    ///
+    /// The batch is the queue in ONE global order — `priority DESC,
+    /// run_order, job_order`, then the `run_id, job_id` tie-breakers that make
+    /// the order total and keep `OFFSET` paging stable — never the pool key's
+    /// text order: the key groups equal label sets for pruning, it does not
+    /// rank them, and ranking by it starves every label set whose key sorts
+    /// after another's (a runner matching both takes the lexically earlier
+    /// key's job even when the other is older). The bindings read first are
+    /// in that same order: a fresh assignment to the polling runner outranks
+    /// unassigned candidates, so a first window of them must not take the
+    /// runner off its own binding before it expires.
     async fn claim_one(
         &self,
         tx: &Transaction<'_>,
@@ -4821,7 +5505,9 @@ impl PgBackend {
         // Jobs whose namespace admits no new claim (state or running caps)
         // never become candidates; `capped` marks the ones whose claim must
         // first serialize on the namespace's limit rows.
-        let batch_sql = format!(
+        // The candidate columns both claim reads decode; shared so the
+        // assigned-tier scan and the paged queue scan cannot drift.
+        let candidate_columns = format!(
             "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, \
                     a.runner_id, \
                     COALESCE(a.assigned_at > now() - interval '120 seconds', false), \
@@ -4834,97 +5520,162 @@ impl PgBackend {
                     (j.enqueued_at IS NOT NULL \
                      AND j.enqueued_at <= now() - interval '120 seconds'), \
                     (p.requested_at > now() - interval '120 seconds'), \
-                    j.namespace_id, j.pool_key, {capped} \
+                    j.namespace_id, j.pool_key, {capped}",
+            capped = crate::control::types::NAMESPACE_CLAIM_CAPPED,
+        );
+        let batch_sql = format!(
+            "{candidate_columns} \
              FROM jobs j \
              LEFT JOIN job_assignments a ON a.run_id = j.run_id \
                 AND a.job_id = j.job_id \
              LEFT JOIN provision_requests p ON p.run_id = j.run_id \
                 AND p.job_id = j.job_id \
              WHERE j.queue_state = 'ready' AND ({admits}) \
-             ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+             ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
              LIMIT 64 OFFSET $1",
-            capped = crate::control::types::NAMESPACE_CLAIM_CAPPED,
             admits = crate::control::types::NAMESPACE_ADMITS_CLAIM,
         );
-        for _attempt in 0..CLAIM_ATTEMPTS {
-            let mut offset: i64 = 0;
-            loop {
-                // The pool key prunes by label set; the shared eligibility
-                // ladder and matcher still decide.
-                let rows = tx.query(batch_sql.as_str(), &[&offset]).await.map_err(db)?;
-                let exhausted = rows.len() < 64;
-                let mut candidates = Vec::with_capacity(rows.len());
-                // `(namespace, pool_key, capped)` per candidate, kept index-
-                // aligned with `candidates` (both are `swap_remove`d together).
-                let mut namespaces: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
-                for (position, row) in rows.iter().enumerate() {
-                    let assigned: Option<i64> = row.get(4);
-                    let assignment_fresh: bool = row.get(5);
-                    let first_assigned_fresh: bool = row.get(6);
-                    let registered: bool = row.get(7);
-                    let assignment = row.get::<_, bool>(8).then_some((
-                        assigned,
-                        assignment_fresh,
-                        first_assigned_fresh,
-                        registered,
-                    ));
-                    let enqueue_ceiling_expired: bool = row.get(9);
-                    // A NULL marks a non-matching LEFT JOIN (no provision
-                    // row); `provision_fresh` is tri-state.
-                    let provision_fresh: Option<bool> = row.get(10);
-                    // `claim_permitted` verbatim (lite/poll.rs): assignment
-                    // rows bind verified sessions while fresh, stale/orphaned
-                    // bindings open to any verified caller, a fresh
-                    // pool-pending row blocks everyone, and unassigned jobs
-                    // are only claimable when strict assignments are off.
-                    // The old model swept stale bindings before checking in
-                    // permissive mode — a stale assignment/pool_pending row
-                    // counts as absent there.
-                    let assignment = if !require_assignments && !assignment_fresh {
-                        None
+        // The assigned tier, read before the paged queue: a fresh binding to
+        // the polling runner outranks every unassigned candidate — the four-
+        // tier preference exists to hand THIS runner its bindings before they
+        // expire — but the paged scan sees one window at a time and would
+        // take an unassigned job from the first window. The runner's own
+        // bindings are read in the same global queue order within the tier;
+        // enqueue pairing skips busy runners (any binding or live request),
+        // so a runner holds at most one fresh binding and one page is
+        // exhaustive.
+        let assigned_sql = verified_runner_id.map(|_| {
+            format!(
+                "{candidate_columns} \
+                 FROM jobs j \
+                 JOIN job_assignments a ON a.run_id = j.run_id \
+                    AND a.job_id = j.job_id \
+                 LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                    AND p.job_id = j.job_id \
+                 WHERE j.queue_state = 'ready' AND ({admits}) \
+                   AND a.runner_id = $1 \
+                   AND a.assigned_at > now() - interval '120 seconds' \
+                 ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
+                 LIMIT 64",
+                admits = crate::control::types::NAMESPACE_ADMITS_CLAIM,
+            )
+        });
+        // One decoded read batch: candidates in read order, with the
+        // per-candidate `(namespace, pool_key, capped)` triples index-aligned
+        // (both are `swap_remove`d together).
+        type ClaimBatch = (Vec<logic::ClaimCandidate>, Vec<(String, String, bool)>);
+        // Decode a read batch into candidates against the shared eligibility
+        // ladder. `base_position` is the batch's offset in the order it was
+        // read: the paged scan's page offset, 0 for the assigned scan.
+        let decode = |rows: &[tokio_postgres::Row],
+                      base_position: u64|
+         -> Result<ClaimBatch, ControlError> {
+            let mut candidates = Vec::with_capacity(rows.len());
+            let mut namespaces: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
+            for (position, row) in rows.iter().enumerate() {
+                let assigned: Option<i64> = row.get(4);
+                let assignment_fresh: bool = row.get(5);
+                let first_assigned_fresh: bool = row.get(6);
+                let registered: bool = row.get(7);
+                let assignment = row.get::<_, bool>(8).then_some((
+                    assigned,
+                    assignment_fresh,
+                    first_assigned_fresh,
+                    registered,
+                ));
+                let enqueue_ceiling_expired: bool = row.get(9);
+                // A NULL marks a non-matching LEFT JOIN (no provision
+                // row); `provision_fresh` is tri-state.
+                let provision_fresh: Option<bool> = row.get(10);
+                // `claim_permitted` verbatim (lite/poll.rs): assignment
+                // rows bind verified sessions while fresh, stale/orphaned
+                // bindings open to any verified caller, a fresh
+                // pool-pending row blocks everyone, and unassigned jobs
+                // are only claimable when strict assignments are off.
+                // The old model swept stale bindings before checking in
+                // permissive mode — a stale assignment/pool_pending row
+                // counts as absent there.
+                let assignment = if !require_assignments && !assignment_fresh {
+                    None
+                } else {
+                    assignment
+                };
+                let provision_fresh = if !require_assignments && provision_fresh == Some(false) {
+                    None
+                } else {
+                    provision_fresh
+                };
+                let claimable = if assignment.is_some() {
+                    if !first_assigned_fresh || enqueue_ceiling_expired {
+                        verified
                     } else {
-                        assignment
-                    };
-                    let provision_fresh = if !require_assignments && provision_fresh == Some(false)
-                    {
-                        None
-                    } else {
-                        provision_fresh
-                    };
-                    let claimable = if assignment.is_some() {
-                        if !first_assigned_fresh || enqueue_ceiling_expired {
-                            verified
-                        } else {
-                            match assigned {
-                                None => verified,
-                                Some(id) => {
-                                    if !registered || !assignment_fresh {
-                                        verified
-                                    } else {
-                                        Some(id) == verified_runner_id
-                                    }
+                        match assigned {
+                            None => verified,
+                            Some(id) => {
+                                if !registered || !assignment_fresh {
+                                    verified
+                                } else {
+                                    Some(id) == verified_runner_id
                                 }
                             }
                         }
-                    } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
-                        false
-                    } else if provision_fresh.is_some() {
-                        verified
-                    } else {
-                        !require_assignments
-                    };
-                    candidates.push(logic::ClaimCandidate {
-                        run_id: codec::run_id(&row.get::<_, String>(0))?,
-                        job_id: JobId(row.get::<_, String>(1)),
-                        runs_on: codec::from_json(row.get::<_, String>(2).as_str())?,
-                        runner_group: row.get(3),
-                        assigned_runner_id: assigned,
-                        assignment_fresh,
-                        queue_position: position as u64,
-                        claimable,
-                    });
-                    namespaces.push((row.get(11), row.get(12), row.get(13)));
+                    }
+                } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
+                    false
+                } else if provision_fresh.is_some() {
+                    verified
+                } else {
+                    !require_assignments
+                };
+                candidates.push(logic::ClaimCandidate {
+                    run_id: codec::run_id(&row.get::<_, String>(0))?,
+                    job_id: JobId(row.get::<_, String>(1)),
+                    runs_on: codec::from_json(row.get::<_, String>(2).as_str())?,
+                    runner_group: row.get(3),
+                    assigned_runner_id: assigned,
+                    assignment_fresh,
+                    // Position in the order the batch was read: the paged
+                    // scan reports the GLOBAL queue position (the page
+                    // offset counts), the assigned scan its own order.
+                    queue_position: base_position + position as u64,
+                    claimable,
+                });
+                namespaces.push((row.get(11), row.get(12), row.get(13)));
+            }
+            Ok((candidates, namespaces))
+        };
+        for _attempt in 0..CLAIM_ATTEMPTS {
+            // The assigned tier first (see `assigned_sql`): the runner's own
+            // fresh bindings, wherever they sit in the global queue.
+            if let (Some(proven), Some(assigned_sql)) =
+                (verified_runner_id, assigned_sql.as_deref())
+            {
+                let rows = tx.query(assigned_sql, &[&proven]).await.map_err(db)?;
+                let (mut candidates, mut namespaces) = decode(&rows, 0)?;
+                while let Some(index) = logic::claim_preference(
+                    &candidates,
+                    Some(proven),
+                    &caps.labels,
+                    None,
+                    &runner_match,
+                ) {
+                    let chosen = candidates.swap_remove(index);
+                    let (namespace, pool_key, capped) = namespaces.swap_remove(index);
+                    if self
+                        .claim_candidate(tx, runner_id, &chosen, &namespace, &pool_key, capped)
+                        .await?
+                    {
+                        return Ok(Some((chosen.run_id, chosen.job_id)));
+                    }
                 }
+            }
+            let mut offset: i64 = 0;
+            loop {
+                // The batch is the ready queue in global dispatch order; the
+                // shared eligibility ladder and matcher decide.
+                let rows = tx.query(batch_sql.as_str(), &[&offset]).await.map_err(db)?;
+                let exhausted = rows.len() < 64;
+                let (mut candidates, mut namespaces) = decode(&rows, offset as u64)?;
                 // Walk the candidates in preference order, claiming the first
                 // whose row lock lands. A skipped (locked) or already-claimed
                 // row advances to the next-eligible candidate.
@@ -4938,33 +5689,14 @@ impl PgBackend {
                 ) {
                     let chosen = candidates.swap_remove(index);
                     let (namespace, pool_key, capped) = namespaces.swap_remove(index);
-                    if capped
-                        && !self
-                            .capped_claim_admitted(tx, &namespace, &pool_key, &chosen)
-                            .await?
+                    if !self
+                        .claim_candidate(tx, runner_id, &chosen, &namespace, &pool_key, capped)
+                        .await?
                     {
-                        // Another claim took the namespace's last slot after
-                        // the batch was read.
                         raced = true;
                         continue;
                     }
-                    let claimed = tx
-                        .execute(
-                            "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
-                             claimed_by_runner_id = $3, claimed_at = now() \
-                             FROM (SELECT run_id, job_id FROM jobs \
-                                   WHERE run_id = $1::text::uuid AND job_id = $2 \
-                                     AND queue_state = 'ready' \
-                                   FOR UPDATE SKIP LOCKED) c \
-                             WHERE j.run_id = c.run_id AND j.job_id = c.job_id",
-                            &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
-                        )
-                        .await
-                        .map_err(db)?;
-                    if claimed > 0 {
-                        return Ok(Some((chosen.run_id, chosen.job_id)));
-                    }
-                    raced = true;
+                    return Ok(Some((chosen.run_id, chosen.job_id)));
                 }
                 if raced {
                     // A concurrent claim moved rows under us: re-read from the
@@ -4978,6 +5710,45 @@ impl PgBackend {
             }
         }
         Ok(None)
+    }
+
+    /// Attempt the claim fence for one chosen candidate: the namespace-cap
+    /// re-check under its limit-row locks, then the conditional `FOR UPDATE
+    /// SKIP LOCKED` update. `false` means the row moved under us — locked or
+    /// claimed by a concurrent poller, or its namespace cap filled — and the
+    /// caller advances to the next candidate.
+    async fn claim_candidate(
+        &self,
+        tx: &Transaction<'_>,
+        runner_id: Option<i64>,
+        chosen: &logic::ClaimCandidate,
+        namespace: &str,
+        pool_key: &str,
+        capped: bool,
+    ) -> Result<bool, ControlError> {
+        if capped
+            && !self
+                .capped_claim_admitted(tx, namespace, pool_key, chosen)
+                .await?
+        {
+            // Another claim took the namespace's last slot after the batch
+            // was read.
+            return Ok(false);
+        }
+        let claimed = tx
+            .execute(
+                "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
+                 claimed_by_runner_id = $3, claimed_at = now() \
+                 FROM (SELECT run_id, job_id FROM jobs \
+                       WHERE run_id = $1::text::uuid AND job_id = $2 \
+                         AND queue_state = 'ready' \
+                       FOR UPDATE SKIP LOCKED) c \
+                 WHERE j.run_id = c.run_id AND j.job_id = c.job_id",
+                &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
+            )
+            .await
+            .map_err(db)?;
+        Ok(claimed > 0)
     }
 
     /// Re-check a capped namespace's admission under its limit-row locks.
@@ -5410,6 +6181,7 @@ impl<'a> Sweep<'a> {
         reported: ExecutionStatus,
         outputs: &BTreeMap<String, serde_json::Value>,
         annotations: &[serde_json::Value],
+        environment_url: Option<&str>,
     ) -> Result<CompletionApplied, ControlError> {
         let was_terminal_success = self
             .graphs
@@ -5440,8 +6212,9 @@ impl<'a> Sweep<'a> {
         };
         let replayed = prior.is_terminal() && prior != ExecutionStatus::Cancelled;
         let effective = match (prior, reported) {
-            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
-            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
+            (ExecutionStatus::Cancelled, status) if status.is_terminal() => {
+                ExecutionStatus::Cancelled
+            }
             _ if replayed => prior,
             _ => reported,
         };
@@ -5475,6 +6248,20 @@ impl<'a> Sweep<'a> {
             if let Some(node) = self.node_mut(run_id, job_id) {
                 node.annotations = Some(value);
             }
+        }
+        // The runner evaluated `environment.url` after its steps ran; the
+        // value rides the completion and is what the deployment status
+        // reports. Written straight to the row: no in-memory node field
+        // mirrors it, and no later node flush touches the column.
+        if let Some(url) = environment_url.filter(|url| !url.is_empty()) {
+            self.tx
+                .execute(
+                    "UPDATE jobs SET environment_url = $3 \
+                     WHERE run_id = $1::text::uuid AND job_id = $2",
+                    &[&run_id.0.to_string(), &job_id.0, &url],
+                )
+                .await
+                .map_err(db)?;
         }
         self.mark(run_id, job_id);
         // Retire the node's attempts (settled rows stay readable).
@@ -5637,6 +6424,40 @@ pub(super) async fn attempt_log_key(
         .unwrap_or_else(|| format!("{}:{}", run_id.0, job_id.0)))
 }
 
+/// Outcome of the targeted settle core (no graph load).
+struct SettleCoreOutcome {
+    effective_status: ExecutionStatus,
+    /// The job already held a terminal (non-cancelled) verdict: nothing was
+    /// written and the caller reports the run unchanged.
+    replayed: bool,
+    cancelled_siblings: Vec<JobId>,
+    /// Reusable callers folded terminal by this completion, innermost first.
+    folded_callers: Vec<JobId>,
+    /// A dependent just became promotable — the caller runs the promotion
+    /// sweep for the run.
+    promotable_dependents: bool,
+    newly_terminal_success: bool,
+    run_completed: bool,
+    conclusion: Option<String>,
+    live_log_key: String,
+}
+
+impl Default for SettleCoreOutcome {
+    fn default() -> Self {
+        Self {
+            effective_status: ExecutionStatus::Pending,
+            replayed: false,
+            cancelled_siblings: Vec::new(),
+            folded_callers: Vec::new(),
+            promotable_dependents: false,
+            newly_terminal_success: false,
+            run_completed: false,
+            conclusion: None,
+            live_log_key: String::new(),
+        }
+    }
+}
+
 impl PgBackend {
     /// `complete_job`: settle the attempt, flip the job, propagate outputs and
     /// dependents, fail-fast siblings.
@@ -5658,46 +6479,32 @@ impl PgBackend {
         {
             settle_request_tx(&tx, request_id, completion.status).await?;
         }
-        let mut sweep = Sweep::new(self, &tx).await?;
-        let graph = PgBackend::load_graph(self, &tx, run_id)
-            .await?
-            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
-        sweep.graphs.insert(run_id, graph);
-        let applied = sweep
-            .complete_node(run_id, &job_id, completion.status, &completion.outputs, &[])
+        // Targeted core: no graph load, no sweep, no flush. `complete_job` has
+        // no annotations on its wire shape.
+        let outputs: BTreeMap<String, serde_json::Value> = completion
+            .outputs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let outcome = self
+            .settle_job_targeted(&tx, run_id, &job_id, completion.status, &outputs, &[], None)
             .await?;
-        if !applied.replayed {
-            // The claimed marker is gone once the job is terminal.
-            sweep
-                .tx
-                .execute(
-                    "UPDATE job_assignments SET runner_id = NULL \
-                     WHERE run_id = $1::text::uuid AND job_id = $2",
-                    &[&run_id.0.to_string(), &job_id.0],
-                )
-                .await
-                .map_err(db)?;
-            sweep.sweep().await?;
-        }
-        let scheduling = std::mem::take(&mut sweep.outcome);
+        let scheduling = if outcome.promotable_dependents {
+            self.promote_unblocked(&tx, run_id).await?
+        } else {
+            crate::runtime_scheduling::SchedulingOutcome::default()
+        };
         let queue_nonempty = Self::work_pending_on(&tx).await?;
-        let record = sweep
-            .graphs
-            .get(&run_id)
-            .map(|graph| graph.record.clone())
-            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
-        sweep.flush().await?;
         tx.commit().await.map_err(db)?;
         drop(client);
         Ok(CompleteOutcome {
-            record,
-            effective_status: applied.effective_status,
-            newly_terminal_success: applied.newly_terminal_success,
-            cancelled_siblings: applied.cancelled_siblings,
+            effective_status: outcome.effective_status,
+            newly_terminal_success: outcome.newly_terminal_success,
+            cancelled_siblings: outcome.cancelled_siblings,
             scheduling,
-            live_log_key: applied.live_log_key,
+            live_log_key: outcome.live_log_key,
             queue_nonempty,
-            replayed: applied.replayed,
+            replayed: outcome.replayed,
         })
     }
 
@@ -5739,32 +6546,43 @@ impl PgBackend {
             }
             attempt = Some(request_id);
         }
-        let mut sweep = Sweep::new(self, &tx).await?;
-        let graph = PgBackend::load_graph(self, &tx, run_id)
-            .await?
-            .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
-        sweep.graphs.insert(run_id, graph);
-        // The handler masked `comp.annotations` against the provider.
-        let annotations = comp.annotations.clone();
+        // Targeted core: no graph load, no sweep, no flush. The handler masked
+        // `comp.annotations` against the provider.
         let outputs: BTreeMap<String, serde_json::Value> = comp
             .outputs
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let applied = sweep
-            .complete_node(run_id, &job_id, comp.status, &outputs, &annotations)
+        let outcome = self
+            .settle_job_targeted(
+                &tx,
+                run_id,
+                &job_id,
+                comp.status,
+                &outputs,
+                &comp.annotations,
+                comp.environment_url.as_deref(),
+            )
             .await?;
-        if applied.replayed {
-            let record = sweep
-                .graphs
-                .get(&run_id)
-                .map(|graph| graph.record.clone())
-                .expect("loaded");
+        if outcome.replayed {
+            // A duplicate completion reports the run unchanged: the record
+            // comes from the same transaction that settled the attempt, so
+            // the reply reflects the writes above.
+            let record = PgBackend::load_graph(self, &tx, run_id)
+                .await?
+                .map(|graph| graph.record)
+                .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
             tx.commit().await.map_err(db)?;
+            drop(client);
             return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
         }
+        let scheduling = if outcome.promotable_dependents {
+            self.promote_unblocked(&tx, run_id).await?
+        } else {
+            crate::runtime_scheduling::SchedulingOutcome::default()
+        };
         if let Some(request_id) = attempt {
-            settle_request_tx(&tx, request_id, applied.effective_status).await?;
+            settle_request_tx(&tx, request_id, outcome.effective_status).await?;
             // The attempt's step results land on its manifest.
             for wire in &comp.step_results {
                 let Some(external_id) = wire.external_id.as_deref() else {
@@ -5781,24 +6599,261 @@ impl PgBackend {
                 }
             }
         }
-        sweep.sweep().await?;
-        let scheduling = std::mem::take(&mut sweep.outcome);
         // Cheap existence check: the handler only needs to know whether to
         // wake pollers, not the exact depth (the supervisor reads that from
         // the 5s sampler snapshot).
         let queue_nonempty = Self::work_pending_on(&tx).await?;
         let next_runs_on = Self::ready_front_labels_on(&tx).await?;
-        sweep.flush().await?;
         tx.commit().await.map_err(db)?;
         Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
-            effective_status: applied.effective_status,
-            cancelled_siblings: applied.cancelled_siblings,
+            effective_status: outcome.effective_status,
+            cancelled_siblings: outcome.cancelled_siblings,
             scheduling,
             queue_nonempty,
-            newly_terminal_success: applied.newly_terminal_success,
-            live_log_key: applied.live_log_key,
+            newly_terminal_success: outcome.newly_terminal_success,
+            live_log_key: outcome.live_log_key,
             next_runs_on,
         })))
+    }
+
+    /// Targeted settle flow: mark terminal, retire the attempt's rows, release
+    /// the job's hold, fail-fast siblings, fold reusable callers, refresh the
+    /// dependents' counters and stamp the run — all without loading the run
+    /// graph.
+    ///
+    /// Promotion is the one step that still needs the graph (needs hydration,
+    /// job/JobSet gates, max-parallel cohorts, deferred expansion are not
+    /// expressible as conditional writes), so it stays with the shared
+    /// [`Sweep`] — but only when this completion actually made a dependent
+    /// promotable (`promotable_dependents`). A leg of a large fan-out
+    /// therefore settles without ever materializing the run.
+    async fn settle_job_targeted(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+        status: ExecutionStatus,
+        outputs: &BTreeMap<String, serde_json::Value>,
+        annotations: &[serde_json::Value],
+        environment_url: Option<&str>,
+    ) -> Result<SettleCoreOutcome, ControlError> {
+        let run = run_id.0.to_string();
+        // 1. Prior state: the first-verdict rule, `continue-on-error`, and the
+        // base id fail-fast and the dependent refresh key on.
+        let row = tx
+            .query_opt(
+                "SELECT j.status, j.base_id, COALESCE(s.continue_on_error, false) \
+                 FROM jobs j \
+                 LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                 WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
+                &[&run, &job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .ok_or_else(|| ControlError::NotFound(format!("job {job_id}")))?;
+        let prior = crate::control::types::status_parse(row.get::<_, String>(0).as_str());
+        let base_id: String = row.get(1);
+        let continue_on_error: bool = row.get(2);
+        let decision = crate::control::logic::completion_decision(logic::CompletionRow {
+            job_id: job_id.clone(),
+            prior_status: prior,
+            reported_status: status,
+            continue_on_error,
+            run_will_be_terminal: false,
+        });
+        let effective = decision.effective_status;
+        let mut outcome = SettleCoreOutcome {
+            effective_status: effective,
+            replayed: decision.replayed,
+            live_log_key: attempt_log_key(tx, run_id, job_id, None).await?,
+            ..SettleCoreOutcome::default()
+        };
+        if decision.replayed {
+            // A terminal (non-cancelled) verdict sticks; nothing to write.
+            return Ok(outcome);
+        }
+        // The run's own transition decides the workflow-hold release and
+        // `run.completed.v1`, so remember where it started.
+        let run_status_before: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM runs WHERE run_id=$1::text::uuid",
+                &[&run],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| row.get(0));
+        // 2. The job's terminal write. Outputs/annotations only land when the
+        // runner reported any — an empty map is not a result.
+        let outputs_json = (!outputs.is_empty())
+            .then(|| serde_json::to_string(outputs).unwrap_or_else(|_| "{}".to_owned()));
+        let annotations_json = (!annotations.is_empty())
+            .then(|| serde_json::to_string(annotations).unwrap_or_else(|_| "[]".to_owned()));
+        tx.execute(
+            "UPDATE jobs SET status=$3, queue_state='none', \
+                    completed_at=COALESCE(completed_at, now()), \
+                    claimed_by_runner_id=NULL, \
+                    outputs=COALESCE($4::text::jsonb, outputs), \
+                    annotations=COALESCE($5::text::jsonb, annotations) \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[
+                &run,
+                &job_id.0,
+                &status_str(effective),
+                &outputs_json,
+                &annotations_json,
+            ],
+        )
+        .await
+        .map_err(db)?;
+        if let Some(url) = environment_url.filter(|url| !url.is_empty()) {
+            tx.execute(
+                "UPDATE jobs SET environment_url=$3 \
+                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run, &job_id.0, &url],
+            )
+            .await
+            .map_err(db)?;
+        }
+        // Retire the job's open attempts, drop its machine binding, and settle
+        // the newest attempt's orphaned in-progress steps with it.
+        retire_node_requests(tx, run_id, job_id, Retirement::Settle(effective)).await?;
+        clear_assignment(tx, run_id, job_id).await?;
+        tx.execute(
+            concat!(
+                "UPDATE job_steps SET conclusion=$3, finished_at=COALESCE(finished_at, ",
+                ts!("$4"),
+                ") WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 ORDER BY request_id DESC LIMIT 1) AND conclusion = 'in_progress'"
+            ),
+            &[&run, &job_id.0, &status_str(effective), &now_us()],
+        )
+        .await
+        .map_err(db)?;
+        // Release this job's hold or wait row, and a JobSet hold if this was
+        // its final terminal member. Promotion also handles max-parallel
+        // re-parking without leaving the completed holder behind.
+        release_concurrency_for_job(self, tx, run_id, job_id).await?;
+        // 3. Fail-fast siblings of a failed matrix leg.
+        if effective == ExecutionStatus::Failure {
+            outcome.cancelled_siblings =
+                Sweep::cancel_fail_fast_siblings(self, tx, run_id, job_id, &base_id).await?;
+        }
+        // 4. Reusable caller fold, walking up nested callers.
+        let mut current = job_id.clone();
+        while let Some(caller) = Sweep::try_fold_reusable_caller(self, tx, run_id, &current).await?
+        {
+            current = caller.clone();
+            outcome.folded_callers.push(caller);
+        }
+        // 5. Refresh the dependents' `remaining_needs` for everything that just
+        // turned terminal: the job, its fail-fast siblings and the folded
+        // callers. A dependent that is now `blocked` with zero needs left is
+        // what the promotion sweep below picks up.
+        let mut promotable = Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
+        for settled in outcome
+            .cancelled_siblings
+            .iter()
+            .chain(outcome.folded_callers.iter())
+        {
+            let settled_base: String = tx
+                .query_one(
+                    "SELECT base_id FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &settled.0],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            promotable |=
+                Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
+        }
+        outcome.promotable_dependents = promotable;
+        // 6. Run status via the DB aggregate; the caller holds the run lock.
+        summarize_run_tx(tx, run_id).await?;
+        let (run_status, conclusion): (String, Option<String>) = {
+            let row = tx
+                .query_one(
+                    "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?;
+            (row.get(0), row.get(1))
+        };
+        let newly_completed =
+            run_status == "completed" && run_status_before.as_deref() != Some("completed");
+        outcome.run_completed = newly_completed;
+        outcome.newly_terminal_success =
+            newly_completed && conclusion.as_deref() == Some("success");
+        outcome.conclusion = conclusion.clone();
+        if newly_completed {
+            // A terminal run must not hold a workflow-level slot: release the
+            // group and promote its next waiter.
+            release_concurrency_for_run(self, tx, run_id).await?;
+            emit_outbox(
+                tx,
+                Some(run_id),
+                "run.completed.v1",
+                serde_json::json!({
+                    "conclusion": conclusion.unwrap_or_else(|| "success".to_owned())
+                }),
+            )
+            .await?;
+        }
+        // 7. Outbox: every job this completion turned terminal — the job, its
+        // fail-fast siblings and the folded callers — so the check-run
+        // projection concludes each one.
+        let mut concluded = vec![(job_id.clone(), effective)];
+        for sibling in &outcome.cancelled_siblings {
+            concluded.push((sibling.clone(), ExecutionStatus::Cancelled));
+        }
+        for caller in &outcome.folded_callers {
+            let caller_status: String = tx
+                .query_one(
+                    "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2",
+                    &[&run, &caller.0],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            concluded.push((
+                caller.clone(),
+                crate::control::types::status_parse(&caller_status),
+            ));
+        }
+        for (concluded_id, concluded_status) in concluded {
+            emit_outbox(
+                tx,
+                Some(run_id),
+                "job.completed.v1",
+                serde_json::json!({
+                    "job_id": concluded_id.0,
+                    "status": status_str(concluded_status),
+                }),
+            )
+            .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Promote whatever the targeted settle unblocked: the shared sweep over
+    /// the run's graph, so needs hydration, gates, cohorts and deferred
+    /// expansion behave exactly as they do on the submit/cancel paths. Only
+    /// called when the completion made a dependent promotable.
+    async fn promote_unblocked<'a>(
+        &'a self,
+        tx: &'a Transaction<'a>,
+        run_id: RunId,
+    ) -> Result<crate::runtime_scheduling::SchedulingOutcome, ControlError> {
+        let mut sweep = Sweep::new(self, tx).await?;
+        let graph = PgBackend::load_graph(self, tx, run_id)
+            .await?
+            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+        sweep.graphs.insert(run_id, graph);
+        sweep.sweep().await?;
+        let scheduling = std::mem::take(&mut sweep.outcome);
+        sweep.flush().await?;
+        Ok(scheduling)
     }
 
     /// The live attempt's request id for a `(run, job)`: the explicit agent
@@ -6242,8 +7297,10 @@ impl PgBackend {
         let built = match claim.built {
             Ok(built) => built,
             Err(status) => {
+                // `settle_node` records the failure in the sweep's outcome;
+                // pushing it a second time would count the job twice and
+                // re-report its check run.
                 sweep.settle_node(run_id, &node_id, status).await?;
-                sweep.outcome.failed.push((run_id, node_id));
                 let outcome = std::mem::take(&mut sweep.outcome);
                 sweep.flush().await?;
                 tx.commit().await.map_err(db)?;
@@ -6264,7 +7321,7 @@ impl PgBackend {
             }
             BuiltExpansion::Matrix { jobs } => {
                 let registered = self
-                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, &node_id, jobs)
                     .await?;
                 // The parent leaves the run's status map; its legs take over.
                 if let Some(node) = sweep.node_mut(run_id, &node_id) {
@@ -6287,7 +7344,7 @@ impl PgBackend {
                 reusable_calls,
             } => {
                 let registered = self
-                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, &caller_id, jobs)
                     .await?;
                 if let Some(node) = sweep.node_mut(run_id, &caller_id) {
                     node.status = ExecutionStatus::InProgress;
@@ -6328,6 +7385,7 @@ impl PgBackend {
         tx: &Transaction<'_>,
         sweep: &mut Sweep<'_>,
         run_id: RunId,
+        placeholder: &JobId,
         jobs: Vec<BuiltJob>,
     ) -> Result<usize, ControlError> {
         let platforms = Self::registered_platforms_on(tx).await?;
@@ -6351,6 +7409,19 @@ impl PgBackend {
             .map(|(k, v)| (k, v as i64))
             .collect();
         let now = now_us();
+        // Expanded jobs keep their run's place in the queue: the run's
+        // `run_order` and the placeholder's `job_order`. A literal 0/0 would
+        // sort them ahead of every other run's jobs.
+        let (run_order, job_order) = sweep
+            .graphs
+            .get(&run_id)
+            .map(|graph| {
+                graph.nodes.get(placeholder).map_or_else(
+                    || (graph.record.created_at.timestamp_micros(), 0),
+                    |node| (node.run_order, node.job_order),
+                )
+            })
+            .unwrap_or((0, 0));
         let mut registered = 0usize;
         for built in jobs {
             let BuiltJob {
@@ -6384,8 +7455,8 @@ impl PgBackend {
                 runs_on: plan.runs_on.clone(),
                 runner_group: plan.runner_group.clone(),
                 priority: 0,
-                run_order: 0,
-                job_order: 0,
+                run_order,
+                job_order,
                 enqueued_at_us: None,
                 claimed_by_runner_id: None,
                 claimed_at_us: None,
@@ -6393,6 +7464,7 @@ impl PgBackend {
                 outputs: None,
                 annotations: None,
                 check_run_id: None,
+                request_id: None,
                 created_at_us: now,
                 deps_ready_at_us: plan.needs.is_empty().then_some(now),
                 concurrency_wait_at_us: None,
@@ -6465,6 +7537,7 @@ impl PgBackend {
                 &crate::models::StepRecord::manifest(&artifacts.agent_msg.steps),
             )
             .await?;
+            node.request_id = Some(request_id);
             artifacts.job_request.request_id = request_id;
             let mut message = message;
             message.request_id = request_id;
@@ -6522,7 +7595,6 @@ impl PgBackend {
     pub(crate) async fn promote_ready_jobs(
         &self,
         run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
     ) -> Result<PromoteOutcome, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
@@ -6539,10 +7611,13 @@ impl PgBackend {
             };
             let mut sweep = Sweep::new(self, &tx).await?;
             sweep.graphs.insert(run_id, graph);
-            release_parked_nodes(&tx, &mut sweep, run_id, rules).await?;
+            release_parked_nodes(&tx, &mut sweep, run_id).await?;
             sweep.sweep().await?;
             outcome.promoted += sweep.outcome.promoted;
             outcome.failed += sweep.outcome.failed.len();
+            outcome
+                .failed_jobs
+                .extend(sweep.outcome.failed.iter().map(|(_, job)| job.clone()));
             if let Some(graph) = sweep.graphs.get_mut(&run_id) {
                 graph.resummarize();
                 graph.touched = true;
@@ -6585,6 +7660,118 @@ impl PgBackend {
             status: crate::control::types::status_parse(row.get::<_, String>(0).as_str()),
         }))
     }
+
+    /// `environment_deployment`: check run + deployment + resolved
+    /// environment for one job, assembled from `jobs`, `runs`, `job_specs`
+    /// and `job_messages`. Works on any job state (the terminal deployment
+    /// status posts after the row leaves `held`). `None` when the job is
+    /// missing or no environment name resolves.
+    pub(crate) async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT r.repository, r.head_sha, j.environment_gate::text, \
+                        j.check_run_id, j.deployment_id, j.environment_url, \
+                        s.environment::text, m.message_template::text, j.status, \
+                        EXISTS(SELECT 1 FROM job_requests q \
+                               WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                                 AND q.started_at IS NOT NULL) \
+                 FROM jobs j \
+                 JOIN runs r ON r.run_id = j.run_id \
+                 LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                 LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
+                 WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let gate: Option<crate::models::EnvironmentGateState> = row
+            .get::<_, Option<String>>(2)
+            .and_then(|json| from_json(&json).ok());
+        // Column order: 5 `jobs.environment_url`, 6 `job_specs.environment`,
+        // 7 `job_messages.message_template`.
+        let template_env: Option<serde_json::Value> = row
+            .get::<_, Option<String>>(7)
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|message| {
+                message
+                    .get("environment")
+                    .or_else(|| message.get("actionsEnvironment"))
+                    .cloned()
+            });
+        let spec_env: Option<serde_json::Value> = row
+            .get::<_, Option<String>>(6)
+            .and_then(|json| from_json(&json).ok());
+        // The hydrated message name wins over the gate's stamp: an arm
+        // taken while the name was still a `${{ needs.* }}` template stamped
+        // that text, and posting it would mint a GitHub deployment under the
+        // expression instead of the environment GitHub actually knows. An
+        // unevaluated message name is skipped — it proves nothing beyond the
+        // stamp.
+        let environment = template_env
+            .as_ref()
+            .and_then(|env| env.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+            .map(str::to_owned)
+            .or_else(|| {
+                gate.as_ref()
+                    .and_then(|gate| gate.environment_name.as_deref())
+                    .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                crate::runtime_scheduling::environment_gate_name_of(spec_env.as_ref())
+                    .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+                    .map(str::to_owned)
+            });
+        let Some(environment) = environment else {
+            return Ok(None);
+        };
+        // The runner-evaluated URL — reported with the job's completion and
+        // stamped on the job row — wins: it is the only source that can
+        // resolve `steps.<id>.outputs`, and what GitHub's own service
+        // receives at job completion. Until it lands, only a literal from
+        // the message or the spec is known; an unevaluated `${{ }}` template
+        // is never posted.
+        let environment_url = row
+            .get::<_, Option<String>>(5)
+            .filter(|url| !url.is_empty())
+            .or_else(|| {
+                template_env
+                    .as_ref()
+                    .and_then(sched_helpers::environment_url_literal)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                spec_env
+                    .as_ref()
+                    .and_then(sched_helpers::environment_url_literal)
+                    .map(str::to_owned)
+            });
+        Ok(Some(EnvironmentDeploymentRow {
+            repository: row.get(0),
+            head_sha: row.get(1),
+            environment,
+            environment_url,
+            check_run_id: row.get::<_, Option<i64>>(3).map(|id| id as u64),
+            deployment_id: row.get::<_, Option<i64>>(4).map(|id| id as u64),
+            job_status: crate::control::types::status_parse(row.get::<_, String>(8).as_str()),
+            deployment_started: row.get::<_, Option<bool>>(9).unwrap_or(false)
+                || gate.as_ref().is_some_and(|gate| {
+                    gate.approval_requested_at_unix_nanos.is_some()
+                        || !gate.approvals.is_empty()
+                        || gate.rejected_by.is_some()
+                }),
+        }))
+    }
 }
 
 /// The runs a pass must visit: the named one, or — for the reaper's
@@ -6615,11 +7802,16 @@ async fn parked_gate_runs(
 /// Re-evaluate every node `run_id` parked at submit and release the ones
 /// whose hold lifted. A run still awaiting fork approval admits nothing at
 /// all — that is the whole point of the hold.
+///
+/// Gate satisfaction is stamped, never cleared: a released job hands its
+/// gate row to the promotion sweep, which re-evaluates it against the same
+/// rules — a still-running wait timer re-arms instead of losing its
+/// deadline. Only a rule resolving to "no protection" clears the row
+/// (inside `evaluate_environment_gate`).
 async fn release_parked_nodes(
     tx: &Transaction<'_>,
     sweep: &mut Sweep<'_>,
     run_id: RunId,
-    rules: &crate::config::EnvironmentRulesMap,
 ) -> Result<(), ControlError> {
     let Some(row) = tx
         .query_opt(
@@ -6659,6 +7851,7 @@ async fn release_parked_nodes(
         .await
         .map_err(db)?;
     let now_unix_nanos = crate::models::now_unix_nanos();
+    let resolver = sweep.backend.environment_resolver();
     for row in parked {
         let job_id = JobId(row.get::<_, String>(0));
         let mut gate: Option<EnvironmentGateState> = row
@@ -6667,22 +7860,90 @@ async fn release_parked_nodes(
         let environment: Option<serde_json::Value> = row
             .get::<_, Option<String>>(2)
             .and_then(|json| from_json(&json).ok());
+        // The resolved name wins: a `Pending` arm records the post-hydration
+        // name so the sweep re-evaluates against the environment GitHub
+        // knows, not the expression text. A message whose name is still a
+        // template (`${{ needs.* }}` before its needs complete) proves nothing
+        // beyond what the stamp already records.
+        let message_name = sweep
+            .message(run_id, &job_id)
+            .await?
+            .and_then(|message| message.actions_environment)
+            .map(|environment| environment.name);
+        let mut env_name = message_name
+            .as_deref()
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+            .map(str::to_owned)
+            .or_else(|| gate.as_ref().and_then(|gate| gate.environment_name.clone()))
+            .or_else(|| {
+                crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
+                    .map(str::to_owned)
+            });
+        if env_name.as_deref().is_some_and(|name| {
+            crate::runtime_scheduling::resolved_environment_name_of(name).is_none()
+        }) {
+            // The name is still a template. A `held` node never reaches the
+            // promotion sweep's hydration, so its message would carry the
+            // expression forever: while needs are still running the gate
+            // stays armed, but once they settle the name resolves here —
+            // hydrate the stored message as `enqueue` does, then re-read it.
+            // A node the dependency decision rules out (`if: false`, a
+            // failed need) never deploys, so its gate is moot — hand it back
+            // to the promotion path to settle instead of holding forever.
+            match sweep.decide(run_id, &job_id).await? {
+                DependencyDecision::Wait => continue,
+                DependencyDecision::Run => {
+                    sweep.hydrate_node(run_id, &job_id).await?;
+                    env_name = sweep
+                        .message(run_id, &job_id)
+                        .await?
+                        .and_then(|message| message.actions_environment)
+                        .map(|environment| environment.name)
+                        .and_then(|name| {
+                            crate::runtime_scheduling::resolved_environment_name_of(&name)
+                                .map(str::to_owned)
+                        })
+                        .or(env_name);
+                }
+                _ => {
+                    if let Some(node) = sweep.node_mut(run_id, &job_id) {
+                        node.queue_state = logic::QueueState::Blocked;
+                        node.status = ExecutionStatus::Queued;
+                    }
+                    sweep.mark(run_id, &job_id);
+                    continue;
+                }
+            }
+        }
+        let Some(env_name) = env_name else {
+            // No environment on the node: the (now lifted) fork hold is the
+            // only thing that parked it, so hand it back to the ordinary
+            // promotion path — same as a gate that resolved to "no rules".
+            if let Some(node) = sweep.node_mut(run_id, &job_id) {
+                node.queue_state = logic::QueueState::Blocked;
+                node.status = ExecutionStatus::Queued;
+            }
+            sweep.mark(run_id, &job_id);
+            continue;
+        };
+        let lookup = resolver.lookup_sync(&repository, &env_name);
         let verdict = crate::runtime_scheduling::evaluate_environment_gate(
-            rules,
-            &repository,
+            &lookup,
             &git_ref,
             run_id,
             &job_id,
-            environment.as_ref(),
+            &env_name,
             &mut gate,
             now_unix_nanos,
         );
         match verdict {
             crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
-                // The gate is satisfied (or no rule applies): drop the stamp
-                // and hand the node back to the ordinary promotion sweep.
+                // The gate is satisfied: keep the stamps (the promotion
+                // sweep re-evaluates them — losing them here would re-arm a
+                // satisfied wait timer as a fresh gate) and hand the node
+                // back to the ordinary promotion path.
                 if let Some(node) = sweep.node_mut(run_id, &job_id) {
-                    node.environment_gate = None;
+                    node.environment_gate = gate;
                     node.queue_state = logic::QueueState::Blocked;
                     node.status = ExecutionStatus::Queued;
                 }
@@ -6701,7 +7962,7 @@ async fn release_parked_nodes(
                 // Fail closed: the node never dispatches, and its dependents
                 // settle through the ordinary sweep.
                 if let Some(node) = sweep.node_mut(run_id, &job_id) {
-                    node.environment_gate = None;
+                    node.environment_gate = gate;
                 }
                 sweep.mark(run_id, &job_id);
                 // `settle_node` records the failure in the sweep's outcome,

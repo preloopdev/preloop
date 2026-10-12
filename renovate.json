@@ -27,7 +27,7 @@
       "matchDepNames": [
         "smol-machines/smolvm"
       ],
-      "description": "SmolVM bumps auto-merge once ci.yml and the smolvm-release-verify check pass. The verify job is inert until a [self-hosted, macOS, ARM64, smolvm-host] runner is registered and SMOLVM_VERIFY_HOST_WORKSPACE is set \u2014 do not trust auto-merge before then.",
+      "description": "SmolVM bumps auto-merge once ci.yml and the smolvm-release-verify check pass (the verify job runs the real-VM E2E on GitHub-hosted KVM).",
       "automerge": true,
       "automergeType": "pr"
     },
@@ -76,7 +76,7 @@
     },
     {
       "customType": "regex",
-      "description": "SmolVM release the golden workflow builds with. The bump PR is gated by .github/workflows/smolvm-release-verify.yml, which installs the candidate and runs the real-VM E2E on the smolvm-host; green runs auto-merge.",
+      "description": "SmolVM release the golden workflow builds with. The bump PR is gated by .github/workflows/smolvm-release-verify.yml, which installs the candidate and runs the real-VM E2E on GitHub-hosted KVM; green runs auto-merge.",
       "fileMatch": [
         "^versions\\.toml$"
       ],

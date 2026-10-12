@@ -20,6 +20,27 @@ impl ControlBackend for PgBackend {
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError> {
         self.submit_run(submit).await
     }
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError> {
+        self.rerun_run(rerun).await
+    }
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
+        self.rerun_plan(run_id, mode).await
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        // Microsecond-epoch arithmetic keeps the timestamptz conversion
+        // exact for any value `now_unix_nanos` can produce.
+        self.test_execute(&format!(
+            "UPDATE runs SET completed_at = to_timestamp(0) \
+                 + ({completed_at_us}::bigint * interval '1 microsecond') \
+             WHERE run_id = '{run_id}'::uuid"
+        ))
+        .await
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,
@@ -95,12 +116,57 @@ impl ControlBackend for PgBackend {
     ) -> Result<(), ControlError> {
         self.set_reports_check_runs(run_id, reported).await
     }
-    async fn promote_ready_jobs(
+    async fn promote_ready_jobs(&self, run: Option<RunId>) -> Result<PromoteOutcome, ControlError> {
+        self.promote_ready_jobs(run).await
+    }
+    fn set_environment_resolver(
         &self,
-        run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
-    ) -> Result<PromoteOutcome, ControlError> {
-        self.promote_ready_jobs(run, rules).await
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
+    ) {
+        PgBackend::set_environment_resolver(self, resolver);
+    }
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        self.environment_approvals(run_id, job_id).await
+    }
+    async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        self.pending_environment_approvals(run_id).await
+    }
+    async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        self.mark_environment_approval_announced(run_id, job_id)
+            .await
+    }
+    async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        self.job_deployment_id(run_id, job_id).await
+    }
+    async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError> {
+        self.set_job_deployment(run_id, job_id, deployment_id).await
+    }
+    async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError> {
+        self.pending_environment_approval_for_check_run(check_run_id)
+            .await
     }
     async fn environment_gate(
         &self,
@@ -108,6 +174,13 @@ impl ControlBackend for PgBackend {
         job_id: &JobId,
     ) -> Result<Option<EnvironmentGateRead>, ControlError> {
         self.environment_gate(run_id, job_id).await
+    }
+    async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        self.environment_deployment(run_id, job_id).await
     }
     async fn renew_request(
         &self,
@@ -154,8 +227,12 @@ impl ControlBackend for PgBackend {
     ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError> {
         self.terminal_jobs().await
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
-        self.archive_finished_runs(limit).await
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.archive_finished_runs(limit, rerun_hold).await
     }
     async fn expired_terminal_runs(
         &self,
@@ -190,6 +267,27 @@ impl ControlBackend for PgBackend {
     }
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
         self.queue_stats().await
+    }
+    async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        self.run_event_snapshot(run_id).await
+    }
+    async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        self.artifact_catalog(run_id).await
+    }
+    async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        self.artifact_by_public_id(public_id).await
+    }
+    async fn put_artifact_catalog(&self, row: NewArtifactRow) -> Result<(), ControlError> {
+        self.put_artifact_catalog(row).await
     }
     async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
         self.create_log(plan_id).await
@@ -724,6 +822,22 @@ impl ControlBackend for PgBackend {
         limit: usize,
     ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
         self.open_webhook_redeliveries(limit).await
+    }
+    async fn retryable_webhook_redeliveries(
+        &self,
+        app_id: &str,
+        attempt_cap: u32,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        self.retryable_webhook_redeliveries(app_id, attempt_cap, limit)
+            .await
+    }
+    async fn claim_webhook_redelivery(
+        &self,
+        observed: &WebhookRedeliveryRecord,
+        claimed_at_us: i64,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        self.claim_webhook_redelivery(observed, claimed_at_us).await
     }
     async fn resolve_webhook_redelivery(
         &self,

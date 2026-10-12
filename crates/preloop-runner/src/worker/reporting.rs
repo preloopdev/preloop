@@ -518,7 +518,11 @@ pub(crate) async fn upload_diagnostic_logs(
         return;
     }
 
-    match rpt.results.upload_log_blob(&signed_url, zip_content).await {
+    match rpt
+        .results
+        .upload_blob_with_refresh(&rpt.token(), &signed_url, zip_content)
+        .await
+    {
         Ok(()) => info!(
             "Uploaded diagnostic logs ({} files, {} bytes)",
             log_files.len(),

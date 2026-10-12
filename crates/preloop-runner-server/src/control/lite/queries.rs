@@ -182,7 +182,11 @@ impl LiteBackend {
             tx.prepare_cached(
                 "SELECT display_name FROM job_specs WHERE run_id = ?1 AND job_id = ?2 \
                  UNION ALL \
-                 SELECT display_name FROM job_history WHERE run_id = ?1 AND job_id = ?2 \
+                 SELECT display_name FROM job_history h WHERE h.run_id = ?1 AND h.job_id = ?2 \
+                   AND NOT EXISTS (SELECT 1 FROM jobs j \
+                       WHERE j.run_id = h.run_id AND j.job_id = h.job_id) \
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                       WHERE run_id = h.run_id AND job_id = h.job_id) \
                  LIMIT 1",
             )
             .map_err(db)?
@@ -206,7 +210,11 @@ impl LiteBackend {
                 .prepare_cached(
                     "SELECT check_run_id FROM jobs WHERE run_id = ?1 AND job_id = ?2 \
                      UNION ALL \
-                     SELECT check_run_id FROM job_history WHERE run_id = ?1 AND job_id = ?2 \
+                     SELECT check_run_id FROM job_history h WHERE h.run_id = ?1 AND h.job_id = ?2 \
+                       AND NOT EXISTS (SELECT 1 FROM jobs j \
+                           WHERE j.run_id = h.run_id AND j.job_id = h.job_id) \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                           WHERE run_id = h.run_id AND job_id = h.job_id) \
                      LIMIT 1",
                 )
                 .map_err(db)?
@@ -224,8 +232,8 @@ impl LiteBackend {
                  UNION ALL \
                  SELECT json_extract(record_details, \
                      '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"') \
-                 FROM run_history WHERE run_id = ?1 AND created_at = ( \
-                     SELECT MAX(created_at) FROM run_history WHERE run_id = ?1)",
+                 FROM run_history WHERE run_id = ?1 AND run_attempt = ( \
+                     SELECT MAX(run_attempt) FROM run_history WHERE run_id = ?1)",
             )
             .map_err(db)?
             .query_row(params![run, job_id.0], |row| row.get::<_, Option<i64>>(0))
@@ -250,7 +258,11 @@ impl LiteBackend {
                 .prepare_cached(
                     "SELECT job_id, status FROM jobs WHERE run_id = ?1 \
                      UNION ALL \
-                     SELECT job_id, status FROM job_history WHERE run_id = ?1 \
+                     SELECT job_id, status FROM job_history h WHERE h.run_id = ?1 \
+                       AND NOT EXISTS (SELECT 1 FROM jobs j \
+                           WHERE j.run_id = h.run_id AND j.job_id = h.job_id) \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                           WHERE run_id = h.run_id AND job_id = h.job_id) \
                      ORDER BY 1",
                 )
                 .map_err(db)?;
@@ -292,7 +304,7 @@ impl LiteBackend {
                 None => match tx
                     .prepare_cached(
                         "SELECT submission, started_at, completed_at, record_details \
-                         FROM run_history WHERE run_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                         FROM run_history WHERE run_id = ?1 ORDER BY run_attempt DESC LIMIT 1",
                     )
                     .map_err(db)?
                     .query_row([&run], |row| {
@@ -322,7 +334,10 @@ impl LiteBackend {
                 let sql = if archived {
                     "SELECT job_id, status, display_name, check_run_id, annotations, \
                          (kind IN ('matrix_parent','reusable_caller')) \
-                     FROM job_history WHERE run_id = ?1 ORDER BY job_id"
+                     FROM job_history h WHERE h.run_id = ?1 \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM job_history \
+                           WHERE run_id = h.run_id AND job_id = h.job_id) \
+                     ORDER BY job_id"
                 } else {
                     "SELECT j.job_id, j.status, s.display_name, j.check_run_id, j.annotations, \
                          (j.kind IN ('matrix_parent','reusable_caller')) \
@@ -450,7 +465,11 @@ impl LiteBackend {
                  SELECT j.run_id, j.job_id, j.check_run_id, j.display_name \
                  FROM job_history j JOIN run_history r \
                    ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
+                      AND r.run_attempt = j.run_attempt \
                  WHERE r.repository = ?2 AND (?3 IS NULL OR r.head_sha = ?3) \
+                   AND r.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                        WHERE run_id = r.run_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = r.run_id) \
                  UNION ALL \
                  SELECT s.run_id, je.key, CAST(je.value AS INTEGER), je.key \
                  FROM run_submissions s JOIN runs r ON r.run_id = s.run_id, \
@@ -461,8 +480,9 @@ impl LiteBackend {
                  SELECT h.run_id, je.key, CAST(je.value AS INTEGER), je.key \
                  FROM run_history h, json_each(h.record_details, '$.job_check_run_ids') je \
                  WHERE h.repository = ?2 AND (?3 IS NULL OR h.head_sha = ?3) \
-                   AND h.created_at = (SELECT MAX(created_at) FROM run_history \
-                                       WHERE run_id = h.run_id)";
+                   AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                       WHERE run_id = h.run_id) \
+                   AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id)";
             let exact = tx
                 .prepare_cached(&format!(
                     "SELECT run_id, job_id FROM ({CANDIDATES}) WHERE check_run_id = ?1 \
@@ -631,8 +651,11 @@ impl LiteBackend {
             let mut stats = QueueStats::default();
             let mut stmt = tx
                 .prepare_cached(&format!(
-                    "SELECT {QUEUE_KIND} AS kind, COUNT(*) FROM jobs j \
-                     WHERE j.queue_state NOT IN ('none', 'expanding') GROUP BY kind"
+                    // The alias must not collide with a column: `jobs.kind`
+                    // (job/matrix_leg/...) would capture `GROUP BY kind` and
+                    // collapse every bucket into one arbitrary row.
+                    "SELECT {QUEUE_KIND} AS bucket, COUNT(*) FROM jobs j \
+                     WHERE j.queue_state NOT IN ('none', 'expanding') GROUP BY bucket"
                 ))
                 .map_err(db)?;
             let rows = stmt
@@ -695,8 +718,10 @@ impl LiteBackend {
                     "SELECT run_id, job_id FROM jobs \
                      WHERE status IN ('success','failure','skipped','cancelled','timed_out') \
                      UNION \
-                     SELECT run_id, job_id FROM job_history \
-                     WHERE status IN ('success','failure','skipped','cancelled','timed_out')",
+                     SELECT run_id, job_id FROM job_history h \
+                     WHERE h.status IN ('success','failure','skipped','cancelled','timed_out') \
+                       AND NOT EXISTS (SELECT 1 FROM jobs j \
+                           WHERE j.run_id = h.run_id AND j.job_id = h.job_id)",
                 )
                 .map_err(db)?;
             let rows = stmt
@@ -713,11 +738,21 @@ impl LiteBackend {
     /// cascades). A candidate completed at least a minute ago, has no
     /// in-flight attempt, no session-bound attempt, no undelivered
     /// cancellation, and no push state that echo dedup may still need.
+    ///
+    /// `rerun_hold` keeps a candidate whose completed attempt has at least
+    /// one failed/cancelled/timed-out job live for that long, so a re-run can
+    /// reset it in place; `None` or zero archives on the plain policy.
+    /// Retention still wins: `expired_terminal_runs` selects live rows too.
     pub(crate) async fn archive_finished_runs(
         &self,
         limit: usize,
+        rerun_hold: Option<std::time::Duration>,
     ) -> Result<Vec<RunId>, ControlError> {
-        self.write(|tx| {
+        let hold_us: Option<i64> = rerun_hold
+            .map(|hold| i64::try_from(hold.as_micros()).unwrap_or(i64::MAX))
+            .filter(|hold| *hold > 0);
+        let rerun_cutoff = hold_us.map(|hold| now_us() - hold);
+        self.write(move |tx| {
             let now = now_us();
             let run_ids: Vec<String> = {
                 let mut stmt = tx
@@ -733,6 +768,10 @@ impl LiteBackend {
                            AND NOT EXISTS (SELECT 1 FROM run_push_states p \
                                            WHERE p.run_id = r.run_id \
                                              AND (p.status = 'pending' OR p.updated_at > ?2)) \
+                           AND (?4 IS NULL OR r.completed_at <= ?4 \
+                                OR NOT EXISTS (SELECT 1 FROM jobs j \
+                                               WHERE j.run_id = r.run_id \
+                                                 AND j.status IN ('failure','cancelled','timed_out'))) \
                          ORDER BY r.completed_at, r.run_id LIMIT ?3",
                     )
                     .map_err(db)?;
@@ -741,7 +780,8 @@ impl LiteBackend {
                         params![
                             now - ARCHIVE_GRACE_US,
                             now - PUSH_ECHO_WINDOW_US,
-                            limit.min(ARCHIVE_BATCH) as i64
+                            limit.min(ARCHIVE_BATCH) as i64,
+                            rerun_cutoff,
                         ],
                         |row| row.get(0),
                     )
@@ -769,14 +809,14 @@ impl LiteBackend {
                          r.completed_at \
                      FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
                      WHERE r.run_id = ?1",
-                    "INSERT INTO job_history (run_id, run_created_at, job_id, namespace_id, \
+                    "INSERT INTO job_history (run_id, run_created_at, run_attempt, job_id, namespace_id, \
                          kind, parent_job_id, base_id, display_name, status, pool_key, outputs, \
                          annotations, check_run_id, created_at, deps_ready_at, started_at, \
-                         completed_at) \
-                     SELECT j.run_id, r.created_at, j.job_id, j.namespace_id, j.kind, \
+                         completed_at, request_id) \
+                     SELECT j.run_id, r.created_at, r.run_attempt, j.job_id, j.namespace_id, j.kind, \
                          j.parent_job_id, j.base_id, COALESCE(s.display_name, j.job_id), \
                          j.status, j.pool_key, j.outputs, j.annotations, j.check_run_id, \
-                         j.created_at, j.deps_ready_at, j.started_at, j.completed_at \
+                         j.created_at, j.deps_ready_at, j.started_at, j.completed_at, j.request_id \
                      FROM jobs j JOIN runs r ON r.run_id = j.run_id \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
                      WHERE j.run_id = ?1",
@@ -838,8 +878,8 @@ impl LiteBackend {
                          SELECT h.run_id, COALESCE(h.completed_at, h.created_at) \
                          FROM run_history h) \
                      GROUP BY run_id \
-                     HAVING MIN(finished_at) < ?1 \
-                     ORDER BY MIN(finished_at), run_id \
+                     HAVING MAX(finished_at) < ?1 \
+                     ORDER BY MAX(finished_at), run_id \
                      LIMIT ?2",
                 )
                 .map_err(db)?;
@@ -1048,7 +1088,11 @@ impl LiteBackend {
                          SELECT h.run_id, 1, \
                                 COALESCE(h.completed_at, h.started_at, h.created_at), \
                                 h.workflow_path, h.event, COALESCE(h.conclusion, 'success') \
-                         FROM run_history h) \
+                         FROM run_history h \
+                         WHERE h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                                WHERE run_id = h.run_id) \
+                           AND NOT EXISTS (SELECT 1 FROM runs live \
+                                           WHERE live.run_id = h.run_id)) \
                      WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
                        AND (?2 IS NULL OR status = ?2 OR (?2 = 'completed' AND terminal_rank = 1)) \
                        AND (?3 IS NULL OR event = ?3) \
@@ -1091,8 +1135,11 @@ impl LiteBackend {
                 .prepare_cached(
                     "SELECT run_id FROM runs WHERE repository = ?1 COLLATE NOCASE \
                      UNION ALL \
-                     SELECT run_id FROM run_history \
-                     WHERE repository = ?1 COLLATE NOCASE",
+                     SELECT h.run_id FROM run_history h \
+                     WHERE h.repository = ?1 COLLATE NOCASE \
+                       AND h.run_attempt = (SELECT MAX(run_attempt) FROM run_history \
+                                            WHERE run_id = h.run_id) \
+                       AND NOT EXISTS (SELECT 1 FROM runs live WHERE live.run_id = h.run_id)",
                 )
                 .map_err(db)?;
             let rows = stmt
@@ -1107,6 +1154,152 @@ impl LiteBackend {
                 }
             }
             Ok(runs)
+        })
+    }
+}
+
+/// v1 artifact catalog + durable run-event snapshot: the read paths that
+/// keep the artifact endpoints and the SSE history alive across a restart,
+/// including state imported from a legacy store.
+impl LiteBackend {
+    /// The run's durable outbox events, `event_id` (commit) order.
+    pub(crate) async fn run_event_snapshot(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<serde_json::Value>, ControlError> {
+        let run = codec::run_key(run_id);
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT payload FROM outbox_events WHERE run_id = ?1 ORDER BY event_id",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([run.as_str()], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db)?;
+            let mut events = Vec::with_capacity(rows.len());
+            for payload in rows {
+                // The outbox carries the run's NDJSON events plus rows that
+                // make no event claim; skip those rather than emit bad lines.
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    events.push(value);
+                }
+            }
+            Ok(events)
+        })
+    }
+
+    /// Finalized v1 artifacts, one run's or every run's, insertion order.
+    pub(crate) async fn artifact_catalog(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<ArtifactCatalogRow>, ControlError> {
+        let run = run_id.map(codec::run_key);
+        let rows = self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT public_id, run_id, name, storage_key, COALESCE(size_bytes, 0) \
+                     FROM artifacts \
+                     WHERE state = 'finalized' AND public_id IS NOT NULL \
+                       AND (?1 IS NULL OR run_id = ?1) \
+                     ORDER BY artifact_id",
+                )
+                .map_err(db)?;
+            stmt.query_map([run.as_deref()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)
+        })?;
+        let mut artifacts = Vec::with_capacity(rows.len());
+        for (public_id, run, name, storage_key, size_bytes) in rows {
+            artifacts.push(ArtifactCatalogRow {
+                public_id,
+                run_id: codec::run_id(&run),
+                name,
+                storage_key,
+                size_bytes,
+            });
+        }
+        Ok(artifacts)
+    }
+
+    /// One finalized v1 artifact row by its public id, served by the unique
+    /// `artifacts_public_id` index (the catalog-wide scan is never needed to
+    /// answer a single id).
+    pub(crate) async fn artifact_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<Option<ArtifactCatalogRow>, ControlError> {
+        let id = public_id.to_owned();
+        let row = self.read(move |tx| {
+            tx.prepare_cached(
+                "SELECT public_id, run_id, name, storage_key, COALESCE(size_bytes, 0) \
+                 FROM artifacts \
+                 WHERE state = 'finalized' AND public_id = ?1",
+            )
+            .map_err(db)?
+            .query_row([&id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .optional()
+            .map_err(db)
+        })?;
+        Ok(row.map(
+            |(public_id, run, name, storage_key, size_bytes)| ArtifactCatalogRow {
+                public_id,
+                run_id: codec::run_id(&run),
+                name,
+                storage_key,
+                size_bytes,
+            },
+        ))
+    }
+
+    /// Upsert a finalized v1 artifact row (native uploads and imports).
+    pub(crate) async fn put_artifact_catalog(
+        &self,
+        row: NewArtifactRow,
+    ) -> Result<(), ControlError> {
+        let run = codec::run_key(row.run_id);
+        let now = now_us();
+        self.write(move |tx| {
+            tx.prepare_cached(
+                "INSERT INTO artifacts (namespace_id, run_id, job_backend_id, name, state, \
+                     size_bytes, storage_key, public_id, created_at, finalized_at) \
+                 VALUES ('default', ?1, '', ?2, 'finalized', ?3, ?4, ?5, ?6, ?6) \
+                 ON CONFLICT (run_id, job_backend_id, name) DO UPDATE SET \
+                     size_bytes = excluded.size_bytes, \
+                     storage_key = excluded.storage_key, \
+                     public_id = excluded.public_id, \
+                     finalized_at = excluded.finalized_at",
+            )
+            .map_err(db)?
+            .execute(params![
+                run,
+                row.name,
+                row.size_bytes,
+                row.storage_key,
+                row.public_id,
+                now
+            ])
+            .map_err(db)?;
+            Ok(())
         })
     }
 }
