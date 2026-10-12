@@ -66,12 +66,12 @@ proptest! {
         );
 
         let input = format!(
-            "LEFT::{raw}::{trimmed}::{standard}::{standard_no_pad}::{url_safe}::{url_safe_no_pad}::PUBLIC_MARKER"
+            "LEFT::{raw}::{trimmed}::{standard}::{standard_no_pad}::{url_safe}::{url_safe_no_pad}::QUOTE_FEED"
         );
         let masked = ctx.mask_secrets(&input);
         prop_assert_eq!(
             masked.as_str(),
-            "LEFT::***::***::***::***::***::***::PUBLIC_MARKER"
+            "LEFT::***::***::***::***::***::***::QUOTE_FEED"
         );
         prop_assert_eq!(ctx.mask_secrets(&masked), masked.as_str());
     }
@@ -99,12 +99,12 @@ proptest! {
         ctx.add_mask(&short);
 
         let input = format!(
-            "LEFT::{short}::MIDDLE::{long}::PUBLIC_MARKER::{short}::{long}::RIGHT"
+            "LEFT::{short}::MIDDLE::{long}::QUOTE_FEED::{short}::{long}::RIGHT"
         );
         let masked = ctx.mask_secrets(&input);
         prop_assert_eq!(
             masked.as_str(),
-            "LEFT::***::MIDDLE::***::PUBLIC_MARKER::***::***::RIGHT"
+            "LEFT::***::MIDDLE::***::QUOTE_FEED::***::***::RIGHT"
         );
         prop_assert_eq!(ctx.mask_secrets(&masked), masked.as_str());
     }
@@ -160,10 +160,10 @@ proptest! {
         }).unwrap_or(false);
         prop_assert!(live_has_masks);
 
-        let input = format!("LEFT::{raw}::{first}::{second}::PUBLIC_MARKER");
+        let input = format!("LEFT::{raw}::{first}::{second}::QUOTE_FEED");
         prop_assert_eq!(
             ctx.mask_secrets(&input),
-            "LEFT::***::***::***::PUBLIC_MARKER"
+            "LEFT::***::***::***::QUOTE_FEED"
         );
     }
 }
