@@ -1261,6 +1261,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // different tree than the one the PR would merge is never acceptable.
     let local_pull_request_merge = if submission.event == "pull_request"
         && !submission.no_merge
+        && submission.prebuilt_merge.is_none()
         && local_workspace.is_some()
     {
         let Some(base_branch) = pull_request_base_branch(&submission) else {
@@ -1369,6 +1370,12 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             submission.payload = serde_json::json!({});
         }
         let pull_request_base_ref = pull_request_base_branch(&submission);
+        if submission.event == "pull_request"
+            && let Some(base_ref) = pull_request_base_ref.as_ref()
+            && let Some(object) = github.as_object_mut()
+        {
+            object.insert("base_ref".to_owned(), serde_json::json!(base_ref));
+        }
         if let Some(payload) = submission.payload.as_object_mut() {
             let (owner, name) = submission
                 .repository

@@ -2728,7 +2728,15 @@ fn usable_diff_base(base: &str) -> bool {
 
 /// Remotes configured for this repository, in git's order.
 fn git_remotes() -> Vec<String> {
-    std::process::Command::new("git")
+    git_remotes_in(None)
+}
+
+fn git_remotes_in(repository: Option<&std::path::Path>) -> Vec<String> {
+    let mut command = std::process::Command::new("git");
+    if let Some(repository) = repository {
+        command.arg("-C").arg(repository);
+    }
+    command
         .arg("remote")
         .output()
         .ok()
@@ -2910,8 +2918,14 @@ fn default_local_filter_branch(
 }
 
 fn local_default_branch() -> Option<String> {
-    for remote in git_remotes() {
-        let output = std::process::Command::new("git")
+    local_default_branch_in(std::path::Path::new("."))
+}
+
+fn local_default_branch_in(repository: &std::path::Path) -> Option<String> {
+    for remote in git_remotes_in(Some(repository)) {
+        let local = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
             .args([
                 "symbolic-ref",
                 "--quiet",
@@ -2919,14 +2933,35 @@ fn local_default_branch() -> Option<String> {
                 &format!("refs/remotes/{remote}/HEAD"),
             ])
             .output();
-        let Ok(output) = output else {
-            continue;
-        };
-        if output.status.success() {
+        if let Ok(output) = local
+            && output.status.success()
+        {
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if !branch.is_empty() {
                 return Some(branch);
             }
+        }
+
+        let advertised = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["ls-remote", "--symref", &remote, "HEAD"])
+            .output();
+        let Ok(output) = advertised else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let branch = output.lines().find_map(|line| {
+            let (reference, name) = line.split_once('\t')?;
+            (name == "HEAD")
+                .then(|| reference.strip_prefix("ref: refs/heads/"))
+                .flatten()
+        });
+        if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+            return Some(format!("{remote}/{branch}"));
         }
     }
     None
@@ -5609,6 +5644,84 @@ mod tests {
         assert!(
             default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn local_default_branch_uses_advertised_head_when_local_head_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("origin.git");
+        let seed = temp.path().join("seed");
+        let workspace = temp.path().join("workspace");
+        let run_git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git runs in local default-branch fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=main",
+                seed.to_str().unwrap(),
+            ],
+        );
+        run_git(&seed, &["config", "user.name", "Preloop Test"]);
+        run_git(&seed, &["config", "user.email", "test@example.test"]);
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        let remote_url = remote.to_str().unwrap();
+        run_git(&seed, &["remote", "add", "origin", remote_url]);
+        run_git(&seed, &["push", "--quiet", "origin", "main"]);
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=feature",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git(&workspace, &["remote", "add", "origin", remote_url]);
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/main")
+        );
+
+        run_git(
+            &workspace,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/local-default",
+            ],
+        );
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/local-default"),
+            "an existing local remote-HEAD symbolic ref remains preferred"
         );
     }
 

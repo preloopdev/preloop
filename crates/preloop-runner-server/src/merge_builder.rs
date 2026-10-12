@@ -366,8 +366,8 @@ async fn ensure_mirror(mirror: &Path) -> Result<(), MergeError> {
 
 /// Fetch one refspec into `source.mirror` and resolve `resolve_ref` to a sha.
 ///
-/// `refspec` may be a bare sha (fetch-by-sha); `resolve_ref` is then
-/// `FETCH_HEAD`.
+/// `resolve_ref` must be stable across concurrent fetches. Every fetch into
+/// the mirror rewrites `FETCH_HEAD`, so it cannot identify a request's result.
 async fn fetch_into_mirror(
     source: &MergeSource,
     url: &str,
@@ -468,10 +468,17 @@ pub async fn fetch_inputs(
 
     let head_sha = match &request.head {
         MergeHead::Commit(sha) => {
+            if !is_object_id(sha) {
+                return Err(MergeError::MissingCommit {
+                    sha: sha.clone(),
+                    repository: source.mirror.display().to_string(),
+                });
+            }
             if commit_present(&source.mirror, sha).await {
                 sha.clone()
             } else if let Some(url) = &source.fetch_url {
-                fetch_into_mirror(source, url, sha, "FETCH_HEAD").await?
+                let commit_ref = format!("{sha}^{{commit}}");
+                fetch_into_mirror(source, url, sha, &commit_ref).await?
             } else {
                 return Err(MergeError::MissingCommit {
                     sha: sha.clone(),

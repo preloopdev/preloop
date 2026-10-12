@@ -117,6 +117,15 @@ Releases before v0.27.0 predate the changelog.
   `run_history_retention_days`, `namespace_policies`) stay and are marked
   platform-owned in the schema.
 
+### Fixed
+
+- Local pull-request base selection now queries `git ls-remote --symref` when
+  the local remote-`HEAD` symbolic ref is absent. The resolved target is
+  reflected in both `github.base_ref` and the synthetic event payload; an
+  explicit base remains the override. Valid prebuilt merges bypass local base
+  discovery, and fetch-by-SHA merges resolve the requested commit instead of
+  the mirror's shared `FETCH_HEAD`.
+
 ### Security
 
 - **A job never receives the control-plane runtime token as its
