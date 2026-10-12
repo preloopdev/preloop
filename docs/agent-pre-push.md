@@ -21,7 +21,12 @@ Install a tagged release and verify it before an agent uses it:
    `gh attestation verify preloop-cli-<target>.tar.gz --repo preloopdev/preloop`.
 3. Put `preloop` on your `PATH` and run `preloop update` to install the pinned
    SmolVM runtime.
-4. Run `preloop init` yourself. Its first step sets up a GitHub credential,
+4. On Linux, also install the guest runner every job VM needs:
+   `preloop-runner-<triple>` from the same release, verified the same way, at
+   `<prefix>/lib/preloop/runner/<triple>/preloop-runner`. `preloop update`
+   places it on macOS only. [Self-hosting §3](self-hosting.md#3-install) has
+   the commands.
+5. Run `preloop init` yourself. Its first step sets up a GitHub credential,
    and the agent should never handle that credential.
 
 ## Steps
