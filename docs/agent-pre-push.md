@@ -41,10 +41,18 @@ Install a tagged release and verify it before an agent uses it:
    preloop plan -f <file> --json
    ```
 
+   The plan lists jobs, `needs:`, `runs-on`, and the matrix. It does not show
+   steps, `environment:`, `permissions:`, or secret reads, so read the
+   workflow file too before you pick jobs.
 3. **Pick the check jobs:** tests, lint, build, and any gate job that collects
    them. Skip every job that deploys, publishes, pushes, or reads a secret
    other than `GITHUB_TOKEN`. `environment:`, `secrets.`, `deploy`, `release`,
-   and `pages` in a job are the usual signs.
+   and `pages` in a job are the usual signs. Also skip every job whose
+   `GITHUB_TOKEN` can write: a `write` or `write-all` entry under the job's
+   `permissions:`, or under the workflow's when the job declares none. With a
+   GitHub App or PAT configured, `GITHUB_TOKEN` is a real GitHub credential
+   with those permissions ([GitHub tokens](github-tokens.md)). A job without
+   `permissions:` at either level gets read-only defaults.
 4. **Run each check job:**
 
    ```sh
