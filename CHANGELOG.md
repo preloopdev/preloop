@@ -10,6 +10,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
+  replayed on one node waited for the other nodes' five-second queue poll before
+  it was claimed. The committing node now sends one coalesced `preloop_webhooks`
+  notification after its commit, and each peer's worker wakes on it.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
