@@ -208,15 +208,6 @@ pub(super) async fn settle_unrun(
     status: ExecutionStatus,
     out: &mut SchedulingOutcome,
 ) -> Result<Vec<JobId>, ControlError> {
-    let run = run_id.0.to_string();
-    let run_status_before: Option<String> = tx
-        .query_opt(
-            "SELECT status FROM runs WHERE run_id=$1::text::uuid",
-            &[&run],
-        )
-        .await
-        .map_err(db)?
-        .map(|row| row.get(0));
     mark_terminal(node, status, now_us());
     flush_node(tx, run_id, job_id, node).await?;
     release_concurrency_for_job(backend, tx, run_id, job_id).await?;
@@ -226,7 +217,6 @@ pub(super) async fn settle_unrun(
     clear_assignment(tx, run_id, job_id).await?;
     let unblocked = Sweep::refresh_remaining_needs(tx, run_id, job_id, &node.base_id).await?;
     out.push(status, run_id, job_id.clone());
-    summarize_run_tx(tx, run_id).await?;
     emit_outbox(
         tx,
         Some(run_id),
@@ -234,17 +224,42 @@ pub(super) async fn settle_unrun(
         serde_json::json!({"job_id": job_id.0, "status": status_str(status)}),
     )
     .await?;
-    let (run_status, conclusion): (String, Option<String>) = {
-        let row = tx
-            .query_one(
-                "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
-                &[&run],
-            )
-            .await
-            .map_err(db)?;
-        (row.get(0), row.get(1))
-    };
-    if run_status == "completed" && run_status_before.as_deref() != Some("completed") {
+    conclude_run(backend, tx, run_id, status_str(status)).await?;
+    Ok(unblocked)
+}
+
+/// Stamp the run's status from its job rows ([`summarize_run_tx`]) and, when
+/// that completed it, finish the run: release its workflow-level concurrency
+/// hold (promoting the group's next waiter) and emit `run.completed.v1`.
+/// `fallback_conclusion` names the conclusion when the run row carries none.
+///
+/// A run that was already `completed` is left alone, so a command that settles
+/// several jobs concludes the run once. The caller holds the run lock.
+pub(super) async fn conclude_run(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    fallback_conclusion: &str,
+) -> Result<(), ControlError> {
+    let run = run_id.0.to_string();
+    let status_before: Option<String> = tx
+        .query_opt(
+            "SELECT status FROM runs WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .map_err(db)?
+        .map(|row| row.get(0));
+    summarize_run_tx(tx, run_id).await?;
+    let row = tx
+        .query_one(
+            "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+    let (status, conclusion): (String, Option<String>) = (row.get(0), row.get(1));
+    if status == "completed" && status_before.as_deref() != Some("completed") {
         // A terminal run must not hold a workflow-level slot: release the
         // group and promote its next waiter.
         release_concurrency_for_run(backend, tx, run_id).await?;
@@ -253,12 +268,12 @@ pub(super) async fn settle_unrun(
             Some(run_id),
             "run.completed.v1",
             serde_json::json!({
-                "conclusion": conclusion.unwrap_or_else(|| status_str(status).to_owned())
+                "conclusion": conclusion.unwrap_or_else(|| fallback_conclusion.to_owned())
             }),
         )
         .await?;
     }
-    Ok(unblocked)
+    Ok(())
 }
 
 /// How many legs of a cohort occupy a `max-parallel` slot: running, claimed or

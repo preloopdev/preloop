@@ -96,6 +96,30 @@ impl NeedsView {
             .collect();
         Ok(Self { rows })
     }
+
+    /// The outputs of the jobs `needs` name, merged under each job's base id
+    /// (a matrix base collects every leg's outputs; a later leg overwrites an
+    /// earlier one's key). A job with no recorded base id merges under the
+    /// need that named it. This is what a deferred expansion evaluates its
+    /// `needs.*.outputs` expressions against.
+    pub(super) fn outputs_by_base(
+        &self,
+        needs: &[JobId],
+    ) -> BTreeMap<String, BTreeMap<String, serde_json::Value>> {
+        let mut merged: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+        for need in needs {
+            for matched in self.matching_ids(need) {
+                if let Some(outputs) = self.need_outputs(&matched) {
+                    let base = self
+                        .rows
+                        .get(&matched)
+                        .map_or_else(|| need.0.clone(), |row| row.base_id.clone());
+                    merged.entry(base).or_default().extend(outputs.clone());
+                }
+            }
+        }
+        merged
+    }
 }
 
 impl NeedsSource for NeedsView {
