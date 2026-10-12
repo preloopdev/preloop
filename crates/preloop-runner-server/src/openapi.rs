@@ -7,7 +7,7 @@ use utoipa::{
 };
 
 use crate::runs::{ApproveForkRequest, ApproveForkResponse};
-use crate::runs::{ApproveJobRequest, ApproveJobResponse};
+use crate::runs::{ApproveJobRequest, ApproveJobResponse, RerunRequest};
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -413,13 +413,32 @@ fn live_run_logs() {}
 )]
 fn cancel_run() {}
 
-/// Rerun a completed workflow.
+/// Rerun a completed workflow as a new attempt on the same run.
+///
+/// `mode` selects the jobs that reset: `all` (GitHub's "Re-run all jobs"),
+/// `failed` (failed/cancelled jobs plus their dependents — the "Re-run
+/// failed jobs" button), or `job` (`job_id` required: that job plus its
+/// dependents). Non-selected jobs keep their prior results and outputs for
+/// dependents; `github.run_attempt` increments and the previous attempt is
+/// archived to history. An environment-gated job re-arms its protection
+/// gate for the new attempt, and workflow/job concurrency groups are
+/// re-acquired exactly as at submit.
+///
+/// A run whose live rows the archiver already moved to history can only be
+/// re-run in full: `all` resubmits the recorded submission as a new run
+/// (new `run_id`), while `failed`/`job` return 409. Errors: 404 (unknown
+/// run), 409 (run still in progress, nothing selected by `failed`, attempt
+/// limit ≥ 51, the 30-day rerun window has passed, or a partial re-run of an
+/// archived run), 400 (bad mode).
 #[utoipa::path(
     post, path = "/api/v1/runs/{run_id}/rerun", tag = "Runs",
     params(("run_id" = String, Path, description = "Run UUID")),
+    request_body(content = RerunRequest, description = "Rerun mode; absent body = all jobs"),
     responses(
         (status = 202, description = "Rerun accepted", body = RunAcceptedResponse),
-        (status = 404, description = "Run not found", body = ApiErrorResponse)
+        (status = 400, description = "Unknown mode or missing job_id", body = ApiErrorResponse),
+        (status = 404, description = "Run not found", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, nothing to re-run, or rerun window closed", body = ApiErrorResponse)
     ),
     security(("native_bearer" = []))
 )]

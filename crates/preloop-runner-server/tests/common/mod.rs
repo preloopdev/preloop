@@ -474,22 +474,35 @@ pub async fn open_live(app: &axum::Router, uri: String) -> Response {
 }
 
 /// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
-/// `kind`, `job` ("" for system), `jti` = staging dir name. Returns
-/// `(jwt, jti)` — the pending-reservation maps key on `jti`.
-pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str) -> (String, String) {
+/// `kind`, `op` ("read" | "write"), `job` (never empty), `jti` = staging
+/// dir name. Returns `(jwt, jti)` — the pending-reservation maps key on
+/// `jti`.
+pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str, op: &str) -> (String, String) {
     let jti = uuid::Uuid::new_v4().to_string();
-    let jwt = state
+    (mint_blob_jwt_for_jti(state, kind, job, op, &jti), jti)
+}
+
+/// Mint a blob JWT for an existing staging dir `jti` (e.g. a `read` token
+/// for a blob uploaded through a `write` token).
+pub fn mint_blob_jwt_for_jti(
+    state: &AppState,
+    kind: &str,
+    job: &str,
+    op: &str,
+    jti: &str,
+) -> String {
+    state
         .local_jwt_with_lifetime(
             json!({
                 "sub": "preloop-blob",
                 "kind": kind,
+                "op": op,
                 "job": job,
                 "jti": jti,
             }),
-            crate::memory_caps::PENDING_UPLOAD_TTL,
+            crate::memory_caps::SIGNED_BLOB_URL_TTL,
         )
-        .unwrap();
-    (jwt, jti)
+        .unwrap()
 }
 
 /// Point PAT scope introspection at a dead local address so tests that
@@ -919,6 +932,26 @@ pub async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
         }),
     )
     .await
+}
+
+/// Submit a workflow and return its first job's `(run_id, plan_id,
+/// agent_job_id)`. The JobServer action-download endpoints resolve the run
+/// from the plan id in the URL, so tests addressing them need a real one.
+pub async fn submit_run_first_job(
+    app: &axum::Router,
+    state: &AppState,
+    yaml: &str,
+) -> (String, String, uuid::Uuid) {
+    let accepted = submit_yaml(app, yaml, "owner/repo").await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let parsed: RunId = run_id.parse().unwrap();
+    let inner = state.test_tx().await;
+    let request = inner
+        .job_requests
+        .values()
+        .find(|request| request.run_id == parsed)
+        .expect("submit must create a job request");
+    (run_id, request.plan_id.clone(), request.agent_job_id)
 }
 
 /// Extract the queued job message for a run, wherever it currently sits.
@@ -1630,7 +1663,7 @@ pub async fn register_live_job_in(
     job_uuid: uuid::Uuid,
     _plan_id: &str,
     repository: &str,
-) {
+) -> String {
     let accepted = crate::submit_run_inner(
         &state.shared(),
         preloop_gha_protocol::WorkflowSubmission {
@@ -1676,6 +1709,7 @@ pub async fn register_live_job_in(
         .await
         .expect("re-key the seed attempt");
     assert_eq!(updated, 1, "the seed run has exactly one attempt");
+    run_key
 }
 
 /// Register a live job attempt (see [`register_live_job_in`]) under a
@@ -1702,8 +1736,14 @@ pub async fn complete_live_job(state: &AppState, job_uuid: uuid::Uuid) {
 
 /// Register a live job whose run belongs to `test-org/test-repo`: the legacy
 /// cache path resolves job → attempt → run → submission repository.
-pub async fn register_live_job_with_run(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
-    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await;
+/// Returns the run key (a UUID string) so tests can bind legacy
+/// `/_apis/pipelines/workflows/:run_id/…` paths to the job's own run.
+pub async fn register_live_job_with_run(
+    state: &AppState,
+    job_uuid: uuid::Uuid,
+    plan_id: &str,
+) -> String {
+    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await
 }
 
 /// Claim the next queued job through the real broker path — register the

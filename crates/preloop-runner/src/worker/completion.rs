@@ -268,11 +268,17 @@ pub(crate) fn evaluate_environment_url(
     if value.is_empty() {
         return Ok(None);
     }
-    if job_ctx
-        .masks
-        .iter()
-        .any(|mask| !mask.is_empty() && value.contains(mask.as_str()))
-    {
+    if job_ctx.masks.iter().any(|mask| {
+        if mask.is_empty() {
+            return false;
+        }
+        // Transform-aware: a URL embedding the secret base64/percent/hex
+        // encoded discloses it just as surely as the raw value.
+        value.contains(mask.as_str())
+            || preloop_gha_protocol::masking::secret_variants(mask)
+                .iter()
+                .any(|variant| value.contains(variant.as_str()))
+    }) {
         // Official `JobExtension.FinalizeJob`: a URL that would disclose a
         // secret is skipped, never reported.
         warn!("Skip setting environment url as it may contain secret");

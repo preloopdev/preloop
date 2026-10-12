@@ -25,8 +25,11 @@ struct GithubCommitResponse {
 /// `github_token` is the engine's static credential (env `PRELOOP_GITHUB_TOKEN`
 /// or the config file's `github.pat` — the caller resolves the precedence),
 /// attached as a bearer header so private `uses: owner/repo/...` references
-/// resolve without a separately exported token.
+/// resolve without a separately exported token. Both fetches go through the
+/// labeled GitHub sender under the PAT bucket (or the anonymous bucket when
+/// no token is configured), so breaker and consumption accounting see them.
 pub async fn resolve_remote_workflows(
+    shared: &Arc<SharedState>,
     submission: &mut WorkflowSubmission,
     root_workflow: &preloop_gha_parser::Workflow,
     github_token: Option<&str>,
@@ -86,7 +89,20 @@ pub async fn resolve_remote_workflows(
             if let Some(token) = token {
                 commit_request = commit_request.bearer_auth(token);
             }
-            let commit_response = commit_request.send().await.map_err(|error| {
+            let bucket = if token.is_some() {
+                crate::github_breaker::GithubCredentialBucket::Pat
+            } else {
+                crate::github_breaker::GithubCredentialBucket::Anonymous
+            };
+            let commit_response = crate::github_breaker::send_observed_labeled(
+                &shared.state.github_breakers,
+                bucket,
+                &shared.state.github_consumption,
+                crate::github_breaker::GithubSubsystem::Workflows,
+                commit_request,
+            )
+            .await
+            .map_err(|error| {
                 ApiError::bad_gateway(format!(
                     "resolve reusable workflow `{reference}` SHA: {error}"
                 ))
@@ -119,7 +135,15 @@ pub async fn resolve_remote_workflows(
             if let Some(token) = token {
                 request = request.bearer_auth(token);
             }
-            let response = request.send().await.map_err(|error| {
+            let response = crate::github_breaker::send_observed_labeled(
+                &shared.state.github_breakers,
+                bucket,
+                &shared.state.github_consumption,
+                crate::github_breaker::GithubSubsystem::Workflows,
+                request,
+            )
+            .await
+            .map_err(|error| {
                 ApiError::bad_gateway(format!("fetch reusable workflow `{reference}`: {error}"))
             })?;
             let status = response.status();
@@ -199,5 +223,162 @@ mod tests {
             encoding: "base64".to_owned(),
         };
         assert_eq!(decode_github_contents(&response).unwrap(), "name: CI\n");
+    }
+}
+
+#[cfg(test)]
+mod observed_sender_tests {
+    use super::*;
+    use crate::github_breaker::{GithubCredentialBucket, GithubSubsystem};
+    use std::sync::Arc;
+
+    /// The two fetches `resolve_remote_workflows` makes must go through the
+    /// labeled sender: the breaker sees them and the `workflows` subsystem
+    /// accounts for them. Pre-fix these were direct `.send()` calls with the
+    /// static PAT, invisible to both.
+    #[tokio::test]
+    async fn remote_workflow_fetches_use_the_labeled_sender() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
+        let reusable_yaml = "on: push\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let content_b64 =
+            base64::engine::general_purpose::STANDARD.encode(reusable_yaml.as_bytes());
+        let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let hits_route = hits.clone();
+        let sha_owned = sha.to_owned();
+        let app = axum::Router::new().route(
+            "/*path",
+            axum::routing::get(move |request: axum::extract::Request| {
+                let hits_route = hits_route.clone();
+                let sha_owned = sha_owned.clone();
+                let content_b64 = content_b64.clone();
+                async move {
+                    hits_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let path = request.uri().path().to_owned();
+                    let body = if path.contains("/commits/") {
+                        serde_json::json!({ "sha": sha_owned }).to_string()
+                    } else {
+                        serde_json::json!({
+                            "content": content_b64,
+                            "encoding": "base64",
+                        })
+                        .to_string()
+                    };
+                    axum::http::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().join("state").to_path_buf())
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+
+        let yaml = "on: push\njobs:\n  call:\n    uses: o/r/.github/workflows/reusable.yml@main\n";
+        let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
+        let mut submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            ..Default::default()
+        };
+        resolve_remote_workflows(&shared, &mut submission, &workflow, None)
+            .await
+            .expect("resolution must succeed against the stub");
+        assert_eq!(
+            submission
+                .reusable_workflows
+                .get("o/r/.github/workflows/reusable.yml@main")
+                .map(String::as_str),
+            Some(reusable_yaml),
+            "the fetched workflow must be stored decoded"
+        );
+        assert_eq!(
+            submission
+                .reusable_workflow_shas
+                .get("o/r/.github/workflows/reusable.yml@main")
+                .map(String::as_str),
+            Some(sha),
+            "the resolved SHA must be pinned"
+        );
+
+        // Both fetches went through the labeled sender: the stub saw them,
+        // the anonymous bucket's breaker observed them, and the workflows
+        // subsystem accounts for them.
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "commit SHA + contents fetches"
+        );
+        let usage = shared
+            .state
+            .github_consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == GithubSubsystem::Workflows.as_str())
+            .expect("workflows subsystem must be in the snapshot");
+        assert_eq!(usage.requests, 2);
+        assert!(
+            shared
+                .state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::Anonymous)
+                .acquire()
+                .is_ok(),
+            "successful fetches must leave the bucket closed"
+        );
+    }
+
+    /// A throttled PAT bucket fails the submission-time fetch fast instead of
+    /// spending the (already exhausted) budget: the error surfaces as a
+    /// gateway error, not a hang.
+    #[tokio::test]
+    async fn throttled_pat_bucket_fails_remote_workflow_fetch_fast() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().join("state").to_path_buf())
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        // Park the PAT bucket the way a 429 would.
+        shared
+            .state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Pat)
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(std::time::Duration::from_secs(60)),
+                },
+                "429",
+            );
+
+        let yaml = "on: push\njobs:\n  call:\n    uses: o/r/.github/workflows/reusable.yml@main\n";
+        let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
+        let mut submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            ..Default::default()
+        };
+        // A token is configured so the PAT bucket governs (anonymous would
+        // be a different, open bucket).
+        let error = resolve_remote_workflows(&shared, &mut submission, &workflow, Some("pat-x"))
+            .await
+            .expect_err("a parked PAT bucket must fail the fetch");
+        assert!(
+            error.message().contains("circuit breaker is open"),
+            "must fail fast on the open breaker, got: {}",
+            error.message()
+        );
     }
 }

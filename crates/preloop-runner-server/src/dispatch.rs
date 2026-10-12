@@ -29,6 +29,7 @@ use crate::control::backend::ControlBackend as _;
 use crate::dispatch_auth::DispatchIdentity;
 use crate::events::EventAdapter;
 use crate::events::trust_tier::TrustTier;
+use crate::github::resolve_ref_protected;
 use crate::state::SharedState;
 use crate::{ApiError, RunAccepted, WorkflowSubmission, errors::ApiErrorKind};
 
@@ -116,6 +117,7 @@ pub async fn workflow_dispatch(
         effective,
         &filename,
         &sha,
+        resolve_ref_protected(&shared, &repository, &git_ref).await,
         &identity,
     );
     submit_and_report(&shared, submission, &repository, &sha).await?;
@@ -170,6 +172,9 @@ pub async fn repository_dispatch(
             ApiError::bad_gateway(format!("failed to fetch workflows at {git_ref}: {error}"))
         })?;
 
+    // Every workflow this broadcast fans out to runs on the default branch.
+    let ref_protected = resolve_ref_protected(&shared, &repository, &git_ref).await;
+
     for (filename, content) in workflows {
         let payload = json!({
             "action": event_type,
@@ -195,6 +200,7 @@ pub async fn repository_dispatch(
             effective,
             &filename,
             &sha,
+            ref_protected,
             &identity,
         );
         match submit_and_report(&shared, submission, &repository, &sha).await {
@@ -491,6 +497,7 @@ fn submission_from_effective(
     effective: crate::events::EffectiveEvent,
     filename: &str,
     sha: &str,
+    ref_protected: bool,
     identity: &DispatchIdentity,
 ) -> WorkflowSubmission {
     WorkflowSubmission {
@@ -521,6 +528,7 @@ fn submission_from_effective(
         resolved_sha: Some(sha.to_owned()),
         status_check_sha: Some(sha.to_owned()),
         filter_branch: None,
+        ref_protected,
         dispatch_inputs: BTreeMap::new(),
         dispatch_inputs_stringified: BTreeMap::new(),
         selected_jobs: vec![],

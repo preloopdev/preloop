@@ -11,8 +11,8 @@ mod common;
 use common::*;
 
 use preloop_runner_server::merge_builder::{
-    MergeError, MergeHead, MergeOutcome, MergeRequest, MergeSource, attach_prebuilt_merge,
-    build_merge, prebuilt_merge_record, webhook_merge_source,
+    MergeError, MergeHead, MergeOutcome, MergeRequest, attach_prebuilt_merge, build_merge,
+    prebuilt_merge_record, webhook_merge_source,
 };
 use std::path::{Path, PathBuf};
 
