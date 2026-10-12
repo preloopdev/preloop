@@ -100,6 +100,12 @@ Releases before v0.27.0 predate the changelog.
   be under `.github/workflows/`, with segments of letters, digits, `-`, `_` and
   `.` only: a `..` segment, an empty or absolute path, or any other character
   is refused before a request is sent.
+
+- **Breaker refusals are typed and the webhook queue gate sees live probes**:
+  action downloads answer `503` only for a real breaker refusal, and the queue
+  stops claiming while a half-open probe is in flight. A failed delivery is
+  parked without spending an attempt only when GitHub is down or its own
+  credential bucket is throttled, not whenever any bucket is.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
