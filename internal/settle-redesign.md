@@ -30,33 +30,31 @@ settle_job(run_id, job_id, status):
      on each free gate holding one of the settled legs' cohort waiters (FIFO)
   8. Refresh `remaining_needs` for the dependents of everything that just
      turned terminal (one indexed UPDATE per settled job; it returns the
-     dependents left `blocked` with no needs outstanding), and check each
-     settled job's cohort for a parked leg a freed slot can take; the settle
-     outcome carries both by id
+     dependents left `blocked` with no needs outstanding), and note each
+     settled job's cohort for parked-leg admission
   9. Summarize the run from the DB aggregate; on the first terminal
      transition release the workflow-level hold and emit run.completed.v1
  10. Emit job.completed.v1 for every job this completion concluded (the job,
      its fail-fast siblings, the folded callers)
- 11. If step 8 left a dependent unblocked or a cohort admissible: run the
-     shared promotion sweep over the loaded graph (one `promote_after_settle`
-     step, shared by `settle_job` and `complete_job`)
+ 11. Promote: admit the parked legs of the settled cohorts a freed slot can
+     take, over their own rows; then, if step 8 left a dependent unblocked, run
+     the shared promotion sweep over the loaded graph
 ```
 
-Step 11 is the only part of a completion that still loads the run graph.
-Promotion is the one step whose decisions — needs hydration into the runner
-message, job/JobSet gate admission, max-parallel cohorts, deferred matrix
-expansion, unhostable `runs-on` rejection — are not expressible as
-conditional writes, and `Sweep::promote` is the single implementation of
-them. It runs only when the completion actually unblocked something: a
-dependent became promotable, or a parked leg of the settled leg's cohort can
-take the freed slot. A matrix leg that frees no slot, or any completion with
-no dependents, never materializes the run.
-
-A capped cohort is the exception that remains. While a parked leg and a free
-slot coexist, every completion of that cohort runs the sweep and so loads the
-run. Admitting the parked leg on a leg-scoped view, without that load, is the
-follow-up. Porting the whole promotion to targeted writes (the way lite's
-`promote_run` does it) is the longer one.
+Step 11 is the only part of a completion that still loads the run graph, and
+only to promote dependents. Promotion's decisions — needs hydration into the
+runner message, job/JobSet gate admission, max-parallel cohorts, deferred
+matrix expansion, unhostable `runs-on` rejection — are not expressible as
+conditional writes. `Sweep::promote` is the implementation for dependents; it
+runs only when the completion actually unblocked a dependent. A completion with
+no dependents never materializes the run, and neither does a matrix leg that
+frees a slot: a parked leg of the settled leg's cohort is admitted over its own
+rows (`promote::admit_cohorts`), reading the leg's `jobs`, `job_specs`,
+`job_messages` and `job_needs` rows, its direct needs through a `NeedsView`
+and the run's submission when a gate or environment needs it. The pure
+decisions (environment name and verdict, job gate evaluation) are shared with
+`Sweep::promote` through `promote.rs`. Porting dependent promotion the same
+way is the follow-up.
 
 ## Lock Scope Decision
 
@@ -266,7 +264,13 @@ only the trigger (per-job targeted instead of whole-run scan).
   `CompletionApplied` and the graph-based `enqueue_cancellation` (no callers
   once the targeted settle landed)
 
-Still graph-backed: promotion of newly-unblocked dependents and of capped cohort legs (step 11 above).
+Dependents the completion unblocked are still promoted over the loaded graph
+(step 11 above). Parked legs of capped cohorts are job-scoped: they are
+admitted in job-id order over their own rows by `promote::admit_cohorts`
+(one candidate query per step; a leg that settles at its `if:`/label/
+environment/gate check frees the slot and admission continues), through
+`promote::promote_one`, the job-scoped hydrate → environment → gate → enqueue
+routine.
 
 ## What Stays Unchanged
 

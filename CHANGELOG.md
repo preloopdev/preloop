@@ -94,10 +94,12 @@ Releases before v0.27.0 predate the changelog.
   attempt, fail-fast the siblings, fold reusable callers, retry cohort waiters
   parked behind a gate, refresh the dependents' `remaining_needs` and summarize
   the run with targeted statements. The graph is materialized only when a
-  completion makes a dependent promotable or a parked leg of the settled leg's
-  `max-parallel` cohort can take the freed slot. Promotion (needs hydration,
-  gates, deferred expansion) still runs the shared sweep, so a capped matrix
-  loads the run on each completion while a parked leg and a free slot coexist.
+  completion makes a dependent promotable. Promotion of a dependent (needs
+  hydration, gates, deferred expansion) still runs the shared sweep. Parked
+  legs of a `max-parallel` cohort that a freed slot can take are admitted in
+  job-id order over their own rows (needs hydration, `runs-on` labels,
+  environment approval, `concurrency:` gates); a leg that settles at its `if:`
+  or at a gate frees its slot and admission continues.
   Fail-fast now cancels every non-terminal sibling of the base, releasing its
   concurrency hold and queueing the runner cancellation, matching the SQLite
   path. Deferred reusable callers record their expanded subtree, so they fold

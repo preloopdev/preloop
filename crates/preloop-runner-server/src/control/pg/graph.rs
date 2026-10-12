@@ -154,6 +154,14 @@ pub(super) struct RunGraph {
     pub(crate) touched: bool,
 }
 
+/// The run-level inputs a single job's promotion needs, read without the
+/// run's nodes ([`PgBackend::load_run_scope`]).
+pub(super) struct RunScope {
+    pub(crate) namespace: String,
+    pub(crate) submission: Arc<WorkflowSubmission>,
+    pub(crate) github: serde_json::Value,
+}
+
 impl RunGraph {
     /// The working view: job id -> status, in `jobs`-row order.
     pub(crate) fn statuses(&self) -> BTreeMap<JobId, ExecutionStatus> {
@@ -297,6 +305,145 @@ pub(crate) fn queue_state_str(state: QueueState) -> &'static str {
     }
 }
 
+/// The `SELECT … FROM jobs ⨝ job_specs ⨝ job_messages` every [`Node`] read
+/// shares; callers append their own `WHERE`. [`decode_node`] reads its columns.
+macro_rules! node_select {
+    () => {
+        concat!(
+            "SELECT j.job_id, j.kind, j.parent_job_id, j.base_id, j.status, \
+             j.queue_state, j.remaining_needs, j.pool_key, j.runs_on::text, \
+             j.runner_group, j.priority, j.run_order, j.job_order, \
+             j.outputs::text, j.annotations::text, j.check_run_id, ",
+            us!("j.created_at"),
+            ", ",
+            us!("j.deps_ready_at"),
+            ", ",
+            us!("j.concurrency_wait_at"),
+            ", ",
+            us!("j.concurrency_acquired_at"),
+            ", ",
+            us!("j.started_at"),
+            ", ",
+            us!("j.completed_at"),
+            ", j.claimed_by_runner_id, ",
+            us!("j.claimed_at"),
+            ", ",
+            us!("j.enqueued_at"),
+            ", j.expand_generation, \
+             s.display_name, s.display_order, s.if_condition, s.matrix::text, \
+             s.deferred_matrix, s.max_parallel, s.environment::text, \
+             s.concurrency::text, s.reusable_call::text, s.fail_fast, \
+             s.continue_on_error, s.id_token_granted, s.oidc_environment, \
+             s.oidc_job_workflow_ref, s.oidc_job_workflow_sha, \
+             m.condition_context::text, m.secret_names::text, \
+             j.environment_gate::text, j.request_id \
+             FROM jobs j \
+             LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+             LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id"
+        )
+    };
+}
+
+/// One [`node_select!`] row decoded. `has_children` is left `false`: whether
+/// another node names this one as its parent is a fact about the whole run,
+/// which the caller resolves (or, reading one leg, knows is false).
+fn decode_node(row: &tokio_postgres::Row, needs: Vec<JobId>) -> Result<Node, ControlError> {
+    let job_id = JobId(row.get::<_, String>(0));
+    let concurrency: Option<preloop_gha_parser::Concurrency> = row
+        .get::<_, Option<String>>(33)
+        .map(|text| decode_concurrency(&text))
+        .transpose()?;
+    let reusable: Option<ReusableNodeSpec> = row
+        .get::<_, Option<String>>(34)
+        .map(|text| decode_reusable(&text))
+        .transpose()?;
+    Ok(Node {
+        kind: NodeKind::parse(row.get(1)),
+        parent_job_id: row.get(2),
+        base_id: row.get(3),
+        status: job_status(row.get(4)),
+        queue_state: queue_state(row.get(5)),
+        remaining_needs: row.get(6),
+        pool_key: row.get(7),
+        runs_on: row
+            .get::<_, Option<String>>(8)
+            .map(|t| codec::from_json(&t))
+            .transpose()?
+            .unwrap_or_default(),
+        runner_group: row.get(9),
+        priority: row.get::<_, i32>(10),
+        run_order: row.get(11),
+        job_order: row.get(12),
+        outputs: row
+            .get::<_, Option<String>>(13)
+            .map(|t| serde_json::from_str(&t))
+            .transpose()
+            .map_err(ControlError::backend)?,
+        annotations: row
+            .get::<_, Option<String>>(14)
+            .map(|t| serde_json::from_str(&t))
+            .transpose()
+            .map_err(ControlError::backend)?,
+        check_run_id: row.get(15),
+        request_id: row.get(44),
+        created_at_us: row.get::<_, Option<i64>>(16).unwrap_or(0),
+        deps_ready_at_us: row.get(17),
+        concurrency_wait_at_us: row.get(18),
+        concurrency_acquired_at_us: row.get(19),
+        started_at_us: row.get(20),
+        completed_at_us: row.get(21),
+        claimed_by_runner_id: row.get(22),
+        claimed_at_us: row.get(23),
+        enqueued_at_us: row.get(24),
+        expand_generation: row.get(25),
+        display_name: row
+            .get::<_, Option<String>>(26)
+            .unwrap_or_else(|| job_id.0.clone()),
+        display_order: row.get::<_, Option<i32>>(27).unwrap_or(0),
+        if_condition: row.get(28),
+        matrix: row
+            .get::<_, Option<String>>(29)
+            .map(|t| decode_matrix(&t))
+            .transpose()?
+            .unwrap_or_default(),
+        deferred_matrix: row.get(30),
+        max_parallel: row.get::<_, Option<i32>>(31).map(|v| v.max(0) as u64),
+        environment: row
+            .get::<_, Option<String>>(32)
+            .map(|t| serde_json::from_str(&t))
+            .transpose()
+            .map_err(ControlError::backend)?,
+        concurrency,
+        reusable,
+        fail_fast: row.get(35),
+        continue_on_error: row.get(36),
+        id_token_granted: row.get::<_, Option<bool>>(37).unwrap_or(false),
+        oidc: crate::state::OidcJobContext {
+            environment: row.get(38),
+            job_workflow_ref: row.get(39),
+            job_workflow_sha: row.get(40),
+        },
+        needs,
+        condition_context: row
+            .get::<_, Option<String>>(41)
+            .map(|t| decode_context(&t))
+            .transpose()?
+            .unwrap_or_default(),
+        secret_names: row
+            .get::<_, Option<String>>(42)
+            .map(|t| codec::from_json(&t))
+            .transpose()?
+            .unwrap_or_default(),
+        // Fail closed: a present-but-unreadable gate reloads as the
+        // empty gate, which re-arms the wait/approval instead of
+        // dropping it.
+        environment_gate: row
+            .get::<_, Option<String>>(43)
+            .map(|t| serde_json::from_str(&t).unwrap_or_default()),
+        has_children: false,
+    })
+}
+
 impl PgBackend {
     /// Lock a run row for this command's writes (`FOR NO KEY UPDATE` — the
     /// per-run mutex: exclusive between commands, but it does not block the
@@ -387,37 +534,8 @@ impl PgBackend {
         let job_rows = tx
             .query(
                 concat!(
-                    "SELECT j.job_id, j.kind, j.parent_job_id, j.base_id, j.status, \
-                     j.queue_state, j.remaining_needs, j.pool_key, j.runs_on::text, \
-                     j.runner_group, j.priority, j.run_order, j.job_order, \
-                     j.outputs::text, j.annotations::text, j.check_run_id, ",
-                    us!("j.created_at"),
-                    ", ",
-                    us!("j.deps_ready_at"),
-                    ", ",
-                    us!("j.concurrency_wait_at"),
-                    ", ",
-                    us!("j.concurrency_acquired_at"),
-                    ", ",
-                    us!("j.started_at"),
-                    ", ",
-                    us!("j.completed_at"),
-                    ", j.claimed_by_runner_id, ",
-                    us!("j.claimed_at"),
-                    ", ",
-                    us!("j.enqueued_at"),
-                    ", j.expand_generation, \
-                     s.display_name, s.display_order, s.if_condition, s.matrix::text, \
-                     s.deferred_matrix, s.max_parallel, s.environment::text, \
-                     s.concurrency::text, s.reusable_call::text, s.fail_fast, \
-                     s.continue_on_error, s.id_token_granted, s.oidc_environment, \
-                     s.oidc_job_workflow_ref, s.oidc_job_workflow_sha, \
-                     m.condition_context::text, m.secret_names::text, \
-                     j.environment_gate::text, j.request_id \
-                     FROM jobs j \
-                     LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
-                     LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
-                     WHERE j.run_id = $1::text::uuid ORDER BY j.job_id"
+                    node_select!(),
+                    " WHERE j.run_id = $1::text::uuid ORDER BY j.job_id"
                 ),
                 &[&run],
             )
@@ -442,99 +560,7 @@ impl PgBackend {
 
         for row in &job_rows {
             let job_id = JobId(row.get::<_, String>(0));
-            let concurrency: Option<preloop_gha_parser::Concurrency> = row
-                .get::<_, Option<String>>(33)
-                .map(|text| decode_concurrency(&text))
-                .transpose()?;
-            let reusable: Option<ReusableNodeSpec> = row
-                .get::<_, Option<String>>(34)
-                .map(|text| decode_reusable(&text))
-                .transpose()?;
-            let node = Node {
-                kind: NodeKind::parse(row.get(1)),
-                parent_job_id: row.get(2),
-                base_id: row.get(3),
-                status: job_status(row.get(4)),
-                queue_state: queue_state(row.get(5)),
-                remaining_needs: row.get(6),
-                pool_key: row.get(7),
-                runs_on: row
-                    .get::<_, Option<String>>(8)
-                    .map(|t| codec::from_json(&t))
-                    .transpose()?
-                    .unwrap_or_default(),
-                runner_group: row.get(9),
-                priority: row.get::<_, i32>(10),
-                run_order: row.get(11),
-                job_order: row.get(12),
-                outputs: row
-                    .get::<_, Option<String>>(13)
-                    .map(|t| serde_json::from_str(&t))
-                    .transpose()
-                    .map_err(ControlError::backend)?,
-                annotations: row
-                    .get::<_, Option<String>>(14)
-                    .map(|t| serde_json::from_str(&t))
-                    .transpose()
-                    .map_err(ControlError::backend)?,
-                check_run_id: row.get(15),
-                request_id: row.get(44),
-                created_at_us: row.get::<_, Option<i64>>(16).unwrap_or(0),
-                deps_ready_at_us: row.get(17),
-                concurrency_wait_at_us: row.get(18),
-                concurrency_acquired_at_us: row.get(19),
-                started_at_us: row.get(20),
-                completed_at_us: row.get(21),
-                claimed_by_runner_id: row.get(22),
-                claimed_at_us: row.get(23),
-                enqueued_at_us: row.get(24),
-                expand_generation: row.get(25),
-                display_name: row
-                    .get::<_, Option<String>>(26)
-                    .unwrap_or_else(|| job_id.0.clone()),
-                display_order: row.get::<_, Option<i32>>(27).unwrap_or(0),
-                if_condition: row.get(28),
-                matrix: row
-                    .get::<_, Option<String>>(29)
-                    .map(|t| decode_matrix(&t))
-                    .transpose()?
-                    .unwrap_or_default(),
-                deferred_matrix: row.get(30),
-                max_parallel: row.get::<_, Option<i32>>(31).map(|v| v.max(0) as u64),
-                environment: row
-                    .get::<_, Option<String>>(32)
-                    .map(|t| serde_json::from_str(&t))
-                    .transpose()
-                    .map_err(ControlError::backend)?,
-                concurrency,
-                reusable,
-                fail_fast: row.get(35),
-                continue_on_error: row.get(36),
-                id_token_granted: row.get::<_, Option<bool>>(37).unwrap_or(false),
-                oidc: crate::state::OidcJobContext {
-                    environment: row.get(38),
-                    job_workflow_ref: row.get(39),
-                    job_workflow_sha: row.get(40),
-                },
-                needs: needs.get(&job_id).cloned().unwrap_or_default(),
-                condition_context: row
-                    .get::<_, Option<String>>(41)
-                    .map(|t| decode_context(&t))
-                    .transpose()?
-                    .unwrap_or_default(),
-                secret_names: row
-                    .get::<_, Option<String>>(42)
-                    .map(|t| codec::from_json(&t))
-                    .transpose()?
-                    .unwrap_or_default(),
-                // Fail closed: a present-but-unreadable gate reloads as the
-                // empty gate, which re-arms the wait/approval instead of
-                // dropping it.
-                environment_gate: row
-                    .get::<_, Option<String>>(43)
-                    .map(|t| serde_json::from_str(&t).unwrap_or_default()),
-                has_children: false,
-            };
+            let node = decode_node(row, needs.get(&job_id).cloned().unwrap_or_default())?;
             nodes.insert(job_id, node);
         }
 
@@ -727,6 +753,82 @@ impl PgBackend {
             submission,
             github,
             touched: false,
+        }))
+    }
+
+    /// One node read from its own rows (`jobs` ⨝ `job_specs` ⨝ `job_messages`
+    /// plus its `job_needs`), without the run's other nodes. `None` when the
+    /// job has no row. `has_children` is `false`: a leg or plain job has none.
+    pub(super) async fn load_node(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<Node>, ControlError> {
+        let run = run_id.0.to_string();
+        let Some(row) = tx
+            .query_opt(
+                concat!(
+                    node_select!(),
+                    " WHERE j.run_id = $1::text::uuid AND j.job_id = $2"
+                ),
+                &[&run, &job_id.0],
+            )
+            .await
+            .map_err(db)?
+        else {
+            return Ok(None);
+        };
+        let needs = tx
+            .query(
+                "SELECT needs_job_id FROM job_needs \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 ORDER BY position",
+                &[&run, &job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .iter()
+            .map(|row| JobId(row.get(0)))
+            .collect();
+        decode_node(&row, needs).map(Some)
+    }
+
+    /// The run-level inputs a job's promotion reads: its namespace, the
+    /// submission payload and the GitHub context. One statement.
+    pub(super) async fn load_run_scope(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+    ) -> Result<Option<RunScope>, ControlError> {
+        let Some(row) = tx
+            .query_opt(
+                "SELECT r.namespace_id, s.submission::text, s.github_context::text \
+                 FROM runs r \
+                 LEFT JOIN run_submissions s ON s.run_id = r.run_id \
+                 WHERE r.run_id = $1::text::uuid",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .map_err(db)?
+        else {
+            return Ok(None);
+        };
+        let (submission, github) = match row.get::<_, Option<String>>(1) {
+            Some(submission) => (
+                Arc::new(
+                    serde_json::from_str::<WorkflowSubmission>(&submission)
+                        .map_err(ControlError::backend)?,
+                ),
+                serde_json::from_str(row.get::<_, String>(2).as_str())
+                    .map_err(ControlError::backend)?,
+            ),
+            None => (
+                Arc::new(WorkflowSubmission::default()),
+                serde_json::Value::Null,
+            ),
+        };
+        Ok(Some(RunScope {
+            namespace: row.get(0),
+            submission,
+            github,
         }))
     }
 
