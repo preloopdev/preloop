@@ -6282,7 +6282,9 @@ jobs:
             .lock()
             .iter()
             .skip(before)
-            .filter(|(method, _, _)| method == "POST" || method == "PATCH")
+            .filter(|(method, path, _)| {
+                (method == "POST" || method == "PATCH") && path.contains("/check-runs")
+            })
             .cloned()
             .collect();
         assert_eq!(writes.len(), 1);
@@ -6293,7 +6295,7 @@ jobs:
                 .lock()
                 .iter()
                 .skip(before)
-                .any(|(method, _, _)| method == "POST"),
+                .any(|(method, path, _)| method == "POST" && path.contains("/check-runs")),
             "no duplicate POST"
         );
     }
@@ -6395,7 +6397,11 @@ jobs:
         assert_eq!(lookups.len(), 1, "one reconciliation lookup: {lookups:?}");
         assert!(lookups[0].contains("check_name=build"), "{lookups:?}");
         assert!(lookups[0].contains("app_id=424"), "{lookups:?}");
-        let writes = check_run_writes(&requests);
+        // Token mints are POSTs too; only the check-run writes count here.
+        let writes: Vec<_> = check_run_writes(&requests)
+            .into_iter()
+            .filter(|(_, path, _)| path.contains("/check-runs"))
+            .collect();
         assert_eq!(writes.len(), 1, "one write only: {writes:?}");
         assert_eq!(writes[0].0, "PATCH");
         assert!(writes[0].1.ends_with("/check-runs/9001"));
