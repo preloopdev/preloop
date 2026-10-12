@@ -212,7 +212,9 @@ pub struct UnknownJobSelection {
 /// Keep only the jobs a `--job` / `selected_jobs` request runs: the requested
 /// jobs plus their transitive `needs:` closure.
 ///
-/// Jobs match by base id, so requesting a job runs every matrix cell of it. A
+/// The closure walks base job ids, and every matrix cell of a base job runs
+/// together. Expansion rewrites a `needs:` on a matrix job to the cells it
+/// names (`build (linux)`), so those cells map back to their base job first. A
 /// reusable caller can also be requested by its own matrix-suffixed node
 /// (`call (linux)`). An empty request keeps the whole plan. The submission path
 /// and the CLI's secret preflight both call this, so they run the same jobs.
@@ -225,13 +227,24 @@ pub fn retain_selected_jobs(
     if selected.is_empty() {
         return Ok(());
     }
+    // Expansion rewrites a `needs:` on a matrix job to the cells it names, so
+    // map each named cell back to its base job before walking the graph.
+    let base_of: BTreeMap<&str, &str> = jobs
+        .iter()
+        .map(|job| (job.id.0.as_str(), job.base_id.as_str()))
+        .collect();
     let pairs: Vec<(String, Vec<String>)> = jobs
         .iter()
         .map(|job| {
-            (
-                job.base_id.clone(),
-                job.needs.iter().map(|need| need.0.clone()).collect(),
-            )
+            let needs = job
+                .needs
+                .iter()
+                .map(|need| match base_of.get(need.0.as_str()) {
+                    Some(base) => (*base).to_owned(),
+                    None => need.0.clone(),
+                })
+                .collect();
+            (job.base_id.clone(), needs)
         })
         .collect();
     let mut known: BTreeSet<&str> = pairs.iter().map(|(id, _)| id.as_str()).collect();
@@ -714,5 +727,18 @@ mod tests {
         assert_eq!(error.unknown, ["tset"]);
         assert_eq!(error.available, ["build", "docs", "lint", "test"]);
         assert_eq!(plan_ids(&jobs), ["lint", "build", "test", "docs"]);
+    }
+
+    #[test]
+    fn selection_follows_needs_on_a_matrix_job_to_all_of_its_cells() {
+        // Expansion rewrites `needs: build` to the cells it names.
+        let mut jobs = vec![
+            job_plan("build (linux)", "build", &[]),
+            job_plan("build (macos)", "build", &[]),
+            job_plan("test", "test", &["build (linux)", "build (macos)"]),
+            job_plan("docs", "docs", &[]),
+        ];
+        retain_selected_jobs(&mut jobs, &selected(&["test"])).unwrap();
+        assert_eq!(plan_ids(&jobs), ["build (linux)", "build (macos)", "test"]);
     }
 }

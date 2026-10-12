@@ -5175,6 +5175,30 @@ jobs:
     }
 
     #[test]
+    fn secret_preflight_job_includes_the_matrix_cells_it_needs() {
+        let workflow = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, macos]
+    steps:
+      - run: echo "${{ secrets.BUILD_TOKEN }}"
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#;
+        assert_eq!(
+            missing_secrets_for(workflow, &["test"], &[]),
+            Some(names(&["BUILD_TOKEN"]))
+        );
+    }
+
+    #[test]
     fn secret_preflight_unknown_job_defers_to_the_submission() {
         assert!(
             run_secret_requirements(

@@ -948,6 +948,58 @@ async fn selected_jobs_empty_runs_all_workflow_jobs() {
 }
 
 #[tokio::test]
+async fn selected_jobs_keeps_every_matrix_cell_a_selected_job_needs() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = try_req(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, macos]
+    steps:
+      - run: echo build
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+"#,
+            "event": "push",
+            "repository": "owner/repo",
+            "selected_jobs": ["test"]
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a job's needs on a matrix job must select all of its cells: {body}"
+    );
+    let inner = state.test_tx().await;
+    let run = inner.runs.values().next().unwrap();
+    let job_ids: BTreeSet<String> = run.job_base_ids.keys().map(|id| id.0.clone()).collect();
+    assert_eq!(
+        job_ids,
+        BTreeSet::from([
+            "build (linux)".to_owned(),
+            "build (macos)".to_owned(),
+            "test".to_owned(),
+        ])
+    );
+}
+
+#[tokio::test]
 async fn agent_request_patch_targets_only_the_request_id() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
