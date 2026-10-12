@@ -732,7 +732,11 @@ pub async fn run_broker_loop(
                                 delete_broker_session(&client, &token, &mut session_id).await;
                                 need_session = true;
                                 if let Some(new_url) = re_resolve_broker_url(http, &config.settings.server_url).await {
-                                    info!("New broker URL after migration: {new_url}");
+                                    // Never log a URL with userinfo intact; the broker
+                                    // URL is operator-configured but defense in depth
+                                    // costs nothing here.
+                                    let shown = preloop_gha_protocol::masking::strip_url_userinfo(&new_url);
+                                    info!("New broker URL after migration: {shown}");
                                     client = BrokerClient::new(http.clone(), new_url.trim_end_matches('/').to_string());
                                 }
                             }

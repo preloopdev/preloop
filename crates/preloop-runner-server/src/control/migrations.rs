@@ -33,7 +33,7 @@ pub(crate) const LEDGER_TABLE: &str = "refinery_schema_history";
 /// refinery without `int8-versions`): 10-digit `YYYYMMDDNN` stamps, not
 /// 14-digit timestamps.
 pub(crate) const MIGRATIONS: &[i32] = &[
-    2026100501, 2026100502, 2026100503, 2026100504, 2026100505, 2026100506, 2026100507,
+    2026100501, 2026100502, 2026100503, 2026100504, 2026100505, 2026100506, 2026100507, 2026100508,
 ];
 
 /// The newest migration this build ships.

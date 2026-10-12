@@ -119,25 +119,40 @@ pub async fn require_results_bearer(
 
 /// Authorize `/twirp-blob/{kind}/{token}` requests.
 ///
-/// The blob endpoints are bearerless by protocol design — the Azure SDK in
+/// The blob endpoints are bearerless by protocol design: the Azure SDK in
 /// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
-/// without attaching the job bearer — so the gate cannot simply require a
+/// without attaching the job bearer, so the gate cannot simply require a
 /// bearer without breaking wire compatibility with the official toolkit.
-/// Instead it enforces three properties:
+/// Instead it enforces four properties:
 ///   1. the kind is allowlisted and the token is decode-then-validated, so no
 ///      request can address outside `<state_dir>/blobs/{kind}/`;
 ///   2. the token must be a server-signed blob JWT (`sub: preloop-blob`,
-///      `kind` matching the path) — arbitrary tokens address nothing, which
+///      `kind` matching the path) - arbitrary tokens address nothing, which
 ///      kills the unauthenticated PUT-to-anything repro, and minted URLs
 ///      survive engine restarts since validity is the signature, not a
 ///      registration map;
-///   3. writes require the owning job to still be live: the JWT's `job`
+///   3. the token's `op` claim pins the exact operation and `job` names the
+///      minting owner (never empty): a download URL (`read`) rejects PUT
+///      with 403 and an upload URL (`write`) rejects GET with 403 - a
+///      bearerless PUT to a signed download URL can no longer overwrite the
+///      finalized blob (round-3 finding 3);
+///   4. writes require the owning job to still be live: the JWT's `job`
 ///      claim names the owner recorded at mint time, so a completed job's
 ///      upload URL stops working immediately instead of at TTL sweep. A
-///      presented bearer is verified and must match the `job` claim.
+///      presented bearer is verified and must match the `job` claim. The
+///      `system` owner (control-plane-minted URLs) skips the liveness check,
+///      as it did when empty owners meant "system".
+///   5. diag uploads additionally require the token's `jti` to still be
+///      registered in `diag_upload_tokens`: the per-job cap evicts the
+///      oldest token, and eviction must invalidate — a signature alone
+///      cannot see eviction, so without this a live job could re-mint
+///      forever and accumulate unbounded staging directories. (Consequence:
+///      diag URLs no longer survive an engine restart; the map is
+///      in-memory only. Diag uploads happen immediately after minting, so a
+///      restart in between was already a lost upload.)
 ///
-/// Reads stay bearer-optional — the unguessable, server-minted URL is the
-/// credential, the same SAS-style model as `/replay/results/*` — because the
+/// Reads stay bearer-optional - the unguessable, server-minted URL is the
+/// credential, the same SAS-style model as `/replay/results/*` - because the
 /// download clients are equally bearerless.
 async fn authorize_blob_request(
     state: &AppState,
@@ -150,12 +165,50 @@ async fn authorize_blob_request(
     };
     let is_write = request.method() == axum::http::Method::PUT;
 
-    // The signed token is the credential: `job` is the owner recorded at
-    // mint time ("" = minted via the system credential).
+    // The signed token is the credential: `op` pins the exact operation and
+    // `job` names the minting owner (never empty).
     let Some(claims) = crate::blob_store::verify_blob_token(state, &kind, &token) else {
         return Err(ApiError::not_found("blob not found"));
     };
+    let op = crate::blob_store::blob_token_op(&claims);
     let owner = crate::blob_store::blob_token_job(&claims).unwrap_or_default();
+
+    // Operation binding (round-3 finding 3): a download URL must never
+    // accept a PUT, an upload URL must never serve a GET. Tokens minted
+    // before op binding (no `op` claim) or with an empty owner are rejected
+    // the same way.
+    let op_ok = if is_write {
+        op == Some(crate::blob_store::BLOB_OP_WRITE)
+    } else {
+        op == Some(crate::blob_store::BLOB_OP_READ)
+    };
+    if !op_ok || owner.is_empty() {
+        return Err(ApiError::forbidden(
+            "blob token is not valid for this operation",
+        ));
+    }
+
+    // Diag upload tokens are bearerless single-job reservations: the mint
+    // handler records the token's `jti` in `diag_upload_tokens` and evicts
+    // the oldest per job at the cap. A signature alone cannot see eviction,
+    // so an evicted (or never-registered) diag token's PUT must not upload —
+    // otherwise a live job could re-mint forever and accumulate unbounded
+    // staging directories. Membership in the live map is the credential for
+    // diag PUTs, on top of the signature and owner-job liveness checks.
+    if is_write && kind == "diag" {
+        let jti = crate::blob_store::blob_token_jti(&claims)
+            .ok_or_else(|| ApiError::bad_request("malformed blob token"))?;
+        let registered = state
+            .inner
+            .lock()
+            .await
+            .diag_upload_tokens
+            .contains_key(&jti);
+        if !registered {
+            warn!(jti, "rejected diag PUT for evicted or unknown upload token");
+            return Err(ApiError::not_found("blob not found"));
+        }
+    }
 
     match bearer_from_headers(request.headers()) {
         Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
@@ -165,7 +218,7 @@ async fn authorize_blob_request(
                 _ => return Err(ApiError::unauthorized("results-service job token required")),
             };
             if is_write {
-                if !owner.is_empty() && owner == job_id {
+                if owner == job_id {
                     Ok(next.run(request).await)
                 } else {
                     Err(ApiError::forbidden("blob token is not owned by this job"))
@@ -176,9 +229,11 @@ async fn authorize_blob_request(
         }
         // Bearerless Azure-SDK-style flow: the unguessable, server-minted URL
         // is the credential. Writes additionally require the owning job to be
-        // live — a completed job's minted URL must not keep accepting data.
+        // live - a completed job's minted URL must not keep accepting data.
+        // The `system` owner (control-plane-minted URLs) is not a job and
+        // skips this check.
         None => {
-            if is_write && !owner.is_empty() {
+            if is_write && owner != crate::blob_store::BLOB_SYSTEM_OWNER {
                 let job_uuid = owner
                     .parse::<uuid::Uuid>()
                     .map_err(|_| ApiError::forbidden("blob token owner is not a job"))?;

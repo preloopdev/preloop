@@ -168,6 +168,7 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_CREDENTIAL_STORE` | `os` | Credential backend for the engine token and GitHub App/PAT credentials. `os` uses the native keychain/secret-service; `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt — use for headless hosts, containers, and local iteration where repeated keychain prompts are unacceptable); `memory` is non-persistent (tests only) |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run (counted after matrix expansion). API submits expanding past it are rejected with 400 before the insert transaction opens; `0` disables the cap. Webhook deliveries bypass it (a push is never refused) — see [Submit limits](#submit-limits) |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
 Managed engines read their generated token from the OS credential store (or
@@ -210,6 +211,23 @@ rather than refusing to boot — off retains nothing, so a typo costs caching,
 never startup. `GET /api/v1/config/checkout-cache` (native bearer) returns
 the effective policy.
 
+### Actions cache
+
+`actions/cache` entries are finalized into `<state_dir>/cache/` and bounded
+by a total quota with least-recently-used eviction: when a commit pushes the
+total over the quota, the least recently used entries are deleted until the
+total fits again. Uploads stream to disk chunk-by-chunk — a large blob is
+never buffered in server RAM — and downloads stream off disk the same way.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` | `10 GiB` | Total bytes of finalized cache entries kept on disk, across all namespaces; LRU entries are evicted past it |
+
+The same key lives under `[cache]` in the config file (`total_quota_bytes`);
+the environment wins, and an unparseable value fails startup rather than
+silently keeping or dropping cached entries. A single entry larger than the
+quota is kept by the commit that created it and evicted by the next commit.
+
 Objects are namespaced by forge origin, the credential that fetched them (App
 installation, or a PAT fingerprint), and the repository's numeric id — never by
 `owner/repo` or commit sha, so a rename cannot cross namespaces and two
@@ -239,6 +257,7 @@ forever.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PRELOOP_RETENTION_DAYS` | `90` | Days a finished run (plus its checks, statuses, artifacts, and logs) is kept. `0` disables cleanup |
+| `PRELOOP_RERUN_WINDOW_DAYS` | `30` | How long a completed run with at least one failed/cancelled/timed-out job stays in the live control tables so it can be re-run in place (`github.run_attempt` increments on the same run). `0` disables the hold and archives every settled run on the 60-second policy. Retention still wins: a held run past `PRELOOP_RETENTION_DAYS` is deleted. |
 
 The same key lives at the top level of the config file as `retention_days`;
 the environment wins. Only runs that have finished are ever deleted — a
@@ -247,6 +266,51 @@ matter how old it is. A background sweep deletes expired runs once at
 startup and hourly afterwards, from both memory and the durable store, so
 a restart cannot resurrect them. Workflows see the effective value as
 `github.retention_days`.
+
+### Submit limits
+
+One HTTP request used to mean one database transaction: a 20,000-job
+submit held the writer for over a minute (SQLite) or pinned a Postgres
+writer connection until the pool exhausted. Two guards now bound that:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run, counted **after** matrix expansion. An API submit expanding past it is rejected with `400` before the insert transaction opens, so no giant transaction ever starts. `0` disables the cap. |
+
+The same key lives at the top level of the config file as
+`max_jobs_per_run`; the environment wins. The per-namespace quotas
+(`namespace_limits.max_jobs_per_run`, `submit_rate_per_minute`,
+`max_queued_jobs`) remain the finer-grained, opt-in control — the server
+cap is the backstop that is always on.
+
+Webhook deliveries bypass the cap, like the namespace quotas: a push is
+never refused. Their protection is the second guard — the submit insert
+is chunked in slices of 250 jobs, committing between chunks, on both the
+SQLite and Postgres backends. A concurrent control write waits for one
+chunk at most, never the whole insert. If a chunk fails after the run row
+committed, the run is marked completed/failed so a partial submit can
+never dispatch or wedge a concurrency group.
+
+### Diagnostic-log staging
+
+Diagnostic logs upload bearerless to signed per-job URLs
+(`/twirp-blob/diag/{token}`, Azure SDK compat). Each token is a single-job
+reservation recorded in memory: the per-job cap (32) evicts the oldest
+token, and an evicted or unknown token's PUT is rejected, so a re-mint loop
+cannot accumulate unbounded staging directories. The reaper deletes a
+token's staging directory when its reservation expires (1h TTL), and an
+age-based sweep removes any orphaned staging directory older than:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` | `24` | Max age of a `<state_dir>/blobs/diag/` staging directory before the reaper deletes it. `0` disables the age-based sweep (TTL-expired token directories are still reaped) |
+
+The same key lives at the top level of the config file as
+`diag_staging_max_age_hours`; the environment wins. Note the trade-off this
+buys: diag upload URLs are valid only while the engine that minted them is
+running — the token registry is in-memory, so a restart invalidates
+outstanding diag URLs (a runner that minted just before a restart re-mints
+on its next attempt).
 
 ### Runner pool
 
@@ -259,25 +323,27 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_RUNNER_STORAGE_GB` | `80` | Writable guest disk ceiling (sparse — not allocated until written). The packed OCI golden needs ~80 GiB uncompressed |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free space kept on the VM data volume before a job VM is started; below it the pool holds the slot (`waiting for disk: …`) and jobs wait rather than fail. `0` disables |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | — | Proceed past the golden disk check with a warning. Without it, a golden download that cannot fit is refused before it starts, and a golden build is refused below builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB pack staging |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | `6` | Free space the golden unpack waits for, as a multiple of the pack's compressed size. smolvm writes several times the pack before its own layer preflight runs; the engine stalls the unpack rather than ENOSPC mid-write, and a failed attempt prunes its `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses the wait |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
-| `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
-| `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
-| `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
+| `PRELOOP_USE_FORK` | `true` | Run the pool as forks of the golden rather than one boot per job |
+| `PRELOOP_GOLDEN_URL` | release asset | Mirror of the official packed golden. When set it replaces the OCI reference, and the mirror must be verifiable: the checksum is this URL plus `.sha256`, or `PRELOOP_GOLDEN_SHA256` names the digest. An unverified mirror is refused |
+| `PRELOOP_GOLDEN_SHA256` | — | Expected SHA-256 of the packed golden, for mirrors that publish no `.sha256` sidecar |
 | `PRELOOP_GOLDEN_OCI_REF` | per-architecture official GHCR artifacts | OCI packed golden reference downloaded automatically on the matching host architecture |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` | Host-side Node externals directory |
-| `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
+| `PRELOOP_RUNNER_BASE_IMAGE` | — (official golden) | Image a custom golden is baked from, used as-is plus the GitHub-runner machinery. `runs-on: ubuntu-latest`/`ubuntu-24.04` and an unconfigured pool use the official packed golden instead. Wins over the `[golden] base_image` that `preloop init` records |
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
 | `PRELOOP_RUNNER_DNS` | `8.8.8.8` | Resolver used inside guests; override when a different public resolver is preferred |
 | `PRELOOP_RUNNER_PACK_PROXY` / `_NO_PROXY` | — | Proxy and no-proxy values used while downloading and packing golden artifacts |
-| `PRELOOP_WORKSPACE` | — | Workspace context for daemon deployments; not a package or toolchain installation input |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
 
-To add organization-wide software, derive an OCI image from one of Preloop's
-digest-pinned Ubuntu bases and build a custom packed golden. For the complete
-build, checksum, publishing, and runtime configuration flow, see
+To add organization-wide software, publish an OCI image that carries it and
+point `PRELOOP_RUNNER_BASE_IMAGE` (or `[golden] base_image`, which
+`preloop init` records) at it: the image is used exactly as it is, plus the
+GitHub-runner machinery a bake adds. For the complete build, pre-bake, and
+runtime configuration flow, see
 [VM images and version tracking](vm-images.md#adding-organization-wide-software).
 Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.

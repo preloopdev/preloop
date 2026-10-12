@@ -26,6 +26,7 @@ mod lifecycle;
 mod lookups;
 mod outbox;
 mod reaper;
+mod rerun;
 mod runners;
 #[cfg(test)]
 mod tests;

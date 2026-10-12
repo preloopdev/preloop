@@ -771,7 +771,18 @@ pub struct PendingCache {
     pub namespace: String,
     #[serde(default)]
     pub job_backend_id: String,
-    pub bytes: Vec<u8>,
+    /// Absolute path of the on-disk staging file receiving the upload
+    /// chunks. Chunks are appended here as they arrive so a large upload
+    /// never sits in server RAM; `cache_commit` hands the file to
+    /// `CacheStore::commit_file_scoped`, which moves it into the entry
+    /// directory. The TTL sweeper deletes the staging file of abandoned
+    /// reservations.
+    #[serde(default)]
+    pub staging_path: PathBuf,
+    /// Bytes staged so far; the running total the upload caps are enforced
+    /// against.
+    #[serde(default)]
+    pub staging_len: u64,
     /// Unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.
@@ -826,7 +837,10 @@ pub struct ArtifactV2Pending {
 /// The diag blob token is minted per call and handed to the runner, which
 /// PUTs to `/twirp-blob/diag/{token}` bearerless (Azure SDK compat). The
 /// registry binds the token to the owning job so the blob gate can reject
-/// writes from any other job. In-memory only: diag uploads happen
+/// writes from any other job. Eviction invalidates: the gate rejects PUTs
+/// for tokens no longer in the map (evicted by the per-job cap, TTL-swept,
+/// or never registered), so a re-mint loop cannot accumulate unbounded
+/// staging directories. In-memory only: diag uploads happen
 /// immediately after minting, and the TTL sweeper bounds the map.
 #[derive(Debug, Clone)]
 pub struct DiagUploadToken {

@@ -45,34 +45,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.97"
-      - name: Install lld and PostgreSQL ${{ matrix.postgres }}
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
+      - name: Use the image's preinstalled LLD
+        # The official image ships versioned LLVM tools; `-fuse-ld=lld` needs
+        # the unversioned name that `apt install lld` used to provide. Link
+        # the image's own lld-18 instead of paying an apt update per job.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lld curl ca-certificates gnupg
-          sudo install -d /usr/share/postgresql-common/pgdg
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.gpg
-          . /etc/os-release
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}"
-      - name: Start PostgreSQL (trust auth on loopback)
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
+          if [ ! -x /usr/lib/llvm-18/bin/ld.lld ]; then
+            echo "preinstalled ld.lld-18 is missing; the runner image changed" >&2
+            exit 1
+          fi
+          sudo ln -sf /usr/lib/llvm-18/bin/ld.lld /usr/bin/ld.lld
+      - name: Start PostgreSQL ${{ matrix.postgres }} (container)
+        # The server runs in a container the job owns: no apt, no pgdg repo,
+        # no host cluster to configure. Trust auth on loopback matches
+        # PRELOOP_TEST_POSTGRES_URL, and max_connections must clear the
+        # two-node race tests (roughly 204 connections).
         run: |
-          conf="/etc/postgresql/${PG_MAJOR}/main"
-          echo "host all all 127.0.0.1/32 trust" | sudo tee "$conf/pg_hba.conf"
-          echo "local all all trust" | sudo tee -a "$conf/pg_hba.conf"
-          echo "max_connections = 400" | sudo tee -a "$conf/postgresql.conf"
-          sudo pg_ctlcluster "${PG_MAJOR}" main restart
+          image="mirror.gcr.io/library/postgres:${{ matrix.postgres }}"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
           for _ in $(seq 1 30); do
-            psql "$PRELOOP_TEST_POSTGRES_URL" -Atc 'select 1' && exit 0
+            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
             sleep 1
           done
           echo "PostgreSQL did not become ready" >&2
+          docker logs postgres --tail 50 >&2 || true
           exit 1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-nextest
@@ -120,8 +130,19 @@ jobs:
         # ever selects nothing, independent of list output format.
         run: cargo nextest run --locked --no-tests=fail -p preloop-runner-server -E 'test(/^control::/)'
       - name: Target schema applies cleanly
-        run: psql "$PRELOOP_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -q -f docs/control-schema.sql
+        run: |
+          docker cp docs/control-schema.sql postgres:/tmp/control-schema.sql
+          docker exec postgres psql "$PRELOOP_TEST_POSTGRES_URL" \
+            -v ON_ERROR_STOP=1 -q -f /tmp/control-schema.sql
       - name: No leaked per-test databases
         run: |
-          leaked=$(psql "$PRELOOP_TEST_POSTGRES_URL" -Atc "select count(*) from pg_database where datname like 'preloop_t_%'")
+          leaked=$(docker exec postgres psql "$PRELOOP_TEST_POSTGRES_URL" -Atc \
+            "select count(*) from pg_database where datname like 'preloop_t_%'")
           test "$leaked" -eq 0 || { echo "leaked $leaked test databases" >&2; exit 1; }
+      - name: Remove PostgreSQL container
+        # The self-hosted runner host is reused across jobs, and the container
+        # is detached: leave it behind and the next job's
+        # `docker run --name postgres` fails with "name is already in use".
+        # `always()` so a failing test or schema step still cleans up.
+        if: always()
+        run: docker rm -f postgres || true

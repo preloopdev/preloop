@@ -908,7 +908,10 @@ pub(super) fn run_record(
 ) -> Result<Option<RunRecord>, ControlError> {
     let run = codec::run_key(run_id);
     let archived = tx
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM run_history WHERE run_id = ?1)")
+        .prepare_cached(
+            "SELECT NOT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1) \
+                          AND EXISTS(SELECT 1 FROM run_history WHERE run_id = ?1)",
+        )
         .map_err(db)?
         .query_row([&run], |row| row.get::<_, bool>(0))
         .map_err(db)?;
@@ -923,7 +926,7 @@ pub(super) fn run_record(
                     r.fork_approval_pending, r.fork_approval_requested_at, \
                     r.fork_approval_approved_at, r.fork_approval_note, \
                     r.reports_check_runs \
-             FROM run_history r WHERE r.run_id = ?1",
+             FROM run_history r WHERE r.run_id = ?1 ORDER BY r.run_attempt DESC LIMIT 1",
         )
         .map_err(db)?
         .query_row([&run], |row| {
@@ -1044,12 +1047,12 @@ pub(super) fn run_record(
         let mut stmt = tx
             .prepare_cached(
                 "SELECT job_id, status, base_id, outputs FROM job_history h \
-                 WHERE h.run_id = ?1 AND h.run_created_at = ( \
-                     SELECT MAX(run_created_at) FROM job_history \
+                 WHERE h.run_id = ?1 AND h.run_attempt = ( \
+                     SELECT MAX(run_attempt) FROM job_history \
                      WHERE run_id = ?1) \
                  AND NOT (h.kind = 'matrix_parent' AND EXISTS ( \
                      SELECT 1 FROM job_history c WHERE c.run_id = h.run_id \
-                     AND c.run_created_at = h.run_created_at \
+                     AND c.run_attempt = h.run_attempt \
                      AND c.parent_job_id = h.job_id))",
             )
             .map_err(db)?;
@@ -1134,8 +1137,8 @@ pub(super) fn run_record(
         tx.prepare_cached(
             "SELECT job_id, display_name, NULL, NULL, NULL, check_run_id, \
                     annotations, base_id, CAST(NULL AS INTEGER), status FROM job_history \
-             WHERE run_id = ?1 AND run_created_at = ( \
-                 SELECT MAX(run_created_at) FROM job_history WHERE run_id = ?1) \
+             WHERE run_id = ?1 AND run_attempt = ( \
+                 SELECT MAX(run_attempt) FROM job_history WHERE run_id = ?1) \
              ORDER BY job_id",
         )
         .map_err(db)?

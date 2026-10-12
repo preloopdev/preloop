@@ -41,6 +41,25 @@ Invariants worth keeping:
 
 - The watermark **never advances on a failed poll** and never past the grace
   boundary, so no range of history is silently skipped.
+- A store's **first poll adopts the history before it**: with no watermark
+  yet, the watermark starts at the grace boundary. A new store (cutover,
+  deleted state dir) has no rows for deliveries another store already
+  handled, and repairing them would replay three days of closed PRs and
+  superseded pushes. The boundary is drawn and persisted at the first poll
+  *attempt*, before the history call, so a history outage cannot move it
+  forward past deliveries that failed while polling was down. Recover a
+  known gap by redelivering it from GitHub.
+- **Open repairs are retried on every pass**, whatever the watermark says.
+  Judging is one-shot — the watermark advances past everything examined — so
+  a delivery judged missing below it (a redelivery request GitHub refused, a
+  redelivery that never landed, or a repair left by an older build's
+  unfinished first scan) would otherwise never be examined again. The repair
+  table stores the delivery id the redelivery endpoint needs; present
+  deliveries close their rows, the rest retry under the same per-GUID
+  backoff and cap as the scan, so no untracked history is replayed. Each
+  pass reads one App's rows that are still below the attempt cap, so a full
+  window of another App's backlog — or of rows at the cap — can never starve
+  a retryable repair out of it.
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.
@@ -48,6 +67,11 @@ Invariants worth keeping:
   poll would fail anyway.
 - Per-GUID backoff (0, 5m, 15m, 1h, 6h) with a cap; a GUID that hits the cap
   stays **open** as a standing finding rather than disappearing.
+- An attempt is **claimed before the request**: the attempt count and the
+  last-attempt clock move in one conditional store write that only succeeds
+  while the row still looks like the pass's read. Two watchdogs overlapping —
+  a restart, or a second server on the same store — can therefore neither ask
+  GitHub to redeliver the same delivery twice nor charge it twice.
 
 ## Layer 2 — outage circuit breaker
 

@@ -1723,14 +1723,15 @@ impl AppSubscription {
 
 /// Read a GitHub App endpoint as JSON.
 ///
-/// The optional breaker is used by periodic health checks; startup reads pass
-/// `None` because the breaker is not initialized at that point.
+/// The optional breaker registry is used by periodic health checks; startup
+/// reads pass `None` because the registry is not initialized at that point.
+/// App-JWT calls carry the App bucket: the App's own rate-limit identity.
 async fn read_app_json_at(
     api_base: &str,
     path: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-    breaker: Option<&crate::github_breaker::GithubBreaker>,
+    breaker: Option<&crate::github_breaker::GithubBreakerRegistry>,
 ) -> anyhow::Result<serde_json::Value> {
     let app_jwt = sign_app_jwt(app_id, private_key)?;
     let request = CLIENT
@@ -1739,7 +1740,14 @@ async fn read_app_json_at(
         .header("Authorization", format!("Bearer {app_jwt}"))
         .header("Accept", "application/vnd.github+json");
     let response = match breaker {
-        Some(breaker) => crate::github_breaker::send_observed(breaker, request).await?,
+        Some(registry) => {
+            crate::github_breaker::send_observed(
+                registry,
+                crate::github_breaker::GithubCredentialBucket::App,
+                request,
+            )
+            .await?
+        }
         None => request
             .send()
             .await
@@ -1774,7 +1782,7 @@ pub async fn read_app_subscription_at_with_breaker(
     api_base: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-    breaker: Option<&crate::github_breaker::GithubBreaker>,
+    breaker: Option<&crate::github_breaker::GithubBreakerRegistry>,
 ) -> anyhow::Result<AppSubscription> {
     let payload = read_app_json_at(api_base, "/app", app_id, private_key, breaker).await?;
     let events = payload
@@ -1835,7 +1843,7 @@ pub async fn read_app_hook_config_at_with_breaker(
     api_base: &str,
     app_id: &str,
     private_key: &rsa::RsaPrivateKey,
-    breaker: Option<&crate::github_breaker::GithubBreaker>,
+    breaker: Option<&crate::github_breaker::GithubBreakerRegistry>,
 ) -> anyhow::Result<AppHookConfig> {
     let payload =
         read_app_json_at(api_base, "/app/hook/config", app_id, private_key, breaker).await?;

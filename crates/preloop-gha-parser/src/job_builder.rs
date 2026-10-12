@@ -248,7 +248,15 @@ pub fn normalize_github_context(github: &Value) -> Value {
         .entry("graphql_url".to_owned())
         .or_insert_with(|| json!("https://api.github.com/graphql"));
     object.insert("ref_name".to_owned(), json!(ref_name));
-    object.insert("ref_protected".to_owned(), json!(false));
+    // GitHub sends `ref_protected` as a JSON boolean (context data typed
+    // `boolean`, stringified to `true`/`false` only when the runner builds
+    // the env). Keep whatever the server derived from branch protection or
+    // rulesets; a local submission with no context stays unprivileged.
+    let ref_protected = object
+        .get("ref_protected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    object.insert("ref_protected".to_owned(), json!(ref_protected));
     object.insert("ref_type".to_owned(), json!(ref_type));
     object.insert("secret_source".to_owned(), json!("Actions"));
     object
