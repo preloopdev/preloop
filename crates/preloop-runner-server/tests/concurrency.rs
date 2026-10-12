@@ -2793,6 +2793,68 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
         );
     }
 }
+/// A dropped connection to the API is transient: `github_json` must retry the
+/// read before reporting failure, and a still-failing transport must say
+/// "transport error" so `classify` maps it to 502 (upstream outage) rather
+/// than 400 ("did the client push?").
+#[tokio::test]
+async fn github_json_retries_transient_transport_and_marks_errors() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let attempts_server = attempts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let attempt = attempts_server.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0u8; 2048];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            if attempt == 0 {
+                // First connection dies before any response bytes — the
+                // client sees a transport failure, never an HTTP status.
+                drop(stream);
+                continue;
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .unwrap();
+        }
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+
+    let value = crate::github_push::github_json("token", "owner/repo", "GET", "commits/x", None)
+        .await
+        .expect("the retry must succeed once the server answers");
+    assert_eq!(value, json!({}));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "one transport failure, one retry, one success"
+    );
+
+    // A read that never gets an answer fails with a transport marker that
+    // `classify` recognizes as an outage, not a client mistake.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead); // nothing will ever accept
+    let _dead_url = crate::state::TestEnvVar::set(
+        "PRELOOP_GITHUB_API_URL",
+        format!("http://127.0.0.1:{dead_port}"),
+    );
+    let error = crate::github_push::github_json("token", "owner/repo", "GET", "commits/x", None)
+        .await
+        .expect_err("a dead endpoint must still error after retries");
+    assert!(
+        format!("{error:#}").contains("transport error"),
+        "error must classify as upstream outage: {error:#}"
+    );
+}
 
 /// The terminal `Synced` write records `effective_sha`, which is what
 /// makes the push webhook's echo match `already_published`. Losing it

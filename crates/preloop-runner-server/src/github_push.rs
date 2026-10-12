@@ -569,31 +569,56 @@ pub async fn github_json(
             format!("/{path}")
         }
     );
-    let request = client
-        .request(
-            reqwest::Method::from_bytes(method.as_bytes()).expect("fixed methods"),
-            &url,
-        )
-        .header("User-Agent", "preloop")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json");
-    let request = match body {
-        Some(body) => request.json(&body),
-        None => request,
-    };
-    let response = request.send().await?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "GitHub API {} {path} failed with status {}: {}",
-            method,
-            status.as_u16(),
-            text
-        ));
+    // Read-only calls retry on transport failure: a dropped or recycled
+    // connection is indistinguishable from "commit not found" downstream,
+    // and treating it as a user error permanently blocks the push. Writes
+    // are not retried here — a send that may have reached the server must
+    // not be replayed (a second PR/check-run create is worse than a 502).
+    const TRANSPORT_ATTEMPTS: u32 = 3;
+    let read_only = matches!(method, "GET" | "HEAD");
+    let attempts = if read_only { TRANSPORT_ATTEMPTS } else { 1 };
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
+        }
+        let request = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).expect("fixed methods"),
+                &url,
+            )
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json");
+        let request = match &body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "GitHub API {} {path} failed with status {}: {}",
+                method,
+                status.as_u16(),
+                text
+            ));
+        }
+        return serde_json::from_str(&text)
+            .map_err(|error| anyhow::anyhow!("unparsable GitHub response: {error}"));
     }
-    serde_json::from_str(&text)
-        .map_err(|error| anyhow::anyhow!("unparsable GitHub response: {error}"))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request never sent"))).map_err(|error| {
+        anyhow::anyhow!(
+            "GitHub API {method} {path} transport error after {attempts} attempt(s): {error}"
+        )
+    })
 }
 
 /// Map an upstream failure to the right HTTP answer: GitHub being down
@@ -604,6 +629,8 @@ fn classify(message: &str) -> ApiError {
     let text = message.to_lowercase();
     let transient = [
         "status 5",
+        "transport error",
+        "error sending request",
         "connection",
         "timeout",
         "temporary failure",
