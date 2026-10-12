@@ -3117,6 +3117,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         &workflow_path,
         &workflow_yaml,
         &reusable_workflows,
+        args.job.as_slice(),
         &args.secrets,
         args.strict_secrets,
     )
@@ -3871,12 +3872,35 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
     push::push_run(&client, &url, api_token(), &run_id, None).await
 }
 
+/// The secrets the jobs a run executes read, from the parsed workflow.
+///
+/// Without `selected_jobs` that is every job of the workflow. With them it is
+/// only the selected jobs and their `needs:` closure, the same selection the
+/// engine applies at submission, so a secret only an unselected job reads does
+/// not gate this run. `None` when the workflow does not expand here or a
+/// selected id is unknown; the submission reports both with more context.
+fn run_secret_requirements(
+    workflow_yaml: &str,
+    reusable_workflows: &BTreeMap<String, String>,
+    selected_jobs: &[String],
+) -> Option<preloop_gha_parser::SecretRequirements> {
+    let workflow = preloop_gha_parser::parse_workflow(workflow_yaml).ok()?;
+    let mut expanded =
+        preloop_gha_parser::expand_jobs_with_reusables(&workflow, reusable_workflows).ok()?;
+    // Select before materializing: only a selected reusable caller expands its
+    // callee subtree.
+    preloop_gha_parser::dag::retain_selected_jobs(&mut expanded.jobs, selected_jobs).ok()?;
+    let jobs = materialize_plan_jobs(expanded.jobs, reusable_workflows).ok()?;
+    Some(preloop_gha_parser::collect_secret_requirements(&jobs))
+}
+
 /// Report secrets a workflow reads that this engine has not stored.
 ///
 /// The engine resolves `secrets.*` from its own store and never reads
 /// GitHub's — those values are write-only — so a name that is referenced but
 /// not seeded here reaches its step as an empty string. Warn before
 /// submitting; `--strict-secrets` turns the same finding into a failure.
+/// Only the jobs this run executes are checked (see `run_secret_requirements`).
 /// Anything that blocks the preflight itself (unparseable workflow, engine
 /// unreachable) is left to the submission path, which reports it with more
 /// context than a preflight could.
@@ -3884,21 +3908,15 @@ async fn preflight_secrets(
     workflow_path: &std::path::Path,
     workflow_yaml: &str,
     reusable_workflows: &BTreeMap<String, String>,
+    selected_jobs: &[String],
     inline_secrets: &[String],
     strict: bool,
 ) -> anyhow::Result<()> {
-    let Ok(workflow) = preloop_gha_parser::parse_workflow(workflow_yaml) else {
-        return Ok(());
-    };
-    let Ok(expanded) =
-        preloop_gha_parser::expand_jobs_with_reusables(&workflow, reusable_workflows)
+    let Some(requirements) =
+        run_secret_requirements(workflow_yaml, reusable_workflows, selected_jobs)
     else {
         return Ok(());
     };
-    let Ok(jobs) = materialize_plan_jobs(expanded.jobs, reusable_workflows) else {
-        return Ok(());
-    };
-    let requirements = preloop_gha_parser::collect_secret_requirements(&jobs);
     if requirements.is_empty() {
         return Ok(());
     }
@@ -5034,6 +5052,139 @@ fn find_debug_machine(
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    /// `test` reads TEST_TOKEN; `deploy` needs `test` and reads DEPLOY_KEY in
+    /// `production`; `docs` is independent and reads DOCS_TOKEN.
+    const SECRET_SCOPE_WORKFLOW: &str = r#"
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.TEST_TOKEN }}"
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "${{ secrets.DEPLOY_KEY }}"
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.DOCS_TOKEN }}"
+"#;
+
+    fn names(list: &[&str]) -> std::collections::BTreeSet<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// The names a strict preflight would report missing when only `stored`
+    /// secrets are seeded. `None` when the selection cannot be checked.
+    fn missing_secrets_for(
+        workflow: &str,
+        selected: &[&str],
+        stored: &[&str],
+    ) -> Option<std::collections::BTreeSet<String>> {
+        let selected: Vec<String> = selected.iter().map(|job| (*job).to_owned()).collect();
+        let requirements = run_secret_requirements(workflow, &BTreeMap::new(), &selected)?;
+        Some(requirements.missing_from(stored.iter().copied()))
+    }
+
+    #[test]
+    fn secret_preflight_without_job_checks_every_job() {
+        assert_eq!(
+            missing_secrets_for(SECRET_SCOPE_WORKFLOW, &[], &["TEST_TOKEN"]),
+            Some(names(&["DEPLOY_KEY", "DOCS_TOKEN"]))
+        );
+    }
+
+    #[test]
+    fn secret_preflight_job_ignores_secrets_only_unselected_jobs_read() {
+        // `--job test` runs `test` alone, so the secrets `deploy` and `docs`
+        // read do not gate the run.
+        let requirements = run_secret_requirements(
+            SECRET_SCOPE_WORKFLOW,
+            &BTreeMap::new(),
+            &["test".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(requirements.names, names(&["TEST_TOKEN"]));
+        assert!(requirements.by_environment.is_empty());
+        assert_eq!(
+            missing_secrets_for(SECRET_SCOPE_WORKFLOW, &["test"], &["TEST_TOKEN"]),
+            Some(names(&[]))
+        );
+    }
+
+    #[test]
+    fn secret_preflight_job_includes_its_needs_closure() {
+        // `deploy` needs `test`, so TEST_TOKEN gates it too; `docs` stays out.
+        assert_eq!(
+            missing_secrets_for(SECRET_SCOPE_WORKFLOW, &["deploy"], &[]),
+            Some(names(&["DEPLOY_KEY", "TEST_TOKEN"]))
+        );
+        assert_eq!(
+            missing_secrets_for(SECRET_SCOPE_WORKFLOW, &["deploy"], &["TEST_TOKEN"]),
+            Some(names(&["DEPLOY_KEY"]))
+        );
+        let requirements = run_secret_requirements(
+            SECRET_SCOPE_WORKFLOW,
+            &BTreeMap::new(),
+            &["deploy".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(requirements.by_environment.len(), 1);
+        assert_eq!(
+            requirements.by_environment.get("production"),
+            Some(&names(&["DEPLOY_KEY"]))
+        );
+    }
+
+    #[test]
+    fn secret_preflight_job_selects_a_reusable_callers_callee_secrets() {
+        let caller = r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    secrets: inherit
+  other:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo other
+"#;
+        let reusable = BTreeMap::from([(
+            ".github/workflows/callee.yml".to_owned(),
+            r#"
+on: workflow_call
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.CALLEE_TOKEN }}"
+"#
+            .to_owned(),
+        )]);
+        let requirements_for =
+            |job: &str| run_secret_requirements(caller, &reusable, &[job.to_owned()]).unwrap();
+        let called = requirements_for("call");
+        assert_eq!(called.names, names(&["CALLEE_TOKEN"]));
+        // The callee subtree inherits the caller's `secrets: inherit` flag too.
+        assert!(called.inherits.contains("call"));
+        assert!(requirements_for("other").is_empty());
+    }
+
+    #[test]
+    fn secret_preflight_unknown_job_defers_to_the_submission() {
+        assert!(
+            run_secret_requirements(
+                SECRET_SCOPE_WORKFLOW,
+                &BTreeMap::new(),
+                &["tset".to_owned()]
+            )
+            .is_none()
+        );
+    }
 
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
         tokio::spawn(std::future::pending())

@@ -10,6 +10,12 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **`preloop run --job` secret preflight checks only the jobs it runs**: the
+  `--strict-secrets` check and its warning read every job in the workflow file,
+  so `--job test` aborted over a secret that only an unselected `deploy` job
+  reads. The check now uses the selected job and its `needs:` closure, the same
+  selection the engine applies, from one shared function. An unknown `--job` id
+  is still rejected by the submission, which names it.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
