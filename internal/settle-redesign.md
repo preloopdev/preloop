@@ -29,15 +29,17 @@ settle_job(run_id, job_id, status):
   7. Retry the cohort waiters that `promote_waiter` re-parked at max-parallel,
      on each free gate holding one of the settled legs' cohort waiters (FIFO)
   8. Refresh `remaining_needs` for the dependents of everything that just
-     turned terminal (one indexed UPDATE per settled job), and check each
-     settled job's cohort for a parked leg a freed slot can take; both report
-     whether promotion is needed
+     turned terminal (one indexed UPDATE per settled job; it returns the
+     dependents left `blocked` with no needs outstanding), and check each
+     settled job's cohort for a parked leg a freed slot can take; the settle
+     outcome carries both by id
   9. Summarize the run from the DB aggregate; on the first terminal
      transition release the workflow-level hold and emit run.completed.v1
  10. Emit job.completed.v1 for every job this completion concluded (the job,
      its fail-fast siblings, the folded callers)
- 11. If step 8 reported promotion: run the shared promotion sweep over the
-     loaded graph
+ 11. If step 8 left a dependent unblocked or a cohort admissible: run the
+     shared promotion sweep over the loaded graph (one `promote_after_settle`
+     step, shared by `settle_job` and `complete_job`)
 ```
 
 Step 11 is the only part of a completion that still loads the run graph.
