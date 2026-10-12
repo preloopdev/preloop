@@ -11,12 +11,12 @@
 > A failed step, a fix in another pane, and a re-run, all local, with no push required.
 
 
-preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/MacOS or Linux, and resume in 300ms. Your `.github/workflows` run unmodified, and you can run CI against your uncommitted changes(respects .gitignored/untracked ones).
+preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/macOS or Linux, and resume in 300ms. Your `.github/workflows` run unmodified, and you can run CI against your uncommitted changes(respects .gitignored/untracked ones).
 
 
 It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it without GitHub-hosted minutes. You can also use our Rust-equivalent runner — 36× smaller install, 19× lower peak memory (see benchmarks below).
 
-Preloop doesn't rely only on Github Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the GitHub API. You can run your committed changes and run workflows locally and pass `--push` or `--create-pr` to open a PR with the checks correctly updated (new PRs open as drafts by default, see `--pr-draft`). This can be useful if/when Github's webhook service is down.
+Preloop doesn't rely only on GitHub Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the GitHub API. You can run your committed changes and run workflows locally and pass `--push` or `--create-pr` to open a PR with the checks correctly updated (new PRs open as drafts by default, see `--pr-draft`). This can be useful if/when GitHub's webhook service is down.
 
 ## Quick start
 
@@ -47,7 +47,7 @@ flags — `preloop init --probe --json` reports what this host supports without
 changing anything, and `preloop init --help` documents every flag. It is the
 one-command front door to what `preloop setup github` and a hand-picked
 `PRELOOP_RUNNER_BASE_IMAGE` used to be.
-This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so at least 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image — `preloop init` records it for you. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
+This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official GitHub Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official GitHub image is around 9GB compressed, and unpacks to almost 50 GB so at least 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image — `preloop init` records it for you. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
 Prefer not to run a script: take `preloop-cli-<target>.tar.gz` and its `.sha256`
 from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
 verify the checksum, put `preloop` on your `PATH`, and run `preloop update` to
@@ -59,7 +59,7 @@ and [docs/self-hosting.md §3](docs/self-hosting.md) has the manual commands.
 
 On Apple Silicon, x86_64 goldens also run through Rosetta 2 translation (enabled automatically for every VM). Performance is slightly slower than arm64 native, so prefer arm64 goldens on Apple Silicon when you can. Docker actions are not supported yet on this path: amd64 images inside the VM's Docker lack the Rosetta mount, so they fail with a cryptic `rosetta-wrapper` error. Fixing soon.
 
-You can simulate most if not all Github events locally. For some events, you might need to add a payload.
+You can simulate most if not all GitHub events locally. For some events, you might need to add a payload.
 See [docs/cli_reference.md](docs/cli_reference.md) for more flags you can pass.
 
 To continue with the setup, see GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
