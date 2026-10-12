@@ -118,7 +118,7 @@ async fn diag_evicted_upload_token_put_is_rejected() {
     assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
 
     // A token that was never registered at all is rejected the same way.
-    let (unknown_jwt, _) = mint_blob_jwt(&state, "diag", &job_id.to_string());
+    let (unknown_jwt, _) = mint_blob_jwt(&state, "diag", &job_id.to_string(), "write");
     let unknown = app
         .clone()
         .oneshot(
