@@ -68,6 +68,25 @@ Releases before v0.27.0 predate the changelog.
   explicit `MemoryCredentialStore::default()` instances stay per-instance for
   test isolation.
 
+- **A pool failure no longer takes the engine down**: `RunnerPool::run`
+  already tears every machine down on the way out, so when its task returned
+  an error the engine now rebuilds the pool on an exponential backoff (1 s,
+  doubling to a 5-minute ceiling) instead of exiting. Each generation runs
+  on a fresh child shutdown token — the pool cancels the token it is handed
+  when a slot ends, which would otherwise kill the replacement instantly —
+  the backoff only resets after a run that finished preparing and reached
+  steady state, and the HTTP server and shutdown signal stay in the backoff
+  race so a dead server stops the engine instead of spawning a pool for
+  nothing.
+- **A refused machine delete no longer leaves a live VM**: `smolvm machine
+  delete -f` declines to stop a guest whose agent cannot confirm a safe
+  shutdown ("left the VM alive for retry"), which stranded the detached
+  hypervisor holding `storage.raw`/`overlay.raw` open — and on macOS its
+  `pack/layers-cs` mount — until the next orphan purge happened to reach it.
+  The delete path now SIGKILLs only that machine's hypervisor (attributed by
+  the boot-config path in its argv, never a neighboring machine's), retries
+  the delete, and detaches an orphaned layer mount if one remains.
+
 ## [0.34.0] - 2026-10-09
 
 ### Changed
