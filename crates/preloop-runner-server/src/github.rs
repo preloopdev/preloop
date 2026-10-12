@@ -4175,7 +4175,10 @@ fn app_registration_enabled() -> bool {
     let Ok(value) = std::env::var("PRELOOP_ENABLE_APP_REGISTRATION") else {
         return false;
     };
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on")
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    )
 }
 
 /// The `Host` the browser addressed; the manifest's URLs are built from it.
@@ -4215,8 +4218,7 @@ fn unix_now_secs() -> u64 {
 fn app_manifest_state_token(key: &[u8], nonce: &str, expires_at: u64) -> String {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .expect("HMAC accepts keys of any length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(format!("app-manifest-state:{nonce}.{expires_at}").as_bytes());
     let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     format!("{nonce}.{expires_at}.{signature}")
@@ -4302,8 +4304,14 @@ fn manifest_page(
 ) -> axum::response::Response {
     let mut response = (status, axum::response::Html(body)).into_response();
     let headers = response.headers_mut();
-    headers.insert("cache-control", axum::http::HeaderValue::from_static("no-store"));
-    headers.insert("referrer-policy", axum::http::HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
     if let Some(cookie) = set_cookie {
         headers.append("set-cookie", cookie);
     }
@@ -4448,7 +4456,11 @@ pub async fn github_callback(
     let code = params.code.as_deref().filter(|code| !code.is_empty());
     let Some(code) = code.filter(|_| bound) else {
         warn!("rejected GitHub App manifest callback: state missing, mismatched, or expired");
-        return Ok(manifest_page(StatusCode::BAD_REQUEST, MANIFEST_REJECTED_PAGE.to_owned(), None));
+        return Ok(manifest_page(
+            StatusCode::BAD_REQUEST,
+            MANIFEST_REJECTED_PAGE.to_owned(),
+            None,
+        ));
     };
 
     let credentials = exchange_manifest_code(code).await?;
@@ -4465,7 +4477,11 @@ pub async fn github_callback(
 
     // The registration is complete, so the binding cookie goes too.
     let cleared = app_manifest_cookie("", 0, manifest_is_https(manifest_host(&headers)))?;
-    Ok(manifest_page(StatusCode::OK, app_credentials_page(&credentials), Some(cleared)))
+    Ok(manifest_page(
+        StatusCode::OK,
+        app_credentials_page(&credentials),
+        Some(cleared),
+    ))
 }
 
 /// Exchange the one-time manifest `code` for the App's credentials. The code is
@@ -4811,11 +4827,17 @@ mod tests {
             let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
             for value in ["1", "true", "TRUE", " on ", "On"] {
                 let _flag = crate::state::TestEnvVar::set(FLAG, value);
-                assert!(app_registration_enabled(), "{value:?} should enable registration");
+                assert!(
+                    app_registration_enabled(),
+                    "{value:?} should enable registration"
+                );
             }
             for value in ["", "0", "false", "off", "yes"] {
                 let _flag = crate::state::TestEnvVar::set(FLAG, value);
-                assert!(!app_registration_enabled(), "{value:?} should not enable registration");
+                assert!(
+                    !app_registration_enabled(),
+                    "{value:?} should not enable registration"
+                );
             }
             let _unset = crate::state::TestEnvVar::unset(FLAG);
             assert!(!app_registration_enabled());
@@ -4833,7 +4855,10 @@ mod tests {
             let uri = format!("/api/v1/github/callback?code=c1&state={token}");
             let callback = get(&h.app, &uri, Some(cookie.as_str()), None).await;
             assert_eq!(callback.status(), StatusCode::NOT_FOUND);
-            assert!(upstream(&h.requests).is_empty(), "a disabled route must not reach GitHub");
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "a disabled route must not reach GitHub"
+            );
         }
 
         #[tokio::test]
@@ -4846,9 +4871,18 @@ mod tests {
             let forged = app_manifest_state_token(b"not-this-engine", "nonce-good", expiry);
             let refused: [(String, Option<String>); 6] = [
                 ("/api/v1/github/callback?code=c1".to_owned(), None),
-                (format!("/api/v1/github/callback?code=c1&state={token}"), None),
-                ("/api/v1/github/callback?code=c1".to_owned(), Some(cookie.clone())),
-                (format!("/api/v1/github/callback?code=c1&state={other}"), Some(cookie.clone())),
+                (
+                    format!("/api/v1/github/callback?code=c1&state={token}"),
+                    None,
+                ),
+                (
+                    "/api/v1/github/callback?code=c1".to_owned(),
+                    Some(cookie.clone()),
+                ),
+                (
+                    format!("/api/v1/github/callback?code=c1&state={other}"),
+                    Some(cookie.clone()),
+                ),
                 (
                     format!("/api/v1/github/callback?code=c1&state={forged}"),
                     Some(format!("preloop_app_manifest_state={forged}")),
@@ -4862,7 +4896,10 @@ mod tests {
                 let response = get(&h.app, uri, cookie_header.as_deref(), None).await;
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
             }
-            assert!(upstream(&h.requests).is_empty(), "no refused callback may reach GitHub");
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "no refused callback may reach GitHub"
+            );
         }
 
         #[tokio::test]
@@ -4877,7 +4914,10 @@ mod tests {
             let uri = format!("/api/v1/github/callback?code=c1&state={expired}");
             let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert!(upstream(&h.requests).is_empty(), "an expired state must not reach GitHub");
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "an expired state must not reach GitHub"
+            );
         }
 
         #[tokio::test]
@@ -4899,7 +4939,10 @@ mod tests {
             )
             .await;
             assert_eq!(register.status(), StatusCode::OK);
-            assert_eq!(register.headers()["cache-control"].to_str().unwrap(), "no-store");
+            assert_eq!(
+                register.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
             let set_cookie = set_cookie_of(&register);
             for attribute in [
                 "HttpOnly",
@@ -4908,7 +4951,10 @@ mod tests {
                 "Max-Age=3600",
                 "Secure",
             ] {
-                assert!(set_cookie.contains(attribute), "missing {attribute}: {set_cookie}");
+                assert!(
+                    set_cookie.contains(attribute),
+                    "missing {attribute}: {set_cookie}"
+                );
             }
             let cookie = set_cookie.split(';').next().unwrap().to_owned();
             let token = cookie
@@ -4917,7 +4963,9 @@ mod tests {
                 .to_owned();
             let page = text(register).await;
             assert!(
-                page.contains(&format!("https://github.com/settings/apps/new?state={token}")),
+                page.contains(&format!(
+                    "https://github.com/settings/apps/new?state={token}"
+                )),
                 "the form must send the token the cookie carries"
             );
 
@@ -4931,13 +4979,25 @@ mod tests {
             )
             .await;
             assert_eq!(callback.status(), StatusCode::OK);
-            assert_eq!(callback.headers()["cache-control"].to_str().unwrap(), "no-store");
-            assert_eq!(callback.headers()["referrer-policy"].to_str().unwrap(), "no-referrer");
-            assert!(set_cookie_of(&callback).contains("Max-Age=0"), "the binding is cleared");
+            assert_eq!(
+                callback.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                callback.headers()["referrer-policy"].to_str().unwrap(),
+                "no-referrer"
+            );
+            assert!(
+                set_cookie_of(&callback).contains("Max-Age=0"),
+                "the binding is cleared"
+            );
             let page = text(callback).await;
             assert!(page.contains("GitHub App Registered Successfully!"));
             assert!(page.contains("987654"));
-            assert!(page.contains("acme-admin"), "the owner is shown for confirmation");
+            assert!(
+                page.contains("acme-admin"),
+                "the owner is shown for confirmation"
+            );
             assert!(
                 page.contains("--webhook-secret &#39;mock-webhook-secret-xyz&#39;"),
                 "the handoff must pass the secret on the CLI"
@@ -4945,7 +5005,11 @@ mod tests {
             assert!(!page.contains("export PRELOOP_WEBHOOK_SECRET"));
 
             let calls = upstream(&h.requests);
-            assert_eq!(calls.len(), 1, "one registration makes one conversion request");
+            assert_eq!(
+                calls.len(),
+                1,
+                "one registration makes one conversion request"
+            );
             assert_eq!(calls[0].0, "POST");
             assert_eq!(calls[0].1, "/app-manifests/the-code/conversions");
         }
@@ -4995,11 +5059,19 @@ mod tests {
             let token = app_manifest_state_token(key, "nonce", now + 600);
             assert!(app_manifest_state_is_valid(key, &token, now));
             // The nonce, the expiry, and the engine key are all covered by the signature.
-            assert!(!app_manifest_state_is_valid(key, &token.replacen("nonce", "other", 1), now));
+            assert!(!app_manifest_state_is_valid(
+                key,
+                &token.replacen("nonce", "other", 1),
+                now
+            ));
             let longer = (now + 6_000).to_string();
             let extended = token.replacen(&(now + 600).to_string(), &longer, 1);
             assert!(!app_manifest_state_is_valid(key, &extended, now));
-            assert!(!app_manifest_state_is_valid(b"another-engine-key", &token, now));
+            assert!(!app_manifest_state_is_valid(
+                b"another-engine-key",
+                &token,
+                now
+            ));
             // Expired from the expiry second onward.
             assert!(!app_manifest_state_is_valid(key, &token, now + 600));
         }

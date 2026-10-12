@@ -1369,7 +1369,10 @@ async fn github_app_manifest_registration_flow() {
     // Held for the whole test: both variables are process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     unsafe {
-        std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{}", port));
+        std::env::set_var(
+            "PRELOOP_GITHUB_API_URL",
+            format!("http://127.0.0.1:{}", port),
+        );
         std::env::set_var("PRELOOP_ENABLE_APP_REGISTRATION", "1");
     };
 
@@ -1413,7 +1416,9 @@ async fn github_app_manifest_registration_flow() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/api/v1/github/callback?code=mock_code_123&state={token}"))
+                .uri(format!(
+                    "/api/v1/github/callback?code=mock_code_123&state={token}"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1427,7 +1432,9 @@ async fn github_app_manifest_registration_flow() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/api/v1/github/callback?code=mock_code_123&state={token}"))
+                .uri(format!(
+                    "/api/v1/github/callback?code=mock_code_123&state={token}"
+                ))
                 .header("cookie", cookie)
                 .body(Body::empty())
                 .unwrap(),
