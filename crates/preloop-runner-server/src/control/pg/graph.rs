@@ -263,7 +263,7 @@ fn decode_concurrency(text: &str) -> Result<preloop_gha_parser::Concurrency, Con
 
 /// `jobs.status` -> `ExecutionStatus` (`timed_out` is `Failure`: the wire
 /// enum has no timed-out variant).
-fn job_status(text: &str) -> ExecutionStatus {
+pub(super) fn job_status(text: &str) -> ExecutionStatus {
     if text == "timed_out" {
         ExecutionStatus::Failure
     } else {

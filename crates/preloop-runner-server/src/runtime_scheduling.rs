@@ -429,28 +429,83 @@ pub enum DependencyDecision {
     Error,
 }
 
-pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
-    if job.needs.is_empty() {
+/// What `needs:` evaluation reads about the jobs a dependent can name: which
+/// jobs a declared need expands to, their statuses and outputs, and their own
+/// declared needs (the ancestor walk). A whole [`RunRecord`] is one source; a
+/// backend that loads only the rows a single job's needs reach (a job-scoped
+/// view) is another, so a decision never has to materialize the run.
+pub trait NeedsSource {
+    /// Ids a declared need names: the job itself or every job whose base id
+    /// is the need (a matrix base names all its legs). Jobs that no longer
+    /// speak for themselves (an expanded matrix parent) are never matched.
+    fn matching_ids(&self, need: &JobId) -> Vec<JobId>;
+    fn need_status(&self, job_id: &JobId) -> Option<ExecutionStatus>;
+    fn need_outputs(&self, job_id: &JobId) -> Option<&BTreeMap<String, serde_json::Value>>;
+    fn declared_needs(&self, job_id: &JobId) -> Option<&[JobId]>;
+}
+
+impl NeedsSource for RunRecord {
+    fn matching_ids(&self, need: &JobId) -> Vec<JobId> {
+        self.jobs
+            .keys()
+            .filter(|job_id| {
+                *job_id == need
+                    || self
+                        .job_base_ids
+                        .get(*job_id)
+                        .is_some_and(|base| base == &need.0)
+            })
+            .cloned()
+            .collect()
+    }
+    fn need_status(&self, job_id: &JobId) -> Option<ExecutionStatus> {
+        self.jobs.get(job_id).copied()
+    }
+    fn need_outputs(&self, job_id: &JobId) -> Option<&BTreeMap<String, serde_json::Value>> {
+        self.job_outputs.get(job_id)
+    }
+    fn declared_needs(&self, job_id: &JobId) -> Option<&[JobId]> {
+        self.job_needs.get(job_id).map(Vec::as_slice)
+    }
+}
+
+pub fn dependency_decision(run: &impl NeedsSource, job: &QueuedJob) -> DependencyDecision {
+    dependency_decision_of(
+        run,
+        &job.needs,
+        job.if_condition.as_deref(),
+        &job.condition_context,
+    )
+}
+
+/// [`dependency_decision`] over the three job fields it reads, for callers
+/// that hold a job's decision inputs without a full `QueuedJob`.
+pub fn dependency_decision_of(
+    run: &impl NeedsSource,
+    needs: &[JobId],
+    if_condition: Option<&str>,
+    condition_context: &preloop_gha_expressions::Context,
+) -> DependencyDecision {
+    if needs.is_empty() {
         return DependencyDecision::Run;
     }
-    let direct_statuses = job
-        .needs
+    let direct_statuses = needs
         .iter()
         .flat_map(|need| matching_need_statuses(run, need))
         .collect::<Vec<_>>();
     if direct_statuses.is_empty() || direct_statuses.iter().any(|status| !status.is_terminal()) {
         return DependencyDecision::Wait;
     }
-    let statuses = ancestor_statuses(run, job);
+    let statuses = ancestor_statuses(run, needs);
     let aggregate = aggregate_need_status(&statuses).unwrap_or(ExecutionStatus::Skipped);
-    let context = job.condition_context.clone().with_status(
+    let context = condition_context.clone().with_status(
         aggregate == ExecutionStatus::Success,
         aggregate == ExecutionStatus::Failure,
         aggregate == ExecutionStatus::Cancelled,
     );
     let mut context = context;
-    context.insert("needs", needs_json_context(run, &job.needs));
-    let condition = preloop_gha_expressions::effective_condition(job.if_condition.as_deref());
+    context.insert("needs", needs_json_context(run, needs));
+    let condition = preloop_gha_expressions::effective_condition(if_condition);
     match preloop_gha_expressions::eval_bool(&condition, &context) {
         Ok(true) => DependencyDecision::Run,
         Ok(false) => DependencyDecision::Skip,
@@ -458,32 +513,21 @@ pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecisi
     }
 }
 
-pub fn matching_need_ids(run: &RunRecord, need: &JobId) -> Vec<JobId> {
-    run.jobs
-        .keys()
-        .filter(|job_id| {
-            *job_id == need
-                || run
-                    .job_base_ids
-                    .get(*job_id)
-                    .is_some_and(|base| base == &need.0)
-        })
-        .cloned()
+pub fn matching_need_ids(run: &impl NeedsSource, need: &JobId) -> Vec<JobId> {
+    run.matching_ids(need)
+}
+
+pub fn matching_need_statuses(run: &impl NeedsSource, need: &JobId) -> Vec<ExecutionStatus> {
+    run.matching_ids(need)
+        .iter()
+        .filter_map(|job_id| run.need_status(job_id))
         .collect()
 }
 
-pub fn matching_need_statuses(run: &RunRecord, need: &JobId) -> Vec<ExecutionStatus> {
-    matching_need_ids(run, need)
+pub fn ancestor_statuses(run: &impl NeedsSource, needs: &[JobId]) -> Vec<ExecutionStatus> {
+    let mut pending = needs
         .iter()
-        .filter_map(|job_id| run.jobs.get(job_id).copied())
-        .collect()
-}
-
-pub fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<ExecutionStatus> {
-    let mut pending = job
-        .needs
-        .iter()
-        .flat_map(|need| matching_need_ids(run, need))
+        .flat_map(|need| run.matching_ids(need))
         .collect::<Vec<_>>();
     let mut visited = std::collections::BTreeSet::new();
     let mut statuses = Vec::new();
@@ -492,11 +536,11 @@ pub fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<ExecutionStatu
         if !visited.insert(job_id.clone()) {
             continue;
         }
-        if let Some(status) = run.jobs.get(&job_id) {
-            statuses.push(*status);
+        if let Some(status) = run.need_status(&job_id) {
+            statuses.push(status);
         }
-        if let Some(needs) = run.job_needs.get(&job_id) {
-            pending.extend(needs.iter().flat_map(|need| matching_need_ids(run, need)));
+        if let Some(needs) = run.declared_needs(&job_id) {
+            pending.extend(needs.iter().flat_map(|need| run.matching_ids(need)));
         }
     }
     statuses
@@ -719,7 +763,7 @@ pub fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     }
 }
 
-pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
+pub fn hydrate_needs_context(job: &mut QueuedJob, run: &impl NeedsSource) {
     let needs = job
         .needs
         .iter()
@@ -853,7 +897,7 @@ pub fn resolve_deferred_runs_on_labels(
     };
 }
 
-pub fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
+pub fn needs_json_context(run: &impl NeedsSource, needs: &[JobId]) -> serde_json::Value {
     let values = needs
         .iter()
         .filter_map(|need| {
@@ -862,7 +906,7 @@ pub fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value
             let matching_ids = matching_need_ids(run, need);
             let mut outputs = serde_json::Map::new();
             for job_id in matching_ids {
-                if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+                if let Some(job_outputs) = run.need_outputs(&job_id) {
                     outputs.extend(job_outputs.clone());
                 }
             }
@@ -983,12 +1027,12 @@ pub fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionSt
     }
 }
 
-pub fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextData> {
+pub fn need_context(run: &impl NeedsSource, need: &JobId) -> Option<azdo::PipelineContextData> {
     let statuses = matching_need_statuses(run, need);
     let result = aggregate_need_status(&statuses)?;
     let mut outputs = BTreeMap::new();
     for job_id in matching_need_ids(run, need) {
-        if let Some(job_outputs) = run.job_outputs.get(&job_id) {
+        if let Some(job_outputs) = run.need_outputs(&job_id) {
             for (key, value) in job_outputs {
                 outputs.insert(key.clone(), azdo::PipelineContextData::from_json(value));
             }
