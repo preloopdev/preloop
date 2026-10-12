@@ -14,7 +14,7 @@
 preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/macOS or Linux, and resume in 300ms. Your `.github/workflows` run unmodified, and you can run CI against your uncommitted changes(respects .gitignored/untracked ones).
 
 
-It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it without GitHub-hosted minutes. You can also use our Rust-equivalent runner — 36× smaller install, 19× lower peak memory (see benchmarks below).
+It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it without GitHub-hosted minutes. You can also use our Rust runner, which installs 36× smaller and peaks at 19× lower memory (see benchmarks below).
 
 Preloop doesn't rely only on GitHub Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the GitHub API. You can run your committed changes and run workflows locally and pass `--push` or `--create-pr` to open a PR with the checks correctly updated (new PRs open as drafts by default, see `--pr-draft`). This can be useful if/when GitHub's webhook service is down.
 
@@ -22,12 +22,12 @@ Preloop doesn't rely only on GitHub Webhooks to update the status of the CI. We 
 
 ```sh
 # Install (macOS/Linux), any one of:
-brew install preloopdev/tap/preloop   # Homebrew — formula published by the release workflow
-npm install -g @preloop-dev/cli       # npm — same release binaries, fetched at install time
+brew install preloopdev/tap/preloop   # Homebrew
+npm install -g @preloop-dev/cli       # npm, downloads the same release binaries
 
 # Or fetch the installer at a release tag, read it, then run it. It downloads
-# the release binaries and verifies every artifact's sha256.
-ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+# the release binaries and verifies the sha256 of each one.
+ver=v0.34.0   # latest release, others at https://github.com/preloopdev/preloop/releases
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sh install.sh
@@ -40,24 +40,33 @@ preloop serve            # engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
-`preloop init` walks through four steps (GitHub credential, the golden image
-every job forks from, run mode, preflight) and writes the result to
-`~/.preloop/config.toml`. Without a terminal it takes the same answers as
-flags — `preloop init --probe --json` reports what this host supports without
-changing anything, and `preloop init --help` documents every flag. It is the
-one-command front door to what `preloop setup github` and a hand-picked
-`PRELOOP_RUNNER_BASE_IMAGE` used to be.
-This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official GitHub Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official GitHub image is around 9GB compressed, and unpacks to almost 50 GB so at least 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image — `preloop init` records it for you. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
-Prefer not to run a script: take `preloop-cli-<target>.tar.gz` and its `.sha256`
-from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
-verify the checksum, put `preloop` on your `PATH`, and run `preloop update` to
-install the pinned SmolVM runtime. Every release asset also carries keyless
-build provenance (`gh attestation verify <asset> --repo preloopdev/preloop`).
-MicroVM jobs need the Linux guest runner at
-`<prefix>/lib/preloop/runner/<triple>/preloop-runner`; `install.sh` places it,
-and [docs/self-hosting.md §3](docs/self-hosting.md) has the manual commands.
+`preloop init` is a short setup wizard. It sets up your GitHub credential,
+picks the VM image your jobs run in, and chooses how the engine runs, then
+writes `~/.preloop/config.toml`. Without a terminal it takes the same answers
+as flags. Every flag is in the [`init` reference](docs/cli_reference.md#preloop-init-options).
 
-On Apple Silicon, x86_64 goldens also run through Rosetta 2 translation (enabled automatically for every VM). Performance is slightly slower than arm64 native, so prefer arm64 goldens on Apple Silicon when you can. Docker actions are not supported yet on this path: amd64 images inside the VM's Docker lack the Rosetta mount, so they fail with a cryptic `rosetta-wrapper` error. Fixing soon.
+`preloop serve` runs in the foreground. Add `-d` to detach it.
+
+The first run downloads the default VM image, a packed copy of the official
+GitHub runner image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)),
+and builds a local "golden" VM from it. That takes a few minutes. The image is
+about 9 GB compressed and almost 50 GB unpacked, so keep at least 80 GB of disk
+free. Every job then forks from the golden VM in about 300 ms. Each VM uses
+only the memory its job needs, and the idle engine takes about 25 MB. To use
+your own image, point `init` at an OCI image; see [docs/vm-images.md](docs/vm-images.md).
+
+Prefer not to run a script? Download `preloop-cli-<target>.tar.gz` and its
+`.sha256` from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
+check the checksum, put `preloop` on your `PATH`, and run `preloop update` to
+install the pinned SmolVM runtime. Release assets also carry build provenance:
+`gh attestation verify <asset> --repo preloopdev/preloop`. MicroVM jobs also
+need the Linux guest runner at `<prefix>/lib/preloop/runner/<triple>/preloop-runner`.
+`install.sh` installs it, and [docs/self-hosting.md §3](docs/self-hosting.md)
+has the manual commands.
+
+On Apple Silicon, x86_64 goldens run through Rosetta 2 at close to native
+speed. Prefer arm64 goldens when you can. Known limits are in
+[docs/fidelity-gap.md](docs/fidelity-gap.md).
 
 You can simulate most if not all GitHub events locally. For some events, you might need to add a payload.
 See [docs/cli_reference.md](docs/cli_reference.md) for more flags you can pass.
@@ -69,13 +78,13 @@ domain): [docs/self-hosting.md](docs/self-hosting.md)
 
 ### Just the runner
 
-`preloop-runner` is a drop-in Rust replacement for `actions/runner` — it
-registers against GitHub (or a preloop server) the same way, at 36× smaller
-install and 19× lower peak memory:
+`preloop-runner` is a drop-in Rust replacement for `actions/runner`. It
+registers against GitHub (or a preloop server) the same way, with a 36×
+smaller install and 19× lower peak memory:
 
 ```sh
 # Fetch the installer at a release tag, read it, then run it with --runner.
-ver=v0.34.0   # any tag from v0.33.7 on; older installers lack --runner
+ver=v0.34.0   # latest release; --runner needs v0.33.7 or newer
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sh install.sh --runner
