@@ -41,10 +41,13 @@ It behaves **exactly like the official runner**:
 
 ### 1. Installation
 
-Install with one command:
+Fetch the installer at a release tag, read it, then run it with `--runner`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+ver=v0.34.0   # any tag from v0.33.7 on; older installers lack --runner
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sh install.sh --runner
 ```
 
 This detects your platform, downloads `preloop-runner`, verifies the sha256 checksum,

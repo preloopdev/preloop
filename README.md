@@ -11,12 +11,12 @@
 > A failed step, a fix in another pane, and a re-run, all local, with no push required.
 
 
-preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/MacOS or Linux, and resume in 300ms. Your `.github/workflows` run unmodified, and you can run CI against your uncomitted changes(respects .gitignored/untracked ones).
+preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`preloop serve`) accepts workflows the same way GitHub does: `${{ }}` expressions, matrix builds, reusable workflows, concurrency groups, OIDC etc. It executes them on hardware-isolated microvms that work on Windows/MacOS or Linux, and resume in 300ms. Your `.github/workflows` run unmodified, and you can run CI against your uncommitted changes(respects .gitignored/untracked ones).
 
 
 It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it without GitHub-hosted minutes. You can also use our Rust-equivalent runner — 36× smaller install, 19× lower peak memory (see benchmarks below).
 
-Preloop doesnt rely only on Github Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the Gtihub API. You can run your committed changes and run workflows locally and pass `--push` or `--create-pr` to open a PR with the checks correctly updated (new PRs open as drafts by default, see `--pr-draft`). This can be useful if/when Github's webhook service is down.
+Preloop doesn't rely only on Github Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the GitHub API. You can run your committed changes and run workflows locally and pass `--push` or `--create-pr` to open a PR with the checks correctly updated (new PRs open as drafts by default, see `--pr-draft`). This can be useful if/when Github's webhook service is down.
 
 ## Quick start
 
@@ -47,7 +47,7 @@ flags — `preloop init --probe --json` reports what this host supports without
 changing anything, and `preloop init --help` documents every flag. It is the
 one-command front door to what `preloop setup github` and a hand-picked
 `PRELOOP_RUNNER_BASE_IMAGE` used to be.
-This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so atleast 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image — `preloop init` records it for you. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
+This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so at least 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image — `preloop init` records it for you. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
 Prefer not to run a script: take `preloop-cli-<target>.tar.gz` and its `.sha256`
 from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
 verify the checksum, put `preloop` on your `PATH`, and run `preloop update` to
@@ -74,7 +74,11 @@ registers against GitHub (or a preloop server) the same way, at 36× smaller
 install and 19× lower peak memory:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+# Fetch the installer at a release tag, read it, then run it with --runner.
+ver=v0.34.0   # any tag from v0.33.7 on; older installers lack --runner
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sh install.sh --runner
 export PATH="$HOME/.local/bin:$PATH"
 preloop-runner configure --url https://github.com/owner/repo --token <registration-token>
 preloop-runner run
@@ -109,7 +113,7 @@ Details: [docs/setup.md](docs/setup.md#just-the-runner-standalone-github-actions
 - We use the real runner protocol, not a behavior approximation: the official runner binary works against it unchanged.
 - Hardware-isolated microvms for each job that spin up in 300ms, elastically scale up and down, and cross-platform.
 - GitHub App and fine-grained PAT support with per-job token minting so your checks get updated.
-- DAP-powered job inspection: attach at entry, inspect live GitHub/job context, pause, and continue, and allow for step-level rerties. 
+- DAP-powered job inspection: attach at entry, inspect live GitHub/job context, pause, and continue, and allow for step-level retries. 
 - Heavily tested with property tests, differential tests, and formal verification. Conformance is table-stakes. 
 - NDJSON event output for agents and developer tooling.
 
@@ -170,11 +174,11 @@ Reproduce: `scripts/bench-runner-compare.sh` (set `BENCH_RUNS=N`; needs
 | GitHub App webhooks and check runs | [docs/github-app-webhook.md](docs/github-app-webhook.md) |
 | Job tokens, minting, OIDC | [docs/github-tokens.md](docs/github-tokens.md) |
 | Debug sessions (pause, inspect, retry) | [docs/debug-sessions.md](docs/debug-sessions.md) |
+| Pre-push checks for coding agents | [docs/agent-pre-push.md](docs/agent-pre-push.md) |
 | Architecture and crate map | [docs/architecture.md](docs/architecture.md) |
 | Protocol conformance | [docs/conformance.md](docs/conformance.md) |
 | Fidelity gaps and roadmap | [docs/fidelity-gap.md](docs/fidelity-gap.md) |
 | Contributing and CI requirements | [CONTRIBUTING.md](CONTRIBUTING.md) |
-| Pre-push checks for coding agents | [docs/agent-pre-push.md](docs/agent-pre-push.md) |
 
 ## License
 
