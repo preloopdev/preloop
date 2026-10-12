@@ -942,9 +942,14 @@ impl SmolVmProvider {
     /// [`VmProvider::sweep_orphaned_data_dirs`]), so it must not re-acquire
     /// the lock per machine: a writer queued behind the sweep would block a
     /// nested read forever.
+    ///
+    /// `data-dir` goes through [`Self::recovery`], not [`Self::checked`]:
+    /// it cannot boot a VMM, and the delete-escalation path consults it
+    /// exactly when recovery must still work despite a bad operator sandbox
+    /// override (`SMOLVM_SECCOMP`/`SMOLVM_LANDLOCK`) that `checked` refuses.
     async fn machine_data_dir_direct(&self, name: &MachineName) -> Result<PathBuf, VmError> {
         let output = self
-            .checked(
+            .recovery(
                 "data-dir",
                 &[
                     "machine".into(),
@@ -2566,15 +2571,29 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
             source,
         })?;
     let text = String::from_utf8_lossy(&output.stdout);
+    // Attribute by the boot-config path as written in argv, not by splitting
+    // argv on whitespace: `ps` prints the command verbatim, so a data root
+    // containing spaces (an operator's PRELOOP_HOME, a worktree path) would
+    // shred the token a whitespace split looks for. Data dirs are
+    // hash-unique, so the literal `…/boot-config.json` match cannot collide
+    // with another machine's argument.
+    let mut needles = Vec::new();
+    for dir in [&target, data_dir] {
+        let needle = format!("{}/{}", dir.display(), BOOT_CONFIG_FILE);
+        if !needles.contains(&needle) {
+            needles.push(needle);
+        }
+    }
     let mut killed = 0usize;
     for line in text.lines() {
         if !line.contains(BOOT_VM_PROCESS) {
             continue;
         }
-        if !boot_config_dirs(line, &roots)
-            .iter()
-            .any(|dir| canonical_path(dir) == target)
-        {
+        let attributed = needles.iter().any(|needle| line.contains(needle))
+            || boot_config_dirs(line, &roots)
+                .iter()
+                .any(|dir| canonical_path(dir) == target);
+        if !attributed {
             continue;
         }
         let Some(pid) = line
@@ -3428,6 +3447,64 @@ mod tests {
         );
         let _ = neighbor.kill();
         let _ = neighbor.wait();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The real trigger end to end: smolvm refuses `machine delete -f`
+    /// because the guest cannot confirm a safe shutdown and leaves the VM
+    /// alive. The provider must resolve the machine's data directory, kill
+    /// only that hypervisor, and let the retried delete finish. The data
+    /// dir name carries a space to pin the argv attribution against
+    /// whitespace in a PRELOOP_HOME or worktree path.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The PRELOOP_HOME guard must stay held across the delete's awaits:
+    // `kill_vm_processes_in` reads PRELOOP_HOME via `machine_data_root`, and
+    // releasing it mid-test would let a parallel env-mutating test redirect
+    // this test's kills. Sync locking across awaits is the established
+    // pattern for the env-mutating suite.
+    #[allow(clippy::await_holding_lock)]
+    async fn refused_delete_kills_the_hypervisor_and_retries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-refused-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let root = super::machine_data_root().expect("this home resolves to a data root");
+        let data_dir = root.join("vm with space");
+        std::fs::create_dir_all(&data_dir).expect("machine data dir");
+
+        let mut hypervisor =
+            spawn_fake_boot_vm(&[data_dir.join("boot-config.json").to_str().unwrap()]);
+        let hypervisor_pid = hypervisor.id() as i32;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("delete-refused");
+        let binary = directory.path().join("smolvm");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *data-dir*) printf '%s\\n' '{}';;\n  *delete*)\n    if [ ! -f '{}' ]; then\n      touch '{}'\n      echo 'guest did not confirm filesystem synchronization; left the VM alive for retry' >&2\n      exit 1\n    fi;;\nesac\n",
+                data_dir.display(),
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = SmolVmProvider::new(&binary);
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("a refused delete must be force-cleaned and retried");
+
+        assert!(marker.exists(), "the first delete attempt was refused");
+        let _ = hypervisor.wait();
+        assert!(
+            !process_alive(hypervisor_pid),
+            "the stranded hypervisor must be dead before the delete retry"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
