@@ -80,7 +80,11 @@ Install a tagged release and verify it before an agent uses it:
      and open the VM with `preloop shell`.
    - After a fix, commit and run the job again with `preloop run`.
      `preloop rerun <run-id> --failed` re-runs the failed jobs on the tree the
-     first run captured. Use it for a flaky failure; it does not pick up a fix.
+     first run captured, so it does not pick up a fix. The engine keeps that
+     tree for 30 minutes after the run ends
+     (`PRELOOP_SNAPSHOT_RETENTION_SECONDS`), much less than the 30-day rerun
+     window (`PRELOOP_RERUN_WINDOW_DAYS`), so use it for a flaky failure soon
+     after the run.
 6. **Push only when every selected job passed.**
 
 ## Rules for the agent
