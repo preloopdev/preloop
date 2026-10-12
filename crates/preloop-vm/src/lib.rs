@@ -1466,6 +1466,58 @@ impl VmProvider for SmolVmProvider {
                 Err(error) => break Err(error),
             }
         };
+        // A refused `delete -f` (`guest did not confirm filesystem
+        // synchronization; left the VM alive for retry`) leaves the detached
+        // `_boot-vm` hypervisor running, pinning the machine's storage fds —
+        // on macOS also its `pack/layers-cs` mount. The guest cannot be
+        // asked again, so SIGKILL the hypervisor for this machine's own data
+        // directory and retry the delete once; smolvm can then finish the
+        // removal. A kill that finds nothing is harmless, so any persistent
+        // delete failure takes this path.
+        let result = match result {
+            Err(delete_error) => {
+                let data_dir = self.machine_data_dir(name).await.ok();
+                let killed = match data_dir {
+                    Some(dir) => kill_vm_processes_in(&dir).unwrap_or_else(|error| {
+                        warn!(%error, "hypervisor scan before forced delete failed");
+                        0
+                    }),
+                    None => 0,
+                };
+                if killed == 0 {
+                    Err(delete_error)
+                } else {
+                    info!(
+                        machine = name.as_str(),
+                        killed, "killed hypervisor left alive by refused delete; retrying"
+                    );
+                    let retried = match self.recovery("delete", &args).await {
+                        Ok(_) => Ok(()),
+                        Err(VmError::Command { message, .. })
+                            if message.to_ascii_lowercase().contains("not found") =>
+                        {
+                            Ok(())
+                        }
+                        Err(retry_error) => Err(retry_error),
+                    };
+                    if retried.is_ok() {
+                        // The dead hypervisor can leave the layer store
+                        // mounted under the now-removed data directory.
+                        match detach_orphaned_layer_mounts() {
+                            Ok(detached) if detached > 0 => {
+                                info!(detached, "detached layer mounts after forced delete")
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, "layer-mount detach after forced delete failed")
+                            }
+                        }
+                    }
+                    retried
+                }
+            }
+            ok => ok,
+        };
         if result.is_ok() {
             let mut forked = self.forked_machines.lock().await;
             forked.remove(name.as_str());
@@ -2261,7 +2313,6 @@ fn machine_data_state(line: &str, roots: &[PathBuf]) -> MachineDataState {
 /// table: both sides are canonicalized so `/tmp/...` and `/private/tmp/...`
 /// compare equal. A path that cannot be canonicalized (a fixture, an
 /// already-removed directory) is compared as written.
-#[cfg(any(target_os = "macos", test))]
 fn canonical_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -2480,6 +2531,62 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
         // SIGKILL: the machine is unreachable through smolvm (no record, or
         // an unresponsive agent) — the hypervisor process must die to
         // release the storage fds.
+        let status = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        if matches!(status, Ok(status) if status.success()) {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
+/// SIGKILL every `_boot-vm` hypervisor whose boot config lives in `data_dir`.
+///
+/// The escalation for a refused `machine delete -f`: smolvm declines to stop
+/// a guest whose agent cannot confirm a safe shutdown and "leaves the VM
+/// alive for retry", but nothing retries — the hypervisor keeps the
+/// machine's `storage.raw`/`overlay.raw` descriptors open (and its
+/// `pack/layers-cs` mount on macOS) until it dies. Attribution is the argv
+/// boot-config path compared against the canonical data directory, so only
+/// this machine's own hypervisor matches; a process whose argv names no
+/// boot config under [`machine_data_roots`] is never touched. Returns the
+/// number of processes killed.
+fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
+    let roots = machine_data_roots();
+    if roots.is_empty() {
+        return Ok(0);
+    }
+    let target = canonical_path(data_dir);
+    let output = std::process::Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .output()
+        .map_err(|source| VmError::Launch {
+            program: "ps".to_owned(),
+            source,
+        })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut killed = 0usize;
+    for line in text.lines() {
+        if !line.contains(BOOT_VM_PROCESS) {
+            continue;
+        }
+        if !boot_config_dirs(line, &roots)
+            .iter()
+            .any(|dir| canonical_path(dir) == target)
+        {
+            continue;
+        }
+        let Some(pid) = line
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 {
+            continue;
+        }
         let status = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .status();
@@ -3290,6 +3397,38 @@ mod tests {
         let link_len = std::fs::symlink_metadata(sub.join("link")).unwrap().len();
         assert_eq!(super::dir_size_bytes(&data_dir), 150 + link_len);
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn kill_vm_processes_in_kills_only_the_named_machines_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-kill-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let root = super::machine_data_root().expect("this home resolves to a data root");
+        let target_dir = root.join("target-machine");
+        let neighbor_dir = root.join("neighbor-machine");
+        std::fs::create_dir_all(target_dir.join("pack/layers-cs")).expect("target dir");
+        std::fs::create_dir_all(&neighbor_dir).expect("neighbor dir");
+
+        let mut target =
+            spawn_fake_boot_vm(&[target_dir.join("boot-config.json").to_str().unwrap()]);
+        let mut neighbor =
+            spawn_fake_boot_vm(&[neighbor_dir.join("boot-config.json").to_str().unwrap()]);
+        let target_pid = target.id() as i32;
+        let neighbor_pid = neighbor.id() as i32;
+
+        let killed = super::kill_vm_processes_in(&target_dir).expect("scoped kill");
+
+        assert_eq!(killed, 1, "only the named machine's hypervisor may die");
+        let _ = target.wait();
+        assert!(!process_alive(target_pid));
+        assert!(
+            process_alive(neighbor_pid),
+            "a neighboring machine's hypervisor must be spared"
+        );
+        let _ = neighbor.kill();
+        let _ = neighbor.wait();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

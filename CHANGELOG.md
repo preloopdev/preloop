@@ -40,6 +40,15 @@ Releases before v0.27.0 predate the changelog.
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
 
+- **A refused machine delete no longer leaves a live VM**: `smolvm machine
+  delete -f` declines to stop a guest whose agent cannot confirm a safe
+  shutdown ("left the VM alive for retry"), which stranded the detached
+  hypervisor holding `storage.raw`/`overlay.raw` open — and on macOS its
+  `pack/layers-cs` mount — until the next orphan purge happened to reach it.
+  The delete path now SIGKILLs only that machine's hypervisor (attributed by
+  the boot-config path in its argv, never a neighboring machine's), retries
+  the delete, and detaches an orphaned layer mount if one remains.
+
 ## [0.34.0] - 2026-10-09
 
 ### Changed
