@@ -123,6 +123,14 @@ pub(super) fn purge_node_requests(
             .execute([request_id])
             .map_err(db)?;
     }
+    // The node's own row must not keep pointing at a request that is gone.
+    tx.prepare_cached(
+        "UPDATE jobs SET request_id = NULL \
+         WHERE run_id = ?1 AND job_id = ?2 AND request_id IS NOT NULL",
+    )
+    .map_err(db)?
+    .execute(params![run, job_id.0])
+    .map_err(db)?;
     Ok(())
 }
 
@@ -264,12 +272,13 @@ pub(super) fn apply_fail_fast(
     };
     let mut cancelled = Vec::new();
     for (job_id, status, request_id) in siblings {
-        if status == "in_progress"
-            && let Some(request_id) = request_id
-        {
+        let job_id = JobId(job_id);
+        if status != "in_progress" {
+            // Never claimed: no runner will settle its request.
+            retire_node_requests(tx, run_id, &job_id, ExecutionStatus::Cancelled)?;
+        } else if let Some(request_id) = request_id {
             queue_cancellation(tx, request_id, Some("fail_fast"))?;
         }
-        let job_id = JobId(job_id);
         finish_job_row(tx, run_id, &job_id, ExecutionStatus::Cancelled)?;
         release_concurrency_for_job(tx, backend, run_id, &job_id)?;
         // `finish_job_row` bypasses `settle_node`, so a cancelled sibling
@@ -520,9 +529,7 @@ fn fail_jobset(
         .execute(params![codec::run_key(run_id), job_id.0])
         .map_err(db)?;
         finish_job_row(tx, run_id, job_id, status)?;
-        if is_expandable(tx, run_id, job_id)? {
-            retire_node_requests(tx, run_id, job_id, status)?;
-        }
+        retire_node_requests(tx, run_id, job_id, status)?;
         release_concurrency_for_job(tx, backend, run_id, job_id)?;
     }
     jobs::summarize_run_row(tx, run_id)?;
@@ -593,9 +600,10 @@ pub(super) fn cancel_run_inner(
             cancellations += 1;
         }
     }
-    // Every expandable node (deferred matrix parent / reusable caller) minted
-    // a request at submit even though it never ran — settle them now,
-    // whatever queue slot they were parked in.
+    // Every job that never started (and every expandable node: deferred
+    // matrix parent / reusable caller) minted a request at submit that no
+    // runner will settle — settle them now, whatever queue slot they were
+    // parked in. A running attempt keeps its request: its runner settles it.
     let nodes: Vec<JobId> = {
         let mut stmt = tx
             .prepare_cached(
@@ -619,7 +627,8 @@ pub(super) fn cancel_run_inner(
     .execute(params![run, now_us()])
     .map_err(db)?;
     for job_id in &nodes {
-        if is_expandable(tx, run_id, job_id)? {
+        let running = in_flight.iter().any(|(id, _)| *id == job_id.0);
+        if !running || is_expandable(tx, run_id, job_id)? {
             retire_node_requests(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
         }
     }
@@ -710,7 +719,7 @@ pub(super) fn cancel_job_inner(
     for child in children {
         count += cancel_job_inner(tx, backend, run_id, &child)?;
     }
-    if expandable {
+    if expandable || job.status != ExecutionStatus::InProgress {
         retire_node_requests(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
     }
     release_concurrency_for_job(tx, backend, run_id, job_id)?;
@@ -847,9 +856,9 @@ pub(super) fn expire_fork_approvals_inner(
     let mut failed = Vec::with_capacity(expired.len());
     for run_id in expired {
         let run = codec::run_key(run_id);
-        // Expandable nodes (deferred matrix parents, reusable callers) minted
-        // placeholder requests at submit even though they never ran; settle
-        // them with the node so no in-flight marker outlives the run.
+        // A held run's jobs never started, yet each minted a request at
+        // submit (expandable nodes included); settle them with the job so no
+        // open request outlives the run.
         let nodes: Vec<JobId> = {
             let mut stmt = tx
                 .prepare_cached(
@@ -873,9 +882,7 @@ pub(super) fn expire_fork_approvals_inner(
         .execute(params![run, now])
         .map_err(db)?;
         for job_id in &nodes {
-            if is_expandable(tx, run_id, job_id)? {
-                retire_node_requests(tx, run_id, job_id, ExecutionStatus::Failure)?;
-            }
+            retire_node_requests(tx, run_id, job_id, ExecutionStatus::Failure)?;
         }
         let finalized = tx
             .prepare_cached(

@@ -38,6 +38,21 @@ impl ControlBackend for LiteBackend {
             Ok(())
         })
     }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_request_integrity(
+        &self,
+    ) -> Result<crate::control::testview::RequestIntegrity, ControlError> {
+        use super::db;
+        self.read(|tx| {
+            tx.query_row(crate::control::testview::REQUEST_INTEGRITY_SQL, [], |row| {
+                Ok(crate::control::testview::RequestIntegrity {
+                    inflight_requests: row.get(0)?,
+                    live_job_request_pointer_mismatches: row.get(1)?,
+                })
+            })
+            .map_err(db)
+        })
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,

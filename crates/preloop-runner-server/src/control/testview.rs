@@ -17,6 +17,34 @@ use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{JobId, RegisteredRunner, RunId, RunnerSession};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
+/// The two request-bookkeeping integrity numbers the control-load harness
+/// reads after a drain (`benchmarks/control-load/run-round.sh`), both zero in
+/// a healthy store.
+///
+/// `inflight_requests` counts open `job_requests` rows (`result IS NULL`)
+/// whose job already settled, whose run completed, or whose job row is gone;
+/// a job still in flight legitimately owns one. `live_job_request_pointer_mismatches`
+/// counts `jobs.request_id` values that name no request of that job.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RequestIntegrity {
+    pub inflight_requests: i64,
+    pub live_job_request_pointer_mismatches: i64,
+}
+
+/// One statement both backends run for [`RequestIntegrity`]; plain SQL that
+/// parses on SQLite and Postgres alike.
+pub const REQUEST_INTEGRITY_SQL: &str = "SELECT \
+    (SELECT count(*) FROM job_requests q \
+       LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
+       LEFT JOIN runs r ON r.run_id = q.run_id \
+      WHERE q.result IS NULL \
+        AND (j.job_id IS NULL OR r.status = 'completed' \
+             OR j.status IN ('success','failure','cancelled','skipped'))), \
+    (SELECT count(*) FROM jobs j \
+       LEFT JOIN job_requests q ON q.request_id = j.request_id \
+      WHERE j.request_id IS NOT NULL \
+        AND (q.request_id IS NULL OR q.run_id <> j.run_id OR q.job_id <> j.job_id))";
+
 /// Field names deliberately match the old `InnerState` scheduling subset —
 /// the ported logic reads identically, and every field here is either
 /// loaded from the database or seeded from configuration at load time.

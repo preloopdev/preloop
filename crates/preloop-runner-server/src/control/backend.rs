@@ -194,6 +194,13 @@ pub(crate) trait ControlBackend: Send + Sync {
         completed_at_us: i64,
     ) -> Result<(), ControlError>;
 
+    /// Test hook: the harness's request-bookkeeping integrity counts
+    /// ([`RequestIntegrity`](super::testview::RequestIntegrity)), read with
+    /// the same SQL it runs against the database after a drain.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_request_integrity(
+        &self,
+    ) -> Result<super::testview::RequestIntegrity, ControlError>;
     /// Allocate the next run number for a workflow path from the durable
     /// counter. Called before the job messages are built (the number is
     /// embedded in `github.run_number`), so it is its own transaction — a
@@ -1918,6 +1925,15 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
             Self::Postgres(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_request_integrity(
+        &self,
+    ) -> Result<super::testview::RequestIntegrity, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.test_request_integrity().await,
+            Self::Postgres(b) => b.test_request_integrity().await,
         }
     }
     async fn allocate_run_number(

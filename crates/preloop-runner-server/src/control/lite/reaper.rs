@@ -9,10 +9,10 @@
 
 use super::codec::{self, now_us};
 use super::jobs;
-use super::{LiteBackend, db, runners};
+use super::{LiteBackend, db, runners, settle};
 use crate::control::logic::{self, StarvationCandidate, StarvationVerdict};
 use crate::control::types::*;
-use preloop_gha_protocol::{JobId, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
@@ -70,14 +70,19 @@ fn queue_job_cancellation(
 /// concurrency release — the job never held a gate).
 fn starve_job(tx: &Transaction<'_>, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
     let run = codec::run_key(run_id);
-    tx.prepare_cached(
-        "UPDATE jobs SET status = 'failure', queue_state = 'none', \
-         completed_at = ?3 \
-         WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
-    )
-    .map_err(db)?
-    .execute(params![run, job_id.0, now_us()])
-    .map_err(db)?;
+    let changed = tx
+        .prepare_cached(
+            "UPDATE jobs SET status = 'failure', queue_state = 'none', \
+             completed_at = ?3 \
+             WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
+        )
+        .map_err(db)?
+        .execute(params![run, job_id.0, now_us()])
+        .map_err(db)?;
+    // The job never ran: no runner will settle its request.
+    if changed > 0 {
+        settle::retire_node_requests(tx, run_id, job_id, ExecutionStatus::Failure)?;
+    }
     tx.prepare_cached("DELETE FROM job_assignments WHERE run_id = ?1 AND job_id = ?2")
         .map_err(db)?
         .execute(params![run, job_id.0])
