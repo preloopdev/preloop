@@ -179,6 +179,13 @@ Metadata lives in `job_specs.reusable_call` JSONB (`caller_job_id`,
 is the indexed lookup path; fall back to the metadata's `inner_job_ids` list
 if stricter fidelity is needed.
 
+A deferred caller (a `uses:` whose subtree materializes at runtime) starts with
+`inner_job_ids` empty. Its expansion fills them: the registered subtree becomes
+the caller's `inner_job_ids`, the callee metadata lands on the callee spec rows,
+and a deferred matrix parent named in a caller's list is replaced by its legs
+when it expands. These are lite's `write_reusable_meta` and
+`splice_matrix_parents`. Without them a deferred caller never folds on PG.
+
 ## If: Condition Evaluation (Per Newly-Unblocked Job)
 
 When the conditional UPDATE unblocks a dependent, evaluate its `if:` before
@@ -282,6 +289,9 @@ Still graph-backed: promotion of newly-unblocked dependents and of capped cohort
   reusable callers that share inner job ids, and rejection of non-terminal
   completions. `refresh_remaining_needs` matrix and chain cases and fail-fast
   sibling cancellation (with the `fail_fast=false` opt-out) stay pinned too.
+- The shared suite runs the deferred reusable caller scenarios (static callee,
+  deferred matrix callee, pre-seeded placeholder, pre-populated control) on both
+  backends.
 - Load-test A/B: confirm per-completion lock hold time drops and throughput
   rises on the 25 rps harness.
 

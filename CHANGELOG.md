@@ -100,7 +100,8 @@ Releases before v0.27.0 predate the changelog.
   loads the run on each completion while a parked leg and a free slot coexist.
   Fail-fast now cancels every non-terminal sibling of the base, releasing its
   concurrency hold and queueing the runner cancellation, matching the SQLite
-  path.
+  path. Deferred reusable callers record their expanded subtree, so they fold
+  on Postgres as they do on SQLite.
 - A completion that reports a non-terminal status is rejected with a bad
   request before anything is written.
 
