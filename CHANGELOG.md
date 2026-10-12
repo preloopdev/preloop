@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+
+### Added
+
+- **Self-built pull-request test merges**: a local `preloop run --event
+  pull_request` now tests the merge of the pull request's *current* base tip
+  into the workspace head (the synthetic snapshot commit when the tree is
+  dirty), exactly like GitHub's `refs/pull/<n>/merge`, instead of the branch
+  alone. The engine fetches the base branch from the workspace's `origin`,
+  builds the merge with `git merge-tree`/`git commit-tree`, and serves it to
+  the run's jobs from an engine-served snapshot repository (the commit exists
+  only here). `github.sha` is the merge commit, `github.ref` stays
+  `refs/pull/<n>/merge`, and the payload's `base.sha`/`head.sha` carry the
+  fetched base tip and the merged head, so changed-file actions keep diffing
+  the user's changes. A conflicted pull request fails the submission (409)
+  listing the conflicted files, exactly where GitHub refuses to run
+  `pull_request` workflows; an unreachable base fails loudly instead of
+  testing a different tree. `--no-merge` restores testing the branch alone,
+  and `push` events are unchanged (they test the commit itself). The server
+  also validates and serves prebuilt merges for other submission paths.
+
 ### Fixed
 
 - **`preloop run --job` secret preflight checks only the jobs it runs**: the
@@ -51,6 +71,14 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
+  process**: the env-selected backend handed each caller a fresh empty store,
+  so a config write sealed `[secrets]` under a key stored in a store instance
+  that vanished with the caller — the next read resolved a different key and
+  failed with `store envelope authentication failed`. The memory backend is
+  now one process-wide store, matching the shared `os`/`file` behavior;
+  explicit `MemoryCredentialStore::default()` instances stay per-instance for
+  test isolation.
 
 - **A pool failure no longer takes the engine down**: `RunnerPool::run`
   already tears every machine down on the way out, so when its task returned
@@ -199,7 +227,6 @@ Releases before v0.27.0 predate the changelog.
   Rerun context updates `github.triggering_actor` while retaining the
   original `github.actor`; migration `V2026100508__job_request_links` carries
   the nullable columns forward.
-
 - Environment protection rules now come from GitHub. When a GitHub App (or
   `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
   `environment:` are read from the repository's environments API —
@@ -301,6 +328,15 @@ Releases before v0.27.0 predate the changelog.
   `namespace_limits.max_job_timeout_minutes`/`priority_tier`/
   `run_history_retention_days`, `namespace_policies`) stay and are marked
   platform-owned in the schema.
+
+### Fixed
+
+- Local pull-request base selection now queries `git ls-remote --symref` when
+  the local remote-`HEAD` symbolic ref is absent. The resolved target is
+  reflected in both `github.base_ref` and the synthetic event payload; an
+  explicit base remains the override. Valid prebuilt merges bypass local base
+  discovery, and fetch-by-SHA merges resolve the requested commit instead of
+  the mirror's shared `FETCH_HEAD`.
 
 ### Security
 
