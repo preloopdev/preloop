@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use rand::Rng;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use rustls::pki_types::pem::PemObject;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +55,8 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 pub struct HttpClient {
     inner: reqwest::Client,
     control: Option<ControlTransport>,
+    /// TLS roots shared by the websocket probe and the HTTP clients.
+    websocket_tls: Arc<rustls::ClientConfig>,
     /// When set, URLs matching the origin prefix are rewritten to the upstream
     /// prefix before sending. Used in TCP upstream mode where the server
     /// advertises loopback URLs but the runner must reach it via a LAN address.
@@ -89,6 +93,34 @@ fn build_reqwest_client(ca_pem: Option<&[u8]>, socket: Option<&Path>) -> Result<
         }
     }
     Ok(builder.build()?)
+}
+fn build_websocket_tls_config(ca_pem: Option<&[u8]>) -> Result<Arc<rustls::ClientConfig>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Match reqwest's platform verifier for ordinary system roots. The
+    // bundled webpki roots above preserve the probe's previous behavior on
+    // platforms whose native store is unavailable.
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+
+    if let Some(pem) = ca_pem {
+        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
+            let cert = cert.context("parsing websocket CA bundle")?;
+            roots
+                .add(cert)
+                .context("adding websocket CA bundle certificate")?;
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("building websocket TLS configuration")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
 }
 
 fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
@@ -147,6 +179,7 @@ impl HttpClient {
                 std::fs::read(path).with_context(|| format!("reading CA bundle {}", path.display()))
             })
             .transpose()?;
+        let websocket_tls = build_websocket_tls_config(ca_pem.as_deref())?;
 
         let inner = build_reqwest_client(ca_pem.as_deref(), None)?;
         let control = control
@@ -165,8 +198,13 @@ impl HttpClient {
         Ok(Self {
             inner,
             control,
+            websocket_tls,
             upstream_rewrite: None,
         })
+    }
+    /// TLS configuration shared with the broker websocket probe.
+    pub(crate) fn websocket_tls_config(&self) -> Arc<rustls::ClientConfig> {
+        self.websocket_tls.clone()
     }
 
     /// Select the transport for a URL, routing only the configured local

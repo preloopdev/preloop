@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, oneshot};
+use tracing::{error, info, warn};
 
 use anyhow::Context;
 
@@ -1152,6 +1153,109 @@ fn runner_arch() -> &'static str {
         "ARM64"
     } else {
         "X64"
+    }
+}
+
+/// Job-message variable key carrying the broker websocket probe URL. v2.338.0:
+/// `WellKnownDistributedTaskVariables.RunnerBrokerWebSocketProbeUrl`.
+const BROKER_WEBSOCKET_PROBE_URL_VARIABLE: &str = "system.runner.brokerwebsocketprobeurl";
+
+/// Temporary probe of broker long-poll websocket compatibility.
+///
+/// v2.338.0 `JobExtension.cs`: when the job message advertises a probe URL,
+/// `_brokerWebSocketProbeTask` connects the job's `SystemVssConnection`
+/// credential to it and holds/reconnects until the job finishes; the result is
+/// appended to job telemetry as `broker_websocket_telemetry:<json>` with type
+/// `ConnectivityCheck`. The probe never affects the job outcome.
+pub struct BrokerWsProbe {
+    cancel_tx: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<crate::client::broker::BrokerWebSocketProbeResult>,
+}
+
+impl BrokerWsProbe {
+    /// Spawn the probe iff the job's variables carry the probe URL.
+    ///
+    /// `service_token` is the `SystemVssConnection` OAuth access token from
+    /// the job message endpoints, used as the websocket `Authorization:
+    /// Bearer`. A missing endpoint mirrors upstream's setup failure: the task
+    /// records `Connected = false` with the error string instead of throwing.
+    pub fn spawn(job_ctx: &JobContext, service_token: Option<String>) -> Option<Self> {
+        Self::spawn_with_http(job_ctx, service_token, None)
+    }
+
+    /// Spawn with the reporting client's configured TLS trust.
+    pub fn spawn_with_http(
+        job_ctx: &JobContext,
+        service_token: Option<String>,
+        http: Option<crate::client::http::HttpClient>,
+    ) -> Option<Self> {
+        let probe_url = job_ctx
+            .get_variable(BROKER_WEBSOCKET_PROBE_URL_VARIABLE)
+            .filter(|url| !url.is_empty())?
+            .to_owned();
+        info!("Start checking runner websocket connectivity in background.");
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            match service_token {
+                Some(token) => {
+                    let Some(http) =
+                        http.or_else(|| crate::client::http::HttpClient::new(None).ok())
+                    else {
+                        return crate::client::broker::BrokerWebSocketProbeResult {
+                            connected: false,
+                            errors: vec![
+                                "Unable to construct HTTP client for websocket probe".to_owned(),
+                            ],
+                            ..Default::default()
+                        };
+                    };
+                    crate::client::broker::run_long_poll_websocket_probe_with_http(
+                        &http,
+                        &probe_url,
+                        &token,
+                        &mut cancel_rx,
+                    )
+                    .await
+                }
+                None => crate::client::broker::BrokerWebSocketProbeResult {
+                    connected: false,
+                    errors: vec![
+                        "SystemVssConnection endpoint is missing from the job message".to_owned(),
+                    ],
+                    ..Default::default()
+                },
+            }
+        });
+        Some(Self { cancel_tx, task })
+    }
+
+    /// Cancel the probe and append its result to job telemetry.
+    ///
+    /// Mirrors `JobExtension.FinalizeJobAsync`'s
+    /// `_brokerWebSocketProbeToken.Cancel(); await _brokerWebSocketProbeTask`
+    /// followed by the `ConnectivityCheck` telemetry entry.
+    pub async fn finish(self, telemetry: &Mutex<Vec<serde_json::Value>>) {
+        let _ = self.cancel_tx.send(());
+        let message = match self.task.await {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(data) => {
+                    info!("Runner websocket probe result: {data}");
+                    format!("broker_websocket_telemetry:{data}")
+                }
+                Err(err) => {
+                    error!("Fail to serialize runner websocket probe result: {err}");
+                    format!("Fail to check runner websocket connectivity. {err}")
+                }
+            },
+            Err(err) => {
+                error!("Fail to check runner websocket connectivity. {err}");
+                format!("Fail to check runner websocket connectivity. {err}")
+            }
+        };
+        telemetry.lock().await.push(serde_json::json!({
+            "type": "ConnectivityCheck",
+            "message": message,
+        }));
     }
 }
 

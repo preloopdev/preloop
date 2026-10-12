@@ -560,6 +560,17 @@ pub async fn run_job(
         }
     });
 
+    // Temporary probe (v2.338.0): gauge websocket compatibility with the
+    // broker listener, only when run-service sends down a probe URL via the
+    // job message's `system.runner.brokerwebsocketprobeurl` variable. Uses
+    // the job's SystemVssConnection bearer; result lands in completejob
+    // telemetry at `finish` below. Never affects the job outcome.
+    let ws_probe = super::job_extension::BrokerWsProbe::spawn_with_http(
+        &job_ctx,
+        reporting.as_ref().map(|rpt| rpt.token()),
+        reporting.as_ref().map(|rpt| rpt.results.http().clone()),
+    );
+
     // Spawn job-timeout timer that trips cancel and sets the timed_out flag.
     //
     // Ticked rather than slept in one shot, so seconds spent paused at a failed
@@ -755,6 +766,12 @@ pub async fn run_job(
             col: None,
             end_column: None,
         });
+    }
+
+    // Collect the broker websocket probe into telemetry (official:
+    // `_brokerWebSocketProbeToken.Cancel(); await _brokerWebSocketProbeTask`).
+    if let (Some(probe), Some(rpt)) = (ws_probe, reporting.as_ref()) {
+        probe.finish(&rpt.connectivity_telemetry).await;
     }
 
     if was_lease_lost && !was_timeout {
