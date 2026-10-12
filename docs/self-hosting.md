@@ -63,7 +63,7 @@ SmolVM runtime, verifying every artifact against the release's published
 `sha256`:
 
 ```sh
-ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+ver=v0.34.0   # latest release, others at https://github.com/preloopdev/preloop/releases
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sudo -H env PREFIX=/usr/local sh install.sh

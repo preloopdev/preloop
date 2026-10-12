@@ -70,6 +70,7 @@ feature-depth = 1
 ignore = [
     "RUSTSEC-2023-0071",
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained but a working leaf for PEM parsing; accepted until a maintained successor is adopted." },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; it is the YAML engine under serde_yaml 0.9.34+deprecated, which parses workflows in preloop-gha-parser. The advisory is an unmaintained notice, not a vulnerability. Accepted until a replacement is chosen against the conformance corpus; revisit by 2026-12-31." },
 ]
 # The path where the advisory databases are cloned/fetched into
 #db-path = "$CARGO_HOME/advisory-dbs"
