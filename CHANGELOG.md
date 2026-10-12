@@ -10,6 +10,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Fewer GitHub calls for check runs and lookups**: the crash-recovery list
+  of existing check runs is filtered by check name and App id, and commit,
+  branch, and environment-rule lookups revalidate with `If-None-Match` so an
+  unchanged answer is a free `304`.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
