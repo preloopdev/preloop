@@ -2243,10 +2243,14 @@ pub async fn submit_run(
     // A dirty-tree push has no known head commit at submit time: check runs
     // would attach to the base commit and stay pending forever. The push
     // endpoint reports them against the materialized branch head instead
-    // (`github_push.rs` step 4). Clean-tree pushes know their commit up
-    // front and get queued checks immediately.
+    // (`github_push.rs` step 4). A bundled commit is known, but it exists only
+    // in the uploaded bundle until the client publishes it after CI, and
+    // GitHub rejects check runs against a commit it does not have, so it
+    // defers the same way. Clean-tree pushes know their commit up front and
+    // get queued checks immediately.
     let dirty_push = submission.push.as_ref().is_some_and(|push| push.dirty);
-    let clean_push_checks = push_requested && !dirty_push;
+    let unpublished_commit = submission.git_bundle_id.is_some();
+    let clean_push_checks = push_requested && !dirty_push && !unpublished_commit;
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
         let run_id = accepted.run_id;
