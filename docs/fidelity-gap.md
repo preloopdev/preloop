@@ -620,8 +620,9 @@ Every item below broke a real workflow step and was fixed in preloop:
   the campaign VMs expose SmolVM's translator at `/mnt/rosetta`. The guest
   has no corresponding binfmt registration, however, so directly executing
   an x86_64 binary still fails. This is a Preloop guest-bootstrap gap, not a
-  SmolVM capability gap. Docker actions additionally need the Rosetta mount
-  propagated into containers.
+  SmolVM capability gap. Docker actions are not supported on this path yet:
+  containers created by the in-guest dockerd do not carry the Rosetta mount,
+  so amd64-only images fail with a `rosetta-wrapper` error.
 - **`/tmp` is tmpfs**, so third-party actions that `rename()` across
   `/tmp` → toolcache die with `EXDEV` (setup-wasm-pack does exactly this).
   GitHub's image keeps `/tmp` on disk; the golden could mask
