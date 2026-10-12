@@ -10,6 +10,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **The GitHub App JWT breaker is partitioned by App id**: one App's rate
+  limit or outage no longer skips the webhook-health and delivery-watchdog
+  checks of the other Apps, and installation lookup, token minting, and App
+  reads now go through the breaker and the `app-auth` consumption counters.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
