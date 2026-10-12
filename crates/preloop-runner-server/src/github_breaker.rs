@@ -378,9 +378,9 @@ impl GithubCredentialBucket {
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0100_0000_01b3;
-    bytes
-        .iter()
-        .fold(OFFSET_BASIS, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(PRIME))
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// Registry of per-credential breakers.
@@ -1048,16 +1048,25 @@ mod tests {
                 },
                 "429",
             );
-        assert!(registry.breaker_for(GithubCredentialBucket::App(1)).is_open());
         assert!(
-            !registry.breaker_for(GithubCredentialBucket::App(2)).is_open(),
+            registry
+                .breaker_for(GithubCredentialBucket::App(1))
+                .is_open()
+        );
+        assert!(
+            !registry
+                .breaker_for(GithubCredentialBucket::App(2))
+                .is_open(),
             "App 2 must keep flowing while App 1 is rate limited"
         );
     }
 
     #[test]
     fn numeric_app_id_names_its_bucket_directly() {
-        assert_eq!(GithubCredentialBucket::for_app("123"), GithubCredentialBucket::App(123));
+        assert_eq!(
+            GithubCredentialBucket::for_app("123"),
+            GithubCredentialBucket::App(123)
+        );
         assert_eq!(GithubCredentialBucket::App(123).label(), "app:123");
     }
 
@@ -1066,7 +1075,10 @@ mod tests {
         let bucket = GithubCredentialBucket::for_app("emulated-app");
         assert!(matches!(bucket, GithubCredentialBucket::App(_)));
         assert_eq!(bucket, GithubCredentialBucket::for_app("emulated-app"));
-        assert_ne!(bucket, GithubCredentialBucket::for_app("other-emulated-app"));
+        assert_ne!(
+            bucket,
+            GithubCredentialBucket::for_app("other-emulated-app")
+        );
     }
 
     /// A tiny stub GitHub: serves scripted responses and counts hits, so

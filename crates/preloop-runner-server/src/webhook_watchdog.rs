@@ -400,10 +400,9 @@ async fn poll_app(
     let mut reached_watermark = false;
     let mut has_more_pages = false;
     for _page in 0..max_pages().max(1) {
-        let (items, next_cursor) =
-            list_deliveries(shared, app, &api_base, &jwt, cursor.as_deref())
-                .await
-                .map_err(|error| anyhow::anyhow!("listing deliveries: {error}"))?;
+        let (items, next_cursor) = list_deliveries(shared, app, &api_base, &jwt, cursor.as_deref())
+            .await
+            .map_err(|error| anyhow::anyhow!("listing deliveries: {error}"))?;
         if items.is_empty() {
             break;
         }
@@ -726,10 +725,10 @@ async fn repair_delivery(
     )
     .await;
     if let Ok(response) = &response {
-        shared.state.github_consumption.record_advertised_bytes(
-            crate::github_breaker::GithubSubsystem::Webhooks,
-            response,
-        );
+        shared
+            .state
+            .github_consumption
+            .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Webhooks, response);
     }
 
     // The claim already charged this attempt, moved the last-attempt clock
@@ -798,10 +797,10 @@ async fn list_deliveries(
             .header("X-GitHub-Api-Version", "2022-11-28"),
     )
     .await?;
-    shared.state.github_consumption.record_advertised_bytes(
-        crate::github_breaker::GithubSubsystem::Webhooks,
-        &response,
-    );
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Webhooks, &response);
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -1250,7 +1249,9 @@ mod tests {
         shared
             .state
             .github_breakers
-            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app("424"))
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app(
+                "424",
+            ))
             .record_failure(
                 &crate::github_breaker::GithubFailureKind::RateLimited {
                     retry_after: Some(std::time::Duration::from_secs(60)),

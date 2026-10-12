@@ -989,15 +989,9 @@ async fn mint_for_repository(
                 missing.join(", ")
             );
         }
-        let minted = mint_installation_token(
-            api_base,
-            creds,
-            &app_jwt,
-            installation_id,
-            repo,
-            &clamped,
-        )
-        .await?;
+        let minted =
+            mint_installation_token(api_base, creds, &app_jwt, installation_id, repo, &clamped)
+                .await?;
         narrowed = Some(clamped);
         minted
     } else {
@@ -1958,8 +1952,14 @@ pub async fn read_app_hook_config_at_with_breaker(
     private_key: &rsa::RsaPrivateKey,
     accounting: Option<(&GithubBreakerRegistry, &GithubConsumption)>,
 ) -> anyhow::Result<AppHookConfig> {
-    let payload =
-        read_app_json_at(api_base, "/app/hook/config", app_id, private_key, accounting).await?;
+    let payload = read_app_json_at(
+        api_base,
+        "/app/hook/config",
+        app_id,
+        private_key,
+        accounting,
+    )
+    .await?;
     let field = |name: &str| {
         payload
             .get(name)

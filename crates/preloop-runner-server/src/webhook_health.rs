@@ -119,7 +119,10 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some((&shared.state.github_breakers, &shared.state.github_consumption)),
+            Some((
+                &shared.state.github_breakers,
+                &shared.state.github_consumption,
+            )),
         )
         .await
         {
@@ -149,7 +152,10 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some((&shared.state.github_breakers, &shared.state.github_consumption)),
+            Some((
+                &shared.state.github_breakers,
+                &shared.state.github_consumption,
+            )),
         )
         .await
         {
@@ -292,7 +298,9 @@ mod tests {
         shared
             .state
             .github_breakers
-            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app(app_id))
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app(
+                app_id,
+            ))
             .record_failure(
                 &crate::github_breaker::GithubFailureKind::RateLimited {
                     retry_after: Some(Duration::from_secs(60)),
