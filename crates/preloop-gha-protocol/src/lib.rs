@@ -346,6 +346,14 @@ pub struct WorkflowSubmission {
     /// Explicit base ref for the run (populates `github.base_ref`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// GitHub's `github.ref_protected`: whether branch protection rules or
+    /// rulesets apply to `git_ref`. Resolved by the forge adapter at intake;
+    /// `false` for tags, pull-request refs and anything unresolvable. Engine-
+    /// resolved only: the native submission handler clears whatever a request
+    /// body sends, because the value feeds `GITHUB_REF_PROTECTED` and the
+    /// signed OIDC `ref_protected` claim.
+    #[serde(default)]
+    pub ref_protected: bool,
     /// Keep the failed job VM alive after the job ends for `preloop shell`.
     #[serde(default)]
     pub preserve_on_failure: bool,
@@ -897,9 +905,9 @@ where
 
 fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_json::Value {
     match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(masking::mask_secrets(&text, secrets.iter().copied(), &[]))
-        }
+        serde_json::Value::String(text) => serde_json::Value::String(
+            masking::mask_secrets_transform_aware(&text, secrets.iter().copied(), &[]),
+        ),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()

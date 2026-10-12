@@ -136,8 +136,16 @@ jobs:
             rm -f "$SOCKET"
           }
           trap cleanup EXIT
-          IMAGE="$(grep '^ubuntu_24_04_base' versions.toml | cut -d'"' -f2)"
-          [ -n "$IMAGE" ] || { echo "ubuntu_24_04_base missing from versions.toml" >&2; exit 1; }
+          # The base image once came from versions.toml's `ubuntu_24_04_base`;
+          # that pin is gone with the curated bake. Verify the runtime against
+          # the image the official goldens are actually built from, per arch.
+          case "$(uname -m)" in
+            x86_64) OFFICIAL_KEY=official_runner_image_base_amd64 ;;
+            arm64|aarch64) OFFICIAL_KEY=official_runner_image_base_arm64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          IMAGE="$(awk -F'"' -v k="^${OFFICIAL_KEY} = " '$0 ~ k { print $2; exit }' official-image.toml)"
+          [ -n "$IMAGE" ] || { echo "$OFFICIAL_KEY missing from official-image.toml" >&2; exit 1; }
           python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$SOCKET'); s.close()"
           echo "creating machine from $IMAGE"
           smolvm machine create --name "$NAME" \

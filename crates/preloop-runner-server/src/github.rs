@@ -217,7 +217,7 @@ async fn resolve_check_run_token(shared: &Arc<SharedState>, repo: &str) -> Optio
 
 async fn send_github_check_request(
     shared: &Arc<SharedState>,
-    breaker: &crate::github_breaker::GithubBreaker,
+    bucket: crate::github_breaker::GithubCredentialBucket,
     token: &str,
     repo: &str,
     method: reqwest::Method,
@@ -226,8 +226,11 @@ async fn send_github_check_request(
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
-    let res = crate::github_breaker::send_observed(
-        breaker,
+    let res = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::CheckRuns,
         client
             .request(method, &url)
             .header("User-Agent", "preloop")
@@ -236,11 +239,13 @@ async fn send_github_check_request(
             .json(body),
     )
     .await?;
-
-    // Honour the primary budget advertised on the response: once remaining
-    // hits zero, wait for the reset instead of spending the next call on a
-    // guaranteed 403.
-    breaker.observe_rate_budget(res.headers());
+    // The labeled sender already honours the primary budget advertised on
+    // the response (`x-ratelimit-remaining: 0` + `x-ratelimit-reset`), so
+    // the explicit `observe_rate_budget` call it replaces is gone.
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::CheckRuns, &res);
 
     if !res.status().is_success() {
         let status = res.status();
@@ -419,7 +424,7 @@ fn check_run_external_id(update: &crate::control::types::CheckRunUpdate) -> Stri
 /// for `filter=all` so a newer same-named check cannot hide ours.
 async fn find_existing_check_run(
     shared: &Arc<SharedState>,
-    breaker: &crate::github_breaker::GithubBreaker,
+    bucket: crate::github_breaker::GithubCredentialBucket,
     token: &str,
     repo: &str,
     sha: &str,
@@ -430,7 +435,7 @@ async fn find_existing_check_run(
     for page in 1..=MAX_PAGES {
         let payload = match send_github_check_request(
             shared,
-            breaker,
+            bucket,
             token,
             repo,
             reqwest::Method::GET,
@@ -479,6 +484,19 @@ pub(crate) enum CheckRunRateKey {
     Pat,
 }
 
+impl CheckRunRateKey {
+    /// The breaker bucket for this rate key: installation budgets are
+    /// per-installation, the PAT fallback shares the one PAT bucket.
+    fn bucket(&self) -> crate::github_breaker::GithubCredentialBucket {
+        match self {
+            CheckRunRateKey::Installation(id) => {
+                crate::github_breaker::GithubCredentialBucket::Installation(*id)
+            }
+            CheckRunRateKey::Pat => crate::github_breaker::GithubCredentialBucket::Pat,
+        }
+    }
+}
+
 /// Ceiling on how long a rate limit may park a row; a bogus header must not
 /// strand a check run for a day.
 const MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(3_600);
@@ -503,11 +521,11 @@ const CHECK_RUN_NOT_FOUND_RETRIES: i32 = 3;
 /// The serve bootstrap spawns one per node; tests build their own and drive
 /// [`CheckRunSender::drain_once`]. Rate budgets are per installation, so a
 /// throttled installation parks only its own rows and the rest keep flowing.
+/// Breaker state lives in the shared [`crate::github_breaker::GithubBreakerRegistry`]:
+/// PAT-backed check runs share the PAT bucket with every other PAT caller
+/// (action downloads, ref resolution), so a PAT 429 parks them too.
 pub(crate) struct CheckRunSender {
     owner: String,
-    budget: parking_lot::Mutex<
-        std::collections::HashMap<CheckRunRateKey, Arc<crate::github_breaker::GithubBreaker>>,
-    >,
 }
 
 impl Default for CheckRunSender {
@@ -520,16 +538,7 @@ impl CheckRunSender {
     pub(crate) fn new() -> Self {
         Self {
             owner: uuid::Uuid::new_v4().to_string(),
-            budget: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
-    }
-
-    fn breaker(&self, key: &CheckRunRateKey) -> Arc<crate::github_breaker::GithubBreaker> {
-        let mut budget = self.budget.lock();
-        budget
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(crate::github_breaker::GithubBreaker::default()))
-            .clone()
     }
 
     /// Lease and process one batch. Returns how many rows were leased; the
@@ -569,14 +578,20 @@ impl CheckRunSender {
             .to_owned();
         // Resolve the real installation before budgeting or sending: the
         // queue row's `installation_id` is projection metadata (0 = unknown),
-        // never an authority.
-        let key = resolve_check_run_rate_key(shared, &repo).await;
-        let breaker = self.breaker(&key);
+        // never an authority. The bucket comes from the shared registry, so
+        // PAT-backed check runs share the PAT bucket with action downloads
+        // and every other PAT caller.
+        let bucket = resolve_check_run_rate_key(shared, &repo).await.bucket();
+        let breaker = shared.state.github_breakers.breaker_for(bucket);
         if let Some(remaining) = breaker.retry_after() {
             // Waiting out a rate limit is not a delivery failure: release the
             // row due at GitHub's advertised resume time without burning an
             // attempt, so a long throttle cannot exhaust the permanent-drop
             // budget.
+            shared
+                .state
+                .github_consumption
+                .record_breaker_blocked(crate::github_breaker::GithubSubsystem::CheckRuns);
             if let Err(error) = shared
                 .state
                 .backend
@@ -593,7 +608,7 @@ impl CheckRunSender {
             return;
         }
         let token = resolve_check_run_token(shared, &repo).await;
-        match send_queued_check_run(shared, &self.owner, &breaker, token.as_deref(), update).await {
+        match send_queued_check_run(shared, &self.owner, bucket, token.as_deref(), update).await {
             Ok(()) => {}
             Err(error) if error.to_string().contains(LOST_CHECK_RUN_LEASE) => {
                 // Another sender owns the row now; it delivers the update.
@@ -651,6 +666,25 @@ async fn resolve_check_run_rate_key(shared: &Arc<SharedState>, repo: &str) -> Ch
         },
         None => CheckRunRateKey::Pat,
     }
+}
+
+/// The breaker bucket for a check-run/deployment request carrying `token`.
+///
+/// When the resolved token is the static PAT, the PAT bucket governs no
+/// matter what the installation lookup said: the installation mint failed
+/// and the PAT budget is what is actually spent. Otherwise the resolved
+/// installation's bucket applies.
+async fn check_request_bucket(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    token: Option<&str>,
+) -> crate::github_breaker::GithubCredentialBucket {
+    if let Some(token) = token
+        && Some(token) == shared.state.static_github_pat().as_deref()
+    {
+        return crate::github_breaker::GithubCredentialBucket::Pat;
+    }
+    resolve_check_run_rate_key(shared, repo).await.bucket()
 }
 
 /// Drain the durable check-run queue. This is the only path that invokes the
@@ -720,13 +754,13 @@ fn check_retry_delay(error: &anyhow::Error, attempts: i32) -> std::time::Duratio
     std::time::Duration::from_millis(base + rand::random::<u64>() % 250)
 }
 
-/// Render and deliver one queued update. `breaker` is the resolved
+/// Render and deliver one queued update. `bucket` is the resolved
 /// installation's rate budget; every request this function makes goes
 /// through it.
 async fn send_queued_check_run(
     shared: &Arc<SharedState>,
     owner: &str,
-    breaker: &crate::github_breaker::GithubBreaker,
+    bucket: crate::github_breaker::GithubCredentialBucket,
     token: Option<&str>,
     update: &crate::control::types::CheckRunUpdate,
 ) -> anyhow::Result<()> {
@@ -811,7 +845,7 @@ async fn send_queued_check_run(
         // check from another workflow or app.
         let external_id = check_run_external_id(update);
         check_run_id =
-            find_existing_check_run(shared, breaker, token, repo, sha, &external_id).await?;
+            find_existing_check_run(shared, bucket, token, repo, sha, &external_id).await?;
         if let Some(id) = check_run_id {
             persist_check_run_id(shared, owner, update, id).await?;
         }
@@ -834,7 +868,7 @@ async fn send_queued_check_run(
         send_check_run_body(
             shared,
             owner,
-            breaker,
+            bucket,
             token,
             repo,
             sha,
@@ -863,7 +897,7 @@ async fn send_queued_check_run(
             send_check_run_body(
                 shared,
                 owner,
-                breaker,
+                bucket,
                 token,
                 repo,
                 sha,
@@ -963,7 +997,7 @@ async fn send_queued_check_run(
                     body["status"] = Value::String("queued".to_owned());
                 }
                 id = send_check_run_body(
-                    shared, owner, breaker, token, repo, sha, &title, update, id, body,
+                    shared, owner, bucket, token, repo, sha, &title, update, id, body,
                 )
                 .await?;
             }
@@ -1024,7 +1058,7 @@ async fn timeline_annotations(
 async fn send_check_run_body(
     shared: &Arc<SharedState>,
     owner: &str,
-    breaker: &crate::github_breaker::GithubBreaker,
+    bucket: crate::github_breaker::GithubCredentialBucket,
     token: &str,
     repo: &str,
     sha: &str,
@@ -1062,7 +1096,7 @@ async fn send_check_run_body(
         anyhow::bail!(LOST_CHECK_RUN_LEASE);
     }
     let response =
-        match send_github_check_request(shared, breaker, token, repo, method, &path, &body).await {
+        match send_github_check_request(shared, bucket, token, repo, method, &path, &body).await {
             Ok(response) => response,
             Err(error) => {
                 // An early 404 is usually a just-created check still
@@ -1090,7 +1124,7 @@ async fn send_check_run_body(
             Some(id) => id,
             None => {
                 let external_id = check_run_external_id(update);
-                find_existing_check_run(shared, breaker, token, repo, sha, &external_id)
+                find_existing_check_run(shared, bucket, token, repo, sha, &external_id)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?
             }
@@ -1443,9 +1477,10 @@ async fn ensure_environment_deployment(
             format!("preloop run {run_id} job {}", job_id.0).into(),
         );
     }
+    let bucket = check_request_bucket(shared, &row.repository, Some(&token)).await;
     let res = send_github_check_request(
         shared,
-        &shared.state.github_breaker,
+        bucket,
         &token,
         &row.repository,
         reqwest::Method::POST,
@@ -1498,9 +1533,10 @@ async fn post_deployment_status(
     if let Some(url) = environment_url {
         body["environment_url"] = serde_json::json!(url);
     }
+    let bucket = check_request_bucket(shared, repo, Some(token)).await;
     send_github_check_request(
         shared,
-        &shared.state.github_breaker,
+        bucket,
         token,
         repo,
         reqwest::Method::POST,
@@ -1542,9 +1578,10 @@ async fn patch_check_run_actions(
     if let Some(summary) = summary {
         body["output"] = serde_json::json!({ "title": "Deployment review", "summary": summary });
     }
+    let bucket = check_request_bucket(shared, repo, Some(token)).await;
     send_github_check_request(
         shared,
-        &shared.state.github_breaker,
+        bucket,
         token,
         repo,
         reqwest::Method::PATCH,
@@ -1892,15 +1929,29 @@ pub async fn fetch_workflows_at(
         }
         Ok(workflows)
     } else {
-        let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repo).await {
-            let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-            Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
-        } else {
-            shared.state.static_github_pat()
+        let (token, bucket) = match crate::github_app::select_app_for_repo(shared, repo).await {
+            Some(app) => {
+                let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+                let token =
+                    crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions)
+                        .await?;
+                // The installation id is the rate-limit identity; never
+                // invent one (same convention as check runs).
+                let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                    Ok(installation) if installation != 0 => {
+                        crate::github_breaker::GithubCredentialBucket::Installation(installation)
+                    }
+                    _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                };
+                (Some(token), bucket)
+            }
+            None => (
+                shared.state.static_github_pat(),
+                crate::github_breaker::GithubCredentialBucket::Pat,
+            ),
         };
         if let Some(token) = &token {
-            fetch_remote_workflows(&shared.state.github_breaker, token, repo, git_ref, api_base)
-                .await
+            fetch_remote_workflows(shared, bucket, token, repo, git_ref, api_base).await
         } else if !git_ref.is_empty() {
             anyhow::bail!(
                 "cannot fetch workflow revision {git_ref:?} without a local workspace or GitHub credentials"
@@ -1928,7 +1979,8 @@ pub async fn fetch_workflows_at(
 }
 
 async fn fetch_remote_workflows(
-    breaker: &crate::github_breaker::GithubBreaker,
+    shared: &Arc<SharedState>,
+    bucket: crate::github_breaker::GithubCredentialBucket,
     token: &str,
     repo: &str,
     git_ref: &str,
@@ -1941,8 +1993,11 @@ async fn fetch_remote_workflows(
         repo,
         git_ref
     );
-    let response = crate::github_breaker::send_observed(
-        breaker,
+    let response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Workflows,
         client
             .get(&url)
             .header("User-Agent", "preloop")
@@ -1973,8 +2028,11 @@ async fn fetch_remote_workflows(
             && (item.name.ends_with(".yml") || item.name.ends_with(".yaml"))
             && let Some(download_url) = &item.download_url
         {
-            let file_res = crate::github_breaker::send_observed(
-                breaker,
+            let file_res = crate::github_breaker::send_observed_labeled(
+                &shared.state.github_breakers,
+                bucket,
+                &shared.state.github_consumption,
+                crate::github_breaker::GithubSubsystem::Workflows,
                 client
                     .get(download_url)
                     .header("User-Agent", "preloop")
@@ -2025,25 +2083,18 @@ pub async fn resolve_ref_sha(
         return Ok(None);
     }
     let api_base = github_api_base();
-    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await
-    {
-        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-        Some(
-            crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
-                .await?,
-        )
-    } else {
-        std::env::var("PRELOOP_GITHUB_TOKEN").ok()
-    };
-    let Some(token) = token else {
+    let Some((token, bucket)) = contents_read_token(shared, repository, &api_base).await? else {
         return Ok(None);
     };
     let commit_ref = git_ref
         .strip_prefix("refs/heads/")
         .or_else(|| git_ref.strip_prefix("refs/tags/"))
         .unwrap_or(git_ref);
-    let response = crate::github_breaker::send_observed(
-        &shared.state.github_breaker,
+    let response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Workflows,
         crate::shared_http::CLIENT
             .clone()
             .get(format!(
@@ -2061,8 +2112,131 @@ pub async fn resolve_ref_sha(
     Ok(commit.get("sha").and_then(Value::as_str).map(str::to_owned))
 }
 
+/// The credential [`resolve_ref_sha`] and [`resolve_ref_protected`] query
+/// GitHub with: an App-minted `contents: read` installation token for the
+/// repository, else the static PAT. `None` when neither exists.
+async fn contents_read_token(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    api_base: &str,
+) -> anyhow::Result<Option<(String, crate::github_breaker::GithubCredentialBucket)>> {
+    if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        let token =
+            crate::github_app::get_or_mint_token_at(api_base, &app, repository, &permissions)
+                .await?;
+        // The installation id is the rate-limit identity; never invent one
+        // (same convention as check runs).
+        let bucket = match crate::github_app::installation_for_repo(&app, repository).await {
+            Ok(installation) if installation != 0 => {
+                crate::github_breaker::GithubCredentialBucket::Installation(installation)
+            }
+            _ => crate::github_breaker::GithubCredentialBucket::Pat,
+        };
+        return Ok(Some((token, bucket)));
+    }
+    // The env PAT here mirrors the pre-existing credential ladder; the
+    // bucket is the PAT's either way.
+    Ok(std::env::var("PRELOOP_GITHUB_TOKEN")
+        .ok()
+        .map(|token| (token, crate::github_breaker::GithubCredentialBucket::Pat)))
+}
+
+/// GitHub's `github.ref_protected` for `git_ref`: whether branch protection
+/// rules or rulesets apply to it. Only `refs/heads/*` is resolved here; tags
+/// (which a tag ruleset can protect), pull-request refs, a local workspace,
+/// and any lookup that fails resolve to `false`. That is the unprivileged
+/// answer — consumers grant more to a protected ref (cache writers publish
+/// only from one, OIDC trust policies key on the claim) — so an unknown ref
+/// must never read as protected.
+pub async fn resolve_ref_protected(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    git_ref: &str,
+) -> bool {
+    let Some(branch) = git_ref.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    if shared.state.local_workspace.is_some() {
+        return false;
+    }
+    match fetch_branch_protected(shared, repository, branch).await {
+        Ok(protected) => protected,
+        Err(error) => {
+            warn!(
+                repository,
+                branch,
+                ?error,
+                "could not resolve branch protection; reporting github.ref_protected = false"
+            );
+            false
+        }
+    }
+}
+
+async fn fetch_branch_protected(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    let api_base = github_api_base();
+    let Some((token, bucket)) = contents_read_token(shared, repository, &api_base).await? else {
+        return Ok(false);
+    };
+    // Branch names are URL-significant: `git check-ref-format` permits `#`, `%`
+    // and `/`, so a raw `release#test` is transmitted as `release` (the rest is
+    // a fragment) and a lookup for an unprotected branch would answer with a
+    // *different* branch's protection. Encode the name as one path segment, the
+    // way the action-tarball URLs already do.
+    let encoded = crate::actions::percent_encode_path_segment(branch);
+    let response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::RefResolve,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!("{api_base}/repos/{repository}/branches/{encoded}"))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await?;
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        anyhow::bail!("GitHub returned {status} for branch {branch:?}");
+    }
+    let body: Value = response.json().await?;
+    // The answer must be about the branch that was asked for: a server (or
+    // intermediary) that folds or drops part of the encoded name — or resolves
+    // it to another ref — would otherwise lend that branch's protection to
+    // this run. Anything but an exact match is unresolvable, and unresolvable
+    // is unprivileged.
+    match body.get("name").and_then(Value::as_str) {
+        Some(name) if name == branch => {}
+        other => {
+            warn!(
+                repository,
+                branch,
+                resolved = ?other,
+                "branch protection lookup answered for a different branch; \
+                 reporting github.ref_protected = false"
+            );
+            return Ok(false);
+        }
+    }
+    Ok(body
+        .get("protected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
 async fn get_pr_changed_files(
-    breaker: &crate::github_breaker::GithubBreaker,
+    shared: &Arc<SharedState>,
+    bucket: crate::github_breaker::GithubCredentialBucket,
     token: &str,
     repo: &str,
     pr_number: u64,
@@ -2085,8 +2259,11 @@ async fn get_pr_changed_files(
             pr_number,
             page
         );
-        let response = crate::github_breaker::send_observed(
-            breaker,
+        let response = crate::github_breaker::send_observed_labeled(
+            &shared.state.github_breakers,
+            bucket,
+            &shared.state.github_consumption,
+            crate::github_breaker::GithubSubsystem::Workflows,
             client
                 .get(&url)
                 .header("User-Agent", "preloop")
@@ -2132,24 +2309,30 @@ pub async fn resolve_pr_changed_files_at(
     pr_number: u64,
     api_base: &str,
 ) -> anyhow::Result<Option<Vec<String>>> {
-    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repo).await {
-        let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
-        Some(crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?)
-    } else {
-        std::env::var("PRELOOP_GITHUB_TOKEN").ok()
+    let (token, bucket) = match crate::github_app::select_app_for_repo(shared, repo).await {
+        Some(app) => {
+            let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
+            let token =
+                crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?;
+            let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                Ok(installation) if installation != 0 => {
+                    crate::github_breaker::GithubCredentialBucket::Installation(installation)
+                }
+                _ => crate::github_breaker::GithubCredentialBucket::Pat,
+            };
+            (Some(token), bucket)
+        }
+        None => (
+            std::env::var("PRELOOP_GITHUB_TOKEN").ok(),
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
     };
     let Some(token) = token else {
         return Ok(None);
     };
-    get_pr_changed_files(
-        &shared.state.github_breaker,
-        &token,
-        repo,
-        pr_number,
-        api_base,
-    )
-    .await
-    .map(Some)
+    get_pr_changed_files(shared, bucket, &token, repo, pr_number, api_base)
+        .await
+        .map(Some)
 }
 
 const WEBHOOK_ACK_BUDGET: Duration = Duration::from_secs(8);
@@ -2975,8 +3158,10 @@ async fn drain_webhook_queue_loop(shared: &Arc<SharedState>) -> anyhow::Result<u
         // A known GitHub outage means every claim here would charge an
         // attempt and then fail on the same dependency. Not claiming is the
         // difference between riding out an incident and dead-lettering every
-        // push that arrived during it.
-        if let Some(retry_after) = shared.state.github_breaker.retry_after() {
+        // push that arrived during it. Only unreachability gates claiming:
+        // a per-credential rate limit parks that credential's bucket, while
+        // other credentials' deliveries keep flowing.
+        if let Some(retry_after) = shared.state.github_breakers.unavailable_retry_after() {
             debug!(
                 retry_in_secs = retry_after.as_secs(),
                 "GitHub breaker open; deferring webhook queue drain"
@@ -3089,7 +3274,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
     // reason a step failed.
     let outcome = match outcome {
         WebhookOutcome::TransientError(error) => {
-            match shared.state.github_breaker.retry_after() {
+            match shared.state.github_breakers.retry_after() {
                 Some(retry_after) => WebhookOutcome::DependencyUnavailable {
                     error,
                     // Bounded: a long breaker window still gets re-examined
@@ -3641,6 +3826,12 @@ async fn process_delivery_payload_with_lease(
             }
         }
 
+        // GitHub's `github.ref_protected` for this event's ref. Resolved once
+        // per effective event, not per workflow: every workflow one event
+        // fans out to sees the same ref.
+        let ref_protected =
+            resolve_ref_protected(shared, &repo_full_name, &effective.git_ref).await;
+
         for (filename, content) in workflows {
             if lease_lost.is_cancelled() {
                 return WebhookOutcome::Success;
@@ -3782,6 +3973,7 @@ async fn process_delivery_payload_with_lease(
                     .clone()
                     .or_else(|| Some(resolved_sha.clone())),
                 filter_branch,
+                ref_protected,
                 dispatch_inputs: BTreeMap::new(),
                 dispatch_inputs_stringified: BTreeMap::new(),
                 selected_jobs: vec![],
@@ -4462,15 +4654,18 @@ mod tests {
         );
     }
 
-    /// Trip the shared breaker the way three consecutive 5xx responses would.
+    /// Trip a breaker bucket the way three consecutive 5xx responses would.
     fn open_breaker(state: &AppState) {
+        let breaker = state
+            .github_breakers
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::Pat);
         for _ in 0..3 {
-            state.github_breaker.record_failure(
+            breaker.record_failure(
                 &crate::github_breaker::GithubFailureKind::Unavailable,
                 "GitHub responded 503",
             );
         }
-        assert!(state.github_breaker.is_open(), "breaker must be open");
+        assert!(breaker.is_open(), "breaker must be open");
     }
 
     /// A known GitHub outage must stop the queue from claiming: every claim
@@ -5884,6 +6079,75 @@ jobs:
         );
     }
 
+    /// A PAT 429 observed on the actions path parks PAT-backed check runs:
+    /// the sender shares the PAT bucket from the registry instead of a
+    /// private breaker, so the throttled budget is not spent twice.
+    #[tokio::test]
+    async fn pat_throttle_on_actions_parks_check_run_sender() {
+        use crate::github_breaker::{GithubCredentialBucket, GithubSubsystem};
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let (api, requests) = start_github_stub(move |_, _, _| {
+            (
+                429,
+                vec![("x-ratelimit-reset", reset.to_string())],
+                serde_json::json!({"message": "API rate limit exceeded"}),
+            )
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "pat-for-test");
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+
+        // Trip the PAT bucket the way an action-tarball 429 would: the 429
+        // response itself is returned, and the bucket opens at once.
+        let response = crate::github_breaker::send_observed_labeled(
+            &shared.state.github_breakers,
+            GithubCredentialBucket::Pat,
+            &shared.state.github_consumption,
+            GithubSubsystem::Actions,
+            crate::shared_http::CLIENT.get(format!("{api}/repos/o/r/tarball/main")),
+        )
+        .await
+        .expect("the 429 response itself is returned, not an error");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            shared
+                .state
+                .github_breakers
+                .breaker_for(GithubCredentialBucket::Pat)
+                .is_open(),
+            "the PAT bucket must be parked"
+        );
+
+        // A check run for a PAT-backed repo must not reach GitHub now: the
+        // sender consults the same shared bucket and defers the row.
+        let job = JobId("build".to_owned());
+        seed_check_run_update(&shared, run_id, &job, 1, "in_progress", None).await;
+        assert_eq!(drain_sender(&shared).await, 1);
+        assert!(
+            check_run_writes(&requests).is_empty(),
+            "no check-run write may reach GitHub while the PAT bucket is parked"
+        );
+        let usage: std::collections::HashMap<&str, crate::github_breaker::GithubSubsystemUsage> =
+            shared
+                .state
+                .github_consumption
+                .snapshot()
+                .into_iter()
+                .map(|usage| (usage.subsystem, usage))
+                .collect();
+        assert_eq!(usage["check-runs"].breaker_blocked, 1);
+        assert_eq!(
+            usage["check-runs"].requests, 0,
+            "a refused attempt is not a GitHub request"
+        );
+    }
+
     /// (e) crash after POST before the id was saved: the next attempt finds
     /// the existing check run (or the persisted job mapping) and PATCHes it;
     /// it never POSTs a duplicate.
@@ -6383,6 +6647,90 @@ jobs:
         assert!(
             delay > std::time::Duration::from_secs(1_700),
             "a spent budget waits for the advertised reset, got {delay:?}"
+        );
+    }
+
+    /// `github.ref_protected` comes from the forge: branch protection (or a
+    /// ruleset) answers `protected`, a branch GitHub does not know answers
+    /// false, and non-branch refs are never looked up at all.
+    #[tokio::test]
+    async fn ref_protected_reads_branch_protection_from_the_forge() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let branch_stub = axum::routing::get({
+            let seen = seen.clone();
+            move |axum::extract::Path(branch): axum::extract::Path<String>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().push(branch.clone());
+                    let protected = matches!(branch.as_str(), "main" | "release");
+                    if protected || branch == "feature" {
+                        axum::Json(serde_json::json!({"name": branch, "protected": protected}))
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({"message": "Branch not found"})),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        });
+        // A server that answers about a *different* branch must never lend
+        // that branch's protection to this run.
+        let mismatch_stub = axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"name": "release", "protected": true}))
+        });
+        let stub = axum::Router::new()
+            .route("/repos/owner/repo/branches/:branch", branch_stub)
+            .route("/repos/owner/mismatch/branches/:branch", mismatch_stub);
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+        let _token =
+            crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "branch-protection-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+
+        assert!(resolve_ref_protected(&shared, "owner/repo", "refs/heads/main").await);
+        assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/heads/feature").await);
+        assert!(resolve_ref_protected(&shared, "owner/repo", "refs/heads/release").await);
+        // `#`, `%` and `/` are all legal in a branch name, so the lookup must
+        // transmit the whole name as one encoded segment: sent raw, the
+        // fragment cut `release#test` down to `release` and the lookup
+        // answered with *that* branch's protection.
+        assert!(
+            !resolve_ref_protected(&shared, "owner/repo", "refs/heads/release#test").await,
+            "release#test must not inherit release's protection"
+        );
+        assert!(
+            !resolve_ref_protected(&shared, "owner/repo", "refs/heads/release/test").await,
+            "release/test must not inherit release's protection"
+        );
+        // A 200 naming another branch is not an answer about the one asked
+        // for: an exact name match is what makes the answer trustworthy.
+        assert!(
+            !resolve_ref_protected(&shared, "owner/mismatch", "refs/heads/release#test").await,
+            "a lookup answered with a different branch name must stay unprivileged"
+        );
+        // Tags and pull-request refs cannot be protected; no lookup is made.
+        assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/tags/v1.0.0").await);
+        assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/pull/7/merge").await);
+        assert_eq!(
+            seen.lock().clone(),
+            vec![
+                "main".to_owned(),
+                "feature".to_owned(),
+                "release".to_owned(),
+                "release#test".to_owned(),
+                "release/test".to_owned(),
+            ],
+            "each lookup must carry the branch name verbatim, as one path segment"
         );
     }
 

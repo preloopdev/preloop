@@ -821,6 +821,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // workflow fetches: private `uses: owner/repo/...` references must
     // resolve without a separately exported token.
     crate::remote_workflows::resolve_remote_workflows(
+        shared,
         &mut submission,
         &workflow,
         shared.state.static_github_pat().as_deref(),
@@ -1090,6 +1091,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
     }
 
+    // Server-wide submit cap, enforced after expansion (the count above is
+    // post-matrix-expansion and post-closure-filter) but before the build
+    // loop and the insert transaction: a rejected run never opens a giant
+    // transaction, so it can never pin the writer. Webhook deliveries
+    // bypass it — like the namespace submit quotas, a push is never
+    // refused; chunked inserts bound their writer hold instead.
+    if webhook_delivery_id.is_none() {
+        let max_jobs_per_run = shared.state.max_jobs_per_run;
+        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
+            return Err(ApiError::bad_request(format!(
+                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
+                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
+                jobs.len(),
+            )));
+        }
+    }
+
     let run_id = RunId::new();
     // Durable before the run commits: any node may acquire its jobs later.
     // Dropped again unless the submit commits a new run.
@@ -1234,7 +1252,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "api_url": shared.state.github_urls.api_url,
         "graphql_url": shared.state.github_urls.graphql_url,
         "ref_name": ref_name,
-        "ref_protected": false,
+        "ref_protected": submission.ref_protected,
         "ref_type": ref_type,
         "secret_source": "Actions",
         "event": submission.payload,
@@ -1295,6 +1313,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             Err(error) => return Err(error.into_api_error()),
         }
     } else if let Some(workspace) = local_workspace {
+        // The snapshot is a local submission's only copy of the tested tree:
+        // the synthetic commit exists nowhere else, so there is no other
+        // checkout to fall back to. Failing here reports the real reason (a
+        // full disk, a publish that could not be completed) to the person who
+        // submitted, instead of queueing jobs that can only die in setup.
         match create_workspace_snapshot(
             &shared.state.state_dir,
             workspace,
@@ -1306,21 +1329,24 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .await
         {
             Ok(snapshot) => Some(snapshot),
-            // A merge-requested run must never fall back to a normal
-            // checkout: that is the branch-alone tree the merge request
-            // exists to replace. Other snapshot failures keep the historical
-            // best-effort fallback.
-            Err(error) if local_pull_request_merge.is_some() => return Err(error),
             Err(error) => {
-                warn!(%run_id, error = ?error, "Failed to create workspace snapshot — falling back to normal checkout");
-                None
+                error!(
+                    %run_id,
+                    workspace = %workspace.display(),
+                    message = error.message(),
+                    "Refusing local submission: workspace snapshot could not be created"
+                );
+                return Err(error);
             }
         }
     } else {
         match create_remote_checkout_snapshot(shared, &submission, run_id, &sha).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                warn!(%run_id, error = ?error, "Failed to populate remote checkout cache — falling back to normal checkout");
+                // The commit exists upstream, so jobs can still check out
+                // directly — degraded, never broken. Reported at error level
+                // because it is a full forge fetch per job, not a cache hit.
+                error!(%run_id, error = ?error, "Failed to populate remote checkout cache — jobs will fetch from the forge");
                 None
             }
         }
@@ -2153,6 +2179,11 @@ pub async fn submit_run(
     // request body to select the trust tier used by auto-PR and secret policy;
     // only the GitHub webhook adapters may stamp this field.
     submission.trust_tier = None;
+    // Same rule for branch protection: `ref_protected` is a claim about the
+    // forge's configuration, so only the adapters that resolve it against
+    // GitHub may set it. A body cannot assert it into `GITHUB_REF_PROTECTED`
+    // or the signed OIDC claim — consumers grant more to a protected ref.
+    submission.ref_protected = false;
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
@@ -2652,7 +2683,8 @@ pub(crate) fn build_job_artifacts(
     }
 
     // The request id is the `job_requests` primary key; it is minted inside
-    // the writer transaction (`submit_run_tx`/`register_expanded_jobs`) under
+    // the writer transaction (`submit_run`'s chunk transactions /
+    // `register_expanded_jobs`) under
     // the cross-process writer lock, not here — a process-local atomic would
     // let two engines sharing one database allocate the same id. Stamp the
     // placeholder the transaction overwrites on both the message and the
@@ -3605,6 +3637,19 @@ pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
+    cancel_run_inner(&shared, run_id).await.map(Json)
+}
+
+/// Cancel a run: stop its in-flight attempts, fail its queued jobs
+/// (`cancelled`), and report the cancelled jobs' check runs in the
+/// background. Shared by the native route and the GitHub-compat shim;
+/// `NotFound` when the run does not exist. Cancelling an already-terminal run
+/// is a no-op that returns the record (the native endpoint is idempotent; the
+/// compat shim pre-checks the status and answers `409` like github.com).
+pub(crate) async fn cancel_run_inner(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+) -> Result<RunRecord, ApiError> {
     let crate::control::types::CancelOutcome {
         cancellations: cancellation_count,
         record,
@@ -3640,7 +3685,7 @@ pub async fn cancel_run(
     // each behind a busy engine. Awaiting it here let a client that timed out
     // drop the handler midway: the run stayed cancelled while the remaining
     // check runs were never updated and sat `queued` on GitHub forever.
-    let reporter = Arc::clone(&shared);
+    let reporter = Arc::clone(shared);
     tokio::spawn(async move {
         for job_id in cancelled_jobs {
             crate::github::report_check_run_completed(
@@ -3652,7 +3697,7 @@ pub async fn cancel_run(
             .await;
         }
     });
-    Ok(Json(record))
+    Ok(record)
 }
 
 /// Request body for approving a pending environment protection gate.
@@ -3782,18 +3827,33 @@ pub async fn approve_job(
         }
     }
 }
-pub async fn rerun_run_inner(
+/// Re-run a completed run as a new attempt on the same `run_id`: the
+/// backend archives the finished attempt into `run_history`/`job_history`,
+/// resets the mode-selected jobs (plus their dependents), and re-admits
+/// them through the same gate/queue chain a submit would. `github.run_attempt`
+/// increments; non-rerun jobs keep their results and outputs for dependents.
+///
+/// A *fully archived* run (no live `runs`/`jobs` rows — the archiver moves
+/// settled runs out of the hot tables) cannot be reset in place: its
+/// scheduler rows (`job_specs`, `job_messages`, `job_needs`) are gone with
+/// the live row. A full re-run resubmits the recorded submission as a new
+/// run; a partial mode is refused (`409`, GitHub-shaped: a re-run that
+/// cannot name its jobs cannot be carried out). In-place re-runs of
+/// archived runs are not supported.
+pub(crate) async fn rerun_run_with_mode(
     shared: &Arc<SharedState>,
     run_id: RunId,
+    mode: crate::control::types::RerunMode,
     reused_check_run: Option<(JobId, u64)>,
+    triggering_actor: Option<String>,
 ) -> Result<RunAccepted, ApiError> {
-    let mut submission = shared
+    let record = shared
         .state
         .backend
         .run_record(run_id)
         .await
-        .map(|run| (*run.submission).clone())
         .map_err(ApiError::from)?;
+    let mut submission = (*record.submission).clone();
     // A re-run sees the values the original submission supplied; they live
     // in the provider's run tier while the run's history survives.
     let run_tier = shared
@@ -3802,7 +3862,7 @@ pub async fn rerun_run_inner(
         .run_tier(run_id)
         .map_err(|error| secret_provider_error(shared, error))?;
     // The submission recorded the names it supplied. If any can no longer be
-    // resolved, fail loudly: submitting with them silently dropped would run
+    // resolved, fail loudly: re-running with them silently dropped would run
     // the workflow without secrets.
     let missing: Vec<&str> = submission
         .run_secret_names
@@ -3817,15 +3877,246 @@ pub async fn rerun_run_inner(
         )));
     }
     submission.secrets = run_tier;
-    let accepted = submit_run_inner(shared, submission).await?;
+
+    // The mode-resolved selection plus the members that have no stored
+    // `job_messages` template (skipped/unhostable at submit): those need a
+    // rebuilt template before the write transaction can mint their attempt.
+    // `NotFound` here means the live rows are gone (the record resolved, so
+    // the run exists) — i.e. the run was archived.
+    let plan = match shared.state.backend.rerun_plan(run_id, &mode).await {
+        Ok(plan) => Some(plan),
+        Err(crate::control::ControlError::NotFound(_)) => None,
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    let Some(plan) = plan else {
+        return match mode {
+            crate::control::types::RerunMode::All => {
+                archived_rerun(shared, run_id, submission, reused_check_run).await
+            }
+            _ => Err(ApiError::conflict(format!(
+                "run {run_id} was archived; only a full re-run (all jobs) is possible"
+            ))),
+        };
+    };
+
+    // Workflow-level concurrency is re-evaluated for the new attempt off
+    // the stored workflow, against the stored github context — the same
+    // inputs submit evaluated (`inputs`, not `dispatch_inputs`, mirroring
+    // submit's own merge where dispatch inputs sit on top).
+    let mut workflow_concurrency = None;
+    let mut templates = Vec::new();
+    if !plan.missing_templates.is_empty() || submission.workflow_yaml.contains("concurrency") {
+        let workflow = parse_workflow(&submission.workflow_yaml)?;
+        if let Some(raw) = &workflow.concurrency {
+            let eval_ctx = concurrency::ConcurrencyContext {
+                scope: concurrency::ConcurrencyScope::Workflow,
+                github: &record.github,
+                vars: &submission.vars,
+                inputs: &submission.inputs,
+                matrix: None,
+                strategy: None,
+                needs: None,
+            };
+            let (group, cancel, queue) = concurrency::evaluate_concurrency(raw, &eval_ctx)
+                .map_err(|error| {
+                    ApiError::bad_request(format!("concurrency evaluation failed: {error}"))
+                })?;
+            if !group.trim().is_empty() {
+                workflow_concurrency = Some(crate::control::types::WorkflowConcurrency {
+                    group,
+                    cancel_in_progress: cancel,
+                    queue,
+                    raw: raw.clone(),
+                });
+            }
+        }
+
+        if !plan.missing_templates.is_empty() {
+            let normalized_github =
+                preloop_gha_parser::job_builder::normalize_github_context(&record.github);
+            let base_url = runner_base_url();
+            // The rerun rebuilds templates for the same workflow snapshot —
+            // expansion is deterministic over the stored submission's
+            // inputs/event, so JobPlans match the submit's expansion.
+            let dispatch_inputs: BTreeMap<String, serde_json::Value> = submission
+                .dispatch_inputs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let mut jobs =
+                preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
+                    &workflow,
+                    &submission.reusable_workflows,
+                    &submission.reusable_workflow_shas,
+                    (!dispatch_inputs.is_empty()).then_some(&dispatch_inputs),
+                    Some(submission.event.as_str()),
+                )
+                .map_err(ApiError::from)?
+                .jobs;
+            if !submission.dispatch_inputs.is_empty() {
+                for job in &mut jobs {
+                    for (name, value) in &submission.dispatch_inputs {
+                        job.inputs
+                            .entry(name.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            let plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan> =
+                jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
+            for job_id in &plan.missing_templates {
+                let Some(job) = plans.get(job_id) else {
+                    return Err(ApiError::conflict(format!(
+                        "cannot rerun run {run_id}: job {job_id} has no plan in the stored workflow"
+                    )));
+                };
+                let artifacts = build_job_artifacts(
+                    shared,
+                    &submission,
+                    run_id,
+                    &record.workflow_path_str,
+                    &record.workflow_ref,
+                    &record.head_sha,
+                    &normalized_github,
+                    &base_url,
+                    record.workspace_snapshot.as_ref(),
+                    job,
+                )?;
+                let condition_context = build_context(
+                    &record.github,
+                    &BTreeMap::new(),
+                    &submission.vars,
+                    &indexmap::IndexMap::new(),
+                    &serde_json::json!({}),
+                    &BTreeMap::new(),
+                    &job.inputs,
+                );
+                templates.push(crate::control::types::RerunJobTemplate {
+                    job_id: job_id.clone(),
+                    message: artifacts.agent_msg,
+                    condition_context,
+                    token_request: artifacts.github_token_request,
+                });
+            }
+        }
+    }
+
+    let outcome = match shared
+        .state
+        .backend
+        .rerun_run(crate::control::types::RerunRun {
+            run_id,
+            mode: mode.clone(),
+            triggering_actor,
+            workflow_concurrency,
+            environment_rules: crate::config::EnvironmentRulesMap::default(),
+            templates,
+        })
+        .await
+    {
+        Ok(outcome) => outcome,
+        // The archiver moved the run between the plan read and the write
+        // (a 5s sweep of runs completed >60s ago). Same fallback as an
+        // archived plan: full re-runs resubmit, partial modes refuse. The
+        // mode's job selection was already validated by `rerun_plan`.
+        Err(crate::control::ControlError::NotFound(_)) => {
+            return match mode {
+                crate::control::types::RerunMode::All => {
+                    archived_rerun(shared, run_id, submission, reused_check_run).await
+                }
+                _ => Err(ApiError::conflict(format!(
+                    "run {run_id} was archived; only a full re-run (all jobs) is possible"
+                ))),
+            };
+        }
+        Err(error) => return Err(ApiError::from(error)),
+    };
+
+    // Post-commit: refresh the node-local labels the runner supervisor
+    // reads. The ready-queue depth gauge itself is the sampler's; the wake
+    // beside the waiter notification below refreshes it early.
+    if let Ok(mut next) = shared.state.next_job_runs_on.write() {
+        *next = outcome.next_runs_on.clone();
+    }
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
-        let new_run = accepted.run_id;
-        // Guarded by the setter itself: a missing `jobs` row writes nothing.
+        // The check-run id attaches to the job's new attempt; the setter is
+        // a no-op when the job was not selected by the mode. Guarded by the
+        // setter itself: a missing `jobs` row writes nothing.
         let mapping_changed = shared
             .state
             .backend
-            .set_job_check_run(new_run, job_id, *check_run_id)
+            .set_job_check_run(run_id, job_id, *check_run_id)
+            .await
+            .map_err(ApiError::from)?;
+        // Same persistence obligation as `report_check_run_queued`: the
+        // reused check id must survive a restart before the job's first
+        // status event. The setter wrote the event inside its transaction.
+        if mapping_changed {
+            shared
+                .state
+                .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+                .await;
+        }
+    }
+
+    // A rerun restarts the run's lifecycle; anything the reset dispatched
+    // (or parked) needs the same waiter wake a submit sends, plus the
+    // sampler wake that keeps the queue-depth gauge current.
+    shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
+    shared
+        .state
+        .emit(preloop_gha_protocol::NdjsonEvent::RunStatus {
+            run_id,
+            status: outcome.status,
+            reason: None,
+        })
+        .await;
+    for (job_id, status, reason) in &outcome.concluded {
+        shared
+            .state
+            .emit(preloop_gha_protocol::NdjsonEvent::JobStatus {
+                run_id,
+                job_id: job_id.clone(),
+                status: *status,
+                reason: reason.clone(),
+            })
+            .await;
+    }
+    crate::rerun_checks::report_rerun_check_runs(
+        shared,
+        run_id,
+        reused_check_run,
+        Some(&outcome.selected),
+    )
+    .await;
+    Ok(RunAccepted {
+        run_id,
+        run_number: outcome.run_number,
+        queued_jobs: outcome.queued_jobs,
+    })
+}
+
+/// Re-run a fully archived run: resubmit its recorded submission as a NEW
+/// run. The run-tier secrets survive the archive move (the submission's
+/// secret names still resolve), and the new run gets a fresh
+/// `run_id`/`run_number` with `run_attempt` 1 — GitHub's "same run id, new
+/// attempt" only applies while the run's scheduler rows are live. A rehydrate
+/// that re-runs an archived run in place is not supported.
+async fn archived_rerun(
+    shared: &Arc<SharedState>,
+    archived_run_id: RunId,
+    submission: WorkflowSubmission,
+    reused_check_run: Option<(JobId, u64)>,
+) -> Result<RunAccepted, ApiError> {
+    let accepted = submit_run_inner(shared, submission).await?;
+    if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
+        // Guarded by the setter itself: a missing job row writes nothing.
+        let mapping_changed = shared
+            .state
+            .backend
+            .set_job_check_run(accepted.run_id, job_id, *check_run_id)
             .await
             .map_err(ApiError::from)?;
         // Same persistence obligation as `report_check_run_queued`: the
@@ -3840,15 +4131,120 @@ pub async fn rerun_run_inner(
                 .await;
         }
     }
+    tracing::info!(
+        archived_run_id = %archived_run_id,
+        new_run_id = %accepted.run_id,
+        "re-ran an archived run as a new run"
+    );
     crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
     Ok(accepted)
+}
+
+/// Re-run a recorded submission as a fresh run for the legacy check-run
+/// rerequest path. Callers that need in-place semantics use the mode-aware
+/// helper below; this preserves the legacy fresh-run behavior for existing
+/// check-run integrations.
+pub(crate) async fn rerun_run_inner(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    reused_check_run: Option<(JobId, u64)>,
+) -> Result<RunAccepted, ApiError> {
+    let mut submission = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map(|run| (*run.submission).clone())
+        .map_err(ApiError::from)?;
+    let run_tier = shared
+        .state
+        .secret_provider
+        .run_tier(run_id)
+        .map_err(|error| secret_provider_error(shared, error))?;
+    let missing: Vec<&str> = submission
+        .run_secret_names
+        .iter()
+        .filter(|name| !run_tier.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "cannot rerun run {run_id}: its submission secrets ({}) can no longer be resolved",
+            missing.join(", ")
+        )));
+    }
+    submission.secrets = run_tier;
+    let accepted = submit_run_inner(shared, submission).await?;
+    if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
+        let mapping_changed = shared
+            .state
+            .backend
+            .set_job_check_run(accepted.run_id, job_id, *check_run_id)
+            .await
+            .map_err(ApiError::from)?;
+        if mapping_changed {
+            shared
+                .state
+                .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
+                    run_id: accepted.run_id,
+                })
+                .await;
+        }
+    }
+    crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
+    Ok(accepted)
+}
+
+/// Request body for `POST /api/v1/runs/:run_id/rerun`. `mode` mirrors
+/// GitHub's three re-run modes: `all` (every job), `failed` (failed and
+/// cancelled jobs plus their dependents), `job` (one `job_id` plus its
+/// dependents, job id or matrix/caller base id).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RerunRequest {
+    /// `all` | `failed` | `job`. Absent body/default = `all`, matching the
+    /// GitHub UI's default "Re-run all jobs".
+    #[serde(default = "default_rerun_mode")]
+    pub mode: String,
+    /// Required when `mode` is `job`; ignored otherwise.
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+fn default_rerun_mode() -> String {
+    "all".to_owned()
+}
+
+impl TryFrom<&RerunRequest> for crate::control::types::RerunMode {
+    type Error = ApiError;
+    fn try_from(request: &RerunRequest) -> Result<Self, Self::Error> {
+        match request.mode.as_str() {
+            "all" => Ok(Self::All),
+            "failed" => Ok(Self::Failed),
+            "job" => request
+                .job_id
+                .as_deref()
+                .map(|id| Self::Job(JobId(id.to_owned())))
+                .ok_or_else(|| ApiError::bad_request("mode 'job' requires a 'job_id'".to_owned())),
+            other => Err(ApiError::bad_request(format!(
+                "unknown rerun mode '{other}': expected all|failed|job"
+            ))),
+        }
+    }
 }
 
 pub async fn rerun_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
+    body: Option<Json<RerunRequest>>,
 ) -> Result<Json<RunAccepted>, ApiError> {
-    rerun_run_inner(&shared, run_id, None).await.map(Json)
+    let request = body.map(|Json(request)| request).unwrap_or(RerunRequest {
+        mode: default_rerun_mode(),
+        job_id: None,
+    });
+    let mode = crate::control::types::RerunMode::try_from(&request)?;
+    rerun_run_with_mode(&shared, run_id, mode, None, None)
+        .await
+        .map(Json)
 }
 
 /// Request body for approving a run held by the fork-PR workflow policy.
@@ -4974,6 +5370,169 @@ mod tests {
         );
     }
 
+    /// The server-wide `max_jobs_per_run` cap fails a run fast: a 3-job
+    /// submit against a cap of 2 is rejected with 400 after expansion but
+    /// before the build loop and the insert transaction, while exactly 2
+    /// jobs are accepted.
+    #[tokio::test]
+    async fn submit_run_inner_enforces_max_jobs_per_run() {
+        fn three_job_submission() -> preloop_gha_protocol::WorkflowSubmission {
+            preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                    .to_owned(),
+                event: "push".to_owned(),
+                repository: "owner/repo".to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                workflow_file: Some("ci.yml".to_owned()),
+                actor: "alice".to_owned(),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                ..Default::default()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 2;
+        let shared = state.shared();
+
+        let error = submit_run_inner(&shared, three_job_submission())
+            .await
+            .expect_err("3 jobs over a cap of 2 must be rejected");
+        assert!(
+            error.message().contains("max_jobs_per_run"),
+            "rejection names the limit, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("3 jobs"),
+            "rejection names the expanded count, got: {}",
+            error.message()
+        );
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "an oversized submit is a 4xx"
+        );
+
+        // Exactly at the cap: accepted, both jobs recorded.
+        let mut two_jobs = three_job_submission();
+        two_jobs.workflow_yaml = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+            .to_owned();
+        let accepted = submit_run_inner(&shared, two_jobs).await.unwrap();
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(run.jobs.len(), 2, "a run at exactly the cap is accepted");
+    }
+
+    /// The cap counts expanded jobs, not declared ones: 2 declared matrix
+    /// jobs expanding to 400 legs are rejected by a cap of 300 and accepted
+    /// by a cap of 500 (the accepted run also exercises the chunked insert:
+    /// 400 > `SUBMIT_JOB_CHUNK_SIZE`).
+    #[tokio::test]
+    async fn submit_run_inner_cap_counts_expanded_jobs() {
+        fn matrix_submission(
+            jobs: usize,
+            cells: usize,
+        ) -> preloop_gha_protocol::WorkflowSubmission {
+            let values = (1..=cells)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut yaml = String::from("on: push\njobs:\n");
+            for j in 0..jobs {
+                yaml.push_str(&format!(
+                    "  m{j}:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        i: [{values}]\n    steps:\n      - run: echo hi\n"
+                ));
+            }
+            preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: yaml,
+                event: "push".to_owned(),
+                repository: "owner/repo".to_owned(),
+                workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+                workflow_file: Some("ci.yml".to_owned()),
+                actor: "alice".to_owned(),
+                sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+                ..Default::default()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 300;
+        let shared = state.shared();
+
+        let error = submit_run_inner(&shared, matrix_submission(2, 200))
+            .await
+            .expect_err("400 expanded jobs over a cap of 300 must be rejected");
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::BAD_REQUEST,
+            "an oversized expanded submit is a 4xx"
+        );
+
+        // `shared()` snapshots the state, so re-snapshot after raising the cap.
+        state.max_jobs_per_run = 500;
+        let shared = state.shared();
+        let accepted = submit_run_inner(&shared, matrix_submission(2, 200))
+            .await
+            .expect("400 expanded jobs fit a cap of 500");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(
+            run.jobs.len(),
+            400,
+            "all 400 expanded legs persisted via chunked inserts"
+        );
+    }
+
+    /// Webhook deliveries bypass the cap — like the namespace submit quotas,
+    /// a push is never refused; chunked inserts bound its writer hold
+    /// instead.
+    #[tokio::test]
+    async fn webhook_delivery_bypasses_max_jobs_per_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.max_jobs_per_run = 2;
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner_with_webhook_delivery(
+            &shared,
+            submission,
+            Some("delivery-cap-bypass"),
+        )
+        .await
+        .expect("webhook deliveries bypass the cap");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
+        assert_eq!(run.jobs.len(), 3, "the push's run is recorded whole");
+    }
+
     /// A submission whose only job is gated off by its `if:` has no runner
     /// work to do, so it must finish at submit: terminal status, `completed_at`
     /// stamped, nothing reported as queued. A run that keeps a non-terminal
@@ -5027,6 +5586,80 @@ mod tests {
             "GitHub reports a run whose every job was skipped as skipped"
         );
         assert_eq!(accepted.queued_jobs, 0, "nothing was queued to a runner");
+    }
+
+    /// `ref_protected` is a claim about the forge's configuration, so a native
+    /// request body cannot assert it: the endpoint clears it exactly the way it
+    /// clears `trust_tier`. Without that, a body could mint a signed OIDC
+    /// `ref_protected: "true"` claim — and a `GITHUB_REF_PROTECTED=true` job
+    /// environment — for a ref that has no protection at all.
+    #[tokio::test]
+    async fn native_submission_cannot_assert_ref_protected() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, header};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+        let app = crate::app(state, CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+                            "event": "push",
+                            "repository": "owner/repo",
+                            "git_ref": "refs/heads/main",
+                            "sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                            "ref_protected": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the submission itself must be accepted, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let runs = shared
+            .state
+            .backend
+            .list_runs(crate::control::backend::RunListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "one run was submitted");
+        let run = &runs[0];
+        assert!(
+            !run.submission.ref_protected,
+            "a request body must not assert branch protection"
+        );
+        assert_eq!(
+            run.github["ref_protected"],
+            serde_json::json!(false),
+            "the run's github context must report the unprivileged value"
+        );
     }
 
     /// The same workless submission must not take the workflow's concurrency
