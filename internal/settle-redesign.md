@@ -260,6 +260,9 @@ only the trigger (per-job targeted instead of whole-run scan).
 - `graph.resummarize()` for the settled job (replaced by `summarize_run_tx`)
 - the in-memory `propagate_reusable_outputs` fold in `complete_job_inner`
   (replaced by the targeted, metadata-driven fold)
+- the in-memory `Sweep::complete_node` and its fail-fast helper, with
+  `CompletionApplied` and the graph-based `enqueue_cancellation` (no callers
+  once the targeted settle landed)
 
 Still graph-backed: promotion of newly-unblocked dependents and of capped cohort legs (step 11 above).
 
