@@ -2048,10 +2048,14 @@ async fn cmd_engine(
                 .await
         })
     };
+    // Each generation gets a fresh child token: `RunnerPool::run` cancels the
+    // token it is handed when a slot ends so its siblings drain, and reusing
+    // the same token would hand the replacement pool an already-fired
+    // cancellation that makes it exit `Ok` — and stop the engine — instantly.
     let mut pool = pool_config.as_ref().map(|config| {
         spawn_pool(
             config,
-            shutdown.clone(),
+            shutdown.child_token(),
             backend.expect("the backend is resolved when a pool config exists"),
         )
     });
@@ -2063,32 +2067,23 @@ async fn cmd_engine(
     // rebuilt on an exponential backoff; a run that reached steady state
     // resets the backoff so a one-off failure retries quickly.
     let mut signal = Box::pin(engine_shutdown_signal());
-    let mut restart_backoff = POOL_RESTART_MIN;
-    let stop = loop {
-        let pool_started = std::time::Instant::now();
-        match wait_for_stop(&mut server, &mut pool, signal.as_mut()).await {
-            Stop::Pool(Err(error)) => {
-                tracing::error!(
-                    %error,
-                    retry_in = ?restart_backoff,
-                    "runner pool exited; rebuilding it after a backoff"
-                );
-                pool_status.record_provision_failure();
-                if pool_started.elapsed() >= POOL_STEADY_AFTER {
-                    restart_backoff = POOL_RESTART_MIN;
-                }
-                tokio::select! {
-                    _ = &mut signal => break Stop::Signal,
-                    _ = tokio::time::sleep(restart_backoff) => {}
-                }
-                restart_backoff = restart_backoff.saturating_mul(2).min(POOL_RESTART_MAX);
-                if let (Some(config), Some(backend)) = (&pool_config, backend) {
-                    pool = Some(spawn_pool(config, shutdown.clone(), backend));
-                }
-            }
-            stop => break stop,
-        }
-    };
+    let stop = supervise_pool(
+        &mut server,
+        &mut pool,
+        signal.as_mut(),
+        |restart| {
+            tracing::error!(%restart, "runner pool exited; rebuilding it after a backoff");
+            pool_status.record_provision_failure();
+            !pool_preparing.load(std::sync::atomic::Ordering::Acquire)
+        },
+        || {
+            pool_config
+                .as_ref()
+                .zip(backend)
+                .map(|(config, backend)| spawn_pool(config, shutdown.child_token(), backend))
+        },
+    )
+    .await;
     let result = match stop {
         Stop::Server(result) | Stop::Pool(result) => Some(result),
         Stop::Signal => None,
@@ -2109,12 +2104,14 @@ const POOL_RESTART_MIN: Duration = Duration::from_secs(1);
 /// Longest wait between pool rebuilds; each consecutive failure doubles the
 /// previous wait.
 const POOL_RESTART_MAX: Duration = Duration::from_secs(300);
-/// A pool that ran this long reached steady state; a later failure restarts
-/// from [`POOL_RESTART_MIN`] instead of inheriting a stale maximum.
+/// A pool that finished preparing and then ran this long reached steady
+/// state; a later failure restarts from [`POOL_RESTART_MIN`] instead of
+/// inheriting a stale maximum.
 const POOL_STEADY_AFTER: Duration = Duration::from_secs(60);
 
 /// Why the engine is stopping; each result is handled *after* the pool has
 /// settled, never by an early return past its teardown.
+#[derive(Debug)]
 enum Stop {
     Server(anyhow::Result<()>),
     Pool(anyhow::Result<()>),
@@ -2162,6 +2159,59 @@ where
         *pool = None;
     }
     stop
+}
+
+/// Run the server/pool race until the engine must stop, rebuilding a failed
+/// pool instead of ending the process.
+///
+/// A `RunnerPool::run` that returns an error has already torn every machine
+/// down, so the failure is survivable: `report` sees it (logging, status
+/// counters) and answers whether the dead pool had finished preparing —
+/// only a pool that reached steady state resets the backoff, because a slow
+/// persistent failure (a multi-GB unpack on a full disk) must keep doubling
+/// rather than hot-retry every second. `respawn` builds the next
+/// generation's handle; each generation must carry a fresh child token
+/// because `RunnerPool::run` cancels the token it is handed when a slot
+/// ends.
+///
+/// While the backoff sleeps the server and the shutdown signal stay in the
+/// race — a dead HTTP side stops the engine now instead of after the sleep
+/// spawning a pool for a dead server. `Stop::Server`, `Stop::Pool(Ok(..))`,
+/// and `Stop::Signal` end the loop untouched.
+async fn supervise_pool<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
+    mut report: impl FnMut(&anyhow::Error) -> bool,
+    mut respawn: impl FnMut() -> Option<tokio::task::JoinHandle<Result<(), P>>>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let mut restart_backoff = POOL_RESTART_MIN;
+    let mut signal = signal;
+    loop {
+        let pool_started = std::time::Instant::now();
+        match wait_for_stop(server, pool, signal.as_mut()).await {
+            Stop::Pool(Err(error)) => {
+                let reached_steady = report(&error) && pool_started.elapsed() >= POOL_STEADY_AFTER;
+                if reached_steady {
+                    restart_backoff = POOL_RESTART_MIN;
+                }
+                tokio::select! {
+                    result = &mut *server => {
+                        return Stop::Server(flatten_task_result(result));
+                    }
+                    _ = signal.as_mut() => return Stop::Signal,
+                    _ = tokio::time::sleep(restart_backoff) => {}
+                }
+                restart_backoff = restart_backoff.saturating_mul(2).min(POOL_RESTART_MAX);
+                *pool = respawn();
+            }
+            stop => return stop,
+        }
+    }
 }
 
 /// Give the pool `grace` to reach its own teardown after the shutdown token
@@ -5168,6 +5218,93 @@ mod tests {
         );
         settle_pool(&mut pool, Duration::from_millis(20)).await;
         server.abort();
+    }
+
+    /// A pool generation that fails after cancelling its own shutdown token
+    /// — exactly what `RunnerPool::run` does on a slot failure — must not
+    /// poison the replacement: the respawned generation gets a fresh child
+    /// token that is not already cancelled. This is the regression the
+    /// supervise loop exists for; without child tokens the engine would
+    /// observe an instant `Ok` exit and shut down.
+    #[tokio::test]
+    async fn restarted_pool_gets_an_uncancelled_shutdown_token() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut server = never_ending_server();
+
+        let generation_token = shutdown.child_token();
+        let first_token = generation_token.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            first_token.cancel();
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_respawn = seen.clone();
+        let parent = shutdown.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || {
+                    let token = parent.child_token();
+                    seen_respawn.lock().unwrap().push(token.clone());
+                    Some(tokio::spawn(async move {
+                        token.cancelled().await;
+                        Ok(())
+                    }))
+                },
+            )
+            .await
+        })
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the replacement pool must run until cancellation, not exit instantly"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one generation was respawned");
+        assert!(
+            !seen[0].is_cancelled(),
+            "the respawned pool's token must not inherit generation one's cancellation"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a pool's own cancellation must never reach the engine token"
+        );
+    }
+
+    /// If the HTTP server dies during the restart backoff the engine stops
+    /// immediately instead of sleeping to the ceiling and spawning a pool
+    /// for a dead server.
+    #[tokio::test]
+    async fn server_death_during_pool_backoff_stops_the_engine() {
+        let mut server = tokio::spawn(async { anyhow::bail!("listener died") });
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("golden unpack failed"))
+        }));
+
+        let stop = tokio::time::timeout(
+            Duration::from_millis(POOL_RESTART_MIN.as_millis() as u64 + 300),
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || None,
+            ),
+        )
+        .await
+        .expect("a dead server must stop the engine inside the backoff window");
+
+        let Stop::Server(Err(error)) = stop else {
+            panic!("server failure must be the stop reason, got {stop:?}");
+        };
+        assert_eq!(error.to_string(), "listener died");
+        // Whether the pool arm or the server arm won the first race is
+        // nondeterministic; the assertion that matters is above: the stop
+        // reason is the server error, inside the backoff window.
     }
 
     /// Serializes tests that mutate process-global env vars read by
