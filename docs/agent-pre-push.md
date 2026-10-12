@@ -96,6 +96,4 @@ Install a tagged release and verify it before an agent uses it:
 - A local pass does not replace CI. The run on the pull request stays the
   record, and the local run only stops a red push early.
 
-Every flag above is listed in the [CLI reference](cli_reference.md). An
-example of this as an agent skill:
-[`pre-push`](https://github.com/uncovertechtalent/cto-powersuit/blob/main/plugins/sdlc/skills/pre-push/SKILL.md).
+Every flag above is listed in the [CLI reference](cli_reference.md).
