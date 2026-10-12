@@ -40,6 +40,13 @@ Releases before v0.27.0 predate the changelog.
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
 
+- **A pool failure no longer takes the engine down**: `RunnerPool::run`
+  already tears every machine down on the way out, so when its task returned
+  an error the engine now rebuilds the pool on an exponential backoff (1 s,
+  doubling to a 5-minute ceiling, reset after a run reaches steady state)
+  instead of exiting. The HTTP server keeps answering — `preloop status`
+  reports the failure count — and shutdown still tears the pool down within
+  the same 30-second grace.
 - **A refused machine delete no longer leaves a live VM**: `smolvm machine
   delete -f` declines to stop a guest whose agent cannot confirm a safe
   shutdown ("left the VM alive for retry"), which stranded the detached

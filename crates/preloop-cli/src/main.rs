@@ -2005,45 +2005,90 @@ async fn cmd_engine(
         result = wait_for_engine_socket(&socket, listen) => result?,
     }
 
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match pool_config {
-        Ok(config) => {
-            if !pool_enabled {
-                if config.use_fork {
-                    tracing::info!(
-                        "warm runner pool disabled; forking one VM per queued job from the golden"
-                    );
-                } else {
-                    tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
-                }
-            }
-            let pool_shutdown = shutdown.clone();
-            // Supervisor-side, once, before any VM boots: systemd's
-            // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
-            // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
-            // get no cpu/memory/pids limit files. This performs the same
-            // vacate-then-enable dance `smolvm serve` does. It is the only
-            // place Preloop writes to the cgroup hierarchy — the CLI paths
-            // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
-            // root read-only and never mutate it.
-            preloop_vm::init_vm_cgroup_delegation();
-            let backend = vm_backend()?;
-            tracing::info!(backend = backend.as_str(), "VM substrate selected");
-            Some(tokio::spawn(async move {
-                RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-                    .run(pool_shutdown)
-                    .await
-            }))
-        }
-        Err(_) => None,
-    };
-
-    // Every way out of this process — the normal shutdown below, a slot
-    // failure that ends the pool, an error return — must not leave VMs
-    // running: see `VmTeardownOnExit`.
+    // Every way out of this process — the normal shutdown below, a pool that
+    // never recovers, an error return like a failed `vm_backend()` — must not
+    // leave VMs running: see `VmTeardownOnExit`. Armed before the first pool
+    // spawn so even those early returns run the exit scan.
     let _vm_teardown = VmTeardownOnExit;
 
-    let stop = wait_for_stop(&mut server, &mut pool, engine_shutdown_signal()).await;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let pool_config = pool_config.ok();
+    let mut backend = None;
+    if let Some(config) = &pool_config {
+        if !pool_enabled {
+            if config.use_fork {
+                tracing::info!(
+                    "warm runner pool disabled; forking one VM per queued job from the golden"
+                );
+            } else {
+                tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
+            }
+        }
+        // Supervisor-side, once, before any VM boots: systemd's
+        // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+        // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+        // get no cpu/memory/pids limit files. This performs the same
+        // vacate-then-enable dance `smolvm serve` does. It is the only
+        // place Preloop writes to the cgroup hierarchy — the CLI paths
+        // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+        // root read-only and never mutate it.
+        preloop_vm::init_vm_cgroup_delegation();
+        let selected = vm_backend()?;
+        tracing::info!(backend = selected.as_str(), "VM substrate selected");
+        backend = Some(selected);
+    }
+
+    let spawn_pool = |config: &RunnerPoolConfig,
+                      pool_shutdown: tokio_util::sync::CancellationToken,
+                      backend: VmBackend| {
+        let config = config.clone();
+        tokio::spawn(async move {
+            RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
+                .run(pool_shutdown)
+                .await
+        })
+    };
+    let mut pool = pool_config.as_ref().map(|config| {
+        spawn_pool(
+            config,
+            shutdown.clone(),
+            backend.expect("the backend is resolved when a pool config exists"),
+        )
+    });
+
+    // A pool task that returns an error ends only the pool, not the engine:
+    // `RunnerPool::run` ran its teardown on the way out, so nothing is left
+    // running, and the server must keep answering clients (including
+    // `preloop status`, which is how this failure is diagnosed). The pool is
+    // rebuilt on an exponential backoff; a run that reached steady state
+    // resets the backoff so a one-off failure retries quickly.
+    let mut signal = Box::pin(engine_shutdown_signal());
+    let mut restart_backoff = POOL_RESTART_MIN;
+    let stop = loop {
+        let pool_started = std::time::Instant::now();
+        match wait_for_stop(&mut server, &mut pool, signal.as_mut()).await {
+            Stop::Pool(Err(error)) => {
+                tracing::error!(
+                    %error,
+                    retry_in = ?restart_backoff,
+                    "runner pool exited; rebuilding it after a backoff"
+                );
+                pool_status.record_provision_failure();
+                if pool_started.elapsed() >= POOL_STEADY_AFTER {
+                    restart_backoff = POOL_RESTART_MIN;
+                }
+                tokio::select! {
+                    _ = &mut signal => break Stop::Signal,
+                    _ = tokio::time::sleep(restart_backoff) => {}
+                }
+                restart_backoff = restart_backoff.saturating_mul(2).min(POOL_RESTART_MAX);
+                if let (Some(config), Some(backend)) = (&pool_config, backend) {
+                    pool = Some(spawn_pool(config, shutdown.clone(), backend));
+                }
+            }
+            stop => break stop,
+        }
+    };
     let result = match stop {
         Stop::Server(result) | Stop::Pool(result) => Some(result),
         Stop::Signal => None,
@@ -2058,6 +2103,15 @@ async fn cmd_engine(
         None => Ok(()),
     }
 }
+
+/// First wait before rebuilding a pool whose task returned an error.
+const POOL_RESTART_MIN: Duration = Duration::from_secs(1);
+/// Longest wait between pool rebuilds; each consecutive failure doubles the
+/// previous wait.
+const POOL_RESTART_MAX: Duration = Duration::from_secs(300);
+/// A pool that ran this long reached steady state; a later failure restarts
+/// from [`POOL_RESTART_MIN`] instead of inheriting a stale maximum.
+const POOL_STEADY_AFTER: Duration = Duration::from_secs(60);
 
 /// Why the engine is stopping; each result is handled *after* the pool has
 /// settled, never by an early return past its teardown.
@@ -2075,13 +2129,17 @@ fn flatten_task_result<E: Into<anyhow::Error>>(
 
 /// Wait for the first reason the engine must stop.
 ///
+/// `signal` is borrowed, not consumed: the caller loops over this function
+/// when it restarts a failed pool, and the pending signal future must
+/// survive between iterations.
+///
 /// When the pool task is the one that ended the race, its handle is consumed
 /// out of `pool`: a finished `JoinHandle` panics if it is polled again, and
 /// the shutdown sequence that follows would otherwise wait on it.
 async fn wait_for_stop<S, P>(
     server: &mut tokio::task::JoinHandle<Result<(), S>>,
     pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
-    signal: impl Future<Output = ()>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
 ) -> Stop
 where
     S: Into<anyhow::Error>,
@@ -5050,7 +5108,12 @@ mod tests {
             Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
         }));
 
-        let stop = wait_for_stop(&mut server, &mut pool, std::future::pending()).await;
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::pending()),
+        )
+        .await;
         let Stop::Pool(Err(error)) = stop else {
             panic!("the pool's failure must be reported as the stop reason");
         };
@@ -5091,7 +5154,12 @@ mod tests {
         let mut pool: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
             Some(tokio::spawn(std::future::pending()));
 
-        let stop = wait_for_stop(&mut server, &mut pool, std::future::ready(())).await;
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::ready(())),
+        )
+        .await;
 
         assert!(matches!(stop, Stop::Signal));
         assert!(
