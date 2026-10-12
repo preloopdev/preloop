@@ -7,13 +7,29 @@ use serde::{Deserialize, Serialize};
 /// establishes its connection. Unknown settings are intentionally represented
 /// by `agent_download_urls` as JSON so the server can evolve that payload
 /// without requiring a protocol crate release for every shape change.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerServerSettings {
     #[serde(default)]
     pub is_hosted_server: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Per-platform runner download URLs. An empty object is the explicit
+    /// self-hosted default; omitting this property makes older clients treat
+    /// the response as an incomplete settings document.
+    #[serde(default = "default_agent_download_urls")]
     pub agent_download_urls: Option<serde_json::Value>,
+}
+
+fn default_agent_download_urls() -> Option<serde_json::Value> {
+    Some(serde_json::json!({}))
+}
+
+impl Default for RunnerServerSettings {
+    fn default() -> Self {
+        Self {
+            is_hosted_server: false,
+            agent_download_urls: Some(serde_json::json!({})),
+        }
+    }
 }
 
 /// Service location data returned by `GET _apis/connectionData`.
