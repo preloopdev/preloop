@@ -24,7 +24,7 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
