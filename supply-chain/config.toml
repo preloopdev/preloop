@@ -173,7 +173,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.bit-set]]
 version = "0.11.1"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.bit-vec]]
 version = "0.9.1"
@@ -181,7 +181,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.bit-vec]]
 version = "0.10.1"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.bitflags]]
 version = "2.13.0"
@@ -209,11 +209,11 @@ criteria = "safe-to-deploy"
 
 [[exemptions.borsh]]
 version = "1.8.1"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.borsh-derive]]
 version = "1.8.1"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.bstr]]
 version = "1.12.3"
@@ -345,7 +345,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.core_detect]]
 version = "1.0.0"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.cpubits]]
 version = "0.1.1"
@@ -1103,6 +1103,10 @@ criteria = "safe-to-deploy"
 version = "1.12.0"
 criteria = "safe-to-run"
 
+[[exemptions.proptest]]
+version = "1.12.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.prost]]
 version = "0.14.4"
 criteria = "safe-to-deploy"
@@ -1178,6 +1182,10 @@ criteria = "safe-to-deploy"
 [[exemptions.rand_xorshift]]
 version = "0.5.0"
 criteria = "safe-to-run"
+
+[[exemptions.rand_xorshift]]
+version = "0.5.0"
+criteria = "safe-to-deploy"
 
 [[exemptions.rcgen]]
 version = "0.13.2"
