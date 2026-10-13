@@ -50,6 +50,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Boot closes unbound attempts whose job left the queue** (#579): an attempt
+  with no runner or session binding outlived its job when the job left the queue
+  without settling it, as cancelled and starved jobs did. Nothing claimed or
+  reaped such an attempt, so it pinned its job's in-flight slot, and a job
+  parked outside the queue kept its run `in_progress` with nothing executing it.
+  Boot now closes these attempts: a parked job fails so its run can settle, a
+  concluded job closes its attempt with its own verdict, and an attempt whose
+  job row is gone is closed alone.
+
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

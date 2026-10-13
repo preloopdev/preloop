@@ -1441,6 +1441,80 @@ pub async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
     recovered + unclaimable.len()
 }
 
+/// Close unsettled attempts that nothing holds and that can never complete:
+/// no runner or session binding, and a backing job that is gone or has left
+/// the queue. Nothing claims them, and no reaper deadline fires for them (a
+/// deadline needs a start stamp or a lease), so each one pins its job's
+/// in-flight slot, and a parked job keeps its run open across restarts.
+///
+/// A concluded job closes its attempt with its own verdict. A job still parked
+/// outside the queue fails the way an unclaimable claim does, so its run can
+/// settle. Boot-only, like [`reconcile_orphaned_claims`]: it runs before the
+/// listener opens, so it never races a live transition.
+pub async fn reconcile_orphaned_requests(shared: &Arc<SharedState>) -> usize {
+    let requests = match shared.state.backend.unbound_orphaned_requests().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(?error, "reconcile_orphaned_requests query failed");
+            return 0;
+        }
+    };
+    let mut settled = 0usize;
+    for (request_id, run_id, job_id) in requests {
+        let queue_state = shared
+            .state
+            .backend
+            .job_queue_state(run_id, &job_id)
+            .await
+            .ok()
+            .flatten();
+        let closed = match queue_state {
+            // The job row is gone: close the attempt. Nothing else in the run
+            // depends on a row that no longer exists.
+            None => shared
+                .state
+                .backend
+                .settle_request(
+                    request_id,
+                    ExecutionStatus::Failure,
+                    &agent_request_locked_until(),
+                )
+                .await
+                .map(|attempt| attempt.is_some()),
+            Some((_, status)) => {
+                let status = crate::control::types::status_parse(&status);
+                if status.is_terminal() {
+                    shared
+                        .state
+                        .backend
+                        .settle_request(request_id, status, &agent_request_locked_until())
+                        .await
+                        .map(|attempt| attempt.is_some())
+                } else {
+                    fail_unclaimable_request(shared, request_id).await;
+                    Ok(true)
+                }
+            }
+        };
+        match closed {
+            Ok(true) => settled += 1,
+            Ok(false) => {}
+            Err(error) => warn!(
+                request_id,
+                ?error,
+                "reconcile could not close orphaned request"
+            ),
+        }
+    }
+    if settled > 0 {
+        warn!(
+            settled,
+            "closed unbound job requests orphaned by a control-plane restart"
+        );
+    }
+    settled
+}
+
 pub async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,

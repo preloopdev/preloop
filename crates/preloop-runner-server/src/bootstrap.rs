@@ -1853,6 +1853,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // anyone; settle them before serving so the pool is not handed a queue of
     // jobs it is structurally unable to claim.
     crate::broker::reconcile_orphaned_claims(&shared).await;
+    // Unbound attempts whose job left the queue: nothing will claim or reap
+    // them, so close them (and fail their parked jobs) before serving.
+    crate::broker::reconcile_orphaned_requests(&shared).await;
 
     match config.tls {
         TlsMode::None => {

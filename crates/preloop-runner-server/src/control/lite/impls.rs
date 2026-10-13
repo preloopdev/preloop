@@ -658,6 +658,9 @@ impl ControlBackend for LiteBackend {
     async fn orphaned_claims(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
         self.orphaned_claims().await
     }
+    async fn unbound_orphaned_requests(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+        self.unbound_orphaned_requests().await
+    }
     async fn release_claimed_request(
         &self,
         request_id: i64,

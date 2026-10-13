@@ -468,6 +468,40 @@ impl LiteBackend {
         })
     }
 
+    /// Unbound unsettled attempts whose job is gone or has left the queue: no
+    /// runner or session binding, and either no `jobs` row, or `queue_state =
+    /// 'none'` on a concluded job or a plain job. Expansion parents and
+    /// reusable callers also sit at `'none'` while their subtree runs, so their
+    /// kinds are excluded; `ready`, `blocked`, `held` and expansion states hold
+    /// unbound attempts legitimately and never match.
+    pub(crate) async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+        self.read(|tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT q.request_id, q.run_id, q.job_id FROM job_requests q \
+                     LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                     WHERE q.result IS NULL AND q.runner_id IS NULL AND q.session_id IS NULL \
+                       AND (j.run_id IS NULL OR (j.queue_state = 'none' AND ( \
+                            j.status IN ('success','failure','cancelled','skipped','timed_out') \
+                            OR j.kind IN ('job','matrix_leg')))) \
+                     ORDER BY q.request_id",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        codec::run_id(&row.get::<_, String>(1)?),
+                        JobId(row.get(2)?),
+                    ))
+                })
+                .map_err(db)?;
+            rows.collect::<Result<_, _>>().map_err(db)
+        })
+    }
+
     /// Release a claimed attempt for redelivery: clear the session binding,
     /// owner, start stamp and timeout flag, and drop its lease (a lease
     /// needs an owner). `Ok(false)` when settled or unknown.
