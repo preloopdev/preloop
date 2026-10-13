@@ -2389,9 +2389,15 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         shutdown: CancellationToken::new(),
     });
     assert_eq!(
-        crate::github_push::already_published(&shared, "owner/repo", SHA, PUBLISHED_WORKFLOW)
-            .await
-            .expect("dedup read must succeed"),
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            SHA,
+            PUBLISHED_WORKFLOW,
+            "push"
+        )
+        .await
+        .expect("dedup read must succeed"),
         Some(published_id),
         "the echo of our own push must be recognised"
     );
@@ -2400,7 +2406,21 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             &shared,
             "owner/repo",
             SHA,
-            ".github/workflows/other.yml"
+            PUBLISHED_WORKFLOW,
+            "pull_request"
+        )
+        .await
+        .expect("dedup read must succeed"),
+        None,
+        "a branch publish tested the head alone, so the PR's merge test must still run"
+    );
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            SHA,
+            ".github/workflows/other.yml",
+            "push"
         )
         .await
         .expect("dedup read must succeed"),
@@ -2412,7 +2432,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             &shared,
             "owner/repo",
             "dddddddddddddddddddddddddddddddddddddddd",
-            PUBLISHED_WORKFLOW
+            PUBLISHED_WORKFLOW,
+            "push"
         )
         .await
         .expect("dedup read must succeed"),
@@ -2471,7 +2492,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             &shared,
             "owner/repo",
             MATERIALIZED_SHA,
-            PUBLISHED_WORKFLOW
+            PUBLISHED_WORKFLOW,
+            "push"
         )
         .await
         .expect("dedup read must succeed"),
@@ -2479,9 +2501,15 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         "the webhook echo of a materialized dirty-tree commit must be recognised"
     );
     assert_eq!(
-        crate::github_push::already_published(&shared, "owner/repo", BASE_SHA, PUBLISHED_WORKFLOW)
-            .await
-            .expect("dedup read must succeed"),
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            BASE_SHA,
+            PUBLISHED_WORKFLOW,
+            "push",
+        )
+        .await
+        .expect("dedup read must succeed"),
         Some(dirty_id),
         "the recorded submission sha (the base commit) still matches, as for any push-back run"
     );
@@ -2785,6 +2813,7 @@ async fn already_published_fails_closed_when_the_backend_read_fails() {
         "owner/repo",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ".github/workflows/ci.yml",
+        "push",
     )
     .await;
     assert!(

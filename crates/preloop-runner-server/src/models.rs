@@ -28,6 +28,19 @@ pub struct PushState {
     pub effective_sha: Option<String>,
 }
 
+/// A concluded run whose push-back published a commit. The publish's webhook
+/// echo is judged against what that run tested, so the record says how the run
+/// was submitted and whether it checked out a self-built pull-request merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedRun {
+    pub run_id: RunId,
+    /// The GitHub event the run was submitted as (`push`, `pull_request`, ...).
+    pub event: String,
+    /// Whether the run checked out a self-built pull-request merge. A run that
+    /// tested the branch alone did not.
+    pub tested_merge: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DapPortRegistration {
     pub port: u16,

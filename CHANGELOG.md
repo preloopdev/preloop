@@ -37,10 +37,13 @@ Releases before v0.27.0 predate the changelog.
   the base tip (never every local ref), streams to disk under a 512 MiB cap,
   is single-use, and is deleted as soon as the submission is accepted or
   refused; unsubmitted uploads are swept after an hour. Webhook echoes of the
-  publish (the branch `push`, and the `pull_request` that opening or updating
-  its PR emits) are deduplicated against the published head, while
-  `pull_request_target`, manual dispatches and other later events at the same
-  head still run. Auto-PR requires webhook delivery provenance, so a native
+  publish are deduplicated against the published head: the branch `push` is
+  skipped once any run published that commit, while the `pull_request` that
+  opening or updating its PR emits is skipped only when a `pull_request` run
+  that tested the base merged in published it, so a branch-only publish still
+  lets the PR's merge test run. `pull_request_target`, manual dispatches and
+  other later events at the same head still run. Auto-PR requires webhook
+  delivery provenance, so a native
   submission cannot trigger it. The local branch moves only after a
   successful push, on confirmation, when the working tree still matches the
   submitted tree by content.

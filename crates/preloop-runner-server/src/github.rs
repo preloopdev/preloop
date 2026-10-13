@@ -4714,10 +4714,11 @@ async fn process_delivery_payload_with_lease(
 
             // Pull-request workflows check out the merge commit but GitHub
             // delivers the echo for the head commit. Match the status-check
-            // SHA first so push-back on that head suppresses the PR echo too.
-            // Only what publishing itself causes is an echo (see
-            // `is_publish_echo`); any other event at this head is a new
-            // request and always runs.
+            // SHA first, so a publication that tested that merge suppresses
+            // the PR echo too; one that tested the branch alone does not (see
+            // `already_published`). Only what publishing itself causes is an
+            // echo (see `is_publish_echo`); any other event at this head is a
+            // new request and always runs.
             let echo_sha = submission
                 .status_check_sha
                 .as_deref()
@@ -4729,6 +4730,7 @@ async fn process_delivery_payload_with_lease(
                     &repo_full_name,
                     echo_sha,
                     submission.workflow_path.as_deref().unwrap_or_default(),
+                    &effective.event,
                 )
                 .await
                 {
