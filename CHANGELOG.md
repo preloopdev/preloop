@@ -392,15 +392,18 @@ Releases before v0.27.0 predate the changelog.
 - **Webhook auto-PR requires delivery provenance**: native submissions cannot
   trigger it by setting a trust-tier field.
 
+### Changed
+- **The container-engine bootstrap is now maintained as a shell file** at
+  `scripts/docker-start.sh` and syntax-checked before it is sent to guests.
+
 ### Fixed
-- **A restart no longer fails the queued backlog as starved**: the starvation
-  sweep measured every queued job from its ready-enqueue instant, so jobs
-  queued for more than an hour before an engine restart failed with
-  `none appeared within 3600s` seconds after boot — before the restarted
-  pool had registered a single runner (221 jobs on one deploy). Both the
-  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
-  whichever is later, so a restart gives the backlog the same window a newly
-  queued job gets.
+- **Failed container-engine starts now include daemon diagnostics** by
+  forwarding the tail of `/var/log/dockerd.log` after both retries fail.
+
+- **Root/sudo guest-script wrapping now handles trailing whitespace**, so
+  file-backed scripts remain valid when inlined.
+
+
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
@@ -705,6 +708,15 @@ Releases before v0.27.0 predate the changelog.
   Legs of one matrix share that `job_order`, so among themselves they fall
   back to `job_id`.
 
+- **Fresh pull-request merge resolution**: Webhook-delivered `pull_request` and
+  `pull_request_review` runs accept GitHub's live test merge only when its first
+  parent matches the base SHA observed in the same API response and its second
+  parent matches the webhook payload head. Otherwise GitHub is polled within
+  the existing budget, then the engine builds a merge of the target branch's
+  current tip fetched at fallback time and the pinned payload head. Runs never
+  fall back to the bare pull-request head. The base is not guaranteed to remain
+  latest at job execution; base advancement does not automatically rerun jobs.
+  Conflicted pull requests do not start `pull_request` runs.
 - **A new store no longer replays three days of webhook history**: the
   delivery watchdog treated every delivery in GitHub's history as a phantom
   ack when the store had no watchdog cursor, and asked GitHub to redeliver
@@ -740,6 +752,19 @@ Releases before v0.27.0 predate the changelog.
   Postgres store, so the next run died on the store's key-fingerprint
   guard. The node key now survives the wipe, restored private (`0600`)
   rather than carrying a saved file's permissions.
+
+- **Container jobs without Git can check out**: `actions/checkout` on a
+  minimal image takes its no-git path, which resolves
+  `{github-server-url}/api/v3` and downloads
+  `GET /repos/{owner}/{repo}/tarball/{ref}`. The engine answered that with a
+  404, so every `container:` job whose first step was a redirected checkout
+  failed. The endpoint now serves the run's own snapshot as a `git archive`
+  shaped like the forge's tarball (one `{owner}-{repo}-{sha}/` top-level
+  directory) and relays other repositories to the forge anonymously, with the
+  guest control socket carrying these two read-only repository shapes. The
+  snapshot archive serves only the requesting run's own commit: a
+  repository-scoped cache holds every cached run's commits, and naming
+  another run's SHA must not archive its tree.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
