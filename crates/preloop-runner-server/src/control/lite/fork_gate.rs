@@ -14,7 +14,7 @@ use super::codec;
 use super::promote;
 use super::{LiteBackend, db, jobs};
 use crate::control::backend::{EnvironmentGateRead, PromoteOutcome};
-use crate::control::types::ControlError;
+use crate::control::types::{ControlError, EnvironmentDeploymentRow, PendingEnvironmentApproval};
 use crate::models::EnvironmentGateState;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -26,10 +26,8 @@ impl LiteBackend {
     pub(crate) async fn promote_ready_jobs(
         &self,
         run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
     ) -> Result<PromoteOutcome, ControlError> {
-        let rules = rules.clone();
-        self.write(move |tx| promote_ready_jobs_tx(tx, self, run, &rules))
+        self.write(move |tx| promote_ready_jobs_tx(tx, self, run))
     }
 
     /// `environment_gate`: one job's stored environment, armed gate and
@@ -52,22 +50,399 @@ impl LiteBackend {
             }))
         })
     }
+    /// The jobs still parked on an armed required-reviewer gate — the
+    /// announce scan and the check-run webhook lookup read these. `run_id`
+    /// narrows to one run (submit path); `None` scans every run (the reaper
+    /// sweep).
+    pub(crate) async fn pending_environment_approvals(
+        &self,
+        run_id: Option<RunId>,
+    ) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+        self.read(move |tx| pending_environment_approvals_tx(tx, run_id, false))
+    }
+
+    /// One held approval-gated job by its GitHub check run id — the
+    /// `check_run.requested_action` webhook's join key.
+    pub(crate) async fn pending_environment_approval_for_check_run(
+        &self,
+        check_run_id: u64,
+    ) -> Result<Option<PendingEnvironmentApproval>, ControlError> {
+        self.read(move |tx| {
+            pending_environment_approvals_tx(tx, None, true)?
+                .into_iter()
+                .find(|row| row.check_run_id == Some(check_run_id))
+                .map(Some)
+                .map(Ok)
+                .unwrap_or(Ok(None))
+        })
+    }
+
+    /// Stamp `approval_announced` on the job's gate — the announce PATCH was
+    /// delivered (or the job reports no checks, so nothing would show).
+    /// In-place JSON update: approvals recorded concurrently are preserved.
+    pub(crate) async fn mark_environment_approval_announced(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<(), ControlError> {
+        let job_id = job_id.clone();
+        self.write(move |tx| {
+            tx.prepare_cached(
+                "UPDATE jobs SET environment_gate = \
+                     json_set(environment_gate, '$.approval_announced', json('true')) \
+                 WHERE run_id = ?1 AND job_id = ?2 AND environment_gate IS NOT NULL",
+            )
+            .map_err(db)?
+            .execute(params![codec::run_key(run_id), job_id.0])
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// The job's GitHub deployment id, when one was created for it.
+    pub(crate) async fn job_deployment_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        let job_id = job_id.clone();
+        self.read(move |tx| {
+            tx.prepare_cached("SELECT deployment_id FROM jobs WHERE run_id = ?1 AND job_id = ?2")
+                .map_err(db)?
+                .query_row(params![codec::run_key(run_id), job_id.0], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .optional()
+                .map_err(db)
+                .map(|id| id.flatten().map(|id| id as u64))
+        })
+    }
+
+    /// Record the job's GitHub deployment id (created by the reporting path).
+    pub(crate) async fn set_job_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        deployment_id: u64,
+    ) -> Result<(), ControlError> {
+        let job_id = job_id.clone();
+        self.write(move |tx| {
+            tx.prepare_cached(
+                "UPDATE jobs SET deployment_id = ?3 WHERE run_id = ?1 AND job_id = ?2",
+            )
+            .map_err(db)?
+            .execute(params![
+                codec::run_key(run_id),
+                job_id.0,
+                deployment_id as i64
+            ])
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// `environment_deployment`: check run + deployment + resolved
+    /// environment for one job, assembled from `jobs`, `runs`, `job_specs`
+    /// and `job_messages`. Works on any job state (the terminal deployment
+    /// status posts after the row leaves `held`). `None` when the job is
+    /// missing or no environment name resolves.
+    pub(crate) async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        let job_id = job_id.clone();
+        self.read(move |tx| {
+            let row = tx
+                .prepare_cached(
+                    "SELECT r.repository, r.head_sha, j.environment_gate, \
+                            j.check_run_id, j.deployment_id, j.environment_url, \
+                            s.environment, m.message_template, j.status, \
+                            EXISTS(SELECT 1 FROM job_requests q \
+                                   WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                                     AND q.started_at IS NOT NULL) \
+                     FROM jobs j \
+                     JOIN runs r ON r.run_id = j.run_id \
+                     LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                     LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
+                     WHERE j.run_id = ?1 AND j.job_id = ?2",
+                )
+                .map_err(db)?
+                .query_row(params![codec::run_key(run_id), job_id.0], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                })
+                .optional()
+                .map_err(db)?;
+            let Some((
+                repository,
+                head_sha,
+                gate_json,
+                check_run_id,
+                deployment_id,
+                resolved_url,
+                spec_env,
+                template,
+                job_status,
+                job_started,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            let Some((environment, environment_url)) = resolve_environment_parts(
+                resolved_url.as_deref(),
+                gate_json.as_deref(),
+                template.as_deref(),
+                spec_env.as_deref(),
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(EnvironmentDeploymentRow {
+                repository,
+                head_sha,
+                environment,
+                environment_url,
+                check_run_id: check_run_id.map(|id| id as u64),
+                deployment_id: deployment_id.map(|id| id as u64),
+                job_status: crate::control::types::status_parse(&job_status),
+                deployment_started: job_started != 0
+                    || environment_gate_engaged(gate_json.as_deref()),
+            }))
+        })
+    }
+}
+
+/// Whether the armed gate blob shows the environment gate ever engaged
+/// GitHub's review surface — a required-reviewer wait was stamped, or a
+/// decision landed. GitHub creates a Deployment when a job waits on
+/// reviewers, so these jobs carry one even though no runner ever ran them;
+/// a job skipped by `if:` has neither marker and gets none.
+fn environment_gate_engaged(gate_json: Option<&str>) -> bool {
+    gate_json
+        .and_then(|json| serde_json::from_str::<EnvironmentGateState>(json).ok())
+        .is_some_and(|gate| {
+            gate.approval_requested_at_unix_nanos.is_some()
+                || !gate.approvals.is_empty()
+                || gate.rejected_by.is_some()
+        })
+}
+
+/// The environment name recorded on a job's stored runner message, when it
+/// has one. Read from `job_messages.message_template`; the same source
+/// `environment_deployment` resolves the deployed name from.
+fn message_environment_name(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<Option<String>, ControlError> {
+    let template: Option<String> = tx
+        .prepare_cached(
+            "SELECT message_template FROM job_messages WHERE run_id = ?1 AND job_id = ?2",
+        )
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id), job_id.0], |row| row.get(0))
+        .optional()
+        .map_err(db)?;
+    Ok(template.and_then(|template| {
+        serde_json::from_str::<serde_json::Value>(&template)
+            .ok()
+            .and_then(|message| {
+                message
+                    .get("environment")
+                    .or_else(|| message.get("actionsEnvironment"))
+                    .cloned()
+            })
+            .and_then(|environment| {
+                environment
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    }))
+}
+
+/// Resolve `(environment_name, environment_url)` for one job from its three
+/// sources: the armed gate blob (post-hydration stamp), the stored runner
+/// message (`environment` / `actionsEnvironment` — deferred names resolve
+/// into it), and the spec literal. `None` when no source yields a name — the
+/// job isn't an environment job.
+///
+/// The URL precedence is: the runner-evaluated value reported with the job's
+/// completion (the only source that can resolve `steps.<id>.outputs`, and what
+/// GitHub's own service receives at job completion), then a statically known
+/// literal from the message or the spec. An unevaluated `${{ }}` template is
+/// never returned — see [`crate::runtime_scheduling::environment_url_literal`].
+fn resolve_environment_parts(
+    resolved_url: Option<&str>,
+    gate_json: Option<&str>,
+    template: Option<&str>,
+    spec_env: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let gate: Option<EnvironmentGateState> =
+        gate_json.and_then(|json| serde_json::from_str(json).ok());
+    let message_environment = template.and_then(|t| {
+        serde_json::from_str::<serde_json::Value>(t)
+            .ok()
+            .and_then(|message| {
+                message
+                    .get("environment")
+                    .or_else(|| message.get("actionsEnvironment"))
+                    .cloned()
+            })
+    });
+    let spec = spec_env.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    // A hydrated message name outranks the stamp: an arm taken while the name
+    // was still a `${{ needs.* }}` template stamped that text, and the sweeps
+    // must re-evaluate the environment GitHub actually knows once
+    // `hydrate_needs_context` resolves it.
+    let message_name = message_environment
+        .as_ref()
+        .and_then(|env| env.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+        .map(str::to_owned);
+    let environment = message_name
+        .or_else(|| {
+            gate.as_ref()
+                .and_then(|gate| gate.environment_name.as_deref())
+                .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            spec.as_ref().and_then(|value| {
+                crate::runtime_scheduling::environment_gate_name_of(Some(value))
+                    .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+                    .map(str::to_owned)
+            })
+        })?;
+    let environment_url = resolved_url
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            message_environment
+                .as_ref()
+                .and_then(crate::runtime_scheduling::environment_url_literal)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            spec.as_ref()
+                .and_then(crate::runtime_scheduling::environment_url_literal)
+                .map(str::to_owned)
+        });
+    Some((environment, environment_url))
+}
+
+/// `pending_environment_approvals` over one (or every) run. The gate blob
+/// carries the armed-at name; `environment.url` comes from the job spec's
+/// `environment:` object (expression URLs resolve into the runner message,
+/// which the announce path reads from `job_messages` when present).
+fn pending_environment_approvals_tx(
+    tx: &Transaction<'_>,
+    run_id: Option<RunId>,
+    include_announced: bool,
+) -> Result<Vec<PendingEnvironmentApproval>, ControlError> {
+    let (where_run, run_param): (&str, Vec<rusqlite::types::Value>) = match run_id {
+        Some(run_id) => ("AND j.run_id = ?1", vec![codec::run_key(run_id).into()]),
+        None => ("", Vec::new()),
+    };
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "SELECT j.run_id, j.job_id, r.repository, j.environment_gate, \
+                    j.check_run_id, j.deployment_id, \
+                    s.environment, m.message_template, r.reports_check_runs \
+             FROM jobs j \
+             JOIN runs r ON r.run_id = j.run_id \
+             LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+             LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
+             WHERE j.queue_state = 'held' AND j.status = 'pending' \
+               AND j.environment_gate IS NOT NULL {where_run} \
+             ORDER BY j.run_id, j.job_order"
+        ))
+        .map_err(db)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(run_param), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })
+        .map_err(db)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (
+            run,
+            job_id,
+            repository,
+            gate_json,
+            check_run_id,
+            deployment_id,
+            spec_env,
+            template,
+            reports_check_runs,
+        ) = row.map_err(db)?;
+        let gate: EnvironmentGateState = serde_json::from_str(&gate_json).unwrap_or_default();
+        // Only armed approval gates are reportable: the pending row exists
+        // so the announce loop PATCHes the check run once, not every tick.
+        if gate.approval_requested_at_unix_nanos.is_none()
+            || (!include_announced && gate.approval_announced)
+        {
+            continue;
+        }
+        let Some((environment_name, environment_url)) = resolve_environment_parts(
+            None,
+            Some(&gate_json),
+            template.as_deref(),
+            spec_env.as_deref(),
+        ) else {
+            continue;
+        };
+        out.push(PendingEnvironmentApproval {
+            run_id: codec::run_id(&run),
+            job_id: JobId(job_id),
+            repository,
+            environment_name,
+            environment_url,
+            check_run_id: check_run_id.map(|id| id as u64),
+            deployment_id: deployment_id.map(|id| id as u64),
+            reports_check_runs: reports_check_runs != 0,
+        });
+    }
+    Ok(out)
 }
 
 fn promote_ready_jobs_tx(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     run: Option<RunId>,
-    rules: &crate::config::EnvironmentRulesMap,
 ) -> Result<PromoteOutcome, ControlError> {
     let now_unix_nanos = crate::models::now_unix_nanos();
     let mut outcome = PromoteOutcome::default();
     for run_id in sweep_runs(tx, run)? {
-        release_parked_jobs(tx, backend, run_id, rules, now_unix_nanos, &mut outcome)?;
+        release_parked_jobs(tx, backend, run_id, now_unix_nanos, &mut outcome)?;
         let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
         promote::promote_run(tx, backend, run_id, &mut scheduling)?;
         outcome.promoted += scheduling.promoted;
         outcome.failed += scheduling.failed.len();
+        outcome
+            .failed_jobs
+            .extend(scheduling.failed.iter().map(|(_, job)| job.clone()));
     }
     outcome.next_runs_on = jobs::next_ready_labels(tx)?;
     Ok(outcome)
@@ -100,14 +475,19 @@ fn sweep_runs(tx: &Transaction<'_>, run: Option<RunId>) -> Result<Vec<RunId>, Co
         .collect())
 }
 
-/// Re-evaluate every job `run_id` parked at submit and release the ones whose
+/// Re-evaluate every job `run_id` parked on a hold and release the ones whose
 /// hold lifted. A run still awaiting fork approval admits nothing at all —
 /// that is the whole point of the hold.
+///
+/// Gate satisfaction is stamped, never cleared: a released job hands its
+/// gate row to the promotion sweep, which re-evaluates it against the same
+/// rules — a still-running wait timer re-arms instead of losing its
+/// deadline. Only a rule that resolves to "no protection" clears the row
+/// (inside `evaluate_environment_gate`).
 fn release_parked_jobs(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     run_id: RunId,
-    rules: &crate::config::EnvironmentRulesMap,
     now_unix_nanos: i64,
     outcome: &mut PromoteOutcome,
 ) -> Result<(), ControlError> {
@@ -130,25 +510,107 @@ fn release_parked_jobs(
     if fork_pending {
         return Ok(());
     }
-    for job in parked_jobs(tx, run_id)? {
+    let resolver = backend.environment_resolver();
+    // A job parked while its environment name was still a `${{ needs.* }}`
+    // template never reaches `promote_run`'s hydration — the sweep only
+    // hydrates `blocked` candidates. Load the graph so this pass can
+    // hydrate the stored message once the name's needs settle, and hand
+    // dependency-dead jobs back to `promote_run` instead of holding them.
+    let graph = jobs::run_graph(tx, run_id)?;
+    for mut job in parked_jobs(tx, run_id)? {
         let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
-        let environment = spec.and_then(|spec| spec.environment);
         let mut gate = job.environment_gate.clone();
+        // The resolved name wins: a `Pending` arm records the post-hydration
+        // name so the sweep re-evaluates against the environment GitHub
+        // knows, not the expression text. A message whose name is still a
+        // template (`${{ needs.* }}` before its needs complete) proves nothing
+        // beyond what the stamp already records.
+        let mut env_name = message_environment_name(tx, run_id, &job.job_id)?
+            .as_deref()
+            .and_then(crate::runtime_scheduling::resolved_environment_name_of)
+            .map(str::to_owned)
+            .or_else(|| gate.as_ref().and_then(|gate| gate.environment_name.clone()))
+            .or_else(|| {
+                crate::runtime_scheduling::environment_gate_name_of(
+                    spec.as_ref().and_then(|spec| spec.environment.as_ref()),
+                )
+                .map(str::to_owned)
+            });
+        if env_name.as_deref().is_some_and(|name| {
+            crate::runtime_scheduling::resolved_environment_name_of(name).is_none()
+        }) {
+            // The name is still a template. Its needs still running is the
+            // ordinary case — the gate stays armed and the sweep revisits.
+            // Once every need is terminal the name can resolve: hydrate the
+            // stored message (as the promotion path does) and re-read it.
+            // A job the dependency decision rules out (`if: false`, a failed
+            // need) never deploys, so its gate is moot — hand it back to
+            // `promote_run` to settle instead of holding it forever.
+            let needs = jobs::job_needs(tx, run_id, &job.job_id)?;
+            let ctx: String = tx
+                .prepare_cached(
+                    "SELECT condition_context FROM job_messages \
+                     WHERE run_id = ?1 AND job_id = ?2",
+                )
+                .map_err(db)?
+                .query_row(params![run, job.job_id.0], |row| row.get(0))
+                .optional()
+                .map_err(db)?
+                .unwrap_or_else(|| "{}".to_owned());
+            let condition_context: preloop_gha_expressions::Context =
+                serde_json::from_str(&ctx).unwrap_or_default();
+            match promote::dependency_decision(
+                &graph,
+                &needs,
+                spec.as_ref().and_then(|s| s.if_condition.as_deref()),
+                &condition_context,
+            )? {
+                crate::runtime_scheduling::DependencyDecision::Wait => continue,
+                crate::runtime_scheduling::DependencyDecision::Run => {
+                    env_name = promote::hydrate_message(tx, &graph, &mut job)?.or(env_name);
+                }
+                _ => {
+                    tx.prepare_cached(
+                        "UPDATE jobs SET queue_state = 'blocked', status = 'queued' \
+                         WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'held'",
+                    )
+                    .map_err(db)?
+                    .execute(params![run, job.job_id.0])
+                    .map_err(db)?;
+                    continue;
+                }
+            }
+        }
+        let Some(env_name) = env_name else {
+            // No environment on the job: the (now lifted) fork hold is the
+            // only thing that parked it, so hand it back to the ordinary
+            // promotion path — same as a gate that resolved to "no rules".
+            tx.prepare_cached(
+                "UPDATE jobs SET queue_state = 'blocked', status = 'queued' \
+                 WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'held'",
+            )
+            .map_err(db)?
+            .execute(params![run, job.job_id.0])
+            .map_err(db)?;
+            continue;
+        };
+        let lookup = resolver.lookup_sync(&repository, &env_name);
         let verdict = crate::runtime_scheduling::evaluate_environment_gate(
-            rules,
-            &repository,
+            &lookup,
             &git_ref,
             run_id,
             &job.job_id,
-            environment.as_ref(),
+            &env_name,
             &mut gate,
             now_unix_nanos,
         );
         match verdict {
             crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
-                // The gate is satisfied (or no rule applies): drop the stamp
-                // and hand the job back to the ordinary promotion sweep.
-                write_gate(tx, run_id, &job.job_id, None)?;
+                // The gate is satisfied: keep the stamps (the promotion
+                // sweep re-evaluates them — losing them here would re-arm
+                // a satisfied wait timer as a fresh gate) and hand the job
+                // back to the ordinary promotion path.
+                write_gate(tx, run_id, &job.job_id, gate)?;
                 tx.prepare_cached(
                     "UPDATE jobs SET queue_state = 'blocked', status = 'queued' \
                      WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'held'",
@@ -166,7 +628,7 @@ fn release_parked_jobs(
             crate::runtime_scheduling::EnvironmentGateOutcome::Failed => {
                 // Fail closed: the job never dispatches, and its dependents
                 // settle through the ordinary sweep.
-                write_gate(tx, run_id, &job.job_id, None)?;
+                write_gate(tx, run_id, &job.job_id, gate)?;
                 super::settle::settle_node(
                     tx,
                     backend,
@@ -175,6 +637,7 @@ fn release_parked_jobs(
                     ExecutionStatus::Failure,
                 )?;
                 outcome.failed += 1;
+                outcome.failed_jobs.push(job.job_id.clone());
             }
         }
     }
@@ -208,7 +671,7 @@ fn parked_jobs(tx: &Transaction<'_>, run_id: RunId) -> Result<Vec<jobs::JobRow>,
 }
 
 /// Persist one job's gate progress (`None` clears it).
-fn write_gate(
+pub(super) fn write_gate(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,

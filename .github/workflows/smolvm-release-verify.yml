@@ -136,8 +136,16 @@ jobs:
             rm -f "$SOCKET"
           }
           trap cleanup EXIT
-          IMAGE="$(grep '^ubuntu_24_04_base' versions.toml | cut -d'"' -f2)"
-          [ -n "$IMAGE" ] || { echo "ubuntu_24_04_base missing from versions.toml" >&2; exit 1; }
+          # The base image once came from versions.toml's `ubuntu_24_04_base`;
+          # that pin is gone with the curated bake. Verify the runtime against
+          # the image the official goldens are actually built from, per arch.
+          case "$(uname -m)" in
+            x86_64) OFFICIAL_KEY=official_runner_image_base_amd64 ;;
+            arm64|aarch64) OFFICIAL_KEY=official_runner_image_base_arm64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          IMAGE="$(awk -F'"' -v k="^${OFFICIAL_KEY} = " '$0 ~ k { print $2; exit }' official-image.toml)"
+          [ -n "$IMAGE" ] || { echo "$OFFICIAL_KEY missing from official-image.toml" >&2; exit 1; }
           python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$SOCKET'); s.close()"
           echo "creating machine from $IMAGE"
           smolvm machine create --name "$NAME" \
@@ -242,8 +250,8 @@ jobs:
           # This runner is root, but preloop.service runs as an unprivileged
           # user, so smolvm's per-VM uid drop is inactive in production. Match
           # that here: as root the drop is on by default and squashes packed
-          # ownership (see docs/internal/workflows.md), which is an upstream
-          # defect, not a property of the release under test.
+          # ownership, which is an upstream defect, not a property of the
+          # release under test.
           export SMOLVM_VM_UID_DROP=off
           smolvm machine create --name "$CLONE_NAME" --from "${PACK}.smolmachine"
           smolvm machine start --name "$CLONE_NAME"
@@ -274,8 +282,7 @@ jobs:
           # through a count-1 idmapped mount, so any non-zero uid surfaces as the
           # overflow uid. Blocking on it would gate our bumps on an upstream fix
           # we do not ship; losing the signal entirely would let it regress
-          # silently if preloop ever runs privileged. See
-          # docs/internal/workflows.md.
+          # silently if preloop ever runs privileged.
           BASE_NAME="preloop-uiddrop-base-$(date +%s)"
           CLONE_NAME="${BASE_NAME}-clone"
           WORK="$(mktemp -d "${TMPDIR:-/tmp}/preloop-uiddrop.XXXXXX")"

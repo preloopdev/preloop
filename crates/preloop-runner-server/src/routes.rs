@@ -1072,6 +1072,15 @@ pub fn build_app(
             "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
             post(twirp_artifact_v2_delete),
         )
+        // Refresh an expired blob upload URL: the runner POSTs the old
+        // (expired) upload JWT with its live job bearer and gets a fresh
+        // upload JWT for the same pending staging dir. The job must be live;
+        // a settled job's refresh is refused so uploads never extend past
+        // job death.
+        .route(
+            "/twirp/github.actions.results.api.v1.BlobService/RefreshUploadURL",
+            post(twirp_refresh_blob_upload_url),
+        )
         // Azure Block Blob compat blob store — upload (PUT) and download (GET).
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token} (download URL appends.zip for content-type detection)

@@ -53,6 +53,13 @@ pub(crate) const NAMESPACE_CLAIM_CAPPED: &str = "\
 /// (the `jobs_namespace_queued` partial index).
 pub(crate) const NAMESPACE_QUEUED_STATES: &str = "('blocked','held','ready','pending_expansion')";
 
+/// Jobs per submit transaction chunk. A submit inserts its jobs in chunks of
+/// this size, committing between chunks, so no single request pins the
+/// writer for the whole insert — a concurrent control write waits for one
+/// chunk at most. Both backends share the constant so their chunked submits
+/// stay identical.
+pub(crate) const SUBMIT_JOB_CHUNK_SIZE: usize = 250;
+
 /// Submit admission for a namespace in `state`.
 ///
 /// API/CLI submits need an `active` namespace: `draining` keeps claiming its
@@ -355,6 +362,109 @@ pub(crate) struct SubmitOutcome {
     pub(crate) events: Vec<preloop_gha_protocol::NdjsonEvent>,
 }
 
+/// Which jobs a re-run resets, mirroring github.com's three re-run modes
+/// (<https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs>):
+/// all jobs, failed/cancelled jobs plus their dependents, or one job plus
+/// its dependents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RerunMode {
+    /// Every job of the run (`gh run rerun` / "Re-run all jobs").
+    All,
+    /// Failed and cancelled jobs plus every job reachable downstream
+    /// ("Re-run failed jobs"; dependents include jobs skipped by a failed
+    /// `needs:` — they re-evaluate against the new attempt).
+    Failed,
+    /// One job plus its dependents (REST `…/actions/jobs/{job_id}/rerun`,
+    /// `gh run rerun --job`). The id matches a job id or a matrix/caller
+    /// base id, the same rule `job_needs` matching uses.
+    Job(JobId),
+}
+
+/// A rebuilt message template for a re-run job that has no stored
+/// `job_messages` row (e.g. it was concluded `Skipped` at submit and GitHub
+/// lets a new attempt run it). The handler builds these with the same
+/// `build_job_artifacts` path a submit uses.
+#[derive(Debug)]
+pub(crate) struct RerunJobTemplate {
+    pub(crate) job_id: JobId,
+    /// Fresh secret-free template; carries the attempt's new `jobId`,
+    /// `planId`, `timeline.id` and the bumped `github.run_attempt`.
+    pub(crate) message: azdo::AgentJobRequestMessage,
+    /// Fresh `if:`/needs expression context built from the bumped github
+    /// context (mirrors `QueuedJob.condition_context` at submit).
+    pub(crate) condition_context: preloop_gha_expressions::Context,
+    /// Deferred App-token mint request for this job's new request id.
+    pub(crate) token_request: Option<crate::models::GitHubTokenRequest>,
+}
+
+/// `rerun_run` input: the run to re-execute plus the admission inputs the
+/// handler re-evaluated outside the transaction. GitHub re-runs the same
+/// workflow snapshot, so job specs, needs edges and stored messages are
+/// reused; what changes is the attempt identity.
+#[derive(Debug)]
+pub(crate) struct RerunRun {
+    pub(crate) run_id: RunId,
+    pub(crate) mode: RerunMode,
+    /// User who requested this re-run. Native control-plane callers do not
+    /// carry a user identity and pass `None`; the stored triggering actor is
+    /// left unchanged in that case.
+    pub(crate) triggering_actor: Option<String>,
+    /// Evaluated workflow-level concurrency as at submit (persisted in
+    /// `run_submissions.record_details.workflow_concurrency`), re-acquired
+    /// for the new attempt. `None` when the workflow declares none.
+    pub(crate) workflow_concurrency: Option<WorkflowConcurrency>,
+    /// The node-local environment protection rules, re-evaluated for every
+    /// reset job exactly as at submit.
+    pub(crate) environment_rules: crate::config::EnvironmentRulesMap,
+    /// Rebuilt templates for reset jobs that have no stored `job_messages`
+    /// row. A reset job with neither a stored row nor a template here is
+    /// concluded `Failure` rather than left messageless on the ready queue.
+    pub(crate) templates: Vec<RerunJobTemplate>,
+}
+
+/// Outcome of `rerun_run`.
+#[derive(Debug)]
+pub(crate) struct RerunOutcome {
+    pub(crate) run_id: RunId,
+    /// The attempt the run is now executing (`previous + 1`).
+    pub(crate) run_attempt: u64,
+    pub(crate) run_number: u64,
+    /// Jobs admitted to the queue this attempt (`RunAccepted.queued_jobs`).
+    pub(crate) queued_jobs: usize,
+    /// Run status after the reset (Queued / Pending / terminal).
+    pub(crate) status: ExecutionStatus,
+    /// Jobs concluded during re-admission (skipped `if:`s, gate failures,
+    /// arrival-cancelled) — the handler emits events for them.
+    pub(crate) concluded: Vec<(JobId, ExecutionStatus, Option<String>)>,
+    /// Job ids whose rows were reset and dispatched again, with the fresh
+    /// `agent_job_id` minted for the attempt (`None` when the job carried no
+    /// request row — expandable placeholders re-mint at expansion).
+    pub(crate) rerun_jobs: Vec<(JobId, Option<String>)>,
+    /// Every job the mode selected for reset (superset of `rerun_jobs` —
+    /// includes members concluded during re-admission and expandable
+    /// nodes). Reporting surfaces (check runs, webhooks) act on this set.
+    pub(crate) selected: BTreeSet<JobId>,
+    /// Whether the attempt was parked behind a workflow-level gate.
+    pub(crate) held: bool,
+    /// `runs-on` labels of the next ready job, for `next_job_runs_on`.
+    /// (The ready-queue depth gauge is the sampler's; a rerun never counts
+    /// the queue itself.)
+    pub(crate) next_runs_on: Vec<String>,
+}
+
+/// Read-side view of what a `rerun_run` call would touch: the selected job
+/// set plus the members that carry no runnable `job_messages` template
+/// (skipped/unhostable at submit) and therefore need a rebuilt template in
+/// `RerunRun::templates`. Expandable nodes (deferred matrix parents,
+/// reusable callers) mint at expansion and are never listed as missing.
+#[derive(Debug)]
+pub(crate) struct RerunPlan {
+    /// Selected jobs (the rerun_set result, minus dead matrix parents).
+    pub(crate) set: std::collections::BTreeSet<JobId>,
+    /// Members with no usable stored template — handler rebuilds these.
+    pub(crate) missing_templates: Vec<JobId>,
+}
+
 /// What a session poll produced. The handler maps each variant onto the
 /// wire response; `Empty` means long-poll or return the empty body.
 #[derive(Debug)]
@@ -417,7 +527,6 @@ pub(crate) struct AcquireContext {
 /// handler must fan out (events, check-run effects, live-log close).
 #[derive(Debug)]
 pub(crate) struct CompleteOutcome {
-    pub(crate) record: RunRecord,
     /// The status actually stored (terminal-locked jobs keep their first
     /// verdict).
     pub(crate) effective_status: ExecutionStatus,
@@ -997,14 +1106,16 @@ pub(crate) struct ReapSweep {
     pub(crate) paused: std::collections::BTreeMap<i64, std::time::Duration>,
     /// A co-hosted pool is preparing/provisioning a runner.
     pub(crate) pool_preparing: bool,
-    /// This process started less than `MAX_QUEUED_GRACE` ago.
-    pub(crate) warm_window_open: bool,
+    /// When this node's process started: starvation clocks never start
+    /// before it (`logic::starvation_verdict`).
+    pub(crate) booted_at: std::time::SystemTime,
     /// Labels the co-hosted pool advertises; empty when it published none.
     pub(crate) pool_labels: Vec<String>,
     /// Node-local starvation marks: the instant this node's
     /// reaper first saw each unmatched ready job. Backends feed
     /// `first_seen.get(&(run, job))` to `logic::starvation_verdict`; they
-    /// never persist marks. A missing entry falls back to `enqueued_at`.
+    /// never persist marks. A missing entry falls back to `enqueued_at` or
+    /// `booted_at`, whichever is later.
     pub(crate) first_seen: std::collections::BTreeMap<(RunId, JobId), std::time::SystemTime>,
 }
 
@@ -1040,13 +1151,33 @@ pub(crate) struct ReapSweepOutcome {
     pub(crate) starved: Vec<StarvedJob>,
 }
 
-/// `record_environment_approval` input: one operator approval for a job
-/// waiting on its environment's required-reviewer gate.
+/// The reviewer's decision on an environment approval gate (GitHub's
+/// "Review pending deployments" Approve / Reject pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentDecision {
+    /// Approve the pending deployment.
+    Approve,
+    /// Reject it — the gate fails closed and the job concludes `failure`,
+    /// matching GitHub's reviewer-rejection behavior.
+    Reject,
+}
+
+/// `record_environment_approval` input: one review decision for a job
+/// waiting on its environment's required-reviewer gate. `actor` is the
+/// GitHub login the check-run webhook carried (`sender.login`); `None` means
+/// the native operator endpoint, which has no user identities and is logged
+/// as an admin override (`admin_override`).
 #[derive(Debug, Clone)]
 pub(crate) struct EnvironmentApproval {
     pub(crate) run_id: RunId,
     pub(crate) job_id: JobId,
-    /// Operator note recorded with the approval (audit trail).
+    /// Approve or reject.
+    pub(crate) decision: EnvironmentDecision,
+    /// Reviewer identity, when the decision arrived from GitHub.
+    pub(crate) actor: Option<String>,
+    /// The native admin override path bypassed reviewer authorization.
+    pub(crate) admin_override: bool,
+    /// Optional review comment (audit trail).
     pub(crate) note: Option<String>,
 }
 
@@ -1066,6 +1197,89 @@ pub(crate) enum EnvironmentApprovalResult {
         required: u32,
         satisfied: bool,
     },
+    /// A rejection was recorded; the promotion sweep fails the job closed.
+    Rejected,
+}
+
+/// A job parked on its environment's required-reviewer gate plus the GitHub
+/// side-channel facts the announce/approve paths need — the check run to
+/// offer Approve/Reject on and the deployment to stamp.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingEnvironmentApproval {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The post-hydration environment name the gate was armed against.
+    pub(crate) environment_name: String,
+    /// The job's `environment.url` when declared (deployment status field).
+    pub(crate) environment_url: Option<String>,
+    /// The job's GitHub check run, when the run reports checks.
+    pub(crate) check_run_id: Option<u64>,
+    /// The job's GitHub deployment, when one was created.
+    pub(crate) deployment_id: Option<u64>,
+    /// Whether the run reports GitHub check runs (`runs.reports_check_runs`).
+    /// The announce loop needs this: a `None` check_run_id on a reporting run
+    /// means the check run mint has not landed yet (separate spawned task),
+    /// so the gate must stay unannounced for the retry sweep, while a `None`
+    /// on a non-reporting run means no check run will ever exist.
+    pub(crate) reports_check_runs: bool,
+}
+
+/// Everything the GitHub environment side-channel needs for one job: the
+/// resolved environment name/url, the run's head sha (deployment `ref`), and
+/// the already-minted GitHub ids. Built on demand by `environment_deployment`
+/// — the check run / deployment / environment name live on different rows.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvironmentDeploymentRow {
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The run's head sha — the deployment's `ref`.
+    pub(crate) head_sha: String,
+    /// The post-hydration environment name (armed gate → message → spec).
+    pub(crate) environment: String,
+    /// The job's `environment.url`, when declared.
+    pub(crate) environment_url: Option<String>,
+    /// The job's GitHub check run, when the run reports checks.
+    pub(crate) check_run_id: Option<u64>,
+    /// The job's GitHub deployment, when one was already created.
+    pub(crate) deployment_id: Option<u64>,
+    /// The job's persisted status — read once more right before posting so a
+    /// terminal conclusion that landed during token mint suppresses the
+    /// asynchronous `in_progress` deployment status.
+    pub(crate) job_status: ExecutionStatus,
+    /// Whether anything happened GitHub would have created a Deployment for:
+    /// a runner claimed the job (`job_requests.started_at`), or the
+    /// environment gate engaged (a review was requested or recorded). A job
+    /// skipped by `if:` — or otherwise concluded before either — has no
+    /// GitHub deployment, so the terminal report must not create one.
+    pub(crate) deployment_started: bool,
+}
+
+/// One durable environment-review audit row (`environment_approvals`): who
+/// decided what on which environment, when, and with which comment. The row
+/// outlives the gate and the run — run archival never deletes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnvironmentApprovalAudit {
+    /// The run the decision belonged to (a plain key: the run row may be
+    /// archived while this audit row stays readable).
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The post-hydration environment name the gate was armed against.
+    pub(crate) environment: String,
+    /// `"approved"` or `"rejected"`.
+    pub(crate) decision: String,
+    /// GitHub login of the reviewing user; `None` for the operator's
+    /// system-token (admin) override, which carries no user identity.
+    pub(crate) actor: Option<String>,
+    /// The decision bypassed the reviewer list (native admin endpoint).
+    pub(crate) admin_override: bool,
+    /// Reviewer comment, when one was supplied.
+    pub(crate) comment: Option<String>,
+    /// When the decision was recorded (unix nanos).
+    pub(crate) decided_at_unix_nanos: i64,
 }
 
 /// `record_environment_approval` outcome plus the queue gauges the handler
@@ -1267,4 +1481,26 @@ pub(crate) struct OidcGrant {
     /// `id-token: write` was granted to the job (missing grant row = false).
     pub(crate) granted: bool,
     pub(crate) context: crate::state::OidcJobContext,
+}
+
+/// One finalized v1 artifact from the control catalog. `public_id` is the
+/// UUID the v1 API addresses artifacts by; `storage_key` is the file path
+/// holding the bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactCatalogRow {
+    pub(crate) public_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) name: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
+}
+
+/// A finalized v1 artifact row to persist when an upload completes.
+#[derive(Debug, Clone)]
+pub(crate) struct NewArtifactRow {
+    pub(crate) public_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) name: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
 }

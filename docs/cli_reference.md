@@ -18,10 +18,12 @@ Usage: preloop <COMMAND>
 | `status` | Show active and recent runs |
 | `logs` | Show run logs (defaults to the most recent run) |
 | `cancel` | Cancel the current run |
+| `rerun` | Re-run a completed run: all jobs, failed jobs, or one job |
 | `secret` | Manage the local secret store |
 | `setup` | Configure GitHub credentials (App or fine-grained PAT) |
 | `doctor` | Verify the GitHub credential configuration |
 | `server` | Install/remove the control plane as a supervised service |
+| `store` | Control-database operations: import a legacy `preloop.db` |
 | `shell` | Open a shell in a preserved VM |
 | `debug` | Attach to a job paused at a failed step |
 | `dap` | Attach an interactive DAP client to a debugger-enabled run |
@@ -55,6 +57,7 @@ Submit a workflow and stream its events until terminal.
 | `--push` | After the run completes, push the tested commit and publish the result (pull request + check runs) |
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
 | `--pr-draft` | Create new pull requests as drafts (default true; `--pr-draft=false` opens them ready for review) |
+| `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it |
 
 Behavior notes:
 - **Pausing**: pausing is the SmolVM default in an interactive terminal so you
@@ -62,6 +65,18 @@ Behavior notes:
   Non-interactive runs (pipes, CI, `--detach`) never pause.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
+- **`pull_request` test merge**: like GitHub, a local `--event pull_request`
+  run tests the merge of the pull request's *current* base tip into the head
+  (the workspace `HEAD`, or the snapshot commit when the tree is dirty), not
+  the branch alone. The engine fetches the base branch from the workspace's
+  `origin`, so a base that moved since the branch was cut is picked up. The
+  run's `github.sha` is the merge commit and `github.ref` is
+  `refs/pull/<n>/merge`; the payload's `base.sha` is the fetched tip and
+  `head.sha` the merged head. A conflicted pull request fails the submission
+  with the conflicted files listed (GitHub runs no `pull_request` workflows on
+  a conflict), and an unfetchable base fails loudly — `--no-merge` tests the
+  branch alone in either case. `push` events are unaffected: they test the
+  commit itself.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
 - **Secret preflight**: before submitting, `preloop run` lists the secrets the
@@ -86,7 +101,7 @@ automatically, and an explicit `--payload` field always wins:
 |---|---|---|
 | changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
 | PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
-| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else local `remote/HEAD` or advertised `HEAD` (queried with `git ls-remote --symref` when needed) | GitHub applies PR branch filters to the **target** branch, not the head branch |
 | branch / tag | the current checkout | It is the ref being tested |
 
 The base for the diff is `--base` when given, otherwise the branch's tracking
@@ -168,6 +183,27 @@ preloop logs -f --job test            # tail it live
 ## `preloop cancel [RUN_ID]`
 
 Cancel a run. `RUN_ID` defaults to the most recent active run.
+
+## `preloop rerun [RUN_ID] [--failed | --job <JOB_ID>]`
+
+Re-run a completed run. `RUN_ID` defaults to the most recent completed run.
+Without flags every job resets as a new attempt on the same run
+(`github.run_attempt` increments; the previous attempt stays in history).
+`--failed` resets failed/cancelled jobs and the jobs that depend on them —
+succeeded jobs keep their results and outputs for the new attempt.
+`--job <JOB_ID>` resets one job (the id `preloop status <RUN_ID>` shows) and
+its dependents.
+
+A run the archiver already moved to history can only be re-run in full, as a
+new run; `--failed`/`--job` report a conflict. `PRELOOP_RERUN_WINDOW_DAYS`
+(see `self-hosting.md`) controls how long a failed run stays re-runnable in
+place.
+
+```bash
+preloop rerun                       # newest completed run, all jobs
+preloop rerun 4e1c… --failed        # just the failed jobs (and dependents)
+preloop rerun 4e1c… --job test      # one job (and its dependents)
+```
 
 ## `preloop-runner-client approve <RUN_ID> <JOB_ID> [--note <NOTE>]`
 
@@ -377,6 +413,26 @@ and per-App webhook configuration drift.
 |---|---|
 | `--json` | Print the raw JSON document |
 
+## `preloop store <COMMAND>`
+
+Control-database operations. They are offline and explicit — they never
+bootstrap the engine.
+
+### `preloop store import-legacy [OPTIONS]`
+
+One-time import of a released v11 `preloop.db` (the durable-state store the
+control backend replaced) into a fresh control database. See
+[Importing a legacy `preloop.db`](./setup.md#importing-a-legacy-preloopdb).
+
+| Flag | Description |
+|---|---|
+| `--source <LEGACY_DB>` | Legacy `preloop.db` to read (opened read-only, never modified) |
+| `--target <CONTROL_DB>` | Control database to create; must not exist |
+| `--state-dir <DIR>` | Server state dir the target will live in (secret tiers, log segments). Defaults to the target's directory |
+| `--key <FILE>` | Cluster key file (32 bytes). Defaults to `PRELOOP_HMAC_KEY`, then `<state-dir>/hmac-key.bin` |
+| `--active <POLICY>` | In-flight work on unfinished jobs: `refuse` (default), `requeue`, or `cancel`. Claims on already-terminal jobs are settled as history without an override |
+| `--json` | Print the machine-readable report |
+
 ## `preloop update [OPTIONS]`
 
 Poll GitHub Releases and atomically install the matching binary.
@@ -417,17 +473,21 @@ preloop build-golden \
 ```
 
 The command is hidden from the normal help because it is an operator/build
-command rather than part of workflow submission. The base must currently be
-Ubuntu-derived, and its architecture must match the runner bundle and host.
-`--base-image` also accepts a registry snapshot of the official hosted image.
-`--workspace <PATH>` selects the workspace whose toolchain version files
-(rust-toolchain.toml, .nvmrc, …) are baked into the golden; it defaults to
-the current directory.
+command rather than part of workflow submission. `build-golden` must know the
+image it bakes: pass `--base-image <ref>`, or leave it out to use the
+configured image (`PRELOOP_RUNNER_BASE_IMAGE`, else `[golden] base_image`).
+There is no default base — the official golden is published packed and cannot
+be built locally. A registry snapshot of the official hosted image is a valid
+base, and so is any other image; the only requirement the bake checks is a
+glibc dynamic loader, and its architecture must match the runner bundle and
+host. The image is used as it is, plus the GitHub-runner machinery (the
+`runner` account, tool cache, and build record) — no packages or toolchains
+are added.
 Set `--storage-gb` or `PRELOOP_RUNNER_STORAGE_GB` for large snapshots; the
 default is 80 GiB.
 See [VM images and version tracking](vm-images.md#building-a-golden) for the
-stock build, custom OCI base, checksum, publishing, and runtime configuration
-steps.
+custom-OCI-base, pre-bake, and runtime configuration steps, and
+[Building official goldens](build-goldens.md) for the official artifact.
 
 For the everyday case — "run my workflows on something other than the official
 image" — `preloop init` records the choice instead:
@@ -440,8 +500,10 @@ dockerfile = "ci/Dockerfile"                        # only for kind = "dockerfil
 ```
 
 `serve` reads `base_image` when `PRELOOP_RUNNER_BASE_IMAGE` is unset, and
-prepares the golden on its normal path: the packed official artifact for the
-stock base, or a local bake for a custom one.
+prepares the golden on its normal path: jobs that name `ubuntu-latest` or
+`ubuntu-24.04` — and a pool with no image configured at all — use the
+official packed golden, downloaded per architecture; every other label set
+uses the configured image, baked locally as-is.
 
 ## Environment variables
 
@@ -456,21 +518,21 @@ stock base, or a local bake for a custom one.
 | `PRELOOP_RUNNER_POOL_ENABLED` | Enable the local microVM runner pool (default off) |
 | `PRELOOP_RUNNER_POOL_SIZE` | Pool size (warm forks/VMs) |
 | `PRELOOP_RUNNER_CPUS` | vCPUs allocated to each runner VM (default 8) |
-| `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
-| `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
-| `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
+| `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true) |
+| `PRELOOP_GOLDEN_URL` | Mirror of the official packed golden; the checksum URL is this value plus `.sha256`. When set it replaces the OCI reference, and the mirror must be verifiable — an unverified mirror is refused |
+| `PRELOOP_GOLDEN_SHA256` | Expected SHA-256 of the packed golden, for mirrors that publish no `.sha256` sidecar |
 | `PRELOOP_GOLDEN_OCI_REF` | Override the per-architecture packed golden OCI reference; the engine has digest-pinned defaults for both the official arm64 and x86_64 GHCR artifacts |
-| `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden. Wins over the `[golden] base_image` that `preloop init` records |
+| `PRELOOP_RUNNER_BASE_IMAGE` | Image a custom golden is baked from, used as-is plus the GitHub-runner machinery. Wins over the `[golden] base_image` that `preloop init` records; `runs-on: ubuntu-latest`/`ubuntu-24.04` and an unconfigured pool use the official packed golden regardless |
 | `PRELOOP_VERIFY_BASE_IMAGE` / `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Require a digest-pinned OCI base's GitHub attestation and Cosign signature before `build-golden` |
 | `PRELOOP_REQUIRE_BASE_DIGEST` | Reject mutable registry tags during `build-golden` (used by release provenance builds) |
 | `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 80 GiB) |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | Free space kept on the VM volume (`PRELOOP_RUNNER_STORAGE_GB`'s volume) before a job VM is forked or created (default 20 GiB; `0` disables). Below it the pool holds the slot and re-measures instead of starting a runner, logging `waiting for disk: …`; jobs wait, they are not failed. A volume that cannot be measured never blocks |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | Proceed past the golden disk check with a warning. Without it, a golden download is refused when the artifact cannot fit on its volume, and a golden build when the SmolVM data volume has less than the builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB of pack staging free |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | Free space the golden unpack waits for, as a multiple of the pack's compressed size (default 6). smolvm writes several times the pack before its own layer preflight runs, so the engine stalls the unpack rather than ENOSPC mid-write; a failed attempt prunes its own `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses this wait too |
 | `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
-| `PRELOOP_WORKSPACE` | Workspace whose toolchain version files (rust-toolchain.toml, .nvmrc, …) drive golden toolchain baking; overrides the current directory for daemon deployments |
 | `PRELOOP_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
 | `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |

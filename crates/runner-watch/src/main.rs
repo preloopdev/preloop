@@ -3605,6 +3605,7 @@ fn flows_diff(args: &FlowsDiffArgs) -> anyhow::Result<()> {
             Some(except) => compare::ValueGate::AllExcept(except.clone()),
             None => compare::ValueGate::Off,
         },
+        ..compare::GatePolicy::default()
     };
     let failures = report.failures(&policy);
     if args.json {

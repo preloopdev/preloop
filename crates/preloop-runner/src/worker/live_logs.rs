@@ -247,8 +247,10 @@ impl LiveLogQueue {
             if !sent {
                 let disable = sender.should_disable();
                 if disable {
+                    // The feed URL is server-supplied; never log userinfo.
+                    let shown_url = preloop_gha_protocol::masking::strip_url_userinfo(&sender.url);
                     warn!(
-                        url = %sender.url,
+                        url = %shown_url,
                         failed = sender.failed_batches,
                         total = sender.total_batches,
                         "disabling live log websocket — failure rate exceeded 50%"
@@ -374,7 +376,9 @@ async fn connect_websocket(
         let mut request = match url.into_client_request() {
             Ok(request) => request,
             Err(error) => {
-                warn!(%error, %url, "invalid live log websocket URL");
+                // The feed URL is server-supplied; never log it with userinfo.
+                let shown = preloop_gha_protocol::masking::strip_url_userinfo(url);
+                warn!(%error, url = %shown, "invalid live log websocket URL");
                 return None;
             }
         };
@@ -419,9 +423,11 @@ fn truncate_line(line: &str) -> String {
 /// Re-mask a sequence of physical log lines against the current secrets.
 ///
 /// Lines are joined, masked, and split so a secret spanning a line boundary
-/// still matches. `mask_secrets_preserving_lines` re-emits every newline
-/// inside a matched secret, so the output line count always equals the input
-/// line count and the split is one-to-one.
+/// still matches. `mask_secrets_preserving_lines_transform_aware` re-emits
+/// every newline inside a matched secret, so the output line count always
+/// equals the input line count and the split is one-to-one. Matching is
+/// transform-aware (encoded variants, ASCII case-insensitive) like every
+/// other log path.
 fn mask_lines<'a, I>(lines: I, secrets: &[String]) -> Vec<String>
 where
     I: IntoIterator<Item = &'a str>,
@@ -430,7 +436,7 @@ where
     if joined.is_empty() {
         return Vec::new();
     }
-    preloop_gha_protocol::masking::mask_secrets_preserving_lines(
+    preloop_gha_protocol::masking::mask_secrets_preserving_lines_transform_aware(
         &joined,
         secrets.iter().map(String::as_str),
         &[],

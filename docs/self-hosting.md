@@ -63,7 +63,7 @@ SmolVM runtime, verifying every artifact against the release's published
 `sha256`:
 
 ```sh
-ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+ver=v0.34.0   # latest release, others at https://github.com/preloopdev/preloop/releases
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sudo -H env PREFIX=/usr/local sh install.sh
@@ -168,6 +168,7 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
 | `PRELOOP_CREDENTIAL_STORE` | `os` | Credential backend for the engine token and GitHub App/PAT credentials. `os` uses the native keychain/secret-service; `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt — use for headless hosts, containers, and local iteration where repeated keychain prompts are unacceptable); `memory` is non-persistent (tests only) |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run (counted after matrix expansion). API submits expanding past it are rejected with 400 before the insert transaction opens; `0` disables the cap. Webhook deliveries bypass it (a push is never refused) — see [Submit limits](#submit-limits) |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
 Managed engines read their generated token from the OS credential store (or
@@ -210,6 +211,23 @@ rather than refusing to boot — off retains nothing, so a typo costs caching,
 never startup. `GET /api/v1/config/checkout-cache` (native bearer) returns
 the effective policy.
 
+### Actions cache
+
+`actions/cache` entries are finalized into `<state_dir>/cache/` and bounded
+by a total quota with least-recently-used eviction: when a commit pushes the
+total over the quota, the least recently used entries are deleted until the
+total fits again. Uploads stream to disk chunk-by-chunk — a large blob is
+never buffered in server RAM — and downloads stream off disk the same way.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` | `10 GiB` | Total bytes of finalized cache entries kept on disk, across all namespaces; LRU entries are evicted past it |
+
+The same key lives under `[cache]` in the config file (`total_quota_bytes`);
+the environment wins, and an unparseable value fails startup rather than
+silently keeping or dropping cached entries. A single entry larger than the
+quota is kept by the commit that created it and evicted by the next commit.
+
 Objects are namespaced by forge origin, the credential that fetched them (App
 installation, or a PAT fingerprint), and the repository's numeric id — never by
 `owner/repo` or commit sha, so a rename cannot cross namespaces and two
@@ -239,6 +257,7 @@ forever.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PRELOOP_RETENTION_DAYS` | `90` | Days a finished run (plus its checks, statuses, artifacts, and logs) is kept. `0` disables cleanup |
+| `PRELOOP_RERUN_WINDOW_DAYS` | `30` | How long a completed run with at least one failed/cancelled/timed-out job stays in the live control tables so it can be re-run in place (`github.run_attempt` increments on the same run). `0` disables the hold and archives every settled run on the 60-second policy. Retention still wins: a held run past `PRELOOP_RETENTION_DAYS` is deleted. |
 
 The same key lives at the top level of the config file as `retention_days`;
 the environment wins. Only runs that have finished are ever deleted — a
@@ -247,6 +266,51 @@ matter how old it is. A background sweep deletes expired runs once at
 startup and hourly afterwards, from both memory and the durable store, so
 a restart cannot resurrect them. Workflows see the effective value as
 `github.retention_days`.
+
+### Submit limits
+
+One HTTP request used to mean one database transaction: a 20,000-job
+submit held the writer for over a minute (SQLite) or pinned a Postgres
+writer connection until the pool exhausted. Two guards now bound that:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run, counted **after** matrix expansion. An API submit expanding past it is rejected with `400` before the insert transaction opens, so no giant transaction ever starts. `0` disables the cap. |
+
+The same key lives at the top level of the config file as
+`max_jobs_per_run`; the environment wins. The per-namespace quotas
+(`namespace_limits.max_jobs_per_run`, `submit_rate_per_minute`,
+`max_queued_jobs`) remain the finer-grained, opt-in control — the server
+cap is the backstop that is always on.
+
+Webhook deliveries bypass the cap, like the namespace quotas: a push is
+never refused. Their protection is the second guard — the submit insert
+is chunked in slices of 250 jobs, committing between chunks, on both the
+SQLite and Postgres backends. A concurrent control write waits for one
+chunk at most, never the whole insert. If a chunk fails after the run row
+committed, the run is marked completed/failed so a partial submit can
+never dispatch or wedge a concurrency group.
+
+### Diagnostic-log staging
+
+Diagnostic logs upload bearerless to signed per-job URLs
+(`/twirp-blob/diag/{token}`, Azure SDK compat). Each token is a single-job
+reservation recorded in memory: the per-job cap (32) evicts the oldest
+token, and an evicted or unknown token's PUT is rejected, so a re-mint loop
+cannot accumulate unbounded staging directories. The reaper deletes a
+token's staging directory when its reservation expires (1h TTL), and an
+age-based sweep removes any orphaned staging directory older than:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` | `24` | Max age of a `<state_dir>/blobs/diag/` staging directory before the reaper deletes it. `0` disables the age-based sweep (TTL-expired token directories are still reaped) |
+
+The same key lives at the top level of the config file as
+`diag_staging_max_age_hours`; the environment wins. Note the trade-off this
+buys: diag upload URLs are valid only while the engine that minted them is
+running — the token registry is in-memory, so a restart invalidates
+outstanding diag URLs (a runner that minted just before a restart re-mints
+on its next attempt).
 
 ### Runner pool
 
@@ -259,25 +323,27 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_RUNNER_STORAGE_GB` | `80` | Writable guest disk ceiling (sparse — not allocated until written). The packed OCI golden needs ~80 GiB uncompressed |
 | `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free space kept on the VM data volume before a job VM is started; below it the pool holds the slot (`waiting for disk: …`) and jobs wait rather than fail. `0` disables |
 | `PRELOOP_SKIP_DISK_PREFLIGHT` | — | Proceed past the golden disk check with a warning. Without it, a golden download that cannot fit is refused before it starts, and a golden build is refused below builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB pack staging |
+| `PRELOOP_GOLDEN_UNPACK_FACTOR` | `6` | Free space the golden unpack waits for, as a multiple of the pack's compressed size. smolvm writes several times the pack before its own layer preflight runs; the engine stalls the unpack rather than ENOSPC mid-write, and a failed attempt prunes its `pack/` residue. `PRELOOP_SKIP_DISK_PREFLIGHT` bypasses the wait |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
-| `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
-| `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
-| `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
+| `PRELOOP_USE_FORK` | `true` | Run the pool as forks of the golden rather than one boot per job |
+| `PRELOOP_GOLDEN_URL` | release asset | Mirror of the official packed golden. When set it replaces the OCI reference, and the mirror must be verifiable: the checksum is this URL plus `.sha256`, or `PRELOOP_GOLDEN_SHA256` names the digest. An unverified mirror is refused |
+| `PRELOOP_GOLDEN_SHA256` | — | Expected SHA-256 of the packed golden, for mirrors that publish no `.sha256` sidecar |
 | `PRELOOP_GOLDEN_OCI_REF` | per-architecture official GHCR artifacts | OCI packed golden reference downloaded automatically on the matching host architecture |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` | Host-side Node externals directory |
-| `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
+| `PRELOOP_RUNNER_BASE_IMAGE` | — (official golden) | Image a custom golden is baked from, used as-is plus the GitHub-runner machinery. `runs-on: ubuntu-latest`/`ubuntu-24.04` and an unconfigured pool use the official packed golden instead. Wins over the `[golden] base_image` that `preloop init` records |
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
 | `PRELOOP_RUNNER_DNS` | `8.8.8.8` | Resolver used inside guests; override when a different public resolver is preferred |
 | `PRELOOP_RUNNER_PACK_PROXY` / `_NO_PROXY` | — | Proxy and no-proxy values used while downloading and packing golden artifacts |
-| `PRELOOP_WORKSPACE` | — | Workspace context for daemon deployments; not a package or toolchain installation input |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
 
-To add organization-wide software, derive an OCI image from one of Preloop's
-digest-pinned Ubuntu bases and build a custom packed golden. For the complete
-build, checksum, publishing, and runtime configuration flow, see
+To add organization-wide software, publish an OCI image that carries it and
+point `PRELOOP_RUNNER_BASE_IMAGE` (or `[golden] base_image`, which
+`preloop init` records) at it: the image is used exactly as it is, plus the
+GitHub-runner machinery a bake adds. For the complete build, pre-bake, and
+runtime configuration flow, see
 [VM images and version tracking](vm-images.md#adding-organization-wide-software).
 Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.
@@ -505,8 +571,20 @@ Also worth knowing:
 | `state/github-app.json` | GitHub App private key and installation details |
 | `state/blobs/`, `state/replay/` | Step logs and job artifacts |
 | `state/cache/` | Actions cache entries |
+| `state/snapshots/` | Per-run immutable workspace snapshots; in-flight captures stage under `state/snapshots/.staging/` |
 | `vms/` | Golden images and per-machine state |
 | `engine.token` | Private fallback for the generated native API token when no OS credential service is available |
+
+Keep the whole state directory on one filesystem. Everything the engine
+publishes — workspace snapshots, blob uploads, caches — is staged inside the
+directory it is published to and moved into place with an atomic `rename(2)`,
+which the kernel refuses across mounts; a state directory split over several
+devices by a bind mount turns those publishes into hard failures (a local
+submission is refused outright, since the snapshot is its only copy of the
+tested tree). The process temp directory (`TMPDIR`, `/tmp`) is never used for
+staging, so the common Linux layout — a tmpfs `/tmp` next to an LVM/ext4 state
+volume — is fine. Snapshot staging trees abandoned by a killed engine are
+collected at startup.
 
 Back up at least the database and `github-app.json`. Losing the database strands
 any check run GitHub is still waiting on; losing the key means re-keying the App.
@@ -537,6 +615,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
 | Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
+| `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 
 ---
 
@@ -665,52 +744,94 @@ Semantics:
   `permissions:` by design; the ceiling does not apply to it.
 ### 8.3 Environment protection rules
 
-Per-environment branch policies, wait timers, and required reviewers,
-mirroring GitHub's environment protection rules. The existing `[environments]`
-registry keeps gating existence (bare names stay valid); rules are additive:
+When a GitHub App (or `PRELOOP_GITHUB_TOKEN`) covers a repository, preloop
+sources its environment protection rules from GitHub's environments API —
+the same `github.com/environments/{env}` configuration the UI edits — and
+enforces it at scheduler admission:
+
+- **Deployment branch policies** — `protected_branches` expands to the
+  repo's protected-branch list; `custom_branch_policies` name patterns
+  (branch and tag) match against the run's `git_ref`. A policy configured
+  but matching nothing denies the ref, exactly as GitHub does.
+- **Wait timer** — `wait_timer` minutes hold the job `pending`; the
+  deadline is stamped durably and released by the 10-second gate sweep.
+- **Required reviewers** — the job parks on an `action_required` check run
+  carrying Approve/Reject actions and a `pending` deployment status.
+  Reviewers click through GitHub; each click arrives as a
+  `check_run.requested_action` webhook, is authorized against the
+  environment's reviewer set (teams expanded via the org members API) plus
+  `prevent_self_review`, and the recorded decision releases the job or
+  fails it closed. A reviewer rejection fails the job, matching GitHub.
+- **Custom deployment protection rules** — third-party App rules enabled
+  on the environment fail the job closed: their contract is a callback
+  token preloop cannot impersonate.
+
+The check run's Approve/Reject actions are what GitHub's "Review pending
+deployments" buttons produce; the App must subscribe to `check_run`
+webhooks for them to arrive. Required App permissions: `Actions: read` and
+`Checks: write` (check runs already need these), `Deployments: write`
+(creating deployments + statuses), `Contents: read` (the read floor for
+the environments GETs), and `Members: read` at the org level when
+environment reviewers include teams. A missing grant degrades that one
+surface — an unauthorized review is simply ignored — and the job holds
+until the rules resolve. GitHub answers 404 for resources a credential cannot
+see, so a missing environment is only accepted as "no protection" when the
+same credential can read the repository's Actions surface; otherwise the
+fetch fails and the job holds (it is retried once the grant exists).
+
+The GitHub deployment for an `environment:` job is created lazily on the
+first announce and carries the resolved name; `environment.url` (or
+`environment_url`) rides on each deployment status, and the statuses
+track the job: `pending` while reviewers deliberate, `queued` once
+approved, `in_progress` at job start, `success`/`failure` at conclusion.
+
+`environment.url` may reference `steps.<id>.outputs`, which exist only once
+the job has run: the runner evaluates the expression at job completion and
+reports the result over the completion protocol, and that evaluated value is
+what the terminal deployment status carries. Until the report lands only a
+literal URL is known — an unevaluated `${{ … }}` template is never posted
+to GitHub.
+
+The `[environments]` registry is gone. GitHub accepts any `environment:`
+name, auto-creates the environment unprotected on first reference, and
+applies whatever protection rules the repository configured for it — so
+preloop no longer rejects unknown names, and no longer sources gating from a
+local registry. A config file still carrying a non-empty `[environments]`
+table fails the load with an error naming the removed table: silently
+ignoring it would change what the operator believes is enforced.
+Environment secrets stay keyed by name under `[env_secrets]` (GitHub's API
+never returns secret values, so preloop holds them). They behave like
+secrets stored in that environment on GitHub: any non-fork job that names
+the environment receives them once the environment's protection rules
+pass. Nothing else guards them — an environment with no protection rules on
+GitHub (including one GitHub auto-created on first reference) releases its
+stored secrets to any workflow that names it. Configure protection rules on
+GitHub for every environment whose secrets you store in preloop.
+
+With no GitHub credential configured (local mode), `[environment_rules]`
+TOML remains the whole story, unchanged:
 
 ```toml
-[environments]
-"owner/repo" = ["prod"]
-
 [environment_rules."owner/repo".prod]
 deployment_branches = ["main"]  # refs/heads/ prefix optional; empty = any ref
 wait_timer_minutes = 10         # 0 = no wait
 required_reviewers = 1          # 0 = no approval gate
 ```
 
+In local mode there are no user identities, so `required_reviewers` above
+1 is still rejected at config load — one token holder could satisfy any
+quorum alone. The GitHub path lifts that cap: the reviewer list is a set
+of identities, and one approval from it satisfies the gate.
+
+The native `POST /api/v1/runs/:run_id/jobs/:job_id/approve` endpoint keeps
+working for operators but bypasses the reviewer list — every approval it
+records is stamped `admin_override` and logged at warn, for audit.
+
 Enforcement happens at scheduler admission, before concurrency gating and
 before the job is queued — so a denied or waiting job never occupies a
 concurrency slot, and a denied job's environment secrets never reach a
-runner:
-
-- **Branch policy.** The run's `git_ref` must match `deployment_branches`
-  (compared after stripping a leading `refs/heads/` from both sides, so
-  `main` matches `refs/heads/main`). A run on any other ref fails the job
-  closed at admission.
-- **Wait timer.** After the job becomes eligible it waits the configured
-  minutes before it may start. The wait is visible (the job reports status
-  `pending`) and cancellable (`preloop cancel`, run/job cancel APIs). The
-  deadline is stamped on the job and survives restarts; the 10-second
-  background sweep re-runs admission so timers release without waiting for
-  another scheduling event.
-- **Required reviewers.** The job waits in a pending-approval state until
-  the configured number of approvals is recorded. Approvals are explicit and
-  human-driven: `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system
-  bearer token; optional `{"note": "..."}` for the audit trail), e.g. via
-  `preloop-runner-client approve <run-id> <job-id> [--note ...]`. Preloop
-  has no user identities — the approver is whoever holds the operator
-  credential — so
-  for a single-operator server this is a deliberate confirmation step, not
-  a second human. Because one token holder could satisfy any quorum alone
-  by calling the approval endpoint repeatedly, `required_reviewers` is
-  capped at 1; values above 1 are rejected at config load (fail closed).
-  A job not approved within 24 hours of entering the gate
-  fails closed.
-
-Removing an environment's rules releases its armed gates. Gate denials and
-approvals are logged with run, job, and environment.
-
+runner. Removing an environment's rules releases its armed gates; a job
+not approved within 24 hours of entering the gate fails closed.
 
 ## See also
 

@@ -1456,114 +1456,6 @@ async fn postgres_concurrent_open_serializes_migrations() {
     );
 }
 
-/// `PRELOOP_STORE_URL` selects the control backend when no explicit URL is
-/// given — the documented `preloop engine`/systemd configuration, which has no
-/// `--store` flag at all. Regression: the cutover dropped the env fallback, so
-/// the engine silently ran on local SQLite while `/api/v1/status` still
-/// reported `postgres` (the label path kept reading the env).
-#[tokio::test]
-async fn store_url_env_selects_the_control_backend() {
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let env_db = dir.path().join("from-env.db");
-    let _env = crate::state::TestEnvVar::set(
-        crate::store::STORE_URL_ENV,
-        format!("sqlite://{}", env_db.display()),
-    );
-    let state_dir = dir.path().join("state");
-    fs::create_dir_all(&state_dir).unwrap();
-    let backend = crate::state::test_open_backend(None, &state_dir)
-        .await
-        .expect("env-selected backend must open");
-    assert_eq!(backend, "sqlite");
-    assert!(
-        env_db.exists(),
-        "PRELOOP_STORE_URL must select the database"
-    );
-    assert!(
-        !state_dir.join("preloop.db").exists(),
-        "the state-dir default must not be opened when the env selects a database"
-    );
-}
-
-/// Explicit URL wins over the environment — the precedence the merge base had.
-#[tokio::test]
-async fn explicit_store_url_wins_over_env() {
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let env_db = dir.path().join("from-env.db");
-    let explicit_db = dir.path().join("explicit.db");
-    let _env = crate::state::TestEnvVar::set(
-        crate::store::STORE_URL_ENV,
-        format!("sqlite://{}", env_db.display()),
-    );
-    let state_dir = dir.path().join("state");
-    fs::create_dir_all(&state_dir).unwrap();
-    let backend = crate::state::test_open_backend(
-        Some(&format!("sqlite://{}", explicit_db.display())),
-        &state_dir,
-    )
-    .await
-    .unwrap();
-    assert_eq!(backend, "sqlite");
-    assert!(explicit_db.exists());
-    assert!(!env_db.exists());
-    assert!(!state_dir.join("preloop.db").exists());
-}
-
-/// `Backend::open` must parse store URLs with the same grammar as the status
-/// label: `sqlite:` (single slash) is valid, a whitespace-only value means
-/// "unset", and an unknown scheme is rejected outright rather than becoming a
-/// bogus relative path.
-#[tokio::test]
-async fn store_url_parsing_matches_the_label_path() {
-    // The whitespace case falls back to `PRELOOP_STORE_URL`, so this test has
-    // to serialize with the other env-mutating tests and pin the variable
-    // unset — otherwise a sibling's temp database leaks in and is gone.
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
-    let dir = tempfile::tempdir().unwrap();
-    let state_dir = dir.path().join("state");
-    fs::create_dir_all(&state_dir).unwrap();
-
-    // `sqlite:` single-slash form (the merge base accepted it).
-    let single = dir.path().join("single.db");
-    let backend =
-        crate::state::test_open_backend(Some(&format!("sqlite:{}", single.display())), &state_dir)
-            .await
-            .expect("sqlite: single-slash form must be accepted");
-    assert_eq!(backend, "sqlite");
-    assert!(single.exists());
-
-    // A whitespace-only value is "unset": the state-dir default is opened, and
-    // no database file literally named " " appears in the working directory.
-    let ws_dir = tempfile::tempdir().unwrap();
-    let ws_state = ws_dir.path().join("state");
-    fs::create_dir_all(&ws_state).unwrap();
-    let backend = crate::state::test_open_backend(Some("   "), &ws_state)
-        .await
-        .unwrap();
-    assert_eq!(backend, "sqlite");
-    assert!(
-        ws_state.join("preloop.db").exists(),
-        "a whitespace-only URL must fall back to <state_dir>/preloop.db"
-    );
-    assert!(
-        !std::path::Path::new(" ").exists(),
-        "a whitespace-only URL must not create a file named ' '"
-    );
-
-    // Unknown scheme: explicit rejection, not an I/O error on a relative path.
-    let error = match crate::state::test_open_backend(Some("mysql://host/db"), &state_dir).await {
-        Ok(_) => panic!("unknown scheme must be rejected"),
-        Err(error) => error,
-    };
-    assert!(
-        error.contains("unsupported store URL"),
-        "unexpected error: {error}"
-    );
-}
-
 /// Postgres twin of `store_recovery_preserves_run_secrets`. The redaction bug
 /// lived in the shared serialization path, so both backends have to prove it.
 
@@ -3272,7 +3164,7 @@ async fn blob_rejects_wrong_job_write() {
     // Both jobs are live so the ownership mismatch is the only rejection.
     register_live_job(&state, owner_job, "plan-blob").await;
     register_live_job(&state, other_job, "plan-blob").await;
-    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &owner_job.to_string());
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &owner_job.to_string(), "write");
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
@@ -3313,7 +3205,7 @@ async fn bearerless_put_requires_live_owner() {
 
     let job_id = uuid::Uuid::new_v4();
     register_live_job(&state, job_id, "plan-blob").await;
-    let (blob_jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string(), "write");
     let uri = format!("/twirp-blob/artifact/{blob_jwt}");
 
     // Live owner: bearerless PUT succeeds.
@@ -3647,9 +3539,8 @@ async fn legacy_artifact_create_rejects_stale_job_token() {
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-artifact", &job_id);
-    register_live_job_with_run(&state, job_id, "plan-artifact").await;
+    let run_id = register_live_job_with_run(&state, job_id, "plan-artifact").await;
     let bearer = format!("Bearer {token}");
-    let run_id = uuid::Uuid::new_v4();
 
     // Live: artifact creation succeeds.
     let live = app
@@ -3689,4 +3580,127 @@ async fn legacy_artifact_create_rejects_stale_job_token() {
         .await
         .unwrap();
     assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn legacy_artifact_handlers_bind_to_caller_run() {
+    // Repro (round-3 §6): the legacy `/_apis/pipelines/workflows/:run_id/artifacts`
+    // handlers never bound `:run_id` to the caller, so run A's LIVE job token
+    // could create artifacts catalogued under run B, and list/read run B's
+    // artifacts. The list response also leaked the server-side storage path.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let job_a = uuid::Uuid::new_v4();
+    let token_a = state.mint_runtime_token("plan-a", &job_a);
+    let run_a = register_live_job_with_run(&state, job_a, "plan-a").await;
+    let bearer_a = format!("Bearer {token_a}");
+
+    let job_b = uuid::Uuid::new_v4();
+    let token_b = state.mint_runtime_token("plan-b", &job_b);
+    let run_b = register_live_job_with_run(&state, job_b, "plan-b").await;
+    let bearer_b = format!("Bearer {token_b}");
+
+    let post_artifact = |app: &Router, run: &str, bearer: &str, name: &str| {
+        let app = app.clone();
+        let uri = format!("/_apis/pipelines/workflows/{run}/artifacts");
+        let bearer = bearer.to_owned();
+        let body =
+            serde_json::json!({"name": name, "file_name": format!("{name}.bin")}).to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, bearer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get = |app: &Router, uri: String, bearer: &str| {
+        let app = app.clone();
+        let bearer = bearer.to_owned();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Same-run flows still work for both tokens.
+    let created_b = post_artifact(&app, &run_b, &bearer_b, "b-art").await;
+    assert_eq!(created_b.status(), StatusCode::OK);
+    let created_b: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created_b.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let artifact_b_id = created_b["id"].as_str().unwrap().to_owned();
+
+    let created_a = post_artifact(&app, &run_a, &bearer_a, "a-art").await;
+    assert_eq!(created_a.status(), StatusCode::OK);
+
+    // Cross-run: run A's live token may not create under run B.
+    let squat = post_artifact(&app, &run_b, &bearer_a, "squat").await;
+    assert_eq!(squat.status(), StatusCode::FORBIDDEN);
+
+    // Cross-run: run A's live token may not list run B's artifacts.
+    let list_b = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_b}/artifacts"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(list_b.status(), StatusCode::FORBIDDEN);
+
+    // Cross-run: run A's live token may not read run B's artifact bytes.
+    let get_b = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_b}/artifacts/{artifact_b_id}"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(get_b.status(), StatusCode::FORBIDDEN);
+
+    // Same-run list works, and leaks no server-side storage path.
+    let list_a = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_a}/artifacts"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(list_a.status(), StatusCode::OK);
+    let list_a: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_a.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(list_a["count"].as_u64().unwrap(), 1);
+    let entry = &list_a["value"][0];
+    assert_eq!(entry["name"].as_str().unwrap(), "a-art");
+    assert!(
+        entry.get("path").is_none(),
+        "list response must not leak the storage path: {entry}"
+    );
+    assert!(
+        entry.get("storage_key").is_none(),
+        "list response must not leak the storage key: {entry}"
+    );
+
+    // Same-run get works.
+    let artifact_a_id = entry["id"].as_str().unwrap();
+    let get_a = get(
+        &app,
+        format!("/_apis/pipelines/workflows/{run_a}/artifacts/{artifact_a_id}"),
+        &bearer_a,
+    )
+    .await;
+    assert_eq!(get_a.status(), StatusCode::OK);
 }

@@ -261,8 +261,8 @@ export PRELOOP_GITHUB_TOKEN="github_pat_..."
 
 - The PAT is embedded as `GITHUB_TOKEN` only when its classic OAuth scopes
   are introspected and don't exceed declared `permissions:`; broader PATs
-  refuse the run, and unverifiable bounds withhold the PAT (jobs keep the
-  runtime token). It is not scoped per repository. This is exactly why a
+  refuse the run, and unverifiable bounds withhold the PAT (the job then runs
+  with no `GITHUB_TOKEN` at all). It is not scoped per repository. This is exactly why a
   failed App mint does not reach for the PAT unless
   `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` says so.
 - Classic PATs are the only kind whose bounds can be introspected
@@ -281,16 +281,21 @@ GitHub App installation token
   (scoped to one repository and to `permissions:`, fresh per job, 1h TTL)
   ↓ configured? no App at all
 PRELOOP_GITHUB_TOKEN PAT (static, scope-checked against `permissions:` at submission; unscoped per-repository)
-  ↓ falls back to
-Local HMAC JWT (only works against the Preloop server)
+  ↓ neither available
+empty `GITHUB_TOKEN` — API clients go anonymous
 ```
 
 With App credentials configured, the App path is the *only* path a successful
 job token comes from — the PAT is not a silent second choice. A failed mint is
-resolved by `PRELOOP_GITHUB_APP_MINT_FAILURE` (see §4), which defaults to the local
-HMAC JWT. With no App configured at all, the PAT is the primary job token.
-Either way every job receives some `GITHUB_TOKEN` value, unless the policy is
-`error`, which rejects the submission outright.
+resolved by `PRELOOP_GITHUB_APP_MINT_FAILURE` (see §4), which defaults to no
+GitHub token at all. With no App configured at all, the PAT is the primary job
+token. A job that ends up with neither receives *no* `GITHUB_TOKEN` — the same
+value the official runner yields when its message carries no
+`system.github.token` variable — so `${{ github.token }}` inputs such as
+`actions/checkout`'s and maturin-action's `token` resolve empty and their API
+calls are anonymous. The job-scoped runtime JWT is never handed out as
+`GITHUB_TOKEN`: it authenticates to this engine only, so exporting it made every
+step that read the token fail against github.com with `Bad credentials`.
 
 Regardless of which branch is taken, `ACTIONS_RUNTIME_TOKEN` and the pinned
 `actions/checkout` token stay local HMAC JWTs, so cache, artifacts, logs, OIDC,

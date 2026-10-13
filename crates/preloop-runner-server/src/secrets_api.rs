@@ -233,15 +233,9 @@ pub async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name.clone(), value.clone());
-            // Storing an environment secret creates the environment, as on
-            // GitHub: the environment becomes claimable by `environment:`.
-            // Only this operator-held endpoint can register names this way;
-            // workflow authors cannot self-approve an environment.
-            config
-                .environments
-                .entry(repo.clone())
-                .or_default()
-                .insert(env.clone());
+            // No environment registry to update: environments are created
+            // on demand by `environment:` (GitHub semantics), so storing a
+            // secret for one only defines that environment's secret tier.
         }
         (Some(repo), None) => {
             config
@@ -272,13 +266,6 @@ pub async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name, value);
-            // Mirror the persisted registration above: storing an
-            // environment secret creates the environment.
-            store
-                .environments
-                .entry(repo.clone())
-                .or_default()
-                .insert(env.clone());
         }
         (Some(repo), None) => {
             store

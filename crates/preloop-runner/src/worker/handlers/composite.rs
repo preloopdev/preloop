@@ -133,16 +133,33 @@ pub async fn run_composite_action(
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    run_composite_action_inner(manifest, action_dir, with, workspace, ctx, 0, cancel_rx).await
+    run_composite_action_at_depth(manifest, action_dir, with, workspace, ctx, cancel_rx, 0).await
+}
+
+/// Run a composite action at nesting `depth`. Top-level callers pass zero;
+/// a composite re-entered from inside another composite passes its caller's
+/// depth plus one.
+pub(crate) async fn run_composite_action_at_depth(
+    manifest: &ActionManifest,
+    action_dir: &Path,
+    with: &serde_json::Value,
+    workspace: &str,
+    ctx: &mut StepContext<'_>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    depth: u32,
+) -> Result<()> {
+    run_composite_action_inner(manifest, action_dir, with, workspace, ctx, depth, cancel_rx).await
 }
 
 /// Run nested steps and publish composite outputs, restoring the calling
 /// step's environment and GitHub action path/status before returning.
 ///
-/// `depth` starts at zero; values of 10 or more are rejected. Inputs and
-/// defaults use the calling step's environment, retaining their original
-/// text when template evaluation returns an error. Job environment and PATH
-/// changes from file commands persist after the composite returns.
+/// `depth` counts the composite frames above this one: entry points pass zero,
+/// and every nested action re-entry, composite or not, passes `depth + 1`.
+/// Values of 10 or more are rejected. Inputs and defaults use the calling
+/// step's environment, retaining their original text when template evaluation
+/// returns an error. Job environment and PATH changes from file commands
+/// persist after the composite returns.
 ///
 /// Returns errors for missing `runs.steps`, condition evaluation, file-command
 /// creation, and output-file writes. Inner-step errors propagate after eligible
@@ -443,13 +460,14 @@ fn run_composite_action_inner<'a>(
                                     .await
                                     .map(|_| "Success".to_string())
                                 }
-                                Ok(_) => super::action::run_action_from_dir(
+                                Ok(_) => super::action::run_action_from_dir_nested(
                                     &inner_action_dir,
                                     &inner_with,
                                     workspace,
                                     ctx,
                                     cancel_rx.clone(),
                                     Some(uses),
+                                    depth + 1,
                                 )
                                 .await
                                 .map(|_| "Success".to_string()),
@@ -476,12 +494,13 @@ fn run_composite_action_inner<'a>(
                                     .await
                                     .map(|_| "Success".to_string())
                                 }
-                                _ => super::action::run_action(
+                                _ => super::action::run_action_nested(
                                     uses,
                                     &inner_with,
                                     workspace,
                                     ctx,
                                     cancel_rx.clone(),
+                                    depth + 1,
                                 )
                                 .await
                                 .map(|_| "Success".to_string()),
@@ -489,12 +508,13 @@ fn run_composite_action_inner<'a>(
                         } else if uses.starts_with("docker://") {
                             // Docker refs have no @ref and must not enter
                             // remote-action staging.
-                            super::action::run_action(
+                            super::action::run_action_nested(
                                 uses,
                                 &inner_with,
                                 workspace,
                                 ctx,
                                 cancel_rx.clone(),
+                                depth + 1,
                             )
                             .await
                             .map(|_| "Success".to_string())
@@ -506,18 +526,19 @@ fn run_composite_action_inner<'a>(
                                     .await;
                             match staged {
                                 Ok(action_dir) => {
-                                    // run_action_from_dir does not set
+                                    // run_action_from_dir_nested does not set
                                     // github.action{,_repository,_ref}; do it
                                     // here so nested remotes match top-level
                                     // run_action() behavior.
                                     super::action::set_action_repository_context(ctx, uses);
-                                    super::action::run_action_from_dir(
+                                    super::action::run_action_from_dir_nested(
                                         &action_dir,
                                         &inner_with,
                                         workspace,
                                         ctx,
                                         cancel_rx.clone(),
                                         Some(uses),
+                                        depth + 1,
                                     )
                                     .await
                                     .map(|_| "Success".to_string())
@@ -1160,6 +1181,52 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("nesting depth exceeded"));
+    }
+
+    /// A `./` self-reference falls back to the workspace when the
+    /// action-relative path is missing; that re-entry must keep counting depth.
+    #[tokio::test]
+    async fn self_referencing_workspace_composite_hits_depth_cap() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let action_dir = workspace.path().join(".github/actions/loop");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            r#"
+name: Loop
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/loop
+"#,
+        )
+        .unwrap();
+
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let err = crate::worker::handlers::action::run_action(
+            "./.github/actions/loop",
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("Composite action nesting depth exceeded (max 10)"),
+            "unexpected error: {message}"
+        );
     }
 
     // --- composite gap coverage ---

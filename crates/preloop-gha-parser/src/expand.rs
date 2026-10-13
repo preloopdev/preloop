@@ -103,18 +103,20 @@ fn defaults_run_token(run: &crate::DefaultsRun) -> Value {
 /// When the job declares `name:`, expressions are resolved against the
 /// matrix cell and (for reusable-workflow contexts) the caller's inputs —
 /// e.g. `name: "${{ matrix.repo }}"` renders as the cell's repo value.
-/// Without `name:`, GitHub displays the expanded job id, which already
-/// carries the matrix suffix (`build (ubuntu-latest, 3.9)`).
+/// Without `name:`, GitHub's `JobNameBuilder` renders the job key with the
+/// cell's scalar values as segments (`build (ubuntu-latest, 3.9)`), flattening
+/// an object- or array-valued axis into its values and capping the result at
+/// 100 characters — see `matrix_expand::display_job_name`.
 fn resolved_job_name(
     name: Option<&str>,
-    expanded_id: &str,
+    base_id: &str,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
 ) -> String {
     match name {
         Some(raw) => crate::eval::resolve_string(raw, &expression_context(matrix, inputs, None))
             .unwrap_or_else(|_| raw.to_owned()),
-        None => expanded_id.to_owned(),
+        None => matrix_expand::display_job_name(base_id, matrix),
     }
 }
 
@@ -663,7 +665,7 @@ fn job_plan_from_job(
     {
         defaults.push(defaults_run_token(run));
     }
-    let name = resolved_job_name(job.name.as_deref(), &expanded_id, &matrix, inputs);
+    let name = resolved_job_name(job.name.as_deref(), job_id, &matrix, inputs);
     Ok(JobPlan {
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
@@ -1034,7 +1036,7 @@ fn expand_jobs_with_reusables_internal(
                     base_id: job_id.clone(),
                     name: resolved_job_name(
                         job.name.as_deref(),
-                        &expanded_job_id,
+                        job_id,
                         &matrix,
                         Some(&resolved_inputs),
                     ),
@@ -1820,7 +1822,7 @@ pub fn expand_deferred_reusable_call(
         cell_plan.id = JobId(matrix_expand::expanded_job_id(&caller_plan.id.0, &cell));
         cell_plan.name = resolved_job_name(
             raw_name.as_deref(),
-            &cell_plan.id.0,
+            &caller_plan.id.0,
             &cell,
             Some(&caller_plan.inputs),
         );

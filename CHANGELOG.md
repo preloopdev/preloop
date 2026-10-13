@@ -9,7 +9,359 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
 
+### Added
+
+- **Self-built pull-request test merges**: a local `preloop run --event
+  pull_request` now tests the merge of the pull request's *current* base tip
+  into the workspace head (the synthetic snapshot commit when the tree is
+  dirty), exactly like GitHub's `refs/pull/<n>/merge`, instead of the branch
+  alone. The engine fetches the base branch from the workspace's `origin`,
+  builds the merge with `git merge-tree`/`git commit-tree`, and serves it to
+  the run's jobs from an engine-served snapshot repository (the commit exists
+  only here). `github.sha` is the merge commit, `github.ref` stays
+  `refs/pull/<n>/merge`, and the payload's `base.sha`/`head.sha` carry the
+  fetched base tip and the merged head, so changed-file actions keep diffing
+  the user's changes. A conflicted pull request fails the submission (409)
+  listing the conflicted files, exactly where GitHub refuses to run
+  `pull_request` workflows; an unreachable base fails loudly instead of
+  testing a different tree. `--no-merge` restores testing the branch alone,
+  and `push` events are unchanged (they test the commit itself). The server
+  also validates and serves prebuilt merges for other submission paths.
+
+### Fixed
+
+- **Expression depth no longer rejects sibling-heavy expressions**: the
+  nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
+  against one counter that was never unwound, so `format('{0}', github.ref, …)`
+  with 128 arguments failed with `TooDeep`. Depth is now tracked per subtree
+  (a leaf is 1; every node is one deeper than its deepest child), so siblings
+  add nothing, and a node over the ceiling is refused before it is built —
+  including a call wrapped around a deep index chain, which previously slipped
+  through.
+- **Needs cycle detection and `on:` filter matching no longer recurse per
+  job or per character**: `detect_needs_cycle` walks an explicit stack, and
+  glob matching is an iterative NFA in O(pattern × value) instead of recursive
+  backtracking whose work grows exponentially with the number of `*`.
+- **Composite actions carry nesting depth through every re-entry**: `./`
+  fallbacks and remote composite references restarted the depth at zero, so a
+  self-referencing composite was not stopped by the 10-level cap.
+- **Golden unpacks wait for disk instead of filling it, and failed unpacks
+  clean up after themselves**: unpacking a packed golden writes several times
+  the pack's size before smolvm's own layer preflight runs, and a failed
+  attempt left ~29 GB of `pack/` intermediates that survived every retry
+  until a restart's stale-machine sweep happened to claim them — enough to
+  fill a volume at 100% on a loop. The unpack now stalls behind the same
+  disk-wait discipline as job VMs when the volume lacks
+  `PRELOOP_GOLDEN_UNPACK_FACTOR` (default 6) times the pack's compressed
+  size, and the check serializes against the extraction it gates so two
+  goldens cannot commit the same free bytes. Failure cleanup reaches the
+  unregistered data dir a create that died mid-extraction leaves (no
+  `storage.raw`, no registry row, invisible to `delete`), then the named
+  machine's own `pack/`; the startup sweep prunes residue a crashed delete
+  left inside registered machines.
+- **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
+  process**: the env-selected backend handed each caller a fresh empty store,
+  so a config write sealed `[secrets]` under a key stored in a store instance
+  that vanished with the caller — the next read resolved a different key and
+  failed with `store envelope authentication failed`. The memory backend is
+  now one process-wide store, matching the shared `os`/`file` behavior;
+  explicit `MemoryCredentialStore::default()` instances stay per-instance for
+  test isolation.
+
+- **A pool failure no longer takes the engine down**: `RunnerPool::run`
+  already tears every machine down on the way out, so when its task returned
+  an error the engine now rebuilds the pool on an exponential backoff (1 s,
+  doubling to a 5-minute ceiling) instead of exiting. Each generation runs
+  on a fresh child shutdown token — the pool cancels the token it is handed
+  when a slot ends, which would otherwise kill the replacement instantly —
+  the backoff only resets after a run that finished preparing and reached
+  steady state, and the HTTP server and shutdown signal stay in the backoff
+  race so a dead server stops the engine instead of spawning a pool for
+  nothing.
+- **A refused machine delete no longer leaves a live VM**: `smolvm machine
+  delete -f` declines to stop a guest whose agent cannot confirm a safe
+  shutdown ("left the VM alive for retry"), which stranded the detached
+  hypervisor holding `storage.raw`/`overlay.raw` open — and on macOS its
+  `pack/layers-cs` mount — until the next orphan purge happened to reach it.
+  The delete path now SIGKILLs only that machine's hypervisor (attributed by
+  the boot-config path in its argv, never a neighboring machine's), retries
+  the delete, and detaches an orphaned layer mount if one remains.
+
+## [0.34.0] - 2026-10-09
+
+### Changed
+
+- **The warm pool forks on completion instead of replacing mid-job**: a slot
+  now serves exactly one job per VM — fork from the golden, run the job,
+  delete the VM, fork the next one — so a slot holds one VM instead of a
+  running runner plus a pre-provisioned successor, and no successor boot
+  competes with the running job for host CPU. The fork → ready window
+  (~5 s measured, against an average job time of ~400 s) now sits in front
+  of the job a slot picks up next, which costs roughly 1% throughput for
+  half the VMs per slot. The memory-derived warm pool cap therefore sizes
+  one runner ceiling per slot instead of two, and the queued-job backpressure
+  that decided whether a successor was worth building is gone. On-demand
+  (size=0) slots also no longer provision a successor alongside the running
+  job; each serves one job from one VM, like a warm slot.
+  `preloop status`'s `building` counter now reports the fork/boot in flight
+  (including direct environment boots) rather than successor builds, which no
+  longer exist, in both pool modes.
+- **One golden source: the official packed golden, or the image you
+  configured.** `runs-on: ubuntu-latest`/`ubuntu-24.04` — and any pooled
+  environment with no image configured — now resolve to the published packed
+  golden, downloaded per architecture from a digest-pinned OCI reference
+  (`PRELOOP_GOLDEN_OCI_REF` overrides it; `PRELOOP_GOLDEN_URL` still selects a
+  release-asset mirror) and installed only after its checksum (release asset)
+  or layer digest (OCI) matches. The transfer resumes from a `.partial` file
+  across retries and engine restarts, and a download that cannot complete
+  fails the job: there is no local bake and no stock-Ubuntu fallback behind it.
+  `ubuntu-22.04` now maps nowhere and keeps the configured image instead of
+  silently selecting a 24.04 base.
+
+  The curated stock bake is deleted with it: no toolchain layers
+  (Rust/Go/Python/Node), no `base_install_script`, no apt package pins or
+  index-freshness marker (and no weekly `apt-indices-refresh` workflow), no
+  goldens baked per `runs-on` environment, no local bake from stock Ubuntu and
+  no direct-create fallback when the packed artifact is unavailable.
+  `PRELOOP_USE_PACKED_GOLDEN` is gone — a file-pack backend always uses a
+  packed golden — and the pool holds one golden per pool environment and forks
+  it per job.
+
+  A configured image (`PRELOOP_RUNNER_BASE_IMAGE`, or the `[golden]
+  base_image` that `preloop init` records) is now used exactly as it is.
+  Preloop adds only the GitHub-runner machinery at golden build: a `runner`
+  account (uid 1001) with its home, `_work` and passwordless sudo unless the
+  image already has them; an owner-only ownership walk over the runner home
+  (`find … ! -user 1001 -exec chown -h 1001:1001 {} +`, which leaves a
+  runner-owned file's group alone); a writable `/opt/hostedtoolcache` with
+  `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in `/etc/environment`; and the
+  `/etc/preloop-bake.json` build record. The only checked requirement is a
+  glibc dynamic loader — a missing `bash`, `git` or `docker` fails the step
+  that needs it, exactly as on GitHub. `preloop build-golden`
+  takes the image it bakes (`--base-image <ref>`, or the configured image when
+  the flag is absent); the official golden is published packed and cannot be
+  built locally.
+
+  Guest `PATH`, `RUSTUP_HOME` and `CARGO_HOME` overrides are gone: the guest
+  runner's PATH is the system PATH, and tool versions come from the workflow's
+  `setup-*` actions, as they do on GitHub.
+
+- **A golden is keyed by everything that changes it.** The official golden's
+  fingerprint now covers the source this host would fetch it from
+  (`PRELOOP_GOLDEN_OCI_REF` or the `PRELOOP_GOLDEN_URL` mirror), so changing
+  the mirror re-fetches instead of serving the previous pack forever; a
+  configured image's fingerprint covers its effective runner account, so
+  changing `PRELOOP_RUNNER_USER`/`_UID` rebuilds instead of adopting a golden
+  baked for the account before it. A backend that cannot restore packs
+  (AgentENV) boots the pinned official runner image for the official golden —
+  the sentinel itself is not an image — and an unconfigured pool no longer
+  fails to start there.
+
+- **Leftovers of earlier releases are cleaned up at startup.** Packed-golden
+  payloads keyed on the retired stock Ubuntu bases
+  (`preloop-[mirror.gcr.io-library-]ubuntu-{24.04,22.04}[-sha256-…]-<arch>-<fingerprint>`)
+  live under a stem this release no longer produces, so no fingerprint
+  rotation would ever reach them; the startup sweep now removes them. Goldens
+  prepared per `runs-on` environment (`<prefix>-golden-<fingerprint12>`) keep
+  their fingerprint record, which exempted them from the stale-machine
+  cleanup; one that neither the official golden nor the configured image
+  resolves to is now deleted with its record.
+
+- **Apt indices are baked into the golden.** The runner-image dump ships with
+  `/var/lib/apt/lists` wiped, and a workflow's `sudo apt-get install <pkg>`
+  with no `apt-get update` first (uv's musl cell) fails with `E: Unable to
+  locate package`. The golden contract now refreshes the indices at build, and
+  an unpacked pack that has none is refreshed once before it is frozen, so
+  forks inherit them. Also fixes `golden_contract_script("root", …)`, which
+  rendered `; ;` and did not parse as `sh`.
+
+- **The guest runner inherits the image's environment.** It is launched
+  through a shell that sources `/etc/environment`, so the PATH a step sees is
+  the image's own — the tools a hosted image preinstalls keep resolving —
+  while the pool's variables are re-asserted afterwards. An image that
+  already carries a `runner` account at another uid now has that account moved
+  to the configured uid instead of running jobs as a uid that owns nothing.
+  The Rosetta amd64 install is no longer fatal for a configured image without
+  apt: the bake warns that x86_64 binaries will not run instead of refusing an
+  otherwise usable image.
+
+- **Stopping the engine no longer waits for a golden transfer.**
+  `prepare_fork_base` checks the shutdown token before starting a download or
+  bake, so a restart during the warm returns promptly; the transfer resumes on
+  the next start.
+- **A mixed `runs-on` queue no longer retains a golden per environment on a
+  host that cannot hold them**: every retained golden is a full runner
+  ceiling, so a second environment is baked only when the host has memory
+  left for it next to the pool's runners. Otherwise its runners boot that
+  job's base image directly — a cold start instead of a host that runs past
+  its memory budget while jobs execute.
+
 ### Security
+
+- **The golden's runner account name is validated** before it reaches the
+  root-run bake scripts and the `sudoers.d` filename: anything that is not a
+  Linux account name (or `root`) is refused, closing a shell-injection hole
+  for a hostile or mistyped `PRELOOP_RUNNER_USER`.
+
+- **A `PRELOOP_GOLDEN_URL` mirror must be verifiable.** Its bytes become the
+  image every job runs, so an unverified payload is now refused: the mirror
+  must publish `<asset>.sha256` or the host must pin the digest with
+  `PRELOOP_GOLDEN_SHA256`. The engine's own release assets keep the previous
+  tolerated-with-a-warning behavior.
+### Added
+- In-place reruns now persist `jobs.request_id` and copy it into
+  per-attempt `job_history`, preserving log/step/artifact resolution for
+  carried-forward and newly minted executions on both control backends.
+  Rerun context updates `github.triggering_actor` while retaining the
+  original `github.actor`; migration `V2026100508__job_request_links` carries
+  the nullable columns forward.
+- Environment protection rules now come from GitHub. When a GitHub App (or
+  `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
+  `environment:` are read from the repository's environments API —
+  deployment branch policies (including `protected_branches` expansion via
+  the protected-branch list), `wait_timer`, `required_reviewers` with
+  `prevent_self_review` (teams expanded via the org members API), and
+  custom deployment protection rules (which fail the job closed: their
+  callback contract cannot be impersonated). Rules are cached for 60
+  seconds and refreshed by the reaper. `[environment_rules]` TOML remains
+  the source for repositories no credential covers, and for local mode.
+- Reviewer approvals arrive as `check_run.requested_action` webhooks: the
+  held job's check run completes with an `action_required` conclusion and
+  Approve/Reject buttons, the deployment status is `pending`, and an
+  authorized click releases the job or rejects it (the job fails, matching
+  GitHub). The check run returns to `in_progress` after approval. Approvals,
+  rejections, and the native admin override are recorded in a durable
+  `environment_approvals` table that outlives the run and its archival.
+- Every `environment:` job now gets a GitHub Deployment whose statuses
+  track the job: `pending` while reviewers deliberate, `queued` on
+  approval, `in_progress` at job start, `success`/`failure` at conclusion.
+  `environment.url` is evaluated by the runner at job completion (so
+  `steps.<id>.outputs` works) and reported over the completion protocol;
+  the evaluated value rides on the deployment statuses.
+- The App manifest requests `actions: read` and `deployments: write` (check
+  runs already needed `checks: write`) so the environment surfaces work
+  without a second install.
+- A schema-drift guard keeps the SQLite (`control/lite/schema.sql`) and
+  Postgres (`control/pg/schema.sql`) control schemas aligned: same tables,
+  column names, foreign keys and indexes, with every deliberate difference
+  listed and reasoned in `control/schema_drift.rs` (partition children, the
+  xid8 outbox columns and their ordering index, the pg-only
+  `job_messages.job_timeout_s`, the shared `timeline_id`, and the
+  `runner_sessions.runner_id` FK). The guard fails on an undocumented
+  difference and on a stale entry, so aligning the backends shrinks the list
+  instead of letting it rot.
+- Coverage for id and time storage on both backends: a run id and job
+  round-trip in lowercase-canonical form, a sub-microsecond instant reads
+  back as whole microseconds (nanosecond `bigint` stamps keep full
+  precision), SQLite accepts several attempts of one job sharing a
+  `timeline_id` (the deliberate pg-`UNIQUE` divergence) and its
+  `job_requests_timeline_cascade` trigger prunes the shared timeline with the
+  last request.
+
+### Changed
+
+- **Postgres completions no longer load the run graph**: `settle_job` and
+  `complete_job` write the terminal transition, retire the attempt, fail-fast
+  the siblings, fold reusable callers, refresh the dependents'
+  `remaining_needs` and summarize the run with targeted statements. The graph
+  is materialized only when a completion actually makes a dependent
+  promotable — promotion (needs hydration, gates, max-parallel cohorts,
+  deferred expansion) still runs the shared sweep — so a leg of a large
+  fan-out settles without touching the rest of the run. Fail-fast now cancels
+  every non-terminal sibling of the base, releasing its concurrency hold and
+  queueing the runner cancellation, matching the SQLite path.
+
+- Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
+  ready-queue priority over older automatic jobs; Pullfrog reviews run only on
+  explicit comments or manual dispatches instead of every pull request update.
+
+- **Breaking:** the `[environments]` config table is removed. GitHub
+  accepts any `environment:` name and auto-creates it unprotected, so an
+  unknown name is no longer rejected (no more 403 at submit) and gating is
+  decided by the environment's rules. A config file with a non-empty
+  `[environments]` table now fails to load with an error naming the removed
+  table. Environment secrets stay keyed by name under `[env_secrets]`.
+- **Breaking:** the control-store schema version bumped (SQLite 4 → 5,
+  Postgres 5 → 6) for the `environment_approvals` table and the job's
+  environment-gate columns. There are no migrations: existing dev databases
+  are refused at boot and must be recreated.
+- Environment deployment statuses use the hydrated environment name, and
+  server-side completion handling drops secret-bearing `environment.url`
+  values even when a client did not mask them.
+- Environment rules that cannot be fetched hold the job fail-closed
+  (a resolver `Pending` state) instead of proceeding unprotected; a job
+  not approved within 24 hours fails closed.
+- Environment names are evaluated before protection lookup. Jobs whose names
+  depend on unfinished `needs` outputs remain held until the name resolves.
+- SQLite's `jobs_ready` key is now `(pool_key, priority DESC, run_order,
+  job_order)` — exactly the claim / ready-queue `ORDER BY`, the key Postgres
+  already carries. `namespace_id` sat between the pool key and the priority,
+  so SQLite sorted the last three ORDER BY terms on every poll; the claim
+  query now reads the ready front in index order (`EXPLAIN QUERY PLAN` goes
+  from `USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY` to no sort). SQLite
+  also gains `job_requests_attempts (run_id, job_id, request_id DESC)`, the
+  same index Postgres has, which serves the latest-attempt lookups and the
+  `jobs` -> `job_requests` cascade that the partial inflight index cannot.
+  Both are fresh-database changes: an existing database keeps working
+  unchanged, because a missing index is never an error.
+- The control schema no longer carries objects nothing uses:
+  `run_submissions.secret_refs`, `jobs.not_before`,
+  `provision_requests.lease_owner`/`leased_until`,
+  `runner_sessions.engine_node_id`, `log_files.byte_count`/`line_count`,
+  `artifacts.upload_token_hash` and Postgres's `runners_labels` GIN index
+  (label matching reads `runners.labels` in Rust and uses no operator a GIN
+  index serves). No code referenced any of them, so an existing control
+  database that still has the columns keeps working. The namespace
+  platform columns (`cell_generation`, `config_version`,
+  `namespace_limits.max_job_timeout_minutes`/`priority_tier`/
+  `run_history_retention_days`, `namespace_policies`) stay and are marked
+  platform-owned in the schema.
+
+### Fixed
+
+- Local pull-request base selection now queries `git ls-remote --symref` when
+  the local remote-`HEAD` symbolic ref is absent. The resolved target is
+  reflected in both `github.base_ref` and the synthetic event payload; an
+  explicit base remains the override. Valid prebuilt merges bypass local base
+  discovery, and fetch-by-SHA merges resolve the requested commit instead of
+  the mirror's shared `FETCH_HEAD`.
+
+### Security
+
+- **A job never receives the control-plane runtime token as its
+  `GITHUB_TOKEN`**: with no GitHub App and no embeddable static PAT (the
+  tokenless conformance configuration, `PRELOOP_SKIP_GH_TOKEN=1`), the broker
+  filled `system.github.token`, `github_token` and the `github` context's
+  `token` with the job-scoped runtime JWT. Every step that reads
+  `${{ github.token }}`, `secrets.GITHUB_TOKEN` or `GITHUB_TOKEN` — such as
+  `maturin-action`'s `getInput('token') || process.env.GITHUB_TOKEN` and
+  zizmor's online audits — then presented that engine credential to
+  github.com and failed with `Bad credentials`, and the credential itself
+  could be exfiltrated to any third party a workflow pointed at. The token
+  surface now stays empty unless a real GitHub credential exists (an App
+  installation token, or a PAT whose OAuth scopes were verified), matching
+  the official runner's value when its message carries no
+  `system.github.token` variable: API clients go anonymous. The runtime token
+  keeps travelling where the engine needs it — the pinned snapshot checkout
+  steps, the forge-relay reroutes and the `SystemVssConnection` endpoint. The
+  acquirejob conformance gate permits exactly those two token fields to be
+  absent in tokenless captures while keeping all other response fields strict.
+- **The environment-rule cache is bounded to environments in use**: cached
+  rules were never evicted and every expired entry was refetched each reaper
+  tick, so a fork PR with a matrix of made-up environment names could pin
+  memory and spend the App's GitHub API budget (shared with check-run
+  reporting) indefinitely. Only keys a lookup re-requests are refreshed, and
+  keys idle for 10 minutes are evicted.
+
+- **A system install initializes the control database as the `preloop`
+  service account, never as root**: the store lives in the state tree the
+  install chowns to the service, so a root-owned create, write or chmod
+  there could be aimed anywhere the account can place a symlink — a dangling
+  `state/preloop.db` link had root create and chmod a file of the attacker's
+  choosing. The installer now prepares the store after the ownership
+  transfer, dropped to the service account, and the brand-new preparation
+  refuses a symlinked database path (and, for a privileged caller, a parent
+  directory that is not exclusively its own) instead of following it.
 
 - **The static GitHub PAT no longer crosses the network over plain HTTP**:
   action resolution and action tarball downloads attached the PAT to any
@@ -22,6 +374,206 @@ Releases before v0.27.0 predate the changelog.
   authenticated.
 
 ### Fixed
+- **A restart no longer fails the queued backlog as starved**: the starvation
+  sweep measured every queued job from its ready-enqueue instant, so jobs
+  queued for more than an hour before an engine restart failed with
+  `none appeared within 3600s` seconds after boot — before the restarted
+  pool had registered a single runner (221 jobs on one deploy). Both the
+  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
+  whichever is later, so a restart gives the backlog the same window a newly
+  queued job gets.
+- **Golden workflows pass security checks**: the runtime-drift workflow now
+  pins `actions/download-artifact` to a commit from that action's repository,
+  and the image-pin comparison passes the PR base branch through an environment
+  variable instead of expanding it directly into shell code. The weekly rewrite
+  of the file's composed runtime keys now hands each value to `awk` as one
+  argument, so no probed value can reach a `sed` pattern, and it keeps the
+  guest-side `$(ulimit …)` reads in the best-effort messages literal instead of
+  baking the machine that ran the workflow into the file. The bump PR it opens
+  arrives without CI, because GitHub starts no workflow runs for events the
+  workflow's own token creates; the PR body says how to run the checks.
+
+- **Workspace snapshots publish again when `/tmp` is a different filesystem**:
+  the snapshot was staged in the process temp directory and published into the
+  state directory with `rename(2)`, which the kernel refuses across mounts
+  (`EXDEV`). On the common production layout — tmpfs `/tmp` over an LVM/ext4
+  state volume — every local submission's snapshot failed to publish, so the
+  run fell back to a checkout of a commit the forge has never seen and its jobs
+  died in setup (exit 2). Staging now lives under `state/snapshots/.staging`,
+  on the destination's own filesystem by construction; a publish that still
+  crosses devices copies into the destination directory and renames from there
+  (keeping the publish atomic); a failed publish is logged at error level with
+  the OS error and both paths; and a local submission whose snapshot cannot be
+  created is refused with that reason instead of being queued. Abandoned
+  staging trees are collected at startup.
+- **Engine shutdown stops the VMs it owns and never leaves a layer image
+  mounted**: a shutdown signal that arrived while the runner pool was still
+  preparing its golden or provisioning a runner did not reach the pool's
+  teardown, so the CLI's bounded stop aborted the pool mid-flight and exited
+  with the microVM still running — and, on macOS, its `pack/layers-cs` APFS
+  image still mounted, which made the Preloop home impossible to remove
+  (`rm -rf` → `Resource busy`) until the host rebooted. The pool now observes
+  the shutdown token at every preparation and provisioning await and tears
+  down on every exit path (slot failures and a failed artifact build
+  included); startup, shutdown, and process exit reap orphaned `_boot-vm`
+  hypervisors and detach the layer mounts no live hypervisor claims, matching
+  this home's machine data root by path component so a neighboring home is
+  never touched; and an AgentENV start cancelled mid-flight records or
+  deletes the server-assigned sandbox instead of leaving it to its TTL.
+- **A push to a pull request no longer piles up golden bakes**:
+  `official-golden.yml` now runs under a per-PR concurrency group with
+  `cancel-in-progress` for `pull_request` runs only, so a superseded push
+  cancels the bake it replaces while a `workflow_dispatch` or scheduled bake
+  that has been running for hours is never cancelled. The workflow also bakes
+  only when the `official_runner_image_base_*` pins move: the `golden_*`
+  launch-time runtime keys in the same file no longer start a ~60 GiB rebuild.
+
+
+- **A guest job's runtime now matches a GitHub-hosted runner's**: the hosted
+  VM boots with systemd/cloud-init and runs the runner as a systemd service, so
+  the image's `/etc/sysctl.d`, `/etc/security/limits.conf`, systemd
+  `DefaultLimit*` and hostname setup all apply before a step runs. A preloop
+  guest enters the job workload through the VM's exec channel instead — the
+  smolvm guest's PID 1 is `/run/smolvm/init`, with no systemd at all, and an
+  AgentENV job arrives via `aenv exec` off `envd`, outside systemd and PAM — so
+  the golden carried GitHub's files but nothing ever applied them. The engine
+  now applies them itself: a per-guest **hosted runtime init** (hostname
+  resolution plus the hosted sysctls, one idempotent exec per machine) and the
+  process limits raised on every launch that hosts a workload. Every value is
+  asserted by `fixtures/workflows/hosted-runtime-parity.yml` in a step, an
+  ad-hoc `docker run` and a `container:` job.
+
+- **Guest sysctls now match GitHub's hosted runner image**: the microVM guest
+  boots straight into the job workload, so nothing applied the sysctls the
+  hosted `ubuntu-24.04` image bakes into `/etc/sysctl.conf`, and jobs saw
+  kernel defaults — `vm.max_map_count` 65530 instead of 262144, inotify
+  watches 64372 instead of 655360, instances 128 instead of 1280 (read back
+  from a live job VM before and after the change). The engine now applies the
+  hosted values per machine on the same post-boot exec path as the
+  runner-ownership reconciliation: idempotent, escalating through the runner
+  account's passwordless sudo, and failing provisioning if a write the kernel
+  exposes does not take. The write list is built from the keys the guest
+  kernel actually exposes and that differ from the hosted values, so a kernel
+  missing one key still gets every other key instead of aborting the apply (a
+  missing key makes both `sysctl -w` and a direct `/proc/sys` write fail). The
+  values are the `golden_sysctl_*` keys in `official-image.toml`, so the
+  scheduled drift update moves what the guest init applies together with the
+  expectation it is checked against. No golden rebake is required; keys a
+  guest kernel does not expose are skipped, as the hosted image's own sysctl
+  lines for unknown keys are.
+  `vm.overcommit_memory` is deliberately left at `0` —
+  a probe job on a real GitHub-hosted runner (image `20260927.320.1`, kernel
+  `6.17.0-1022-azure`) reads back `0` there too, so Valkey's overcommit
+  warning is parity, not a fidelity gap.
+
+- **Guest forks resolve their own hostname to an address they own**: the
+  curated bake writes the *golden's* name into `/etc/hosts`, but every fork
+  boots under a new name, so `sudo` printed `sudo: unable to resolve host
+  <name>` before each of its invocations — 25 such lines in a single Valkey
+  job, where a hosted-runner log has none. The engine now makes the machine's
+  own name resolve per machine on the same post-boot exec path as the
+  runner-ownership reconciliation: idempotent (a machine whose name already
+  resolves to one of its own addresses writes nothing), escalating through the
+  runner account's passwordless sudo, and failing provisioning if the name
+  still does not resolve. The name is treated as untrusted input: it is
+  validated as a hostname (`[A-Za-z0-9._-]`) and matched as a string, so it is
+  never interpolated into a shell or `sed` program, and every answer the
+  resolver returns — not just one of them — must be an address of this machine.
+  The resolution check runs on `getent`, present in the golden and in every
+  Ubuntu base: a machine without it fails provisioning with that reason rather
+  than reporting an apply that never verified anything. Resolving is not enough on its own: an AgentENV guest
+  booted with a hosts file mapping its name to an address it did **not** own
+  (`10.1.0.59 runnervm…` while its interfaces carried `169.254.0.21`), and a
+  check that only asks whether the name resolves passed there while every
+  consumer of the name got an unreachable address. The check is now "resolves
+  to loopback or a local-interface address", matching what a hosted runner's
+  own `/etc/hosts` entry does (the VM's name mapped to its interface address);
+  a foreign mapping is replaced with the bake's `127.0.0.1 <host>` entry.
+
+- **Guest job processes run on GitHub's file-descriptor limit**: the hosted
+  image's `configure-limits.sh` writes `DefaultLimitNOFILE=65536` and
+  `* soft/hard nofile 65536`, and a hosted step, `container:` job and ad-hoc
+  `docker run` all read back `Max open files 65536 / 65536`; a preloop job
+  inherited the exec channel's defaults instead (1024 soft / 4096 hard on
+  AgentENV), below what suites that raise their own soft limit ask for
+  (valkey's test suite requests 10032) and enough to make the runner die with
+  `EPERM` on `setrlimit`. The runner wrapper (before it drops privileges) and
+  the container-engine launch now raise the pair next to the stack raise, with
+  the strict form: a raise they ran for that fails ends the launch instead of
+  handing the job a limit it was not meant to have. A launch that keeps the
+  exec channel's identity raises both pairs best-effort, since a hard limit can
+  only be raised by root, and says on stderr which limit stayed. The earlier
+  524288 hard limit here was a guess at what GitHub's runner service inherits —
+  the probe shows 65536.
+
+- **A guest step's environment no longer carries the terminal the exec channel
+  booted with**: a hosted step has no `TERM` (or `COLORTERM`) in its
+  environment — a probe of a real hosted runner shows `printenv TERM` unset,
+  no `TERM` in `env` or `/proc/self/environ`, and the `dumb` a bash step
+  prints for `$TERM` is bash's own default for an *unset* `TERM`
+  (`bash/variables.c`: `set_if_not ("TERM", "dumb")`), not an exported
+  variable. A preloop runner is started through the VM's exec channel, which
+  carries the terminal the guest booted with (`TERM=linux` from the smolvm
+  init, and from `envd` on AgentENV), and every step process inherits the
+  runner's machine environment: the runner now drops an inherited
+  `TERM`/`COLORTERM` from the step environment, so a step's environment
+  matches a hosted runner's. A workflow that declares either still wins.
+
+- **Guest job workloads run on GitHub's stack size again**: the hosted
+  `ubuntu-24.04` image doubles the kernel's 8192 KiB process stack
+  (`actions/runner-images` `images/ubuntu/scripts/build/configure-limits.sh`
+  writes `DefaultLimitSTACK=16M:infinity` into `/etc/systemd/system.conf` and
+  `* soft stack 16384` into `/etc/security/limits.conf`), and a hosted step
+  inherits it from the `actions.runner.*` service. The guest boots straight
+  into the job workload, so neither the image's systemd units nor a PAM
+  session ever applies those files: the runner chain kept the VM init's
+  8192 KiB, half of GitHub's. pydantic's deep-recursion serializer tests —
+  which walk Python's recursion limit through pydantic-core's Rust frames and
+  assert a `RecursionError` — died with a stack-overflow `SIGSEGV` (exit 139)
+  on that half-sized stack while the same commit passed on GitHub. Every
+  guest launch that hosts a workload now raises the limit to the hosted
+  16384 KiB soft / `unlimited` hard: the runner wrapper (including the
+  `runner_user`-unset and `root` launches, which keep their account and gain
+  the raise), the container engine's own start, and the golden's preload
+  daemon, whose live chain a fork inherits as its container engine. A chain
+  inherited from a golden baked before this fix is re-raised in place, so
+  containers do not keep the half-sized stack either. Those raises are strict
+  where the launch runs as root or through passwordless sudo: a guest that
+  cannot reach the hosted pair ends the launch instead of handing the workload
+  half of GitHub's stack, while the launch that keeps the exec channel's
+  identity raises best-effort and reports the limit it had to keep.
+
+- **Matrix job names render object-valued cells the way GitHub does**: a
+  `strategy.matrix` cell that is an object — valkey's `server: [{version,
+  file}]` compatibility matrix, say — was named with the raw JSON
+  (`test-ubuntu-latest-compatibility ({"version":"8.1.4","file":"…"})`), so the
+  check name published for the commit did not match GitHub's. The display name
+  now walks each cell the way the official runner's `JobNameBuilder` does
+  (scalar leaves in declaration order, object keys omitted) and caps the result
+  at 100 characters; the internal job id keeps its unambiguous form.
+- **Isolated test credentials and store URLs**: Store-URL integration tests run
+  in a separate test binary. Git LFS fixtures ignore ambient App and PAT
+  credentials, keeping no-credential cases deterministic.
+
+- **Comment- and payload-triggered workflows no longer run without stored
+  secrets**: every event whose workflow file comes from the default branch
+  (`issue_comment`, `issues`, `discussion`, `discussion_comment`, `label`,
+  `milestone`, `watch`, `fork`, `member`, `public`, `gollum`, `page_build`,
+  `repository_dispatch`, `check_run`, `check_suite`, `delete`) was stamped
+  with the `Untrusted` trust tier — the fail-closed default for events with
+  no classification of their own. That tier withholds every stored secret,
+  read-clamps `GITHUB_TOKEN` regardless of the declared `permissions:`, and
+  drops the OIDC grant, so a comment-triggered bot workflow (the canonical
+  `@bot review` chatops pattern) started with an empty `secrets.*` and died
+  on its first API-key check even though the engine held the secret. These
+  events only ever execute the repository's own default-branch workflow —
+  the payload is data, never code — which is the same posture as a push to
+  the default branch, and it is what github.com grants them: repository
+  secrets, the declared permission set, and OIDC. Only fork pull-request
+  workflows keep the withheld-secret profile. Runs persisted before this
+  change keep their recorded tier.
+  A present unknown tier also fails closed; a missing tier remains the
+  trusted-native case.
 
 - Job runtime tokens remain valid for the effective job timeout plus pause allowance and slack, capped at GitHub's five-day self-hosted maximum.
 
@@ -48,6 +600,142 @@ Releases before v0.27.0 predate the changelog.
   control bridge exists, are untouched. Host steps,
   the runner itself, and the official runner's Docker command shape are
   unchanged.
+- **Environment-gate denials record one failure, not two**: the Postgres
+  promotion paths pushed a settled job into the sweep's failure list after
+  `settle_node` had already recorded it, so an environment gate denied on the
+  promotion sweep (and an unsatisfiable `runs-on` resolved at promotion, and
+  a failed deferred expansion) counted twice — duplicate `JobStatus` events
+  and check-run reports, and an inflated `PromoteOutcome::failed`.
+  `settle_node` is the single recorder again.
+
+- **Environment approvals serialize with the promotion sweep** (Postgres):
+  `record_environment_approval` now takes the run lock (`FOR NO KEY UPDATE`)
+  before reading the gate and locks the job row (`FOR UPDATE OF j`), so an
+  approval racing a sweep that is concluding the job can no longer commit a
+  decision built from the stale `pending` snapshot, and the approval's
+  whole-blob gate write cannot erase a concurrent announce stamp.
+
+- **Environment resolution and reviewer-team expansion use the configured
+  PAT**: the resolver read only `PRELOOP_GITHUB_TOKEN`, so a PAT-only setup
+  whose credential lives in the config file (`github.pat`) resolved rules
+  through the empty TOML fallback and failed every team-reviewer check
+  closed. Both paths now read `AppState::static_github_pat()`, the same
+  credential source the rest of the server uses.
+
+- **Environment protection follow-ups:** GitHub team reviewers without an
+  inline organization now resolve against the repository owner, and an empty
+  protected-branch set follows GitHub's all-branches deployment semantics.
+- **Removed environment protection releases armed jobs:** deleting reviewers,
+  timers, branch policy, and custom rules on GitHub no longer leaves a job
+  held behind stale gate state.
+- **Deferred environment names fail or hydrate deterministically:** jobs no
+  longer wait forever after a `${{ needs.* }}` name cannot be resolved.
+- **Environment policy pagination fails closed:** truncated protected-branch,
+  branch-policy, and team-member lists remain unresolved instead of being
+  treated as complete.
+- **Manifest-created GitHub Apps subscribe to `check_run`**: without it
+  GitHub never delivered `check_run.requested_action`, so environment
+  Approve/Reject clicks on `action_required` check runs went unheard.
+- **Environment deployment/review tokens carry `checks: write`**: the
+  minted installation token asked only for `deployments: write` +
+  `contents: read`, so the `action_required` Approve/Reject check-run
+  PATCHes were rejected by GitHub.
+- **Deployment and review reporting fall back to the config-file PAT**:
+  `resolve_repo_token` consulted only `PRELOOP_GITHUB_TOKEN`, so a PAT in
+  `github.pat` got no deployment statuses or review buttons (and could send
+  an empty bearer). It now reads `AppState::static_github_pat()`.
+- **Environment gates stay announced-retryable until every GitHub surface
+  lands**: a gate scanned before its check run id was persisted, or whose
+  deployment create failed, was stamped `announced` and never retried —
+  permanently losing the Approve/Reject buttons or the `pending` status.
+- **A late `in_progress` deployment status no longer revives a finished
+  deployment**: the asynchronous post now fences on the persisted job state.
+- **Skipped `environment:` jobs no longer mint phantom deployments**:
+  concluding a job that never ran (and whose gate never engaged) created a
+  deployment plus a `failure` status; GitHub creates none for skipped jobs.
+- **`check_run.requested_action` must name the held job's repository**: a
+  delivery whose `repository.full_name` mismatched (or was missing) the
+  gated job's repository could record an environment review for it; it is
+  ignored now.
+- **The scheduler claims the oldest ready job again, whatever its `runs-on`
+  labels.** The ready queue was read in pool-key order (the key is a
+  canonical label-set string), and pool keys sort as text: every runner
+  matching both `["preloop-cpane","self-hosted"]` and `["self-hosted"]` took
+  the lexically earlier key's jobs first, so a label set whose key sorted
+  later starved behind the other's — on the production cell 91
+  `preloop-cpane` jobs all started while 15 `self-hosted` jobs (one an hour
+  older, the required "Runner light conformance" check) never did. The claim
+  batch, the ready-queue front gauges and the reaper's ready scans now read
+  one global queue order — `priority DESC, run_order, job_order`, with
+  `run_id, job_id` as tie-breakers — on both backends; the pool key groups
+  equal label sets for pruning and never ranks them. A runner's own fresh
+  bindings are read before the paged queue, so a first window of older
+  unassigned jobs can no longer take a runner off the job the control plane
+  bound to it: the binding is exclusive and expires after 120s, and the
+  four-tier preference puts it above every unassigned candidate wherever in
+  the queue it sits. A new
+  `jobs_ready_global` partial index (`queue_state = 'ready'`) carries that
+  order, so the claim stays an index read instead of a sort of the whole
+  ready queue (0.2 ms vs 28 ms at 20k ready jobs); `jobs_ready` is kept for
+  the per-pool quota predicates. The index is added by migration
+  `V2026100507`; the claim order is correct without it, so a database that
+  has not migrated yet only loses the speedup.
+
+- **Runs are queued in arrival order on Postgres, and expanded jobs keep
+  their run's place.** Postgres ordered the queue by the workflow's run
+  number — a per-workflow counter — so run #3 of one workflow was claimed
+  before run #800 of another that arrived earlier. `run_order` is now the
+  run's submit time on both backends. Jobs a deferred matrix or a reusable
+  workflow expands into were inserted with `run_order = 0, job_order = 0`,
+  which put them ahead of every other run's ready jobs on both backends;
+  they now take their run's `run_order` and the placeholder's `job_order`.
+  Legs of one matrix share that `job_order`, so among themselves they fall
+  back to `job_id`.
+
+- **Fresh pull-request merge resolution**: Webhook-delivered `pull_request` and
+  `pull_request_review` runs accept GitHub's live test merge only when its first
+  parent matches the base SHA observed in the same API response and its second
+  parent matches the webhook payload head. Otherwise GitHub is polled within
+  the existing budget, then the engine builds a merge of the target branch's
+  current tip fetched at fallback time and the pinned payload head. Runs never
+  fall back to the bare pull-request head. The base is not guaranteed to remain
+  latest at job execution; base advancement does not automatically rerun jobs.
+  Conflicted pull requests do not start `pull_request` runs.
+- **A new store no longer replays three days of webhook history**: the
+  delivery watchdog treated every delivery in GitHub's history as a phantom
+  ack when the store had no watchdog cursor, and asked GitHub to redeliver
+  all of them. After a store cutover this re-ran CI for merged PRs and
+  superseded pushes, and the replays queued ahead of live webhooks in the
+  inbox. A store's first poll now adopts the history before it (the
+  watermark starts at the grace boundary, drawn and persisted at the first
+  attempt, so a history outage right after startup cannot swallow the
+  deliveries that failed while polling was down); later passes repair
+  phantom acks and edge failures as before, and a restored snapshot keeps
+  its cursor and still repairs everything since. Recover a known gap by
+  redelivering it from GitHub.
+
+- **Judged-missing webhooks are no longer stranded below the watchdog
+  watermark**: the watermark advances past everything a pass examines, so a
+  delivery judged missing — a redelivery request GitHub refused, a
+  redelivery that never landed, or a repair left by an older build's
+  unfinished first scan — was never examined again: its repair row stayed
+  open and the webhook stayed missing. Every pass now works the open-repair
+  table directly from the delivery ids it stores: rows whose delivery landed
+  locally close, the rest are requested again under the same per-GUID
+  backoff and attempt cap as the scan, so untracked history is still never
+  replayed. The retry scan reads this App's rows that are still below the
+  attempt cap, so another App's backlog — or rows at the cap — cannot fill
+  the bounded window and starve newer repairs out of it. An attempt is
+  claimed before the request, in one conditional store write, so two
+  watchdogs overlapping a restart cannot both request or both charge the
+  same delivery.
+
+- **The conformance campaign survives a second run against the same
+  Postgres database**: `conformance-5repos.sh` wiped the campaign home,
+  including the node key, on every run while requiring a persistent
+  Postgres store, so the next run died on the store's key-fingerprint
+  guard. The node key now survives the wipe, restored private (`0600`)
+  rather than carrying a saved file's permissions.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so
@@ -60,6 +748,20 @@ Releases before v0.27.0 predate the changelog.
   its own stub. The action-resolution test now pins the behavior
   `#351` introduced: the PAT follows the *configured* GitHub origin, and never
   follows a request to an unconfigured origin.
+- **`github.ref_protected` reports the real branch, not a constant**: the
+  webhook, dispatch and scheduler adapters now resolve branch protection
+  (rulesets included) through the forge API and carry it into the runner's
+  `GITHUB_REF_PROTECTED` environment variable and the OIDC `ref_protected`
+  claim. Previously every run reported `false`, so a protected-branch push
+  looked unprotected to tools that key on it — kache, for one, publishes
+  remote cache entries only from protected-branch pushes, which left its
+  remote cache unwritten and every later lookup a miss. Non-branch refs
+  (tags — even ones a tag ruleset protects — and `refs/pull/*`) stay `false`
+  and are never looked up; an unresolved lookup falls back to `false`, the
+  unprivileged answer. The value is engine-resolved only — a native
+  submission cannot assert it — and a branch is looked up under its exact,
+  URL-encoded name, so `release#test` never answers with `release`'s
+  protection.
 
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
@@ -147,6 +849,24 @@ Releases before v0.27.0 predate the changelog.
   `null` body was treated as a message with id 0 and type `unknown`. It is
   now an empty poll, as in the official listener.
 
+### Changed
+
+- **Control-plane CI stops installing lld and PostgreSQL with apt**: the
+  three `control` jobs now link against the runner image's own `ld.lld-18`
+  (only the unversioned `ld.lld` name expected by `-fuse-ld=lld` was missing)
+  and run PostgreSQL from a container —
+  `mirror.gcr.io/library/postgres:<major>`, `--network host`, trust auth on
+  loopback, `max_connections=400` for the two-node race tests. Both
+  `apt-get update` passes and the pgdg repository are gone: measured on the
+  engine, the lld link plus container start takes 13–26 s per `control` job,
+  where the apt install plus cluster start took 33–38 s.
+
+- **Read-only kache jobs skip the remote push**: kache publishes only from
+  protected-branch pushes, so a pull-request job's post step listed all
+  27,090 remote keys and uploaded nothing — 17–19 s per job. `save-cache` is
+  now tied to `github.event_name == 'push'` in every kache step (`ci.yml`'s
+  four jobs and the server-conformance job).
+
 ## [0.33.9] - 2026-10-02
 
 ### Changed
@@ -173,6 +893,68 @@ Releases before v0.27.0 predate the changelog.
 ## [0.33.8] - 2026-10-02
 
 ### Added
+
+- Control-database schema is now versioned and migratable: refinery 0.10 runs
+  the forward-only migration sets in `migrations/{sqlite,postgres}` (rerun
+  history attempt keys, environment deployments/review audit, fork-approval
+  sweep index), the ledger `refinery_schema_history` is the sole version
+  authority, and `preloop store migrate|status` is the explicit
+  initialize/upgrade path. `preloop serve` never migrates: a missing, older,
+  newer or divergent schema refuses with the recovery command, and a legacy
+  store refuses with `preloop store import-legacy`. SQLite migrations take a
+  consistent pre-migration backup (`VACUUM INTO`) as the rollback path;
+  populated baseline fixtures and an executable parity test against
+  `schema.sql` keep upgrades lossless. Brand-new local installs still
+  initialize on first `preloop run`/`init`/`server install`.
+- **`preloop store import-legacy` imports a released v11 `preloop.db` into a
+  fresh control SQLite database.** The source is opened read-only at `PRAGMA
+  user_version = 11` and hashed before and after; runs, queued jobs (secrets
+  move to the SecretProvider run tier and are stripped from the stored message
+  templates), attempts, steps, log bytes, counters, runners, sessions,
+  webhooks, check ids, and the durable metadata snapshot are written in one
+  transaction into `<target>.importing`, verified (`PRAGMA
+  foreign_key_check`, row counts, schema version), then published atomically
+  (never overwriting an existing target) — a failure leaves no target and a
+  retry is safe. Claimed-but-unfinished attempts, session bindings, and live
+  concurrency gates refuse by default; `--active=requeue|cancel` drains them
+  explicitly. The legacy event log is carried into the outbox (ids and order
+  preserved), per-attempt message frames are verified against the imported
+  templates (reconstructing them for terminal jobs), the finalized artifact
+  registry — legacy v1 `artifact_records` and `artifact_v2_registry.json` —
+  moves into `artifacts`, and buffered timeline events move into the outbox.
+  Both uploads and imports land in that durable catalog, and the v1 artifact
+  GET/list endpoints serve from it: a restart (or a process that never saw
+  the upload) keeps serving, an imported artifact is served instead of
+  vanishing with the legacy process, and one id is one row by the unique
+  `artifacts_public_id` index — never a scan of the whole catalog.
+  Anything not carried into a table is written to
+  `<state-dir>/legacy-import-archive.json`; only node-local state that
+  cannot be carried (queued broker frames, in-flight artifact/cache uploads,
+  pool provisioning marks) refuses the import, and only provably unreachable
+  tombstones/ephemeral tokens are reported as skipped. `preloop serve` still
+  never migrates a database on its own.
+- Workflow runs can be re-run in place as a new attempt: the same run id
+  with `github.run_attempt` incremented and the previous attempt kept in
+  history, exactly like GitHub's "Re-run jobs". Three modes match GitHub's
+  buttons: all jobs, failed/cancelled jobs plus their dependents, and one
+  job plus its dependents (`POST /api/v1/runs/:id/rerun` with
+  `{"mode":"all|failed|job","job_id":…}`, or the new
+  `preloop rerun <run-id> [--failed|--job <id>]`). Re-run jobs re-arm
+  `environment:` protection gates and re-acquire workflow/job concurrency
+  groups; jobs outside the selection keep their results and outputs, so
+  dependents see the carried-forward `needs` context. A run the archiver
+  already moved to history can only be re-run in full, which starts a new
+  run (previous behavior).
+- `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0` disables) keeps completed runs
+  that have a failed/cancelled/timed-out job in the live control tables so
+  they stay re-runnable in place; everything else still archives within a
+  minute of completion, and retention (`PRELOOP_RETENTION_DAYS`) still wins.
+  The volume cost is one live run row plus its jobs and attempts per failed
+  run for up to the window — small next to the run's own artifacts and logs,
+  and the knob trades it for keeping "Re-run failed jobs" working long after
+  the 60-second archive grace.
+
+### Changed
 
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
@@ -212,6 +994,24 @@ Releases before v0.27.0 predate the changelog.
   scope. Secret masking still covers the entire scope server-side.
 
 ### Fixed
+
+- `preloop store import-legacy` no longer refuses a legacy store whose only
+  "active" work is stale. A claimed-but-unfinished attempt whose job (per the
+  run record) or whole run is already terminal is imported settled as
+  history — the job's terminal result (or `cancelled` when the job recorded
+  none), `finished_at` set, no runner/session binding, no `job_leases` row,
+  never `ready`/`claimed` — and the settlement is counted in the report
+  (`N stale claim(s) on already-finished jobs were settled as history`).
+  Session bindings that point only at such attempts are dropped the same way,
+  and runtime concurrency gates whose holder runs are terminal or already
+  evicted (a stopped legacy process can never release them) are released as
+  history with their counts reported. Claims and gates on non-terminal runs
+  still refuse by default, and `--active=requeue` / `--active=cancel` are
+  unchanged. A finished attempt no longer writes a `job_leases` row: a lease
+  is live scheduling state, not history. Legacy unscoped log metadata
+  (`job:<agent_job_id>`, `step:<step_id>`, written before Results identifiers
+  were canonicalized) is now attributed to the attempt it names instead of
+  being reported as unmapped.
 
 - A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
   provisioning removed the guest's small tmpfs `/tmp`, which left it on the

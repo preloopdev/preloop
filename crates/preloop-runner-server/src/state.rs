@@ -112,6 +112,26 @@ impl AppState {
     }
 
     pub fn verify_local_jwt_claims(&self, token: &str) -> Option<serde_json::Value> {
+        self.verify_local_jwt_claims_inner(token, true)
+    }
+
+    /// Verify a local JWT's signature and decode its claims WITHOUT checking
+    /// expiry.
+    ///
+    /// For the upload-URL refresh path: the presented token is expected to be
+    /// expired (that is why the caller is refreshing), but it must still be
+    /// server-minted. Callers must NOT treat the returned claims as an
+    /// authorization grant — only as an identifier for a pending upload
+    /// session whose ownership and liveness they re-verify independently.
+    pub fn verify_local_jwt_claims_unchecked_exp(&self, token: &str) -> Option<serde_json::Value> {
+        self.verify_local_jwt_claims_inner(token, false)
+    }
+
+    fn verify_local_jwt_claims_inner(
+        &self,
+        token: &str,
+        check_exp: bool,
+    ) -> Option<serde_json::Value> {
         let parts: Vec<&str> = token.splitn(3, '.').collect();
         if parts.len() != 3 {
             return None;
@@ -123,11 +143,13 @@ impl AppState {
         }
         let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
         let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-        let exp = payload.get("exp").and_then(|value| value.as_u64())?;
-        let nbf = payload.get("nbf").and_then(|value| value.as_u64());
-        if exp <= now || nbf.is_some_and(|value| value > now + 30) {
-            return None;
+        if check_exp {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            let exp = payload.get("exp").and_then(|value| value.as_u64())?;
+            let nbf = payload.get("nbf").and_then(|value| value.as_u64());
+            if exp <= now || nbf.is_some_and(|value| value > now + 30) {
+                return None;
+            }
         }
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.local_jwt_key).ok()?;
         mac.update(format!("{}.{}", parts[0], parts[1]).as_bytes());
@@ -559,7 +581,11 @@ impl AppState {
 /// a live connection. The knob defaults are the boot defaults.
 ///
 /// A free function rather than a hook method: it needs no [`AppState`], and
-/// its whole point is the selection [`AppState::new`] would have done.
+/// its whole point is the selection [`AppState::new`] would have done in
+/// production. It is also the only test-build caller whose `None` still
+/// reaches `Backend::open`'s environment fallback: `AppState::new_with_store`
+/// pins `None` to the state-dir default so a test mutating the variable
+/// cannot redirect an unrelated `AppState`.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn test_open_backend(
     store_url: Option<&str>,
@@ -705,6 +731,33 @@ pub type ActionShaCache = std::sync::Mutex<
 pub type ActionArchiveSha256Pins =
     std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
 
+/// Nested `uses:` of a composite action's manifest: (`owner`, `repo`,
+/// `ref`) (owner/repo lowercased) → normalized `owner/repo` scopes nested
+/// inside the action's `action.yml`/`action.yaml`. Populated lazily from
+/// the forge contents API the first time a run asks to resolve an action
+/// that is not directly declared in its workflow (composite actions stage
+/// their nested `uses:` in later waves, after the parent's own download).
+/// Only definitive answers are cached — a 200 (even with no nested uses)
+/// or a 404 (no manifest). Transient failures are not cached, so the next
+/// adjudication retries instead of failing closed for the process lifetime.
+pub type ActionManifestNestedUses = std::sync::Mutex<
+    std::collections::HashMap<(String, String, String), std::collections::BTreeSet<String>>,
+>;
+
+/// Per-run action-resolution ledger: `RunId` → (`owner/repo`, `ref`)
+/// triples this run has already resolved tickets for. Lets the
+/// declared-action allowlist extend transitively: a composite action's
+/// nested `uses:` arrive in later resolution waves, after the parent's
+/// download, and are permitted when a manifest fetched for an already
+/// resolved parent names them. Bounded; a run resolving more distinct
+/// actions than the cap keeps only the most recent.
+pub type ActionResolvedUses =
+    std::sync::Mutex<std::collections::HashMap<RunId, Vec<(String, String)>>>;
+
+/// Maximum (`owner/repo`, `ref`) triples remembered per run in
+/// [`ActionResolvedUses`].
+pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -806,11 +859,19 @@ pub struct AppState {
     /// this (see [`wake_waiters`]); only the sampler listens on it.
     pub sampler_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
-    /// Circuit breaker for durable webhook delivery work. Check-run updates
-    /// go through the sender's per-installation budgets instead, so an
-    /// ingress outage cannot suppress status transitions for runs already in
-    /// progress.
-    pub github_breaker: Arc<crate::github_breaker::GithubBreaker>,
+    /// Circuit breakers for durable webhook delivery work, partitioned by the
+    /// calling credential's rate-limit identity (installation, PAT, App JWT,
+    /// anonymous). Check-run updates resolve their installation's bucket, so
+    /// an ingress outage cannot suppress status transitions for runs already
+    /// in progress, and one throttled credential never parks another's
+    /// traffic.
+    pub github_breakers: Arc<crate::github_breaker::GithubBreakerRegistry>,
+    /// Per-subsystem consumption accounting for outbound GitHub traffic
+    /// (requests, bytes, rate limits, breaker-blocked attempts). Only the
+    /// labeled sender ([`crate::github_breaker::send_observed_labeled`])
+    /// records here; the unlabeled [`crate::github_breaker::send_observed`]
+    /// covers only pre-`AppState` bootstrap reads and records nothing.
+    pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
     pub webhook_status: Arc<crate::webhook_status::WebhookResilienceStatus>,
@@ -819,6 +880,11 @@ pub struct AppState {
     /// constant so tests can drive the retry path without sleeping through the
     /// real tiers.
     pub webhook_retry_backoff: Vec<std::time::Duration>,
+    /// Bounded poll schedule for resolving a pull request's live test-merge
+    /// commit before a GitHub webhook delivery creates pull_request runs.
+    /// State rather than constants so tests drive the poll without sleeping
+    /// through the production budget.
+    pub fresh_merge_poll: crate::github::FreshMergePoll,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -883,9 +949,27 @@ pub struct AppState {
     /// Default 90 follows GitHub; `0` disables the sweep. Resolved from
     /// `retention_days` in the config file, `PRELOOP_RETENTION_DAYS` wins.
     pub retention_days: u64,
-    /// Per-environment protection rules (`[environment_rules]`), loaded at
-    /// startup. Empty by default (no rules).
-    pub environment_rules: crate::config::EnvironmentRulesMap,
+    /// Maximum jobs one run may expand to (after matrix expansion). API
+    /// submits past this are rejected with 400 before the insert
+    /// transaction opens; webhook deliveries bypass it (a push is never
+    /// refused — the namespace quotas behave the same way) and rely on
+    /// chunked inserts to bound their writer hold. Default 500; `0`
+    /// disables the cap. Resolved from `max_jobs_per_run` in the config
+    /// file, `PRELOOP_MAX_JOBS_PER_RUN` wins.
+    pub max_jobs_per_run: u64,
+    /// Maximum age, in seconds, of a diagnostic-log staging directory under
+    /// `<state_dir>/blobs/diag/` before the reaper's age-based sweep deletes
+    /// it. Staging directories whose upload token expired (TTL) or was
+    /// evicted are removed promptly on the next reaper tick regardless of
+    /// this value; the age sweep is the backstop for orphaned directories
+    /// (crash leftovers, pre-fix accumulation). `0` disables the age-based
+    /// sweep. Resolved from `diag_staging_max_age_hours` in the config
+    /// file (default 24), `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins.
+    pub diag_staging_max_age_seconds: u64,
+    /// Environment protection rules resolver: `[environment_rules]` TOML as
+    /// the local fallback, GitHub's environments API when an App (or
+    /// `PRELOOP_GITHUB_TOKEN`) covers the run's repository.
+    pub environment_resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
     /// File-backed live log segments for real-time console tail persistence.
@@ -942,6 +1026,13 @@ pub struct AppState {
     /// cache hit, so the first download after a restart is trusted —
     /// guarded by the engine's TLS fetch like any other download.
     pub action_archive_sha256_pins: Arc<ActionArchiveSha256Pins>,
+    /// Lazily populated composite-action manifest index for the
+    /// declared-action allowlist's transitive closure; see
+    /// [`ActionManifestNestedUses`].
+    pub action_manifest_nested_uses: Arc<ActionManifestNestedUses>,
+    /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
+    /// see [`ActionResolvedUses`].
+    pub action_resolved_uses: Arc<ActionResolvedUses>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1027,21 +1118,6 @@ pub struct SecretStore {
     /// `global` for jobs of that repository whose `environment:` resolves to
     /// that environment.
     pub env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
-    /// Registered environments, keyed by `owner/repo` then environment name.
-    /// A job's `environment:` must be registered for its repository; a job
-    /// claiming any other name fails closed before secrets are injected or
-    /// an OIDC environment subject is minted.
-    pub environments: BTreeMap<String, BTreeSet<String>>,
-}
-
-impl SecretStore {
-    /// Whether `environment:` `env` names a registered environment of
-    /// `repo`. Jobs claiming an unregistered environment fail closed.
-    pub fn is_environment_registered(&self, repo: &str, env: &str) -> bool {
-        self.environments
-            .get(repo)
-            .is_some_and(|envs| envs.contains(env))
-    }
 }
 
 /// Redacting `Debug`: the store holds plaintext secret values, so a single
@@ -1071,7 +1147,6 @@ impl std::fmt::Debug for SecretStore {
             .field("global_names", &self.global.keys().collect::<Vec<_>>())
             .field("repo_names", &repo_names)
             .field("env_names", &env_names)
-            .field("environments", &self.environments)
             .finish()
     }
 }
@@ -1230,13 +1305,31 @@ impl AppState {
     ///
     /// `store_url` takes precedence over the `PRELOOP_STORE_URL` environment
     /// variable; `None` falls back to the environment, then to SQLite at
-    /// `<state_dir>/preloop.db`.
+    /// `<state_dir>/preloop.db`. Test builds skip the environment read: one
+    /// process env shared across parallel tests cannot select a store
+    /// deterministically.
     pub async fn new_with_store(
         state_dir: PathBuf,
         config_path: PathBuf,
         store_url: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let cache = CacheStore::new(state_dir.join("cache")).await?;
+        // Test binaries share one process env: a sibling test mutating
+        // `PRELOOP_STORE_URL` must not silently retarget a state built for a
+        // temp dir, so in test builds `None` means the state-dir default.
+        // (`Backend::open` keeps the production env fallback; the
+        // `PRELOOP_STORE_URL` selection contract is covered through
+        // `test_open_backend`.)
+        #[cfg(any(test, feature = "test-support"))]
+        let store_url = Some(store_url.map_or_else(
+            || format!("sqlite://{}", state_dir.join("preloop.db").display()),
+            str::to_owned,
+        ));
+        // Back to `Option<&str>` so the production call site below is
+        // identical in every build — and `as_deref` never appears where the
+        // parameter is already `Option<&str>` (clippy::needless-option-as-deref).
+        #[cfg(any(test, feature = "test-support"))]
+        let store_url = store_url.as_deref();
+        let mut cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
         let oidc_state_dir = state_dir.clone();
@@ -1348,7 +1441,20 @@ impl AppState {
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
         let checkout_cache = crate::config::checkout_cache_config(&config)?;
+        // Actions-cache quota: operator-overridable, 10 GiB default.
+        // Enforced at startup too, so entries committed under a larger quota
+        // are evicted LRU-first on the next boot.
+        let cache_quota_bytes = crate::config::cache_config(&config)?.total_quota_bytes;
+        cache.set_quota_bytes(cache_quota_bytes);
+        cache.enforce_quota().await?;
+        // In-flight chunked uploads never survive a restart (`pending_caches`
+        // is in-memory only), so staging files left by a crashed server are
+        // debris, not resumable uploads.
+        let _ = tokio::fs::remove_dir_all(state_dir.join("cache-staging")).await;
         let retention_days = crate::config::retention_days(&config)?;
+        let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
+        let diag_staging_max_age_seconds =
+            crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
         let github_apps = crate::github_app::load_from(&config)?;
         let github_app = github_apps
             .as_ref()
@@ -1420,7 +1526,6 @@ impl AppState {
             global: config.secrets,
             repo: config.repo_secrets,
             env: config.env_secrets,
-            environments: config.environments,
         }));
         let secret_provider: Arc<dyn crate::secret_provider::SecretProvider> =
             Arc::new(crate::secret_provider::BuiltinSecretProvider::new(
@@ -1554,9 +1659,11 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
+            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
+            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
+            fresh_merge_poll: crate::github::FreshMergePoll::default(),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),
@@ -1582,7 +1689,11 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
             retention_days,
-            environment_rules: config.environment_rules.clone(),
+            max_jobs_per_run,
+            diag_staging_max_age_seconds,
+            environment_resolver: crate::environment_resolver::EnvironmentResolver::local(
+                config.environment_rules.clone(),
+            ),
             state_dir,
             log_segments,
             system_token,
@@ -1607,6 +1718,10 @@ impl AppState {
             action_archive_sha256_pins: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            action_manifest_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
@@ -2053,6 +2168,24 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
+    /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
+    /// trailing-overlap buffer so a secret split across two appends is
+    /// matched on the reassembled stream, never per-chunk. The per-key mutex
+    /// serializes appends of one log without holding the global state lock
+    /// during the masking scan. Flushed and removed when the job finishes;
+    /// dropping an entry (memory-pressure eviction) discards at most the
+    /// withheld tail from the lossy in-memory preview.
+    ///
+    /// The masker is built from the secret list resolved at the log's first
+    /// append and never reseeded: run secrets are immutable, and the only
+    /// alternative first-append resolution (the negative-cache union) is a
+    /// superset of the real list, so the masker can only over-mask, never
+    /// under-mask.
+    pub log_stream_maskers: BTreeMap<
+        String,
+        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
+    >,
     /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job

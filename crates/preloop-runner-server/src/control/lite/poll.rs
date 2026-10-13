@@ -170,10 +170,14 @@ fn pending_cancellation(
 }
 
 /// `claim_one` (pg dispatch.rs): the ready job this runner should take,
-/// chosen by the shared four-tier preference over the ready queue in
-/// dispatch order. The queue is read in pages until a candidate matches —
-/// a 64-row window must not hide a job a runner can serve. The conditional
-/// UPDATE is the claim fence.
+/// chosen by the shared four-tier preference over the ready queue in the
+/// shared global queue order (`priority DESC, run_order, job_order`, the
+/// `run_id, job_id` tie-breakers last — never the pool key's text order).
+/// The runner's own fresh bindings are read first, wherever they sit in the
+/// queue (the top two tiers); the rest of the queue is read in pages until a
+/// candidate matches — a 64-row window of unassigned jobs must not hide a
+/// job a runner can serve, nor a binding this runner must take before it
+/// expires. The conditional UPDATE is the claim fence.
 fn claim_one(
     tx: &Transaction<'_>,
     runner_id: Option<i64>,
@@ -199,13 +203,20 @@ fn claim_one(
         group_id: caps.runner_group_id,
         group_name: caps.runner_group_name.clone(),
     };
-    // Page the ready queue in dispatch order until a candidate matches or the
-    // ready set is exhausted: a runner whose own pool sorts past the first
-    // batch must still see the jobs it can serve. Jobs whose namespace admits
-    // no new claim (state or running caps) are never candidates; the single
-    // writer makes the read-then-claim exact without a lock.
-    let batch_sql = format!(
-        "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
+    // Page the ready queue in the shared global dispatch order until a
+    // candidate matches or the ready set is exhausted: a 64-row window must
+    // not hide a job a runner can serve. The order is `priority DESC,
+    // run_order, job_order` plus the `run_id, job_id` tie-breakers — the same
+    // queue order pg `claim_one` reads, and the one `ready_jobs`/`queue_stats`
+    // report — never the pool key's text order: the key groups equal label
+    // sets for pruning, it does not rank them, and ranking by it starves
+    // every label set whose key sorts after another's. Jobs whose namespace
+    // admits no new claim (state or running caps) are never candidates; the
+    // single writer makes the read-then-claim exact without a lock.
+    //
+    // The candidate columns both claim reads decode; shared so the assigned-
+    // tier scan and the paged queue scan cannot drift.
+    let columns = "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
          j.enqueued_at, \
          a.runner_id, \
          (a.run_id IS NOT NULL), \
@@ -213,46 +224,69 @@ fn claim_one(
          (a.first_assigned_at IS NOT NULL AND a.first_assigned_at > ?1), \
          (a.runner_id IS NOT NULL AND EXISTS( \
             SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id)), \
-         p.requested_at \
+         p.requested_at";
+    let batch_sql = format!(
+        "{columns} \
          FROM jobs j \
          LEFT JOIN job_assignments a ON a.run_id = j.run_id \
             AND a.job_id = j.job_id \
          LEFT JOIN provision_requests p ON p.run_id = j.run_id \
             AND p.job_id = j.job_id \
-         WHERE j.queue_state = 'ready' AND ({}) \
-         ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+         WHERE j.queue_state = 'ready' AND ({admits}) \
+         ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
          LIMIT 64 OFFSET ?2",
-        crate::control::types::NAMESPACE_ADMITS_CLAIM
+        admits = crate::control::types::NAMESPACE_ADMITS_CLAIM
     );
-    let mut offset: i64 = 0;
-    loop {
-        let rows: Vec<ReadyRow> = {
-            let mut stmt = tx.prepare_cached(&batch_sql).map_err(db)?;
-            let rows = stmt
-                .query_map(params![fresh_after, offset], |row| {
-                    let assigned: Option<i64> = row.get(5)?;
-                    let assignment_exists: bool = row.get(6)?;
-                    let fresh: bool = row.get(7)?;
-                    let first_fresh: bool = row.get(8)?;
-                    let registered: bool = row.get(9)?;
-                    let enqueued: Option<i64> = row.get(4)?;
-                    // Raw `p.requested_at`: NULL marks a non-matching LEFT JOIN
-                    // (no provision row) — `provision_fresh` is tri-state in Rust.
-                    let provision_at: Option<i64> = row.get(10)?;
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
-                        row.get::<_, Option<String>>(3)?,
-                        enqueued.unwrap_or(0),
-                        assignment_exists.then_some((assigned, fresh, first_fresh, registered)),
-                        provision_at,
-                    ))
-                })
-                .map_err(db)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(db)?
-        };
-        let exhausted = rows.len() < 64;
+    // The assigned tier, read before the paged queue: a fresh binding to the
+    // polling runner outranks every unassigned candidate — the four-tier
+    // preference exists to hand THIS runner its bindings before they expire —
+    // but the paged scan sees one window at a time and would take an
+    // unassigned job from the first window. The runner's own bindings are
+    // read in the same global queue order within the tier; enqueue pairing
+    // skips busy runners (any binding or live request), so a runner holds at
+    // most one fresh binding and one page is exhaustive.
+    let assigned_sql = verified_runner_id.map(|_| {
+        format!(
+            "{columns} \
+             FROM jobs j \
+             JOIN job_assignments a ON a.run_id = j.run_id \
+                AND a.job_id = j.job_id \
+             LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                AND p.job_id = j.job_id \
+             WHERE j.queue_state = 'ready' AND ({admits}) \
+               AND a.runner_id = ?2 \
+               AND a.assigned_at IS NOT NULL AND a.assigned_at > ?1 \
+             ORDER BY j.priority DESC, j.run_order, j.job_order, j.run_id, j.job_id \
+             LIMIT 64",
+            admits = crate::control::types::NAMESPACE_ADMITS_CLAIM
+        )
+    });
+    // The row shape both claim reads share: one mapper for the assigned scan
+    // and the paged scan, so the two cannot drift.
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ReadyRow> {
+        let assigned: Option<i64> = row.get(5)?;
+        let assignment_exists: bool = row.get(6)?;
+        let fresh: bool = row.get(7)?;
+        let first_fresh: bool = row.get(8)?;
+        let registered: bool = row.get(9)?;
+        let enqueued: Option<i64> = row.get(4)?;
+        // Raw `p.requested_at`: NULL marks a non-matching LEFT JOIN
+        // (no provision row) — `provision_fresh` is tri-state in Rust.
+        let provision_at: Option<i64> = row.get(10)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+            row.get::<_, Option<String>>(3)?,
+            enqueued.unwrap_or(0),
+            assignment_exists.then_some((assigned, fresh, first_fresh, registered)),
+            provision_at,
+        ))
+    };
+    // Decode a read batch into candidates against the shared eligibility
+    // ladder. `base_position` is the batch's offset in the order it was read:
+    // the paged scan's page offset, 0 for the assigned scan.
+    let decode = |rows: Vec<ReadyRow>, base_position: u64| -> Vec<logic::ClaimCandidate> {
         let mut candidates = Vec::with_capacity(rows.len());
         for (position, (run, job, runs_on, runner_group, enqueued_at, assignment, provision_at)) in
             rows.into_iter().enumerate()
@@ -308,10 +342,65 @@ fn claim_one(
                 runner_group,
                 assigned_runner_id,
                 assignment_fresh,
-                queue_position: position as u64,
+                // Position in the order the batch was read: the paged scan
+                // reports the GLOBAL queue position (the page offset counts),
+                // the assigned scan its own order.
+                queue_position: base_position + position as u64,
                 claimable,
             });
         }
+        candidates
+    };
+    // The claim fence: a conditional UPDATE on the chosen row. `false` means
+    // the row moved under us.
+    let claim = |chosen: &logic::ClaimCandidate| -> Result<bool, ControlError> {
+        let claimed = tx
+            .prepare_cached(
+                "UPDATE jobs SET queue_state = 'claimed', status = 'in_progress', \
+                 claimed_by_runner_id = ?3, claimed_at = ?4 \
+                 WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
+            )
+            .map_err(db)?
+            .execute(params![
+                codec::run_key(chosen.run_id),
+                chosen.job_id.0,
+                runner_id,
+                now_us()
+            ])
+            .map_err(db)?;
+        Ok(claimed > 0)
+    };
+    // The assigned tier first (see `assigned_sql`): the runner's own fresh
+    // bindings, wherever they sit in the global queue.
+    if let (Some(proven), Some(assigned_sql)) = (verified_runner_id, assigned_sql.as_deref()) {
+        let rows: Vec<ReadyRow> = {
+            let mut stmt = tx.prepare_cached(assigned_sql).map_err(db)?;
+            let rows = stmt
+                .query_map(params![fresh_after, proven], map_row)
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+        };
+        let mut candidates = decode(rows, 0);
+        while let Some(index) =
+            logic::claim_preference(&candidates, Some(proven), &caps.labels, None, &runner_match)
+        {
+            let chosen = candidates.swap_remove(index);
+            if claim(&chosen)? {
+                return Ok(Some((chosen.run_id, chosen.job_id)));
+            }
+        }
+    }
+    let mut offset: i64 = 0;
+    loop {
+        let rows: Vec<ReadyRow> = {
+            let mut stmt = tx.prepare_cached(&batch_sql).map_err(db)?;
+            let rows = stmt
+                .query_map(params![fresh_after, offset], map_row)
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+        };
+        let exhausted = rows.len() < 64;
+        let mut candidates = decode(rows, offset as u64);
         // `assigned_to_this_runner` keys off the proven runner id: an
         // unverified session cannot satisfy an assignment binding even by
         // name.
@@ -329,21 +418,7 @@ fn claim_one(
             continue;
         };
         let chosen = candidates.swap_remove(index);
-        let claimed = tx
-            .prepare_cached(
-                "UPDATE jobs SET queue_state = 'claimed', status = 'in_progress', \
-                 claimed_by_runner_id = ?3, claimed_at = ?4 \
-                 WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
-            )
-            .map_err(db)?
-            .execute(params![
-                codec::run_key(chosen.run_id),
-                chosen.job_id.0,
-                runner_id,
-                now_us()
-            ])
-            .map_err(db)?;
-        if claimed == 0 {
+        if !claim(&chosen)? {
             return Ok(None);
         }
         return Ok(Some((chosen.run_id, chosen.job_id)));

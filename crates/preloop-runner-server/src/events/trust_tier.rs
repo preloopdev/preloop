@@ -39,7 +39,10 @@ pub enum TrustTier {
     Deployment,
     /// Fired by the internal schedule executor.
     Schedule,
-    /// Fired by any other webhook event with unknown trust.
+    /// Fired by a webhook event with no trust rule of its own: the
+    /// fail-closed default. Every supported adapter classifies its events,
+    /// so this tier now only appears on runs persisted before their event
+    /// was classified (and on any future adapter that forgets to).
     Untrusted,
 }
 
@@ -62,15 +65,13 @@ impl TrustTier {
     /// Returns true if the server may inject repository secrets for this tier.
     /// `submit_run_inner` applies this policy before a job message is built.
     pub fn allows_secrets(&self) -> bool {
-        !matches!(
-            self,
-            TrustTier::UntrustedForkPullRequest | TrustTier::Untrusted
-        )
+        !self.is_fork_restricted()
     }
 
     /// Returns true if the tier runs code that GitHub would run with its
-    /// restricted fork profile: a `pull_request` from a fork, or a fail-closed
-    /// unknown event.
+    /// restricted fork profile: a `pull_request` from a fork, or the
+    /// fail-closed `Untrusted` default (a webhook event whose adapter never
+    /// classified it).
     ///
     /// GitHub gives these jobs a read-only `GITHUB_TOKEN` *regardless* of the
     /// workflow's declared `permissions:` block ("Pull requests from public
@@ -132,15 +133,15 @@ pub struct JobAuthorization {
 
 /// Resolve a submission's trust tier.
 ///
-/// Native submissions carry no tier (`None` is therefore trusted); a tier
-/// that fails to parse is treated the same way, matching the pre-existing
-/// secret policy. The webhook dispatcher is the only producer of tier
-/// strings and always writes a serialized [`TrustTier`].
+/// Native submissions carry no tier (`None` is therefore trusted); a present
+/// tier that fails to parse is treated as [`TrustTier::Untrusted`]. The webhook
+/// dispatcher is the only producer of tier strings and always writes a
+/// serialized [`TrustTier`].
 pub fn tier_of(submission: &preloop_gha_protocol::WorkflowSubmission) -> Option<TrustTier> {
-    submission
-        .trust_tier
-        .as_deref()
-        .and_then(|value| serde_json::from_value::<TrustTier>(serde_json::json!(value)).ok())
+    submission.trust_tier.as_deref().map(|value| {
+        serde_json::from_value::<TrustTier>(serde_json::json!(value))
+            .unwrap_or(TrustTier::Untrusted)
+    })
 }
 
 /// Whether the job a results/cache request authenticates as is
@@ -183,10 +184,8 @@ pub async fn fork_restricted_from_token(
             // the missing record widens the denial rather than the access.
             json.map(|json| {
                 serde_json::from_str::<preloop_gha_protocol::WorkflowSubmission>(&json)
-                    // A submission without a tier field is a native
-                    // (trusted) submission and stays allowed; `tier_of`'s
-                    // parse-failure-is-trusted convention matches the secret
-                    // policy.
+                    // Missing tier is a native (trusted) submission; an
+                    // unrecognized present tier maps to Untrusted.
                     .map(|submission| {
                         tier_of(&submission).is_some_and(|tier| tier.is_fork_restricted())
                     })
@@ -293,6 +292,23 @@ mod tests {
             .iter()
             .map(|(scope, level)| (scope.to_string(), level.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn malformed_present_tier_fails_closed_but_missing_tier_stays_trusted() {
+        let malformed = preloop_gha_protocol::WorkflowSubmission {
+            trust_tier: Some("future-tier".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(tier_of(&malformed), Some(TrustTier::Untrusted));
+
+        let native = preloop_gha_protocol::WorkflowSubmission::default();
+        assert_eq!(tier_of(&native), None);
+
+        let policy = job_authorization(tier_of(&malformed), None, true);
+        assert!(!policy.allows_secrets);
+        assert!(!policy.id_token_granted);
+        assert!(policy.fork_restricted);
     }
 
     #[test]

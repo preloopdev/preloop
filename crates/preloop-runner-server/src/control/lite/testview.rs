@@ -15,6 +15,7 @@ use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{
     ExecutionStatus, JobId, RegisteredRunner, RunId, RunnerSession, SessionId, azdo,
 };
+use rusqlite::OptionalExtension;
 use std::collections::{BTreeMap, BTreeSet};
 use steps::{STEP_COLUMNS, step_row};
 
@@ -1003,6 +1004,19 @@ impl TestDb<'_> {
     /// cover.
     pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize> {
         self.0.execute(sql, params)
+    }
+
+    /// `EXPLAIN QUERY PLAN` detail lines for one statement, so index tests
+    /// can assert which access path (and whether a sort) the planner picks.
+    pub fn query_plan(&self, sql: &str) -> Vec<String> {
+        let mut stmt = self
+            .0
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare EXPLAIN QUERY PLAN");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("run EXPLAIN QUERY PLAN");
+        rows.map(|row| row.expect("plan row")).collect()
     }
 
     /// `job_assignments` staleness: `assigned_at`/`first_assigned_at`.

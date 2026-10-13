@@ -16,5 +16,69 @@
 #
 # Flat `key = "value"` lines like versions.toml, so the same readers apply
 # (orchestrator build.rs codegen, workflow awk, Renovate regex managers).
+#
+# Two classes of keys live here, and they mean different things:
+# - `official_runner_image_base_*`: the image pins. A change means "rebuild the
+#   goldens" — `official-golden.yml` diffs exactly these keys and bakes only
+#   when they move.
+# - `golden_*`: launch-time runtime expectations (process limits, sysctls, the
+#   hostname contract, the step-env contract). Nothing bakes them: the engine
+#   applies them per guest and per launch, `build.rs` compiles them into the
+#   orchestrator, `fixtures/hosted-runtime-probe.sh` asserts them, and
+#   `golden-runtime-drift.yml` keeps them honest against real hosted runners.
+#   Changing them must not start a golden rebuild.
 official_runner_image_base_amd64 = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795"
 official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:3884ef2266edee7ae2da8f70f54faba5340238e68ede5274d0e90fdec80faf9e"
+
+# ── Golden runtime values (the single source of truth) ──────────────────
+#
+# What a job running in a golden sees on a real GitHub-hosted runner, read
+# back from a probe of `ubuntu-24.04` and `ubuntu-24.04-arm` (image
+# 20260927.320.1 / 20260927.135.1, kernel 6.17.0-1022-azure). Everything
+# that has to match derives from these keys: the orchestrator's guest init
+# and launch wrappers (build.rs codegen -> constants), the parity fixture,
+# the CI job that runs the fixture's probe inside a real guest, and the
+# scheduled drift job that re-probes GitHub and opens a bump PR when one of
+# them moves.
+#
+# Provenance in actions/runner-images: `configure-limits.sh` writes
+# `DefaultLimitSTACK=16M:infinity`, `DefaultLimitNOFILE=65536` and the
+# `* soft/hard stack|nofile` lines into the image; `configure-environment.sh`
+# appends the three sysctls to /etc/sysctl.conf.
+golden_rlimit_stack_soft_kib = "16384"
+golden_rlimit_stack_hard = "unlimited"
+golden_rlimit_nofile_soft = "65536"
+golden_rlimit_nofile_hard = "65536"
+golden_sysctl_vm_max_map_count = "262144"
+golden_sysctl_fs_inotify_max_user_watches = "655360"
+golden_sysctl_fs_inotify_max_user_instances = "1280"
+# The machine's own name must resolve to an address the machine owns
+# (loopback or a local-interface address), the way a hosted runner's does.
+golden_hostname_resolves_locally = "true"
+# Environment keys a hosted step's environment does not carry: the terminal
+# identity, which the guest's exec channel would otherwise leak into steps.
+golden_step_env_unset = "TERM,COLORTERM"
+# The composed forms the code and the launch scripts use, so no shell text and
+# no prlimit value is a literal in the init: each line must agree with the
+# primitive keys above (the unit test `guest_runtime_values_come_from_official_image_toml`
+# fails if they drift).
+#
+# Two classes: the strict forms fail the launch (`|| exit 1`) when a raise they
+# ran for fails, so a workload never comes up on limits it was not meant to
+# have, and the `*_best_effort` forms are for the launches that keep the exec
+# channel's identity, where raising a hard limit needs root and the launch
+# must still start — those keep what they inherited and say so on stderr.
+#
+# The nofile raise is order-independent: hard first (refused and ignored when
+# the inherited hard is above the target and the kernel rejects lowering it
+# under a higher soft), soft second, hard again to pin it — so an inherited
+# 1024/4096 and an inherited 1048576/1048576 both end at 65536/65536, where a
+# soft-before-hard raise left the AgentENV exec channel at soft 1024 / hard
+# 65536 (the soft raise hit EPERM above the old hard and was swallowed).
+golden_stack_ulimit_raise = "ulimit -Hs unlimited || exit 1; ulimit -Ss 16384 || exit 1"
+golden_stack_ulimit_raise_best_effort = "ulimit -Hs unlimited 2>/dev/null || true; ulimit -Ss 16384 2>/dev/null || echo preloop: RLIMIT_STACK stays $(ulimit -Ss)KiB soft / $(ulimit -Hs) hard - raising it needs root and this launch keeps the exec channel identity >&2"
+golden_nofile_ulimit_raise = "ulimit -Hn 65536 2>/dev/null || true; ulimit -Sn 65536 || exit 1; ulimit -Hn 65536 || exit 1"
+golden_nofile_ulimit_raise_best_effort = "ulimit -Hn 65536 2>/dev/null; ulimit -Sn 65536 2>/dev/null || true; ulimit -Hn 65536 2>/dev/null || echo preloop: RLIMIT_NOFILE hard limit stays $(ulimit -Hn) - raising it needs root and this launch keeps the exec channel identity >&2"
+golden_stack_soft_bytes = "16777216"
+golden_stack_prlimit = "16777216:unlimited"
+golden_nofile_prlimit = "65536:65536"
