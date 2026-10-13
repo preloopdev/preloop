@@ -17,7 +17,7 @@ const KEY: &[u8] = b"legacy-import-test-key-32-bytes!";
 #[derive(Debug)]
 struct Imported {
     _dir: tempfile::TempDir,
-    source: PathBuf,
+    _source: PathBuf,
     target: PathBuf,
     state_dir: PathBuf,
     report: ImportReport,
@@ -40,7 +40,7 @@ fn import(spec: &LegacyFixtureSpec, policy: ActivePolicy, key: &[u8]) -> anyhow:
     let _ = fixture;
     Ok(Imported {
         _dir: dir,
-        source,
+        _source: source,
         target,
         state_dir,
         report,

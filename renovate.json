@@ -6,7 +6,89 @@
   ],
   "minimumReleaseAge": "7 days",
   "dependencyDashboard": true,
+  "dependencyDashboardApproval": false,
+  "timezone": "America/New_York",
+  "schedule": [
+    "* 7 * * 1"
+  ],
+  "updateNotScheduled": false,
   "packageRules": [
+    {
+      "description": "Batch 1: every non-breaking update (minor, patch, digest, pin) in one PR. Gated deps keep their own rules below.",
+      "matchDepNames": [
+        "!actions/runner",
+        "!smol-machines/smolvm",
+        "!node20",
+        "!node24"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "non-breaking dependencies"
+    },
+    {
+      "description": "Batch 2: breaking updates in one PR, reviewed on their own. Majors, plus 0.x minor bumps, which Cargo treats as breaking.",
+      "matchDepNames": [
+        "!actions/runner",
+        "!smol-machines/smolvm",
+        "!node20",
+        "!node24"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": "breaking dependencies"
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "matchCurrentVersion": "/^0\\./",
+      "groupName": "breaking dependencies",
+      "groupSlug": "major-breaking-dependencies"
+    },
+    {
+      "description": "Batch 3: Rust toolchain alone, so a compiler change never hides inside a dependency failure.",
+      "matchDepNames": [
+        "rust"
+      ],
+      "groupName": "rust toolchain"
+    },
+    {
+      "description": "Batch 4: crypto and TLS crates alone, whatever the update type, so their API changes get dedicated review.",
+      "matchPackageNames": [
+        "aes",
+        "cbc",
+        "cipher",
+        "hkdf",
+        "hmac",
+        "rsa",
+        "sha1",
+        "sha2",
+        "rcgen",
+        "rustls",
+        "rustls-native-certs",
+        "tokio-rustls",
+        "x509-parser"
+      ],
+      "groupName": "crypto crates",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Frozen inputs, not dependencies: upstream workflow fixtures pin old versions on purpose, and benchmarks pin images and crates so past results stay comparable.",
+      "matchFileNames": [
+        "fixtures/upstream-workflows/**",
+        "benchmarks/**"
+      ],
+      "enabled": false
+    },
     {
       "matchDatasources": [
         "github-releases"

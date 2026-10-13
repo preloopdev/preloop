@@ -2106,13 +2106,12 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
 
     let token = request_json(
@@ -2190,12 +2189,11 @@ async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
     let alternate_scope_token = state
         .local_jwt(json!({
@@ -2279,13 +2277,12 @@ async fn oidc_default_audience_is_owner_url() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
 
     let token = request_json(
@@ -2316,13 +2313,12 @@ async fn oidc_forbidden_without_id_token_write() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
     let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
 

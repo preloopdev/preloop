@@ -1284,11 +1284,10 @@ jobs:
 // dimension at all.
 // ---------------------------------------------------------------------------
 
-/// Secrets must come back as themselves. `SecretString::Serialize` emits the
-/// literal `"<redacted>"`, so any persistence path that does not go through
-/// `WorkflowSubmission::to_request_json` silently substitutes the redaction
-/// marker for every secret and the resumed run authenticates with garbage.
-
+// Secrets must come back as themselves. `SecretString::Serialize` emits the
+// literal `"<redacted>"`, so any persistence path that does not go through
+// `WorkflowSubmission::to_request_json` silently substitutes the redaction
+// marker for every secret and the resumed run authenticates with garbage.
 // ---------------------------------------------------------------------------
 // Durable-store restart contracts.
 //
@@ -1458,7 +1457,7 @@ async fn postgres_concurrent_open_serializes_migrations() {
 
 /// Postgres twin of `store_recovery_preserves_run_secrets`. The redaction bug
 /// lived in the shared serialization path, so both backends have to prove it.
-
+///
 /// Postgres twin of `store_recovery_preserves_run_secrets`: values survive a
 /// restart in the provider's run tier, never in the shared database.
 #[tokio::test]
@@ -1509,13 +1508,12 @@ async fn postgres_recovery_preserves_run_secrets() {
 // Regression tests for the cubic.dev review blockers on PR #27.
 // ---------------------------------------------------------------------------
 
-/// Restart while a reusable-caller node is parked (its concurrency gate is
-/// held by an earlier run) must keep the caller plan and the expansion-only
-/// fields (`github`, `head_sha`, `workflow_ref`) that the scheduler needs to
-/// materialize the callee subtree later. They were `#[serde(skip)]` on
-/// `RunRecord`, so a restart reset them to defaults and the deferred
-/// expansion failed or misbuilt.
-
+// Restart while a reusable-caller node is parked (its concurrency gate is
+// held by an earlier run) must keep the caller plan and the expansion-only
+// fields (`github`, `head_sha`, `workflow_ref`) that the scheduler needs to
+// materialize the callee subtree later. They were `#[serde(skip)]` on
+// `RunRecord`, so a restart reset them to defaults and the deferred
+// expansion failed or misbuilt.
 // ---------------------------------------------------------------------------
 // Regression tests for the cubic.dev review blockers on PR #27.
 // ---------------------------------------------------------------------------

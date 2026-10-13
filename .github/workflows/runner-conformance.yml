@@ -25,7 +25,7 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # Conformance goldens are LFS-tracked; without this they arrive
           # as pointer stubs and every test that reads them fails.
@@ -51,7 +51,7 @@ jobs:
       GH_TOKEN: ${{ secrets.RUNNER_CONFORMANCE_TOKEN }}
       PRELOOP_RUNNER_HOST: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/preloop-runner
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
           # Same as the light job: the deep batch replays live runners, not the
