@@ -44,7 +44,7 @@ missing_docs = "warn"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 hyper = "1.0"
 hyper-util = { version = "0.1", features = ["full"] }
