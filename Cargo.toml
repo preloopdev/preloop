@@ -65,7 +65,7 @@ rand = "0.8"
 # `arch` must name the job `build (ubuntu-latest, x64)`. Sorted keys silently
 # reorder every dynamic-matrix job id.
 serde_json = { version = "1.0", features = ["preserve_order"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-postgres = "0.7"
 refinery = { version = "0.10.0", default-features = false, features = ["rusqlite", "tokio-postgres"] }
 postgres_rustls = "0.1"
