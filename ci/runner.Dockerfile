@@ -1,7 +1,7 @@
 # Minimal preloop-runner image: the runner binary plus the tools a job needs
 # to do anything useful (git for checkouts, curl, certs). Node externals are
 # fetched by `preloop-runner configure` unless --no-externals is passed.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG TARGETARCH
 RUN apt-get update -qq \
