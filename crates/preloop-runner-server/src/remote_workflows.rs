@@ -56,7 +56,7 @@ pub async fn resolve_remote_workflows(
             let Some(reference) = job.uses.as_deref() else {
                 continue;
             };
-            if reference.starts_with("./") {
+            if reference.starts_with("./") || reference.starts_with("$/") {
                 continue;
             };
             if let Some(contents) = submission.reusable_workflows.get(reference).cloned() {

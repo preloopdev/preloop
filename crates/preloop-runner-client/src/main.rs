@@ -428,7 +428,10 @@ async fn resolve_remote_workflows(
             let Some(reference) = job.uses.as_deref() else {
                 continue;
             };
-            if reference.starts_with("./") || workflows.contains_key(reference) {
+            if reference.starts_with("./")
+                || reference.starts_with("$/")
+                || workflows.contains_key(reference)
+            {
                 continue;
             }
             let Some((owner, repo, path, git_ref)) = parse_remote_reference(reference) else {
@@ -589,5 +592,34 @@ mod tests {
             workflows["octo/hello/.github/workflows/reusable.yml@main"],
             WORKFLOW
         );
+    }
+
+    /// `uses: $/...` names the submitting repository. The gate must leave it
+    /// to local expansion instead of parsing it as `owner/repo/path@ref` and
+    /// fetching it from the forge. The API base is a closed port, so any
+    /// remote request fails the test.
+    #[tokio::test]
+    async fn resolve_remote_workflows_keeps_self_repository_refs_local() {
+        const WORKFLOW: &str = "on: workflow_call\njobs:\n  inner:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
+        let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/reusable.yml\n";
+        let workflows = BTreeMap::from([(
+            ".github/workflows/reusable.yml".to_owned(),
+            WORKFLOW.to_owned(),
+        )]);
+        let client = reqwest::Client::new();
+        let resolved = with_test_env(
+            &[("PRELOOP_GITHUB_API_URL", Some("http://127.0.0.1:1".to_owned()))],
+            resolve_remote_workflows(workflows.clone(), root, &client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, workflows);
+
+        let parsed = preloop_gha_parser::parse_workflow(root).unwrap();
+        let expanded = preloop_gha_parser::expand_jobs_with_reusables(&parsed, &resolved).unwrap();
+        assert_eq!(expanded.jobs.len(), 1);
+        assert_eq!(expanded.jobs[0].id.0, "call");
+        let call = expanded.jobs[0].reusable_call.as_ref().expect("reusable call");
+        assert_eq!(call.workflow_file, ".github/workflows/reusable.yml");
     }
 }

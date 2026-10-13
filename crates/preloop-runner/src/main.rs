@@ -140,7 +140,10 @@ async fn resolve_remote_workflows(
             let Some(reference) = job.uses.as_deref() else {
                 continue;
             };
-            if reference.starts_with("./") || workflows.contains_key(reference) {
+            if reference.starts_with("./")
+                || reference.starts_with("$/")
+                || workflows.contains_key(reference)
+            {
                 continue;
             }
             let Some((owner, repo, path, git_ref)) = parse_remote_reference(reference) else {

@@ -80,6 +80,13 @@ Releases before v0.27.0 predate the changelog.
 ### Fixed
 
 - **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
+
+- **Reusable workflows called as `uses: $/...` resolve** (#581): the runner
+  client, the `preloop-runner` resolver, and the server's remote-workflow
+  resolver treated `$/` as a remote `owner/repo/path@ref` reference and
+  rejected it as unsupported. `$/` names the submitted repository, so it now
+  resolves against the workspace's `.github/workflows/` tree the way `./`
+  does, with no forge fetch.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
