@@ -80,7 +80,7 @@ tempfile = "3.10"
 libc = "0.2"
 hex = "0.4"
 parking_lot = "0.12"
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "io-std", "process"] }
 tokio-util = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
