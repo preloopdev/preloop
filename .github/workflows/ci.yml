@@ -47,7 +47,7 @@ jobs:
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           components: rustfmt,clippy
       - name: Select Rust toolchain binaries
         run: |
@@ -151,7 +151,7 @@ jobs:
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           components: rustfmt,clippy
       - name: Select Rust toolchain binaries
         run: |
@@ -295,7 +295,7 @@ jobs:
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
       - name: Select Rust toolchain binaries
         run: |
           toolchain_bin="$(dirname "$(rustup which rustc)")"
@@ -419,7 +419,7 @@ jobs:
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
       - name: Select Rust toolchain binaries
         run: |
           toolchain_bin="$(dirname "$(rustup which rustc)")"

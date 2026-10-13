@@ -46,7 +46,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           targets: ${{ matrix.triple }}
 
       - name: Set up Zig cross toolchain
@@ -131,7 +131,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
       - name: Set up Zig cross toolchain
