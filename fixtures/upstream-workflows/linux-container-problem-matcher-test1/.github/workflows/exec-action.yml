@@ -10,7 +10,7 @@ jobs:
     container: ${{matrix.image}}
     runs-on: self-hosted
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - if: matrix.image != ''
       run: |
         echo GITHUB_WORKSPACE: $GITHUB_WORKSPACE && echo ::add-matcher::$GITHUB_WORKSPACE/problem.json && echo ::add-matcher::problem.json

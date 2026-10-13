@@ -11,7 +11,7 @@ jobs:
           test: 0
     runs-on: self-hosted
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - run: echo '${{tojson(matrix)}}'
     - run: exit ${{ strategy.job-index == 0 && strategy.job-total == 1 && matrix.test == 0 && matrix.hello == 'b' && '0' || '1'}}
   testb:
@@ -33,6 +33,6 @@ jobs:
           ok: false
     runs-on: self-hosted
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - run: echo '${{tojson(matrix)}}'
     - run: exit ${{ strategy.job-index == 0 && strategy.job-total == 1 && matrix.hello.misc == 'val2' && matrix.hello.mkd == 'key3' && !matrix.ok && '0' || '1'}}
