@@ -21,6 +21,7 @@ pub mod fork_policy;
 pub mod github;
 pub mod github_app;
 pub mod github_breaker;
+pub mod github_etag;
 pub mod github_pr;
 pub mod github_push;
 pub mod scheduler;

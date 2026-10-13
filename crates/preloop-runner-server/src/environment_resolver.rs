@@ -575,7 +575,8 @@ async fn environment_token(
 ///
 /// Goes through the shared GitHub breaker with the `env` accounting label,
 /// so environment fetches stop hammering a rate-limited GitHub instead of
-/// each reaper tick discovering the 429 on its own.
+/// each reaper tick discovering the 429 on its own. Revalidates against the
+/// shared ETag cache, so rules unchanged since the last fetch cost a free `304`.
 async fn github_get(
     shared: &crate::state::SharedState,
     api_base: &str,
@@ -583,10 +584,11 @@ async fn github_get(
     bucket: crate::github_breaker::GithubCredentialBucket,
     path: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let res = crate::github_breaker::send_observed_labeled(
+    let res = crate::github_etag::send_conditional_get(
+        &shared.state.github_etags,
         &shared.state.github_breakers,
-        bucket,
         &shared.state.github_consumption,
+        bucket,
         crate::github_breaker::GithubSubsystem::Env,
         crate::shared_http::CLIENT
             .get(format!("{api_base}{path}"))
@@ -596,19 +598,15 @@ async fn github_get(
             .header("X-GitHub-Api-Version", "2026-03-10"),
     )
     .await?;
-    shared
-        .state
-        .github_consumption
-        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Env, &res);
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
+    if res.status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
+    if !res.is_success() {
+        let status = res.status;
+        let body = String::from_utf8_lossy(&res.body);
         anyhow::bail!("GET {path} failed with status {status}: {body}");
     }
-    Ok(Some(res.json().await?))
+    Ok(Some(serde_json::from_slice(&res.body)?))
 }
 
 /// Whether the credential can read this repository's Actions surface —

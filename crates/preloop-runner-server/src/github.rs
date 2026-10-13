@@ -422,19 +422,29 @@ fn check_run_external_id(update: &crate::control::types::CheckRunUpdate) -> Stri
 }
 
 /// Find the check run this queue row already created on `sha`, by its
-/// `external_id`. Pages through every check run on the commit (100 per page,
-/// bounded) rather than trusting GitHub's default first page of 30, and asks
-/// for `filter=all` so a newer same-named check cannot hide ours.
+/// `external_id`.
+///
+/// `check_name` (the name the sender POSTs) and `app_id` (the App whose
+/// installation token created it; `None` under the PAT) are server-side
+/// filters, so the usual listing is one small page. The client-side
+/// `external_id` and `head_sha` match stays the authority: a filter GitHub
+/// ignores still pages through the commit (100 per page, bounded), and
+/// `filter=all` keeps a superseded same-named check from hiding ours.
 async fn find_existing_check_run(
     shared: &Arc<SharedState>,
     bucket: crate::github_breaker::GithubCredentialBucket,
     token: &str,
     repo: &str,
     sha: &str,
+    check_name: &str,
+    app_id: Option<u64>,
     external_id: &str,
 ) -> anyhow::Result<Option<u64>> {
     const PER_PAGE: u64 = 100;
     const MAX_PAGES: u64 = 10;
+    let encoded_name =
+        percent_encoding::utf8_percent_encode(check_name, percent_encoding::NON_ALPHANUMERIC);
+    let app_filter = app_id.map(|id| format!("&app_id={id}")).unwrap_or_default();
     for page in 1..=MAX_PAGES {
         let payload = match send_github_check_request(
             shared,
@@ -442,7 +452,9 @@ async fn find_existing_check_run(
             token,
             repo,
             reqwest::Method::GET,
-            &format!("commits/{sha}/check-runs?filter=all&per_page={PER_PAGE}&page={page}"),
+            &format!(
+                "commits/{sha}/check-runs?filter=all&per_page={PER_PAGE}&page={page}&check_name={encoded_name}{app_filter}"
+            ),
             &Value::Null,
         )
         .await
@@ -474,6 +486,17 @@ async fn find_existing_check_run(
         }
     }
     Ok(None)
+}
+
+/// The App id a check-run lookup filters on: the App whose installation
+/// token `token` is. `None` for the static PAT, whose checks carry no App.
+async fn check_run_app_id(shared: &Arc<SharedState>, repo: &str, token: &str) -> Option<u64> {
+    if shared.state.static_github_pat().as_deref() == Some(token) {
+        return None;
+    }
+    crate::github_app::select_app_for_repo(shared, repo)
+        .await
+        .and_then(|app| app.app_id.parse::<u64>().ok())
 }
 
 /// Per-installation rate budget key.
@@ -847,8 +870,10 @@ async fn send_queued_check_run(
         // already created (matched by its `external_id`), never a same-named
         // check from another workflow or app.
         let external_id = check_run_external_id(update);
+        let app_id = check_run_app_id(shared, repo, token).await;
         check_run_id =
-            find_existing_check_run(shared, bucket, token, repo, sha, &external_id).await?;
+            find_existing_check_run(shared, bucket, token, repo, sha, name, app_id, &external_id)
+                .await?;
         if let Some(id) = check_run_id {
             persist_check_run_id(shared, owner, update, id).await?;
         }
@@ -1127,9 +1152,19 @@ async fn send_check_run_body(
             Some(id) => id,
             None => {
                 let external_id = check_run_external_id(update);
-                find_existing_check_run(shared, bucket, token, repo, sha, &external_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?
+                let app_id = check_run_app_id(shared, repo, token).await;
+                find_existing_check_run(
+                    shared,
+                    bucket,
+                    token,
+                    repo,
+                    sha,
+                    name,
+                    app_id,
+                    &external_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("GitHub check-run POST returned no id"))?
             }
         };
         persist_check_run_id(shared, owner, update, id).await?;
@@ -2093,10 +2128,11 @@ pub async fn resolve_ref_sha(
         .strip_prefix("refs/heads/")
         .or_else(|| git_ref.strip_prefix("refs/tags/"))
         .unwrap_or(git_ref);
-    let response = crate::github_breaker::send_observed_labeled(
+    let response = crate::github_etag::send_conditional_get(
+        &shared.state.github_etags,
         &shared.state.github_breakers,
-        bucket,
         &shared.state.github_consumption,
+        bucket,
         crate::github_breaker::GithubSubsystem::Workflows,
         crate::shared_http::CLIENT
             .clone()
@@ -2108,10 +2144,10 @@ pub async fn resolve_ref_sha(
             .header("Accept", "application/vnd.github+json"),
     )
     .await?;
-    if !response.status().is_success() {
+    if !response.is_success() {
         return Ok(None);
     }
-    let commit: Value = response.json().await?;
+    let commit: Value = serde_json::from_slice(&response.body)?;
     Ok(commit.get("sha").and_then(Value::as_str).map(str::to_owned))
 }
 
@@ -2192,10 +2228,11 @@ async fn fetch_branch_protected(
     // *different* branch's protection. Encode the name as one path segment, the
     // way the action-tarball URLs already do.
     let encoded = crate::actions::percent_encode_path_segment(branch);
-    let response = crate::github_breaker::send_observed_labeled(
+    let response = crate::github_etag::send_conditional_get(
+        &shared.state.github_etags,
         &shared.state.github_breakers,
-        bucket,
         &shared.state.github_consumption,
+        bucket,
         crate::github_breaker::GithubSubsystem::RefResolve,
         crate::shared_http::CLIENT
             .clone()
@@ -2205,14 +2242,14 @@ async fn fetch_branch_protected(
             .header("Accept", "application/vnd.github+json"),
     )
     .await?;
-    let status = response.status();
+    let status = response.status;
     if status == StatusCode::NOT_FOUND {
         return Ok(false);
     }
-    if !status.is_success() {
+    if !response.is_success() {
         anyhow::bail!("GitHub returned {status} for branch {branch:?}");
     }
-    let body: Value = response.json().await?;
+    let body: Value = serde_json::from_slice(&response.body)?;
     // The answer must be about the branch that was asked for: a server (or
     // intermediary) that folds or drops part of the encoded name — or resolves
     // it to another ref — would otherwise lend that branch's protection to
@@ -7928,7 +7965,12 @@ jobs:
             let handler = handler.clone();
             async move {
                 let method = request.method().to_string();
-                let path = request.uri().path().to_owned();
+                // The query string is recorded too, so tests can assert the
+                // filters a lookup sends.
+                let path = request
+                    .uri()
+                    .path_and_query()
+                    .map_or_else(String::new, |found| found.as_str().to_owned());
                 let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
                     .await
                     .unwrap_or_default();
@@ -8213,6 +8255,17 @@ jobs:
         assert_eq!(writes.len(), 1, "one write only: {writes:?}");
         assert_eq!(writes[0].0, "PATCH");
         assert!(writes[0].1.ends_with("/check-runs/7001"));
+        // Reconciliation names the check it wants. Under the PAT there is no
+        // App filter: the PAT's checks are not App-attributed.
+        let lookups: Vec<String> = requests
+            .lock()
+            .iter()
+            .filter(|(method, path, _)| method == "GET" && path.contains("/commits/"))
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(lookups.len(), 1, "one reconciliation lookup: {lookups:?}");
+        assert!(lookups[0].contains("check_name=build"), "{lookups:?}");
+        assert!(!lookups[0].contains("app_id="), "{lookups:?}");
         assert_eq!(
             shared
                 .state
@@ -8239,7 +8292,9 @@ jobs:
             .lock()
             .iter()
             .skip(before)
-            .filter(|(method, _, _)| method == "POST" || method == "PATCH")
+            .filter(|(method, path, _)| {
+                (method == "POST" || method == "PATCH") && path.contains("/check-runs")
+            })
             .cloned()
             .collect();
         assert_eq!(writes.len(), 1);
@@ -8250,9 +8305,120 @@ jobs:
                 .lock()
                 .iter()
                 .skip(before)
-                .any(|(method, _, _)| method == "POST"),
+                .any(|(method, path, _)| method == "POST" && path.contains("/check-runs")),
             "no duplicate POST"
         );
+    }
+
+    /// (i) under an App installation token the lookup also filters on that
+    /// App's id, so a same-named check from another app cannot be adopted.
+    #[tokio::test]
+    async fn app_token_lookup_is_filtered_to_its_app() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let own_external_id = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let stub_external_id = own_external_id.clone();
+        let (api, requests) = start_github_stub(move |method, path, _body| {
+            if path.contains("/access_tokens") {
+                return (
+                    201,
+                    vec![],
+                    serde_json::json!({"token": "ghs-app", "expires_at": "2099-01-01T00:00:00Z"}),
+                );
+            }
+            if method == "GET" && path.starts_with("/app/installations/") {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"account": {"login": "owner"}}),
+                );
+            }
+            if method == "GET" && path.contains("commits/") {
+                let existing = serde_json::json!({"total_count": 1, "check_runs": [{
+                    "id": 9001,
+                    "name": "build",
+                    "external_id": *stub_external_id.lock(),
+                    "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                }]});
+                return (200, vec![], existing);
+            }
+            (200, vec![], serde_json::json!({"id": 9001}))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        // A PAT is configured as well: the App token must be the one in use.
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let mut app = crate::github_app::GitHubAppCredentials::for_tests(
+            "424",
+            key,
+            crate::github_app::MintFailurePolicy::LocalJwt,
+        );
+        app.installation_id = Some(101);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![app.clone()],
+            default_index: 0,
+        });
+        state.github_app = Some(app);
+        let shared = state.shared();
+        let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let submission = WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n".to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            sha: sha.to_owned(),
+            resolved_sha: Some(sha.to_owned()),
+            ..Default::default()
+        };
+        let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
+        shared
+            .state
+            .backend
+            .set_reports_check_runs(accepted.run_id, true)
+            .await
+            .unwrap();
+        *own_external_id.lock() = format!("{}:build", accepted.run_id);
+        shared
+            .state
+            .backend
+            .enqueue_check_run_update(crate::control::types::CheckRunUpdateInput {
+                run_id: accepted.run_id,
+                job_id: JobId("build".to_owned()),
+                installation_id: 0,
+                check_run_id: None,
+                version: 1,
+                payload: serde_json::json!({
+                    "repository": "owner/repo",
+                    "sha": sha,
+                    "job_id": "build",
+                    "status": "queued",
+                    "name": "build",
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(drain_sender(&shared).await, 1);
+        let lookups: Vec<String> = requests
+            .lock()
+            .iter()
+            .filter(|(method, path, _)| method == "GET" && path.contains("/commits/"))
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(lookups.len(), 1, "one reconciliation lookup: {lookups:?}");
+        assert!(lookups[0].contains("check_name=build"), "{lookups:?}");
+        assert!(lookups[0].contains("app_id=424"), "{lookups:?}");
+        // Token mints are POSTs too; only the check-run writes count here.
+        let writes: Vec<_> = check_run_writes(&requests)
+            .into_iter()
+            .filter(|(_, path, _)| path.contains("/check-runs"))
+            .collect();
+        assert_eq!(writes.len(), 1, "one write only: {writes:?}");
+        assert_eq!(writes[0].0, "PATCH");
+        assert!(writes[0].1.ends_with("/check-runs/9001"));
     }
 
     /// (h) a throttled installation parks only its own rows: the other

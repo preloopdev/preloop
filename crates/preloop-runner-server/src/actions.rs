@@ -281,10 +281,11 @@ async fn resolve_ref_to_sha(
     } else {
         crate::github_breaker::GithubCredentialBucket::Anonymous
     };
-    let response = match crate::github_breaker::send_observed_labeled(
+    let response = match crate::github_etag::send_conditional_get(
+        &state.github_etags,
         &state.github_breakers,
-        bucket,
         &state.github_consumption,
+        bucket,
         crate::github_breaker::GithubSubsystem::RefResolve,
         request,
     )
@@ -296,14 +297,11 @@ async fn resolve_ref_to_sha(
             return None;
         }
     };
-    state.github_consumption.record_advertised_bytes(
-        crate::github_breaker::GithubSubsystem::RefResolve,
-        &response,
-    );
-    let sha = if response.status().is_success() {
-        response
-            .json::<serde_json::Value>()
-            .await
+    // A revalidating `304` serves the cached body (no advertised bytes), so an
+    // expired but unchanged ref costs no rate budget; the timestamp below
+    // restarts its TTL either way.
+    let sha = if response.is_success() {
+        serde_json::from_slice::<serde_json::Value>(&response.body)
             .ok()
             .and_then(|body| {
                 body.get("sha")
@@ -312,7 +310,7 @@ async fn resolve_ref_to_sha(
                     .map(str::to_owned)
             })
     } else {
-        let status = response.status();
+        let status = response.status;
         tracing::warn!(%owner, %repo, %git_ref, %status, "action ref resolution rejected; falling back to ref");
         None
     };
