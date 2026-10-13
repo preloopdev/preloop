@@ -83,7 +83,7 @@ async fn dispatch_fixture_with_app(
         .await
         .unwrap();
     state.local_workspace = Some(ws);
-    let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     state.github_app = Some(crate::github_app::GitHubAppCredentials::for_tests(
         "424",
         key.clone(),
@@ -831,7 +831,7 @@ async fn dispatch_with_foreign_app_jwt_is_401() {
         dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     // A JWT from an unrelated App's keypair.
-    let other_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let other_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let jwt = crate::github_app::sign_app_jwt("999", &other_key).unwrap();
 
     let (status, _) = post_json(
@@ -1007,8 +1007,8 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
 /// Build a two-App registry: the default App (secret `legacy-secret`) plus a
 /// second App with its own secret and key.
 fn two_app_registry() -> (crate::github_app::GitHubApps, rsa::RsaPrivateKey) {
-    let default_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-    let second_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let default_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let second_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let mut second = crate::github_app::GitHubAppCredentials::for_tests(
         "525",
         second_key.clone(),
@@ -1453,7 +1453,7 @@ fn sign_test_jwt(app_id: &str, key: &rsa::RsaPrivateKey, iat: u64, exp: u64) -> 
     };
     let signing_input = format!("{}.{}", encode(&header), encode(&claims));
     let signature = SigningKey::<Sha256>::new(key.clone())
-        .sign_with_rng(&mut rand::thread_rng(), signing_input.as_bytes());
+        .sign_with_rng(&mut rsa::rand_core::OsRng, signing_input.as_bytes());
     format!(
         "{signing_input}.{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())

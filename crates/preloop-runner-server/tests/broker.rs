@@ -1639,7 +1639,7 @@ async fn github_app_manifest_registration_flow() {
 
     // Setup a local mock GitHub API server for manifest conversion
     let mock_app = Router::new().route(
-            "/app-manifests/:code/conversions",
+            "/app-manifests/{code}/conversions",
             post(|Path(code): Path<String>| async move {
                 assert_eq!(code, "mock_code_123");
                 Json(json!({

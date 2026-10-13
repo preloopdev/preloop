@@ -54,7 +54,7 @@ async fn spawn_fake(fake: Arc<Fake>) -> String {
             ),
         )
         .route(
-            "/api/v1/debug/sessions/:id/verdict",
+            "/api/v1/debug/sessions/{id}/verdict",
             get(|State(fake): State<Arc<Fake>>| async move {
                 if let Some(probe) = fake.pause_probe.lock().as_ref()
                     && probe.load(Ordering::SeqCst)
@@ -76,7 +76,7 @@ async fn spawn_fake(fake: Arc<Fake>) -> String {
             }),
         )
         .route(
-            "/api/v1/debug/sessions/:id/close",
+            "/api/v1/debug/sessions/{id}/close",
             post(
                 |State(fake): State<Arc<Fake>>, Json(body): Json<Value>| async move {
                     fake.closes.fetch_add(1, Ordering::SeqCst);
@@ -351,7 +351,7 @@ async fn spawn_exchange(state: Arc<Exchange>) -> String {
             ),
         )
         .route(
-            "/api/v1/debug/sessions/:id/verdict",
+            "/api/v1/debug/sessions/{id}/verdict",
             get(
                 move |State(state): State<Arc<Exchange>>, headers: axum::http::HeaderMap| async move {
                     record(&state, &headers);
@@ -360,7 +360,7 @@ async fn spawn_exchange(state: Arc<Exchange>) -> String {
             ),
         )
         .route(
-            "/api/v1/debug/sessions/:id/close",
+            "/api/v1/debug/sessions/{id}/close",
             post(
                 move |State(state): State<Arc<Exchange>>,
                       headers: axum::http::HeaderMap,

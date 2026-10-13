@@ -8338,7 +8338,7 @@ jobs:
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
         let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
 
-        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let mut app_a = crate::github_app::GitHubAppCredentials::for_tests(
             "424",
             key.clone(),
@@ -8560,7 +8560,7 @@ jobs:
         let creates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mock_app = axum::Router::new()
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 axum::routing::patch({
                     let attempts = attempts.clone();
                     move || {
@@ -8728,8 +8728,8 @@ jobs:
             axum::Json(serde_json::json!({"name": "release", "protected": true}))
         });
         let stub = axum::Router::new()
-            .route("/repos/owner/repo/branches/:branch", branch_stub)
-            .route("/repos/owner/mismatch/branches/:branch", mismatch_stub);
+            .route("/repos/owner/repo/branches/{branch}", branch_stub)
+            .route("/repos/owner/mismatch/branches/{branch}", mismatch_stub);
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -9145,7 +9145,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -9160,7 +9160,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 patch({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -9438,12 +9438,12 @@ jobs:
             apps: vec![
                 crate::github_app::GitHubAppCredentials::for_tests(
                     "111111",
-                    rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+                    rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
                     crate::github_app::MintFailurePolicy::LocalJwt,
                 ),
                 crate::github_app::GitHubAppCredentials::for_tests(
                     "222222",
-                    rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+                    rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
                     crate::github_app::MintFailurePolicy::LocalJwt,
                 ),
             ],
@@ -9524,7 +9524,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -9539,7 +9539,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 patch({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -9721,11 +9721,11 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post(|| async { Json(serde_json::json!({"id": 1})) }),
             )
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 patch(|| async { Json(serde_json::json!({"id": 99})) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9861,7 +9861,7 @@ jobs:
         let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let mut app = crate::github_app::GitHubAppCredentials::for_tests(
             "424",
-            rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+            rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
             crate::github_app::MintFailurePolicy::LocalJwt,
         );
         app.installation_id = Some(101);
@@ -10049,7 +10049,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10064,7 +10064,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 patch({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10192,7 +10192,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10289,7 +10289,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10392,7 +10392,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10505,7 +10505,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10591,7 +10591,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10606,7 +10606,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 patch({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10706,7 +10706,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/deployments/:id/statuses",
+                "/repos/owner/repo/deployments/{id}/statuses",
                 post({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,
@@ -10721,7 +10721,7 @@ jobs:
                 }),
             )
             .route(
-                "/repos/owner/repo/check-runs/:id",
+                "/repos/owner/repo/check-runs/{id}",
                 patch({
                     let seen = seen.clone();
                     move |axum::extract::Path(id): axum::extract::Path<u64>,

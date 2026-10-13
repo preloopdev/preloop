@@ -6335,7 +6335,7 @@ mod remote_checkout_cache_tests {
         let canonical = canonical_slug.to_owned();
         let router = axum::Router::new()
             .route(
-                "/repositories/:id",
+                "/repositories/{id}",
                 get(
                     |Path(id): Path<u64>,
                      Extension(repo_id): Extension<RepoId>,
@@ -6372,7 +6372,7 @@ mod remote_checkout_cache_tests {
                 ),
             )
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |Extension(authed): Extension<AuthedDownloads>,
                      Extension(blob): Extension<Vec<u8>>| async move {
@@ -6442,7 +6442,7 @@ mod remote_checkout_cache_tests {
                 ),
             )
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |headers: axum::http::HeaderMap,
                      Extension(authed): Extension<AuthedDownloads>,
@@ -6699,7 +6699,7 @@ mod remote_checkout_cache_tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = axum::Router::new()
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |headers: HeaderMap,
                      Extension(authed): Extension<Arc<AtomicUsize>>,
@@ -7267,38 +7267,26 @@ mod snapshot_staging_tests {
         }
     }
 
-    /// The bench that found this: the engine's `TMPDIR` on tmpfs, the state
-    /// directory on another device. Staging in the process temp directory made
-    /// the publish fail with `EXDEV`, the immutable snapshot was never created,
-    /// and the run fell back to a checkout of a commit no forge has.
+    /// The bench that found this: staging in the process temp directory made
+    /// the publish fail with `EXDEV` on a host whose `TMPDIR` is a tmpfs, the
+    /// immutable snapshot was never created, and the run fell back to a
+    /// checkout of a commit no forge has. Staging lives under the state
+    /// directory now. This test leaves `TMPDIR` alone: changing the process
+    /// environment raced with other tests that create their own temporary
+    /// directories, which then vanished when this one was torn down. It checks
+    /// the real temp directory for legacy staging trees instead.
     #[tokio::test]
-    async fn snapshot_publishes_when_the_process_temp_dir_is_another_filesystem() {
+    async fn snapshot_publishes_without_staging_in_the_process_temp_dir() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("ws");
         let state_dir = temp.path().join("state");
         init_workspace(&workspace);
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        let other = OtherFilesystem::create(&state_dir, temp.path());
-        let tmpdir_guard = other
-            .as_ref()
-            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
-        let tmpdir = match &tmpdir_guard {
-            Some(tmpdir) => tmpdir.path().to_path_buf(),
-            // No second filesystem to point `TMPDIR` at: the publish below
-            // still runs, but only a host with a spare device can make the
-            // rename cross-device. The recovery itself is covered by
-            // `cross_filesystem_staging_still_publishes_atomically`.
-            None => temp.path().join("tmp"),
-        };
-        std::fs::create_dir_all(&tmpdir).unwrap();
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _tmpdir = crate::state::TestEnvVar::set("TMPDIR", &tmpdir);
-
         let run_id = RunId::new();
         let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None, None)
             .await
-            .expect("the snapshot must publish whatever TMPDIR points at");
+            .expect("the snapshot must publish");
 
         let repository = state_dir.join(&snapshot.repository);
         assert!(
@@ -7310,11 +7298,14 @@ mod snapshot_staging_tests {
             Vec::<String>::new(),
             "publishing leaves no staging tree behind"
         );
-        let staged_in_temp_dir: Vec<String> = std::fs::read_dir(&tmpdir)
+        let run_name = run_id.to_string();
+        let staged_in_temp_dir: Vec<String> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("preloop-workspace-snapshot"))
+            .filter(|name| {
+                name.starts_with("preloop-workspace-snapshot") && name.contains(&run_name)
+            })
             .collect();
         assert!(
             staged_in_temp_dir.is_empty(),
@@ -7917,7 +7908,7 @@ mod lfs_accounting_tests {
                         axum::routing::get(move || async move { blob_response(blob) }),
                     )
                     .route(
-                        "/*path",
+                        "/{*path}",
                         axum::routing::post(move || async move { batch_response(&batch_body) }),
                     );
                 servers.push(tokio::spawn(async move {
@@ -7946,7 +7937,7 @@ mod lfs_accounting_tests {
                 let batch_base = format!("http://{}", batch_listener.local_addr().unwrap());
                 servers.push(tokio::spawn(async move {
                     let app = axum::Router::new().route(
-                        "/*path",
+                        "/{*path}",
                         axum::routing::post(move || async move { batch_response(&batch_body) }),
                     );
                     axum::serve(batch_listener, app).await.unwrap()

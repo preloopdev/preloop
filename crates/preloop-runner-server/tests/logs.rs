@@ -2630,7 +2630,7 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         Vec::<(u64, serde_json::Value)>::new(),
     ));
     let mock_app = Router::new().route(
-        "/repos/owner/repo/check-runs/:id",
+        "/repos/owner/repo/check-runs/{id}",
         axum::routing::patch({
             let check_completions = check_completions.clone();
             move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
@@ -2734,7 +2734,7 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
             post(|| async { Json(json!({"id": CHECK_RUN_ID})) }),
         )
         .route(
-            "/repos/owner/repo/check-runs/:id",
+            "/repos/owner/repo/check-runs/{id}",
             axum::routing::patch({
                 let patches = patches.clone();
                 move |Path(_id): Path<u64>, body: axum::extract::Json<Value>| {
@@ -3577,7 +3577,7 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
 async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -3770,7 +3770,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
 async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
@@ -3868,7 +3868,7 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
             get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post(
                 |Path(installation_id): Path<u64>, body: Json<Value>| async move {
                     assert_eq!(installation_id, 4242);
@@ -3893,7 +3893,7 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(

@@ -247,7 +247,7 @@ mod observed_sender_tests {
         let hits_route = hits.clone();
         let sha_owned = sha.to_owned();
         let app = axum::Router::new().route(
-            "/*path",
+            "/{*path}",
             axum::routing::get(move |request: axum::extract::Request| {
                 let hits_route = hits_route.clone();
                 let sha_owned = sha_owned.clone();

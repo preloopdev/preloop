@@ -169,7 +169,7 @@ mod tests {
     use serde_json::json;
 
     static TEST_KEY: std::sync::LazyLock<rsa::RsaPrivateKey> = std::sync::LazyLock::new(|| {
-        rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("test key")
+        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("test key")
     });
 
     async fn stub_github(hook_url: &str, hook_status: axum::http::StatusCode) -> String {

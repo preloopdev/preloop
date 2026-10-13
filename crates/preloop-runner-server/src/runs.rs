@@ -4261,12 +4261,17 @@ impl TryFrom<&RerunRequest> for crate::control::types::RerunMode {
 pub async fn rerun_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
-    body: Option<Json<RerunRequest>>,
+    // axum 0.8 rejects a malformed or non-JSON body where `Option<Json<_>>`
+    // used to read it as absent; keep that fallback to the default rerun.
+    body: Result<Json<RerunRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<RunAccepted>, ApiError> {
-    let request = body.map(|Json(request)| request).unwrap_or(RerunRequest {
-        mode: default_rerun_mode(),
-        job_id: None,
-    });
+    let request = body
+        .ok()
+        .map(|Json(request)| request)
+        .unwrap_or(RerunRequest {
+            mode: default_rerun_mode(),
+            job_id: None,
+        });
     let mode = crate::control::types::RerunMode::try_from(&request)?;
     rerun_run_with_mode(&shared, run_id, mode, None, None)
         .await
@@ -5071,7 +5076,7 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(callee_yaml.as_bytes());
         let mock = axum::Router::new()
             .route(
-                "/repos/:owner/:repo/contents/*path",
+                "/repos/{owner}/{repo}/contents/{*path}",
                 get({
                     let seen = seen_auth.clone();
                     move |headers: HeaderMap| async move {
@@ -5097,7 +5102,7 @@ mod tests {
                 }),
             )
             .route(
-                "/repos/:owner/:repo/commits/:git_ref",
+                "/repos/{owner}/{repo}/commits/{git_ref}",
                 get(|| async move {
                     Json(serde_json::json!({"sha": "c0ffee0000000000000000000000000000000000"}))
                 }),

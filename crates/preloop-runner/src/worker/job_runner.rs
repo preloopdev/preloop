@@ -1080,7 +1080,7 @@ fn spawn_renew_loop(
                         // Sec-WebSocket-Key (random), Sec-WebSocket-Version: 13
                         use base64::Engine;
                         let mut nonce = [0u8; 16];
-                        rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
+                        rand::RngExt::fill(&mut rand::rng(), &mut nonce);
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
                         http.client_for(&results_ws)
                             .get(&results_ws)
@@ -1238,8 +1238,8 @@ async fn first_renew_gate(
                     _ = tokio::time::sleep(match timing.first_renew_backoff {
                         RenewBackoff::Fixed(delay) => delay,
                         RenewBackoff::Official => {
-                            Duration::from_secs(rand::Rng::gen_range(
-                                &mut rand::thread_rng(),
+                            Duration::from_secs(rand::RngExt::random_range(
+                                &mut rand::rng(),
                                 1..=10,
                             ))
                         }
@@ -1332,7 +1332,7 @@ fn renew_backoff(encountering_error: u32) -> Duration {
     } else {
         (5, 15)
     };
-    Duration::from_secs(rand::Rng::gen_range(&mut rand::thread_rng(), min..=max))
+    Duration::from_secs(rand::RngExt::random_range(&mut rand::rng(), min..=max))
 }
 
 fn parse_lease_deadline(value: &str) -> Option<DateTime<Utc>> {
