@@ -82,9 +82,10 @@
       "separateMajorMinor": false
     },
     {
-      "description": "Upstream workflow fixtures pin old action and image versions on purpose; they are test inputs, not dependencies.",
+      "description": "Frozen inputs, not dependencies: upstream workflow fixtures pin old versions on purpose, and benchmarks pin images and crates so past results stay comparable.",
       "matchFileNames": [
-        "fixtures/upstream-workflows/**"
+        "fixtures/upstream-workflows/**",
+        "benchmarks/**"
       ],
       "enabled": false
     },
