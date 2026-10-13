@@ -113,7 +113,7 @@ similar = "2.5"
 cron = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-utoipa = { version = "5", features = ["uuid", "chrono"] }
+utoipa = { version = "6", features = ["uuid", "chrono"] }
 cap-std = "3.4"
 keyring = "4.2"
 
