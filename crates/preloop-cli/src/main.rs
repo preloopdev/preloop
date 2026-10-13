@@ -3163,6 +3163,27 @@ fn default_local_filter_branch(
     (!name.is_empty()).then_some(name)
 }
 
+/// The base branch whose tip rides in a hosted dirty-submit bundle. The server
+/// builds the test merge against `pull_request_base_branch`, which reads the
+/// payload's `pull_request.base.ref` first, then `--base`, then the derived
+/// filter branch; the bundle must carry the tip of that same branch or the
+/// engine has nothing to merge against.
+fn submit_base_branch(
+    payload: &serde_json::Value,
+    base_arg: Option<&str>,
+    derived_filter_branch: Option<&str>,
+) -> Option<String> {
+    payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .and_then(serde_json::Value::as_str)
+        .or(base_arg)
+        .or(derived_filter_branch)
+        .map(|raw| strip_branch_prefix(raw).to_owned())
+        .filter(|name| !name.is_empty())
+}
+
 fn local_default_branch() -> Option<String> {
     local_default_branch_in(std::path::Path::new("."))
 }
@@ -3307,13 +3328,19 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // A hosted pull-request merge is built against the base branch, so the
         // base tip rides in the bundle; every other event tests C alone.
         let base_branch = (event == "pull_request" && !args.no_merge)
-            .then_some(derived_filter_branch.as_deref())
+            .then(|| {
+                submit_base_branch(
+                    &payload,
+                    args.base.as_deref(),
+                    derived_filter_branch.as_deref(),
+                )
+            })
             .flatten();
         Some(create_submit_commit(
             args.message.as_deref(),
             &dirty,
             &detect_git_ref(),
-            base_branch,
+            base_branch.as_deref(),
         )?)
     } else {
         None
@@ -3398,9 +3425,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
     if let Some(commit) = submit_commit.as_ref() {
-        let bundle_id = upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await?;
-        submission.git_bundle_id = Some(bundle_id);
+        // The bundle is single-use scratch: remove it whether or not the upload
+        // succeeded, so a refused or failed upload (413, network error) cannot
+        // strand up to 512 MiB in the temp directory.
+        let uploaded = upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await;
         let _ = std::fs::remove_file(&commit.bundle_path);
+        submission.git_bundle_id = Some(uploaded?);
     }
     // Secrets redact on plain serialization; sending them is opt-in.
     let mut request = client
@@ -7409,6 +7439,28 @@ mod tests {
             format!("{error:#}").contains("no-such-branch"),
             "an unresolvable base fails loudly: {error:#}"
         );
+    }
+
+    #[test]
+    fn submit_bundle_base_follows_the_branch_the_server_merges_against() {
+        let payload = serde_json::json!({"pull_request": {"base": {"ref": "release"}}});
+        // The payload wins even though `default_local_filter_branch` yields
+        // nothing for it: the server merges against `release`, so that is the
+        // tip the bundle must carry.
+        assert_eq!(
+            submit_base_branch(&payload, Some("main"), None).as_deref(),
+            Some("release")
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(
+            submit_base_branch(&empty, Some("refs/heads/dev"), Some("main")).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            submit_base_branch(&empty, None, Some("main")).as_deref(),
+            Some("main")
+        );
+        assert_eq!(submit_base_branch(&empty, None, None), None);
     }
 
     #[test]
