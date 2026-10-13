@@ -57,7 +57,7 @@ Submit a workflow and stream its events until terminal.
 | `--push` | After the run completes, push the tested commit and publish the result (pull request + check runs) |
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
 | `--pr-draft` | Create new pull requests as drafts (default true; `--pr-draft=false` opens them ready for review) |
-| `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it |
+| `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it. Required against a remote engine for a clean tree |
 | `-m, --message <TEXT>` | Commit message for the commit `--push` creates when the working tree is dirty. Without it, `$EDITOR` opens prefilled in an interactive terminal; otherwise a generated message is used |
 
 Behavior notes:
@@ -90,9 +90,11 @@ Behavior notes:
   `refs/pull/<n>/merge`; the payload's `base.sha` is the fetched tip and
   `head.sha` the merged head. A conflicted pull request fails the submission
   with the conflicted files listed (GitHub runs no `pull_request` workflows on
-  a conflict), and an unfetchable base fails loudly — `--no-merge` tests the
-  branch alone in either case. `push` events are unaffected: they test the
-  commit itself.
+  a conflict), and an unfetchable base fails loudly. A remote engine has no
+  workspace to merge from, so a clean `--event pull_request` submit there is
+  refused until `--no-merge` is given (a dirty submit is bundled and merged as
+  usual). `--no-merge` tests the branch alone in every case. `push` events are
+  unaffected: they test the commit itself.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
 - **Secret preflight**: before submitting, `preloop run` lists the secrets the

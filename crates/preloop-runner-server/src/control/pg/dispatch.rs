@@ -4303,18 +4303,19 @@ fn submit_node(
     (node, message, secret_names)
 }
 
-/// The committed run for this `(delivery, workflow path)` as seen INSIDE a
+/// The committed run for this `(delivery, workflow path, event)` as seen INSIDE a
 /// write transaction: the replay check has to share the inserting
 /// transaction's snapshot so two nodes cannot both pass it.
 async fn delivery_run_in_tx(
     tx: &Transaction<'_>,
     delivery_id: &str,
     workflow_path: &str,
+    event: &str,
 ) -> Result<Option<RunId>, ControlError> {
     tx.query_opt(
         "SELECT run_id::text FROM runs WHERE webhook_delivery_id = $1 \
-         AND workflow_path = $2",
-        &[&delivery_id, &workflow_path],
+         AND workflow_path = $2 AND event = $3",
+        &[&delivery_id, &workflow_path, &event],
     )
     .await
     .map_err(db)?
@@ -4558,14 +4559,16 @@ impl PgBackend {
             check_hostable,
         } = submit;
         // A webhook delivery that already produced a run for this workflow
-        // path replays that run instead of duplicating it. The check must see
-        // the inserting transaction's snapshot: a redelivery racing on another
+        // path and event replays that run instead of duplicating it. The check
+        // must see the inserting transaction's snapshot: a redelivery racing on another
         // node has to be caught by `runs_delivery`, never as a duplicate-key
         // failure.
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         if let Some(delivery_id) = &record.webhook_delivery_id {
-            let existing = delivery_run_in_tx(&tx, delivery_id, &record.workflow_path_str).await?;
+            let existing =
+                delivery_run_in_tx(&tx, delivery_id, &record.workflow_path_str, &record.event)
+                    .await?;
             if let Some(existing) = existing {
                 drop(tx);
                 drop(client);
@@ -4658,7 +4661,7 @@ impl PgBackend {
         // keeps reporting every conflict as an error. The index is partial, so
         // the inference predicate must repeat it.
         let conflict = if record.webhook_delivery_id.is_some() {
-            " ON CONFLICT (webhook_delivery_id, workflow_path) \
+            " ON CONFLICT (webhook_delivery_id, workflow_path, event) \
               WHERE webhook_delivery_id IS NOT NULL DO NOTHING"
         } else {
             ""
@@ -4724,13 +4727,14 @@ impl PgBackend {
                 .webhook_delivery_id
                 .as_deref()
                 .expect("a conflict is only tolerated for a delivery id");
-            let existing = delivery_run_in_tx(&tx, delivery_id, &record.workflow_path_str)
-                .await?
-                .ok_or_else(|| {
-                    ControlError::backend(anyhow::anyhow!(
-                        "run insert conflicted with no conflicting delivery"
-                    ))
-                })?;
+            let existing =
+                delivery_run_in_tx(&tx, delivery_id, &record.workflow_path_str, &record.event)
+                    .await?
+                    .ok_or_else(|| {
+                        ControlError::backend(anyhow::anyhow!(
+                            "run insert conflicted with no conflicting delivery"
+                        ))
+                    })?;
             drop(tx);
             drop(client);
             let existing = self.run_record(existing).await?;

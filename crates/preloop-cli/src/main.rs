@@ -997,10 +997,11 @@ struct RunArgs {
     pr_draft: bool,
 
     /// Test the branch alone instead of the merge of the pull request's
-    /// current base tip into it. Only affects `--event pull_request` runs
-    /// against a local engine: by default those run on the merge (the base
-    /// tip is fetched from origin), like GitHub's `refs/pull/<n>/merge`.
-    /// Use this when the base branch cannot be fetched.
+    /// current base tip into it. Only affects `--event pull_request` runs: by
+    /// default those run on the merge (the base tip is fetched from origin),
+    /// like GitHub's `refs/pull/<n>/merge`. A remote engine has no workspace to
+    /// build that merge from for a clean tree, so it refuses the run unless this
+    /// is set. Use it too when the base branch cannot be fetched.
     #[arg(long)]
     no_merge: bool,
 }

@@ -373,7 +373,8 @@ pub struct WorkflowSubmission {
     /// Test the branch alone instead of the merge of the pull request's
     /// current base tip into it. Only meaningful for `pull_request` events
     /// (the CLI's `--no-merge`): the escape hatch when the base branch cannot
-    /// be fetched.
+    /// be fetched, or the engine has no workspace to build the merge from. A
+    /// `pull_request` submission without it is refused in that second case.
     #[serde(default)]
     pub no_merge: bool,
     /// A self-built pull-request test merge the run must check out. Set when

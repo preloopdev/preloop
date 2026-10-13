@@ -6989,6 +6989,18 @@
     {
       "schema": "control",
       "table": "runs",
+      "name": "runs_delivery",
+      "column": "event",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": true,
+      "direction": "asc",
+      "column_position": 3
+    },
+    {
+      "schema": "control",
+      "table": "runs",
       "name": "runs_namespace_recent",
       "column": "namespace_id",
       "index_type": "BTREE",

@@ -48,8 +48,13 @@ Releases before v0.27.0 predate the changelog.
   successful push, on confirmation, when the working tree still matches the
   submitted tree by content.
 
+### Changed
+
+- **`pull_request` submits to an engine without a workspace need `--no-merge`**: an engine builds a pull request's test merge only from a workspace it can merge the base into the head from. A remote engine has none: it cannot read the submitting tree, and a clean commit is not bundled. A clean submit used to test the branch alone without saying so; it is now refused with a message naming `no_merge` (`--no-merge` on the CLI), and `no_merge: true` tests the branch alone as before. Dirty `--push` submits, local engines and webhook `pull_request` runs (which already set `no_merge`) are unchanged.
+
 ### Fixed
 
+- **Pull-request workflows that list both `pull_request` and `pull_request_target` run both events**: a `pull_request` webhook delivery projects to both events, but the webhook replay key was (delivery, workflow file), so the second event replayed the first run and its merge test never ran. The key now includes the event: `runs_delivery` is widened to (delivery, workflow path, event) by migration `V2026100509__runs_delivery_event`, which is additive and keeps existing rows. Redelivering the same delivery, workflow and event still creates no run.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

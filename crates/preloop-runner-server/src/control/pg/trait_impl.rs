@@ -584,8 +584,9 @@ impl ControlBackend for PgBackend {
         &self,
         delivery_id: &str,
         workflow_path: &str,
+        event: &str,
     ) -> Result<Option<RunId>, ControlError> {
-        self.run_for_webhook_delivery(delivery_id, workflow_path)
+        self.run_for_webhook_delivery(delivery_id, workflow_path, event)
             .await
     }
     async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {

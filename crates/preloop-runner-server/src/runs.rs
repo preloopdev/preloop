@@ -719,7 +719,11 @@ pub async fn submit_run_inner_with_webhook_delivery(
         )
         .await;
     };
-    let key = (delivery_id.to_owned(), workflow_path.to_owned());
+    let key = (
+        delivery_id.to_owned(),
+        workflow_path.to_owned(),
+        submission.event.clone(),
+    );
     loop {
         // In-transaction dedup inside `submit_run` (SubmitOutcome::existing)
         // makes a committed run win over any in-flight reservation; the
@@ -744,11 +748,11 @@ pub async fn submit_run_inner_with_webhook_delivery(
 }
 struct WebhookRunReservation {
     shared: Arc<SharedState>,
-    key: Option<(String, String)>,
+    key: Option<(String, String, String)>,
 }
 
 impl WebhookRunReservation {
-    fn new(shared: Arc<SharedState>, key: (String, String)) -> Self {
+    fn new(shared: Arc<SharedState>, key: (String, String, String)) -> Self {
         Self {
             shared,
             key: Some(key),
@@ -776,7 +780,7 @@ impl Drop for WebhookRunReservation {
     }
 }
 
-async fn release_webhook_run_reservation(shared: &Arc<SharedState>, key: (String, String)) {
+async fn release_webhook_run_reservation(shared: &Arc<SharedState>, key: (String, String, String)) {
     let mut inner = shared.state.inner.lock().await;
     inner.webhook_run_reservations.remove(&key);
     drop(inner);
@@ -809,6 +813,25 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let webhook_delivery_id = webhook_delivery_id.map(str::to_owned);
     // Dedup is now transactional: `submit_run` returns
     // `SubmitOutcome::existing` for a replayed delivery, so no pre-check.
+
+    // A pull_request run tests the merge of the base tip into the head unless
+    // `no_merge` says otherwise, and only a workspace can build that merge. A
+    // remote engine has none: it cannot read the submitting tree, and a clean
+    // commit is not bundled. Testing the branch alone in the merge's place would
+    // be a silent substitution, so refuse and name the escape instead.
+    if submission.event == "pull_request"
+        && !submission.no_merge
+        && submission.prebuilt_merge.is_none()
+        && submission.local_workspace.is_none()
+        && shared.state.local_workspace.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "this engine cannot build the pull request's test merge: it has no workspace to \
+             merge the base into the head from (a remote engine cannot read the submitting \
+             tree, and a clean commit is not bundled); pass `no_merge` (`--no-merge`) to test \
+             the branch alone",
+        ));
+    }
 
     let t_parse = std::time::Instant::now();
     let workflow = parse_workflow(&submission.workflow_yaml)?;
@@ -1651,7 +1674,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         && let Some(run_id) = shared
             .state
             .backend
-            .run_for_webhook_delivery(delivery_id, &workflow_path)
+            .run_for_webhook_delivery(delivery_id, &workflow_path, &submission.event)
             .await
             .map_err(ApiError::from)?
     {

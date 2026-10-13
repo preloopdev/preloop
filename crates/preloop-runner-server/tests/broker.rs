@@ -1318,6 +1318,11 @@ impl PublishEchoFixture {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        self.drain_delivery(delivery_id).await;
+    }
+
+    /// Drain the webhook queue, then assert that `delivery_id` reached `done`.
+    async fn drain_delivery(&self, delivery_id: &str) {
         let shared = Arc::new(SharedState {
             state: self.state.clone(),
             shutdown: CancellationToken::new(),
@@ -1373,6 +1378,33 @@ impl PublishEchoFixture {
             .collect();
         events.sort();
         events
+    }
+
+    /// The `(event, run)` pairs a webhook delivery produced, sorted.
+    async fn delivery_runs(&self, delivery_id: &str) -> Vec<(String, preloop_gha_protocol::RunId)> {
+        let inner = self.state.test_tx().await;
+        let mut runs: Vec<_> = inner
+            .runs
+            .values()
+            .filter(|run| run.webhook_delivery_id.as_deref() == Some(delivery_id))
+            .map(|run| (run.submission.event.clone(), run.run_id))
+            .collect();
+        runs.sort();
+        runs
+    }
+
+    /// Requeue a completed delivery the way an operator replay does, then
+    /// drain it again.
+    async fn replay_delivery(&self, delivery_id: &str) {
+        let response = request_json(
+            &self.app,
+            Method::POST,
+            &format!("/api/v1/webhooks/deliveries/{delivery_id}/replay"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response["status"], "requeued", "{response}");
+        self.drain_delivery(delivery_id).await;
     }
 }
 
@@ -1489,6 +1521,40 @@ async fn publish_echo_dedup_leaves_the_pull_request_merge_test_after_a_branch_pu
         fixture.runs_besides(published).await,
         ["pull_request"],
         "the `pull_request` echo runs the merge test that a branch publish never performed"
+    );
+}
+
+/// A `pull_request` delivery projects to two effective events for one workflow
+/// file: `pull_request_target` (the base checkout) and `pull_request` (the
+/// merge test). A workflow listing both triggers needs a run for each. The
+/// replay key used to be the delivery and the workflow file alone, so the
+/// second event replayed the first run and its merge test never ran.
+/// Redelivering the completed delivery must still create nothing new.
+#[tokio::test]
+async fn pull_request_delivery_runs_each_event_of_a_workflow_listing_both() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let fixture = PublishEchoFixture::new(
+        "on:\n  pull_request:\n  pull_request_target:\njobs:\n  build:\n    \
+         runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .await;
+
+    fixture
+        .deliver("pull_request", "pr-both", fixture.pull_request_opened())
+        .await;
+    let runs = fixture.delivery_runs("pr-both").await;
+    let events: Vec<&str> = runs.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(
+        events,
+        ["pull_request", "pull_request_target"],
+        "one delivery must create one run per effective event of its workflow"
+    );
+
+    fixture.replay_delivery("pr-both").await;
+    assert_eq!(
+        fixture.delivery_runs("pr-both").await,
+        runs,
+        "replaying the delivery replays each event's own run and creates none"
     );
 }
 
