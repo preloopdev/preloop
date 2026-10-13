@@ -8,6 +8,9 @@ env:
 
 on:
   pull_request:
+    # labeled/unlabeled re-run the guard when a maintainer toggles the
+    # dependency-migration exception.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
   schedule:
@@ -34,6 +37,8 @@ jobs:
 
       - name: Guard policy files
         if: github.event_name == 'pull_request'
+        env:
+          DEPENDENCY_MIGRATION: ${{ contains(github.event.pull_request.labels.*.name, 'dependency-migration') }}
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha }}"
@@ -53,8 +58,14 @@ jobs:
           # Adding a Rust dependency necessarily changes Cargo.lock *and* the
           # manifests that declare it. Permit that dedicated PR shape, but no
           # source changes or other policy files alongside the lockfile.
+          # Exception: a PR labeled dependency-migration (a maintainer-only
+          # action) may carry the source changes a breaking upgrade needs,
+          # as long as Cargo.lock is still its only policy file.
           dependency_only=false
-          if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" ]]; then
+          if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" && "$DEPENDENCY_MIGRATION" == "true" ]]; then
+            echo "dependency-migration label: Cargo.lock may ship with source changes"
+            dependency_only=true
+          elif [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" ]]; then
             dependency_only=true
             while IFS= read -r file; do
               if [[ "$file" != "Cargo.toml" && ! "$file" =~ ^crates/[^/]+/Cargo\.toml$ ]]; then
