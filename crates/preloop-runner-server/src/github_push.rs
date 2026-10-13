@@ -70,8 +70,9 @@ pub struct PushOverride {
     pub draft: Option<bool>,
 }
 
-/// The run that already tested `sha` for `workflow_path` through push-back,
-/// if there is one.
+/// Whether push-back already tested and published what the webhook echo
+/// `echo_event` would run, so the echo must not run it again. Returns the run
+/// whose publication covers it, if there is one.
 ///
 /// Push-back lands the tested commit on GitHub, and GitHub answers with a
 /// push webhook for that very commit — so without this the server would
@@ -84,7 +85,8 @@ pub struct PushOverride {
 /// push-back request, keyed on the same commit AND the same workflow file:
 /// a plain webhook run must never suppress a later one (redeliveries are a
 /// retry mechanism, not a duplicate), and workflows the user never submitted
-/// are genuinely new work that still has to run.
+/// are genuinely new work that still has to run. Which publication covers the
+/// echo depends on the echo (see [`covers_echo`]).
 ///
 /// A dirty-tree run's submission sha is the *base* commit, not the commit
 /// the push webhook carries; once the sync ran, the published (materialized)
@@ -98,13 +100,34 @@ pub async fn already_published(
     repository: &str,
     sha: &str,
     workflow_path: &str,
+    echo_event: &str,
 ) -> Result<Option<RunId>, ApiError> {
-    shared
+    let published = shared
         .state
         .backend
-        .published_run(repository, sha, workflow_path)
+        .published_runs(repository, sha, workflow_path)
         .await
-        .map_err(ApiError::from)
+        .map_err(ApiError::from)?;
+    Ok(published
+        .into_iter()
+        .find(|run| covers_echo(run, echo_event))
+        .map(|run| run.run_id))
+}
+
+/// Whether a publication already ran what the echo `echo_event` would run.
+///
+/// A `push` echo is the branch update push-back itself caused, so any
+/// publication of the commit covers it. A `pull_request` echo is the PR's
+/// merge test, which only a `pull_request` run that checked out a self-built
+/// merge has run: a publication of the branch alone tested the head without
+/// the base merged in, so the echo must still run. Any other event is never
+/// covered.
+fn covers_echo(run: &PublishedRun, echo_event: &str) -> bool {
+    match echo_event {
+        "push" => true,
+        "pull_request" => run.event == "pull_request" && run.tested_merge,
+        _ => false,
+    }
 }
 
 pub async fn push_run_to_github(

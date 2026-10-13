@@ -120,6 +120,11 @@ pub trait CredentialStore: Send + Sync {
     fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()>;
     /// Delete a secret by reference from the store.
     fn delete(&self, reference: &CredentialRef) -> Result<()>;
+    /// Read bypassing any read-through cache, to confirm a write persisted.
+    /// Backends without a cache need not override this.
+    fn get_fresh(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        self.get(reference)
+    }
     /// Human-readable name of the backend for diagnostics.
     fn name(&self) -> &'static str;
     /// Whether the backend can be reached at all.
@@ -148,7 +153,7 @@ impl CredentialStore for OsCredentialStore {
         match Self::entry(reference)?.get_password() {
             Ok(value) => Ok(Some(SecretString::new(value))),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context("read credential from OS store"),
+            Err(error) => Err(deny_helpful_error(error, reference, "read")),
         }
     }
 
@@ -158,7 +163,7 @@ impl CredentialStore for OsCredentialStore {
         }
         Self::entry(reference)?
             .set_password(value.expose())
-            .context("write credential to OS store")?;
+            .map_err(|error| deny_helpful_error(error, reference, "write"))?;
         Ok(())
     }
 
@@ -198,6 +203,27 @@ impl CredentialStore for OsCredentialStore {
         macos_keychain_writable()?;
         Ok(())
     }
+}
+
+/// A keychain denial reads as a generic platform failure. macOS prompts once
+/// per item for binaries outside the item's trusted-apps list (ad-hoc-signed
+/// builds change identity every release), so a denied or dismissed dialog
+/// must tell the operator what to approve instead of surfacing `User
+/// canceled`. Non-interactive sessions cannot approve anything; point those
+/// at the file backend instead of letting them hang on a prompt.
+fn deny_helpful_error(error: keyring::Error, reference: &CredentialRef, op: &str) -> anyhow::Error {
+    if cfg!(target_os = "macos") && matches!(error, keyring::Error::NoStorageAccess(_)) {
+        return anyhow::anyhow!(
+            "credential store denied {} of {:?} ({}): approve the macOS keychain dialog for the `preloop` service with Always Allow (one approval per item covers the process); \
+             headless or background sessions cannot approve dialogs and will hang or fail here — set PRELOOP_CREDENTIAL_STORE=file instead",
+            op,
+            reference,
+            error,
+        );
+    }
+    anyhow::Error::new(error).context(format!(
+        "{op} credential {reference:?} in OS credential store"
+    ))
 }
 
 /// Whether the login keychain accepts writes without user interaction.
@@ -406,7 +432,7 @@ pub fn resolve_engine_token_with_store(
     if let Some(token) = read_engine_token_file(&token_path)? {
         if store_available {
             match store.set(&reference, &SecretString::new(&token)) {
-                Ok(()) => match store.get(&reference) {
+                Ok(()) => match store.get_fresh(&reference) {
                     Ok(Some(stored)) => {
                         match validate_engine_token(stored.expose(), store.name()) {
                             Ok(stored) if stored == token => {
@@ -460,7 +486,7 @@ pub fn resolve_engine_token_with_store(
         .collect::<String>();
     if store_available {
         match store.set(&reference, &SecretString::new(&token)) {
-            Ok(()) => match store.get(&reference) {
+            Ok(()) => match store.get_fresh(&reference) {
                 Ok(Some(stored)) => match validate_engine_token(stored.expose(), store.name()) {
                     Ok(stored) if stored == token => return Ok(token),
                     Ok(stored) => {
@@ -767,6 +793,85 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
+/// Read-through cache in front of any [`CredentialStore`] backend, so each
+/// distinct reference hits the backend at most once per process. The cache
+/// exists for the OS backend: macOS prompts once per keychain hit for
+/// binaries outside the item's trusted-apps list (ad-hoc-signed builds
+/// change identity every release), so every subsystem re-read during boot
+/// turned into another password dialog.
+///
+/// Misses are never cached, so an entry created mid-process is picked up on
+/// the next read. Writes and deletes go through the cache too. The lock is
+/// held across each backend call, so a read's cache fill cannot interleave
+/// with a concurrent write or delete of the same reference and resurrect a
+/// stale value. Operations are serialized; keychain prompts already were.
+/// [`store_from_env`] shares one instance process-wide.
+#[derive(Debug, Default)]
+pub struct CachedCredentialStore<S> {
+    inner: S,
+    cache: parking_lot::Mutex<HashMap<CredentialRef, SecretString>>,
+}
+
+impl<S> CachedCredentialStore<S> {
+    /// Wrap `inner`; the cache starts empty.
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            cache: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<S: CredentialStore> CredentialStore for CachedCredentialStore<S> {
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        let mut cache = self.cache.lock();
+        if let Some(cached) = cache.get(reference) {
+            return Ok(Some(cached.clone()));
+        }
+        let value = self.inner.get(reference)?;
+        if let Some(secret) = &value {
+            cache.insert(reference.clone(), secret.clone());
+        }
+        Ok(value)
+    }
+
+    fn get_fresh(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        let mut cache = self.cache.lock();
+        let value = self.inner.get(reference)?;
+        match &value {
+            Some(secret) => {
+                cache.insert(reference.clone(), secret.clone());
+            }
+            None => {
+                cache.remove(reference);
+            }
+        }
+        Ok(value)
+    }
+
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        let mut cache = self.cache.lock();
+        self.inner.set(reference, value)?;
+        cache.insert(reference.clone(), value.clone());
+        Ok(())
+    }
+
+    fn delete(&self, reference: &CredentialRef) -> Result<()> {
+        let mut cache = self.cache.lock();
+        self.inner.delete(reference)?;
+        cache.remove(reference);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn available(&self) -> Result<()> {
+        self.inner.available()
+    }
+}
+
 /// Select the credential store for this process.
 ///
 /// `PRELOOP_CREDENTIAL_STORE`:
@@ -781,6 +886,8 @@ pub fn store_from_env(state_dir: &Path) -> Arc<dyn CredentialStore> {
         .unwrap_or_default()
         .as_str()
     {
+        // File and memory backends are local and cost no prompt, so they are
+        // not cached: a cache would only hide changes made by other processes.
         "file" => Arc::new(FileCredentialStore::new(FileCredentialStore::default_dir(
             state_dir,
         ))),
@@ -791,8 +898,17 @@ pub fn store_from_env(state_dir: &Path) -> Arc<dyn CredentialStore> {
         // caller's `Arc` drops — the write path would seal data under a key
         // the read path can never recover.
         "memory" => shared_memory_store(),
-        _ => Arc::new(OsCredentialStore),
+        _ => os_credential_store(),
     }
+}
+
+/// The OS store's single process-wide read cache. Every caller shares it, so
+/// one keychain item prompts at most once per process no matter how many
+/// subsystems load configuration.
+fn os_credential_store() -> Arc<dyn CredentialStore> {
+    static OS_STORE: std::sync::LazyLock<Arc<dyn CredentialStore>> =
+        std::sync::LazyLock::new(|| Arc::new(CachedCredentialStore::new(OsCredentialStore)));
+    OS_STORE.clone()
 }
 
 /// The process-wide memory credential store behind `PRELOOP_CREDENTIAL_STORE=memory`.
@@ -951,6 +1067,93 @@ mod tests {
         assert!(store.set(&reference, &SecretString::new("")).is_err());
     }
 
+    /// Backend-hit counter proving the decorator reads each reference once.
+    #[derive(Clone, Default)]
+    struct CountingCredentialStore {
+        inner: MemoryCredentialStore,
+        hits: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl CredentialStore for CountingCredentialStore {
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+            *self.hits.lock().unwrap() += 1;
+            self.inner.get(reference)
+        }
+
+        fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+            self.inner.set(reference, value)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<()> {
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "counting credential store"
+        }
+    }
+
+    #[test]
+    fn cached_store_reads_each_reference_once() {
+        let inner = CountingCredentialStore::default();
+        let store = CachedCredentialStore::new(inner.clone());
+        let reference = CredentialRef::new("github-pat").unwrap();
+        store.set(&reference, &SecretString::new("secret")).unwrap();
+
+        // The set primes the cache: repeated reads never reach the backend.
+        for _ in 0..3 {
+            assert_eq!(
+                store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+                Some("secret")
+            );
+        }
+        assert_eq!(*inner.hits.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn cached_store_caches_backend_reads_and_misses() {
+        let inner = CountingCredentialStore::default();
+        let store = CachedCredentialStore::new(inner.clone());
+        let reference = CredentialRef::new("github-pat").unwrap();
+
+        // Absent entries are never cached: each miss reaches the backend.
+        assert_eq!(store.get(&reference).unwrap(), None);
+        assert_eq!(store.get(&reference).unwrap(), None);
+        assert_eq!(*inner.hits.lock().unwrap(), 2);
+
+        // First present read populates the cache; later reads do not.
+        inner
+            .inner
+            .set(&reference, &SecretString::new("secret"))
+            .unwrap();
+        assert_eq!(
+            store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+            Some("secret")
+        );
+        assert_eq!(
+            store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+            Some("secret")
+        );
+        assert_eq!(*inner.hits.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn cached_store_delete_clears_the_entry() {
+        let inner = CountingCredentialStore::default();
+        let store = CachedCredentialStore::new(inner.clone());
+        let reference = CredentialRef::new("github-pat").unwrap();
+        store.set(&reference, &SecretString::new("secret")).unwrap();
+        assert_eq!(
+            store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+            Some("secret")
+        );
+
+        store.delete(&reference).unwrap();
+        assert_eq!(store.get(&reference).unwrap(), None);
+        // The post-delete read reached the backend (cache was cleared).
+        assert_eq!(*inner.hits.lock().unwrap(), 1);
+    }
+
     /// App IDs are validated as numeric for safety and to enforce canonical identifiers.
     #[test]
     fn app_ids_are_validated_and_canonical() {
@@ -995,6 +1198,164 @@ mod tests {
         assert_eq!(first_ref, first_again);
         assert_ne!(first_ref, second_ref);
         assert!(first_ref.as_str().starts_with("engine-token-"));
+    }
+
+    /// Backend that acknowledges writes without persisting them.
+    #[derive(Default)]
+    struct DroppingCredentialStore;
+
+    impl CredentialStore for DroppingCredentialStore {
+        fn get(&self, _reference: &CredentialRef) -> Result<Option<SecretString>> {
+            Ok(None)
+        }
+
+        fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _reference: &CredentialRef) -> Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "dropping credential store"
+        }
+    }
+
+    /// Backend whose first read parks until released, so a concurrent
+    /// mutation can land while that read is in flight.
+    #[derive(Default)]
+    struct GatedCredentialStore {
+        inner: MemoryCredentialStore,
+        gate: parking_lot::Mutex<
+            Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        >,
+    }
+
+    impl CredentialStore for GatedCredentialStore {
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+            let value = self.inner.get(reference)?;
+            let gate = self.gate.lock().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(value)
+        }
+
+        fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+            self.inner.set(reference, value)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<()> {
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "gated credential store"
+        }
+    }
+
+    #[test]
+    fn get_fresh_observes_the_backend_and_refreshes_the_cache() {
+        let inner = CountingCredentialStore::default();
+        let store = CachedCredentialStore::new(inner.clone());
+        let reference = CredentialRef::new("github-pat").unwrap();
+        store.set(&reference, &SecretString::new("secret")).unwrap();
+
+        // Another writer changes the backend behind the cache.
+        inner
+            .inner
+            .set(&reference, &SecretString::new("rotated"))
+            .unwrap();
+        assert_eq!(
+            store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+            Some("secret")
+        );
+        assert_eq!(
+            store
+                .get_fresh(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|s| s.expose()),
+            Some("rotated")
+        );
+        assert_eq!(
+            store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+            Some("rotated")
+        );
+    }
+
+    #[test]
+    fn get_fresh_reports_a_write_the_backend_dropped() {
+        let store = CachedCredentialStore::new(DroppingCredentialStore);
+        let reference = CredentialRef::new("config-secrets-key").unwrap();
+        store.set(&reference, &SecretString::new("key")).unwrap();
+
+        // The cached read echoes the input; only a backend read shows the drop.
+        assert!(store.get(&reference).unwrap().is_some());
+        assert_eq!(store.get_fresh(&reference).unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_misses_read_the_backend_once() {
+        let inner = CountingCredentialStore::default();
+        let reference = CredentialRef::new("github-pat").unwrap();
+        inner
+            .inner
+            .set(&reference, &SecretString::new("secret"))
+            .unwrap();
+        let store = CachedCredentialStore::new(inner.clone());
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(
+                        store.get(&reference).unwrap().as_ref().map(|s| s.expose()),
+                        Some("secret")
+                    );
+                });
+            }
+        });
+        assert_eq!(*inner.hits.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn in_flight_read_cannot_resurrect_a_deleted_credential() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let inner = GatedCredentialStore::default();
+        let reference = CredentialRef::new("github-pat").unwrap();
+        inner
+            .inner
+            .set(&reference, &SecretString::new("old"))
+            .unwrap();
+        *inner.gate.lock() = Some((entered_tx, release_rx));
+        let store = CachedCredentialStore::new(inner);
+
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| store.get(&reference).unwrap());
+            // The reader is inside the backend read, holding the old value.
+            entered_rx.recv().unwrap();
+            let deleter = scope.spawn(|| store.delete(&reference).unwrap());
+            // Give the delete time to run; it must wait for the read to finish.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+            reader.join().unwrap();
+            deleter.join().unwrap();
+        });
+        assert_eq!(store.get(&reference).unwrap(), None);
+    }
+
+    #[test]
+    fn non_denial_os_errors_do_not_suggest_a_keychain_dialog() {
+        let reference = CredentialRef::new("github-pat").unwrap();
+        let error = deny_helpful_error(
+            keyring::Error::Invalid("attribute".into(), "bad".into()),
+            &reference,
+            "read",
+        );
+        assert!(!format!("{error:#}").contains("Always Allow"));
     }
 
     #[test]

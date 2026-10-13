@@ -27,6 +27,26 @@ Releases before v0.27.0 predate the changelog.
   testing a different tree. `--no-merge` restores testing the branch alone,
   and `push` events are unchanged (they test the commit itself). The server
   also validates and serves prebuilt merges for other submission paths.
+- **Hosted dirty submits**: `preloop run --push` on a dirty working tree now
+  creates a real commit C in a private index (the branch, index and working
+  tree never move; a tracked file that an ignore rule now matches stays in
+  C), uploads it to the engine as a git bundle and tests exactly C — or, for
+  `--event pull_request`, the merge of C with the freshly fetched base tip.
+  After success C is published, its checks attach to C, and `--create-pr`
+  opens the pull request. The bundle carries only C and, for a pull request,
+  the base tip (never every local ref), streams to disk under a 512 MiB cap,
+  is single-use, and is deleted as soon as the submission is accepted or
+  refused; unsubmitted uploads are swept after an hour. Webhook echoes of the
+  publish are deduplicated against the published head: the branch `push` is
+  skipped once any run published that commit, while the `pull_request` that
+  opening or updating its PR emits is skipped only when a `pull_request` run
+  that tested the base merged in published it, so a branch-only publish still
+  lets the PR's merge test run. `pull_request_target`, manual dispatches and
+  other later events at the same head still run. Auto-PR requires webhook
+  delivery provenance, so a native
+  submission cannot trigger it. The local branch moves only after a
+  successful push, on confirmation, when the working tree still matches the
+  submitted tree by content.
 
 ### Fixed
 
@@ -372,16 +392,21 @@ Releases before v0.27.0 predate the changelog.
   every other origin requires HTTPS. Point a remote emulator or GHES at an
   `https://` URL (with `PRELOOP_GITHUB_CA_FILE` for a private CA) to keep it
   authenticated.
+- **Webhook auto-PR requires delivery provenance**: native submissions cannot
+  trigger it by setting a trust-tier field.
+
+### Changed
+- **The container-engine bootstrap is now maintained as a shell file** at
+  `scripts/docker-start.sh` and syntax-checked before it is sent to guests.
 
 ### Fixed
-- **A restart no longer fails the queued backlog as starved**: the starvation
-  sweep measured every queued job from its ready-enqueue instant, so jobs
-  queued for more than an hour before an engine restart failed with
-  `none appeared within 3600s` seconds after boot — before the restarted
-  pool had registered a single runner (221 jobs on one deploy). Both the
-  3600s ceiling and the 120s grace now start at ready-enqueue or engine boot,
-  whichever is later, so a restart gives the backlog the same window a newly
-  queued job gets.
+- **Failed container-engine starts now include daemon diagnostics** by
+  forwarding the tail of `/var/log/dockerd.log` after both retries fail.
+
+- **Root/sudo guest-script wrapping now handles trailing whitespace**, so
+  file-backed scripts remain valid when inlined.
+
+
 - **Golden workflows pass security checks**: the runtime-drift workflow now
   pins `actions/download-artifact` to a commit from that action's repository,
   and the image-pin comparison passes the PR base branch through an environment
@@ -736,6 +761,19 @@ Releases before v0.27.0 predate the changelog.
   Postgres store, so the next run died on the store's key-fingerprint
   guard. The node key now survives the wipe, restored private (`0600`)
   rather than carrying a saved file's permissions.
+
+- **Container jobs without Git can check out**: `actions/checkout` on a
+  minimal image takes its no-git path, which resolves
+  `{github-server-url}/api/v3` and downloads
+  `GET /repos/{owner}/{repo}/tarball/{ref}`. The engine answered that with a
+  404, so every `container:` job whose first step was a redirected checkout
+  failed. The endpoint now serves the run's own snapshot as a `git archive`
+  shaped like the forge's tarball (one `{owner}-{repo}-{sha}/` top-level
+  directory) and relays other repositories to the forge anonymously, with the
+  guest control socket carrying these two read-only repository shapes. The
+  snapshot archive serves only the requesting run's own commit: a
+  repository-scoped cache holds every cached run's commits, and naming
+  another run's SHA must not archive its tree.
 
 - **Server integration tests no longer fail on a leaked static PAT**:
   `cargo test` shares one process environment across a whole test binary, so

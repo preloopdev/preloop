@@ -1284,11 +1284,10 @@ jobs:
 // dimension at all.
 // ---------------------------------------------------------------------------
 
-/// Secrets must come back as themselves. `SecretString::Serialize` emits the
-/// literal `"<redacted>"`, so any persistence path that does not go through
-/// `WorkflowSubmission::to_request_json` silently substitutes the redaction
-/// marker for every secret and the resumed run authenticates with garbage.
-
+// Secrets must come back as themselves. `SecretString::Serialize` emits the
+// literal `"<redacted>"`, so any persistence path that does not go through
+// `WorkflowSubmission::to_request_json` silently substitutes the redaction
+// marker for every secret and the resumed run authenticates with garbage.
 // ---------------------------------------------------------------------------
 // Durable-store restart contracts.
 //
@@ -1458,7 +1457,7 @@ async fn postgres_concurrent_open_serializes_migrations() {
 
 /// Postgres twin of `store_recovery_preserves_run_secrets`. The redaction bug
 /// lived in the shared serialization path, so both backends have to prove it.
-
+///
 /// Postgres twin of `store_recovery_preserves_run_secrets`: values survive a
 /// restart in the provider's run tier, never in the shared database.
 #[tokio::test]
@@ -1509,13 +1508,12 @@ async fn postgres_recovery_preserves_run_secrets() {
 // Regression tests for the cubic.dev review blockers on PR #27.
 // ---------------------------------------------------------------------------
 
-/// Restart while a reusable-caller node is parked (its concurrency gate is
-/// held by an earlier run) must keep the caller plan and the expansion-only
-/// fields (`github`, `head_sha`, `workflow_ref`) that the scheduler needs to
-/// materialize the callee subtree later. They were `#[serde(skip)]` on
-/// `RunRecord`, so a restart reset them to defaults and the deferred
-/// expansion failed or misbuilt.
-
+// Restart while a reusable-caller node is parked (its concurrency gate is
+// held by an earlier run) must keep the caller plan and the expansion-only
+// fields (`github`, `head_sha`, `workflow_ref`) that the scheduler needs to
+// materialize the callee subtree later. They were `#[serde(skip)]` on
+// `RunRecord`, so a restart reset them to defaults and the deferred
+// expansion failed or misbuilt.
 // ---------------------------------------------------------------------------
 // Regression tests for the cubic.dev review blockers on PR #27.
 // ---------------------------------------------------------------------------
@@ -2389,9 +2387,15 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         shutdown: CancellationToken::new(),
     });
     assert_eq!(
-        crate::github_push::already_published(&shared, "owner/repo", SHA, PUBLISHED_WORKFLOW)
-            .await
-            .expect("dedup read must succeed"),
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            SHA,
+            PUBLISHED_WORKFLOW,
+            "push"
+        )
+        .await
+        .expect("dedup read must succeed"),
         Some(published_id),
         "the echo of our own push must be recognised"
     );
@@ -2400,7 +2404,21 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             &shared,
             "owner/repo",
             SHA,
-            ".github/workflows/other.yml"
+            PUBLISHED_WORKFLOW,
+            "pull_request"
+        )
+        .await
+        .expect("dedup read must succeed"),
+        None,
+        "a branch publish tested the head alone, so the PR's merge test must still run"
+    );
+    assert_eq!(
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            SHA,
+            ".github/workflows/other.yml",
+            "push"
         )
         .await
         .expect("dedup read must succeed"),
@@ -2412,7 +2430,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             &shared,
             "owner/repo",
             "dddddddddddddddddddddddddddddddddddddddd",
-            PUBLISHED_WORKFLOW
+            PUBLISHED_WORKFLOW,
+            "push"
         )
         .await
         .expect("dedup read must succeed"),
@@ -2471,7 +2490,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             &shared,
             "owner/repo",
             MATERIALIZED_SHA,
-            PUBLISHED_WORKFLOW
+            PUBLISHED_WORKFLOW,
+            "push"
         )
         .await
         .expect("dedup read must succeed"),
@@ -2479,9 +2499,15 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         "the webhook echo of a materialized dirty-tree commit must be recognised"
     );
     assert_eq!(
-        crate::github_push::already_published(&shared, "owner/repo", BASE_SHA, PUBLISHED_WORKFLOW)
-            .await
-            .expect("dedup read must succeed"),
+        crate::github_push::already_published(
+            &shared,
+            "owner/repo",
+            BASE_SHA,
+            PUBLISHED_WORKFLOW,
+            "push",
+        )
+        .await
+        .expect("dedup read must succeed"),
         Some(dirty_id),
         "the recorded submission sha (the base commit) still matches, as for any push-back run"
     );
@@ -2599,6 +2625,169 @@ async fn push_intake_reports_no_check_run_for_expandable_placeholders() {
     );
 }
 
+/// A hosted dirty submit's commit exists only in the uploaded bundle until the
+/// client publishes it after CI, and GitHub rejects check runs against a
+/// commit it does not have. Submit-time reporting must therefore defer for a
+/// bundled commit (the push sync reports every job's check against the
+/// published head), while a commit GitHub already has still reports at once.
+#[tokio::test]
+async fn bundled_push_submission_defers_check_runs_until_the_commit_is_published() {
+    use parking_lot::Mutex;
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const WORKFLOW: &str =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+
+    let check_names = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock_app = Router::new().route(
+        "/repos/owner/repo/check-runs",
+        post({
+            let check_names = check_names.clone();
+            move |body: axum::extract::Json<Value>| {
+                let check_names = check_names.clone();
+                async move {
+                    check_names
+                        .lock()
+                        .push(body.0["name"].as_str().unwrap_or_default().to_owned());
+                    Json(json!({"id": 7}))
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "deferral-test-token");
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().join("state")).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Control: a commit GitHub already has reports its queued check at submit,
+    // so the empty result below cannot be a harness that never reports.
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": WORKFLOW,
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/x",
+            "sha": SHA,
+            "push_tree": TREE,
+            "push": {"create_pr": false, "draft_pr": false}
+        }),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while check_names.lock().is_empty() {
+            crate::github::drain_check_run_sender(&state.shared()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a known, published commit reports its queued check at submit");
+    assert_eq!(*check_names.lock(), vec!["build".to_owned()]);
+    check_names.lock().clear();
+
+    // A real commit, bundled the way the CLI bundles it.
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=Defer Test",
+                "-c",
+                "user.email=defer@example.test",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("file.txt"), "bundled\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "submitted"]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    git(&["update-ref", "refs/preloop/submit/t/head", &commit]);
+    let bundle = temp.path().join("submit.bundle");
+    git(&[
+        "bundle",
+        "create",
+        bundle.to_str().unwrap(),
+        "refs/preloop/submit/t/head",
+    ]);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/bundles")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(std::fs::read(&bundle).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let uploaded: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": WORKFLOW,
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/x",
+            "sha": commit,
+            "push_tree": tree,
+            "push": {"create_pr": false, "draft_pr": false},
+            "git_bundle_id": uploaded["bundle_id"],
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Give the detached reporter ample time, draining the sender as the
+    // control above had to.
+    for _ in 0..50 {
+        crate::github::drain_check_run_sender(&state.shared()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        check_names.lock().is_empty(),
+        "no check run may be POSTed for a commit GitHub does not have yet: {:?}",
+        check_names.lock()
+    );
+    let inner = state.test_tx().await;
+    assert!(
+        inner
+            .runs
+            .get(&run_id)
+            .unwrap()
+            .job_check_run_ids
+            .is_empty(),
+        "the push sync reports the checks once the commit is published"
+    );
+}
+
 /// The dedup gate decides whether a push webhook may submit at all,
 /// so a backend failure must surface as an error: `None` means "not
 /// published — submit", which re-runs the workflow push-back already tested.
@@ -2622,6 +2811,7 @@ async fn already_published_fails_closed_when_the_backend_read_fails() {
         "owner/repo",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ".github/workflows/ci.yml",
+        "push",
     )
     .await;
     assert!(

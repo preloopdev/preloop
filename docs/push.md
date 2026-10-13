@@ -51,8 +51,11 @@ diverged branch is refused with instructions — never a force-push.
 - **The work is not repeated.** Landing the commit makes GitHub send a push
 webhook for that very commit, which would otherwise re-run the workflow the
 server just finished and report a second set of check runs over the ones
-push-back published. The server recognises the echo of its own push and
-skips it. The match is deliberately narrow — same commit *and* same workflow
+push-back published. The server recognises the echo of its own push and skips
+it. The `pull_request` echo that opening the PR emits is skipped too, but only
+when a `pull_request` run that tested the merge with the base already published
+that commit; a run that tested the branch alone leaves the PR's merge test to
+run. The match is deliberately narrow — same commit *and* same workflow
 file, and only against a completed run that requested push-back — so a
 workflow you never submitted still runs when the branch lands, and an
 ordinary webhook redelivery is still honoured as the retry it is.

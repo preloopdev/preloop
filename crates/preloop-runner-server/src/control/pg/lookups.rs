@@ -14,7 +14,7 @@ use crate::control::types::{
     ArtifactCatalogRow, CallbackJob, ControlError, NewArtifactRow, QueueStats, RunConcurrency,
     RunDispatchInfo, RunDispatchJob, SubmissionFields, check_key_fingerprint,
 };
-use crate::models::{JobDetail, PushState, StepRecord, TaskAgentJobRequestRecord};
+use crate::models::{JobDetail, PublishedRun, PushState, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1028,36 +1028,47 @@ impl PgBackend {
             .map(|row| row.get(0)))
     }
 
-    /// The completed run whose push already published `sha` for
+    /// Every completed run whose push already published `sha` for
     /// `workflow_path` on `repository`: matched on the submitted sha or the
-    /// push's effective sha. Archive keeps such runs live while the push is
-    /// pending or recent, so this reads live tables only.
+    /// push's effective sha, oldest first. `tested_merge` is whether the run's
+    /// workspace snapshot records a self-built merge. Archive keeps such runs
+    /// live while the push is pending or recent, so this reads live tables only.
     ///
-    /// Statement: `SELECT r.run_id FROM runs r JOIN run_push_states p ..
-    /// JOIN run_submissions s .. WHERE r.status = 'completed' AND repository
-    /// AND workflow_path AND (s.submission->>'sha' = $2 OR p.effective_sha =
-    /// $2) ORDER BY r.run_id LIMIT 1`.
-    pub(super) async fn published_run(
+    /// Statement: `SELECT r.run_id, s.submission->>'event', (s.workspace_snapshot
+    /// ->>'merge') IS NOT NULL FROM runs r JOIN run_push_states p .. JOIN
+    /// run_submissions s .. WHERE r.status = 'completed' AND repository AND
+    /// workflow_path AND (s.submission->>'sha' = $2 OR p.effective_sha = $2)
+    /// ORDER BY r.run_id`.
+    pub(super) async fn published_runs(
         &self,
         repository: &str,
         sha: &str,
         workflow_path: &str,
-    ) -> Result<Option<RunId>, ControlError> {
+    ) -> Result<Vec<PublishedRun>, ControlError> {
         let client = self.reader().await?;
         client
-            .query_opt(
-                "SELECT r.run_id::text FROM runs r \
+            .query(
+                "SELECT r.run_id::text, s.submission->>'event', \
+                 (s.workspace_snapshot->>'merge') IS NOT NULL \
+                 FROM runs r \
                  JOIN run_push_states p ON p.run_id = r.run_id \
                  JOIN run_submissions s ON s.run_id = r.run_id \
                  WHERE r.status = 'completed' AND r.repository = $1 AND r.workflow_path = $3 \
                    AND (s.submission->>'sha' = $2 OR p.effective_sha = $2) \
-                 ORDER BY r.run_id LIMIT 1",
+                 ORDER BY r.run_id",
                 &[&repository, &sha, &workflow_path],
             )
             .await
             .map_err(db)?
-            .map(|row| codec::run_id(row.get(0)))
-            .transpose()
+            .into_iter()
+            .map(|row| -> Result<PublishedRun, ControlError> {
+                Ok(PublishedRun {
+                    run_id: codec::run_id(row.get(0))?,
+                    event: row.get(1),
+                    tested_merge: row.get(2),
+                })
+            })
+            .collect()
     }
 
     /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path)`

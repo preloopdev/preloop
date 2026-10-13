@@ -2184,6 +2184,28 @@ pub async fn submit_run(
     // GitHub may set it. A body cannot assert it into `GITHUB_REF_PROTECTED`
     // or the signed OIDC claim — consumers grant more to a protected ref.
     submission.ref_protected = false;
+    // A hosted dirty submit uploads its commit as a git bundle, and the
+    // unpacked bundle is the workspace under test. A workspace header would
+    // repoint the snapshot at the caller's live checkout (or any server-local
+    // path), so CI could test different bytes than the commit that is
+    // published afterwards. The two are mutually exclusive, and a
+    // body-supplied `local_workspace` is replaced by the bundle's own. The
+    // guard reclaims the unpacked bundle when this submission finishes,
+    // however it ends.
+    let _bundle_workspace = match submission.git_bundle_id.clone() {
+        Some(bundle_id) => {
+            if headers.contains_key("x-preloop-local-workspace") {
+                return Err(ApiError::bad_request(
+                    "git_bundle_id cannot be combined with x-preloop-local-workspace",
+                ));
+            }
+            let workspace =
+                crate::bundles::materialize_bundle(&shared, &bundle_id, &submission.sha).await?;
+            submission.local_workspace = Some(workspace.path().to_string_lossy().into_owned());
+            Some(workspace)
+        }
+        None => None,
+    };
     if let Some(encoded) = headers
         .get("x-preloop-local-workspace")
         .and_then(|value| value.to_str().ok())
@@ -2221,10 +2243,14 @@ pub async fn submit_run(
     // A dirty-tree push has no known head commit at submit time: check runs
     // would attach to the base commit and stay pending forever. The push
     // endpoint reports them against the materialized branch head instead
-    // (`github_push.rs` step 4). Clean-tree pushes know their commit up
-    // front and get queued checks immediately.
+    // (`github_push.rs` step 4). A bundled commit is known, but it exists only
+    // in the uploaded bundle until the client publishes it after CI, and
+    // GitHub rejects check runs against a commit it does not have, so it
+    // defers the same way. Clean-tree pushes know their commit up front and
+    // get queued checks immediately.
     let dirty_push = submission.push.as_ref().is_some_and(|push| push.dirty);
-    let clean_push_checks = push_requested && !dirty_push;
+    let unpublished_commit = submission.git_bundle_id.is_some();
+    let clean_push_checks = push_requested && !dirty_push && !unpublished_commit;
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
         let run_id = accepted.run_id;

@@ -454,6 +454,249 @@ async fn push_events_never_merge() {
     assert_eq!(record.github["sha"], serde_json::json!(fixture.head));
     assert!(record.workspace_snapshot.as_ref().unwrap().merge.is_none());
 }
+/// The bundle the CLI uploads: the submitted commit and the base tip under the
+/// submit namespace, and nothing else. `legacy_main` also bundles a stale local
+/// `main`, as an old `--all` bundle would, to prove the engine never reads it.
+fn submit_bundle(fixture: &MergeFixture, head: &str, legacy_main: bool) -> PathBuf {
+    let workspace = &fixture.workspace;
+    git(
+        workspace,
+        &["update-ref", "refs/preloop/submit/test/head", head],
+    );
+    git(
+        workspace,
+        &[
+            "update-ref",
+            "refs/preloop/submit/test/base/main",
+            &fixture.base,
+        ],
+    );
+    let mut refs = vec![
+        "refs/preloop/submit/test/head",
+        "refs/preloop/submit/test/base/main",
+    ];
+    if legacy_main {
+        // What a checkout that never fetched still calls `main`: the point
+        // the branch was cut from, not the tip origin has now.
+        let branch_point = git(workspace, &["merge-base", &fixture.base, &fixture.head]);
+        git(workspace, &["branch", "-f", "main", &branch_point]);
+        refs.push("refs/heads/main");
+    }
+    let path = fixture.temp.path().join("hosted.bundle");
+    let mut args = vec!["bundle", "create", path.to_str().unwrap()];
+    args.extend(refs);
+    git(workspace, &args);
+    path
+}
+
+/// The dirty commit the CLI creates on top of the feature head.
+fn dirty_commit(fixture: &MergeFixture) -> String {
+    std::fs::write(fixture.workspace.join("hosted-dirty.txt"), "uploaded\n").unwrap();
+    git(&fixture.workspace, &["add", "-A"]);
+    let tree = git(&fixture.workspace, &["write-tree"]);
+    git(
+        &fixture.workspace,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &fixture.head,
+            "-m",
+            "hosted submit",
+        ],
+    )
+}
+
+async fn upload_bundle(app: &Router, bundle: &Path) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/bundles")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(std::fs::read(bundle).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+/// Submit a run, optionally with one extra request header.
+async fn post_run(
+    app: &Router,
+    submission: Value,
+    extra_header: Option<(&str, &str)>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/runs")
+        .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some((name, value)) = extra_header {
+        request = request.header(name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(serde_json::to_vec(&submission).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+/// An uploaded commit bundle supplies both the dirty head and the base branch
+/// used to build a hosted pull-request test merge. The base is the explicit
+/// base tip in the bundle, never a stale local `main` that rode along.
+#[tokio::test]
+async fn hosted_bundle_submission_merges_the_uploaded_dirty_commit() {
+    let fixture = MergeFixture::clean();
+    let (state, app) = fixture.app().await;
+    let head = dirty_commit(&fixture);
+    let bundle = submit_bundle(&fixture, &head, true);
+    let (status, accepted) = upload_bundle(&app, &bundle).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut submission = fixture.submission(false);
+    submission["sha"] = serde_json::json!(head);
+    submission["git_bundle_id"] = accepted["bundle_id"].clone();
+    let accepted_run = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
+    let run_id = accepted_run["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let record = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .expect("run record");
+    let snapshot = record.workspace_snapshot.as_ref().expect("bundle snapshot");
+    let merge = snapshot.merge.as_ref().expect("hosted PR merge");
+    assert_eq!(
+        merge.base_sha, fixture.base,
+        "the merge must use the bundled base tip, not the stale `main` in the bundle"
+    );
+    assert_eq!(merge.head_sha, head);
+    assert_eq!(record.github["sha"], serde_json::json!(merge.sha));
+    assert!(
+        queued_message_for(&inner, run_id)
+            .preloop_snapshot_origin_rewrite
+            .is_some()
+    );
+    let served = fixture.state_dir.join("snapshots").join(run_id);
+    assert_eq!(
+        git(&served, &["log", "--format=%P", "-1", &merge.sha]),
+        format!("{} {head}", fixture.base)
+    );
+    assert_eq!(
+        git(
+            &served,
+            &["show", &format!("{}:hosted-dirty.txt", merge.sha)]
+        ),
+        "uploaded"
+    );
+}
+
+/// A bundle is single-use, and a submission leaves nothing of it behind: not
+/// the upload, not its bare repository, not its workspace.
+#[tokio::test]
+async fn hosted_bundle_is_single_use_and_reclaimed_after_the_submission() {
+    let fixture = MergeFixture::clean();
+    let (_state, app) = fixture.app().await;
+    let head = dirty_commit(&fixture);
+    let (status, accepted) = upload_bundle(&app, &submit_bundle(&fixture, &head, false)).await;
+    assert_eq!(status, StatusCode::OK);
+    let bundle_id = accepted["bundle_id"].as_str().unwrap().to_owned();
+
+    let mut submission = fixture.submission(false);
+    submission["sha"] = serde_json::json!(head);
+    submission["git_bundle_id"] = serde_json::json!(bundle_id);
+    let (status, _) = post_run(&app, submission.clone(), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let store = fixture.state_dir.join("bundles");
+    assert!(
+        !store.join(format!("{bundle_id}.bundle")).exists(),
+        "the upload is consumed by the claim"
+    );
+    // The scratch directory is removed on a spawned task.
+    let scratch = store.join(format!("{bundle_id}.work"));
+    for _ in 0..100 {
+        if !scratch.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !scratch.exists(),
+        "the unpacked bundle must be reclaimed once the submission is done"
+    );
+
+    let (status, body) = post_run(&app, submission, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("already used"),
+        "a replayed bundle id is refused: {body}"
+    );
+}
+
+/// The bundle is the workspace under test: a workspace header would repoint the
+/// engine at another tree, so the combination is refused without spending the
+/// bundle.
+#[tokio::test]
+async fn hosted_bundle_refuses_a_workspace_header_and_stays_usable() {
+    use base64::Engine as _;
+    let fixture = MergeFixture::clean();
+    let (_state, app) = fixture.app().await;
+    let head = dirty_commit(&fixture);
+    let (_, accepted) = upload_bundle(&app, &submit_bundle(&fixture, &head, false)).await;
+
+    let mut submission = fixture.submission(false);
+    submission["sha"] = serde_json::json!(head);
+    submission["git_bundle_id"] = accepted["bundle_id"].clone();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(fixture.workspace.to_string_lossy().as_bytes());
+    let (status, body) = post_run(
+        &app,
+        submission.clone(),
+        Some(("x-preloop-local-workspace", &encoded)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("git_bundle_id"), "{body}");
+
+    let (status, body) = post_run(&app, submission, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused attempt must not have consumed the bundle: {body}"
+    );
+}
+
+/// GitHub cannot hold SHA-256 repositories, so only a full SHA-1 commit id is a
+/// publishable submission; anything else is refused before the bundle is spent.
+#[tokio::test]
+async fn hosted_bundle_requires_a_full_sha1_commit_id() {
+    let fixture = MergeFixture::clean();
+    let (_state, app) = fixture.app().await;
+    let head = dirty_commit(&fixture);
+    let (_, accepted) = upload_bundle(&app, &submit_bundle(&fixture, &head, false)).await;
+
+    for bad in ["a".repeat(64), head[..12].to_owned(), "z".repeat(40)] {
+        let mut submission = fixture.submission(false);
+        submission["sha"] = serde_json::json!(bad);
+        submission["git_bundle_id"] = accepted["bundle_id"].clone();
+        let (status, body) = post_run(&app, submission, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert!(body.to_string().contains("invalid commit SHA"), "{body}");
+    }
+}
 
 /// The push publishes the head tree, even though CI checked out the merge tree.
 #[tokio::test]

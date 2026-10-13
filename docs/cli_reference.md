@@ -58,6 +58,7 @@ Submit a workflow and stream its events until terminal.
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
 | `--pr-draft` | Create new pull requests as drafts (default true; `--pr-draft=false` opens them ready for review) |
 | `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it |
+| `-m, --message <TEXT>` | Commit message for the commit `--push` creates when the working tree is dirty. Without it, `$EDITOR` opens prefilled in an interactive terminal; otherwise a generated message is used |
 
 Behavior notes:
 - **Pausing**: pausing is the SmolVM default in an interactive terminal so you
@@ -65,6 +66,21 @@ Behavior notes:
   Non-interactive runs (pipes, CI, `--detach`) never pause.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
+- **Hosted dirty submits**: `--push` tests a commit made from the working tree
+  (tracked changes and untracked, non-ignored files; a tracked file stays in
+  the commit even if an ignore rule now matches it), then publishes that
+  commit after success. `--create-pr` also opens a PR and reports checks on
+  the tested commit; no check runs are created until the commit is published,
+  since GitHub rejects checks for a commit it does not have. The engine
+  receives a git bundle holding only that commit and its history — plus, for
+  `--event pull_request`, the tip of `origin/<base>` (fetched at submit; the
+  last fetched tip is used, with a warning, when `origin` is unreachable). No
+  other branch, stash or remote-tracking ref is uploaded. A bundle is
+  single-use, capped at 512 MiB, and removed from the engine as soon as the
+  submission has been accepted or refused. The local branch moves only by
+  explicit confirmation, after a successful push, when the tree is unchanged
+  (compared by content, not by `git status`); GitHub `origin` and publish
+  credentials are required.
 - **`pull_request` test merge**: like GitHub, a local `--event pull_request`
   run tests the merge of the pull request's *current* base tip into the head
   (the workspace `HEAD`, or the snapshot commit when the tree is dirty), not

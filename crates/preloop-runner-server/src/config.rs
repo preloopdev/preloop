@@ -1583,7 +1583,7 @@ fn resolve_config_sealing_key_with_store(
                     .set(&reference, &SecretString::new(hex::encode(key)))
                     .with_context(|| format!("writing config-secrets key to {}", store.name()))?;
                 let read_back = store
-                    .get(&reference)
+                    .get_fresh(&reference)
                     .with_context(|| {
                         format!("verifying config-secrets key in {} store", store.name())
                     })?

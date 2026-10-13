@@ -4161,6 +4161,20 @@ async fn process_delivery_payload(
     process_delivery_payload_with_lease(shared, delivery, &lease_lost).await
 }
 
+/// Whether a webhook can be the echo of push-back publishing a tested commit:
+/// the branch `push` itself, or the `pull_request` that opening, reopening or
+/// updating its PR emits. Everything else at the same head is a new request
+/// and must run: a `pull_request_target` run executes the *base* branch's
+/// workflow, which a published head run never exercised, and a manual
+/// dispatch, a label or a comment is the user asking again.
+fn is_publish_echo(event: &str, activity_type: Option<&str>) -> bool {
+    match event {
+        "push" => true,
+        "pull_request" => matches!(activity_type, Some("opened" | "reopened" | "synchronize")),
+        _ => false,
+    }
+}
+
 async fn process_delivery_payload_with_lease(
     shared: &Arc<SharedState>,
     delivery: &WebhookDeliveryRecord,
@@ -4695,36 +4709,50 @@ async fn process_delivery_payload_with_lease(
                 } else {
                     None
                 },
+                git_bundle_id: None,
             };
 
-            // The dedup gate decides whether a run may be submitted at all.
-            // A failed read must abort the delivery (GitHub redelivers), not
-            // fall through to submitting: `None` would re-run CI on the exact
-            // commit push-back already tested and published.
-            let tested_by = match crate::github_push::already_published(
-                shared,
-                &repo_full_name,
-                &submission.sha,
-                submission.workflow_path.as_deref().unwrap_or_default(),
-            )
-            .await
+            // Pull-request workflows check out the merge commit but GitHub
+            // delivers the echo for the head commit. Match the status-check
+            // SHA first, so a publication that tested that merge suppresses
+            // the PR echo too; one that tested the branch alone does not (see
+            // `already_published`). Only what publishing itself causes is an
+            // echo (see `is_publish_echo`); any other event at this head is a
+            // new request and always runs.
+            let echo_sha = submission
+                .status_check_sha
+                .as_deref()
+                .unwrap_or(&submission.sha);
+            let tested_by = if is_publish_echo(&effective.event, effective.activity_type.as_deref())
             {
-                Ok(tested_by) => tested_by,
-                Err(error) => {
-                    error!(
-                        ?error,
-                        sha = %submission.sha,
-                        "failed to read push-back publication state; refusing to submit a possible duplicate"
-                    );
-                    return WebhookOutcome::TransientError(format!(
-                        "failed to read push-back publication state: {error:?}"
-                    ));
+                match crate::github_push::already_published(
+                    shared,
+                    &repo_full_name,
+                    echo_sha,
+                    submission.workflow_path.as_deref().unwrap_or_default(),
+                    &effective.event,
+                )
+                .await
+                {
+                    Ok(tested_by) => tested_by,
+                    Err(error) => {
+                        error!(
+                            ?error,
+                            sha = %echo_sha,
+                            "failed to read push-back publication state; refusing to submit a possible duplicate"
+                        );
+                        return WebhookOutcome::TransientError(format!(
+                            "failed to read push-back publication state: {error:?}"
+                        ));
+                    }
                 }
+            } else {
+                None
             };
             if let Some(tested_by) = tested_by {
                 info!(
                     workflow = %filename,
-                    sha = %submission.sha,
+                    sha = %echo_sha,
                     run_id = %tested_by,
                     "skipping webhook run: this commit was already tested and published by push-back"
                 );
@@ -5977,7 +6005,7 @@ mod tests {
 
         let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
-            budget: Duration::from_millis(100),
+            budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
         };
         let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
