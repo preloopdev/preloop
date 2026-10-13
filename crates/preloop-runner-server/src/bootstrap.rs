@@ -128,11 +128,11 @@ pub struct SelfSignedCert {
 /// Generate an ephemeral self-signed TLS certificate valid for localhost.
 pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    let rcgen::CertifiedKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names)
+    let rcgen::CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names)
         .map_err(|e| anyhow::anyhow!("self-signed cert generation failed: {e}"))?;
     Ok(SelfSignedCert {
         cert: cert.pem(),
-        key: key_pair.serialize_pem(),
+        key: signing_key.serialize_pem(),
     })
 }
 

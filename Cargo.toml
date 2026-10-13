@@ -48,7 +48,7 @@ axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 hyper = "1.0"
 hyper-util = { version = "0.1", features = ["full"] }
-rcgen = "0.13"
+rcgen = "0.14"
 base64 = "0.23"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -101,14 +101,14 @@ opentelemetry-http = { version = "0.33", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.33"
 opentelemetry-semantic-conventions = "0.33"
 uuid = { version = "1.8", features = ["v4", "serde"] }
-aes = "0.8"
-cbc = { version = "0.1", features = ["block-padding"] }
-cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+aes = "0.9"
+cbc = { version = "0.2", features = ["block-padding"] }
+cipher = { version = "0.5", features = ["block-padding", "alloc"] }
 rsa = { version = "0.9", features = ["getrandom"] }
 walkdir = "2.5"
 toml = "1.0"
 regex = "1.10"
-x509-parser = { version = "0.16", features = ["verify"] }
+x509-parser = { version = "0.18", features = ["verify"] }
 similar = "3.0"
 cron = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
