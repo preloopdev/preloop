@@ -316,6 +316,18 @@ pub(crate) fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
     }
 }
 
+/// A submit for one webhook delivery's run of `event` against the fixture's
+/// workflow file. The stored event column and the submission both carry it.
+fn delivery_submit(run_id: RunId, delivery_id: &str, event: &str) -> SubmitRun {
+    let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", 1)]);
+    submit.record.webhook_delivery_id = Some(delivery_id.to_owned());
+    submit.record.event = event.to_owned();
+    let mut submission = (*submit.record.submission).clone();
+    submission.event = event.to_owned();
+    submit.record.submission = Arc::new(submission);
+    submit
+}
+
 fn capabilities() -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
@@ -952,6 +964,52 @@ pub(crate) mod suite {
         assert!(second.existing.is_some());
         assert_eq!(second.run_id, run_id);
         assert_eq!(second.queued_jobs, 0);
+    }
+
+    /// The replay key is (delivery, workflow path, event): one `pull_request`
+    /// delivery produces a `pull_request_target` run and a `pull_request` run
+    /// for the same workflow file, and each event replays only its own run.
+    pub(crate) async fn webhook_replay_is_keyed_by_event(backend: &dyn ControlBackend) {
+        let workflow = ".github/workflows/ci.yml";
+        let target = RunId::new();
+        let first = backend
+            .submit_run(delivery_submit(
+                target,
+                "delivery-both",
+                "pull_request_target",
+            ))
+            .await
+            .unwrap();
+        assert!(first.existing.is_none());
+        assert_eq!(first.run_id, target);
+
+        // The same delivery and workflow file under its other event is a new
+        // run, not a replay of the first.
+        let merge = RunId::new();
+        let second = backend
+            .submit_run(delivery_submit(merge, "delivery-both", "pull_request"))
+            .await
+            .unwrap();
+        assert!(second.existing.is_none());
+        assert_eq!(second.run_id, merge);
+        assert_eq!(
+            backend
+                .run_for_webhook_delivery("delivery-both", workflow, "pull_request")
+                .await
+                .unwrap(),
+            Some(merge)
+        );
+
+        // Redelivering either event replays that event's own run and creates nothing.
+        for (event, run_id) in [("pull_request", merge), ("pull_request_target", target)] {
+            let replay = backend
+                .submit_run(delivery_submit(RunId::new(), "delivery-both", event))
+                .await
+                .unwrap();
+            assert!(replay.existing.is_some(), "{event} replays its own run");
+            assert_eq!(replay.run_id, run_id, "{event}");
+            assert_eq!(replay.queued_jobs, 0, "{event}");
+        }
     }
 
     /// `plan_id` is the request's `agent_job_id` string form (derived, never
@@ -8323,6 +8381,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn webhook_replay_is_keyed_by_event() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::webhook_replay_is_keyed_by_event(&backend).await;
+    }
+
+    #[tokio::test]
     async fn request_lookup_resolves_attempt_correlations() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10079,6 +10145,11 @@ mod lite {
     #[tokio::test]
     async fn webhook_replay_is_idempotent() {
         suite::webhook_replay_is_idempotent(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_replay_is_keyed_by_event() {
+        suite::webhook_replay_is_keyed_by_event(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

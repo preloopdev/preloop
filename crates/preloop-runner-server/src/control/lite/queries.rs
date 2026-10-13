@@ -554,20 +554,21 @@ impl LiteBackend {
         })
     }
 
-    /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path)`
+    /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path, event)`
     /// point read over live runs; `None` when no committed run exists yet.
     pub(crate) async fn run_for_webhook_delivery(
         &self,
         delivery_id: &str,
         workflow_path: &str,
+        event: &str,
     ) -> Result<Option<RunId>, ControlError> {
         self.read(|tx| {
             tx.prepare_cached(
                 "SELECT run_id FROM runs WHERE webhook_delivery_id = ?1 \
-                 AND workflow_path = ?2",
+                 AND workflow_path = ?2 AND event = ?3",
             )
             .map_err(db)?
-            .query_row(params![delivery_id, workflow_path], |row| row.get(0))
+            .query_row(params![delivery_id, workflow_path, event], |row| row.get(0))
             .optional()
             .map(|run| run.map(|run: String| codec::run_id(&run)))
             .map_err(db)

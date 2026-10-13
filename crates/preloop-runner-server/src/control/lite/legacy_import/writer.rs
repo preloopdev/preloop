@@ -419,7 +419,7 @@ pub(crate) fn audit_unmappable(source: &SourceData) -> anyhow::Result<()> {
 pub(crate) fn audit_invariants(source: &SourceData) -> anyhow::Result<()> {
     // runs_number: (namespace, repository, workflow_path, number, attempt).
     let mut numbers: BTreeMap<(String, String, u64, u64), String> = BTreeMap::new();
-    let mut deliveries: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut deliveries: BTreeMap<(String, String, String), String> = BTreeMap::new();
     for run in &source.runs {
         let key = (
             run.record.submission.repository.clone(),
@@ -436,13 +436,19 @@ pub(crate) fn audit_invariants(source: &SourceData) -> anyhow::Result<()> {
             );
         }
         if let Some(delivery) = run.record.webhook_delivery_id.as_deref() {
-            let key = (delivery.to_owned(), run.record.workflow_path_str.clone());
+            let key = (
+                delivery.to_owned(),
+                run.record.workflow_path_str.clone(),
+                run.record.event.clone(),
+            );
             if let Some(previous) = deliveries.insert(key.clone(), run.run_id.clone()) {
                 bail!(
                     "legacy runs {previous} and {} share webhook delivery {delivery:?} for \
-                     workflow {:?}; the control schema requires that pair to be unique",
+                     workflow {:?} and event {:?}; the control schema requires that \
+                     combination to be unique",
                     run.run_id,
-                    run.record.workflow_path_str
+                    run.record.workflow_path_str,
+                    run.record.event
                 );
             }
         }

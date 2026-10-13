@@ -522,6 +522,52 @@ mod tests {
         assert!(initialize_empty_sqlite(&mut conn).is_err());
     }
 
+    /// The previous release keyed `runs_delivery` on (delivery, workflow path),
+    /// which refuses the second event a `pull_request` delivery produces for a
+    /// workflow listing both triggers. The upgrade widens the key to the event in
+    /// place: the existing run survives, that second event is then accepted, and
+    /// the same (delivery, workflow path, event) is still refused.
+    #[test]
+    fn runs_delivery_key_widens_to_the_event_in_place() {
+        const PREVIOUS: i32 = 2026100508;
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        sqlite_runner(Target::Version(PREVIOUS))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO namespaces (namespace_id) VALUES ('default') ON CONFLICT DO NOTHING;",
+        )
+        .unwrap();
+        let insert_run = |conn: &rusqlite::Connection, run_id: &str, number: i64, event: &str| {
+            conn.execute(
+                "INSERT INTO runs (run_id, namespace_id, repository, workflow_path, run_number, \
+                 event, ref, ref_type, head_sha, workflow_ref, status, webhook_delivery_id, origin) \
+                 VALUES (?1, 'default', 'owner/repo', '.github/workflows/ci.yml', ?2, ?3, \
+                 'refs/pull/7/merge', 'pull_request', 'abc123', 'owner/repo/ci.yml@main', \
+                 'queued', 'delivery-1', 'webhook')",
+                rusqlite::params![run_id, number, event],
+            )
+        };
+        insert_run(&conn, "run-1", 1, "pull_request_target").unwrap();
+        assert!(
+            insert_run(&conn, "run-2", 2, "pull_request").is_err(),
+            "the previous key refuses the second event of one delivery"
+        );
+
+        run_sqlite(&mut conn).unwrap();
+
+        insert_run(&conn, "run-2", 2, "pull_request")
+            .expect("the upgraded key admits the delivery's second event");
+        assert!(
+            insert_run(&conn, "run-3", 3, "pull_request").is_err(),
+            "one run per delivery, workflow path and event"
+        );
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(runs, 2, "the upgrade keeps the existing run");
+    }
+
     /// The gate's upgrade case: a populated baseline ("previous release")
     /// database, upgraded in place, keeps every row, gains the new index and
     /// ends structurally identical to a fresh migration run.

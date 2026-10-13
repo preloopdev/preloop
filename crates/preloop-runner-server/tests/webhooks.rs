@@ -1907,6 +1907,7 @@ async fn pull_request_submission_uses_head_sha_not_zeros() {
         json!({
             "workflow_yaml": "on: pull_request\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
             "event": "pull_request",
+            "no_merge": true,
             "repository": "owner/repo",
             "payload": {
                 "action": "opened",
@@ -1946,6 +1947,7 @@ async fn pull_request_submission_uses_short_ref_name_and_job_id() {
         json!({
             "workflow_yaml": "on: pull_request\njobs:\n  build:\n    runs-on: self-hosted\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: echo hi\n",
             "event": "pull_request",
+            "no_merge": true,
             "repository": "owner/repo",
             "payload": {
                 "action": "opened",

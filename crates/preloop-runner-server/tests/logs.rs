@@ -3614,6 +3614,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
                 preloop_gha_protocol::WorkflowSubmission {
                     workflow_yaml: yaml.to_owned(),
                     event: "pull_request".to_owned(),
+                    no_merge: true,
                     repository: "owner/repo".to_owned(),
                     payload,
                     trust_tier: tier.map(str::to_owned),

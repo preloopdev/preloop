@@ -924,13 +924,15 @@ pub(crate) trait ControlBackend: Send + Sync {
         workflow_path: &str,
     ) -> Result<Vec<PublishedRun>, ControlError>;
 
-    /// The committed run a webhook delivery produced (`webhook_delivery_id`
-    /// + `workflow_path` uniqueness), if any. Submit checks it before
-    /// allocating a run number so a replayed delivery does not burn one.
+    /// The committed run a webhook delivery produced for one workflow file and
+    /// event (the `(webhook_delivery_id, workflow_path, event)` uniqueness), if
+    /// any. Submit checks it before allocating a run number so a replayed
+    /// delivery does not burn one.
     async fn run_for_webhook_delivery(
         &self,
         delivery_id: &str,
         workflow_path: &str,
+        event: &str,
     ) -> Result<Option<RunId>, ControlError>;
 
     /// Whether `run_id` currently waits on a concurrency slot
@@ -2829,10 +2831,17 @@ impl ControlBackend for Backend {
         &self,
         delivery_id: &str,
         workflow_path: &str,
+        event: &str,
     ) -> Result<Option<RunId>, ControlError> {
         match self {
-            Self::Sqlite(b) => b.run_for_webhook_delivery(delivery_id, workflow_path).await,
-            Self::Postgres(b) => b.run_for_webhook_delivery(delivery_id, workflow_path).await,
+            Self::Sqlite(b) => {
+                b.run_for_webhook_delivery(delivery_id, workflow_path, event)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.run_for_webhook_delivery(delivery_id, workflow_path, event)
+                    .await
+            }
         }
     }
     async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {

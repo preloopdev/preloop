@@ -2038,9 +2038,10 @@ pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<
 pub struct InnerState {
     /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
     pub metadata_revision: std::sync::atomic::AtomicU64,
-    /// Webhook run submissions currently building outside the state lock.
-    /// Entries prevent a replay from doing the same expensive work twice.
-    pub webhook_run_reservations: BTreeSet<(String, String)>,
+    /// Webhook run submissions currently building outside the state lock, keyed
+    /// by (delivery, workflow path, event). Entries prevent a replay from doing
+    /// the same expensive work twice.
+    pub webhook_run_reservations: BTreeSet<(String, String, String)>,
     pub check_run_mint_locks: BTreeMap<RunId, std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// When each runner session last polled. In-memory only: sessions are
     /// ephemeral and re-created by runners, so nothing is persisted here.
