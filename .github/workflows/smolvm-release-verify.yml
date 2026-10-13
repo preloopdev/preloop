@@ -136,16 +136,13 @@ jobs:
             rm -f "$SOCKET"
           }
           trap cleanup EXIT
-          # The base image once came from versions.toml's `ubuntu_24_04_base`;
-          # that pin is gone with the curated bake. Verify the runtime against
-          # the image the official goldens are actually built from, per arch.
-          case "$(uname -m)" in
-            x86_64) OFFICIAL_KEY=official_runner_image_base_amd64 ;;
-            arm64|aarch64) OFFICIAL_KEY=official_runner_image_base_arm64 ;;
-            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          IMAGE="$(awk -F'"' -v k="^${OFFICIAL_KEY} = " '$0 ~ k { print $2; exit }' official-image.toml)"
-          [ -n "$IMAGE" ] || { echo "$OFFICIAL_KEY missing from official-image.toml" >&2; exit 1; }
+          # This step tests smolvm itself: boot, a socket mount, exec as root.
+          # It runs on a GitHub-hosted disk, which cannot unpack the official
+          # runner image (~17 GiB compressed; extracting its layers into the
+          # 10 GiB `--storage` fails), so boot a small glibc base instead,
+          # digest-pinned. The digest is the multi-arch index, so it serves
+          # x86_64 and arm64 runners alike.
+          IMAGE="mirror.gcr.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
           python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$SOCKET'); s.close()"
           echo "creating machine from $IMAGE"
           smolvm machine create --name "$NAME" \
