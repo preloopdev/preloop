@@ -75,7 +75,11 @@ just dogfood    # E2E with real runner
   `Cargo.toml` manifests that declare the dependency; the guard accepts that
   shape and rejects anything else riding along (source, tests, docs, other
   policy files). Adding a dependency (even a dev-dependency) touches
-  `Cargo.lock`; use that dedicated PR or vendor the need away.
+  `Cargo.lock`; use that dedicated PR or vendor the need away. Exception:
+  a breaking upgrade that cannot compile without source changes may ship
+  them alongside `Cargo.lock` when a maintainer applies the
+  `dependency-migration` label. `Cargo.lock` must stay its only policy
+  file; cargo-vet exemptions still go in their own policy PR.
 
 ## Debugging Dogfood (mandatory)
 
