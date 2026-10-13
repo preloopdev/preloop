@@ -6,6 +6,12 @@
   ],
   "minimumReleaseAge": "7 days",
   "dependencyDashboard": true,
+  "dependencyDashboardApproval": false,
+  "timezone": "America/New_York",
+  "schedule": [
+    "* 7 * * 1"
+  ],
+  "updateNotScheduled": false,
   "packageRules": [
     {
       "description": "Batch 1: every non-breaking update (minor, patch, digest, pin) in one PR. Gated deps keep their own rules below.",
