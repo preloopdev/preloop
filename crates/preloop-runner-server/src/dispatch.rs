@@ -406,8 +406,14 @@ pub async fn rerun_actions_run(
     validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    crate::runs::rerun_run_with_mode(&shared, run_id, crate::control::types::RerunMode::All, None)
-        .await?;
+    crate::runs::rerun_run_with_mode(
+        &shared,
+        run_id,
+        crate::control::types::RerunMode::All,
+        None,
+        Some(identity.actor.clone()),
+    )
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -430,6 +436,7 @@ pub async fn rerun_actions_run_failed(
         run_id,
         crate::control::types::RerunMode::Failed,
         None,
+        Some(identity.actor.clone()),
     )
     .await?;
     Ok(StatusCode::CREATED)
@@ -505,6 +512,7 @@ pub async fn rerun_actions_job(
         run_id,
         crate::control::types::RerunMode::Job(job_id),
         None,
+        Some(identity.actor.clone()),
     )
     .await?;
     Ok(StatusCode::CREATED)
