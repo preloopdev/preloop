@@ -1020,6 +1020,7 @@ pub async fn broker_acquire_job(
         }
     }
     if !token_applied {
+        let mut credential_applied = false;
         // The build wrote empty `isSecret` slots for `github_token` /
         // `system.github.token`; no App installation token was minted for this
         // job (untrusted fork, no App, or a mint that legitimately answered
@@ -1072,6 +1073,7 @@ pub async fn broker_acquire_job(
                         },
                         false,
                     );
+                    credential_applied = true;
                 }
                 None => {
                     message.variables.insert(
@@ -1081,6 +1083,32 @@ pub async fn broker_acquire_job(
                         ),
                     );
                 }
+            }
+        }
+        if !credential_applied {
+            // No forge credential reaches the job: the App has no installation
+            // on this owner and no verified PAT is eligible. `github.token`
+            // stays empty and `actions/checkout` would otherwise fail with
+            // "Input required and not supplied: token". Route only eligible
+            // checkouts through the anonymous forge relay, pinned to a fresh
+            // runtime token. The relay strips that token before forwarding,
+            // while private repositories still fail closed upstream.
+            let runtime_token = shared
+                .state
+                .mint_runtime_token(&message.plan.plan_id, &message.job_id);
+            let rerouted = crate::snapshots::reroute_forge_checkouts(
+                &mut message,
+                &runner_base_url(),
+                &runtime_token,
+                false,
+            );
+            if rerouted > 0 {
+                tracing::info!(
+                    request_id,
+                    rerouted,
+                    repository = %ctx.repository,
+                    "no mintable forge credential at claim; rerouted checkouts through anonymous forge relay"
+                );
             }
         }
     }
