@@ -129,10 +129,11 @@ impl EnvironmentSpec {
 
     /// Resolve a queued job's base image from its `runs-on` labels.
     ///
-    /// Only a label that *names* a hosted Ubuntu image selects the official
-    /// golden. Everything else — `[self-hosted, preloop-cpane]`, `[self-hosted,
-    /// runner-sync]`, any private label set — keeps `configured`, the image
-    /// this pool was built around.
+    /// Only a supported hosted Ubuntu label selects the official golden.
+    /// Today that is `ubuntu-latest`/`ubuntu-24.04`. Everything else —
+    /// `[self-hosted, preloop-cpane]`, `[self-hosted, runner-sync]`, any
+    /// private label set, and the newer `ubuntu-26.04` image — keeps
+    /// `configured`, the image this pool was built around.
     ///
     /// The label set used to resolve to the stock `mirror.gcr.io/library/ubuntu`
     /// pin, which was "curated" and therefore sent every slot into the hosted
@@ -265,6 +266,10 @@ mod tests {
             // The 22.04 archive baseline went with the stock bake: the label
             // must keep the configured image rather than select a 24.04 one.
             vec!["ubuntu-22.04".to_owned()],
+            // GitHub offers 26.04, but preloop has no published 26.04
+            // official golden yet; do not silently rebase a configured pool
+            // onto the 24.04 pack.
+            vec!["ubuntu-26.04".to_owned()],
         ] {
             assert_eq!(
                 EnvironmentSpec::base_for_labels(&labels, CONFIGURED),

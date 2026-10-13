@@ -10104,6 +10104,10 @@ done
             runner_environment_labels("ubuntu:24.04"),
             vec!["ubuntu-24.04", "ubuntu-latest"]
         );
+
+        // No 26.04 golden is published yet, so the pool must not advertise
+        // that hosted label until the image and artifact migration lands.
+        assert!(runner_environment_labels("ubuntu:26.04").is_empty());
     }
 
     #[test]
