@@ -30,6 +30,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **`preloop run --job` secret preflight checks only the jobs it runs**: the
+  `--strict-secrets` check and its warning read every job in the workflow file,
+  so `--job test` aborted over a secret that only an unselected `deploy` job
+  reads. The check now uses the selected job and its `needs:` closure, the same
+  selection the engine applies, from one shared function. An unknown `--job` id
+  is still rejected by the submission, which names it.
+- **`--job` runs every matrix cell a selected job needs**: expansion rewrites a
+  `needs:` on a matrix job to the cells it names (`build (linux)`), and the
+  selection walked those names as if they were jobs. `--job test` therefore
+  dropped the cells of a `build` matrix that `test` needs, and the submission
+  failed with a 500. The selection now maps each named cell back to its base
+  job.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

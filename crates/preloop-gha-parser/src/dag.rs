@@ -200,6 +200,85 @@ pub fn dependency_closure(
     closed
 }
 
+/// A `--job` / `selected_jobs` request that names jobs the plan does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownJobSelection {
+    /// Requested ids the plan does not contain, in request order.
+    pub unknown: Vec<String>,
+    /// Ids the selection accepts, sorted.
+    pub available: Vec<String>,
+}
+
+/// Keep only the jobs a `--job` / `selected_jobs` request runs: the requested
+/// jobs plus their transitive `needs:` closure.
+///
+/// The closure walks base job ids, and every matrix cell of a base job runs
+/// together. Expansion rewrites a `needs:` on a matrix job to the cells it
+/// names (`build (linux)`), so those cells map back to their base job first. A
+/// reusable caller can also be requested by its own matrix-suffixed node
+/// (`call (linux)`). An empty request keeps the whole plan. The submission path
+/// and the CLI's secret preflight both call this, so they run the same jobs.
+pub fn retain_selected_jobs(
+    jobs: &mut Vec<JobPlan>,
+    selected: &[String],
+) -> Result<(), UnknownJobSelection> {
+    use std::collections::BTreeSet;
+
+    if selected.is_empty() {
+        return Ok(());
+    }
+    // Expansion rewrites a `needs:` on a matrix job to the cells it names, so
+    // map each named cell back to its base job before walking the graph.
+    let base_of: BTreeMap<&str, &str> = jobs
+        .iter()
+        .map(|job| (job.id.0.as_str(), job.base_id.as_str()))
+        .collect();
+    let pairs: Vec<(String, Vec<String>)> = jobs
+        .iter()
+        .map(|job| {
+            let needs = job
+                .needs
+                .iter()
+                .map(|need| match base_of.get(need.0.as_str()) {
+                    Some(base) => (*base).to_owned(),
+                    None => need.0.clone(),
+                })
+                .collect();
+            (job.base_id.clone(), needs)
+        })
+        .collect();
+    let mut known: BTreeSet<&str> = pairs.iter().map(|(id, _)| id.as_str()).collect();
+    for requested in selected {
+        let names_caller_node = jobs.iter().any(|job| {
+            let node = job.id.0.as_str();
+            job.reusable_call.is_some()
+                && (node == requested.as_str()
+                    || node
+                        .strip_prefix(requested.as_str())
+                        .is_some_and(|suffix| suffix.starts_with(" (")))
+        });
+        if names_caller_node {
+            known.insert(requested.as_str());
+        }
+    }
+    // Reject the whole selection if any id is unknown: silently dropping a
+    // typo would run a subset of the requested jobs and report success.
+    let unknown: Vec<String> = selected
+        .iter()
+        .filter(|id| !known.contains(id.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(UnknownJobSelection {
+            unknown,
+            available: known.into_iter().map(str::to_owned).collect(),
+        });
+    }
+    let closure = dependency_closure(&needs_graph_from_pairs(&pairs), selected);
+    jobs.retain(|job| closure.contains(&job.base_id));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +667,78 @@ mod tests {
         let closed = dependency_closure(&g, &["unknown".into()]);
         assert!(closed.contains("unknown"));
         assert!(!closed.contains("a"));
+    }
+
+    /// Plans for the selection tests: `test` needs `build`, `build` needs
+    /// `lint`, and `docs` is independent.
+    fn selection_plans() -> Vec<JobPlan> {
+        vec![
+            job_plan("lint", "lint", &[]),
+            job_plan("build", "build", &["lint"]),
+            job_plan("test", "test", &["build"]),
+            job_plan("docs", "docs", &[]),
+        ]
+    }
+
+    fn selected(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn plan_ids(jobs: &[JobPlan]) -> Vec<&str> {
+        jobs.iter().map(|job| job.id.0.as_str()).collect()
+    }
+
+    #[test]
+    fn selection_keeps_the_requested_job_and_its_needs_closure() {
+        let mut jobs = selection_plans();
+        retain_selected_jobs(&mut jobs, &selected(&["test"])).unwrap();
+        assert_eq!(plan_ids(&jobs), ["lint", "build", "test"]);
+    }
+
+    #[test]
+    fn selection_leaves_out_dependents_of_the_requested_job() {
+        let mut jobs = selection_plans();
+        retain_selected_jobs(&mut jobs, &selected(&["build"])).unwrap();
+        assert_eq!(plan_ids(&jobs), ["lint", "build"]);
+    }
+
+    #[test]
+    fn selection_empty_keeps_every_job() {
+        let mut jobs = selection_plans();
+        retain_selected_jobs(&mut jobs, &[]).unwrap();
+        assert_eq!(plan_ids(&jobs), ["lint", "build", "test", "docs"]);
+    }
+
+    #[test]
+    fn selection_of_a_base_job_keeps_all_of_its_matrix_cells() {
+        let mut jobs = vec![
+            job_plan("build (linux)", "build", &[]),
+            job_plan("build (macos)", "build", &[]),
+            job_plan("docs", "docs", &[]),
+        ];
+        retain_selected_jobs(&mut jobs, &selected(&["build"])).unwrap();
+        assert_eq!(plan_ids(&jobs), ["build (linux)", "build (macos)"]);
+    }
+
+    #[test]
+    fn selection_rejects_an_unknown_id_and_keeps_the_plan() {
+        let mut jobs = selection_plans();
+        let error = retain_selected_jobs(&mut jobs, &selected(&["build", "tset"])).unwrap_err();
+        assert_eq!(error.unknown, ["tset"]);
+        assert_eq!(error.available, ["build", "docs", "lint", "test"]);
+        assert_eq!(plan_ids(&jobs), ["lint", "build", "test", "docs"]);
+    }
+
+    #[test]
+    fn selection_follows_needs_on_a_matrix_job_to_all_of_its_cells() {
+        // Expansion rewrites `needs: build` to the cells it names.
+        let mut jobs = vec![
+            job_plan("build (linux)", "build", &[]),
+            job_plan("build (macos)", "build", &[]),
+            job_plan("test", "test", &["build (linux)", "build (macos)"]),
+            job_plan("docs", "docs", &[]),
+        ];
+        retain_selected_jobs(&mut jobs, &selected(&["test"])).unwrap();
+        assert_eq!(plan_ids(&jobs), ["build (linux)", "build (macos)", "test"]);
     }
 }
