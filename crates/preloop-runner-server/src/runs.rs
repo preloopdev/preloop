@@ -1396,6 +1396,12 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             submission.payload = serde_json::json!({});
         }
         let pull_request_base_ref = pull_request_base_branch(&submission);
+        if submission.event == "pull_request"
+            && let Some(base_ref) = pull_request_base_ref.as_ref()
+            && let Some(object) = github.as_object_mut()
+        {
+            object.insert("base_ref".to_owned(), serde_json::json!(base_ref));
+        }
         if let Some(payload) = submission.payload.as_object_mut() {
             let (owner, name) = submission
                 .repository

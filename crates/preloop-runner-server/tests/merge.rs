@@ -11,8 +11,8 @@ mod common;
 use common::*;
 
 use preloop_runner_server::merge_builder::{
-    MergeError, MergeHead, MergeOutcome, MergeRequest, attach_prebuilt_merge, build_merge,
-    prebuilt_merge_record, webhook_merge_source,
+    MergeError, MergeHead, MergeOutcome, MergeRequest, MergeSource, attach_prebuilt_merge,
+    build_merge, fetch_inputs, prebuilt_merge_record, webhook_merge_source,
 };
 use std::path::{Path, PathBuf};
 
@@ -151,13 +151,12 @@ impl MergeFixture {
 async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
     let fixture = MergeFixture::clean();
     let (state, app) = fixture.app().await;
-    let accepted = request_json(
-        &app,
-        Method::POST,
-        "/api/v1/runs",
-        fixture.submission(false),
-    )
-    .await;
+    let mut submission = fixture.submission(false);
+    submission["payload"]["pull_request"]
+        .as_object_mut()
+        .unwrap()
+        .remove("base");
+    let accepted = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     let (merge_sha, message) = {
         let inner = state.test_tx().await;
@@ -179,6 +178,11 @@ async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
             "the run must test the merge, not the branch tip"
         );
         assert_eq!(record.github["sha"], serde_json::json!(merge.sha));
+        assert_eq!(record.github["base_ref"], "main");
+        assert_eq!(
+            record.github["event"]["pull_request"]["base"]["ref"],
+            "main"
+        );
         assert_eq!(record.github["ref"], "refs/pull/7/merge");
         // GitHub's shape: base.sha is the CURRENT base tip, head.sha the head.
         assert_eq!(
@@ -231,6 +235,97 @@ async fn local_pull_request_run_checks_out_the_merge_of_the_current_base_tip() {
         message.preloop_snapshot_commit.as_deref(),
         Some(merge_sha.as_str())
     );
+}
+
+/// A real Git client can fetch and check out the merge through the authenticated
+/// snapshot smart-HTTP endpoint, not just from the backing repository path.
+#[tokio::test]
+async fn local_pull_request_merge_is_fetchable_over_snapshot_http() {
+    let fixture = MergeFixture::clean();
+    let (state, app) = fixture.app().await;
+    let mut submission = fixture.submission(false);
+    submission["workflow_yaml"] = serde_json::json!(
+        "on: pull_request\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo merge\n"
+    );
+    let accepted = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let merge_sha = {
+        let inner = state.test_tx().await;
+        inner
+            .runs
+            .values()
+            .find(|run| run.run_id.to_string() == run_id)
+            .unwrap()
+            .workspace_snapshot
+            .as_ref()
+            .unwrap()
+            .merge
+            .as_ref()
+            .unwrap()
+            .sha
+            .clone()
+    };
+    let acquired = acquire_queued_job(&app, "merge-http-smoke").await;
+    let runtime_token = service_endpoint_token(&acquired).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_app = app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, server_app).await.unwrap();
+    });
+
+    let authorization = format!("http.extraHeader=AUTHORIZATION: Bearer {runtime_token}");
+    let snapshot_url = format!("http://{address}/snapshots/{run_id}");
+    let clone = fixture.temp.path().join("http-job-clone");
+    let clone_output = tokio::process::Command::new("git")
+        .arg("-c")
+        .arg(&authorization)
+        .args(["clone", "--quiet", "--no-checkout"])
+        .arg(&snapshot_url)
+        .arg(&clone)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        clone_output.status.success(),
+        "git clone over snapshot HTTP failed: {}",
+        String::from_utf8_lossy(&clone_output.stderr)
+    );
+
+    let fetch_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .arg("-c")
+        .arg(&authorization)
+        .args(["fetch", "--quiet", "--no-tags", "--depth=1", "origin"])
+        .arg(&merge_sha)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        fetch_output.status.success(),
+        "git fetch of the merge commit over snapshot HTTP failed: {}",
+        String::from_utf8_lossy(&fetch_output.stderr)
+    );
+    git(&clone, &["checkout", "--quiet", "--detach", &merge_sha]);
+
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]), merge_sha);
+    let commit_object = git(&clone, &["cat-file", "-p", "HEAD"]);
+    let parents = commit_object
+        .lines()
+        .filter_map(|line| line.strip_prefix("parent "))
+        .collect::<Vec<_>>();
+    assert_eq!(parents, vec![fixture.base.as_str(), fixture.head.as_str()]);
+    for (path, expected) in [
+        ("base-only.txt", "base\n"),
+        ("base-new.txt", "new base\n"),
+        ("head-only.txt", "head\n"),
+        ("shared.txt", "shared base\n"),
+    ] {
+        assert_eq!(std::fs::read_to_string(clone.join(path)).unwrap(), expected);
+    }
+    server.abort();
 }
 
 /// A conflicted pull request fails before any job is queued, naming the
@@ -360,13 +455,52 @@ async fn push_events_never_merge() {
     assert!(record.workspace_snapshot.as_ref().unwrap().merge.is_none());
 }
 
+/// The push publishes the head tree, even though CI checked out the merge tree.
+#[tokio::test]
+async fn push_after_local_pr_merge_records_head_tree_not_merge_tree() {
+    let fixture = MergeFixture::clean();
+    let (state, app) = fixture.app().await;
+    let mut submission = fixture.submission(false);
+    submission["sha"] = serde_json::json!(fixture.head);
+    submission["push"] = serde_json::json!({
+        "create_pr": true,
+        "draft_pr": true,
+        "dirty": true
+    });
+
+    let accepted = request_json(&app, Method::POST, "/api/v1/runs", submission).await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let record = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .expect("push run record");
+    let snapshot = record.workspace_snapshot.as_ref().unwrap();
+    let merge = snapshot.merge.as_ref().unwrap();
+    let head_tree_rev = format!("{}^{{tree}}", fixture.head);
+    let merge_tree_rev = format!("{}^{{tree}}", merge.sha);
+    let head_tree = git(&fixture.workspace, &["rev-parse", &head_tree_rev]);
+    let served = fixture.state_dir.join("snapshots").join(run_id);
+    let merge_tree = git(&served, &["rev-parse", &merge_tree_rev]);
+
+    assert_ne!(head_tree, merge_tree, "fixture must distinguish H from M");
+    assert_eq!(snapshot.tree_sha, head_tree);
+    assert_eq!(
+        record.submission.push_tree.as_deref(),
+        Some(head_tree.as_str()),
+        "push-back must verify the head tree, not the merge tree"
+    );
+}
+
 /// The shared builder contract: fetch + merge + serve, deterministic, and the
 /// `prebuilt_merge` record is validated before anything is served.
 #[tokio::test]
 async fn prebuilt_merge_is_built_served_and_validated() {
     let fixture = MergeFixture::clean();
     std::fs::create_dir_all(&fixture.state_dir).unwrap();
-    let state = AppState::new(fixture.state_dir.clone()).await.unwrap();
+    let mut state = AppState::new(fixture.state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(fixture.workspace.clone());
     let shared = state.shared();
 
     // Build the merge in an engine mirror. The fixture's bare origin is a
@@ -438,6 +572,12 @@ async fn prebuilt_merge_is_built_served_and_validated() {
     let run_app = app(state.clone(), CancellationToken::new());
     let mut submission = fixture.submission(false);
     submission["prebuilt_merge"] = serde_json::to_value(&record).unwrap();
+    submission["base_ref"] = serde_json::Value::Null;
+    submission["filter_branch"] = serde_json::Value::Null;
+    submission["payload"]["pull_request"]
+        .as_object_mut()
+        .unwrap()
+        .remove("base");
     let accepted = request_json(&run_app, Method::POST, "/api/v1/runs", submission).await;
     let submitted_run_id = accepted["run_id"].as_str().unwrap();
     let inner = state.test_tx().await;
@@ -486,6 +626,32 @@ async fn prebuilt_merge_is_built_served_and_validated() {
     assert!(matches!(error, MergeError::InvalidPrebuilt(_)), "{error:?}");
 }
 
+/// A malformed caller-supplied SHA is rejected before it reaches `git fetch`.
+#[tokio::test]
+async fn fetch_inputs_rejects_a_non_object_id_head() {
+    let fixture = MergeFixture::clean();
+    let source = MergeSource {
+        mirror: fixture.state_dir.join("sha-validation.git"),
+        fetch_url: Some(fixture.origin.to_string_lossy().into_owned()),
+        token: None,
+        forge_host: None,
+    };
+    let request = MergeRequest {
+        repository: "owner/repo".to_owned(),
+        pull_request_number: None,
+        base_branch: "main".to_owned(),
+        head: MergeHead::Commit("not-a-full-object-id".to_owned()),
+    };
+
+    let error = fetch_inputs(&source, &request).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MergeError::MissingCommit { ref sha, .. } if sha == "not-a-full-object-id"
+        ),
+        "malformed head must fail as a missing commit, got {error:?}"
+    );
+}
 /// The webhook fallback's mirror is prepared on demand and reused.
 #[tokio::test]
 async fn webhook_merge_source_prepares_a_reusable_mirror() {
