@@ -114,7 +114,7 @@ cron = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 utoipa = { version = "5", features = ["uuid", "chrono"] }
-cap-std = "3.4"
+cap-std = "4.0"
 keyring = "4.2"
 
 command-group = { version = "5", features = ["with-tokio"] }
