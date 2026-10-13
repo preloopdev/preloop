@@ -103,7 +103,7 @@ opentelemetry-semantic-conventions = "0.32"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["block-padding"] }
-cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+cipher = { version = "0.5", features = ["block-padding", "alloc"] }
 rsa = "0.9"
 walkdir = "2.5"
 toml = "0.8"

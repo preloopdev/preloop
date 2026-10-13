@@ -2622,7 +2622,7 @@ dependencies = [
  "anyhow",
  "base64",
  "cbc 0.1.2",
- "cipher 0.4.4",
+ "cipher 0.5.2",
  "indexmap",
  "proptest",
  "rand 0.8.6",
