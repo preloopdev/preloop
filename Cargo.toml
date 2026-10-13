@@ -106,7 +106,7 @@ cbc = { version = "0.1", features = ["block-padding"] }
 cipher = { version = "0.4", features = ["block-padding", "alloc"] }
 rsa = "0.9"
 walkdir = "2.5"
-toml = "0.8"
+toml = "0.9"
 regex = "1.10"
 x509-parser = { version = "0.16", features = ["verify"] }
 similar = "2.5"
