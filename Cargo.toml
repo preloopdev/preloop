@@ -110,7 +110,7 @@ toml = "0.8"
 regex = "1.10"
 x509-parser = { version = "0.16", features = ["verify"] }
 similar = "2.5"
-cron = "0.12"
+cron = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 utoipa = { version = "5", features = ["uuid", "chrono"] }
