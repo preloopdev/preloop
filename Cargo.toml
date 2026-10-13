@@ -88,7 +88,7 @@ tokio-tungstenite = { version = "0.23", default-features = false, features = ["r
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_custom_reader"] }
 # OTLP/HTTP only — never the tonic/gRPC stack (plan §435-437, §1289). Reuses
