@@ -129,6 +129,12 @@ the submission for GitHub event context (`github.ref` and trigger filters), but
 the YAML is fetched from the commit SHA so a branch update cannot select a
 different workflow during delivery.
 
+For `pull_request` and `pull_request_review` runs the checked-out commit is the
+pull request's test merge, not its head, so the workflow files come from that
+merge, as they do for GitHub's own `pull_request` runs. When `preloop` builds
+the merge itself, the merge exists only in its mirror, and the files are read
+from there. Only if that read fails are the head's copies used, with a warning.
+
 1. **Local Filesystem (Offline/Dev Mode)**:
    If `PRELOOP_LOCAL_WORKSPACE` is configured, `preloop` reads the
    `.github/workflows/` directory from the event's commit when that commit is
