@@ -34,7 +34,7 @@ reqwest = { workspace = true }
 # calls. Already in the tree via command-group. Unix-only — non-Unix builds
 # report the error and the caller continues without the space check.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27", features = ["fs"] }
+nix = { version = "0.31", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
