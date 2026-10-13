@@ -58,7 +58,7 @@ zip.workspace = true
 # the tree via command-group. Unix-only — `nix` does not build on Windows,
 # where the `cfg(not(unix))` paths in `process.rs` apply instead.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
