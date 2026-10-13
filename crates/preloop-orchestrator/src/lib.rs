@@ -3018,7 +3018,7 @@ impl GoldenBudget {
     /// another golden.
     fn try_reserve(&self) -> Option<GoldenReservation<'_>> {
         self.free
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                 free.checked_sub(1)
             })
             .ok()
