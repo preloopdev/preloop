@@ -49,7 +49,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 hyper = "1.0"
 hyper-util = { version = "0.1", features = ["full"] }
 rcgen = "0.13"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
