@@ -44,7 +44,7 @@ jobs:
           lfs: false
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
       - name: Use the image's preinstalled LLD
         # The official image ships versioned LLVM tools; `-fuse-ld=lld` needs
         # the unversioned name that `apt install lld` used to provide. Link
