@@ -938,7 +938,7 @@ impl PgBackend {
     ///
     /// Statement (twice, id then name): `SELECT run_id, job_id FROM (<live
     /// jobs of completed runs> UNION ALL <job_history>) c WHERE <match>
-    /// ORDER BY (run_id = $details) DESC, run_id LIMIT 1`.
+    /// ORDER BY (run_id::text = $details) DESC, run_id LIMIT 1`.
     pub(super) async fn check_run_target(
         &self,
         check_run_id: u64,
@@ -983,7 +983,7 @@ impl PgBackend {
             .query_opt(
                 &format!(
                     "{CANDIDATES} WHERE check_run_id = $4 \
-                     ORDER BY COALESCE(run_id = $3::text, false) DESC, run_id LIMIT 1"
+                     ORDER BY COALESCE(run_id::text = $3::text, false) DESC, run_id LIMIT 1"
                 ),
                 &[&repository, &head_sha, &details, &(check_run_id as i64)],
             )
@@ -995,7 +995,7 @@ impl PgBackend {
                 .query_opt(
                     &format!(
                         "{CANDIDATES} WHERE job_id = $4 OR display_name = $4 \
-                         ORDER BY COALESCE(run_id = $3::text, false) DESC, run_id LIMIT 1"
+                         ORDER BY COALESCE(run_id::text = $3::text, false) DESC, run_id LIMIT 1"
                     ),
                     &[&repository, &head_sha, &details, &name],
                 )

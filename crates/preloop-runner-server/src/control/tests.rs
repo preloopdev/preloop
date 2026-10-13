@@ -3657,6 +3657,107 @@ pub(crate) mod suite {
         );
     }
 
+    /// `check_run_target` for one rerequest, against the fixture repository
+    /// and head sha every `submit_run` run shares.
+    async fn rerequest_target(
+        backend: &dyn ControlBackend,
+        check_run_id: u64,
+        name: Option<&str>,
+        details: Option<RunId>,
+    ) -> Option<(RunId, JobId)> {
+        backend
+            .check_run_target(check_run_id, "owner/repo", Some("abc123"), name, details)
+            .await
+            .unwrap()
+    }
+
+    /// A check-run rerequest resolves to a job of a *completed* run: an exact
+    /// check-run id hit first, else the check-run name, with `details_run_id`
+    /// winning ties between runs that share a head sha. A live run is never a
+    /// target. Every `details_run_id` binding must be accepted by the
+    /// backend: Postgres once compared its `uuid` run id to `text` in the
+    /// tie-break ordering, which failed every rerequest with a 500.
+    pub(crate) async fn check_run_target_resolves_completed_runs(backend: &dyn ControlBackend) {
+        let build = JobId("build".to_owned());
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        for (run_id, check_run_id) in [(run_a, 11), (run_b, 12)] {
+            backend
+                .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+                .await
+                .unwrap();
+            assert!(
+                backend
+                    .set_job_check_run(run_id, &build, check_run_id)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            rerequest_target(backend, 11, Some("build"), None).await,
+            None,
+            "a run that has not completed is not a rerequest target"
+        );
+
+        for run_id in [run_a, run_b] {
+            backend
+                .complete_job(JobCompletionInput {
+                    run_id,
+                    job_id: build.clone(),
+                    agent_job_id: None,
+                    status: ExecutionStatus::Success,
+                    outputs: BTreeMap::new(),
+                    runner_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // An exact check-run id is unambiguous whichever run `details` prefers.
+        assert_eq!(
+            rerequest_target(backend, 12, None, None).await,
+            Some((run_b, build.clone()))
+        );
+        assert_eq!(
+            rerequest_target(backend, 12, None, Some(run_a)).await,
+            Some((run_b, build.clone()))
+        );
+        // With no id hit the name matches both runs; `details_run_id` decides.
+        assert_eq!(
+            rerequest_target(backend, 99, Some("build"), Some(run_a)).await,
+            Some((run_a, build.clone()))
+        );
+        assert_eq!(
+            rerequest_target(backend, 99, Some("build"), Some(run_b)).await,
+            Some((run_b, build.clone()))
+        );
+        assert!(
+            rerequest_target(backend, 99, Some("build"), None)
+                .await
+                .is_some_and(|(run_id, _)| run_id == run_a || run_id == run_b)
+        );
+
+        // Other repositories, other head shas and unknown names resolve nothing.
+        assert_eq!(
+            backend
+                .check_run_target(11, "owner/other", Some("abc123"), Some("build"), None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .check_run_target(11, "owner/repo", Some("deadbeef"), Some("build"), None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            rerequest_target(backend, 99, Some("missing"), None).await,
+            None
+        );
+    }
+
     /// Drain the projector until a short batch, returning rows consumed.
     async fn project_all_check_run_events(backend: &dyn ControlBackend, owner: &str) -> usize {
         let mut total = 0;
@@ -8628,6 +8729,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn check_run_target_resolves_completed_runs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::check_run_target_resolves_completed_runs(&backend).await;
+    }
+
+    #[tokio::test]
     async fn dispatch_info_flags_expandable_placeholders() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10331,6 +10440,11 @@ mod lite {
     #[tokio::test]
     async fn check_run_mapping() {
         suite::check_run_mapping(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn check_run_target_resolves_completed_runs() {
+        suite::check_run_target_resolves_completed_runs(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

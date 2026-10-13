@@ -30,6 +30,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **GitHub "Re-run" works on a Postgres-backed engine**: resolving a
+  `check_run` rerequest ordered its candidates by `run_id = $n::text`, but
+  the run id is a `uuid` column in Postgres, so the statement failed at plan
+  time (`operator does not exist: uuid = text`). Every rerequest answered 500
+  and was dead-lettered after six silent retries; the SQLite backend was
+  unaffected. The tie-break now compares `run_id::text`, and a shared-suite
+  test runs the lookup against both backends.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
