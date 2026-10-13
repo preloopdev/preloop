@@ -1193,21 +1193,17 @@ jobs:
     assert_eq!(run_record.submission.event, "pull_request");
     assert_eq!(run_record.submission.git_ref, "refs/pull/42/head");
     assert_eq!(run_record.job_check_run_ids.len(), 1);
-    // The local workspace now serves the merge commit as `github.sha`, while
-    // the pull-request event keeps the head SHA that GitHub supplied.
+    // A pull_request payload has no `after`; preserve its head SHA for status
+    // checks even though a local snapshot may use a synthetic checkout SHA.
     assert_eq!(
-        run_record.github["event"]["pull_request"]["head"]["sha"],
-        serde_json::json!(head_sha),
-        "pull_request head sha must stay in the event payload",
+        run_record.submission.status_check_sha.as_deref(),
+        Some(head_sha.as_str()),
+        "pull_request head sha must drive check reporting",
     );
     assert_eq!(
         run_record.github["sha"],
         serde_json::json!(run_record.head_sha),
-        "github.sha must be the locally built merge commit",
-    );
-    assert_ne!(
-        run_record.head_sha, head_sha,
-        "the local pull-request run must check out the merge commit",
+        "github.sha must identify the checked-out snapshot",
     );
 }
 
