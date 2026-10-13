@@ -184,6 +184,36 @@ pub(crate) fn stale_claims(source: &SourceData) -> BTreeMap<i64, ExecutionStatus
     settled
 }
 
+/// Unfinished jobs whose queue row the legacy store never persisted, keyed by
+/// (run id, job id), with whether the run is already finished. Such a job has
+/// no spec left in the source, so nothing can run it again. Its attempt still
+/// names it, which is how it is found. A claimed job that was in flight when
+/// the engine stopped has this shape: a claim consumes the job's queue row.
+pub(crate) fn orphaned_jobs(source: &SourceData) -> BTreeMap<(String, String), bool> {
+    let queued: BTreeSet<(&str, &str)> = source
+        .jobs
+        .iter()
+        .map(|job| (job.run_id.as_str(), job.job.job_id.0.as_str()))
+        .collect();
+    let attempted: BTreeSet<(&str, &str)> = source
+        .attempts
+        .iter()
+        .map(|attempt| (attempt.run_id.as_str(), attempt.job_id.as_str()))
+        .collect();
+    let mut orphans = BTreeMap::new();
+    for run in &source.runs {
+        let finished = run_state(&run.record).0 == "completed";
+        for (job_id, status) in &run.record.jobs {
+            let key = (run.run_id.as_str(), job_id.0.as_str());
+            if terminal(*status) || queued.contains(&key) || !attempted.contains(&key) {
+                continue;
+            }
+            orphans.insert((run.run_id.clone(), job_id.0.clone()), finished);
+        }
+    }
+    orphans
+}
+
 /// Concurrency gate rows in the runtime snapshot, counted by the snapshot key
 /// they live under. Every gate family is run-scoped (`Holder::{Run,Job,JobSet}`
 /// all name a run; `JobSetId` is `{run_id, …}`; `run_concurrency` and
@@ -270,7 +300,8 @@ fn holder_run_id(holder: &serde_json::Value) -> Option<String> {
 }
 
 /// Find work that must not be imported silently: claimed-but-unfinished
-/// attempts, session bindings to them, and live concurrency gate state.
+/// attempts, session bindings to them, unfinished jobs whose queue row is gone
+/// (see [`orphaned_jobs`]), and live concurrency gate state.
 /// Stale claims (see [`stale_claims`]) are history and are not listed; the
 /// writer reports their settlement.
 pub(crate) fn audit_active(source: &SourceData) -> Vec<ActiveItem> {
@@ -293,6 +324,18 @@ pub(crate) fn audit_active(source: &SourceData) -> Vec<ActiveItem> {
                 ),
             });
         }
+    }
+    for ((run_id, job_id), run_finished) in orphaned_jobs(source) {
+        if run_finished {
+            continue;
+        }
+        items.push(ActiveItem {
+            kind: "orphaned-job".to_owned(),
+            id: format!("{run_id}/{job_id}"),
+            detail: "unfinished job with no persisted queue row; its spec is not in the \
+                     source, so it cannot run again"
+                .to_owned(),
+        });
     }
     for (session, request) in &source.session_active {
         if settled.contains_key(request) {
@@ -693,6 +736,8 @@ pub(crate) fn write_import(
     let stale_gates = gate_state(source).stale;
     let mut stale_settled = 0_u64;
 
+    // Unfinished jobs whose queue row is gone; read before the sources are taken.
+    let orphans = orphaned_jobs(source);
     let runs = std::mem::take(&mut source.runs);
     let jobs = std::mem::take(&mut source.jobs);
     let attempts = std::mem::take(&mut source.attempts);
@@ -783,6 +828,8 @@ pub(crate) fn write_import(
     let mut derived_conclusions = 0_u64;
     let mut drained_claims = 0_u64;
     let mut settled_claims = 0_u64;
+    let mut live_orphans: Vec<String> = Vec::new();
+    let mut history_orphans: Vec<String> = Vec::new();
     for run in runs {
         if run.record.conclusion.as_deref().is_some_and(|conclusion| {
             !["success", "failure", "cancelled", "skipped", "timed_out"].contains(&conclusion)
@@ -890,6 +937,9 @@ pub(crate) fn write_import(
             .collect();
         let run_order = record.created_at.timestamp_micros();
         let mut any_active_job = false;
+        // Set when an orphan of this run is settled as cancelled: once no other
+        // job is active, the run settles too (see the run settlement below).
+        let mut live_orphan_settled = false;
 
         for (fallback_order, job_id) in job_ids.iter().enumerate() {
             let job_key = JobId(job_id.clone());
@@ -910,8 +960,20 @@ pub(crate) fn write_import(
                     && !unclaimed(&attempt.snapshot)
                     && !stale.contains_key(&attempt.request_id)
             });
+            // An orphan has no queue row, so no spec is left to run the job
+            // again: it settles as cancelled under every policy. A live run
+            // refuses by default (see `audit_active`); a finished one is history.
+            let orphan = orphans.get(&(run.run_id.clone(), job_id.clone())).copied();
+            if orphan == Some(false) && policy == ActivePolicy::Refuse {
+                bail!(
+                    "legacy run {} has unfinished job {job_id} with no persisted queue row; \
+                     its spec is not in the source, so it cannot run again. Rerun with \
+                     --active=cancel or --active=requeue to settle it",
+                    run.run_id
+                );
+            }
             let drain_cancel = policy == ActivePolicy::Cancel && active_claim.is_some();
-            let job_status = if drain_cancel && !terminal(status) {
+            let job_status = if orphan.is_some() || (drain_cancel && !terminal(status)) {
                 ExecutionStatus::Cancelled
             } else if status == ExecutionStatus::Pending {
                 // Legacy `pending` means "waiting on a concurrency group";
@@ -922,6 +984,14 @@ pub(crate) fn write_import(
                 status
             };
             any_active_job |= !terminal(job_status);
+            match orphan {
+                Some(false) => {
+                    live_orphans.push(format!("{}/{job_id}", run.run_id));
+                    live_orphan_settled = true;
+                }
+                Some(true) => history_orphans.push(format!("{}/{job_id}", run.run_id)),
+                None => {}
+            }
             let queue_state = if terminal(job_status) {
                 "none".to_owned()
             } else if active_claim.is_some() && policy != ActivePolicy::Requeue {
@@ -1041,7 +1111,9 @@ pub(crate) fn write_import(
                     )?;
                     imported.jobs += 1;
                     imported.job_specs += 1;
-                    synthesized_jobs += 1;
+                    if orphan.is_none() {
+                        synthesized_jobs += 1;
+                    }
                 }
             }
 
@@ -1092,9 +1164,10 @@ pub(crate) fn write_import(
                 if stale_result.is_some() {
                     stale_settled += 1;
                 }
-                if attempt.snapshot.result.is_none()
+                let open = attempt.snapshot.result.is_none() && stale_result.is_none();
+                if open
+                    && orphan.is_none()
                     && !unclaimed(&attempt.snapshot)
-                    && stale_result.is_none()
                     && policy != ActivePolicy::Refuse
                 {
                     match policy {
@@ -1103,10 +1176,10 @@ pub(crate) fn write_import(
                         ActivePolicy::Refuse => {}
                     }
                 }
-                let cancelled = drain_cancel
-                    && attempt.snapshot.result.is_none()
-                    && !unclaimed(&attempt.snapshot)
-                    && stale_result.is_none();
+                // An orphan's open attempts settle with their job, claimed or not:
+                // nothing can run them again.
+                let cancelled =
+                    open && (orphan.is_some() || (drain_cancel && !unclaimed(&attempt.snapshot)));
                 let result = stale_result.or(if cancelled {
                     Some(ExecutionStatus::Cancelled)
                 } else {
@@ -1230,9 +1303,9 @@ pub(crate) fn write_import(
             )?;
         }
         // Every job of the run was cancelled or already terminal: the run
-        // itself is settled (a cancel drain must not leave a lifeless
-        // `in_progress` run behind).
-        if policy == ActivePolicy::Cancel && !any_active_job {
+        // itself is settled (a cancel drain or a settled orphan must not leave
+        // a lifeless `in_progress` run behind).
+        if (policy == ActivePolicy::Cancel || live_orphan_settled) && !any_active_job {
             tx.execute(
                 "UPDATE runs SET status = 'completed', \
                      conclusion = COALESCE(conclusion, 'cancelled'), \
@@ -1264,6 +1337,28 @@ pub(crate) fn write_import(
         notes.push(format!(
             "{settled_claims} claimed attempts were settled as cancelled by the explicit \
              --active=cancel policy"
+        ));
+    }
+    if !live_orphans.is_empty() {
+        let reason = if policy == ActivePolicy::Requeue {
+            "--active=requeue cannot rebuild a job without its spec, so they were settled \
+             as cancelled instead"
+        } else {
+            "they were settled as cancelled by --active=cancel"
+        };
+        notes.push(format!(
+            "{} unfinished job(s) had no queue row in the legacy store, so no spec survives \
+             to run them again; {reason} ({}); re-trigger the workflow to run them again",
+            live_orphans.len(),
+            live_orphans.join(", ")
+        ));
+    }
+    if !history_orphans.is_empty() {
+        notes.push(format!(
+            "{} unfinished job(s) on finished runs had no queue row in the legacy store and \
+             were settled as cancelled history ({}); no --active override was needed",
+            history_orphans.len(),
+            history_orphans.join(", ")
         ));
     }
     if stale_settled > 0 {

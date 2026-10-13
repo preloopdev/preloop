@@ -50,6 +50,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **`preloop store import-legacy` no longer refuses a store whose unfinished job
+  lost its queue row** (#580). A job the legacy store still lists as unfinished,
+  with an attempt that names it but no `jobs` row, bailed with "no persisted
+  queue row" under every `--active` policy. The legacy `job_requests` blob holds
+  only the attempt's snapshot, not the job spec, so the spec cannot be rebuilt
+  and nothing is fabricated. Such a job is imported as a settled cancelled job
+  (no queue row, nothing dispatchable), its open attempts are cancelled, and the
+  report names each one. `--active=refuse` (default) lists a live one and aborts;
+  a job on a finished run is settled as history. `--active=requeue` cannot
+  requeue a job without its spec, so it settles these as cancelled too rather
+  than leaving the run wedged in progress.
+
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

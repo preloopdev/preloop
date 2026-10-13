@@ -103,7 +103,8 @@ struct ImportLegacyArgs {
 
     /// Policy for work that was in flight when the legacy server stopped:
     /// `refuse` (default, list it and abort), `requeue` (release claims and
-    /// requeue), or `cancel` (settle it as cancelled).
+    /// requeue; a job whose spec was never persisted is settled as cancelled
+    /// instead), or `cancel` (settle it as cancelled).
     #[arg(long, default_value = "refuse", value_name = "POLICY")]
     active: String,
 

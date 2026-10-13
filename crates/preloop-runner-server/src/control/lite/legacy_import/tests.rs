@@ -23,27 +23,30 @@ struct Imported {
 }
 
 fn import(spec: &LegacyFixtureSpec) -> Imported {
-    let dir = tempfile::tempdir().unwrap();
+    import_active(spec, ActivePolicy::Refuse).unwrap()
+}
+
+fn import_active(spec: &LegacyFixtureSpec, active: ActivePolicy) -> anyhow::Result<Imported> {
+    let dir = tempfile::tempdir()?;
     let source = dir.path().join("preloop.db");
-    let fixture = write_legacy_fixture(&source, KEY, spec).unwrap();
+    let fixture = write_legacy_fixture(&source, KEY, spec)?;
     let state_dir = dir.path().join("state");
-    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::create_dir_all(&state_dir)?;
     let target = state_dir.join("preloop.db");
     let report = run_import(&ImportOptions {
         source,
         target: target.clone(),
         state_dir: state_dir.clone(),
         key: KEY.to_vec(),
-        active: ActivePolicy::Refuse,
-    })
-    .unwrap();
-    Imported {
+        active,
+    })?;
+    Ok(Imported {
         _dir: dir,
         target,
         state_dir,
         fixture,
         report,
-    }
+    })
 }
 
 #[tokio::test]
@@ -414,4 +417,236 @@ async fn imported_database_rejects_the_legacy_source_itself() {
     let _fixture = write_legacy_fixture(&source, KEY, &spec).unwrap();
     // The backend must refuse the legacy layout rather than half-read it.
     assert!(LiteBackend::open(&source, false, false, Duration::from_secs(300)).is_err());
+}
+
+/// Unfinished jobs whose queue row the legacy store never persisted have no
+/// spec left to run them again. Both drains settle them as cancelled, with
+/// their open attempts, and the report names each one: `requeue` cannot
+/// rebuild a job it has no spec for.
+#[test]
+fn orphaned_jobs_settle_as_cancelled_under_cancel_and_requeue() {
+    for active in [ActivePolicy::Cancel, ActivePolicy::Requeue] {
+        let spec = LegacyFixtureSpec {
+            include_active_claim: false,
+            include_orphaned_jobs: true,
+            include_orphaned_on_finished_run: true,
+            ..Default::default()
+        };
+        let imported = import_active(&spec, active)
+            .unwrap_or_else(|error| panic!("--active={}: {error:#}", active.as_str()));
+        let fixture = imported.fixture.clone();
+        let conn = rusqlite::Connection::open(&imported.target).unwrap();
+        for (run, job, request) in [
+            (&fixture.run_orphan, "test", fixture.request_orphan_test),
+            (
+                &fixture.run_orphan,
+                "publish",
+                fixture.request_orphan_publish,
+            ),
+            (
+                &fixture.run_orphan_done,
+                "scan",
+                fixture.request_orphan_scan,
+            ),
+        ] {
+            let (status, queue_state): (String, String) = conn
+                .query_row(
+                    "SELECT status, queue_state FROM jobs WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run, job],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (status.as_str(), queue_state.as_str()),
+                ("cancelled", "none"),
+                "{active:?} {job}"
+            );
+            let (result, finished_at, runner, session): (
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            ) = conn
+                .query_row(
+                    "SELECT result, finished_at, runner_id, session_id FROM job_requests \
+                     WHERE request_id = ?1",
+                    [request],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(result.as_deref(), Some("cancelled"), "{active:?} {job}");
+            assert!(
+                finished_at.is_some(),
+                "{active:?} {job}: finished_at is set"
+            );
+            assert!(
+                runner.is_none() && session.is_none(),
+                "{active:?} {job}: a settled attempt keeps no runner/session binding"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM job_leases", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{active:?}: a settled orphan never becomes a lease"
+        );
+        // Nothing left to wait on: the live run settles like a cancel drain.
+        let (run_status, conclusion): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, conclusion FROM runs WHERE run_id = ?1",
+                [&fixture.run_orphan],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (run_status.as_str(), conclusion.as_deref()),
+            ("completed", Some("cancelled")),
+            "{active:?}"
+        );
+        let notes = imported.report.notes.join("\n");
+        assert!(
+            notes.contains("2 unfinished job(s) had no queue row in the legacy store"),
+            "{active:?}: {notes}"
+        );
+        assert!(
+            notes.contains(&format!("{}/test", fixture.run_orphan)),
+            "{active:?}: {notes}"
+        );
+        assert!(
+            notes.contains("1 unfinished job(s) on finished runs had no queue row"),
+            "{active:?}: {notes}"
+        );
+        assert!(
+            notes.contains(&format!("{}/scan", fixture.run_orphan_done)),
+            "{active:?}: {notes}"
+        );
+        let reason = match active {
+            ActivePolicy::Requeue => "--active=requeue cannot rebuild a job",
+            _ => "they were settled as cancelled by --active=cancel",
+        };
+        assert!(notes.contains(reason), "{active:?}: {notes}");
+    }
+}
+
+/// The default import refuses live orphans, since their spec is gone and they
+/// cannot run again, and lists only that live work. A job on a finished run is
+/// history and is not refused.
+#[test]
+fn orphaned_jobs_on_live_runs_refuse_by_default() {
+    let spec = LegacyFixtureSpec {
+        include_active_claim: false,
+        include_orphaned_jobs: true,
+        include_orphaned_on_finished_run: true,
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("preloop.db");
+    let fixture = write_legacy_fixture(&source, KEY, &spec).unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let target = state_dir.join("preloop.db");
+    let error = run_import(&ImportOptions {
+        source,
+        target: target.clone(),
+        state_dir,
+        key: KEY.to_vec(),
+        active: ActivePolicy::Refuse,
+    })
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!("orphaned-job {}/publish", fixture.run_orphan)),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("orphaned-job {}/test", fixture.run_orphan)),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&fixture.run_orphan_done),
+        "history must not be refused: {message}"
+    );
+    assert!(message.contains("--active=cancel"), "{message}");
+    assert!(!target.exists(), "a refused import leaves no target");
+}
+
+/// A finished run's unfinished job is history: the default import settles it
+/// and its claim without an override, and the report says so.
+#[test]
+fn orphaned_job_on_finished_run_settles_as_history_by_default() {
+    let spec = LegacyFixtureSpec {
+        include_active_claim: false,
+        include_orphaned_on_finished_run: true,
+        ..Default::default()
+    };
+    let imported = import(&spec);
+    assert!(
+        imported
+            .report
+            .notes
+            .iter()
+            .any(|note| { note.contains("on finished runs") && note.contains("/scan") }),
+        "{:?}",
+        imported.report.notes
+    );
+    let conn = rusqlite::Connection::open(&imported.target).unwrap();
+    let (status, queue_state): (String, String) = conn
+        .query_row(
+            "SELECT status, queue_state FROM jobs WHERE run_id = ?1 AND job_id = 'scan'",
+            [&imported.fixture.run_orphan_done],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (status.as_str(), queue_state.as_str()),
+        ("cancelled", "none")
+    );
+    let (result, runner): (Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT result, runner_id FROM job_requests WHERE request_id = ?1",
+            [imported.fixture.request_orphan_scan],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(result.as_deref(), Some("cancelled"));
+    assert!(runner.is_none(), "history keeps no runner binding");
+}
+
+/// A job with neither a queue row nor any attempt naming it has no spec and no
+/// request anywhere in the source, so nothing can settle it: it still refuses.
+#[test]
+fn unfinished_job_with_neither_queue_row_nor_attempt_still_refuses() {
+    let spec = LegacyFixtureSpec {
+        include_active_claim: false,
+        include_orphaned_jobs: true,
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("preloop.db");
+    let fixture = write_legacy_fixture(&source, KEY, &spec).unwrap();
+    rusqlite::Connection::open(&source)
+        .unwrap()
+        .execute(
+            "DELETE FROM job_requests WHERE request_id = ?1",
+            [fixture.request_orphan_publish],
+        )
+        .unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let target = state_dir.join("preloop.db");
+    let error = run_import(&ImportOptions {
+        source,
+        target: target.clone(),
+        state_dir,
+        key: KEY.to_vec(),
+        active: ActivePolicy::Cancel,
+    })
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("non-terminal job publish with no persisted queue row"),
+        "{message}"
+    );
+    assert!(!target.exists(), "a refused import leaves no target");
 }

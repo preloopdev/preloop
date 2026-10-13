@@ -19,7 +19,9 @@ use std::path::PathBuf;
 pub enum ActivePolicy {
     /// Abort the import and list the active items.
     Refuse,
-    /// Release claims/holds and requeue the affected jobs (explicit drain).
+    /// Release claims/holds and requeue the affected jobs (explicit drain). A
+    /// job whose spec the legacy store never persisted cannot be requeued; it
+    /// is settled as cancelled and reported.
     Requeue,
     /// Settle the affected attempts and jobs as cancelled (explicit drain).
     Cancel,

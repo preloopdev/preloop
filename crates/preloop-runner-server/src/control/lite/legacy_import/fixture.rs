@@ -134,6 +134,16 @@ pub struct LegacyFixtureSpec {
     pub unknown_meta_key: bool,
     /// Add a legacy in-flight protocol frame (fail-closed refusal test).
     pub include_inflight_frame: bool,
+    /// Add two unfinished jobs on a live run whose queue rows the legacy store
+    /// never persisted. `test` was claimed (in flight when the engine stopped,
+    /// so its queue row was consumed and its claim recorded); `publish` was
+    /// queued but never claimed. Both attempts survive and name their jobs,
+    /// but nothing can run either job again.
+    pub include_orphaned_jobs: bool,
+    /// Add an unfinished job on a finished (cancelled) run whose queue row is
+    /// missing and whose claim never recorded a result: history that the
+    /// default import settles without an `--active` override.
+    pub include_orphaned_on_finished_run: bool,
 }
 
 impl Default for LegacyFixtureSpec {
@@ -147,6 +157,8 @@ impl Default for LegacyFixtureSpec {
             secret_value: "hunter2-canary-value".to_owned(),
             unknown_meta_key: false,
             include_inflight_frame: false,
+            include_orphaned_jobs: false,
+            include_orphaned_on_finished_run: false,
         }
     }
 }
@@ -173,6 +185,11 @@ pub struct LegacyFixture {
     pub check_run_id: u64,
     pub workflow_path: String,
     pub repository: String,
+    pub run_orphan: String,
+    pub run_orphan_done: String,
+    pub request_orphan_test: i64,
+    pub request_orphan_publish: i64,
+    pub request_orphan_scan: i64,
 }
 
 const RUN_OK: &str = "11111111-1111-4111-8111-111111111111";
@@ -201,6 +218,14 @@ const CHECK_RUN_ID: u64 = 4242;
 const BASE_US: i64 = 1_700_000_000_000_000;
 const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const REPOSITORY: &str = "acme/widgets";
+const RUN_ORPHAN: &str = "55555555-5555-4555-8555-555555555555";
+const RUN_ORPHAN_DONE: &str = "66666666-6666-4666-8666-666666666666";
+const AGENT_ORPHAN_TEST: &str = "fefefefe-fefe-4efe-8efe-fefefefefefe";
+const AGENT_ORPHAN_PUBLISH: &str = "fdfdfdfd-fdfd-4fdf-8fdf-fdfdfdfdfdfd";
+const AGENT_ORPHAN_SCAN: &str = "fcfcfcfc-fcfc-4fcf-8fcf-fcfcfcfcfcfc";
+const REQUEST_ORPHAN_TEST: i64 = 7;
+const REQUEST_ORPHAN_PUBLISH: i64 = 8;
+const REQUEST_ORPHAN_SCAN: i64 = 9;
 
 fn timeline_of(request_id: i64) -> uuid::Uuid {
     uuid::Uuid::from_u128(0x7e57_0000_0000_0000_0000_0000_0000_0000 + request_id as u128)
@@ -241,6 +266,11 @@ pub fn write_legacy_fixture(
         check_run_id: CHECK_RUN_ID,
         workflow_path: WORKFLOW_PATH.to_owned(),
         repository: REPOSITORY.to_owned(),
+        run_orphan: RUN_ORPHAN.to_owned(),
+        run_orphan_done: RUN_ORPHAN_DONE.to_owned(),
+        request_orphan_test: REQUEST_ORPHAN_TEST,
+        request_orphan_publish: REQUEST_ORPHAN_PUBLISH,
+        request_orphan_scan: REQUEST_ORPHAN_SCAN,
     };
     let tx = conn.transaction()?;
     insert_runs(&tx, &cipher, spec, &fixture)?;
@@ -529,6 +559,68 @@ fn insert_runs(
         stale.completed_at = chrono::DateTime::from_timestamp_micros(BASE_US + 200_000_000);
         stale.conclusion = Some("cancelled".to_owned());
         insert_run(tx, cipher, &stale)?;
+    }
+
+    // ── Live run with unfinished jobs whose queue rows were never persisted:
+    //    `test` was claimed (in flight when the engine stopped), `publish`
+    //    was never claimed.
+    if spec.include_orphaned_jobs {
+        let mut orphan = base_record(RUN_ORPHAN, 5, ExecutionStatus::InProgress);
+        orphan.jobs = BTreeMap::from([
+            (JobId("test".to_owned()), ExecutionStatus::InProgress),
+            (JobId("publish".to_owned()), ExecutionStatus::Queued),
+        ]);
+        orphan.job_names = BTreeMap::from([
+            (JobId("test".to_owned()), "test".to_owned()),
+            (JobId("publish".to_owned()), "publish".to_owned()),
+        ]);
+        orphan.job_base_ids = BTreeMap::from([
+            (JobId("test".to_owned()), "test".to_owned()),
+            (JobId("publish".to_owned()), "publish".to_owned()),
+        ]);
+        orphan.job_needs = BTreeMap::from([
+            (JobId("test".to_owned()), Vec::new()),
+            (JobId("publish".to_owned()), vec![JobId("test".to_owned())]),
+        ]);
+        orphan.jobs_list = vec![
+            JobDetail {
+                job_id: "test".to_owned(),
+                name: "test".to_owned(),
+                conclusion: "in_progress".to_owned(),
+                steps: Vec::new(),
+                annotations: Vec::new(),
+            },
+            JobDetail {
+                job_id: "publish".to_owned(),
+                name: "publish".to_owned(),
+                conclusion: "pending".to_owned(),
+                steps: Vec::new(),
+                annotations: Vec::new(),
+            },
+        ];
+        orphan.started_at = chrono::DateTime::from_timestamp_micros(BASE_US + 120_000_000);
+        insert_run(tx, cipher, &orphan)?;
+    }
+
+    // ── Finished run whose unfinished job lost its queue row: the run record
+    //    settled as cancelled, the job and its claim never did.
+    if spec.include_orphaned_on_finished_run {
+        let mut done = base_record(RUN_ORPHAN_DONE, 6, ExecutionStatus::Cancelled);
+        done.jobs = BTreeMap::from([(JobId("scan".to_owned()), ExecutionStatus::InProgress)]);
+        done.job_names = BTreeMap::from([(JobId("scan".to_owned()), "scan".to_owned())]);
+        done.job_base_ids = BTreeMap::from([(JobId("scan".to_owned()), "scan".to_owned())]);
+        done.job_needs = BTreeMap::from([(JobId("scan".to_owned()), Vec::new())]);
+        done.jobs_list = vec![JobDetail {
+            job_id: "scan".to_owned(),
+            name: "scan".to_owned(),
+            conclusion: "in_progress".to_owned(),
+            steps: Vec::new(),
+            annotations: Vec::new(),
+        }];
+        done.started_at = chrono::DateTime::from_timestamp_micros(BASE_US + 150_000_000);
+        done.completed_at = chrono::DateTime::from_timestamp_micros(BASE_US + 300_000_000);
+        done.conclusion = Some("cancelled".to_owned());
+        insert_run(tx, cipher, &done)?;
     }
     Ok(())
 }
@@ -833,6 +925,55 @@ fn insert_attempts(
         tx.execute(
             "INSERT INTO session_active_requests(session_id, active_request_id) VALUES (?1, ?2)",
             params![SESSION_STALE, REQUEST_STALE],
+        )?;
+    }
+
+    // Orphaned attempts: the request survived while the job's queue row did
+    // not (see `include_orphaned_jobs`).
+    if spec.include_orphaned_jobs {
+        insert_attempt(
+            tx,
+            cipher,
+            &request_snapshot(
+                RUN_ORPHAN,
+                "test",
+                AGENT_ORPHAN_TEST,
+                REQUEST_ORPHAN_TEST,
+                None,
+                Some((BASE_US + 130_000_000, RUNNER_OPEN)),
+                &iso_us(BASE_US + 3_600_000_000),
+            ),
+            "active",
+        )?;
+        insert_attempt(
+            tx,
+            cipher,
+            &request_snapshot(
+                RUN_ORPHAN,
+                "publish",
+                AGENT_ORPHAN_PUBLISH,
+                REQUEST_ORPHAN_PUBLISH,
+                None,
+                None,
+                "",
+            ),
+            "active",
+        )?;
+    }
+    if spec.include_orphaned_on_finished_run {
+        insert_attempt(
+            tx,
+            cipher,
+            &request_snapshot(
+                RUN_ORPHAN_DONE,
+                "scan",
+                AGENT_ORPHAN_SCAN,
+                REQUEST_ORPHAN_SCAN,
+                None,
+                Some((BASE_US + 160_000_000, RUNNER_OPEN)),
+                &iso_us(BASE_US + 3_600_000_000),
+            ),
+            "active",
         )?;
     }
     Ok(())
