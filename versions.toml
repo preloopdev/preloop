@@ -37,7 +37,7 @@ smolvm_golden_version = "1.23.6"
 # Node runtimes the guest runner mounts for JavaScript actions, pinned per
 # runtime and platform. Downloaded once on the host and mounted read-only into
 # every machine (never baked into a golden).
-node20_externals_version = "20.20.2"
+node20_externals_version = "24.21.0"
 node24_externals_version = "24.19.0"
 
 # Docker CLI baked into the standalone preloop-runner container image
