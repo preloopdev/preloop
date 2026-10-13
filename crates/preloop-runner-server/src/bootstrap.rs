@@ -172,11 +172,12 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             })
             .map(|(k, _)| k.clone())
             .collect();
-        let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
         // Diag upload tokens: the map key is the JWT `jti`, which is also
         // the staging directory name under `blobs/diag/`. Sweeping the map
         // entry without the directory would leak the staged bytes — the
-        // same accumulation the TTL sweep fixes for cache/artifact.
+        // same accumulation the TTL sweep fixes for cache/artifact. The
+        // list is taken before `sweep_pending_uploads`, which drops the
+        // expired entries from the map too.
         let expired_diag: Vec<String> = inner
             .diag_upload_tokens
             .iter()
@@ -185,6 +186,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             })
             .map(|(k, _)| k.clone())
             .collect();
+        let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
         // Release lock before doing I/O.
         (
             expired_cache,

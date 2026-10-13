@@ -54,7 +54,9 @@ fn decode_component(encoded: &str) -> Option<String> {
     }
     let bytes: Option<Vec<u8>> = encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hi = (pair[0] as char).to_digit(16)? as u8;
             let lo = (pair[1] as char).to_digit(16)? as u8;
