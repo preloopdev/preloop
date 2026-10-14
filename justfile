@@ -172,3 +172,45 @@ conform-runner-deep:
 # release workflow fails tags without a matching entry in CHANGELOG.md.
 changelog-release VERSION:
     python3 scripts/changelog-release.py "{{VERSION}}"
+
+# --- preloop-dev SmolVM: per-worktree dev VMs forked from a frozen golden ---
+# Agents: run `just dev-vm-check` first; if it fails, use the host toolchain.
+# Optional env: PRELOOP_DEV_GATEWAY_URL + PRELOOP_DEV_GATEWAY_TOKEN_FILE route the
+# VM's OMP through the host's auth gateway (credentials never enter the VM).
+# See scripts/dev-vm/common.sh.
+
+# Succeeds only if the preloop-dev golden exists on this host and can be forked.
+dev-vm-check:
+    scripts/dev-vm/check.sh
+
+# Fork the golden for this worktree (idempotent).
+dev-vm-up:
+    scripts/dev-vm/up.sh
+
+# Run a command in this worktree's dev VM, in /workspace.
+[positional-arguments]
+dev-vm-exec +CMD:
+    scripts/dev-vm/exec.sh "$@"
+
+# Interactive shell (or `just dev-vm-shell omp`) in this worktree's dev VM.
+[positional-arguments]
+dev-vm-shell *CMD:
+    scripts/dev-vm/shell.sh "$@"
+
+# Delete this worktree's dev VM; the worktree is untouched.
+dev-vm-down:
+    scripts/dev-vm/down.sh
+
+# List dev VMs forked from the golden.
+dev-vm-ls:
+    scripts/dev-vm/ls.sh
+
+# Publish guest ports (HOST:GUEST) to the host; restarts the VM. Servers in the
+# guest must bind 0.0.0.0. Prefer PRELOOP_DEV_PORTS="18080:8080" with dev-vm-up.
+[positional-arguments]
+dev-vm-publish +PORTS:
+    scripts/dev-vm/publish.sh "$@"
+
+# Re-sync the VM's OMP providers with the host gateway (after a new login/key).
+dev-vm-omp-sync:
+    scripts/dev-vm/omp-sync.sh

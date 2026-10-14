@@ -1,7 +1,7 @@
 //! Shared HTTP client with CA bundle and proxy support.
 
 use anyhow::{Context, Result};
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use std::path::Path;
 use std::time::Duration;
@@ -31,7 +31,7 @@ impl SessionBackoff {
         } else {
             (30_000, 60_000)
         };
-        Duration::from_millis(rand::thread_rng().gen_range(min..max))
+        Duration::from_millis(rand::rng().random_range(min..max))
     }
 
     pub(crate) fn reset(&mut self) {

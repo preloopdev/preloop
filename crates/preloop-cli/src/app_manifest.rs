@@ -523,7 +523,7 @@ mod tests {
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let router = Router::new().route(
-            "/app-manifests/:code/conversions",
+            "/app-manifests/{code}/conversions",
             axum::routing::post(|axum::extract::Path(code): axum::extract::Path<String>| async move {
                 assert_eq!(code, "conversion-code", "the code from GitHub is forwarded verbatim");
                 axum::Json(serde_json::json!({
@@ -648,7 +648,7 @@ mod tests {
         );
         tokio::spawn(async move {
             let router = Router::new().route(
-                "/app-manifests/:code/conversions",
+                "/app-manifests/{code}/conversions",
                 axum::routing::post(|| async {
                     (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "code expired")
                 }),

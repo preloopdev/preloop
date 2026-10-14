@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.34.4] - 2026-10-13
+
+### Fixed
+
+- **Server integration tests build against tokio-tungstenite 0.30**: the
+  `recovery` suite still sent `String` WebSocket frames, which 0.30 rejects
+  (`Message::Text` takes `Utf8Bytes`). The `test-support` suites compile and
+  pass again; there is no runtime change from 0.34.3.
+
+## [0.34.3] - 2026-10-13
+
 
 ### Added
 
@@ -47,6 +58,11 @@ Releases before v0.27.0 predate the changelog.
   submission cannot trigger it. The local branch moves only after a
   successful push, on confirmation, when the working tree still matches the
   submitted tree by content.
+
+### Changed
+
+- **Dependencies**: the weekly batched updates for the Rust toolchain (#569),
+  non-breaking crates (#570) and breaking crates (#572).
 
 ### Fixed
 

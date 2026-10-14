@@ -2765,7 +2765,7 @@ async fn action_download_info_returns_batch_download_collection() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -2915,7 +2915,7 @@ async fn action_download_info_discards_malformed_or_abbreviated_sha() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async { axum::Json(serde_json::json!({"sha": "abc1234"})) }),
     );
     tokio::spawn(async move {
@@ -2977,7 +2977,7 @@ async fn action_download_info_rejects_all_zero_sha() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(
             move |axum::extract::Path(git_ref): axum::extract::Path<String>| async move {
                 if git_ref == zero_for_mock {
@@ -3051,14 +3051,14 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new()
         .route(
-            "/repos/:owner/:repo/commits/:git_ref",
+            "/repos/{owner}/{repo}/commits/{git_ref}",
             axum::routing::get({
                 let sha = sha.clone();
                 move || async move { axum::Json(serde_json::json!({"sha": sha})) }
             }),
         )
         .route(
-            "/repos/:owner/:repo/contents/*path",
+            "/repos/{owner}/{repo}/contents/{*path}",
             axum::routing::get({
                 let seen_ref = seen_ref.clone();
                 move |axum::extract::Query(
@@ -3137,7 +3137,7 @@ async fn resolve_ref_to_sha_sends_pat_to_the_configured_origin_over_http() {
     let seen_auth = std::sync::Arc::new(parking_lot::Mutex::new(None));
     let recorder = seen_auth.clone();
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(move |headers: axum::http::HeaderMap| {
             let recorder = recorder.clone();
             async move {
@@ -3200,7 +3200,7 @@ async fn runnerresolve_actions_returns_runner_parseable_tar_urls() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3286,7 +3286,7 @@ async fn action_download_info_denies_undeclared_action() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3391,7 +3391,7 @@ async fn action_download_info_job_token_cannot_mint_undeclared() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3461,7 +3461,7 @@ async fn runnerresolve_denies_undeclared_action() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/commits/:git_ref",
+        "/repos/{owner}/{repo}/commits/{git_ref}",
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
         }),
@@ -3549,7 +3549,7 @@ async fn action_download_allows_transitive_composite_nested() {
     let mock =
         axum::Router::new()
             .route(
-                "/repos/:owner/:repo/commits/:git_ref",
+                "/repos/{owner}/{repo}/commits/{git_ref}",
                 axum::routing::get(|| async {
                     axum::Json(
                         serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}),
@@ -3557,7 +3557,7 @@ async fn action_download_allows_transitive_composite_nested() {
                 }),
             )
             .route(
-                "/repos/:owner/:repo/contents/:manifest",
+                "/repos/{owner}/{repo}/contents/{manifest}",
                 axum::routing::get(move || {
                     let encoded = encoded.clone();
                     async move {
@@ -3857,7 +3857,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
     let mock = axum::Router::new().route(
-        "/repos/:owner/:repo/tarball/:git_ref",
+        "/repos/{owner}/{repo}/tarball/{git_ref}",
         axum::routing::get(
             |axum::extract::Path((_owner, _repo, git_ref)): axum::extract::Path<(
                 String,

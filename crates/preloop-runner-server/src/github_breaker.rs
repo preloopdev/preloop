@@ -1020,7 +1020,7 @@ mod tests {
             let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let hits_route = hits.clone();
             let app = axum::Router::new().route(
-                "/*path",
+                "/{*path}",
                 axum::routing::any(move || {
                     let hits_route = hits_route.clone();
                     async move {

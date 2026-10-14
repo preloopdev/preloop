@@ -1460,9 +1460,9 @@ fn split_options(options: &str) -> Vec<String> {
 
 /// Generate 3 random bytes using the rand crate.
 fn rand_bytes() -> [u8; 3] {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    [rng.r#gen(), rng.r#gen(), rng.r#gen()]
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    [rng.random(), rng.random(), rng.random()]
 }
 
 #[cfg(test)]

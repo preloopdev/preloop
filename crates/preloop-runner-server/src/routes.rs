@@ -39,18 +39,18 @@ pub fn build_app(
     let protected_protocol_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
         .route("/_apis/artifactcache/cache", get(cache_lookup))
-        .route("/_apis/artifactcache/cache/:cache_id", patch(cache_upload))
-        .route("/_apis/artifactcache/cache/:cache_id", post(cache_commit))
+        .route("/_apis/artifactcache/cache/{cache_id}", patch(cache_upload))
+        .route("/_apis/artifactcache/cache/{cache_id}", post(cache_commit))
         .route(
-            "/_apis/pipelines/workflows/:run_id/artifacts",
+            "/_apis/pipelines/workflows/{run_id}/artifacts",
             post(artifact_create),
         )
         .route(
-            "/_apis/pipelines/workflows/:run_id/artifacts",
+            "/_apis/pipelines/workflows/{run_id}/artifacts",
             get(artifact_list),
         )
         .route(
-            "/_apis/pipelines/workflows/:run_id/artifacts/:artifact_id",
+            "/_apis/pipelines/workflows/{run_id}/artifacts/{artifact_id}",
             get(artifact_get_compat),
         )
         .route(
@@ -58,21 +58,21 @@ pub fn build_app(
             get(runner_pools),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/sessions",
             post(create_session_disttask).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions",
+            "/_apis/distributedtask/pools/{pool_id}/sessions",
             post(create_session_disttask).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/messages",
             get(next_message_disttask).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
@@ -83,118 +83,118 @@ pub fn build_app(
         // runner traffic, so it stays under the protocol guard — the
         // system-only router below is for runner/session/agent administration.
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/messages/{message_id}",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{run_id}/jobs/{job_id}",
             patch(complete_job_compat_authenticated),
         )
-        .route("/ws/live-logs/:job_id", get(ws_live_logs))
-        .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
-        .route("/broker/:runner_id/renewjob", post(broker_renew_job))
-        .route("/broker/:runner_id/completejob", post(broker_complete_job))
+        .route("/ws/live-logs/{job_id}", get(ws_live_logs))
+        .route("/broker/{runner_id}/acquirejob", post(broker_acquire_job))
+        .route("/broker/{runner_id}/renewjob", post(broker_renew_job))
+        .route("/broker/{runner_id}/completejob", post(broker_complete_job))
         .route(
-            "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            "/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
             patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id",
+            "/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}",
             post(create_log_authenticated),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
             post(append_log_authenticated),
         )
         .route(
-            "/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            "/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
             post(console_log_authenticated),
         )
         .route(
-            "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            "/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
             post(finish_job_authenticated),
         )
         .route(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken",
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{job_id}/oidctoken",
             get(oidc_token),
         )
         .route(
-            "/:orchestration_id//idtoken/:plan_id/:job_id",
+            "/{orchestration_id}//idtoken/{plan_id}/{job_id}",
             get(oidc_token_run_service),
         )
         .route(
-            "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            "/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
             post(action_download_info),
         )
         .route(
-            "/actions/build/:orchestration_id/jobs/:job_id/runnerresolve/actions",
+            "/actions/build/{orchestration_id}/jobs/{job_id}/runnerresolve/actions",
             post(runnerresolve_actions),
         )
         .route(
-            "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            "/runner/server/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
             patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id",
+            "/runner/server/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}",
             post(create_log_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/runner/server/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
             post(append_log_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            "/runner/server/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
             post(console_log_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            "/runner/server/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
             post(finish_job_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            "/runner/server/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
             post(action_download_info),
         )
         .route(
-            "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
+            "/api/v1/runs/{run_id}/jobs/{job_id}/logs/live",
             get(live_logs_sse),
         )
         // standard AzDO API URL pattern used by the preloop-runner AzDO client.
         // These alias the scope/hub-prefixed handlers above so both URL forms work.
         .route(
-            "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            "/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records",
             patch(patch_timeline_records_plan_authenticated).get(get_timeline_records_plan_authenticated),
         )
         .route(
-            "/_apis/v1/plans/:plan_id/logs",
+            "/_apis/v1/plans/{plan_id}/logs",
             post(create_log_plan_authenticated),
         )
         .route(
-            "/_apis/v1/plans/:plan_id/logs/:log_id",
+            "/_apis/v1/plans/{plan_id}/logs/{log_id}",
             put(append_log_plan_authenticated),
         )
         .route(
-            "/_apis/v1/plans/:plan_id/events",
+            "/_apis/v1/plans/{plan_id}/events",
             post(finish_job_plan_authenticated),
         )
         // /runner/server/ aliases — runner uses the SystemVssConnection URL
         // which is http://…/runner/server so all plan-level AzDO calls land here.
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            "/runner/server/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records",
             patch(patch_timeline_records_plan_authenticated).get(get_timeline_records_plan_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/logs",
+            "/runner/server/_apis/v1/plans/{plan_id}/logs",
             post(create_log_plan_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/logs/:log_id",
+            "/runner/server/_apis/v1/plans/{plan_id}/logs/{log_id}",
             put(append_log_plan_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/events",
+            "/runner/server/_apis/v1/plans/{plan_id}/events",
             post(finish_job_plan_authenticated),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -206,7 +206,7 @@ pub fn build_app(
     // bearer, or a trusted system/RunnerManage credential.
     let distributedtask_registration = Router::new()
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/agents",
             get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -228,11 +228,11 @@ pub fn build_app(
     // own sessions through the per-session routes below.
     let protected_system_apis = Router::new()
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/sessions",
             delete(delete_sessions_for_pool),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions",
+            "/_apis/distributedtask/pools/{pool_id}/sessions",
             delete(delete_sessions_for_pool),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -242,31 +242,31 @@ pub fn build_app(
 
     let protected_admin_apis = Router::new()
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/agents/{agent_id}",
             delete(delete_agent).put(update_agent),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            "/_apis/distributedtask/pools/{pool_id}/agents/{agent_id}",
             delete(delete_agent).put(update_agent),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/sessions/{session_id}",
             delete(delete_session),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            "/_apis/distributedtask/pools/{pool_id}/sessions/{session_id}",
             delete(delete_session),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/{org}/_apis/v1/AgentSession/{pool_id}/{session_id}",
             delete(delete_session_org),
         )
         .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/runner/server/_apis/v1/AgentSession/{pool_id}/{session_id}",
             delete(delete_session),
         )
         .route(
-            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/_apis/v1/AgentSession/{pool_id}/{session_id}",
             delete(delete_session),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -300,19 +300,19 @@ pub fn build_app(
     // single place instead of repeating it on every route.
     let dispatch_api = Router::new()
         .route(
-            "/repos/:owner/:repo/actions/workflows/:workflow_id/dispatches",
+            "/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
             post(crate::dispatch::workflow_dispatch),
         )
         .route(
-            "/repos/:owner/:repo/dispatches",
+            "/repos/{owner}/{repo}/dispatches",
             post(crate::dispatch::repository_dispatch),
         )
         .route(
-            "/repos/:owner/:repo/actions/workflows",
+            "/repos/{owner}/{repo}/actions/workflows",
             get(crate::dispatch::list_workflows),
         )
         .route(
-            "/repos/:owner/:repo/actions/runs",
+            "/repos/{owner}/{repo}/actions/runs",
             get(crate::dispatch::list_actions_runs),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -340,7 +340,7 @@ pub fn build_app(
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .merge(observability_routes)
-        .route("/runs/:run_id", get(get_public_run))
+        .route("/runs/{run_id}", get(get_public_run))
         .route(
             "/openapi.json",
             get(|| async { axum::Json(crate::openapi::ApiDoc::openapi()) }),
@@ -355,12 +355,12 @@ pub fn build_app(
         .route("/oidc/.well-known/jwks", get(oidc_jwks))
         .route("/oidc/.well-known/jwks.json", get(oidc_jwks))
         // GHES-style org-prefixed routes
-        .route("/:org/_apis/connectionData", get(connection_data))
-        .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
-        .route("/:org/_apis/v1/AgentPools", get(runner_pools))
-        .route("/:org/_apis/v1/settings/runner", get(runner_settings))
+        .route("/{org}/_apis/connectionData", get(connection_data))
+        .route("/{org}/_apis/v1/oauth2/token", post(oauth2_token))
+        .route("/{org}/_apis/v1/AgentPools", get(runner_pools))
+        .route("/{org}/_apis/v1/settings/runner", get(runner_settings))
         .route(
-            "/:org/_apis/v1/Agent/:pool_id/:agent_id",
+            "/{org}/_apis/v1/Agent/{pool_id}/{agent_id}",
             get(agent_lookup_by_id_org)
                 .post(register_runner_compat_org_2)
                 .put(replace_runner_compat_org_2)
@@ -370,7 +370,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/Agent/:pool_id",
+            "/{org}/_apis/v1/Agent/{pool_id}",
             get(agent_lookup_org)
                 .post(register_runner_compat_org)
                 .route_layer(middleware::from_fn_with_state(
@@ -379,35 +379,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/{org}/_apis/v1/AgentSession/{pool_id}/{session_id}",
             post(create_session_compat_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id",
+            "/{org}/_apis/v1/AgentSession/{pool_id}",
             post(create_session_compat_org_pool_only).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/Message/:pool_id",
+            "/{org}/_apis/v1/Message/{pool_id}",
             get(next_message_compat_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/Message/:pool_id/:message_id",
+            "/{org}/_apis/v1/Message/{pool_id}/{message_id}",
             delete(delete_pool_message_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/AgentRequest/:pool_id/:request_id",
+            "/{org}/_apis/v1/AgentRequest/{pool_id}/{request_id}",
             get(agent_request_get_org)
                 .post(agent_request_ack_org)
                 .patch(agent_request_patch_org)
@@ -417,7 +417,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            "/{org}/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
             patch(patch_timeline_records_org)
                 .get(get_timeline_records_org)
                 .route_layer(middleware::from_fn_with_state(
@@ -426,35 +426,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id",
+            "/{org}/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}",
             post(create_log_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
+            "/{org}/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
             post(append_log_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
+            "/{org}/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
             post(console_log_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            "/{org}/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
             post(finish_job_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            "/{org}/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
             post(action_download_info_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
@@ -466,11 +466,11 @@ pub fn build_app(
             post(github_registration_token),
         )
         .route(
-            "/api/v3/orgs/:org/actions/runners/registration-token",
+            "/api/v3/orgs/{org}/actions/runners/registration-token",
             post(github_registration_token),
         )
         .route(
-            "/api/v3/repos/:owner/:repo/actions/runners/registration-token",
+            "/api/v3/repos/{owner}/{repo}/actions/runners/registration-token",
             post(github_registration_token),
         )
         // Runner version end-of-life schedule (GitHub's September 2026
@@ -480,15 +480,15 @@ pub fn build_app(
         // is global. Credential posture matches the neighbors: no
         // routing-layer middleware, the handler requires the system token.
         .route(
-            "/api/v3/actions/runners/deprecations/:version",
+            "/api/v3/actions/runners/deprecations/{version}",
             get(runner_deprecation_lookup),
         )
         .route(
-            "/api/v3/orgs/:org/actions/runners/deprecations/:version",
+            "/api/v3/orgs/{org}/actions/runners/deprecations/{version}",
             get(runner_deprecation_lookup_org),
         )
         .route(
-            "/api/v3/repos/:owner/:repo/actions/runners/deprecations/:version",
+            "/api/v3/repos/{owner}/{repo}/actions/runners/deprecations/{version}",
             get(runner_deprecation_lookup_repo),
         )
         // GitHub-compatible dispatch API (surface 2): merged sub-router with
@@ -498,7 +498,7 @@ pub fn build_app(
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
         .route(
-            "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
+            "/runner/server/_apis/v1/Agent/{pool_id}/{agent_id}",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)
                 .put(replace_runner_compat)
@@ -508,7 +508,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/runner/server/_apis/v1/Agent/:pool_id",
+            "/runner/server/_apis/v1/Agent/{pool_id}",
             get(agent_lookup)
                 .post(register_runner_compat_pool_only)
                 .route_layer(middleware::from_fn_with_state(
@@ -517,35 +517,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/runner/server/_apis/v1/AgentSession/{pool_id}/{session_id}",
             post(create_session_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id",
+            "/runner/server/_apis/v1/AgentSession/{pool_id}",
             post(create_session_compat_pool_only).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/Message/:pool_id",
+            "/runner/server/_apis/v1/Message/{pool_id}",
             get(next_message_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/Message/:pool_id/:message_id",
+            "/runner/server/_apis/v1/Message/{pool_id}/{message_id}",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id",
+            "/runner/server/_apis/v1/AgentRequest/{pool_id}/{request_id}",
             get(agent_request_get)
                 .post(agent_request_ack)
                 .patch(agent_request_patch)
@@ -585,7 +585,7 @@ pub fn build_app(
             )),
         )
         .route(
-            "/api/v1/secrets/:name",
+            "/api/v1/secrets/{name}",
             put(set_secret)
                 .delete(delete_secret)
                 .route_layer(middleware::from_fn_with_state(
@@ -623,7 +623,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/api/v1/execution-protection/rules/:id",
+            "/api/v1/execution-protection/rules/{id}",
             get(get_execution_protection_rule)
                 .put(update_execution_protection_rule)
                 .delete(delete_execution_protection_rule)
@@ -656,7 +656,7 @@ pub fn build_app(
             ),
         )
         .route(
-            "/api/v1/webhooks/deliveries/:delivery_id/replay",
+            "/api/v1/webhooks/deliveries/{delivery_id}/replay",
             post(crate::webhook_api::replay_webhook_delivery).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_native_bearer),
             ),
@@ -669,77 +669,77 @@ pub fn build_app(
             )),
         )
         .route(
-            "/api/v1/runs/:run_id",
+            "/api/v1/runs/{run_id}",
             get(get_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/logs",
+            "/api/v1/runs/{run_id}/logs",
             get(get_run_logs).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/logs/live",
+            "/api/v1/runs/{run_id}/logs/live",
             get(crate::live_logs::live_run_logs_sse).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/cancel",
+            "/api/v1/runs/{run_id}/cancel",
             post(cancel_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/jobs/:job_id/approve",
+            "/api/v1/runs/{run_id}/jobs/{job_id}/approve",
             post(approve_job).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/rerun",
+            "/api/v1/runs/{run_id}/rerun",
             post(rerun_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/approve-fork",
+            "/api/v1/runs/{run_id}/approve-fork",
             post(approve_fork).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/push",
+            "/api/v1/runs/{run_id}/push",
             post(crate::github_push::push_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/events.ndjson",
+            "/api/v1/runs/{run_id}/events.ndjson",
             get(run_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/debug",
+            "/api/v1/runs/{run_id}/debug",
             get(ws_dap_debug).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/debug",
+            "/api/v1/runs/{run_id}/debug",
             post(register_dap_port).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_runner_bearer,
@@ -766,14 +766,14 @@ pub fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}{DEBUG_SESSION_VERDICT_SUFFIX}"),
             get(crate::debug_sessions::poll_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_CLOSE_SUFFIX}"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}{DEBUG_SESSION_CLOSE_SUFFIX}"),
             post(crate::debug_sessions::close_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
@@ -787,7 +787,7 @@ pub fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}"),
             get(crate::debug_sessions::get_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
@@ -797,7 +797,7 @@ pub fn build_app(
         // DAP) drives a paused session through the same lease-gated,
         // idempotent, version-checked operations.
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/lease"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/lease"),
             post(crate::debug_sessions::acquire_lease)
                 .delete(crate::debug_sessions::release_lease)
                 .route_layer(middleware::from_fn_with_state(
@@ -806,20 +806,20 @@ pub fn build_app(
                 )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/events"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/events"),
             get(crate::debug_sessions::session_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/operations"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/operations"),
             post(crate::debug_sessions::session_operation).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_native_bearer),
             ),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/audit"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/audit"),
             get(crate::debug_sessions::session_audit).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
@@ -827,12 +827,12 @@ pub fn build_app(
         )
         // Archive tickets are bearerless in the official runner protocol.
         .route(
-            "/api/v1/actions/download/:owner/:repo/*git_ref",
+            "/api/v1/actions/download/{owner}/{repo}/{*git_ref}",
             get(download_action_tarball),
         )
         // Read-only Git smart HTTP for immutable local-workspace snapshots.
         .route(
-            "/snapshots/:run_id/*path",
+            "/snapshots/{run_id}/{*path}",
             get(snapshot_git_http).post(snapshot_git_http),
         )
         // Anonymous forge relay for checkouts the snapshot cannot serve
@@ -840,19 +840,19 @@ pub fn build_app(
         // `/api/v3/repos/{o}/{r}` lookup checkout issues for the default
         // branch. Handlers authenticate the pinned job runtime token.
         .route(
-            "/:org/:repo/info/refs",
+            "/{org}/{repo}/info/refs",
             get(crate::snapshots::forge_git_http),
         )
         .route(
-            "/:org/:repo/git-upload-pack",
+            "/{org}/{repo}/git-upload-pack",
             post(crate::snapshots::forge_git_http),
         )
         .route(
-            "/:org/:repo/info/lfs/objects/batch",
+            "/{org}/{repo}/info/lfs/objects/batch",
             post(crate::snapshots::forge_git_http),
         )
         .route(
-            "/api/v3/repos/:owner/:repo",
+            "/api/v3/repos/{owner}/{repo}",
             get(crate::snapshots::forge_api_repo),
         )
         // The archive half of the same surface: `actions/checkout` without a
@@ -860,7 +860,7 @@ pub fn build_app(
         // `/repos/{o}/{r}/tarball/{ref}` from its `{server}/api/v3` base, for
         // the run's snapshot and for relayed forge repositories alike.
         .route(
-            "/api/v3/repos/:owner/:repo/tarball/*git_ref",
+            "/api/v3/repos/{owner}/{repo}/tarball/{*git_ref}",
             get(crate::snapshots::forge_api_repo_tarball),
         )
         .route(
@@ -884,7 +884,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/runner/session/:session_id",
+            "/runner/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -900,7 +900,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/runner/server/runner/session/:session_id",
+            "/runner/server/runner/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -919,7 +919,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/session/:session_id",
+            "/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -935,7 +935,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/runner/server/session/:session_id",
+            "/runner/server/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -963,7 +963,7 @@ pub fn build_app(
             )),
         )
         .route(
-            "/api/v1/artifacts/:artifact_id",
+            "/api/v1/artifacts/{artifact_id}",
             get(artifact_get).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
@@ -974,7 +974,7 @@ pub fn build_app(
         // session/message traffic requires a registered runner credential.
         .route("/_apis/v1/AgentPools", get(runner_pools))
         .route(
-            "/_apis/v1/Agent/:pool_id/:agent_id",
+            "/_apis/v1/Agent/{pool_id}/{agent_id}",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)
                 .put(replace_runner_compat)
@@ -984,7 +984,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/_apis/v1/Agent/:pool_id",
+            "/_apis/v1/Agent/{pool_id}",
             get(agent_lookup)
                 .post(register_runner_compat_pool_only)
                 .route_layer(middleware::from_fn_with_state(
@@ -993,35 +993,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/_apis/v1/AgentSession/{pool_id}/{session_id}",
             post(create_session_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/AgentSession/:pool_id",
+            "/_apis/v1/AgentSession/{pool_id}",
             post(create_session_compat_pool_only).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/Message/:pool_id",
+            "/_apis/v1/Message/{pool_id}",
             get(next_message_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/Message/:pool_id/:message_id",
+            "/_apis/v1/Message/{pool_id}/{message_id}",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/AgentRequest/:pool_id/:request_id",
+            "/_apis/v1/AgentRequest/{pool_id}/{request_id}",
             get(agent_request_get)
                 .post(agent_request_ack)
                 .patch(agent_request_patch)
@@ -1032,7 +1032,7 @@ pub fn build_app(
         )
         // Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
         // The runner PUTs logs/summaries here; we store them in the state directory.
-        .route("/replay/results/*path", put(replay_results_put))
+        .route("/replay/results/{*path}", put(replay_results_put))
         // Twirp APIs accept only the system token or a locally signed Actions.Results job token.
         .route(
             "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
@@ -1102,7 +1102,7 @@ pub fn build_app(
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token} (download URL appends.zip for content-type detection)
         .route(
-            "/twirp-blob/:kind/:token",
+            "/twirp-blob/{kind}/{token}",
             put(blob_put)
                 .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
                 .get(blob_get),
@@ -1136,11 +1136,11 @@ pub fn build_app(
         Some(token) => router.merge(
             Router::new()
                 .route(
-                    "/internal/test/runners/sessions/:session_id/messages",
+                    "/internal/test/runners/sessions/{session_id}/messages",
                     get(next_message),
                 )
                 .route(
-                    "/internal/test/runners/sessions/:session_id/messages/:message_id",
+                    "/internal/test/runners/sessions/{session_id}/messages/{message_id}",
                     delete(delete_session_message),
                 )
                 .route("/internal/test/runners/sessions", post(create_session))
@@ -1152,5 +1152,28 @@ pub fn build_app(
                 .with_state(shared),
         ),
         None => router,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// axum 0.8 panics while registering a legacy `:param` or `*wildcard`
+    /// segment, so constructing the production router is the regression
+    /// check: any route still written in the 0.7 syntax fails right here.
+    #[tokio::test]
+    async fn production_router_builds_and_serves_healthz() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let router = app(state, CancellationToken::new());
+        let response = router
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -18,7 +18,7 @@ use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore,
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1638,7 +1638,7 @@ fn config_secrets_key_reference(dir: &Path) -> anyhow::Result<CredentialRef> {
 
 fn generate_sealing_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     key
 }
 

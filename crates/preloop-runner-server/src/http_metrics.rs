@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// every non-public request when a traces endpoint is configured.
 ///
 /// - `method` — HTTP method (GET, POST, …)
-/// - `route` — Axum matched template (e.g. `/api/v1/runs/:run_id`), never concrete ID or query
+/// - `route` — Axum matched template (e.g. `/api/v1/runs/{run_id}`), never concrete ID or query
 /// - `surface` — finite classification (native, runner, broker, …), never raw path
 /// - `status_class` — 2xx, 4xx, 5xx
 ///

@@ -16,6 +16,7 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey};
+use rsa::rand_core::OsRng;
 use rsa::traits::PublicKeyParts;
 use rsa::{BigUint, Oaep};
 use sha1::Sha1;
@@ -104,11 +105,11 @@ impl AgentRsaPublicKey {
         let result = match hash {
             RsaOaepHash::Sha1 => {
                 self.public_key
-                    .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), plaintext)
+                    .encrypt(&mut OsRng, Oaep::new::<Sha1>(), plaintext)
             }
             RsaOaepHash::Sha256 => {
                 self.public_key
-                    .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha256>(), plaintext)
+                    .encrypt(&mut OsRng, Oaep::new::<Sha256>(), plaintext)
             }
         };
         result.map_err(|e| CryptoError::Wrap(e.to_string()))
@@ -235,7 +236,7 @@ fn xml_tag<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
 impl AgentRsaKeypair {
     /// Generate a new 2048-bit RSA keypair.
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut rng = rand::thread_rng();
+        let mut rng = OsRng;
         let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
             .map_err(|e| CryptoError::KeyGen(e.to_string()))?;
         let public_key = rsa::RsaPublicKey::from(&private_key);
@@ -264,7 +265,7 @@ impl AgentRsaKeypair {
             RsaOaepHash::Sha256 => Oaep::new::<Sha256>(),
         };
         self.public_key
-            .encrypt(&mut rand::thread_rng(), padding, plaintext)
+            .encrypt(&mut OsRng, padding, plaintext)
             .map_err(|e| CryptoError::Wrap(e.to_string()))
     }
 
@@ -477,7 +478,7 @@ pub fn sign_jwt_ps256(
     let signing_input = format!("{header_b64}.{claims_b64}");
 
     let signing_key = SigningKey::<Sha256>::new(keypair.private_key);
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     let signature = signing_key.sign_with_rng(&mut rng, signing_input.as_bytes());
     let sig_bytes: Box<[u8]> = signature.into();
     let sig_b64 = URL_SAFE_NO_PAD.encode(&*sig_bytes);
@@ -516,7 +517,7 @@ pub fn sign_jwt_rs256_with_key(
     let signing_input = format!("{header_b64}.{claims_b64}");
 
     let signing_key = SigningKey::<Sha256>::new(keypair.private_key.clone());
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     let signature = signing_key.sign_with_rng(&mut rng, signing_input.as_bytes());
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
@@ -535,7 +536,7 @@ impl SessionEncryption {
     /// Create a new session with a random AES-256 key.
     pub fn generate() -> Self {
         let mut key = vec![0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut key);
         Self { key }
     }
 
@@ -549,7 +550,7 @@ impl SessionEncryption {
     /// Returns `(ciphertext, iv)` where `iv` is the random 16-byte IV.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         let mut iv = vec![0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut iv);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut iv);
 
         let cipher = Aes256CbcEnc::new(self.key[..].into(), iv[..].into());
         let ciphertext = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext);

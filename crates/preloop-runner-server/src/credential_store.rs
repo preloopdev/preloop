@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 pub use preloop_gha_protocol::SecretString;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
@@ -479,7 +479,7 @@ pub fn resolve_engine_token_with_store(
     }
 
     let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let token = bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
