@@ -536,7 +536,7 @@ impl SessionEncryption {
     /// Create a new session with a random AES-256 key.
     pub fn generate() -> Self {
         let mut key = vec![0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut key);
+        rand::RngExt::fill(&mut rand::rng(), &mut key);
         Self { key }
     }
 
@@ -550,7 +550,7 @@ impl SessionEncryption {
     /// Returns `(ciphertext, iv)` where `iv` is the random 16-byte IV.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         let mut iv = vec![0u8; 16];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut iv);
+        rand::RngExt::fill(&mut rand::rng(), &mut iv);
 
         let cipher = Aes256CbcEnc::new(self.key[..].into(), iv[..].into());
         let ciphertext = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext);

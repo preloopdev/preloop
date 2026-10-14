@@ -2097,7 +2097,7 @@ pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<
         // Wrong size — regenerate.
     }
     let mut key = vec![0u8; 32];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut key);
+    rand::RngExt::fill(&mut rand::rng(), &mut key);
     std::fs::create_dir_all(state_dir)?;
     let temp_path = state_dir.join(format!("hmac-key.{}.tmp", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
