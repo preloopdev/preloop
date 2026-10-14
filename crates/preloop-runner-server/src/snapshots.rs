@@ -4237,12 +4237,19 @@ pub fn reroute_forge_checkouts(
         if !server_ok {
             continue;
         }
-        // A step carrying its own credential (`token: ${{ secrets.X }}` or a
-        // literal) already authenticates — rerouting would strip that token
-        // and strand it on anonymous access. Whatever it contains, it is not
-        // ours to replace.
+        // A step carrying its own credential (`token: ${{ secrets.X }}`, a
+        // literal, or any expression the server cannot evaluate) already
+        // authenticates — rerouting would strip that token and strand it on
+        // anonymous access. The action's declared `${{ github.token }}`
+        // default is different: with no App/PAT it is provably empty here,
+        // so it is eligible for the relay.
         let token = resolve_step_input(step, "token", &context_data);
-        if token.present {
+        let token_rideable = !token.present
+            || token
+                .raw
+                .as_deref()
+                .is_some_and(|raw| raw.trim() == "${{ github.token }}");
+        if !token_rideable {
             continue;
         }
         // SSH checkouts never hit the relay; leave them on the forge. A key
@@ -5745,6 +5752,20 @@ mod deepen_and_redirect_tests {
         assert_eq!(step.inputs["github-server-url"], "http://127.0.0.1:9090");
         assert_eq!(step.inputs["repository"], "owner/repo");
         assert_eq!(step.inputs["token"], "jwt");
+        // The relay credential is an engine runtime token on the checkout
+        // input only; the GitHub token variables stay empty. A runtime JWT
+        // must never be exposed as `GITHUB_TOKEN`.
+        for name in ["system.github.token", "github_token"] {
+            assert!(
+                message
+                    .variables
+                    .get(name)
+                    .and_then(|value| value.value.as_deref())
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{name} must remain absent/empty without a forge credential"
+            );
+        }
         assert_eq!(
             message.preloop_snapshot_token_steps,
             Some(vec!["00000000-0000-0000-0000-000000000010".to_owned()]),
@@ -5808,6 +5829,14 @@ mod deepen_and_redirect_tests {
         assert_eq!(
             reroute_forge_checkouts(&mut message, "http://127.0.0.1:9090", "jwt", false),
             0
+        );
+        // The action's own `${{ github.token }}` default is empty when the
+        // App has no installation and no PAT fallback, so it may ride the
+        // anonymous relay just like an omitted token input.
+        let mut message = make(serde_json::json!({"token": "${{ github.token }}"}));
+        assert_eq!(
+            reroute_forge_checkouts(&mut message, "http://127.0.0.1:9090", "jwt", false),
+            1
         );
     }
 }

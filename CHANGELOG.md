@@ -66,6 +66,12 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Public checkouts without an App installation use the anonymous forge relay**:
+  when no verified App or PAT credential can be delivered, eligible
+  `actions/checkout` steps authenticate only to the engine with a short-lived
+  runtime token while the relay forwards the public fetch without credentials;
+  the job's `GITHUB_TOKEN` remains empty and private or explicitly
+  authenticated checkouts stay fail-closed/direct.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
