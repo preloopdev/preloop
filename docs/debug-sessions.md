@@ -573,6 +573,14 @@ the real error scrolled past.
 Preloop verbs are `:`-prefixed so they never collide with shell commands.
 `Ctrl-D` detaches without destroying, and says so.
 
+### Guest shell commands
+
+Commands entered at the attach prompt run in the failed job's workspace with
+the VM provider's image environment and PATH, but use a non-login `sh -c`.
+This keeps the job's tool lookup behavior without reading an unrelated root or
+runner login profile that can abort before the command starts. The sync, export,
+and guest-check helpers use the same shell mode.
+
 ---
 
 ## 13. Controller API
@@ -698,7 +706,7 @@ authentication, which is the operator's credential.
 **Untrusted fields.** Everything in `OpenSessionRequest` is worker-supplied.
 `workspace` reaches a controller's shell as a `cd` target, so it is validated at
 the door — absolute, no shell-active characters — and rejected rather than
-sanitized downstream. Guest paths are single-quoted at every `sh -lc`
+sanitized downstream. Guest paths are single-quoted at every `sh -c`
 interpolation in the CLI.
 
 Launch requirements, with current status:

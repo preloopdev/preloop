@@ -883,6 +883,10 @@ Releases before v0.27.0 predate the changelog.
   golden's sparse disks exceed. Preloop now passes a 512 GiB ceiling to SmolVM
   unless the operator sets one.
 
+- **Debug-session guest commands avoid unrelated login profiles**: commands
+  entered at the attach prompt, plus the sync/export/probe helpers, use a
+  non-login `sh -c` while inheriting the provider-selected image environment
+  and PATH and preserving the job workspace.
 - **Scheduled golden refreshes no longer launch an impossible hosted bake**:
   the apt-index freshness workflow now opens one idempotent draft PR asking for
   a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are
