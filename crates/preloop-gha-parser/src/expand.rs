@@ -112,10 +112,13 @@ fn resolved_job_name(
     base_id: &str,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
 ) -> String {
     match name {
-        Some(raw) => crate::eval::resolve_string(raw, &expression_context(matrix, inputs, None))
-            .unwrap_or_else(|_| raw.to_owned()),
+        Some(raw) => {
+            crate::eval::resolve_string(raw, &expression_context(matrix, inputs, None, github))
+                .unwrap_or_else(|_| raw.to_owned())
+        }
         None => matrix_expand::display_job_name(base_id, matrix),
     }
 }
@@ -126,8 +129,8 @@ fn resolved_job_name(
 /// workflows (tokio, caddy and uv all use it), and the label decides which
 /// machine the job can run on. Leaving the raw `${{ … }}` in place produces a
 /// label no runner can ever advertise, so the cell is expanded, queued, and
-/// then waits forever — the failure looks like a scheduling bug rather than an
-/// unevaluated expression. GitHub evaluates `runs-on` with the matrix in
+/// then waits forever — the failure looks like a scheduling bug rather than
+/// an unevaluated expression. GitHub evaluates `runs-on` with the matrix in
 /// context, so every other per-cell field here already resolves the same way.
 ///
 /// A label that is a single expression evaluating to an array contributes one
@@ -144,8 +147,9 @@ fn resolved_runs_on(
     labels: Vec<String>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
 ) -> Vec<String> {
-    let context = expression_context(matrix, inputs, None);
+    let context = expression_context(matrix, inputs, None, github);
     let resolved: Vec<String> = labels
         .iter()
         .flat_map(|label| {
@@ -224,6 +228,7 @@ fn expression_context(
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
     event_name: Option<&str>,
+    github: Option<&Value>,
 ) -> Context {
     let mut context = Context::default();
     context.insert(
@@ -240,11 +245,13 @@ fn expression_context(
     } else {
         "push"
     });
-    let mut github_map = serde_json::Map::new();
-    github_map.insert(
-        "event_name".to_owned(),
-        Value::String(actual_event.to_owned()),
-    );
+    let mut github_map = github
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    github_map
+        .entry("event_name".to_owned())
+        .or_insert_with(|| Value::String(actual_event.to_owned()));
     if let Some(inputs) = inputs {
         context.insert(
             "inputs",
@@ -255,22 +262,24 @@ fn expression_context(
                     .collect(),
             ),
         );
-        let stringified: serde_json::Map<String, Value> = inputs
-            .iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    Value::String(s) => s.clone(),
-                    Value::Bool(b) => b.to_string(),
-                    Value::Number(n) => n.to_string(),
-                    Value::Null => String::new(),
-                    other => serde_json::to_string(other).unwrap_or_default(),
-                };
-                (k.clone(), Value::String(s))
-            })
-            .collect();
-        let mut event_map = serde_json::Map::new();
-        event_map.insert("inputs".to_owned(), Value::Object(stringified));
-        github_map.insert("event".to_owned(), Value::Object(event_map));
+        if !github_map.contains_key("event") {
+            let stringified: serde_json::Map<String, Value> = inputs
+                .iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Bool(b) => b.to_string(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Null => String::new(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    (k.clone(), Value::String(s))
+                })
+                .collect();
+            let mut event_map = serde_json::Map::new();
+            event_map.insert("inputs".to_owned(), Value::Object(stringified));
+            github_map.insert("event".to_owned(), Value::Object(event_map));
+        }
     }
     context.insert("github", Value::Object(github_map));
     context
@@ -280,6 +289,7 @@ fn resolve_deferred_bool(
     value: Option<&DeferredBool>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
     default: bool,
 ) -> Result<bool, ParserError> {
     let Some(value) = value else {
@@ -288,8 +298,11 @@ fn resolve_deferred_bool(
     match value {
         DeferredBool::Literal(value) => Ok(*value),
         DeferredBool::Expression(expression) => {
-            let result = eval_expression(expression, &expression_context(matrix, inputs, None))
-                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            let result = eval_expression(
+                expression,
+                &expression_context(matrix, inputs, None, github),
+            )
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             result.as_bool().ok_or_else(|| {
                 ParserError::InvalidExpression(format!(
                     "expression returned {result}, expected a boolean"
@@ -303,6 +316,7 @@ fn resolve_deferred_number(
     value: Option<&DeferredNumber>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
 ) -> Result<Option<u64>, ParserError> {
     let Some(value) = value else { return Ok(None) };
     match value {
@@ -318,8 +332,11 @@ fn resolve_deferred_number(
             })
         }
         DeferredNumber::Expression(expression) => {
-            let result = eval_expression(expression, &expression_context(matrix, inputs, None))
-                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            let result = eval_expression(
+                expression,
+                &expression_context(matrix, inputs, None, github),
+            )
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             result.as_u64().map(Some).ok_or_else(|| {
                 ParserError::InvalidExpression(format!(
                     "expression returned {result}, expected a number"
@@ -334,6 +351,7 @@ fn resolve_step_timeout(
     value: Option<&DeferredNumber>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
     matrix_deferred: bool,
 ) -> Result<Option<u32>, ParserError> {
     let resolved = if matrix_deferred {
@@ -344,7 +362,7 @@ fn resolve_step_timeout(
             Some(DeferredNumber::Expression(_)) | None => None,
         }
     } else {
-        resolve_deferred_number(value, matrix, inputs)?
+        resolve_deferred_number(value, matrix, inputs, github)?
     };
     let Some(value) = resolved else {
         return Ok(None);
@@ -548,7 +566,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
         let (matrixes, deferred_matrix) =
-            expand_matrix(job_id, job.strategy.matrix.as_ref(), None, None)?.into_cells();
+            expand_matrix(job_id, job.strategy.matrix.as_ref(), None, None, None)?.into_cells();
         let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrixes.len();
         for (matrix_index, matrix) in matrixes.into_iter().enumerate() {
@@ -567,6 +585,7 @@ pub fn expand_jobs(workflow: &Workflow) -> Result<Vec<JobPlan>, ParserError> {
                 oidc_environment,
                 workflow.permissions.as_ref(),
                 workflow.defaults.as_ref(),
+                None,
                 None,
                 matrix_deferred,
             )?;
@@ -591,6 +610,7 @@ fn job_plan_from_job(
     workflow_permissions: Option<&Value>,
     workflow_defaults: Option<&JobDefaults>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
     matrix_deferred: bool,
 ) -> Result<JobPlan, ParserError> {
     let (concurrency_group, concurrency_cancel_in_progress, concurrency_queue) =
@@ -615,7 +635,13 @@ fn job_plan_from_job(
             _ => true,
         }
     } else {
-        resolve_deferred_bool(job.strategy.fail_fast.as_ref(), &matrix, inputs, true)?
+        resolve_deferred_bool(
+            job.strategy.fail_fast.as_ref(),
+            &matrix,
+            inputs,
+            github,
+            true,
+        )?
     };
     let max_parallel = if matrix_deferred {
         job.strategy
@@ -623,7 +649,7 @@ fn job_plan_from_job(
             .as_ref()
             .and_then(DeferredNumber::literal)
     } else {
-        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
+        resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs, github)?
     };
     // Job `timeout-minutes` resolves like `max-parallel`: literals apply even
     // under a needs-deferred matrix, expressions wait for the runtime fan-out.
@@ -632,7 +658,7 @@ fn job_plan_from_job(
             .as_ref()
             .and_then(DeferredNumber::literal)
     } else {
-        resolve_deferred_number(job.timeout_minutes.as_ref(), &matrix, inputs)?
+        resolve_deferred_number(job.timeout_minutes.as_ref(), &matrix, inputs, github)?
     };
     let steps = job
         .steps
@@ -650,6 +676,7 @@ fn job_plan_from_job(
                 },
                 &matrix,
                 inputs,
+                github,
                 matrix_deferred,
             )
         })
@@ -665,13 +692,13 @@ fn job_plan_from_job(
     {
         defaults.push(defaults_run_token(run));
     }
-    let name = resolved_job_name(job.name.as_deref(), job_id, &matrix, inputs);
+    let name = resolved_job_name(job.name.as_deref(), job_id, &matrix, inputs, github);
     Ok(JobPlan {
         id: JobId(expanded_id),
         base_id: job_id.to_owned(),
         name,
         runner_group: job.runs_on.group(),
-        runs_on: resolved_runs_on(job.runs_on.labels(), &matrix, inputs),
+        runs_on: resolved_runs_on(job.runs_on.labels(), &matrix, inputs, github),
         needs: job.needs.ids(),
         matrix,
         matrix_index,
@@ -826,6 +853,7 @@ fn expand_jobs_with_reusables_internal(
     reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
     inputs: Option<&BTreeMap<String, Value>>,
     event_name: Option<&str>,
+    github: Option<&Value>,
 ) -> Result<Vec<JobPlan>, ParserError> {
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
@@ -952,6 +980,7 @@ fn expand_jobs_with_reusables_internal(
                 job.strategy.matrix.as_ref(),
                 Some(&coerced_values),
                 event_name,
+                github,
             )?
             .into_cells();
             let matrix_count = matrices.len();
@@ -967,7 +996,7 @@ fn expand_jobs_with_reusables_internal(
                 // every value raw: the runtime fan-out evaluates them per
                 // cell once the matrix exists.
                 let resolved_inputs: BTreeMap<String, Value> = if deferred_matrix.is_none() {
-                    let cell_context = expression_context(&matrix, inputs, event_name);
+                    let cell_context = expression_context(&matrix, inputs, event_name, github);
                     let mut evaluated = BTreeMap::new();
                     for (name, (input_type, coerced)) in &coerced_inputs {
                         let value = match coerced {
@@ -1039,6 +1068,7 @@ fn expand_jobs_with_reusables_internal(
                         job_id,
                         &matrix,
                         Some(&resolved_inputs),
+                        github,
                     ),
                     runner_group: None,
                     runs_on: Vec::new(),
@@ -1103,8 +1133,14 @@ fn expand_jobs_with_reusables_internal(
         // its upstream jobs finish, so `expand_matrix` reports it as deferred
         // rather than as zero cells. The job keeps one un-suffixed DAG node
         // (and its `if:` gating) until the runtime fan-out replaces it.
-        let (matrix_cells, deferred_matrix) =
-            expand_matrix(job_id, job.strategy.matrix.as_ref(), inputs, event_name)?.into_cells();
+        let (matrix_cells, deferred_matrix) = expand_matrix(
+            job_id,
+            job.strategy.matrix.as_ref(),
+            inputs,
+            event_name,
+            github,
+        )?
+        .into_cells();
         let matrix_deferred = deferred_matrix.is_some();
         let matrix_count = matrix_cells.len();
         for (matrix_index, matrix) in matrix_cells.into_iter().enumerate() {
@@ -1124,6 +1160,7 @@ fn expand_jobs_with_reusables_internal(
                 workflow.permissions.as_ref(),
                 workflow.defaults.as_ref(),
                 inputs,
+                github,
                 matrix_deferred,
             )?;
             plan.deferred_matrix = deferred_matrix.clone();
@@ -1187,6 +1224,30 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
     dispatch_inputs: Option<&BTreeMap<String, serde_json::Value>>,
     event_name: Option<&str>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
+        workflow,
+        reusable_workflows,
+        reusable_workflow_shas,
+        dispatch_inputs,
+        event_name,
+        None,
+    )
+}
+
+/// Expand jobs with the triggering event and the submission's GitHub context.
+///
+/// The context is optional for parser-only callers. Server submissions pass
+/// the same immutable context that is later sent to the runner, so expressions
+/// such as `github.repository_owner` are evaluated against real run metadata
+/// rather than an empty placeholder.
+pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
+    workflow: &Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    dispatch_inputs: Option<&BTreeMap<String, serde_json::Value>>,
+    event_name: Option<&str>,
+    github: Option<&Value>,
+) -> Result<ExpandedWorkflows, ParserError> {
     let mut unique_workflows = std::collections::BTreeSet::new();
     let mut call_chain = Vec::new();
     validate_reusable_workflow_tree(
@@ -1206,6 +1267,7 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         &mut reusable_calls,
         dispatch_inputs,
         event_name,
+        github,
     )?;
 
     // Post-process: Rewrite needs to replace base job IDs of reusable calls with their expanded inner job IDs.
@@ -1269,6 +1331,24 @@ pub fn expand_reusable_call(
     reusable_workflows: &BTreeMap<String, String>,
     reusable_workflow_shas: &BTreeMap<String, String>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_reusable_call_with_github_context(
+        called,
+        caller_plan,
+        reusable_workflows,
+        reusable_workflow_shas,
+        None,
+    )
+}
+
+/// Expand a reusable caller with the run's GitHub context available to callee
+/// expressions.
+pub fn expand_reusable_call_with_github_context(
+    called: &Workflow,
+    caller_plan: &JobPlan,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    github: Option<&Value>,
+) -> Result<ExpandedWorkflows, ParserError> {
     let Some(call) = &caller_plan.reusable_call else {
         return Err(ParserError::InvalidExpression(format!(
             "job `{}` is not a reusable-workflow caller",
@@ -1295,6 +1375,7 @@ pub fn expand_reusable_call(
         &mut reusable_calls,
         Some(&caller_plan.inputs),
         None,
+        github,
     )?;
 
     let caller_id = caller_plan.id.0.clone();
@@ -1419,6 +1500,7 @@ fn step_plan(
     defaults: InheritedDefaults<'_>,
     matrix: &IndexMap<String, Value>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
     matrix_deferred: bool,
 ) -> Result<StepPlan, ParserError> {
     let step_label = step
@@ -1431,6 +1513,7 @@ fn step_plan(
         step.timeout_minutes.as_ref(),
         matrix,
         inputs,
+        github,
         matrix_deferred,
     )?;
     let working_directory = step
@@ -1458,7 +1541,7 @@ fn step_plan(
                     DeferredBool::Expression(_) => None,
                 })
             } else {
-                resolve_deferred_bool(Some(value), matrix, inputs, false).map(Some)
+                resolve_deferred_bool(Some(value), matrix, inputs, github, false).map(Some)
             }
         })?,
         timeout_in_minutes,
@@ -1496,6 +1579,7 @@ fn expand_matrix(
     matrix: Option<&MatrixValue>,
     inputs: Option<&BTreeMap<String, Value>>,
     event_name: Option<&str>,
+    github: Option<&Value>,
 ) -> Result<MatrixExpansion, ParserError> {
     let Some(matrix) = matrix else {
         return Ok(MatrixExpansion::Combinations(vec![IndexMap::new()]));
@@ -1514,7 +1598,7 @@ fn expand_matrix(
             }
             let value = eval_expression(
                 expression,
-                &expression_context(&IndexMap::new(), inputs, event_name),
+                &expression_context(&IndexMap::new(), inputs, event_name, github),
             )
             .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if value.is_null() {
@@ -1553,7 +1637,7 @@ fn expand_matrix(
         {
             let resolved = eval_expression(
                 expression,
-                &expression_context(&IndexMap::new(), inputs, event_name),
+                &expression_context(&IndexMap::new(), inputs, event_name, github),
             )
             .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if resolved.is_null() {
@@ -1613,6 +1697,25 @@ pub fn expand_deferred_matrix_job(
     needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
     inputs: Option<&BTreeMap<String, Value>>,
 ) -> Result<Vec<JobPlan>, ParserError> {
+    expand_deferred_matrix_job_with_github_context(
+        workflow,
+        job_id,
+        expression,
+        needs_outputs,
+        inputs,
+        None,
+    )
+}
+
+/// Expand a deferred matrix using the run's GitHub context.
+pub fn expand_deferred_matrix_job_with_github_context(
+    workflow: &Workflow,
+    job_id: &str,
+    expression: &str,
+    needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
+    inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
+) -> Result<Vec<JobPlan>, ParserError> {
     let job = workflow
         .jobs
         .get(job_id)
@@ -1621,7 +1724,8 @@ pub fn expand_deferred_matrix_job(
             ParserError::InvalidExpression(format!("job `{job_id}` not found in workflow"))
         })?;
 
-    let combinations = resolve_deferred_matrix_cells(job_id, expression, needs_outputs, inputs)?;
+    let combinations =
+        resolve_deferred_matrix_cells(job_id, expression, needs_outputs, inputs, github)?;
     let matrix_count = combinations.len();
 
     let global_env = workflow.env.clone().into_strings();
@@ -1650,6 +1754,7 @@ pub fn expand_deferred_matrix_job(
             workflow.permissions.as_ref(),
             workflow.defaults.as_ref(),
             inputs,
+            github,
             false,
         )?;
         if let Some(prefix) = &needs_prefix {
@@ -1685,6 +1790,7 @@ fn resolve_deferred_matrix_cells(
     expression: &str,
     needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
     inputs: Option<&BTreeMap<String, Value>>,
+    github: Option<&Value>,
 ) -> Result<Vec<IndexMap<String, Value>>, ParserError> {
     let mut ctx = Context::default();
     let mut needs_map = serde_json::Map::new();
@@ -1699,6 +1805,9 @@ fn resolve_deferred_matrix_cells(
             callee_local_key(need_id).to_string(),
             Value::Object(job_map),
         );
+    }
+    if let Some(github) = github {
+        ctx.insert("github", github.clone());
     }
     ctx.insert("needs", Value::Object(needs_map));
 
@@ -1780,6 +1889,27 @@ pub fn expand_deferred_reusable_call(
     reusable_workflows: &BTreeMap<String, String>,
     reusable_workflow_shas: &BTreeMap<String, String>,
 ) -> Result<ExpandedWorkflows, ParserError> {
+    expand_deferred_reusable_call_with_github_context(
+        called,
+        caller_workflow,
+        caller_plan,
+        needs_outputs,
+        reusable_workflows,
+        reusable_workflow_shas,
+        None,
+    )
+}
+
+/// Expand a deferred reusable caller with the run's GitHub context.
+pub fn expand_deferred_reusable_call_with_github_context(
+    called: &Workflow,
+    caller_workflow: &Workflow,
+    caller_plan: &JobPlan,
+    needs_outputs: &BTreeMap<String, BTreeMap<String, Value>>,
+    reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    github: Option<&Value>,
+) -> Result<ExpandedWorkflows, ParserError> {
     if caller_plan.reusable_call.is_none() {
         return Err(ParserError::InvalidExpression(format!(
             "job `{}` is not a reusable-workflow caller",
@@ -1813,6 +1943,7 @@ pub fn expand_deferred_reusable_call(
         expression,
         needs_outputs,
         Some(&caller_plan.inputs),
+        github,
     )?;
     let matrix_count = cells.len();
     let mut jobs = Vec::new();
@@ -1825,6 +1956,7 @@ pub fn expand_deferred_reusable_call(
             &caller_plan.id.0,
             &cell,
             Some(&caller_plan.inputs),
+            github,
         );
         cell_plan.matrix = cell;
         cell_plan.matrix_index = (matrix_count > 1).then_some(matrix_index + 1);
@@ -1845,7 +1977,12 @@ pub fn expand_deferred_reusable_call(
                 {
                     let resolved = crate::eval::resolve_string(
                         raw,
-                        &expression_context(&cell_plan.matrix, Some(&caller_plan.inputs), None),
+                        &expression_context(
+                            &cell_plan.matrix,
+                            Some(&caller_plan.inputs),
+                            None,
+                            github,
+                        ),
                     )
                     .map_err(ParserError::InvalidExpression)?;
                     cell_plan
@@ -1854,11 +1991,12 @@ pub fn expand_deferred_reusable_call(
                 }
             }
         }
-        let expanded = expand_reusable_call(
+        let expanded = expand_reusable_call_with_github_context(
             called,
             &cell_plan,
             reusable_workflows,
             reusable_workflow_shas,
+            github,
         )?;
         jobs.extend(expanded.jobs);
         reusable_calls.extend(expanded.reusable_calls);

@@ -1464,6 +1464,109 @@ jobs:
 
     assert_eq!(jobs[0].runs_on, vec!["self-hosted", "X64"]);
 }
+#[test]
+fn runs_on_uses_submission_github_repository_owner() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: "${{ github.repository_owner == 'astral-sh' && 'github-ubuntu-24.04-x86_64-2' || 'ubuntu-slim' }}"
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let owner_true = json!({
+        "event_name": "push",
+        "repository_owner": "astral-sh",
+        "repository": "astral-sh/uv"
+    });
+    let owner_false = json!({
+        "event_name": "push",
+        "repository_owner": "other",
+        "repository": "other/uv"
+    });
+
+    for (github, expected) in [
+        (&owner_true, "github-ubuntu-24.04-x86_64-2"),
+        (&owner_false, "ubuntu-slim"),
+    ] {
+        let expanded = expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
+            &workflow,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            Some("push"),
+            Some(github),
+        )
+        .unwrap();
+        assert_eq!(expanded.jobs[0].runs_on, vec![expected]);
+    }
+}
+
+#[test]
+fn reusable_callee_runs_on_uses_callers_github_context() {
+    let caller = parse_workflow(
+        r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+"#,
+    )
+    .unwrap();
+    let called = parse_workflow(
+        r#"
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: "${{ github.repository_owner == 'astral-sh' && 'github-ubuntu-24.04-x86_64-2' || 'ubuntu-slim' }}"
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let reusable = BTreeMap::from([(
+        "./.github/workflows/callee.yml".to_owned(),
+        serde_yaml::to_string(&called).unwrap(),
+    )]);
+
+    for (owner, expected) in [
+        ("astral-sh", "github-ubuntu-24.04-x86_64-2"),
+        ("other", "ubuntu-slim"),
+    ] {
+        let github = json!({
+            "event_name": "push",
+            "repository_owner": owner,
+            "repository": format!("{owner}/caller")
+        });
+        let expanded = expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
+            &caller,
+            &reusable,
+            &BTreeMap::new(),
+            None,
+            Some("push"),
+            Some(&github),
+        )
+        .unwrap();
+        let placeholder = expanded
+            .jobs
+            .iter()
+            .find(|job| job.base_id == "call")
+            .unwrap();
+        let callee = expand_reusable_call_with_github_context(
+            &called,
+            placeholder,
+            &reusable,
+            &BTreeMap::new(),
+            Some(&github),
+        )
+        .unwrap();
+        assert_eq!(callee.jobs[0].runs_on, vec![expected]);
+    }
+}
 
 /// A `runs-on` expression reading `needs.*` must not be evaluated at expansion
 /// time: the needed job has not run yet, so the resolver would coalesce the
