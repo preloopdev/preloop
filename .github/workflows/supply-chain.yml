@@ -8,9 +8,10 @@ env:
 
 on:
   pull_request:
-    # labeled/unlabeled re-run the guard when a maintainer toggles the
-    # dependency-migration exception.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # A labeled run re-checks the head after a maintainer applies the
+    # dependency-migration exception. synchronize runs never honor it, so
+    # every new push needs the label re-applied.
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   schedule:
@@ -38,7 +39,10 @@ jobs:
       - name: Guard policy files
         if: github.event_name == 'pull_request'
         env:
-          DEPENDENCY_MIGRATION: ${{ contains(github.event.pull_request.labels.*.name, 'dependency-migration') }}
+          # Honored only on the labeled event for this exact label, so the
+          # approval covers the head SHA that existed when a maintainer
+          # applied it. Later pushes (synchronize) fail until re-labeled.
+          DEPENDENCY_MIGRATION: ${{ github.event.action == 'labeled' && github.event.label.name == 'dependency-migration' && contains(github.event.pull_request.labels.*.name, 'dependency-migration') }}
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha }}"
@@ -58,9 +62,10 @@ jobs:
           # Adding a Rust dependency necessarily changes Cargo.lock *and* the
           # manifests that declare it. Permit that dedicated PR shape, but no
           # source changes or other policy files alongside the lockfile.
-          # Exception: a PR labeled dependency-migration (a maintainer-only
-          # action) may carry the source changes a breaking upgrade needs,
-          # as long as Cargo.lock is still its only policy file.
+          # Exception: a maintainer applying dependency-migration to the
+          # current head lets that head carry the source changes a breaking
+          # upgrade needs, as long as Cargo.lock is still its only policy
+          # file.
           dependency_only=false
           if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" && "$DEPENDENCY_MIGRATION" == "true" ]]; then
             echo "dependency-migration label: Cargo.lock may ship with source changes"
