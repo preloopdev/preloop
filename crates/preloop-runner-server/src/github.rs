@@ -6031,6 +6031,14 @@ mod tests {
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
         let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        // Pin the PAT on the AppState itself, not only in the process
+        // environment. This keeps the probe deterministic when the full
+        // suite runs alongside tests that temporarily alter GitHub config.
+        fixture.state.github_pat = Some(preloop_gha_protocol::SecretString::new(
+            "test-token".to_owned(),
+        ));
+        fixture.app =
+            crate::app_with_test_api(fixture.state.clone(), CancellationToken::new(), "test-token");
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
