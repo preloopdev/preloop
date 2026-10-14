@@ -2282,13 +2282,14 @@ async fn lfs_batch_response(
     repository: &FsPath,
     run_id: RunId,
     authorization_header: Option<&str>,
+    base: &str,
     body: &[u8],
     fetch: Option<LfsFetch<'_>>,
 ) -> Result<serde_json::Value, ApiError> {
     let request: LfsBatchRequest = serde_json::from_slice(body)
         .map_err(|error| ApiError::bad_request(format!("invalid Git LFS batch body: {error}")))?;
     let operation = request.operation.as_deref().unwrap_or("download");
-    let base = runner_base_url();
+    let base = base.trim_end_matches('/');
     if operation == "download" {
         populate_missing_lfs_objects(repository, &request.objects, fetch).await;
     }
@@ -4357,6 +4358,7 @@ pub async fn snapshot_git_http(
     request: Request,
 ) -> Result<Response<Body>, ApiError> {
     let run_id = snapshot_route_run_id(&run_id_raw)?;
+    let download_base = crate::broker::runner_base_url_for(request.headers());
     let authorization_header = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -4471,6 +4473,7 @@ pub async fn snapshot_git_http(
             &repository,
             run_id,
             authorization_header.as_deref(),
+            &download_base,
             &request_body,
             lfs_fetch,
         )
@@ -5835,6 +5838,7 @@ mod lfs_batch_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             body.as_bytes(),
             None,
         )
@@ -5870,9 +5874,16 @@ mod lfs_batch_tests {
         })
         .to_string();
 
-        let response = lfs_batch_response(&repository, run_id, None, body.as_bytes(), None)
-            .await
-            .unwrap();
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            None,
+            &runner_base_url(),
+            body.as_bytes(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(response["objects"][0]["error"]["code"], 404);
         assert!(
             response["objects"][0]["actions"].is_null()
@@ -5893,9 +5904,16 @@ mod lfs_batch_tests {
         })
         .to_string();
 
-        let response = lfs_batch_response(&repository, run_id, None, body.as_bytes(), None)
-            .await
-            .unwrap();
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            None,
+            &runner_base_url(),
+            body.as_bytes(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(response["objects"][0]["error"]["code"], 403);
     }
 }
@@ -6546,6 +6564,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(fetch()),
         )
@@ -6567,6 +6586,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(fetch()),
         )
@@ -6600,6 +6620,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(LfsFetch {
                 shared: shared.as_ref(),
@@ -6636,6 +6657,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(LfsFetch {
                 shared: shared.as_ref(),
@@ -6675,6 +6697,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(LfsFetch {
                 shared: shared.as_ref(),
@@ -6755,6 +6778,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(LfsFetch {
                 shared: shared.as_ref(),
@@ -6799,6 +6823,7 @@ mod remote_checkout_cache_tests {
             &repository,
             run_id,
             Some("Bearer job-token"),
+            &runner_base_url(),
             &body,
             Some(LfsFetch {
                 shared: shared.as_ref(),

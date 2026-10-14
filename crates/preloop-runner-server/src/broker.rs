@@ -145,6 +145,52 @@ pub fn runner_base_url() -> String {
         .to_owned()
 }
 
+/// [`runner_base_url`] as the *caller* can dial it: the request's `Host`
+/// when it names a loopback authority other than the configured one.
+///
+/// The in-guest control bridge binds an ephemeral port and the runner
+/// rewrites job-message URLs to it. Calls arriving over that bridge carry
+/// `Host: 127.0.0.1:<bridge-port>`; a signed upload/log/cache URL minted with
+/// the configured base (`127.0.0.1:9090`) would be undialable — nothing
+/// listens there. Echoing the loopback `Host` back into minted URLs keeps
+/// them working for the only caller that ever sees them: this same job.
+///
+/// Non-loopback `Host` values (the public hostname, operator tools) and
+/// missing/unparseable headers fall back to [`runner_base_url`]. Restricted
+/// to loopback so a forged `Host` can never mint URLs pointing at an
+/// arbitrary address — the worst case is a different loopback port.
+pub fn runner_base_url_for(headers: &axum::http::HeaderMap) -> String {
+    let base = runner_base_url();
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return base;
+    };
+    let authority = host.trim();
+    // Split `name[:port]` / `[v6]:port`; the host token decides loopback.
+    let (name, _port) = match authority.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => (name, port),
+        _ => return base,
+    };
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    let loopback = name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        return base;
+    }
+    // The authority is exactly what arrived; keep it (IPv6 brackets included)
+    // and only swap the configured origin's scheme.
+    let scheme = base
+        .strip_prefix("https://")
+        .map(|_| "https")
+        .or_else(|| base.strip_prefix("http://").map(|_| "http"))
+        .unwrap_or("http");
+    format!("{scheme}://{authority}")
+}
+
 pub fn public_base_url() -> String {
     std::env::var("PRELOOP_PUBLIC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
@@ -1737,6 +1783,44 @@ pub async fn broker_complete_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_base_url_for_echoes_loopback_bridge_hosts() {
+        fn headers(host: &str) -> axum::http::HeaderMap {
+            let mut map = axum::http::HeaderMap::new();
+            map.insert(
+                axum::http::header::HOST,
+                host.parse().expect("a valid Host header value"),
+            );
+            map
+        }
+        let configured = runner_base_url();
+        // Bridge traffic: the request's loopback authority wins.
+        assert_eq!(
+            runner_base_url_for(&headers("127.0.0.1:45678")),
+            "http://127.0.0.1:45678"
+        );
+        assert_eq!(
+            runner_base_url_for(&headers("localhost:45678")),
+            "http://localhost:45678"
+        );
+        assert_eq!(
+            runner_base_url_for(&headers("[::1]:45678")),
+            "http://[::1]:45678"
+        );
+        // Anything else — public hostname, foreign IPs, missing or
+        // portless Host — keeps the configured base.
+        assert_eq!(
+            runner_base_url_for(&headers("cpane.example.com")),
+            configured
+        );
+        assert_eq!(runner_base_url_for(&headers("10.0.0.5:9090")), configured);
+        assert_eq!(runner_base_url_for(&headers("127.0.0.1")), configured);
+        assert_eq!(
+            runner_base_url_for(&axum::http::HeaderMap::new()),
+            configured
+        );
+    }
 
     #[tokio::test]
     async fn runner_settings_returns_default_wire_shape() {

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Fixed
+
+- **Control bridge no longer collides with workflow ports** (#600): the
+  in-guest loopback bridge bound the advertised `PRELOOP_CONTROL_ORIGIN`
+  port itself, so a workflow service or test server holding that port
+  (vuejs/core's e2e suite binds `:::9090`) EADDRINUSE'd the bridge and
+  every job-side engine call failed. The bridge now binds an ephemeral
+  port, the runner rewrites the advertised origin (including `ws://`/
+  `wss://` stream spellings) to the bound port across the job message,
+  and the worker inherits the effective origin via `PRELOOP_CONTROL_ORIGIN`
+  so its socket routing matches the rewritten URLs. Runtime-minted URLs
+  (signed blob/cache/artifact/upload URLs, LFS batch hrefs, action
+  download tickets) echo a loopback `Host` from the request so job-side
+  calls that arrive over the bridge stay dialable.
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed

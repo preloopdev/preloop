@@ -59,6 +59,7 @@ pub async fn twirp_workflow_steps_update(
 pub async fn twirp_get_job_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Reject writes from completed/unknown jobs.
@@ -82,7 +83,7 @@ pub async fn twirp_get_job_logs_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
             "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
-            runner_base_url(), path
+            crate::broker::runner_base_url_for(&headers), path
         )
     })))
 }
@@ -90,6 +91,7 @@ pub async fn twirp_get_job_logs_signed_blob_url(
 pub async fn twirp_get_job_diag_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Reject writes from completed/unknown jobs.
@@ -151,7 +153,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     }
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
-        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
+        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", crate::broker::runner_base_url_for(&headers)),
     })))
 }
 
@@ -178,6 +180,7 @@ pub struct RefreshBlobUploadUrlRequest {
 pub async fn twirp_refresh_blob_upload_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<RefreshBlobUploadUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The refresh is itself a mint: the calling job must be live. A settled
@@ -282,7 +285,7 @@ pub async fn twirp_refresh_blob_upload_url(
         crate::blob_store::mint_upload_blob_token(&shared.state, &claimed_kind, token_job, &jti)?;
     let upload_url = format!(
         "{}/twirp-blob/{claimed_kind}/{new_token}",
-        crate::broker::runner_base_url()
+        crate::broker::runner_base_url_for(&headers)
     );
     Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
 }
@@ -290,6 +293,7 @@ pub async fn twirp_refresh_blob_upload_url(
 pub async fn twirp_get_step_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Reject writes from completed/unknown jobs.
@@ -309,7 +313,7 @@ pub async fn twirp_get_step_logs_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
             "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
-            runner_base_url(), path
+            crate::broker::runner_base_url_for(&headers), path
         ),
         "soft_size_limit": "1048576"
     })))
@@ -325,6 +329,7 @@ pub struct StepSummarySignedBlobUrlRequest {
 pub async fn twirp_get_step_summary_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Reject writes from completed/unknown jobs.
@@ -344,7 +349,7 @@ pub async fn twirp_get_step_summary_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
             "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
-            runner_base_url(), path
+            crate::broker::runner_base_url_for(&headers), path
         ),
         "soft_size_limit": "1048576"
     })))
@@ -984,7 +989,10 @@ pub async fn twirp_cache_v2_create(
         &crate::blob_store::blob_owner_for_job(job_backend_id),
         &jti,
     )?;
-    let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
+    let upload_url = format!(
+        "{}/twirp-blob/cache/{token}",
+        crate::broker::runner_base_url_for(&headers)
+    );
     // The cache key is workflow-controlled content; never log it or the
     // version verbatim. A SHA-256 digest identifies the entry well enough to
     // correlate with the finalize/restore logs while leaking nothing.
@@ -1237,7 +1245,10 @@ pub async fn twirp_cache_v2_get_dl_url(
         inner.cache_v2_dl_tokens_created.insert(dl_jti, now_unix());
         trim_cache_dl_tokens(&mut inner);
     }
-    let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());
+    let download_url = format!(
+        "{}/twirp-blob/cache/{dl_token}",
+        crate::broker::runner_base_url_for(&headers)
+    );
     let matched_key = entry
         .key
         .split_once('\0')

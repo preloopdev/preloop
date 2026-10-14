@@ -297,7 +297,14 @@ pub async fn finish_job_org(
 pub async fn action_download_info_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, _scope, _hub, plan_id)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    super::actions::action_download_info_for_plan(&shared, &plan_id, &request).await
+    super::actions::action_download_info_for_plan(
+        &shared,
+        &plan_id,
+        &request,
+        &crate::broker::runner_base_url_for(&headers),
+    )
+    .await
 }

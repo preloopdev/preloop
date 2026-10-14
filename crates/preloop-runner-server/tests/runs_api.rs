@@ -3949,8 +3949,13 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
 
     // action_download_ticket returns None for absolute refs
     assert!(
-        crate::actions::action_download_ticket(&state, "test-owner/test-repo@/tmp/escape", None)
-            .is_none()
+        crate::actions::action_download_ticket(
+            &state,
+            "test-owner/test-repo@/tmp/escape",
+            None,
+            &crate::broker::runner_base_url(),
+        )
+        .is_none()
     );
 }
 
