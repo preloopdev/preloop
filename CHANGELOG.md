@@ -84,9 +84,10 @@ Releases before v0.27.0 predate the changelog.
 - **Reusable workflows called as `uses: $/...` resolve** (#581): the runner
   client, the `preloop-runner` resolver, and the server's remote-workflow
   resolver treated `$/` as a remote `owner/repo/path@ref` reference and
-  rejected it as unsupported. `$/` names the submitted repository, so it now
-  resolves against the workspace's `.github/workflows/` tree the way `./`
-  does, with no forge fetch.
+  rejected it as unsupported. `$/` and `./` now name a file in the submitting
+  repository: the client resolves them from the workspace, the server fetches
+  them at the submitted commit, and a call inside a remote reusable workflow
+  resolves in that workflow's repository at its pinned commit.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
