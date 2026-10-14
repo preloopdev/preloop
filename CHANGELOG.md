@@ -15,6 +15,11 @@ Releases before v0.27.0 predate the changelog.
   inheriting Axum's 2 MiB default, so long failing steps remain available for
   diagnosis while oversized requests are rejected.
 
+- **Log appends and legacy cache chunks above 2 MiB are accepted** (#610):
+  the log append and console routes now accept bodies up to 16 MiB, and the
+  legacy cache chunk upload accepts up to 512 MiB, instead of inheriting
+  Axum's 2 MiB default. Oversized requests still get a deterministic 413.
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed

@@ -39,7 +39,12 @@ pub fn build_app(
     let protected_protocol_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
         .route("/_apis/artifactcache/cache", get(cache_lookup))
-        .route("/_apis/artifactcache/cache/{cache_id}", patch(cache_upload))
+        .route(
+            "/_apis/artifactcache/cache/{cache_id}",
+            // `cache_upload` extracts each chunk as `Bytes`, so this route needs
+            // its own limit: the per-upload budget the handler already enforces.
+            patch(cache_upload).layer(DefaultBodyLimit::max(MAX_CACHE_UPLOAD_BYTES as usize)),
+        )
         .route("/_apis/artifactcache/cache/{cache_id}", post(cache_commit))
         .route(
             "/_apis/pipelines/workflows/{run_id}/artifacts",
@@ -107,11 +112,14 @@ pub fn build_app(
         )
         .route(
             "/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
-            post(append_log_authenticated),
+            // Log and console appends extract the whole body as `Bytes`. Every
+            // log-append and console mount is capped at the per-log retained
+            // window, `MAX_LOG_BYTES_PER_KEY` (memory_caps.rs).
+            post(append_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
-            post(console_log_authenticated),
+            post(console_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
@@ -143,11 +151,11 @@ pub fn build_app(
         )
         .route(
             "/runner/server/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
-            post(append_log_authenticated),
+            post(append_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/runner/server/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
-            post(console_log_authenticated),
+            post(console_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/runner/server/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
@@ -173,7 +181,7 @@ pub fn build_app(
         )
         .route(
             "/_apis/v1/plans/{plan_id}/logs/{log_id}",
-            put(append_log_plan_authenticated),
+            put(append_log_plan_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/_apis/v1/plans/{plan_id}/events",
@@ -191,7 +199,7 @@ pub fn build_app(
         )
         .route(
             "/runner/server/_apis/v1/plans/{plan_id}/logs/{log_id}",
-            put(append_log_plan_authenticated),
+            put(append_log_plan_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/runner/server/_apis/v1/plans/{plan_id}/events",
@@ -450,17 +458,21 @@ pub fn build_app(
         )
         .route(
             "/{org}/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
-            post(append_log_org).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_protocol_bearer,
-            )),
+            post(append_log_org)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_protocol_bearer,
+                ))
+                .layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/{org}/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
-            post(console_log_org).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_protocol_bearer,
-            )),
+            post(console_log_org)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_protocol_bearer,
+                ))
+                .layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
             "/{org}/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",

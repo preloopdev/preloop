@@ -19,6 +19,11 @@ use crate::control::ControlError;
 /// the live-console recovery buffer (read only by a restart to refill this
 /// map) and is bounded to the SAME budget in `store_log_chunk` — keeping
 /// more on disk is pointless since a restart trims it back to this cap.
+///
+/// It is also the body limit of the log-append and console routes in
+/// `routes.rs`. A single append larger than this window would be head-truncated
+/// by both the in-memory buffer and the on-disk live segments, so the route
+/// refuses it with 413 rather than accept bytes it cannot keep.
 pub const MAX_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 
 /// slack above `MAX_LOG_BYTES_PER_KEY` before the in-memory retained
@@ -101,8 +106,11 @@ pub const MAX_PENDING_PER_JOB: usize = 32;
 /// Cap on a single in-flight legacy cache upload
 /// (`PendingCache::bytes`). `cache_upload` appends every PATCH body with no
 /// running total; without this cap a job could grow server RAM without bound
-/// by PATCHing chunks forever (~500 requests/GiB at the 2 MiB default body
-/// limit). Matches the 512 MiB body limit on the Twirp blob upload route.
+/// by PATCHing chunks forever (~500 requests/GiB at Axum's 2 MiB default body
+/// limit). It is also the body limit of the legacy cache upload route
+/// (`PATCH /_apis/artifactcache/cache/{cache_id}`, `routes.rs`), so one chunk
+/// can never exceed the whole upload budget. Matches the 512 MiB body limit on
+/// the Twirp blob upload route.
 pub const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-job aggregate cap on in-flight legacy cache upload bytes.

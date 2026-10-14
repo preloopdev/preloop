@@ -314,8 +314,8 @@ pub async fn cache_upload(
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
     // Stream the chunk straight to the staging file: the full blob is never
     // buffered in server RAM. The append runs under the state lock so the
-    // running total above cannot be raced past; a chunk is at most 2 MiB, so
-    // the page-cache write is fast.
+    // running total above cannot be raced past. The chunk itself is bounded by
+    // the route's body limit, which is `MAX_CACHE_UPLOAD_BYTES`.
     {
         use tokio::io::AsyncWriteExt;
         let mut staged = tokio::fs::OpenOptions::new()

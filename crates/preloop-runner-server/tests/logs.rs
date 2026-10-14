@@ -4239,3 +4239,283 @@ async fn replay_result_upload_rejects_bodies_over_cap() {
         "oversized replay upload should explain the rejection to the caller"
     );
 }
+
+/// A request body of exactly `len` bytes, streamed in 1 MiB chunks that share
+/// one buffer. An oversized body costs nothing to build, and the server, not
+/// the test, decides where the request is cut off.
+fn streamed_body(len: usize) -> Body {
+    const CHUNK: usize = 1024 * 1024;
+    let shared = Bytes::from(vec![b'L'; CHUNK]);
+    let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> = vec![Ok(shared); len / CHUNK];
+    chunks.push(Ok(Bytes::from(vec![b'L'; len % CHUNK])));
+    Body::from_stream(stream::iter(chunks))
+}
+
+#[tokio::test]
+async fn log_append_accepts_bodies_above_axum_default_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/_apis/v1/Logfiles/s/h/p",
+        json!({"path": "logs/step"}),
+    )
+    .await;
+    let log_id = created["id"].as_i64().unwrap();
+
+    // Axum's default Bytes extractor limit is 2 MiB. The AzDO reporting path
+    // appends a whole step log in one call, so a 3 MiB step log must be kept.
+    let body = vec![b'L'; 3 * 1024 * 1024];
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/s/h/p/{log_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.logs.get(&format!("p/{log_id}")).map(Vec::as_slice),
+        Some(body.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn log_append_rejects_bodies_over_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/_apis/v1/Logfiles/s/h/p",
+        json!({"path": "logs/step"}),
+    )
+    .await;
+    let log_id = created["id"].as_i64().unwrap();
+
+    // One byte over the per-key window, streamed so the test never allocates
+    // it. The extractor must cut the request off with a visible 413.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/s/h/p/{log_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(streamed_body(MAX_LOG_BYTES_PER_KEY + 1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("Failed to buffer the request body"),
+        "oversized log append should explain the rejection to the caller"
+    );
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.logs.get(&format!("p/{log_id}")).map_or(0, Vec::len),
+        0,
+        "a refused append must not reach the retained log"
+    );
+}
+
+#[tokio::test]
+async fn log_routes_share_one_body_limit_across_every_mount() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/_apis/v1/Logfiles/s/h/p",
+        json!({"path": "logs/step"}),
+    )
+    .await;
+    let log_id = created["id"].as_i64().unwrap();
+    let timeline = "00000000-0000-0000-0000-0000000000a1";
+    let record = "00000000-0000-0000-0000-0000000000a2";
+    // Every mount that buffers a log or console body, with the status an
+    // in-cap body earns: appends are accepted (202), console batches succeed
+    // (200). A layer missing from any one mount leaves it at Axum's 2 MiB, so
+    // the 3 MiB request below is refused there.
+    let mounts = [
+        (
+            Method::POST,
+            format!("/_apis/v1/Logfiles/s/h/p/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::POST,
+            format!("/runner/server/_apis/v1/Logfiles/s/h/p/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::PUT,
+            format!("/_apis/v1/plans/p/logs/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::PUT,
+            format!("/runner/server/_apis/v1/plans/p/logs/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::POST,
+            format!("/acme/_apis/v1/Logfiles/s/h/p/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::POST,
+            format!("/_apis/v1/TimeLineWebConsoleLog/s/h/p/{timeline}/{record}"),
+            StatusCode::OK,
+        ),
+        (
+            Method::POST,
+            format!("/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/{timeline}/{record}"),
+            StatusCode::OK,
+        ),
+        (
+            Method::POST,
+            format!("/acme/_apis/v1/TimeLineWebConsoleLog/s/h/p/{timeline}/{record}"),
+            StatusCode::OK,
+        ),
+    ];
+    for (method, uri, accepted) in mounts {
+        let request = |body: Body| {
+            Request::builder()
+                .method(method.clone())
+                .uri(uri.as_str())
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(body)
+                .unwrap()
+        };
+        let in_cap = app
+            .clone()
+            .oneshot(request(Body::from(vec![b'L'; 3 * 1024 * 1024])))
+            .await
+            .unwrap();
+        assert_eq!(
+            in_cap.status(),
+            accepted,
+            "3 MiB body refused on {method} {uri}"
+        );
+        let over_cap = app
+            .clone()
+            .oneshot(request(streamed_body(MAX_LOG_BYTES_PER_KEY + 1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            over_cap.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "cap+1 body accepted on {method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cache_upload_accepts_bodies_above_axum_default_limit() {
+    use base64::engine::Engine as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "large-chunk", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+
+    // Axum's default Bytes extractor limit is 2 MiB. A legacy cache chunk up to
+    // the per-upload budget must be staged, committed, and restored intact.
+    let body = vec![b'C'; 3 * 1024 * 1024];
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::ACCEPTED);
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/_apis/artifactcache/cache/{cache_id}"),
+        json!({"size": body.len()}),
+    )
+    .await;
+    let lookup = request_json(
+        &app,
+        Method::GET,
+        "/api/v1/cache?key=large-chunk&version=v1",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(lookup["hit"], true);
+    let expected = base64::engine::general_purpose::STANDARD.encode(&body);
+    assert_eq!(lookup["content_base64"], expected.as_str());
+}
+
+#[tokio::test]
+async fn cache_upload_rejects_bodies_over_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "too-large-chunk", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+
+    // One byte over the per-upload budget, streamed so the test never allocates
+    // it. The route's limit must cut the request off with a visible 413 before
+    // the handler stages anything.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(streamed_body(MAX_CACHE_UPLOAD_BYTES as usize + 1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("Failed to buffer the request body"),
+        "oversized cache upload should explain the rejection to the caller"
+    );
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.pending_caches[&cache_id].staging_len, 0,
+        "a refused chunk must not be staged"
+    );
+}
