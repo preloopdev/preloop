@@ -2133,7 +2133,10 @@ mod tests {
             let login = std::process::Command::new("/bin/sh")
                 .args([
                     "-lc",
-                    &format!("printf login > {}", shell_quote(&login_marker.display().to_string())),
+                    &format!(
+                        "printf login > {}",
+                        shell_quote(&login_marker.display().to_string())
+                    ),
                 ])
                 .env("HOME", &home)
                 .env("PATH", expected_path)
