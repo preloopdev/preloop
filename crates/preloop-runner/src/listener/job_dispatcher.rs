@@ -536,10 +536,30 @@ fn kill_process_tree(root: u32) {
 
 /// Spawn a worker process for a job. Returns immediately without waiting.
 pub async fn spawn_job(
-    job_message: serde_json::Value,
+    mut job_message: serde_json::Value,
     runner_root: &Path,
     via: ProtocolPath,
 ) -> Result<RunningJob> {
+    // The in-guest control bridge listens on an ephemeral port, not the
+    // advertised `PRELOOP_CONTROL_ORIGIN` (see `control_bridge` — a workflow
+    // may already hold that port). Point every control-plane URL in the job
+    // message at the bound port and re-export the origin to the worker so its
+    // own `HttpClient` socket routing matches the rewritten URLs.
+    let worker_origin = crate::control_bridge::effective_origin();
+    if let Some(effective) = &worker_origin {
+        let advertised = std::env::var(crate::control_bridge::CONTROL_ORIGIN_ENV)
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_owned();
+        if !advertised.is_empty() {
+            crate::control_bridge::rewrite_job_message_origin(
+                &mut job_message,
+                &advertised,
+                effective,
+            );
+        }
+    }
+    let job_message = job_message;
     let request_id = job_message
         .get("jobId")
         .or_else(|| job_message.get("requestId"))
@@ -619,6 +639,11 @@ pub async fn spawn_job(
         ProtocolPath::Broker => "broker",
         ProtocolPath::Azdo => "azdo",
     };
+    // The worker's `HttpClient` resolves the control origin from the env; it
+    // must match the rewritten payload URLs, not the advertised port.
+    if let Some(effective) = &worker_origin {
+        command.env(crate::control_bridge::CONTROL_ORIGIN_ENV, effective);
+    }
     let mut child = command
         .arg("--via")
         .arg(via_str)

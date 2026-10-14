@@ -17,17 +17,26 @@ use std::collections::BTreeMap;
 pub async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    action_download_info_for_plan(&shared, &plan_id, &request).await
+    action_download_info_for_plan(
+        &shared,
+        &plan_id,
+        &request,
+        &crate::broker::runner_base_url_for(&headers),
+    )
+    .await
 }
 
 pub(crate) async fn action_download_info_for_plan(
     shared: &Arc<SharedState>,
     plan_id: &str,
     request: &serde_json::Value,
+    runner_url: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let collection = collect_action_download_infos(&shared.state, plan_id, request).await?;
+    let collection =
+        collect_action_download_infos(&shared.state, plan_id, request, runner_url).await?;
     Ok(Json(
         serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })),
     ))
@@ -36,6 +45,7 @@ pub(crate) async fn action_download_info_for_plan(
 pub async fn runnerresolve_actions(
     State(shared): State<Arc<SharedState>>,
     Path((orchestration_id, job_id)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut actions = serde_json::Map::new();
@@ -44,6 +54,7 @@ pub async fn runnerresolve_actions(
         &orchestration_id,
         &job_id,
         &request,
+        &crate::broker::runner_base_url_for(&headers),
         &mut actions,
     )
     .await?;
@@ -578,6 +589,7 @@ pub fn action_download_ticket(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
+    runner_url: &str,
 ) -> Option<(String, serde_json::Value)> {
     if action.starts_with("./") || action.starts_with("../") || action.starts_with("docker://") {
         return None;
@@ -612,7 +624,7 @@ pub fn action_download_ticket(
     }
 
     let key = format!("{repo_part}@{git_ref}");
-    let runner_url = runner_base_url();
+    let runner_url = runner_url.trim_end_matches('/');
     // The download route is bearerless and reachable from inside runner VMs,
     // so the URL itself has to be the capability: signed, scoped to this one
     // action, and short-lived (20 minutes — minted at job setup and used
@@ -651,6 +663,7 @@ pub async fn collect_runnerresolve_refs(
     orchestration_id: &str,
     job_id: &str,
     value: &serde_json::Value,
+    runner_url: &str,
     actions: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ApiError> {
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
@@ -664,7 +677,7 @@ pub async fn collect_runnerresolve_refs(
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        runnerresolve_action(state, &action, version.as_deref()).await
+        runnerresolve_action(state, &action, version.as_deref(), runner_url).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
@@ -684,6 +697,7 @@ pub async fn collect_action_download_infos(
     state: &AppState,
     plan_id: &str,
     value: &serde_json::Value,
+    runner_url: &str,
 ) -> Result<ActionDownloadInfoCollection, ApiError> {
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     if let Ok(list) = serde_json::from_value::<ActionReferenceList>(value.clone()) {
@@ -709,7 +723,7 @@ pub async fn collect_action_download_infos(
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        action_download_info_entry(state, &action, version.as_deref()).await
+        action_download_info_entry(state, &action, version.as_deref(), runner_url).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
@@ -1330,8 +1344,9 @@ async fn resolve_action_download(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
+    runner_url: &str,
 ) -> Option<(String, String, String, Option<String>, String)> {
-    let (key, _) = action_download_ticket(state, action, version_override)?;
+    let (key, _) = action_download_ticket(state, action, version_override, runner_url)?;
     let (name, git_ref) = key.split_once('@')?;
     let name = name.to_string();
     let git_ref = git_ref.to_string();
@@ -1346,7 +1361,7 @@ async fn resolve_action_download(
 
     let pinned = resolve_ref_to_sha(state, &owner, &repo, &git_ref).await;
     let effective_ref = pinned.as_deref().unwrap_or(&git_ref).to_owned();
-    let (_, ticket) = action_download_ticket(state, action, Some(&effective_ref))?;
+    let (_, ticket) = action_download_ticket(state, action, Some(&effective_ref), runner_url)?;
     let tar_url = ticket.get("url")?.as_str()?.to_string();
     Some((key, name, git_ref, pinned, tar_url))
 }
@@ -1382,9 +1397,10 @@ pub async fn runnerresolve_action(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
+    runner_url: &str,
 ) -> Option<(String, serde_json::Value)> {
     let (key, name, git_ref, resolved_sha_opt, tar_url) =
-        resolve_action_download(state, action, version_override).await?;
+        resolve_action_download(state, action, version_override, runner_url).await?;
     // Never echo the mutable ref back as `resolved_sha`. A caller that trusts the
     // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
     // explicit on the wire, and the runner refuses the download instead of fetching
@@ -1416,9 +1432,10 @@ pub async fn action_download_info_entry(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
+    runner_url: &str,
 ) -> Option<(String, ActionDownloadInfo)> {
     let (key, name, git_ref, resolved_sha, tar_url) =
-        resolve_action_download(state, action, version_override).await?;
+        resolve_action_download(state, action, version_override, runner_url).await?;
     // Preloop download capability URLs are HMAC-signed and bearerless.
     // Operator PAT is kept server-side to avoid leaking broad credentials to untrusted workflows.
     let authentication = None;
@@ -2054,7 +2071,8 @@ jobs:
             .unwrap()
             .as_secs();
         let (_, ticket) =
-            action_download_ticket(&state, "actions/checkout@v4", None).expect("ticket must mint");
+            action_download_ticket(&state, "actions/checkout@v4", None, &runner_base_url())
+                .expect("ticket must mint");
         let url = ticket.get("url").and_then(|u| u.as_str()).unwrap();
         let exp: u64 = url
             .split('?')

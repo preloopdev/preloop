@@ -76,6 +76,29 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// transparently, so this only reaps truly idle splices.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// The origin job subprocesses actually dial for the control plane.
+///
+/// The bridge binds an ephemeral port (see [`spawn_from_env_lookup`]), so the
+/// advertised `PRELOOP_CONTROL_ORIGIN` is no longer reachable in the guest.
+/// `spawn_from_env` publishes the bound origin here; `spawn_job` reads it to
+/// rewrite each job message and re-export the variable to worker children.
+static EFFECTIVE_ORIGIN: std::sync::LazyLock<std::sync::RwLock<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// The bound bridge origin (`scheme://host:port`), or `None` when no bridge
+/// is running — the hosted case, where the advertised origin stays valid.
+pub fn effective_origin() -> Option<String> {
+    EFFECTIVE_ORIGIN.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Publish the bound bridge origin. Called once by `spawn_from_env`; a second
+/// call (another listener in the same process) replaces it.
+fn publish_effective_origin(origin: String) {
+    if let Ok(mut guard) = EFFECTIVE_ORIGIN.write() {
+        *guard = Some(origin);
+    }
+}
+
 /// Which upstream transport the bridge forwards accepted connections to.
 #[derive(Debug, Clone)]
 enum Upstream {
@@ -132,10 +155,25 @@ pub async fn spawn_from_env_lookup(
 ) -> Option<ControlBridge> {
     let settings = BridgeSettings::from_lookup(&var, &var_os)?;
     let origin = var(CONTROL_ORIGIN_ENV)?;
-    let address = loopback_address(&origin)?;
+    let advertised = loopback_address(&origin)?;
+    // Bind an ephemeral port on the advertised loopback address, never the
+    // advertised port itself: the advertised port belongs to the job's
+    // network namespace too, so a workflow service or test server can hold
+    // it (vuejs/core's e2e suite binds :::9090 and EADDRINUSEs the bridge).
+    // The job message is rewritten to the bound address before the worker
+    // sees it (see `rewrite_job_message_origin`).
+    let address = SocketAddr::new(advertised.ip(), 0);
     match settings.spawn(address).await {
         Ok(bridge) => {
-            info!(%address, "control-plane loopback bridge listening");
+            // The effective origin keeps the advertised scheme: the splice is
+            // transparent, so a TLS origin stays TLS.
+            let scheme = if origin.starts_with("https://") {
+                "https"
+            } else {
+                "http"
+            };
+            publish_effective_origin(format!("{scheme}://{}", bridge.address()));
+            info!(%origin, bound = %bridge.address(), "control-plane loopback bridge listening");
             Some(bridge)
         }
         Err(error) => {
@@ -145,6 +183,85 @@ pub async fn spawn_from_env_lookup(
             None
         }
     }
+}
+
+/// Rewrite every URL in `message` that names `advertised` so it points at
+/// `effective` instead. Used when the loopback bridge moved to an ephemeral
+/// port: endpoint URLs, signed download URLs, `FeedStreamUrl` — everything
+/// minted server-side with the advertised origin — must dial the port the
+/// bridge actually bound. Signatures are unaffected: preloop's tickets sign
+/// the path and expiry, never the authority.
+///
+/// `ws://`/`wss://` spellings of the advertised origin are rewritten too
+/// (live-log streams). A workflow-authored string that happens to embed the
+/// advertised origin is rewritten as well — acceptable: from inside the
+/// guest that authority means the control plane, not the job.
+pub fn rewrite_job_message_origin(
+    message: &mut serde_json::Value,
+    advertised: &str,
+    effective: &str,
+) -> usize {
+    let advertised = advertised.trim_end_matches('/');
+    let effective = effective.trim_end_matches('/');
+    if advertised.is_empty() || advertised == effective {
+        return 0;
+    }
+    // Pair each `from` spelling with its `to` spelling: the advertised
+    // origin itself, plus its websocket form for stream URLs
+    // (`ws://127.0.0.1:9090/...`).
+    let mut pairs: Vec<(String, String)> = vec![(advertised.to_owned(), effective.to_owned())];
+    for (from, to) in [("https://", "wss://"), ("http://", "ws://")] {
+        if let Some(rest) = advertised.strip_prefix(from)
+            && let Some(effective_rest) = effective
+                .strip_prefix("http://")
+                .or_else(|| effective.strip_prefix("https://"))
+        {
+            pairs.push((format!("{to}{rest}"), format!("{to}{effective_rest}")));
+        }
+    }
+    fn replace_authority(s: &str, from: &str, to: &str) -> Option<String> {
+        // `from` ends at the authority boundary: the next byte must start
+        // the path, query, or fragment. A bare substring match would also
+        // eat the `9090` prefix of a `90909` port or the `9090x` of a path
+        // segment.
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        let mut rewritten = false;
+        while let Some(at) = rest.find(from) {
+            let boundary = rest[at + from.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '/' | '?' | '#'));
+            if boundary {
+                out.push_str(&rest[..at]);
+                out.push_str(to);
+                rewritten = true;
+            } else {
+                out.push_str(&rest[..at + from.len()]);
+            }
+            rest = &rest[at + from.len()..];
+        }
+        out.push_str(rest);
+        rewritten.then_some(out)
+    }
+    fn walk(value: &mut serde_json::Value, pairs: &[(String, String)]) -> usize {
+        match value {
+            serde_json::Value::String(s) => {
+                let mut rewritten = 0;
+                for (from, to) in pairs {
+                    if let Some(next) = replace_authority(s, from, to) {
+                        *s = next;
+                        rewritten += 1;
+                    }
+                }
+                rewritten
+            }
+            serde_json::Value::Array(items) => items.iter_mut().map(|item| walk(item, pairs)).sum(),
+            serde_json::Value::Object(map) => map.values_mut().map(|item| walk(item, pairs)).sum(),
+            _ => 0,
+        }
+    }
+    walk(message, &pairs)
 }
 
 /// Start a bridge on a *container-reachable* address, forwarding to the
@@ -723,6 +840,110 @@ mod tests {
             "the advertised address names the bound port"
         );
         assert_ne!(bound, held, "{held} is held by another process");
+    }
+
+    /// A job holding the advertised port (vuejs/core's e2e suite binds
+    /// `:::9090`, covering the loopback alias) must not stop the bridge:
+    /// it takes an ephemeral port instead and the rewrite moves traffic.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn loopback_bridge_binds_ephemeral_when_advertised_port_is_held() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"pong").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held = holder.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("control.sock");
+        let socket_server = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = socket_server.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"pong2").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let vars = std::collections::HashMap::from([
+            (CONTROL_ORIGIN_ENV, format!("http://{held}")),
+            (CONTROL_SOCKET_ENV, socket_path.display().to_string()),
+        ]);
+
+        let bridge = spawn_from_env_lookup(
+            |name| vars.get(name).cloned(),
+            |name| vars.get(name).map(std::ffi::OsString::from),
+        )
+        .await
+        .expect("the held port must not prevent the bridge");
+
+        assert_ne!(
+            bridge.address().port(),
+            held.port(),
+            "the bridge must move off the advertised port"
+        );
+        let mut client = TcpStream::connect(bridge.address()).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"pong2");
+    }
+
+    /// Every URL spelling the advertised origin moves to the effective one:
+    /// endpoint bases, signed blob URLs, ws stream URLs — and nothing else.
+    #[test]
+    fn rewrite_moves_only_the_advertised_origin() {
+        let mut message = serde_json::json!({
+            "resultsUrl": "http://127.0.0.1:9090/results",
+            "signed": {"url": "http://127.0.0.1:9090/twirp-blob/cache/abc?sig=x"},
+            "stream": "ws://127.0.0.1:9090/feed",
+            "notes": [
+                "prefix http://127.0.0.1:9090/ suffix",
+                "http://10.0.0.9:9090/unrelated",
+                "http://127.0.0.1:90909/lookalike-port"
+            ]
+        });
+
+        let rewritten = rewrite_job_message_origin(
+            &mut message,
+            "http://127.0.0.1:9090",
+            "http://127.0.0.1:45678",
+        );
+
+        assert_eq!(rewritten, 4);
+        assert_eq!(message["resultsUrl"], "http://127.0.0.1:45678/results");
+        assert_eq!(
+            message["signed"]["url"],
+            "http://127.0.0.1:45678/twirp-blob/cache/abc?sig=x"
+        );
+        assert_eq!(message["stream"], "ws://127.0.0.1:45678/feed");
+        assert_eq!(message["notes"][0], "prefix http://127.0.0.1:45678/ suffix");
+        assert_eq!(message["notes"][1], "http://10.0.0.9:9090/unrelated");
+        assert_eq!(message["notes"][2], "http://127.0.0.1:90909/lookalike-port");
+    }
+
+    /// Without a bound bridge (or before spawn), there is nothing to
+    /// rewrite toward: the payload is untouched.
+    #[test]
+    fn rewrite_is_a_noop_for_equal_or_empty_origins() {
+        let mut message = serde_json::json!({"url": "http://127.0.0.1:9090/x"});
+        assert_eq!(
+            rewrite_job_message_origin(
+                &mut message,
+                "http://127.0.0.1:9090",
+                "http://127.0.0.1:9090"
+            ),
+            0
+        );
+        assert_eq!(
+            rewrite_job_message_origin(&mut message, "", "http://127.0.0.1:1"),
+            0
+        );
+        assert_eq!(message["url"], "http://127.0.0.1:9090/x");
     }
 
     /// No control transport means no bridge to point container steps at;
