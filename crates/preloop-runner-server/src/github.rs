@@ -3379,6 +3379,7 @@ async fn process_check_run_rerequest(
         crate::control::types::RerunMode::Job(job_id.clone()),
         Some((job_id.clone(), check_run_id)),
         rerequest_sender.map(str::to_owned),
+        None,
     )
     .await
     .map_err(|error| {

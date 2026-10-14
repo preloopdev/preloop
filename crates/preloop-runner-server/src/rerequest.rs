@@ -120,6 +120,7 @@ pub(crate) async fn process_check_suite_rerequest(
         crate::control::types::RerunMode::All,
         None,
         rerequest_sender.map(str::to_owned),
+        None,
     )
     .await
     .map_err(|error| {

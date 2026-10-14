@@ -3874,6 +3874,7 @@ pub(crate) async fn rerun_run_with_mode(
     mode: crate::control::types::RerunMode,
     reused_check_run: Option<(JobId, u64)>,
     triggering_actor: Option<String>,
+    enable_debugger: Option<bool>,
 ) -> Result<RunAccepted, ApiError> {
     let record = shared
         .state
@@ -3882,6 +3883,11 @@ pub(crate) async fn rerun_run_with_mode(
         .await
         .map_err(ApiError::from)?;
     let mut submission = (*record.submission).clone();
+    // A rerun request may explicitly enable/disable DAP for this attempt.
+    // With no override, preserve the original submission setting.
+    if let Some(enable_debugger) = enable_debugger {
+        submission.enable_debugger = enable_debugger;
+    }
     // A re-run sees the values the original submission supplied; they live
     // in the provider's run tier while the run's history survives.
     let run_tier = shared
@@ -4275,7 +4281,7 @@ pub async fn rerun_run(
             job_id: None,
         });
     let mode = crate::control::types::RerunMode::try_from(&request)?;
-    rerun_run_with_mode(&shared, run_id, mode, None, None)
+    rerun_run_with_mode(&shared, run_id, mode, None, None, None)
         .await
         .map(Json)
 }

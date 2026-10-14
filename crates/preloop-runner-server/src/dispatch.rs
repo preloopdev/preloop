@@ -365,16 +365,20 @@ async fn resolve_run_ref(
         })
 }
 
-/// Validate the optional re-run body GitHub accepts
-/// (`enable_debug_logging`/`enable_debugger` booleans). preloop has no
-/// per-re-run debug toggle, so the flags are accepted and ignored — but a
-/// wrong-typed field is `422`, matching github.com's request validation.
-fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
+/// The optional GitHub-shaped rerun body. `enable_debugger` is not merely
+/// validation: when present it overrides the stored submission for the new
+/// attempt so a caller can attach DAP to a rerun that was not debug-enabled.
+#[derive(Debug, Default, Clone, Copy)]
+struct RerunOptions {
+    enable_debugger: Option<bool>,
+}
+
+fn validate_rerun_body(body: Option<Json<Value>>) -> Result<RerunOptions, ApiError> {
     let Some(Json(body)) = body else {
-        return Ok(());
+        return Ok(RerunOptions::default());
     };
     if body.is_null() {
-        return Ok(());
+        return Ok(RerunOptions::default());
     }
     let Some(object) = body.as_object() else {
         return Err(ApiError::unprocessable(
@@ -390,7 +394,9 @@ fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
             )));
         }
     }
-    Ok(())
+    Ok(RerunOptions {
+        enable_debugger: object.get("enable_debugger").and_then(Value::as_bool),
+    })
 }
 
 /// POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun — GitHub's
@@ -403,7 +409,7 @@ pub async fn rerun_actions_run(
     body: Option<Json<Value>>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
-    validate_rerun_body(body)?;
+    let options = validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
     crate::runs::rerun_run_with_mode(
@@ -412,15 +418,11 @@ pub async fn rerun_actions_run(
         crate::control::types::RerunMode::All,
         None,
         Some(identity.actor.clone()),
+        options.enable_debugger,
     )
     .await?;
     Ok(StatusCode::CREATED)
 }
-
-/// POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs —
-/// GitHub's "Re-run failed jobs": failed/cancelled jobs plus their
-/// dependents. Success is `201 Created`; a run with nothing failed is
-/// `409 Conflict` (the backend refuses a `Failed` mode with no seed).
 pub async fn rerun_actions_run_failed(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
@@ -428,7 +430,7 @@ pub async fn rerun_actions_run_failed(
     body: Option<Json<Value>>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
-    validate_rerun_body(body)?;
+    let options = validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
     crate::runs::rerun_run_with_mode(
@@ -437,6 +439,7 @@ pub async fn rerun_actions_run_failed(
         crate::control::types::RerunMode::Failed,
         None,
         Some(identity.actor.clone()),
+        options.enable_debugger,
     )
     .await?;
     Ok(StatusCode::CREATED)
@@ -504,7 +507,7 @@ pub async fn rerun_actions_job(
     body: Option<Json<Value>>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
-    validate_rerun_body(body)?;
+    let options = validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let (run_id, job_id) = resolve_job_ref(&shared, &repository, &job_ref).await?;
     crate::runs::rerun_run_with_mode(
@@ -513,6 +516,7 @@ pub async fn rerun_actions_job(
         crate::control::types::RerunMode::Job(job_id),
         None,
         Some(identity.actor.clone()),
+        options.enable_debugger,
     )
     .await?;
     Ok(StatusCode::CREATED)
