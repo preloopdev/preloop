@@ -136,7 +136,7 @@ struct CompletionApplied {
 /// propagation (`reusable_workflows::propagate_reusable_outputs`, the same
 /// function pg's Sweep drives over its graph) decides the fold; the writes
 /// land with targeted UPDATEs.
-fn finalize_reusable_callers(
+pub(super) fn finalize_reusable_callers(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     run_id: RunId,
@@ -185,6 +185,18 @@ fn finalize_reusable_callers(
             "job.completed.v1",
             serde_json::json!({"job_id": caller_id.0, "status": status_str(status)}),
         )?;
+    }
+    // A caller can be the last live node in the run. Re-summarize after a
+    // fold — and only a fold — so promotion and expansion paths do not
+    // leave the run queued. The release stays behind the empty-fold guard:
+    // the reaper invokes the settle machinery on a starved run too, and
+    // starvation must keep the run's workflow hold (see
+    // `starved_run_keeps_workflow_hold`).
+    if !finalized.is_empty() {
+        let summary = jobs::summarize_run_row(tx, run_id)?;
+        if summary.is_terminal() {
+            settle::release_concurrency_for_run(tx, backend, run_id)?;
+        }
     }
     Ok(finalized)
 }
