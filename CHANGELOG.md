@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Fixed
+
+- **Owner-gated `runs-on` expressions use the submission context**: workflow
+  expansion now receives the run's actual `github` context, including reusable
+  callee materialization, so repository-owner checks select the same runner
+  label as GitHub instead of silently taking the false branch.
+
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed

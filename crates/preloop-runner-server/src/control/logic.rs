@@ -2326,20 +2326,22 @@ fn build_reusable_expansion(
     })?;
     let expanded = if caller_plan.deferred_matrix.is_some() {
         let caller_workflow = caller_workflow_of(&ctx, &caller_plan)?;
-        preloop_gha_parser::expand_deferred_reusable_call(
+        preloop_gha_parser::expand_deferred_reusable_call_with_github_context(
             &called,
             &caller_workflow,
             &caller_plan,
             &needs_outputs,
             &ctx.submission.reusable_workflows,
             &ctx.submission.reusable_workflow_shas,
+            Some(&ctx.github_json),
         )
     } else {
-        preloop_gha_parser::expand_reusable_call(
+        preloop_gha_parser::expand_reusable_call_with_github_context(
             &called,
             &caller_plan,
             &ctx.submission.reusable_workflows,
             &ctx.submission.reusable_workflow_shas,
+            Some(&ctx.github_json),
         )
     }
     .map_err(|error| {
@@ -2394,7 +2396,7 @@ fn build_matrix_expansion(
         tracing::warn!(%run_id, job = %node_id, %error, "workflow re-parse failed for dynamic matrix");
         ExecutionStatus::Failure
     })?;
-    let plans = preloop_gha_parser::expand_deferred_matrix_job(
+    let plans = preloop_gha_parser::expand_deferred_matrix_job_with_github_context(
         &workflow,
         &base_id,
         &expression,
@@ -2406,6 +2408,7 @@ fn build_matrix_expansion(
         // using it here would fan out cells with an empty `inputs` context
         // while plain jobs see the values.
         Some(&scoped_inputs),
+        Some(&ctx.github_json),
     )
     .map_err(|error| {
         tracing::warn!(%run_id, job = %node_id, %error, "dynamic matrix expansion failed");

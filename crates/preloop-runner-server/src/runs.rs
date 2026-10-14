@@ -996,127 +996,8 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             trigger_mismatch_hint(&reason)
         )));
     }
-    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
-        .dispatch_inputs
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let t_expand = std::time::Instant::now();
-    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
-        &workflow,
-        &submission.reusable_workflows,
-        &submission.reusable_workflow_shas,
-        (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
-        Some(submission.event.as_str()),
-    )?;
-    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
-    let mut jobs = expanded.jobs;
-    let reusable_calls = expanded.reusable_calls;
-    if !submission.dispatch_inputs.is_empty() {
-        for job in &mut jobs {
-            if job.reusable_call.is_some() {
-                // A reusable caller's `inputs` are the evaluated `with:`
-                // values destined for the callee; overwriting them with the
-                // dispatch inputs drops every input the call passes, so the
-                // callee sees empty values. The caller's own gates still
-                // need the dispatch inputs in context, so merge them
-                // underneath instead of replacing.
-                for (name, value) in &submission.dispatch_inputs {
-                    job.inputs
-                        .entry(name.clone())
-                        .or_insert_with(|| value.clone());
-                }
-            } else {
-                job.inputs = submission.dispatch_inputs.clone();
-            }
-        }
-    }
-
-    // Filter to selected jobs and their transitive needs: closure.
-    if !submission.selected_jobs.is_empty() {
-        let pairs: Vec<(String, Vec<String>)> = jobs
-            .iter()
-            .map(|job| {
-                (
-                    job.base_id.clone(),
-                    job.needs.iter().map(|n| n.0.clone()).collect(),
-                )
-            })
-            .collect();
-        // Reject the whole selection if any id is unknown. Silently dropping a
-        // typo would run a subset of the requested jobs and report success.
-        let mut selected = std::collections::BTreeSet::new();
-        let mut known: std::collections::BTreeSet<&str> =
-            pairs.iter().map(|(id, _)| id.as_str()).collect();
-        for requested in &submission.selected_jobs {
-            // A reusable caller is selected by its own (possibly
-            // matrix-suffixed) node: its callee subtree is not part of the
-            // plan anymore — it materializes at runtime after the gate passes.
-            let matched_reusable = reusable_calls.keys().any(|caller| {
-                caller.as_str() == requested
-                    || caller
-                        .strip_prefix(requested)
-                        .is_some_and(|suffix| suffix.starts_with(" ("))
-            });
-            if matched_reusable {
-                known.insert(requested);
-            }
-            selected.insert(requested.clone());
-        }
-        let unknown: Vec<&str> = submission
-            .selected_jobs
-            .iter()
-            .map(String::as_str)
-            .filter(|id| !known.contains(id))
-            .collect();
-        if !unknown.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "unknown job(s) in selected_jobs: {}. available jobs: {}",
-                unknown.join(", "),
-                known.into_iter().collect::<Vec<_>>().join(", ")
-            )));
-        }
-        let graph = preloop_gha_parser::dag::needs_graph_from_pairs(&pairs);
-        let closure = preloop_gha_parser::dag::dependency_closure(
-            &graph,
-            &selected.into_iter().collect::<Vec<_>>(),
-        );
-        let before = jobs.len();
-        jobs.retain(|job| closure.contains(&job.base_id));
-        tracing::info!(
-            selected = ?submission.selected_jobs,
-            before,
-            after = jobs.len(),
-            "filtered jobs to dependency closure"
-        );
-    }
-
-    // Server-wide submit cap, enforced after expansion (the count above is
-    // post-matrix-expansion and post-closure-filter) but before the build
-    // loop and the insert transaction: a rejected run never opens a giant
-    // transaction, so it can never pin the writer. Webhook deliveries
-    // bypass it — like the namespace submit quotas, a push is never
-    // refused; chunked inserts bound their writer hold instead.
-    if webhook_delivery_id.is_none() {
-        let max_jobs_per_run = shared.state.max_jobs_per_run;
-        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
-            return Err(ApiError::bad_request(format!(
-                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
-                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
-                jobs.len(),
-            )));
-        }
-    }
 
     let run_id = RunId::new();
-    // Durable before the run commits: any node may acquire its jobs later.
-    // Dropped again unless the submit commits a new run.
-    let run_secrets = RunSecretsGuard::put(
-        shared.state.secret_provider.as_ref(),
-        run_id,
-        &provided_secrets,
-    )?;
-    drop(provided_secrets);
     let repository_owner = submission
         .repository
         .split('/')
@@ -1262,6 +1143,127 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "triggering_actor": submission.actor
     });
 
+    let dispatch_inputs_for_expand: BTreeMap<String, serde_json::Value> = submission
+        .dispatch_inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let t_expand = std::time::Instant::now();
+    let expanded =
+        preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
+            &workflow,
+            &submission.reusable_workflows,
+            &submission.reusable_workflow_shas,
+            (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
+            Some(submission.event.as_str()),
+            Some(&github),
+        )?;
+    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
+    let mut jobs = expanded.jobs;
+    let reusable_calls = expanded.reusable_calls;
+    if !submission.dispatch_inputs.is_empty() {
+        for job in &mut jobs {
+            if job.reusable_call.is_some() {
+                // A reusable caller's `inputs` are the evaluated `with:`
+                // values destined for the callee; overwriting them with the
+                // dispatch inputs drops every input the call passes, so the
+                // callee sees empty values. The caller's own gates still
+                // need the dispatch inputs in context, so merge them
+                // underneath instead of replacing.
+                for (name, value) in &submission.dispatch_inputs {
+                    job.inputs
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            } else {
+                job.inputs = submission.dispatch_inputs.clone();
+            }
+        }
+    }
+
+    // Filter to selected jobs and their transitive needs: closure.
+    if !submission.selected_jobs.is_empty() {
+        let pairs: Vec<(String, Vec<String>)> = jobs
+            .iter()
+            .map(|job| {
+                (
+                    job.base_id.clone(),
+                    job.needs.iter().map(|n| n.0.clone()).collect(),
+                )
+            })
+            .collect();
+        // Reject the whole selection if any id is unknown. Silently dropping a
+        // typo would run a subset of the requested jobs and report success.
+        let mut selected = std::collections::BTreeSet::new();
+        let mut known: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|(id, _)| id.as_str()).collect();
+        for requested in &submission.selected_jobs {
+            // A reusable caller is selected by its own (possibly
+            // matrix-suffixed) node: its callee subtree is not part of the
+            // plan anymore — it materializes at runtime after the gate passes.
+            let matched_reusable = reusable_calls.keys().any(|caller| {
+                caller.as_str() == requested
+                    || caller
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(" ("))
+            });
+            if matched_reusable {
+                known.insert(requested);
+            }
+            selected.insert(requested.clone());
+        }
+        let unknown: Vec<&str> = submission
+            .selected_jobs
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !known.contains(id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "unknown job(s) in selected_jobs: {}. available jobs: {}",
+                unknown.join(", "),
+                known.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let graph = preloop_gha_parser::dag::needs_graph_from_pairs(&pairs);
+        let closure = preloop_gha_parser::dag::dependency_closure(
+            &graph,
+            &selected.into_iter().collect::<Vec<_>>(),
+        );
+        let before = jobs.len();
+        jobs.retain(|job| closure.contains(&job.base_id));
+        tracing::info!(
+            selected = ?submission.selected_jobs,
+            before,
+            after = jobs.len(),
+            "filtered jobs to dependency closure"
+        );
+    }
+
+    // Server-wide submit cap, enforced after expansion (the count above is
+    // post-matrix-expansion and post-closure-filter) but before the build
+    // loop and the insert transaction: a rejected run never opens a giant
+    // transaction, so it can never pin the writer. Webhook deliveries
+    // bypass it — like the namespace submit quotas, a push is never
+    // refused; chunked inserts bound their writer hold instead.
+    if webhook_delivery_id.is_none() {
+        let max_jobs_per_run = shared.state.max_jobs_per_run;
+        if max_jobs_per_run > 0 && jobs.len() as u64 > max_jobs_per_run {
+            return Err(ApiError::bad_request(format!(
+                "run expands to {} jobs, exceeding the server's max_jobs_per_run limit of \
+                 {max_jobs_per_run} (config `max_jobs_per_run`, env `PRELOOP_MAX_JOBS_PER_RUN`)",
+                jobs.len(),
+            )));
+        }
+    }
+    // Durable before the run commits: any node may acquire its jobs later.
+    // Dropped again unless the submit commits a new run.
+    let run_secrets = RunSecretsGuard::put(
+        shared.state.secret_provider.as_ref(),
+        run_id,
+        &provided_secrets,
+    )?;
+    drop(provided_secrets);
     // Capture one immutable source per run before any job is queued. Local
     // submissions snapshot the caller's working tree; opt-in remote modes
     // fetch the webhook commit once for every job in this run.
@@ -3978,12 +3980,13 @@ pub(crate) async fn rerun_run_with_mode(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             let mut jobs =
-                preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
+                preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event_and_github_context(
                     &workflow,
                     &submission.reusable_workflows,
                     &submission.reusable_workflow_shas,
                     (!dispatch_inputs.is_empty()).then_some(&dispatch_inputs),
                     Some(submission.event.as_str()),
+                    Some(&record.github),
                 )
                 .map_err(ApiError::from)?
                 .jobs;
