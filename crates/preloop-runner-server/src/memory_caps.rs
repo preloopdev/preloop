@@ -104,22 +104,21 @@ pub const MAX_TOP_RECORDS: usize = 500;
 pub const MAX_PENDING_PER_JOB: usize = 32;
 
 /// Cap on a single in-flight legacy cache upload
-/// (`PendingCache::bytes`). `cache_upload` appends every PATCH body with no
-/// running total; without this cap a job could grow server RAM without bound
-/// by PATCHing chunks forever (~500 requests/GiB at Axum's 2 MiB default body
-/// limit). It is also the body limit of the legacy cache upload route
-/// (`PATCH /_apis/artifactcache/cache/{cache_id}`, `routes.rs`), so one chunk
-/// can never exceed the whole upload budget. Matches the 512 MiB body limit on
-/// the Twirp blob upload route.
+/// (`PendingCache::staging_len`). `cache_upload` streams each PATCH body
+/// frame to its staging file and reserves the frame's bytes before writing;
+/// it never collects the request into one `Bytes` allocation. The route's
+/// manual cap is this same budget, with `DefaultBodyLimit` retained only as
+/// defense-in-depth for a future buffered extractor. Matches the 512 MiB
+/// body budget on the Twirp blob upload route.
 pub const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-job aggregate cap on in-flight legacy cache upload bytes.
 /// `MAX_CACHE_UPLOAD_BYTES` bounds one reservation; without an aggregate
 /// budget a job could still hold `MAX_PENDING_PER_JOB` × 512 MiB (~16 GiB)
 /// in `pending_caches`. 1 GiB leaves headroom for two full-size uploads
-/// while keeping a hostile job's worst case bounded. Enforced under the
-/// `inner` lock in `cache_upload`, so concurrent chunks cannot race past
-/// it; bytes are released when the reservation commits or is swept.
+/// while keeping a hostile job's worst case bounded. Per-frame semaphore
+/// permits enforce this without holding `inner` across file I/O; permits are
+/// released when a frame fails, a reservation commits, or it is swept.
 pub const MAX_PENDING_CACHE_BYTES_PER_JOB: u64 = 1024 * 1024 * 1024;
 
 /// Global cap on minted cache download tokens; the oldest are evicted.
@@ -863,20 +862,28 @@ pub fn sweep_pending_uploads(
     for token in stale_artifact {
         inner.artifact_v2_pending.remove(&token);
     }
-    // Legacy reservations are freed too; only `cache_commit` removed
-    // them before, so abandoned uploads accumulated RAM without bound.
-    // Their staged chunks live on disk now: collect the staging files so
-    // the caller can delete them after releasing the lock.
-    let stale_legacy: Vec<(i64, std::path::PathBuf)> = inner
+    // Legacy reservations are freed too. Never wait for an active upload
+    // while holding `InnerState`: an in-flight request owns its reservation
+    // mutex and will release it after its file write or rollback completes.
+    // A later sweep retries entries skipped by `try_lock`.
+    let stale_legacy: Vec<(i64, Arc<tokio::sync::Mutex<()>>)> = inner
         .pending_caches
         .iter()
         .filter(|(_, pending)| pending.created_unix > 0 && pending.created_unix < cutoff)
-        .map(|(cache_id, pending)| (*cache_id, pending.staging_path.clone()))
+        .map(|(cache_id, pending)| (*cache_id, pending.upload_lock.clone()))
         .collect();
     let mut staged_files: Vec<std::path::PathBuf> = Vec::new();
-    for (cache_id, staging_path) in stale_legacy {
-        inner.pending_caches.remove(&cache_id);
-        staged_files.push(staging_path);
+    for (cache_id, upload_lock) in stale_legacy {
+        let Ok(_upload_guard) = upload_lock.try_lock() else {
+            continue;
+        };
+        let Some(pending) = inner.pending_caches.remove(&cache_id) else {
+            continue;
+        };
+        if let Some(job_quota) = &pending.job_quota {
+            job_quota.add_permits(pending.staging_len as usize);
+        }
+        staged_files.push(pending.staging_path);
     }
     let stale_dl: Vec<String> = inner
         .cache_v2_dl_tokens_created

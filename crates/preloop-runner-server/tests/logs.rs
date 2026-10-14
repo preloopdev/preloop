@@ -4509,13 +4509,122 @@ async fn cache_upload_rejects_bodies_over_cap() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert!(
-        String::from_utf8_lossy(&diagnostic).contains("Failed to buffer the request body"),
+        String::from_utf8_lossy(&diagnostic).contains("per-upload cap"),
         "oversized cache upload should explain the rejection to the caller"
     );
 
-    let inner = state.inner.lock().await;
+    let staging_path = {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.pending_caches[&cache_id].staging_len, 0,
+            "a refused chunk must not be counted as staged"
+        );
+        inner.pending_caches[&cache_id].staging_path.clone()
+    };
     assert_eq!(
-        inner.pending_caches[&cache_id].staging_len, 0,
-        "a refused chunk must not be staged"
+        tokio::fs::metadata(&staging_path).await.unwrap().len(),
+        0,
+        "a refused chunk must be truncated before a retry"
+    );
+
+    let retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from("ok"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::ACCEPTED);
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/_apis/artifactcache/cache/{cache_id}"),
+        json!({"size": 2}),
+    )
+    .await;
+    let lookup = request_json(
+        &app,
+        Method::GET,
+        "/api/v1/cache?key=too-large-chunk&version=v1",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(lookup["content_base64"], "b2s=");
+}
+
+#[tokio::test]
+async fn cache_upload_cancellation_invalidates_partial_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "cancelled-chunk", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+    let staging_path = {
+        let inner = state.inner.lock().await;
+        inner.pending_caches[&cache_id].staging_path.clone()
+    };
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let body = stream::once(async move {
+        let _ = started_tx.send(());
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![b'X'; 1024]))
+    })
+    .chain(stream::once(async move {
+        let _ = release_rx.await;
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"never"))
+    }));
+    let request = Request::builder()
+        .method(Method::PATCH)
+        .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+        .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+        .body(Body::from_stream(body))
+        .unwrap();
+    let task = tokio::spawn(app.clone().oneshot(request));
+    started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    task.abort();
+    let _ = task.await;
+    drop(release_tx);
+
+    // Cancellation marks the reservation invalid synchronously, so a commit
+    // cannot observe a partial prefix even if async truncation is still
+    // finishing in the background.
+    let commit = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"size":1024}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .inner
+            .lock()
+            .await
+            .pending_caches
+            .contains_key(&cache_id),
+        "interrupted reservations must not remain committable"
+    );
+    assert!(
+        tokio::fs::metadata(staging_path).await.is_err(),
+        "invalidated staging must be removed when commit closes the reservation"
     );
 }

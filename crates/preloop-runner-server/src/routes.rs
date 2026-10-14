@@ -41,8 +41,9 @@ pub fn build_app(
         .route("/_apis/artifactcache/cache", get(cache_lookup))
         .route(
             "/_apis/artifactcache/cache/{cache_id}",
-            // `cache_upload` extracts each chunk as `Bytes`, so this route needs
-            // its own limit: the per-upload budget the handler already enforces.
+            // `cache_upload` streams `Body` and enforces this cap while reading.
+            // Keep the named route layer as defense-in-depth if its extractor
+            // ever changes back to a buffered type.
             patch(cache_upload).layer(DefaultBodyLimit::max(MAX_CACHE_UPLOAD_BYTES as usize)),
         )
         .route("/_apis/artifactcache/cache/{cache_id}", post(cache_commit))
