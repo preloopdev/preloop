@@ -4154,3 +4154,88 @@ async fn replay_step_log_upload_is_masked_before_persist() {
     );
     assert_eq!(stored, "raw=*** b64=***\n");
 }
+
+#[tokio::test]
+async fn replay_result_upload_accepts_bodies_above_axum_default_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Axum's default Bytes extractor limit is 2 MiB. A real step log can
+    // exceed that while remaining well below the replay upload cap.
+    let body = vec![b'R'; 3 * 1024 * 1024];
+    let path = "/replay/results/plan-large/job-large/step-large.txt";
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sig = sign_replay_upload_ticket(&state, path, expires_at);
+    let uri = format!("{path}?se={expires_at}&sig={sig}");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let stored = tokio::fs::read(
+        temp.path()
+            .join("replay")
+            .join("results")
+            .join("plan-large")
+            .join("job-large")
+            .join("step-large.txt"),
+    )
+    .await
+    .expect("large replay upload must be persisted");
+    assert_eq!(stored, body);
+}
+
+#[tokio::test]
+async fn replay_result_upload_rejects_bodies_over_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let path = "/replay/results/plan-too-large/job-too-large/step-too-large.txt";
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sig = sign_replay_upload_ticket(&state, path, expires_at);
+    let uri = format!("{path}?se={expires_at}&sig={sig}");
+
+    // Stream one byte over the cap without constructing a correspondingly
+    // oversized request buffer. The extractor must reject it with a visible
+    // 413 rather than letting the handler buffer an unbounded body.
+    let chunk = Bytes::from(vec![b'X'; 1024 * 1024]);
+    let chunks = (0..(MAX_REPLAY_RESULT_BYTES / chunk.len()))
+        .map(move |_| Ok::<Bytes, std::convert::Infallible>(chunk.clone()))
+        .chain(std::iter::once(Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from_static(b"X"),
+        )));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(Body::from_stream(stream::iter(chunks)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("Failed to buffer the request body"),
+        "oversized replay upload should explain the rejection to the caller"
+    );
+}

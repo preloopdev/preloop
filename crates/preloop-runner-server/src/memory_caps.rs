@@ -41,6 +41,10 @@ pub const MAX_LOGS_PER_PLAN: usize = 512;
 /// global retained byte budget across all plans. Prevents a runner
 /// from fabricating unlimited `plan_id` values to bypass the per-plan cap.
 pub const MAX_LOG_BYTES_GLOBAL: usize = 256 * 1024 * 1024;
+/// Maximum size of one signed replay-result upload (step/job log or summary).
+/// The upload handler receives the complete body for masking before it is
+/// atomically persisted, so the route must keep this request bounded.
+pub const MAX_REPLAY_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Global retained log entry cap.
 pub const MAX_LOGS_GLOBAL: usize = 4096;

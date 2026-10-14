@@ -1032,7 +1032,12 @@ pub fn build_app(
         )
         // Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
         // The runner PUTs logs/summaries here; we store them in the state directory.
-        .route("/replay/results/{*path}", put(replay_results_put))
+        .route(
+            "/replay/results/{*path}",
+            // Bytes extraction otherwise inherits Axum's 2 MiB default. Keep this
+            // runner-facing upload bounded while allowing real step logs through.
+            put(replay_results_put).layer(DefaultBodyLimit::max(MAX_REPLAY_RESULT_BYTES)),
+        )
         // Twirp APIs accept only the system token or a locally signed Actions.Results job token.
         .route(
             "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",

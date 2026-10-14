@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Fixed
+
+- **Large replay step logs are retained** (#599): signed
+  `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
+  inheriting Axum's 2 MiB default, so long failing steps remain available for
+  diagnosis while oversized requests are rejected.
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed
