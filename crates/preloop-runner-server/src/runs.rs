@@ -1259,7 +1259,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "workflow_ref": workflow_ref,
         "workflow_sha": sha,
         "repository_id": "0",
-        "triggering_actor": submission.actor
+        "triggering_actor": submission.triggering_actor.clone().unwrap_or_else(|| submission.actor.clone())
     });
 
     // Capture one immutable source per run before any job is queued. Local
@@ -3929,7 +3929,14 @@ pub(crate) async fn rerun_run_with_mode(
     let Some(plan) = plan else {
         return match mode {
             crate::control::types::RerunMode::All => {
-                archived_rerun(shared, run_id, submission, reused_check_run).await
+                archived_rerun(
+                    shared,
+                    run_id,
+                    submission,
+                    reused_check_run,
+                    triggering_actor.clone(),
+                )
+                .await
             }
             _ => Err(ApiError::conflict(format!(
                 "run {run_id} was archived; only a full re-run (all jobs) is possible"
@@ -3970,8 +3977,21 @@ pub(crate) async fn rerun_run_with_mode(
         }
 
         if !plan.missing_templates.is_empty() {
-            let normalized_github =
+            // Rebuilt templates would otherwise keep the ORIGINAL attempt's
+            // github context: `record.github` predates the backend's
+            // triggering-actor/attempt bump, so stamp the override the same
+            // way the runner-facing messages are patched.
+            let mut normalized_github =
                 preloop_gha_parser::job_builder::normalize_github_context(&record.github);
+            if let (Some(actor), Some(map)) = (
+                triggering_actor.as_deref(),
+                normalized_github.as_object_mut(),
+            ) {
+                map.insert(
+                    "triggering_actor".to_owned(),
+                    serde_json::Value::String(actor.to_owned()),
+                );
+            }
             let base_url = runner_base_url();
             // The rerun rebuilds templates for the same workflow snapshot —
             // expansion is deterministic over the stored submission's
@@ -4045,7 +4065,7 @@ pub(crate) async fn rerun_run_with_mode(
         .rerun_run(crate::control::types::RerunRun {
             run_id,
             mode: mode.clone(),
-            triggering_actor,
+            triggering_actor: triggering_actor.clone(),
             workflow_concurrency,
             environment_rules: crate::config::EnvironmentRulesMap::default(),
             templates,
@@ -4060,7 +4080,14 @@ pub(crate) async fn rerun_run_with_mode(
         Err(crate::control::ControlError::NotFound(_)) => {
             return match mode {
                 crate::control::types::RerunMode::All => {
-                    archived_rerun(shared, run_id, submission, reused_check_run).await
+                    archived_rerun(
+                        shared,
+                        run_id,
+                        submission,
+                        reused_check_run,
+                        triggering_actor.clone(),
+                    )
+                    .await
                 }
                 _ => Err(ApiError::conflict(format!(
                     "run {run_id} was archived; only a full re-run (all jobs) is possible"
@@ -4145,9 +4172,13 @@ pub(crate) async fn rerun_run_with_mode(
 async fn archived_rerun(
     shared: &Arc<SharedState>,
     archived_run_id: RunId,
-    submission: WorkflowSubmission,
+    mut submission: WorkflowSubmission,
     reused_check_run: Option<(JobId, u64)>,
+    triggering_actor: Option<String>,
 ) -> Result<RunAccepted, ApiError> {
+    // The new run keeps `github.actor` = the original submitter; the
+    // rerequesting user only takes `github.triggering_actor`.
+    submission.triggering_actor = triggering_actor;
     let accepted = submit_run_inner(shared, submission).await?;
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
         // Guarded by the setter itself: a missing job row writes nothing.

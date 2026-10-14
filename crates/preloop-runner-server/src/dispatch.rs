@@ -342,21 +342,25 @@ async fn resolve_run_ref(
     repository: &str,
     run_ref: &str,
 ) -> Result<crate::RunId, ApiError> {
-    // Try parsing as a UUID first and validate it belongs to this repository
+    // UUIDs parse directly and are validated with a single targeted read —
+    // a repository walk would load every live and archived run record.
     if let Ok(run_id) = run_ref.parse::<crate::RunId>() {
-        let runs = shared
-            .state
-            .backend
-            .runs_for_repository(repository)
-            .await
-            .map_err(ApiError::from)?;
-        if runs.iter().any(|run| run.run_id == run_id) {
-            return Ok(run_id);
-        }
-        // UUID is valid but doesn't belong to this repository
-        return Err(ApiError::from(crate::control::ControlError::NotFound(
-            format!("run {run_ref}"),
-        )));
+        let record = shared.state.backend.run_record(run_id).await;
+        let owned = match record {
+            Ok(record) => record
+                .submission
+                .repository
+                .eq_ignore_ascii_case(repository),
+            Err(crate::control::ControlError::NotFound(_)) => false,
+            Err(error) => return Err(ApiError::from(error)),
+        };
+        return if owned {
+            Ok(run_id)
+        } else {
+            Err(ApiError::from(crate::control::ControlError::NotFound(
+                format!("run {run_ref}"),
+            )))
+        };
     }
     // Try parsing as a numeric stable_id
     let numeric: u64 = run_ref.parse().map_err(|_| {
@@ -390,16 +394,12 @@ struct RerunOptions {
 
 /// Validate the optional re-run body GitHub accepts. Empty bodies use
 /// defaults; malformed JSON returns `422` (Unprocessable Entity).
-fn validate_rerun_body(body: Option<Bytes>) -> Result<RerunOptions, ApiError> {
-    let Some(bytes) = body else {
-        return Ok(RerunOptions::default());
-    };
-
-    if bytes.is_empty() {
+fn validate_rerun_body(body: Bytes) -> Result<RerunOptions, ApiError> {
+    if body.is_empty() {
         return Ok(RerunOptions::default());
     }
 
-    let value: Value = serde_json::from_slice(&bytes)
+    let value: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::unprocessable("Invalid request: body must be valid JSON"))?;
 
     if value.is_null() {
@@ -434,7 +434,7 @@ pub async fn rerun_actions_run(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Bytes>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let options = validate_rerun_body(body)?;
@@ -455,7 +455,7 @@ pub async fn rerun_actions_run_failed(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Bytes>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let options = validate_rerun_body(body)?;
@@ -532,7 +532,7 @@ pub async fn rerun_actions_job(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, job_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Bytes>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let options = validate_rerun_body(body)?;
@@ -763,6 +763,7 @@ fn submission_from_effective(
         secrets: BTreeMap::new(),
         run_secret_names: std::collections::BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
+        triggering_actor: None,
         reusable_workflow_shas: BTreeMap::new(),
         enable_debugger: false,
         debugger_welcome_message: None,

@@ -552,12 +552,12 @@ fn rerun_run_tx(
                 &template.condition_context,
             )?;
         } else if let Some(mut message) = jobs::stored_job_message(tx, run_id, &job_id)? {
-            patch_message_attempt(&mut message, run_attempt)?;
+            patch_message_attempt(&mut message, run_attempt, triggering_actor.as_deref())?;
             jobs::update_job_message(tx, run_id, &job_id, &message)?;
             // The stored `if:` context is the previous attempt's; refresh the
             // attempt stamp inside it so the promotion sweep sees the same
             // context the runner will.
-            patch_condition_context(tx, &run, &job_id, run_attempt)?;
+            patch_condition_context(tx, &run, &job_id, run_attempt, triggering_actor.as_deref())?;
         } else if expandable {
             // An expandable node re-mints its runnable messages at
             // expansion; a `pending`/`blocked` placeholder is correct here.
@@ -937,6 +937,7 @@ fn reset_concluded(
 fn patch_message_attempt(
     message: &mut azdo::AgentJobRequestMessage,
     run_attempt: i64,
+    triggering_actor: Option<&str>,
 ) -> Result<uuid::Uuid, ControlError> {
     let agent_job_id = uuid::Uuid::new_v4();
     message.job_id = agent_job_id;
@@ -948,6 +949,15 @@ fn patch_message_attempt(
             "run_attempt".to_owned(),
             azdo::PipelineContextData::Number(run_attempt as f64),
         );
+        // The rerequesting user is this attempt's actor: runner-side
+        // `${{ github.triggering_actor }}` must name who re-ran, not who
+        // submitted the original attempt.
+        if let Some(actor) = triggering_actor {
+            github.insert(
+                "triggering_actor".to_owned(),
+                azdo::PipelineContextData::String(actor.to_owned()),
+            );
+        }
     }
     if let Some(azdo::PipelineContextData::Dict(job)) = message.context_data.get_mut("job") {
         job.insert(
@@ -973,6 +983,7 @@ fn patch_condition_context(
     run: &str,
     job_id: &JobId,
     run_attempt: i64,
+    triggering_actor: Option<&str>,
 ) -> Result<(), ControlError> {
     let ctx_json: Option<String> = tx
         .prepare_cached(
@@ -987,7 +998,16 @@ fn patch_condition_context(
     };
     let mut context: preloop_gha_expressions::Context =
         serde_json::from_str(&ctx_json).unwrap_or_default();
-    context.merge_root("github", serde_json::json!({"run_attempt": run_attempt}));
+    let mut patch = serde_json::json!({"run_attempt": run_attempt});
+    if let Some(actor) = triggering_actor
+        && let Some(github) = patch.as_object_mut()
+    {
+        github.insert(
+            "triggering_actor".to_owned(),
+            serde_json::Value::String(actor.to_owned()),
+        );
+    }
+    context.merge_root("github", patch);
     tx.prepare_cached(
         "UPDATE job_messages SET condition_context = ?3 WHERE run_id = ?1 AND job_id = ?2",
     )

@@ -283,6 +283,13 @@ pub struct WorkflowSubmission {
     /// Enable DAP debugger for the run's jobs.
     #[serde(default)]
     pub enable_debugger: bool,
+    /// Who re-requested the run when this submission re-runs an archived one.
+    ///
+    /// Internal-only: never serialized or deserialized (an external submitter
+    /// must not be able to forge attribution). `github.actor` stays the
+    /// original submitter; this stamp only feeds `github.triggering_actor`.
+    #[serde(default, skip)]
+    pub triggering_actor: Option<String>,
     /// Welcome message to show when debugger attaches.
     #[serde(default)]
     pub debugger_welcome_message: Option<String>,

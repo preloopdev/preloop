@@ -3383,7 +3383,7 @@ async fn process_check_run_rerequest(
         run_id,
         crate::control::types::RerunMode::Job(job_id.clone()),
         Some((job_id.clone(), check_run_id)),
-        rerequest_sender.map(str::to_owned),
+        rerequest_sender,
         None,
     )
     .await
@@ -4692,6 +4692,7 @@ async fn process_delivery_payload_with_lease(
                 reusable_workflows: BTreeMap::new(),
                 reusable_workflow_shas: BTreeMap::new(),
                 enable_debugger: false,
+                triggering_actor: None,
                 debugger_welcome_message: None,
                 sha: resolved_sha.clone(),
                 actor: payload_val
@@ -8058,7 +8059,7 @@ jobs:
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![crate::github_app::GitHubAppCredentials::for_tests(
                 "424",
-                rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
                 crate::github_app::MintFailurePolicy::LocalJwt,
             )],
             default_index: 0,
