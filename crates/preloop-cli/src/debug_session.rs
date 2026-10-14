@@ -2170,6 +2170,10 @@ mod tests {
                 ),
             );
             assert_eq!(std::fs::read_to_string(marker).unwrap(), expected_path);
+
+            // The helper paths share the same provider boundary — a broken
+            // profile must not abort them either.
+            guest_check("probe", "true").unwrap();
         });
     }
 
