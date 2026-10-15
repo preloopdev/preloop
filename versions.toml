@@ -1,7 +1,7 @@
 runner_version = "2.336.0"
 
 # SmolVM runtime floor: v1.18.1 is the first release that carries
-# `machine fork --freeze-source` (upstream PR #1376), which preloop-vm passes
+# `machine fork --freeze-source` (upstream PR #1376), which the SmolVM driver passes
 # on every fork so the golden stays frozen as a reusable branch base instead
 # of live-forking onto new CoW layers. Live forking accumulates qcow2 backing
 # layers until MAX_FORK_LINEAGE_DEPTH (32) wedges the pool, and on macOS it
@@ -13,7 +13,7 @@ runner_version = "2.336.0"
 # overflow uid (65534). `preloop update --ensure-runtime` accepts any stable
 # release >= this and installs the latest stable when the local runtime is
 # below the floor or lacks the required socket capability. Compiled into
-# preloop-cli and preloop-vm. Keep it at the first release that satisfies all
+# preloop-cli and preloop-sandbox. Keep it at the first release that satisfies all
 # runtime invariants; the golden release pin below is Renovate-managed.
 smolvm_min_version = "1.18.1"
 

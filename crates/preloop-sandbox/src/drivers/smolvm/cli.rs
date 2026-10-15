@@ -1,4 +1,8 @@
-//! Typed SmolVM lifecycle primitives for Preloop CI.
+//! Typed SmolVM CLI lifecycle primitives, shared by the SmolVM driver and
+//! (downstream) other CLI-backed drivers.
+//!
+//! The SmolVM driver ([`super::SmolvmDriver`]) is built on these; the CI
+//! runner pool also uses them directly for host-local SmolVM concerns.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -14,10 +18,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-pub mod agentenv;
-pub mod telemetry;
-
-const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
+/// Default bound on captured exec output.
+pub const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 /// A validated persistent SmolVM machine name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -319,13 +321,14 @@ pub struct ProviderCapabilities {
     pub socket_mounts: bool,
     /// [`VmProvider::pack`] produces a host file usable as a base image.
     ///
-    /// `false` means packs live inside the backend (AgentENV snapshots), so
+    /// `false` means packs live inside the backend (snapshot backends), so
     /// the pool must not try to build, download, or relocate artifact files.
     pub file_packs: bool,
     /// A clone inherits filesystem writes the golden made *after* it booted.
     ///
     /// SmolVM's forkable snapshot does not: the pool reinstalls the baseline
-    /// into each fork. AgentENV snapshots the golden's live filesystem.
+    /// into each fork. A snapshot-based backend captures the golden's live
+    /// filesystem instead.
     pub fork_inherits_guest_writes: bool,
     /// A suspended guest retains its live runner, processes, and filesystem
     /// state when resumed. Backends without this must not auto-suspend a live
@@ -454,7 +457,7 @@ pub trait VmProvider: Send + Sync {
 /// Delegate through a box so a backend can be chosen at runtime.
 ///
 /// The pool is generic over its provider for zero-cost static dispatch, but
-/// the CLI picks between SmolVM and AgentENV from the environment. One
+/// the CLI picks the driver at runtime, so one
 /// `Box<dyn VmProvider>` keeps that choice out of the pool's type parameter
 /// without an enum that has to be extended for every future backend. The
 /// virtual call is irrelevant next to booting a VM.
@@ -537,6 +540,7 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
 /// streaming execs (the runner itself) are unaffected.
 const EXEC_TIMEOUT: &str = "30m";
 
+/// `smolvm` CLI driver of the typed lifecycle primitives.
 #[derive(Debug, Clone)]
 pub struct SmolVmProvider {
     binary: PathBuf,
@@ -778,6 +782,36 @@ impl SmolVmProvider {
             return Ok(false);
         };
         Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
+    }
+
+    /// Durably save RAM and disk, then stop (`smolvm machine pause`).
+    pub async fn pause_machine(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "pause",
+            &[
+                "machine".into(),
+                "pause".into(),
+                "--name".into(),
+                name.as_str().into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Resume a paused machine (`smolvm machine resume`).
+    pub async fn resume_machine(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "resume",
+            &[
+                "machine".into(),
+                "resume".into(),
+                "--name".into(),
+                name.as_str().into(),
+            ],
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn checked(
@@ -1919,7 +1953,8 @@ fn extract_dependent_clones(message: &str) -> Vec<String> {
 }
 
 /// Whether a name is usable as a shell environment variable identifier.
-fn is_env_identifier(name: &str) -> bool {
+/// Whether `name` is a valid POSIX environment variable name.
+pub fn is_env_identifier(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -2113,7 +2148,8 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
 /// Preloop home the helper isolates SmolVM into: the explicit `PRELOOP_HOME`,
 /// else `<HOME>/.preloop` (the CLI's `preloop_home()` default), else the
 /// bare `.preloop` relative directory.
-fn effective_preloop_home() -> Option<PathBuf> {
+/// The Preloop home this process uses (`PRELOOP_HOME`, else `~/.preloop`).
+pub fn effective_preloop_home() -> Option<PathBuf> {
     std::env::var_os("PRELOOP_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
@@ -2191,10 +2227,37 @@ fn parse_df_available_kib(output: &str) -> Option<u64> {
 /// may isolate the child's `HOME` on macOS, so the REAL host locations must
 /// be probed explicitly or a standard install's agent rootfs is never found
 /// (the isolated HOME sends smolvm to an empty directory).
-fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) -> Vec<PathBuf> {
+/// Resolve a binary name on PATH and through symlinks.
+fn resolve_binary(binary: &Path) -> Option<PathBuf> {
+    let found = if binary.components().count() > 1 {
+        Some(binary.to_path_buf())
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(binary))
+                .find(|candidate| candidate.is_file())
+        })
+    }?;
+    found.canonicalize().ok()
+}
+
+fn agent_rootfs_candidates(
+    host_home: Option<&Path>,
+    data_dir: Option<&Path>,
+    binary: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(data_dir) = data_dir {
         candidates.push(data_dir.join("agent-rootfs"));
+    }
+    // The rootfs shipped beside the installed binary matches its version;
+    // the platform data dir can hold a stale copy from an older install,
+    // whose guest agent then refuses newer operations (e.g. safe shutdown).
+    if let Some(dir) = binary
+        .and_then(resolve_binary)
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        candidates.push(dir.join("agent-rootfs"));
     }
     if let Some(home) = host_home {
         #[cfg(target_os = "macos")]
@@ -2652,9 +2715,10 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     // explicitly for the child SmolVM process: the agent rootfs lives in the
     // REAL host's platform data dir, which the isolated HOME would miss.
     if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none()
-        && let Some(path) = agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
-            .into_iter()
-            .find(|path| path.is_dir())
+        && let Some(path) =
+            agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref(), binary)
+                .into_iter()
+                .find(|path| path.is_dir())
     {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
     }
@@ -3087,7 +3151,8 @@ fn validate_socket_source(host: &Path) -> Result<(), VmError> {
     )))
 }
 
-async fn read_bounded(
+/// Read a stream, keeping at most `limit` bytes; the flag reports truncation.
+pub async fn read_bounded(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
 ) -> std::io::Result<(Vec<u8>, bool)> {
@@ -3135,7 +3200,7 @@ async fn forward(
 /// concurrently with the wait, so a child that fills one pipe while the other
 /// stays idle cannot deadlock, and a dropped receiver ends forwarding without
 /// killing the child.
-async fn stream_output(
+pub async fn stream_output(
     child: &mut tokio::process::Child,
     output: mpsc::Sender<OutputChunk>,
 ) -> std::io::Result<i32> {
@@ -3152,6 +3217,7 @@ async fn stream_output(
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
 
     /// Serializes the tests that rewrite `PRELOOP_HOME`: `purge_orphaned_vms`
@@ -3946,6 +4012,30 @@ mod tests {
     }
 
     #[test]
+    fn bundled_agent_rootfs_beats_a_stale_platform_copy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path().join("home");
+        #[cfg(target_os = "macos")]
+        let platform = home.join("Library/Application Support/smolvm/agent-rootfs");
+        #[cfg(not(target_os = "macos"))]
+        let platform = home.join(".local/share/smolvm/agent-rootfs");
+        std::fs::create_dir_all(&platform).expect("platform rootfs");
+        let install = dir.path().join("install");
+        std::fs::create_dir_all(install.join("agent-rootfs")).expect("bundled rootfs");
+        std::fs::write(
+            install.join("smolvm"),
+            b"#!/bin/sh
+",
+        )
+        .expect("binary");
+        let found = agent_rootfs_candidates(Some(&home), None, Some(&install.join("smolvm")))
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("a candidate exists");
+        assert_eq!(found, install.join("agent-rootfs").canonicalize().unwrap());
+    }
+
+    #[test]
     fn agent_rootfs_candidates_probe_platform_then_legacy() {
         let dir = tempfile::tempdir().expect("temp dir");
         let home = dir.path();
@@ -3956,7 +4046,7 @@ mod tests {
         let legacy = home.join(".smolvm/agent-rootfs");
         std::fs::create_dir_all(&platform).expect("platform agent rootfs");
         std::fs::create_dir_all(&legacy).expect("legacy agent rootfs");
-        let found = agent_rootfs_candidates(Some(home), None)
+        let found = agent_rootfs_candidates(Some(home), None, None)
             .into_iter()
             .find(|path| path.is_dir())
             .expect("a candidate exists");
@@ -3968,7 +4058,7 @@ mod tests {
         // An explicit SMOLVM_DATA_DIR wins over the platform defaults.
         let explicit = home.join("custom/agent-rootfs");
         std::fs::create_dir_all(&explicit).expect("explicit agent rootfs");
-        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()))
+        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()), None)
             .into_iter()
             .find(|path| path.is_dir())
             .expect("explicit candidate exists");

@@ -62,7 +62,8 @@ Submit a workflow and stream its events until terminal.
 
 Behavior notes:
 - **Pausing**: pausing is the SmolVM default in an interactive terminal so you
-  can fix and retry; on the AgentENV backend pass `--debug` to open a session.
+  can fix and retry; on a backend whose debug holds cost capacity (a remote
+  sandbox host), pass `--debug` to open a session instead.
   Non-interactive runs (pipes, CI, `--detach`) never pause.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
@@ -475,6 +476,26 @@ self-hosting entry point (webhook + Checks endpoints, microVM provisioning).
 | `--save` | Persist the supplied GitHub credentials for later runs |
 | `--store <URL>` | Durable-state backend: `sqlite://<path>`, a bare path, or `postgres://…` (with optional `?sslmode=require\|verify-full`). Defaults to `PRELOOP_STORE_URL`, then SQLite in the state dir |
 
+## `preloop sandbox <COMMAND>`
+
+Drive the Sandbox Service directly: the same service the runner pool uses,
+over `--service <URL>` (default `http://127.0.0.1:9191`, `PRELOOP_SANDBOX_URL`)
+and `--token` (`PRELOOP_SANDBOX_TOKEN`). See [sandbox-service.md](sandbox-service.md).
+
+| Command | Description |
+|---|---|
+| `sandbox serve [--listen ADDR] [--store URL] [--no-local]` | Run a standalone service, with this host's drivers attached unless `--no-local` |
+| `sandbox agent [--service URL] [--name NAME]` | Join a service as a provider with this host's drivers (`PRELOOP_SANDBOX_DRIVERS`) |
+| `sandbox template put --name … (--image OCI \| --recipe R [--driver D])` / `template ls` / `template rm NAME` | Templates |
+| `sandbox pool put --name … --template … [--warm N] [--max N] [--cpus N] [--memory MiB] [--disk GiB]` / `pool ls` / `pool rm NAME` | Pools |
+| `sandbox acquire (--pool P \| --template T) [--key K] [--ttl S] [--env K=V] [--build]` | Acquire a sandbox; prints `{lease, sandbox}` |
+| `sandbox exec SBX [--env K=V] [--workdir DIR] -- CMD …` | Run a command; exits with its status |
+| `sandbox cp SRC DST` | Copy in/out; `sbx-…:/path` marks the sandbox side (Windows: `sbx-…:C:/path`) |
+| `sandbox stop SBX` / `sandbox start SBX [--forkable]` | Power a machine off (keeping its disk) and boot it again |
+| `sandbox snapshot SBX --name T` | Capture a leased sandbox as a template |
+| `sandbox release LSE [--preserve SECS]` | Release a lease; `--preserve` keeps it for debugging |
+| `sandbox ls` / `sandbox providers` | Sandboxes / providers with their capabilities |
+
 ## Golden image automation
 
 Release automation and operators building organization-specific images can
@@ -580,5 +601,7 @@ preloop setup github --via app                   # creates the App in a browser
 preloop doctor --repo owner/repo
 preloop server install --public-url https://ci.example.com --webhook-secret "$(openssl rand -hex 32)"
 preloop serve                                    # foreground engine + pool
+preloop sandbox pool put --name linux --template alpine --warm 2   # a warm sandbox pool
+preloop sandbox exec sbx-… -- uname -a                             # drive one sandbox
 preloop update --check                           # is there a newer release?
 ```

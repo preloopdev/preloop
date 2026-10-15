@@ -60,25 +60,25 @@ Two flags on the wire carry two different intents:
 | `preloop run` at a terminal, SmolVM | historical default retained: pauses; attach with `preloop debug` |
 
 Debugging is now explicit. The old terminal-attached default remains only on
-SmolVM for compatibility, so local macOS behavior is unchanged; on AgentENV —
-where an idle sandbox costs real money — a plain run tears down on failure and
-`--debug` is how you ask for a session.
+SmolVM for compatibility, so local macOS behavior is unchanged; on a backend
+that bills or holds scarce capacity for an idle sandbox, a plain run tears down
+on failure and `--debug` is how you ask for a session.
 
-### Suspended debug VMs (AgentENV)
+### Suspended debug VMs
 
-An AgentENV sandbox parked for debugging costs money while it runs, so the
-orchestrator suspends it when nobody is attached and resumes it on demand:
+A paused sandbox on a state-preserving backend keeps holding host capacity, so
+the orchestrator suspends it when nobody is attached and resumes it on demand:
 
 ```text
-job paused, no controller   → suspend after 15 s   (aenv pause, 0.19 s)
-preloop debug / shell       → resume, then attach  (aenv resume, 0.09 s)
+job paused, no controller   → suspend after 15 s   (backend pause)
+preloop debug / shell       → resume, then attach  (backend resume)
 controller detaches         → suspend again
 idle deadline expires       → delete
 ```
 
-The backend declares `preserves_runtime_state_on_suspend` in
-`VmProvider::capabilities()`. Only a provider that restores the *same* live
-guest (runner process, workspace, caches) on resume may be parked
+The driver declares `preserves_runtime_state_on_suspend` in its capabilities.
+Only a driver that restores the *same* live guest (runner process, workspace,
+caches) on resume may be parked
 mid-session — SmolVM's `stop` is a real shutdown, so it keeps the
 run-in-place behavior instead. The controller-attach marker is host-side
 precisely because a suspended guest cannot be probed.

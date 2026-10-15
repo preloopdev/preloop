@@ -361,7 +361,7 @@
    "type": 3
   },
   "label": {
-   "text": "preloop-vm (smolvm / libkrun)\nephemeral microVM with packed kernel",
+   "text": "preloop-sandbox (smolvm / libkrun)\nephemeral microVM with packed kernel",
    "fontSize": 15
   }
  },

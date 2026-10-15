@@ -164,7 +164,7 @@ just conform / conform-server-deep   # protocol conformance gates
 ```
 
 Key paths: `crates/preloop-cli/src/main.rs` (CLI), `crates/preloop-orchestrator/`,
-`crates/preloop-vm/` (smolvm provider), `preloop/docs/00_index.md` (design docs),
+`crates/preloop-sandbox/` (Sandbox Service + smolvm driver), `preloop/docs/00_index.md` (design docs),
 `fixtures/workflows/` (sample workflows), `goals/` (agent CI benchmarks).
 
 ## Verification rule

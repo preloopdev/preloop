@@ -1220,9 +1220,9 @@ impl Session {
     fn preflight(&mut self, decision: &GoldenDecision, mode: RunMode) -> anyhow::Result<Value> {
         self.section("4/4 Preflight");
         let starting = matches!(mode, RunMode::Foreground | RunMode::Service);
-        let data_root = preloop_vm::machine_data_root();
+        let data_root = preloop_sandbox::drivers::smolvm::cli::machine_data_root();
         let free = data_root.as_deref().and_then(|root| {
-            match preloop_vm::filesystem_available_bytes(root) {
+            match preloop_sandbox::drivers::smolvm::cli::filesystem_available_bytes(root) {
                 Ok(free) => Some(free),
                 Err(error) => {
                     // Mirror the engine: a volume `df` cannot measure is not a
@@ -1867,10 +1867,10 @@ fn hypervisor_state() -> (bool, String) {
 /// `preloop init --probe --json`: a side-effect-free capability report. Nothing
 /// here writes, creates, or starts anything.
 async fn print_probe() -> anyhow::Result<()> {
-    let data_root = preloop_vm::machine_data_root();
-    let disk_free_bytes = data_root
-        .as_deref()
-        .and_then(|root| preloop_vm::filesystem_available_bytes(root).ok());
+    let data_root = preloop_sandbox::drivers::smolvm::cli::machine_data_root();
+    let disk_free_bytes = data_root.as_deref().and_then(|root| {
+        preloop_sandbox::drivers::smolvm::cli::filesystem_available_bytes(root).ok()
+    });
     let (hypervisor, hypervisor_detail) = hypervisor_state();
     let (config, config_error) = match load_config() {
         Ok(config) => (config, None),
