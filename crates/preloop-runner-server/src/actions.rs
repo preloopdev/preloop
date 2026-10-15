@@ -1208,7 +1208,7 @@ async fn read_snapshot_file(
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
+    let stdout = child.stdout.take()?;
     let mut bytes = Vec::with_capacity(ACTION_MANIFEST_MAX_BYTES + 1);
     let read_result = stdout
         .take((ACTION_MANIFEST_MAX_BYTES + 1) as u64)
