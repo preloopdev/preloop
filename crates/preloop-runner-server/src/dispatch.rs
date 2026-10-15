@@ -335,15 +335,34 @@ pub async fn list_actions_runs(
 
 /// Resolve a `{run_id}` path segment to a run UUID: preloop UUIDs parse
 /// directly; GitHub's numeric ids match `stable_id(run_id)` — the same id
-/// `list_actions_runs` emits — over the repo's runs.
+/// `list_actions_runs` emits — over the repo's runs. UUIDs are validated against the repository
+/// to prevent access to runs in other repositories.
 async fn resolve_run_ref(
     shared: &Arc<SharedState>,
     repository: &str,
     run_ref: &str,
 ) -> Result<crate::RunId, ApiError> {
+    // UUIDs parse directly and are validated with a single targeted read —
+    // a repository walk would load every live and archived run record.
     if let Ok(run_id) = run_ref.parse::<crate::RunId>() {
-        return Ok(run_id);
+        let record = shared.state.backend.run_record(run_id).await;
+        let owned = match record {
+            Ok(record) => record
+                .submission
+                .repository
+                .eq_ignore_ascii_case(repository),
+            Err(crate::control::ControlError::NotFound(_)) => false,
+            Err(error) => return Err(ApiError::from(error)),
+        };
+        return if owned {
+            Ok(run_id)
+        } else {
+            Err(ApiError::from(crate::control::ControlError::NotFound(
+                format!("run {run_ref}"),
+            )))
+        };
     }
+    // Try parsing as a numeric stable_id
     let numeric: u64 = run_ref.parse().map_err(|_| {
         ApiError::from(crate::control::ControlError::NotFound(format!(
             "run {run_ref}"
@@ -373,18 +392,26 @@ struct RerunOptions {
     enable_debugger: Option<bool>,
 }
 
-fn validate_rerun_body(body: Option<Json<Value>>) -> Result<RerunOptions, ApiError> {
-    let Some(Json(body)) = body else {
-        return Ok(RerunOptions::default());
-    };
-    if body.is_null() {
+/// Validate the optional re-run body GitHub accepts. Empty bodies use
+/// defaults; malformed JSON returns `422` (Unprocessable Entity).
+fn validate_rerun_body(body: Bytes) -> Result<RerunOptions, ApiError> {
+    if body.is_empty() {
         return Ok(RerunOptions::default());
     }
-    let Some(object) = body.as_object() else {
+
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::unprocessable("Invalid request: body must be valid JSON"))?;
+
+    if value.is_null() {
+        return Ok(RerunOptions::default());
+    }
+
+    let Some(object) = value.as_object() else {
         return Err(ApiError::unprocessable(
             "Invalid request: the re-run body must be a JSON object",
         ));
     };
+
     for key in ["enable_debug_logging", "enable_debugger"] {
         if let Some(value) = object.get(key)
             && !value.is_boolean()
@@ -394,6 +421,7 @@ fn validate_rerun_body(body: Option<Json<Value>>) -> Result<RerunOptions, ApiErr
             )));
         }
     }
+
     Ok(RerunOptions {
         enable_debugger: object.get("enable_debugger").and_then(Value::as_bool),
     })
@@ -406,7 +434,7 @@ pub async fn rerun_actions_run(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let options = validate_rerun_body(body)?;
@@ -427,7 +455,7 @@ pub async fn rerun_actions_run_failed(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let options = validate_rerun_body(body)?;
@@ -504,7 +532,7 @@ pub async fn rerun_actions_job(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, job_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
-    body: Option<Json<Value>>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let options = validate_rerun_body(body)?;
@@ -534,19 +562,25 @@ pub async fn cancel_actions_run(
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
-    let record = shared
-        .state
-        .backend
-        .run_record(run_id)
-        .await
-        .map_err(ApiError::from)?;
-    if record.status.is_terminal() {
-        return Err(ApiError::conflict(format!(
-            "run {run_ref} is already completed and cannot be cancelled"
-        )));
+
+    // github.com answers 202 only when this request cancelled a live run;
+    // an already-terminal run gets 409 "Cannot cancel a workflow run that
+    // is completed." The backend reports the locked transition's outcome,
+    // so a run that finished between the ref resolution and the cancel is
+    // a 409 here, not a stale 202. `resolve_run_ref` already proved the
+    // run belongs to this repository, so a `NotFound` from the cancel can
+    // only mean the archiver moved the (terminal) run mid-flight — also a
+    // 409 on github.com's terms.
+    match crate::runs::cancel_run_inner(&shared, run_id).await {
+        Ok((_, true)) => Ok(StatusCode::ACCEPTED),
+        Ok((_, false)) => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) if error.status() == StatusCode::NOT_FOUND => Err(ApiError::conflict(
+            "Cannot cancel a workflow run that is completed.",
+        )),
+        Err(error) => Err(error),
     }
-    crate::runs::cancel_run_inner(&shared, run_id).await?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 /// Authorization for the workflow_dispatch POST
@@ -729,6 +763,7 @@ fn submission_from_effective(
         secrets: BTreeMap::new(),
         run_secret_names: std::collections::BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
+        triggering_actor: None,
         reusable_workflow_shas: BTreeMap::new(),
         enable_debugger: false,
         debugger_welcome_message: None,

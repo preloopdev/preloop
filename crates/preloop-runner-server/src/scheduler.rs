@@ -772,6 +772,7 @@ async fn cron_loop(
             reusable_workflows: Default::default(),
             reusable_workflow_shas: Default::default(),
             enable_debugger: false,
+            triggering_actor: None,
             debugger_welcome_message: None,
             sha: resolved_sha.clone().unwrap_or_else(|| "0".repeat(40)),
             actor: "preloop-scheduler".to_owned(),

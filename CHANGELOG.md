@@ -14,6 +14,28 @@ Releases before v0.27.0 predate the changelog.
   releases its downstream `needs` dependents instead of leaving the run
   active forever.
 
+### Fixed
+
+- **Large replay step logs are retained** (#599): signed
+  `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
+  inheriting Axum's 2 MiB default, so long failing steps remain available for
+  diagnosis while oversized requests are rejected.
+
+- **Log appends and legacy cache chunks above 2 MiB are accepted** (#610):
+  log append and console routes accept bodies up to 16 MiB, while legacy
+  cache chunks stream to disk up to the existing 512 MiB upload budget instead
+  of inheriting Axum's 2 MiB default. Oversized requests still get a
+  deterministic 413 without buffering the whole cache chunk in RAM.
+
+- **Runner-side `github.event` arrays decode correctly** (#571): the
+  runner's typed-context decoder used a legacy `{"t":1,"d":…}` tag map while
+  the wire codec serializes arrays as `{"t":1,"a":[…]}`. Nested arrays inside
+  `github.event` (labels, commits, head-commit fields) arrived as `null`, so
+  step env/condition expressions such as
+  `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
+  false and label-gated workflows never saw their labels.
+
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed
@@ -73,6 +95,17 @@ Releases before v0.27.0 predate the changelog.
 ### Fixed
 
 - **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
+
+- **Reusable workflows called as `uses: $/...` resolve** (#581): the runner
+  client, the `preloop-runner` resolver, and the server's remote-workflow
+  resolver treated `$/` as a remote `owner/repo/path@ref` reference and
+  rejected it as unsupported. `$/` and `./` now name a file in the submitting
+  repository: the client resolves them from the workspace, the server fetches
+  them at the submitted commit, and a call inside a remote reusable workflow
+  resolves in that workflow's repository at its pinned commit. The path must
+  be under `.github/workflows/`, with segments of letters, digits, `-`, `_` and
+  `.` only: a `..` segment, an empty or absolute path, or any other character
+  is refused before a request is sent.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
@@ -301,6 +334,27 @@ Releases before v0.27.0 predate the changelog.
   `job_requests_timeline_cascade` trigger prunes the shared timeline with the
   last request.
 
+
+### Fixed
+
+- GitHub rerun/cancel endpoints now validate that a provided run UUID
+  belongs to the specified repository, preventing cross-repository
+  access via token reuse. A request with a foreign UUID returns 404.
+- `POST .../actions/runs/{id}/cancel` returns 202 only when the request
+  actually cancelled a live run; an already-completed run answers 409,
+  matching github.com's "Cannot cancel a workflow run that is completed."
+- A `check_suite.rerequested` delivery now re-runs every terminal run whose
+  check runs reported on the suite's head SHA (matched on the reported
+  coordinate — `status_check_sha` for pull_request runs — not the checkout
+  `head_sha`), instead of restarting only the newest run at that SHA. A
+  suite naming an unregistered App id is ignored.
+- Rerun endpoints reject malformed JSON bodies and non-boolean
+  `enable_debug_logging`/`enable_debugger` with a GitHub-shaped 422
+  (`message` + `documentation_url`) instead of silently defaulting.
+- Rerun and rerequest webhook handlers now pass the webhook sender
+  (`sender.login`) as `triggering_actor` to preserve the user who
+  initiated the rerun, while the original submission's actor is
+  retained for authorization.
 ### Changed
 
 - **Postgres completions no longer load the run graph**: `settle_job` and
@@ -855,6 +909,10 @@ Releases before v0.27.0 predate the changelog.
   golden's sparse disks exceed. Preloop now passes a 512 GiB ceiling to SmolVM
   unless the operator sets one.
 
+- **Debug-session guest commands avoid unrelated login profiles**: commands
+  entered at the attach prompt, plus the sync/export/probe helpers, use a
+  non-login `sh -c` while inheriting the provider-selected image environment
+  and PATH and preserving the job workspace.
 - **Scheduled golden refreshes no longer launch an impossible hosted bake**:
   the apt-index freshness workflow now opens one idempotent draft PR asking for
   a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are

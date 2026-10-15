@@ -11,7 +11,7 @@
 //! Source: `MessageListener.cs` → `GetMessageDecryptor()`
 //! Source: `AgentSessionController.cs` → session creation
 
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use rsa::pkcs1::DecodeRsaPublicKey;
@@ -536,7 +536,7 @@ impl SessionEncryption {
     /// Create a new session with a random AES-256 key.
     pub fn generate() -> Self {
         let mut key = vec![0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut key);
+        rand::RngExt::fill(&mut rand::rng(), &mut key);
         Self { key }
     }
 
@@ -550,10 +550,11 @@ impl SessionEncryption {
     /// Returns `(ciphertext, iv)` where `iv` is the random 16-byte IV.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         let mut iv = vec![0u8; 16];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut iv);
+        rand::RngExt::fill(&mut rand::rng(), &mut iv);
 
-        let cipher = Aes256CbcEnc::new(self.key[..].into(), iv[..].into());
-        let ciphertext = cipher.encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        let cipher = Aes256CbcEnc::new_from_slices(&self.key, &iv)
+            .expect("AES-256 key and 16-byte IV have fixed lengths");
+        let ciphertext = cipher.encrypt_padded_vec::<Pkcs7>(plaintext);
 
         Ok((ciphertext, iv))
     }
@@ -563,9 +564,10 @@ impl SessionEncryption {
         if iv.len() != 16 {
             return Err(CryptoError::InvalidIv("IV must be 16 bytes".to_owned()));
         }
-        let cipher = Aes256CbcDec::new(self.key[..].into(), iv[..].into());
+        let cipher = Aes256CbcDec::new_from_slices(&self.key, iv)
+            .expect("AES-256 key and 16-byte IV have fixed lengths");
         cipher
-            .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+            .decrypt_padded_vec::<Pkcs7>(ciphertext)
             .map_err(|e| CryptoError::Decrypt(e.to_string()))
     }
 }
