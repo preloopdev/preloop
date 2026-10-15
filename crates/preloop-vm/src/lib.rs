@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub mod agentenv;
+pub mod guest_privilege;
 pub mod telemetry;
 
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
