@@ -147,6 +147,22 @@ fn runner_volumes(
     }
     Ok(volumes)
 }
+/// Volumes that may be attached to a fork base. AgentENV cannot snapshot a
+/// sandbox while a read-only volume is mounted, so those mounts are attached
+/// to each clone instead.
+fn fork_base_volumes<P: VmProvider>(provider: &P, volumes: Vec<VolumeMount>) -> Vec<VolumeMount> {
+    if provider
+        .capabilities()
+        .fork_bases_may_mount_read_only_volumes
+    {
+        volumes
+    } else {
+        volumes
+            .into_iter()
+            .filter(|volume| !volume.read_only)
+            .collect()
+    }
+}
 
 /// Populate the host-side externals directory, validating the manifest and
 /// binary version for each runtime instead of merely checking for a file.
@@ -3925,7 +3941,14 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, true)?,
+        volumes: fork_base_volumes(
+            provider.as_ref(),
+            runner_volumes(
+                config,
+                golden,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?,
+        ),
         sockets: config
             .control_socket
             .iter()
@@ -3943,6 +3966,9 @@ async fn bake_golden_in_guest<P: VmProvider + 'static>(
     await_guest_ready(provider.as_ref(), golden).await?;
     prepare_rosetta_multiarch(provider.as_ref(), golden, false).await?;
     apply_golden_contract(provider.as_ref(), config, golden).await?;
+    if provider.capabilities().runner_bundle_carries_externals {
+        link_runner_externals(provider.as_ref(), golden).await?;
+    }
     if let Err(error) = preload_images(provider.as_ref(), golden, &config.preload_images).await {
         warn!(
             machine = golden.as_str(),
@@ -3982,6 +4008,41 @@ async fn apply_golden_contract<P: VmProvider>(
     if output.exit_code != 0 {
         return Err(OrchestratorError::Config(format!(
             "golden contract failed on {} (exit {}): {}",
+            name.as_str(),
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("unknown error")
+        )));
+    }
+    Ok(())
+}
+/// AgentENV carries the externals inside the bundle volume. Point the runner
+/// root's conventional externals path at that tree instead of mounting a
+/// second volume under `/home/runner`, which envd cannot create reliably.
+async fn link_runner_externals<P: VmProvider>(
+    provider: &P,
+    name: &MachineName,
+) -> Result<(), OrchestratorError> {
+    let command = format!(
+        "mkdir -p {root} && rm -rf {root}/externals && \
+         ln -s /opt/preloop/bin/externals {root}/externals",
+        root = RUNNER_ROOT
+    );
+    let output = provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                run_as_root_or_sudo_strict(&command),
+            ],
+        )
+        .await?;
+    if output.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "linking runner externals failed on {} (exit {}): {}",
             name.as_str(),
             output.exit_code,
             String::from_utf8_lossy(&output.stderr)
@@ -6529,9 +6590,31 @@ async fn provision_runner<P: VmProvider + 'static>(
     // contents nor the contract this pool baked, so it would register as a
     // runner that cannot run the job it was created for. A fork that cannot be
     // recovered here is an error, and the slot retries it with backoff.
+    let fork_volumes = match golden {
+        Some(_)
+            if !provider
+                .capabilities()
+                .fork_bases_may_mount_read_only_volumes =>
+        {
+            runner_volumes(
+                config,
+                name,
+                !provider.capabilities().runner_bundle_carries_externals,
+            )?
+        }
+        _ => Vec::new(),
+    };
     let forked_golden = match golden {
-        Some(golden) => match provider.fork(golden, name).await {
-            Ok(()) => Some(golden),
+        Some(golden) => match provider
+            .fork_with_volumes(golden, name, &fork_volumes)
+            .await
+        {
+            Ok(()) => {
+                if provider.capabilities().runner_bundle_carries_externals {
+                    link_runner_externals(provider.as_ref(), name).await?;
+                }
+                Some(golden)
+            }
             Err(error) if managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
@@ -6549,8 +6632,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                     match provider.rearm_fork_base(golden, Some(name)).await {
                         Ok(true) => {
                             info!(golden = golden.as_str(), "golden fork base re-armed");
-                            match provider.fork(golden, name).await {
-                                Ok(()) => Some(golden),
+                            match provider
+                                .fork_with_volumes(golden, name, &fork_volumes)
+                                .await
+                            {
+                                Ok(()) => {
+                                    if provider.capabilities().runner_bundle_carries_externals {
+                                        link_runner_externals(provider.as_ref(), name).await?;
+                                    }
+                                    Some(golden)
+                                }
                                 Err(retry_error) => {
                                     error!(
                                         machine = name.as_str(),
@@ -6610,8 +6701,16 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 }
                             }
                             if rearmed {
-                                match provider.fork(golden, name).await {
-                                    Ok(()) => Some(golden),
+                                match provider
+                                    .fork_with_volumes(golden, name, &fork_volumes)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        if provider.capabilities().runner_bundle_carries_externals {
+                                            link_runner_externals(provider.as_ref(), name).await?;
+                                        }
+                                        Some(golden)
+                                    }
                                     Err(retry_error) => {
                                         error!(
                                             machine = name.as_str(),
@@ -6664,8 +6763,14 @@ async fn provision_runner<P: VmProvider + 'static>(
                             error = %last_error,
                             "golden fork failed; retrying the fork"
                         );
-                        match provider.fork(golden, name).await {
+                        match provider
+                            .fork_with_volumes(golden, name, &fork_volumes)
+                            .await
+                        {
                             Ok(()) => {
+                                if provider.capabilities().runner_bundle_carries_externals {
+                                    link_runner_externals(provider.as_ref(), name).await?;
+                                }
                                 retried = Some(golden);
                                 break;
                             }
@@ -6728,7 +6833,11 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name, !from_packed)?,
+            volumes: runner_volumes(
+                config,
+                name,
+                !from_packed && !provider.capabilities().runner_bundle_carries_externals,
+            )?,
             sockets: config
                 .control_socket
                 .iter()
@@ -6746,6 +6855,9 @@ async fn provision_runner<P: VmProvider + 'static>(
         if !from_packed {
             await_guest_ready(provider.as_ref(), name).await?;
             apply_golden_contract(provider.as_ref(), config, name).await?;
+            if provider.capabilities().runner_bundle_carries_externals {
+                link_runner_externals(provider.as_ref(), name).await?;
+            }
         }
     }
 

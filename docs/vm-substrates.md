@@ -72,19 +72,24 @@ orchestrator branches on it instead of assuming SmolVM's semantics.
 
 * **No host bind mounts** (`live_host_volumes: false`). AgentENV volumes are
   block devices (`aenv volume create`, attached as `--volume /guest=<vol>`);
-  there is no virtiofs/9p host-directory passthrough in the CLI or the HTTP
-  API. `MachineSpec::volumes` is therefore *materialized*: the host directory
-  is streamed in as one tar archive at start time, because `aenv upload`
-  rejects symlinks and does not preserve modes, and because one transfer beats
-  thousands of gRPC round trips. Fork clones inherit an already-unpacked
-  filesystem from the snapshot, so the cost lands on the golden only.
-  A read-only mount is approximated by stripping write bits in the guest;
-  that is weaker than virtiofs `:ro`, and there is no host directory behind it
-  to protect in the first place.
-  **Operational consequence:** keep `PRELOOP_RUNNER_BUNDLE` minimal. Pointing
-  it at a 1.5 GiB `target/release` makes every golden pay for the whole
-  directory (observed: golden preparation stalls for minutes), where SmolVM
-  would mount it for free.
+  there is no virtiofs/9p host-directory passthrough in the CLI or HTTP API.
+  Read-only `MachineSpec::volumes` entries are archived once into
+  content-addressed volumes named `preloop-runner-<12 hex>` and mounted by
+  name at sandbox start. The archive preserves file modes and symlinks, and
+  the mount is enforced read-only by the guest block device: uid 1001 and root
+  writes both fail with `EROFS`, while executable files remain executable.
+  Writable host mounts are refused; there is no silent tar fallback.
+* **Fork bases cannot carry read-only volumes.** AgentENV 0.2.1 rejects a
+  snapshot of a sandbox with a read-only volume (`HTTP 500`, volume catalog
+  backing must enter `uploading`). The golden therefore stays volume-free and
+  the provider attaches the current content-addressed bundle volume when
+  starting each clone. This means a runner update creates a new volume rather
+  than requiring a golden rebuild.
+* **The bundle carries Node externals.** The engine mounts only the bundle at
+  `/opt/preloop/bin` and links `/home/runner/externals` to its `externals/`
+  subtree. A second mount at `/home/runner/externals` failed on AgentENV with
+  `failed to chown directory ... no such file or directory`, even when the
+  parent existed; the single-volume layout is the supported path.
 * **No host Unix-socket passthrough** (`socket_mounts: false`). A spec carrying
   `sockets` is rejected with an error naming the remedy. The engine therefore
   runs the guest control plane over TCP: `preloop serve` forces
@@ -190,7 +195,7 @@ under-provisioning or failing a spec that is merely smaller than the base.
 | `PRELOOP_AENV_BINARY` | path to the `aenv` executable (default: `aenv` on `PATH`) |
 | `PRELOOP_AENV_TTL_SECS` | sandbox TTL requested and re-armed (default 3600) |
 | `PRELOOP_RUNNER_URL` | must be guest-reachable on this backend (no socket relay) |
-| `PRELOOP_RUNNER_BUNDLE` | keep it small: it is copied into every golden |
+| `PRELOOP_RUNNER_BUNDLE` | host tree archived into a content-addressed read-only AgentENV volume; bundle changes create a new volume |
 
 ## Prerequisites on the host
 

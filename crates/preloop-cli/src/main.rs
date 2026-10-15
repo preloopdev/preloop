@@ -26,6 +26,7 @@ mod github_setup;
 mod init;
 
 mod push;
+mod runner_volumes;
 mod server_install;
 mod store;
 mod update;
@@ -771,6 +772,11 @@ enum Command {
     /// (refinery has no down; restore the backup to roll back).
     Store(store::StoreArgs),
 
+    /// List and reclaim the read-only volumes AgentENV runners mount. The
+    /// engine creates one per distinct runner tree; `prune` deletes the ones
+    /// no sandbox mounts, keeping the current bundle.
+    RunnerVolumes(runner_volumes::RunnerVolumesArgs),
+
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
 
@@ -1141,6 +1147,7 @@ async fn main() -> anyhow::Result<()> {
         // Schema administration and the legacy import are explicit and
         // offline; never bootstrap (or migrate) the engine for them.
         Command::Store(args) => store::run(args).await,
+        Command::RunnerVolumes(args) => runner_volumes::run(args).await,
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
@@ -1174,7 +1181,8 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Doctor(_)
                     | Command::Secret(_)
                     | Command::Server(_)
-                    | Command::Store(_) => {
+                    | Command::Store(_)
+                    | Command::RunnerVolumes(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },
