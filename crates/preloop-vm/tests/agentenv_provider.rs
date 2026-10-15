@@ -868,3 +868,34 @@ async fn an_explicit_dns_is_refused_before_anything_runs_and_an_absent_one_start
         .unwrap();
     provider.start(&name).await.unwrap();
 }
+
+#[tokio::test]
+async fn pack_resumes_a_paused_machine_before_snapshotting() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("golden-pack").unwrap();
+    provider
+        .create(&spec("golden-pack", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+    // The orchestrator stops a golden before packing it, and AgentENV's stop
+    // is a pause, which the server will not snapshot.
+    provider.stop(&name).await.unwrap();
+    set_state(&executable, "paused");
+
+    let output = home.path().join("golden.smolmachine.json");
+    provider.pack(&name, &output).await.unwrap();
+
+    let ordered: Vec<String> = calls(&executable)
+        .into_iter()
+        .filter(|call| call.starts_with("resume|") || call.starts_with("snapshot|"))
+        .collect();
+    assert_eq!(ordered.len(), 2, "{ordered:?}");
+    assert_eq!(ordered[0], "resume|sb-0001|--timeout|600", "{ordered:?}");
+    assert!(
+        ordered[1].starts_with("snapshot|create|sb-0001|--name|golden-pack-pack-"),
+        "{ordered:?}"
+    );
+}
