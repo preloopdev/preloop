@@ -60,7 +60,15 @@ version = "1.9.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.asn1-rs]]
+version = "0.6.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.asn1-rs]]
 version = "0.7.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.asn1-rs-derive]]
+version = "0.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.asn1-rs-derive]]
@@ -385,6 +393,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.der]]
 version = "0.7.10"
+criteria = "safe-to-deploy"
+
+[[exemptions.der-parser]]
+version = "9.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.der-parser]]
@@ -892,6 +904,10 @@ version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.oid-registry]]
+version = "0.7.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.oid-registry]]
 version = "0.8.1"
 criteria = "safe-to-deploy"
 
@@ -977,6 +993,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.parking_lot_core]]
 version = "0.9.12"
+criteria = "safe-to-deploy"
+
+[[exemptions.pem]]
+version = "3.0.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.pem]]
@@ -1158,6 +1178,10 @@ criteria = "safe-to-deploy"
 [[exemptions.rand_xorshift]]
 version = "0.5.0"
 criteria = "safe-to-run"
+
+[[exemptions.rcgen]]
+version = "0.13.2"
+criteria = "safe-to-deploy"
 
 [[exemptions.rcgen]]
 version = "0.14.10"
@@ -1972,11 +1996,19 @@ version = "0.6.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.x509-parser]]
+version = "0.16.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.x509-parser]]
 version = "0.18.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.xattr]]
 version = "1.6.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.yasna]]
+version = "0.5.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.yasna]]
