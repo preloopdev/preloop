@@ -56,14 +56,8 @@ impl DebugAttach {
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Resume before claiming: the ACTIVE marker tells the engine's watcher
-        // to resume a suspended sandbox, and `resume_guest_if_needed` is the
-        // fallback for an engine that is not watching (restart, different
-        // host). Either way a failed resume must not leave a heartbeat
-        // rewriting ACTIVE for a controller that never attached: the guard
-        // below is never constructed on error, and a dropped JoinHandle
-        // detaches rather than cancels.
-        crate::resume_guest_if_needed(machine).await?;
+        // A dropped JoinHandle below detaches rather than cancels, so the
+        // heartbeat only starts once the marker is written.
         std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
         let heartbeat_marker = marker.clone();
         let heartbeat = tokio::spawn(async move {
@@ -945,7 +939,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
         if std::io::stdin().read_line(&mut line)? == 0 {
             // Ctrl-D. Leaving must never destroy the session.
             println!();
-            println!("Detached — the job stays paused; AgentENV may suspend the VM.");
+            println!("Detached — the job stays paused; the backend may suspend the VM.");
             print_reattach(&session);
             return Ok(ReplOutcome::Detached);
         }
@@ -1085,7 +1079,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 Err(error) => println!("  sync failed: {error:#}"),
             },
             "detach" => {
-                println!("Detached — the job stays paused; AgentENV may suspend the VM.");
+                println!("Detached — the job stays paused; the backend may suspend the VM.");
                 print_reattach(&session);
                 return Ok(ReplOutcome::Detached);
             }
@@ -1434,7 +1428,7 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
         return Ok(());
     }
 
-    let destination = std::env::current_dir()?.join("preloop-vm-changes.patch");
+    let destination = std::env::current_dir()?.join("preloop-changes.patch");
     std::fs::write(&destination, patch.as_bytes())
         .with_context(|| format!("writing {}", destination.display()))?;
     let files = patch.lines().filter(|l| l.starts_with("+++ b/")).count();

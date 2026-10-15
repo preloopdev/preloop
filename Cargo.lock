@@ -2542,7 +2542,9 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "flate2",
+ "futures",
  "futures-util",
+ "hostname",
  "libc",
  "nix 0.31.3",
  "preloop-gha-parser",
@@ -2550,7 +2552,7 @@ dependencies = [
  "preloop-observability",
  "preloop-orchestrator",
  "preloop-runner-server",
- "preloop-vm",
+ "preloop-sandbox",
  "rand 0.10.2",
  "reqwest",
  "rpassword",
@@ -2568,6 +2570,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zip",
 ]
 
@@ -2753,12 +2756,13 @@ dependencies = [
  "preloop-gha-protocol",
  "preloop-observability",
  "preloop-runner-server",
- "preloop-vm",
+ "preloop-sandbox",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2905,6 +2909,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "preloop-sandbox"
+version = "0.35.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "hex",
+ "parking_lot",
+ "postgres_rustls",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "preloop-socket-activation"
 version = "0.1.0"
 dependencies = [
@@ -2914,27 +2948,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "preloop-vm"
-version = "0.21.0"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "hex",
- "parking_lot",
- "preloop-gha-protocol",
- "preloop-observability",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
 
-[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use github_setup::{ApiOutcome, api_list_secrets};
 
-mod aenv_egress;
 mod app_manifest;
 mod dap_client;
 mod debug_session;
@@ -27,10 +26,10 @@ mod github_setup;
 mod init;
 
 mod push;
+mod sandbox;
 mod server_install;
 mod store;
 mod update;
-mod volumes;
 mod webhooks;
 
 pub(crate) fn server_url() -> String {
@@ -615,91 +614,17 @@ pub(crate) fn preloop_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".preloop"))
 }
 
-/// Which microVM substrate the engine drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VmBackend {
-    /// SmolVM: libkrun on macOS, libkrun/KVM on Linux.
-    Smolvm,
-    /// AgentENV: a Firecracker control plane over `/dev/kvm`.
-    Agentenv,
-}
-
-impl VmBackend {
-    /// The backend name as it is written in `PRELOOP_VM_BACKEND`.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Smolvm => "smolvm",
-            Self::Agentenv => "agentenv",
-        }
-    }
-}
-
-/// Resolve the VM backend for this process.
-///
-/// `PRELOOP_VM_BACKEND=smolvm|agentenv` is authoritative. Without it, SmolVM
-/// is selected everywhere: AgentENV stays available as an opt-in
-/// (`PRELOOP_VM_BACKEND=agentenv`) for KVM hosts that have an `aenv` CLI,
-/// but it is not the default until the end-to-end pool interaction is proven
-/// out (see `benchmarks/substrates/REPORT.md` §4).
-///
-/// An unrecognized value is an error rather than a silent fallback: booting
-/// jobs on a substrate the operator did not ask for is exactly the kind of
-/// surprise a typo must not cause.
-pub(crate) fn vm_backend() -> anyhow::Result<VmBackend> {
-    match std::env::var("PRELOOP_VM_BACKEND") {
-        Ok(value) if value.eq_ignore_ascii_case("smolvm") => Ok(VmBackend::Smolvm),
-        Ok(value)
-            if value.eq_ignore_ascii_case("agentenv") || value.eq_ignore_ascii_case("aenv") =>
-        {
-            Ok(VmBackend::Agentenv)
-        }
-        Ok(value) if value.trim().is_empty() => Ok(default_vm_backend()),
-        Ok(value) => {
-            anyhow::bail!("unknown PRELOOP_VM_BACKEND `{value}` (expected `smolvm` or `agentenv`)")
-        }
-        Err(_) => Ok(default_vm_backend()),
-    }
-}
-
-/// The backend chosen when the operator expressed no preference: SmolVM on
-/// every host. AgentENV is strictly opt-in via `PRELOOP_VM_BACKEND`.
-fn default_vm_backend() -> VmBackend {
-    VmBackend::Smolvm
-}
-
-/// The VM provider for the resolved backend, boxed so the pool's type does
-/// not depend on the choice.
-pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider> {
-    match backend {
-        VmBackend::Smolvm => Box::new(preloop_vm::SmolVmProvider::default()),
-        VmBackend::Agentenv => Box::new(
-            preloop_vm::agentenv::AgentEnvProvider::default()
-                .with_bundle_manifest(preloop_orchestrator::runner_bundle_manifest()),
-        ),
-    }
-}
-
-/// A command that runs an argv inside `machine`'s guest, for whichever backend
-/// owns that machine. The caller appends the guest argv.
+/// A command that runs an argv inside `machine`'s guest. The caller appends
+/// the guest argv.
 ///
 /// `preloop shell` and `preloop debug` reach into a paused job's VM from a
-/// separate process, so this is the one place that knows how to address a
-/// guest per backend: SmolVM by machine name, AgentENV by the sandbox id the
-/// engine recorded in its registry.
+/// separate process. Pool machines are sandboxes served by this host's SmolVM
+/// driver, which uses the pool's machine name as the native name, so the
+/// SmolVM CLI addresses them directly.
 pub(crate) fn guest_exec_command(machine: &str) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
-        VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
-            command.args(["machine", "exec", "--name", machine, "--"]);
-            Ok(command)
-        }
-        VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
-            let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-            command.args(["exec", &sandbox, "--"]);
-            Ok(command)
-        }
-    }
+    let mut command = smolvm_command()?;
+    command.args(["machine", "exec", "--name", machine, "--"]);
+    Ok(command)
 }
 
 /// A command that copies a host file to `remote` inside `machine`'s guest.
@@ -708,163 +633,16 @@ pub(crate) fn guest_upload_command(
     local: &str,
     remote: &str,
 ) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
-        VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
-            command.args(["machine", "cp", local, &format!("{machine}:{remote}")]);
-            Ok(command)
-        }
-        VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
-            let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-            command.args(["upload", &sandbox, local, remote]);
-            Ok(command)
-        }
-    }
+    let mut command = smolvm_command()?;
+    command.args(["machine", "cp", local, &format!("{machine}:{remote}")]);
+    Ok(command)
 }
 
 /// An interactive shell attached to `machine`'s guest.
 pub(crate) fn guest_shell_command(machine: &str) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
-        VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
-            command.args(["machine", "shell", "--name", machine]);
-            Ok(command)
-        }
-        VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
-            let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-            command.args(["cn", &sandbox]);
-            Ok(command)
-        }
-    }
-}
-
-/// Resume an AgentENV sandbox before an attach. SmolVM's shell command owns
-/// its own lifecycle, so it needs no separate resume command.
-pub(crate) fn guest_resume_command(machine: &str) -> anyhow::Result<Option<std::process::Command>> {
-    if vm_backend()? != VmBackend::Agentenv {
-        return Ok(None);
-    }
-    let sandbox = recorded_sandbox(machine)?;
-    let timeout = std::env::var("PRELOOP_AENV_TTL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|seconds| *seconds >= 60)
-        .unwrap_or(3600)
-        .to_string();
-    let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-    command.args(["resume", &sandbox, "--timeout", &timeout]);
-    Ok(Some(command))
-}
-
-/// Deadline for one AgentENV control operation against the local sandbox
-/// runtime: `aenv resume`, or one `aenv exec` readiness probe.
-///
-/// Resuming a suspended Firecracker sandbox and answering `aenv exec /bin/true`
-/// inside a live guest are control ops: seconds when the runtime is healthy,
-/// and the observed worst case right after a resume is well under one second.
-/// 30 s is generous for both, and it is the value that turns "attach hangs
-/// forever because `aenv` never returns" into an error.
-pub(crate) const AENV_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long `resume_guest_if_needed` waits for the guest to start answering.
-///
-/// The pre-existing loop was 20 probes 200 ms apart, which observes readiness
-/// within about 5 s. Two minutes is far above that, so the only runs that hit
-/// it are ones where the sandbox is genuinely not coming back; without it, a
-/// sandbox that never becomes ready looped over unbounded probes forever.
-pub(crate) const AENV_READY_DEADLINE: Duration = Duration::from_secs(120);
-
-/// Run an argv inside `machine`'s guest under [`AENV_CONTROL_TIMEOUT`].
-///
-/// Returns `Ok(false)` when the guest did not answer in time (or answered
-/// non-zero), so callers can treat a wedged runtime like an unreachable guest
-/// instead of blocking. The child is killed at the deadline.
-async fn guest_answers(machine: &str, argv: &[&str]) -> anyhow::Result<bool> {
-    let mut command = guest_exec_command(machine)?;
-    command.args(argv);
-    // Process policy (null stdin, kill_on_drop, kill+reap on expiry) belongs to
-    // the shared runner; the guest's own argv/cwd stay here.
-    let command = tokio::process::Command::from(command);
-    match preloop_observability::deadline::run_command_status(
-        command,
-        AENV_CONTROL_TIMEOUT,
-        &format!("`{}` inside `{machine}`", argv.join(" ")),
-    )
-    .await
-    {
-        Ok(status) => Ok(status.success()),
-        Err(error) if error.timed_out() => {
-            eprintln!(
-                "[warn] `{}` inside `{machine}` did not answer within {}s and was killed; \
-                 the sandbox runtime is unresponsive",
-                argv.join(" "),
-                AENV_CONTROL_TIMEOUT.as_secs()
-            );
-            Ok(false)
-        }
-        Err(error) => {
-            Err(anyhow::Error::new(error)).with_context(|| format!("probing `{machine}`"))
-        }
-    }
-}
-
-pub(crate) async fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
-    let Some(resume) = guest_resume_command(machine)? else {
-        return Ok(());
-    };
-    if guest_answers(machine, &["/bin/true"]).await? {
-        return Ok(());
-    }
-
-    // The engine's attach watcher may resume concurrently; a failed resume
-    // command is not fatal while the sandbox still comes up. After the
-    // resume attempt, poll until envd actually answers — a bare `resume`
-    // returning does not mean `cn`'s proxy is already serving ("410 Gone:
-    // sandbox is not proxyable" was observed on the first attach right
-    // after a resume).
-    let resume = tokio::process::Command::from(resume);
-    if preloop_observability::deadline::run_command_status(
-        resume,
-        AENV_CONTROL_TIMEOUT,
-        &format!("{} resume", preloop_vm::agentenv::binary().display()),
-    )
-    .await
-    .is_err()
-    {
-        eprintln!(
-            "[warn] `{} resume` did not finish within {}s and was killed; waiting for the \
-             sandbox to answer anyway",
-            preloop_vm::agentenv::binary().display(),
-            AENV_CONTROL_TIMEOUT.as_secs()
-        );
-    }
-    let ready_by = std::time::Instant::now() + AENV_READY_DEADLINE;
-    loop {
-        if guest_answers(machine, &["/bin/true"]).await? {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= ready_by {
-            anyhow::bail!(
-                "AgentENV sandbox `{machine}` did not become ready within {}s of the resume \
-                 attempt; the sandbox runtime is not responding",
-                AENV_READY_DEADLINE.as_secs()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// The AgentENV sandbox behind `machine`, or an explanation of why the guest
-/// cannot be reached.
-fn recorded_sandbox(machine: &str) -> anyhow::Result<String> {
-    preloop_vm::agentenv::recorded_sandbox(machine).with_context(|| {
-        format!(
-            "no AgentENV sandbox is recorded for machine `{machine}`; the engine that created it \
-             may have exited, or its sandbox TTL expired"
-        )
-    })
+    let mut command = smolvm_command()?;
+    command.args(["machine", "shell", "--name", machine]);
+    Ok(command)
 }
 
 /// A `smolvm` command carrying Preloop's Linux VM-sandbox environment.
@@ -874,7 +652,7 @@ fn recorded_sandbox(machine: &str) -> anyhow::Result<String> {
 /// it when needed, and `machine shell` does the same — so these spawns must
 /// carry the exact seccomp/Landlock/cgroup environment the VM provider
 /// applies to its own boots. This is the single chokepoint for them; the
-/// policy lives in [`preloop_vm::smolvm_sandbox_env`] and is a no-op on
+/// policy lives in [`preloop_sandbox::drivers::smolvm::cli::smolvm_sandbox_env`] and is a no-op on
 /// macOS, matching the provider.
 pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     let mut command = std::process::Command::new("smolvm");
@@ -885,8 +663,8 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
     // same gap from the effective Preloop home (and isolates `HOME` on macOS,
     // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
-    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
-    preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
+    preloop_sandbox::drivers::smolvm::cli::apply_smolvm_runtime_env(&mut command, None)?;
+    preloop_sandbox::drivers::smolvm::cli::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
 
@@ -934,31 +712,21 @@ exit 0
 
 /// Run `test` with a fake `smolvm` first on PATH, restoring PATH afterwards.
 ///
-/// The backend is pinned to SmolVM for the duration: these tests assert the
-/// argv and environment of `smolvm` spawns, and on a Linux host that has
-/// `/dev/kvm` and an `aenv` binary the backend default would otherwise select
-/// AgentENV and never spawn the fake at all.
 #[cfg(test)]
 pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
     let _guard = SMOLVM_PATH_LOCK.blocking_lock();
     let (directory, executable) = fake_smolvm_on_path();
     let previous = std::env::var_os("PATH");
-    let previous_backend = std::env::var_os("PRELOOP_VM_BACKEND");
     let mut path = directory.path().as_os_str().to_owned();
     path.push(":");
     if let Some(previous) = &previous {
         path.push(previous);
     }
     unsafe { std::env::set_var("PATH", path) };
-    unsafe { std::env::set_var("PRELOOP_VM_BACKEND", "smolvm") };
     let result = test(&executable);
     match previous {
         Some(previous) => unsafe { std::env::set_var("PATH", previous) },
         None => unsafe { std::env::remove_var("PATH") },
-    }
-    match previous_backend {
-        Some(previous) => unsafe { std::env::set_var("PRELOOP_VM_BACKEND", previous) },
-        None => unsafe { std::env::remove_var("PRELOOP_VM_BACKEND") },
     }
     result
 }
@@ -1041,11 +809,6 @@ enum Command {
     /// (refinery has no down; restore the backup to roll back).
     Store(store::StoreArgs),
 
-    /// List and reclaim the read-only volumes the engine mounts. Each holds one
-    /// tree (today: the runner bundle); `prune` deletes the ones no sandbox
-    /// mounts, keeping the tree the engine would mount.
-    Volumes(volumes::VolumesArgs),
-
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
 
@@ -1071,6 +834,8 @@ enum Command {
 
     /// Poll GitHub Releases and atomically install the matching binary.
     Update(update::UpdateArgs),
+    /// Drive the Sandbox Service: templates, pools, sandboxes, host agents.
+    Sandbox(sandbox::SandboxArgs),
 
     /// Run the control plane and microVM runner pool in the foreground.
     ///
@@ -1212,7 +977,7 @@ struct RunArgs {
     #[arg(short = 'm', long = "message")]
     message: Option<String>,
     /// Open a live debug session when a job fails. Without this flag, failed
-    /// AgentENV jobs are cleaned up normally. SmolVM retains its historical
+    /// Jobs on a state-preserving backend are cleaned up normally. SmolVM retains its historical
     /// terminal-attached default for compatibility.
     #[arg(long, conflicts_with = "no_debug")]
     debug: bool,
@@ -1416,6 +1181,7 @@ async fn main() -> anyhow::Result<()> {
         Command::BuildGolden(args) => cmd_build_golden(args).await,
         Command::GoldenPath(args) => cmd_golden_path(args).await,
         Command::Update(args) => update::run(args).await,
+        Command::Sandbox(args) => sandbox::run(args).await,
         // Local configuration commands must not spawn the engine.
         Command::Setup(args) => github_setup::cmd_setup(args).await,
         Command::Init(args) => init::run(args, Some(observability.clone())).await,
@@ -1425,7 +1191,6 @@ async fn main() -> anyhow::Result<()> {
         // Schema administration and the legacy import are explicit and
         // offline; never bootstrap (or migrate) the engine for them.
         Command::Store(args) => store::run(args).await,
-        Command::Volumes(args) => volumes::run(args).await,
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
@@ -1452,6 +1217,7 @@ async fn main() -> anyhow::Result<()> {
                     Command::Push(args) => cmd_push(args).await,
                     Command::Webhooks(args) => webhooks::run(args).await,
                     Command::Update(_)
+                    | Command::Sandbox(_)
                     | Command::Serve(_)
                     | Command::Engine
                     | Command::BuildGolden(_)
@@ -1462,8 +1228,7 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Doctor(_)
                     | Command::Secret(_)
                     | Command::Server(_)
-                    | Command::Store(_)
-                    | Command::Volumes(_) => {
+                    | Command::Store(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },
@@ -1585,7 +1350,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_origin: None,
         control_socket: None,
         control_upstream: None,
-        dns: runner_dns_for(vm_backend()?),
+        dns: runner_dns(),
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -1623,11 +1388,10 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         github: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
-    // The bake follows the engine's backend: SmolVM writes a portable
-    // `.smolmachine`, AgentENV writes a descriptor naming the server-side
-    // snapshot it just created (portable only within that server).
-    let backend = vm_backend()?;
-    RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
+    // The bake runs through a private, in-process sandbox service with this
+    // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
+    let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home()).await?;
+    RunnerPool::new(sandboxes.machines(), config)?
         .rebuild_artifact()
         .await?;
     if payload != output {
@@ -2360,7 +2124,6 @@ async fn cmd_engine(
     // error, for hours. The engine keeps serving so `preloop status` and the
     // recovery commands still work; the guard's message names both rootfs
     // paths, both agent hashes, the host version, and the remedy.
-    let mut backend = None;
     let mut agent_guard_error = None;
     if let Ok(config) = &pool_config {
         if !pool_enabled {
@@ -2380,13 +2143,12 @@ async fn cmd_engine(
         // place Preloop writes to the cgroup hierarchy — the CLI paths
         // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
         // root read-only and never mutate it.
-        preloop_vm::init_vm_cgroup_delegation();
-        let selected = vm_backend()?;
-        tracing::info!(backend = selected.as_str(), "VM substrate selected");
-        backend = Some(selected);
-        if selected == VmBackend::Smolvm
-            && let Err(error) = preloop_vm::agent_rootfs::guard(std::path::Path::new("smolvm"))
-        {
+        preloop_sandbox::drivers::smolvm::cli::init_vm_cgroup_delegation();
+        // The public build ships one driver, so the guest-agent guard always
+        // runs: every machine this pool boots comes from the SmolVM driver.
+        if let Err(error) = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::guard(
+            std::path::Path::new("smolvm"),
+        ) {
             tracing::error!("{error}");
             tracing::error!("runner pool disabled until the smolvm guest agent is repaired");
             pool_status.set_mode(preloop_observability::status::PoolMode::Disabled);
@@ -2455,34 +2217,30 @@ async fn cmd_engine(
     }
 
     // Every way out of this process — the normal shutdown below, a pool that
-    // never recovers, an error return like a failed `vm_backend()` — must not
-    // leave VMs running: see `VmTeardownOnExit`. Armed before the first pool
-    // spawn so even those early returns run the exit scan.
+    // never recovers, an error return like a failed sandbox service startup —
+    // must not leave VMs running: see `VmTeardownOnExit`. Armed before the
+    // first pool spawn so even those early returns run the exit scan.
     let _vm_teardown = VmTeardownOnExit;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
+    // The runner pool gets its machines from the embedded Sandbox Service.
+    let sandboxes = sandbox::LocalSandboxes::start(&home).await?;
+    let machines = sandboxes.machines();
+
     let spawn_pool = |config: &RunnerPoolConfig,
-                      pool_shutdown: tokio_util::sync::CancellationToken,
-                      backend: VmBackend| {
+                      pool_shutdown: tokio_util::sync::CancellationToken| {
         let config = config.clone();
-        tokio::spawn(async move {
-            RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-                .run(pool_shutdown)
-                .await
-        })
+        let machines = machines.clone();
+        tokio::spawn(async move { RunnerPool::new(machines, config)?.run(pool_shutdown).await })
     };
     // Each generation gets a fresh child token: `RunnerPool::run` cancels the
     // token it is handed when a slot ends so its siblings drain, and reusing
     // the same token would hand the replacement pool an already-fired
     // cancellation that makes it exit `Ok` — and stop the engine — instantly.
-    let mut pool = pool_config.as_ref().map(|config| {
-        spawn_pool(
-            config,
-            shutdown.child_token(),
-            backend.expect("the backend is resolved when a pool config exists"),
-        )
-    });
+    let mut pool = pool_config
+        .as_ref()
+        .map(|config| spawn_pool(config, shutdown.child_token()));
 
     // A pool task that returns an error ends only the pool, not the engine:
     // `RunnerPool::run` ran its teardown on the way out, so nothing is left
@@ -2503,8 +2261,7 @@ async fn cmd_engine(
         || {
             pool_config
                 .as_ref()
-                .zip(backend)
-                .map(|(config, backend)| spawn_pool(config, shutdown.child_token(), backend))
+                .map(|config| spawn_pool(config, shutdown.child_token()))
         },
     )
     .await;
@@ -2694,14 +2451,16 @@ impl Drop for VmTeardownOnExit {
 /// or holding the engine's socket, so nothing of ours is provisioning), and a
 /// mount whose hypervisor still exists is skipped.
 fn purge_stuck_vms() {
-    match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
+    match preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
+        preloop_sandbox::drivers::smolvm::cli::OrphanPurge::All,
+    ) {
         Ok(killed) if killed > 0 => {
             tracing::info!(killed, "purged orphaned SmolVM hypervisor processes")
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "orphaned hypervisor purge failed"),
     }
-    match preloop_vm::detach_orphaned_layer_mounts() {
+    match preloop_sandbox::drivers::smolvm::cli::detach_orphaned_layer_mounts() {
         Ok(detached) if detached > 0 => {
             tracing::info!(detached, "detached orphaned SmolVM layer mounts")
         }
@@ -2939,28 +2698,6 @@ pub(crate) fn discovered_runner_bundle() -> Option<PathBuf> {
         .filter(|path| linux_runner_bundle(path))
 }
 
-/// The Node externals directory the engine mounts from: `PRELOOP_RUNNER_EXTERNALS`
-/// when set, otherwise `<preloop home>/externals`.
-///
-/// Mirrors the pool config's choice so `preloop volumes prune` reasons
-/// about the same tree the engine does.
-pub(crate) fn local_externals_dir() -> Option<PathBuf> {
-    std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("PRELOOP_HOME")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop"))
-                })
-                .map(|home| home.join("externals"))
-        })
-}
-
-/// The runner binary the pool expects inside a bundle, as
-/// [`RunnerPoolConfig::runner_binary_name`] sets it.
-pub(crate) const RUNNER_BINARY_NAME: &str = "preloop-runner";
-
 // Configuration assembly, not a public API: the parameter list mirrors the
 // inputs the pool genuinely needs.
 #[allow(clippy::too_many_arguments)]
@@ -2986,28 +2723,6 @@ fn local_runner_pool_config(
     let runner_bundle = discovered_runner_bundle().context(
         "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)",
     )?;
-    let backend = vm_backend()?;
-    // AgentENV has no socket relay: the guest dials the runner URL over plain
-    // TCP, so a loopback URL points at the guest itself and no job can ever
-    // register. Fail here with the fix instead of timing jobs out one by one.
-    // An explicit control upstream is the exception: the guest then reaches
-    // the engine over virtio-net at that address instead.
-    if backend == VmBackend::Agentenv && control_upstream.is_none() && url_is_loopback(&server_url)
-    {
-        anyhow::bail!(
-            "PRELOOP_RUNNER_URL is loopback ({server_url}) but the AgentENV backend \
-             reaches the engine over TCP from inside the guest, where loopback is \
-             the guest itself: set PRELOOP_RUNNER_URL to a host-reachable address \
-             (e.g. http://<lan-ip>:<port>), or set PRELOOP_CONTROL_UPSTREAM"
-        );
-    }
-    // With a reachable URL in hand, reconcile the host-side exception that
-    // lets sandboxes actually dial it: the node deny-list complement plus the
-    // ordered firewall rules. No-op on drift-free hosts; loud failure
-    // otherwise (a half-open egress reads as jobs queueing forever).
-    if backend == VmBackend::Agentenv {
-        aenv_egress::ensure_engine_egress(&server_url)?;
-    }
     // The mounted control socket only makes sense when the runner URL is
     // loopback (the VM reaches the host through the socket relay). With
     // `PRELOOP_RUNNER_URL` pointing at a host-reachable LAN address — the
@@ -3017,10 +2732,8 @@ fn local_runner_pool_config(
     // it `None` is what switches the transport.
     let control_socket = control_origin.as_ref().map(|_| home.join("preloop.sock"));
     // When a TCP upstream is configured, skip the socket mount — the
-    // guest control bridge will forward via TCP instead of vsock. AgentENV
-    // cannot forward a host socket into a guest at all, so the same TCP
-    // transport is the only option there.
-    let control_socket = if control_upstream.is_some() || backend == VmBackend::Agentenv {
+    // guest control bridge will forward via TCP instead of vsock.
+    let control_socket = if control_upstream.is_some() {
         None
     } else {
         control_socket
@@ -3047,9 +2760,8 @@ fn local_runner_pool_config(
         } else {
             0
         },
-        // Forking is safe on every backend now: file-pack backends always
-        // restore the packed golden, and AgentENV keeps immutable,
-        // re-forkable snapshots. Size-zero mode still prepares one golden and
+        // Forking is safe when the provider restores packed goldens or keeps
+        // immutable snapshots. Size-zero mode still prepares one golden and
         // forks a disposable VM per job.
         use_fork: env_flag("PRELOOP_USE_FORK", true),
         // Multiple engines on one host must not share a namespace: smolvm
@@ -3102,7 +2814,7 @@ fn local_runner_pool_config(
         control_origin,
         control_socket,
         control_upstream,
-        dns: runner_dns_for(vm_backend()?),
+        dns: runner_dns(),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus,
@@ -3210,18 +2922,15 @@ fn runner_storage_gib() -> u32 {
 
 /// Only an operator override is explicit guest DNS. When unset, the provider
 /// selects its resolver for the actual network backend and workload.
-fn runner_dns_for(backend: VmBackend) -> Option<String> {
-    runner_dns_override(backend, std::env::var("PRELOOP_RUNNER_DNS").ok().as_deref())
+fn runner_dns() -> Option<String> {
+    runner_dns_override(std::env::var("PRELOOP_RUNNER_DNS").ok().as_deref())
 }
 
-fn runner_dns_override(backend: VmBackend, configured: Option<&str>) -> Option<String> {
-    match backend {
-        VmBackend::Smolvm => configured
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned),
-        VmBackend::Agentenv => None,
-    }
+fn runner_dns_override(configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.
@@ -3834,10 +3543,8 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
         None
     };
 
-    let implicit_smolvm_debug = !matches!(vm_backend()?, VmBackend::Agentenv)
-        && !args.no_debug
-        && !args.detach
-        && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let implicit_smolvm_debug =
+        !args.no_debug && !args.detach && std::io::IsTerminal::is_terminal(&std::io::stdin());
     let debug_on_failure = args.debug || implicit_smolvm_debug;
     let preserve_on_failure = debug_on_failure || args.preserve_on_failure;
 
@@ -6088,7 +5795,7 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     eprintln!("[preloop] Exit the shell to release the VM.");
 
     // Build the guest shell command BEFORE claiming the marker: an invalid
-    // sandbox override (SmolVM) or a missing sandbox record (AgentENV) makes
+    // sandbox override (SmolVM) or a missing sandbox record makes
     // this fail, and the claim below must not exist yet when it does —
     // otherwise the preserved VM would stay marked ACTIVE (with the
     // heartbeat touching the marker) until the orchestrator's idle timeout,
@@ -6097,12 +5804,12 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
 
     // Claim the session before starting so the orchestrator stops counting
     // down; the guard writes ACTIVE, starts the heartbeat, and resumes a
-    // suspended AgentENV sandbox.
+    // suspended sandbox.
     let attach = debug_session::DebugAttach::claim(Some(&machine_name)).await?;
 
     // Attach interactively. On SmolVM this boots a stopped machine, so the
     // sandbox environment applies exactly as for a provider spawn; on
-    // AgentENV it attaches to the paused sandbox the engine recorded.
+    // a remote backend it attaches to the paused sandbox the engine recorded.
     let status = command
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -6167,15 +5874,11 @@ mod tests {
 
     #[test]
     fn runner_dns_preserves_provider_choice_unless_explicitly_overridden() {
-        assert_eq!(runner_dns_override(VmBackend::Smolvm, None), None);
-        assert_eq!(runner_dns_override(VmBackend::Smolvm, Some("  ")), None);
+        assert_eq!(runner_dns_override(None), None);
+        assert_eq!(runner_dns_override(Some("  ")), None);
         assert_eq!(
-            runner_dns_override(VmBackend::Smolvm, Some(" 10.0.0.53 ")),
+            runner_dns_override(Some(" 10.0.0.53 ")),
             Some("10.0.0.53".into())
-        );
-        assert_eq!(
-            runner_dns_override(VmBackend::Agentenv, Some("10.0.0.53")),
-            None
         );
     }
 
@@ -8409,16 +8112,6 @@ mod tests {
             "http://127.0.0.1:9090",
             true
         ));
-    }
-
-    #[test]
-    fn loopback_detection_covers_names_and_addresses() {
-        assert!(url_is_loopback("http://127.0.0.1:9090"));
-        assert!(url_is_loopback("http://localhost:9090/"));
-        assert!(url_is_loopback("http://[::1]:9090"));
-        assert!(!url_is_loopback("http://192.168.8.174:9491"));
-        assert!(!url_is_loopback("https://preloop.preloop.dev"));
-        assert!(!url_is_loopback("not a url"));
     }
 
     #[test]

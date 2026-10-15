@@ -114,12 +114,12 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 
 /// Minimum SmolVM release `preloop update` accepts as already compatible,
 /// compiled from `smolvm_min_version` in the workspace `versions.toml` by
-/// `crates/preloop-vm/build.rs` (which the device-budget diagnostic in
-/// `preloop-vm` reads too, so one pin feeds both).
+/// `crates/preloop-sandbox/build.rs` (which the device-budget diagnostic in
+/// the SmolVM driver reads too, so one pin feeds both).
 ///
 /// The configured floor is the first release that satisfies all runtime
-/// invariants: packed-machine ownership preservation (v1.8.1),
-/// `machine fork --freeze-source` (v1.18.1), which preloop-vm passes on every
+/// invariants: packed-machine ownership preservation (v1.8.1) and
+/// `machine fork --freeze-source` (v1.18.1), which the SmolVM driver passes on every
 /// fork so goldens keep a frozen reusable branch base instead of
 /// live-forking the source, and the x86_64 virtio device budget (v1.23.0,
 /// which raised libkrun's MMIO IRQ allocation for virtio devices from 11 to
@@ -127,7 +127,7 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 /// and fail to start with `no more IRQs are available`). Newer stable
 /// releases satisfy it without another code change.
 static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
-    Version::parse(preloop_vm::SMOLVM_MIN_VERSION)
+    Version::parse(preloop_sandbox::drivers::smolvm::cli::SMOLVM_MIN_VERSION)
         .expect("smolvm_min_version in versions.toml must be a semver version")
 });
 
@@ -472,7 +472,7 @@ fn smolvm_platform() -> Option<&'static str> {
 ///
 /// The wrapper scripts can report a recent `--version` while resolving to
 /// an old binary, so the flag's presence in the help text is the reliable
-/// check (the same probe preloop-vm runs before provisioning).
+/// check (the same probe the SmolVM driver runs before provisioning).
 async fn probe_mount_socket(binary: &Path) -> bool {
     probe_mount_socket_with(binary, SMOLVM_PROBE_TIMEOUT).await
 }
@@ -608,7 +608,7 @@ async fn ensure_smolvm(client: &Client) -> anyhow::Result<()> {
         bail!(
             "SmolVM release {} is below configured minimum {}",
             release.tag_name,
-            preloop_vm::SMOLVM_MIN_VERSION
+            preloop_sandbox::drivers::smolvm::cli::SMOLVM_MIN_VERSION
         );
     }
     let archive_name = format!("smolvm-{version}-{platform}.tar.gz");
@@ -1970,7 +1970,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         // Parse-check the floor constant; the loop below pins the concrete
         // versions that must pass or fail against it.
-        let _minimum = Version::parse(preloop_vm::SMOLVM_MIN_VERSION).unwrap();
+        let _minimum =
+            Version::parse(preloop_sandbox::drivers::smolvm::cli::SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
             ("1.30.1", "--mount-socket <HOST:GUEST>", true),
             ("1.30.2", "--mount-socket <HOST:GUEST>", true),

@@ -14,7 +14,9 @@
 //! that used to decide between it and a custom image.
 
 use preloop_gha_protocol::oci_image_ref;
-use preloop_vm::{MachineRole, MachineSpec, SMOLVM_GUEST_VOLUMES_ENV, SMOLVM_WORKLOAD_INIT_ENV};
+use preloop_sandbox::drivers::smolvm::cli::{
+    MachineRole, MachineSpec, SMOLVM_GUEST_VOLUMES_ENV, SMOLVM_WORKLOAD_INIT_ENV,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -266,7 +268,7 @@ fn resolve_runner_account() -> (String, u32) {
 }
 
 /// The launch settings a runtime golden is created with, resolved exactly as
-/// [`SmolVmProvider`](preloop_vm::SmolVmProvider)'s `create` resolves them.
+/// [`SmolVmProvider`](preloop_sandbox::drivers::smolvm::cli::SmolVmProvider)'s `create` resolves them.
 ///
 /// The artifact pack itself does not depend on these: a workload override or a
 /// guest-local volume is applied to the machine created from the pack. They

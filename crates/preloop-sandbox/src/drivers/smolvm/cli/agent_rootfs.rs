@@ -39,7 +39,7 @@
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-use crate::VmError;
+use super::VmError;
 
 /// Path of the guest agent binary inside a rootfs tree.
 pub const AGENT_BINARY: &str = "usr/local/bin/smolvm-agent";
@@ -203,7 +203,7 @@ pub struct Runtime {
 
 impl Runtime {
     /// The guard's inputs as the engine resolves them (the same rules as
-    /// [`crate::smolvm_runtime_env`]).
+    /// [`super::smolvm_runtime_env`]).
     pub fn from_env() -> Self {
         let host_home = std::env::var_os("HOME").map(PathBuf::from);
         let explicit_rootfs = std::env::var_os("SMOLVM_AGENT_ROOTFS")
@@ -211,7 +211,7 @@ impl Runtime {
             .map(PathBuf::from);
         let data_dir = std::env::var_os("SMOLVM_DATA_DIR")
             .map(PathBuf::from)
-            .or_else(|| crate::effective_preloop_home().map(|home| home.join("smolvm")));
+            .or_else(|| super::effective_preloop_home().map(|home| home.join("smolvm")));
         Self {
             host_home,
             data_dir,
@@ -442,7 +442,7 @@ fn probe_host_version(binary: &Path) -> Option<String> {
     command.arg("--version");
     // The macOS wrapper exports `DYLD_LIBRARY_PATH` itself, but a bare
     // `smolvm-bin` path needs the same variables the engine would export.
-    crate::apply_smolvm_runtime_env(&mut command, Some(binary)).ok()?;
+    super::apply_smolvm_runtime_env(&mut command, Some(binary)).ok()?;
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
@@ -496,7 +496,7 @@ pub fn resolve_exported_rootfs(runtime: &Runtime, binary: Option<&Path>) -> Opti
     if let Some(explicit) = &runtime.explicit_rootfs {
         return Some(explicit.clone());
     }
-    let candidates = crate::agent_rootfs_candidates(
+    let candidates = super::agent_rootfs_candidates(
         runtime.host_home.as_deref(),
         runtime.data_dir.as_deref(),
         binary,
@@ -613,7 +613,7 @@ struct Verdict {
 /// recomputed rather than evicted.
 ///
 /// The two are cached separately because [`check`] probes the host by running
-/// `smolvm --version` through [`crate::apply_smolvm_runtime_env`], which
+/// `smolvm --version` through [`super::apply_smolvm_runtime_env`], which
 /// resolves the rootfs again: one combined entry would re-enter its own
 /// computation.
 static RESOLVED: std::sync::Mutex<Option<Resolved>> = std::sync::Mutex::new(None);
@@ -685,7 +685,7 @@ fn inputs_fingerprint(runtime: &Runtime, binary: &Path) -> String {
     if let Some(explicit) = &runtime.explicit_rootfs {
         trees.push(explicit.clone());
     }
-    trees.extend(crate::agent_rootfs_candidates(
+    trees.extend(super::agent_rootfs_candidates(
         runtime.host_home.as_deref(),
         runtime.data_dir.as_deref(),
         Some(binary),

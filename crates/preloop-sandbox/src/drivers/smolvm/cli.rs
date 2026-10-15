@@ -1,4 +1,8 @@
-//! Typed SmolVM lifecycle primitives for Preloop CI.
+//! Typed SmolVM CLI lifecycle primitives, shared by the SmolVM driver and
+//! (downstream) other CLI-backed drivers.
+//!
+//! The SmolVM driver ([`super::SmolvmDriver`]) is built on these; the CI
+//! runner pool also uses them directly for host-local SmolVM concerns.
 
 use async_trait::async_trait;
 use preloop_observability::deadline;
@@ -16,11 +20,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub mod agent_rootfs;
-pub mod agentenv;
-pub mod guest_privilege;
-pub mod telemetry;
 
-const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
+/// Default bound on captured exec output.
+pub const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 /// SmolVM runtime floor, compiled from `smolvm_min_version` in the workspace
 /// `versions.toml` by this crate's `build.rs`.
@@ -840,13 +842,14 @@ pub struct ProviderCapabilities {
     pub socket_mounts: bool,
     /// [`VmProvider::pack`] produces a host file usable as a base image.
     ///
-    /// `false` means packs live inside the backend (AgentENV snapshots), so
+    /// `false` means packs live inside the backend (snapshot backends), so
     /// the pool must not try to build, download, or relocate artifact files.
     pub file_packs: bool,
     /// A clone inherits filesystem writes the golden made *after* it booted.
     ///
     /// SmolVM's forkable snapshot does not: the pool reinstalls the baseline
-    /// into each fork. AgentENV snapshots the golden's live filesystem.
+    /// into each fork. A snapshot-based backend captures the golden's live
+    /// filesystem instead.
     pub fork_inherits_guest_writes: bool,
     /// A suspended guest retains its live runner, processes, and filesystem
     /// state when resumed. Backends without this must not auto-suspend a live
@@ -1009,7 +1012,7 @@ pub trait VmProvider: Send + Sync {
 /// Delegate through a box so a backend can be chosen at runtime.
 ///
 /// The pool is generic over its provider for zero-cost static dispatch, but
-/// the CLI picks between SmolVM and AgentENV from the environment. One
+/// the CLI picks the driver at runtime, so one
 /// `Box<dyn VmProvider>` keeps that choice out of the pool's type parameter
 /// without an enum that has to be extended for every future backend. The
 /// virtual call is irrelevant next to booting a VM.
@@ -1103,6 +1106,7 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
 /// streaming execs (the runner itself) are unaffected.
 const EXEC_TIMEOUT: &str = "30m";
 
+/// `smolvm` CLI driver of the typed lifecycle primitives.
 #[derive(Debug, Clone)]
 pub struct SmolVmProvider {
     binary: PathBuf,
@@ -1519,6 +1523,34 @@ impl SmolVmProvider {
                 message,
             ),
         }
+    /// Durably save RAM and disk, then stop (`smolvm machine pause`).
+    pub async fn pause_machine(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "pause",
+            &[
+                "machine".into(),
+                "pause".into(),
+                "--name".into(),
+                name.as_str().into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Resume a paused machine (`smolvm machine resume`).
+    pub async fn resume_machine(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "resume",
+            &[
+                "machine".into(),
+                "resume".into(),
+                "--name".into(),
+                name.as_str().into(),
+            ],
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn checked(
@@ -2718,7 +2750,8 @@ fn extract_dependent_clones(message: &str) -> Vec<String> {
 }
 
 /// Whether a name is usable as a shell environment variable identifier.
-fn is_env_identifier(name: &str) -> bool {
+/// Whether `name` is a valid POSIX environment variable name.
+pub fn is_env_identifier(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -2912,7 +2945,8 @@ pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(
 /// Preloop home the helper isolates SmolVM into: the explicit `PRELOOP_HOME`,
 /// else `<HOME>/.preloop` (the CLI's `preloop_home()` default), else the
 /// bare `.preloop` relative directory.
-fn effective_preloop_home() -> Option<PathBuf> {
+/// The Preloop home this process uses (`PRELOOP_HOME`, else `~/.preloop`).
+pub fn effective_preloop_home() -> Option<PathBuf> {
     std::env::var_os("PRELOOP_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
@@ -4008,7 +4042,8 @@ fn validate_socket_source(host: &Path) -> Result<(), VmError> {
     )))
 }
 
-async fn read_bounded(
+/// Read a stream, keeping at most `limit` bytes; the flag reports truncation.
+pub async fn read_bounded(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
 ) -> std::io::Result<(Vec<u8>, bool)> {
@@ -4056,7 +4091,7 @@ async fn forward(
 /// concurrently with the wait, so a child that fills one pipe while the other
 /// stays idle cannot deadlock, and a dropped receiver ends forwarding without
 /// killing the child.
-async fn stream_output(
+pub async fn stream_output(
     child: &mut tokio::process::Child,
     output: mpsc::Sender<OutputChunk>,
 ) -> std::io::Result<i32> {
@@ -4073,6 +4108,7 @@ async fn stream_output(
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
 
     /// Serializes the tests that rewrite `PRELOOP_HOME`: `purge_orphaned_vms`
@@ -4864,6 +4900,30 @@ mod tests {
         assert_eq!(swept, 1, "the leftover dir must be reclaimed");
         assert!(!dir.exists(), "an unregistered leftover is a real orphan");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bundled_agent_rootfs_beats_a_stale_platform_copy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path().join("home");
+        #[cfg(target_os = "macos")]
+        let platform = home.join("Library/Application Support/smolvm/agent-rootfs");
+        #[cfg(not(target_os = "macos"))]
+        let platform = home.join(".local/share/smolvm/agent-rootfs");
+        std::fs::create_dir_all(&platform).expect("platform rootfs");
+        let install = dir.path().join("install");
+        std::fs::create_dir_all(install.join("agent-rootfs")).expect("bundled rootfs");
+        std::fs::write(
+            install.join("smolvm"),
+            b"#!/bin/sh
+",
+        )
+        .expect("binary");
+        let found = agent_rootfs_candidates(Some(&home), None, Some(&install.join("smolvm")))
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("a candidate exists");
+        assert_eq!(found, install.join("agent-rootfs").canonicalize().unwrap());
     }
 
     #[test]

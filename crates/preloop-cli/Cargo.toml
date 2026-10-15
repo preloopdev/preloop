@@ -26,7 +26,7 @@ path = "src/main.rs"
 [dependencies]
 preloop-observability = { path = "../preloop-observability" }
 preloop-orchestrator = { path = "../preloop-orchestrator" }
-preloop-vm = { path = "../preloop-vm" }
+preloop-sandbox = { path = "../preloop-sandbox" }
 preloop-runner-server = { path = "../preloop-runner-server" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 anyhow = { workspace = true }
@@ -42,6 +42,9 @@ serde = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
+futures = { workspace = true }
+uuid = { workspace = true }
+hostname = { workspace = true }
 tokio-tungstenite = { workspace = true }
 libc = "0.2"
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }

@@ -1,4 +1,7 @@
-use preloop_vm::{MachineName, VmError};
+//! SmolVM CLI contract tests (argv against a recording fake `smolvm`).
+#![allow(unsafe_code)]
+
+use preloop_sandbox::drivers::smolvm::cli::{MachineName, VmError};
 
 #[test]
 fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
@@ -26,7 +29,7 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use preloop_vm::{
+    use preloop_sandbox::drivers::smolvm::cli::{
         ExecOutput, GuestVolume, MachineRole, MachineSpec, MachineState, NetworkPolicy,
         SmolVmProvider, SocketMount, VmProvider, VolumeMount,
     };
