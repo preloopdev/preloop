@@ -627,6 +627,33 @@ impl AgentEnvProvider {
         })
     }
 
+    /// Make sure `sandbox` is running before it is snapshotted.
+    ///
+    /// AgentENV snapshots only running sandboxes, but `stop` pauses rather than
+    /// stopping, and the orchestrator packs a golden right after stopping it. A
+    /// paused sandbox is therefore resumed first, so the snapshot captures the
+    /// machine the same way it would have while running.
+    async fn ensure_running(&self, sandbox: &str) -> Result<(), VmError> {
+        let states = self.live_sandboxes().await?;
+        if states
+            .get(sandbox)
+            .is_some_and(|state| state.as_str() != "running")
+        {
+            self.checked(
+                "resume",
+                &[
+                    "resume".into(),
+                    sandbox.to_owned(),
+                    "--timeout".into(),
+                    self.ttl_secs.to_string(),
+                ],
+            )
+            .await?;
+            self.await_guest(sandbox).await?;
+        }
+        Ok(())
+    }
+
     /// Re-arm the sandbox TTL for as long as the machine is running.
     ///
     /// Without this a job outliving the TTL would have its VM deleted
@@ -1095,6 +1122,7 @@ impl VmProvider for AgentEnvProvider {
                             golden.as_str(),
                             &uuid::Uuid::new_v4().simple().to_string()[..8]
                         );
+                        self.ensure_running(&golden_sandbox).await?;
                         self.checked(
                             "snapshot",
                             &[
@@ -1533,6 +1561,7 @@ impl VmProvider for AgentEnvProvider {
             name.as_str(),
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
+        self.ensure_running(&sandbox).await?;
         self.checked(
             "pack",
             &[
