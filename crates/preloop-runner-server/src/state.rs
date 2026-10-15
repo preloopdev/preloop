@@ -2161,6 +2161,10 @@ pub struct InnerState {
     /// ends, instead of subscribing to a channel that will never speak again.
     /// Cleared if the same key ingests fresh lines (a retry reusing the job).
     pub live_log_closed: std::collections::BTreeSet<String>,
+    /// Monotonic epochs for `live_log_closed`. A stale-frame liveness lookup
+    /// captures the epoch before awaiting the backend and may reopen only if
+    /// no close happened during that await.
+    pub live_log_close_epochs: BTreeMap<String, u64>,
     /// Resolved plan→run secret masker cache (node-local). `plan_secret_masker`
     /// is the permanent entry once a plan maps to a concrete run;
     /// `plan_secret_masker_pending` is the negative-cache union fallback with a

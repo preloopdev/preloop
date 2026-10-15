@@ -3602,6 +3602,8 @@ async fn live_log_websocket_reopen_allowed_while_job_live() {
 
     server.abort();
 }
+/// A plan-scoped FinishJob callback authenticated for job A must bind to its
+/// own request even when job B is the only other in-flight request;
 /// completion must target A and leave B untouched.
 #[tokio::test]
 async fn finish_job_plan_token_completes_only_its_bound_request() {
@@ -3704,7 +3706,9 @@ async fn finish_job_token_completes_only_its_bound_request() {
     );
 }
 
-/// token still succeeds.
+/// Round-3 §7: the legacy timeline PATCH endpoint carries the same liveness
+/// gate — a settled job's token gets 403, while a live job's token still
+/// succeeds.
 #[tokio::test]
 async fn legacy_timeline_patch_rejects_stale_job_token() {
     let temp = tempfile::tempdir().unwrap();

@@ -749,6 +749,7 @@ pub(crate) fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId, keys
         inner.live_log_lines.remove(&key);
         inner.live_log_tx.remove(&key);
         inner.live_log_closed.remove(&key);
+        inner.live_log_close_epochs.remove(&key);
     }
     inner.timeline_events.remove(&run_id);
     inner.timeline_events_order.retain(|id| *id != run_id);
