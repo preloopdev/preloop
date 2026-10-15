@@ -3875,17 +3875,37 @@ async fn drain_webhook_queue_with_heartbeat(
     }
 }
 
-/// The credential bucket a delivery's GitHub calls are charged to: the App
-/// installation its payload names, or the engine's PAT when the payload names
-/// none (or names it non-numerically).
-fn webhook_delivery_bucket(delivery: &WebhookDeliveryRecord) -> GithubCredentialBucket {
-    serde_json::from_slice::<Value>(&delivery.payload)
+/// The credential bucket a delivery's GitHub calls are charged to.
+///
+/// The payload's `installation.id` is only what the sender claims; it does
+/// not choose the credential. Calls resolve it the way every repo-scoped
+/// GitHub call does — the App covering `repository.full_name` (its real
+/// installation id), else the PAT — so a delivery parks on the bucket its
+/// requests actually spend against, not the one the webhook happened to
+/// name.
+async fn webhook_delivery_bucket(
+    shared: &Arc<SharedState>,
+    delivery: &WebhookDeliveryRecord,
+) -> GithubCredentialBucket {
+    let repo = serde_json::from_slice::<Value>(&delivery.payload)
         .ok()
-        .and_then(|payload| payload["installation"]["id"].as_u64())
-        .map_or(
-            GithubCredentialBucket::Pat,
-            GithubCredentialBucket::Installation,
-        )
+        .and_then(|payload| {
+            payload
+                .get("repository")
+                .and_then(|repository| repository.get("full_name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let Some(repo) = repo else {
+        return GithubCredentialBucket::Pat;
+    };
+    let Some(app) = crate::github_app::select_app_for_repo(shared, &repo).await else {
+        return GithubCredentialBucket::Pat;
+    };
+    match crate::github_app::installation_for_repo(&app, &repo).await {
+        Ok(installation) if installation != 0 => GithubCredentialBucket::Installation(installation),
+        _ => GithubCredentialBucket::Pat,
+    }
 }
 
 /// Process one claimed delivery and update its state according to the failure taxonomy.
@@ -3965,14 +3985,17 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
     let outcome = match outcome {
         WebhookOutcome::TransientError(error) => {
             // Park only when a breaker this delivery depends on is open: a
-            // GitHub-wide outage, or the delivery's own credential. An
+            // GitHub-wide outage, or the credential the delivery's GitHub
+            // calls actually resolve to (payload `installation.id` is not
+            // that credential — the repo's App/PAT selection is). An
             // unrelated throttled installation must not turn every transient
             // failure into a park, which would bypass the attempt cap. When
             // both block, wait for the longer of the two.
             let breakers = &shared.state.github_breakers;
+            let own_bucket = webhook_delivery_bucket(shared, delivery).await;
             let blocked_for = breakers
                 .unavailable_retry_after()
-                .max(breakers.retry_after_for(webhook_delivery_bucket(delivery)));
+                .max(breakers.retry_after_for(own_bucket));
             match blocked_for {
                 Some(retry_after) => WebhookOutcome::DependencyUnavailable {
                     error,
@@ -6777,6 +6800,44 @@ mod tests {
         serde_json::to_vec(&value).unwrap()
     }
 
+    /// Register a test App whose installation on `owner` is
+    /// `installation_id`, stubbing the ownership verification the selection
+    /// ladder makes. Returns the env guard holding `PRELOOP_GITHUB_API_URL`
+    /// and a cloned `AppState` carrying the registry — `github_app`/`github_apps`
+    /// are plain fields, so the returned state is the one the delivery
+    /// processing must run against.
+    async fn configure_app_installation(
+        state: &AppState,
+        installation_id: u64,
+        owner: &'static str,
+    ) -> (crate::state::TestEnvVar, AppState) {
+        let (api, _requests) = start_github_stub(move |method, path, _body| {
+            if method == "GET" && path == format!("/app/installations/{installation_id}") {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"account": {"login": owner}}),
+                );
+            }
+            (404, vec![], serde_json::json!({"message": "not found"}))
+        })
+        .await;
+        let api_env = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let mut app = crate::github_app::GitHubAppCredentials::for_tests(
+            "474",
+            rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
+            crate::github_app::MintFailurePolicy::LocalJwt,
+        );
+        app.installation_id = Some(installation_id);
+        let mut state = state.clone();
+        state.github_app = Some(app.clone());
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![app],
+            default_index: 0,
+        });
+        (api_env, state)
+    }
+
     /// A fixture whose workspace is hidden, so workflow evaluation fails
     /// transiently the way an unreachable dependency would.
     async fn hidden_workspace_fixture(temp: &tempfile::TempDir) -> WebhookFixture {
@@ -6942,11 +7003,16 @@ mod tests {
 
     /// A throttled installation parks its own deliveries' transient failures
     /// even past the attempt cap: the throttle belongs to the credential, not
-    /// to the delivery.
+    /// to the delivery. "Own" means the App installation the repo actually
+    /// selects, which the payload's `installation.id` happens to name here.
     #[tokio::test]
     async fn throttled_own_installation_parks_transient_failures() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let fixture = hidden_workspace_fixture(&temp).await;
+        // The repo's real credential is this App's installation 9: selection,
+        // not the payload's `installation.id`, decides the bucket.
+        let (_api, app_state) = configure_app_installation(&fixture.state, 9, "owner").await;
         fixture
             .state
             .github_breakers
@@ -6964,7 +7030,7 @@ mod tests {
         )
         .await;
         let shared = Arc::new(SharedState {
-            state: fixture.state.clone(),
+            state: app_state,
             shutdown: CancellationToken::new(),
         });
         process_one_delivery(&shared, &delivery).await;
@@ -6983,6 +7049,50 @@ mod tests {
             record
                 .lease_until_us
                 .is_some_and(|retry_at| retry_at > crate::store::now_us())
+        );
+    }
+
+    /// The bucket the delivery's calls resolve to — not the payload's
+    /// `installation.id` — governs parking. No App covers `owner/repo`, so
+    /// the calls spend the PAT even though the payload names installation 9:
+    /// a PAT throttle must park the delivery instead of dead-lettering it
+    /// while installation 9's budget sits unused.
+    #[tokio::test]
+    async fn throttled_pat_parks_delivery_naming_a_foreign_installation() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = hidden_workspace_fixture(&temp).await;
+        fixture
+            .state
+            .github_breakers
+            .breaker_for(GithubCredentialBucket::Pat)
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(Duration::from_secs(120)),
+                },
+                "429",
+            );
+        let delivery = claim_exhausted_delivery(
+            &fixture.state,
+            "delivery-foreign",
+            with_installation(&fixture.payload_bytes, 9),
+        )
+        .await;
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        process_one_delivery(&shared, &delivery).await;
+
+        let record = webhook_record(&fixture.state, "delivery-foreign").await;
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Received,
+            "the PAT bucket is what the delivery's calls spend: its throttle must park"
+        );
+        assert_eq!(
+            record.attempts, WEBHOOK_MAX_ATTEMPTS,
+            "parking refunds the attempt the claim charged"
         );
     }
 
@@ -7017,12 +7127,21 @@ mod tests {
         );
     }
 
-    /// The delivery is charged to the App installation its payload names,
-    /// and to the PAT when it names none.
-    #[test]
-    fn webhook_delivery_bucket_follows_the_payload_installation() {
+    /// The delivery is charged to the credential its GitHub calls resolve
+    /// to — the App covering `repository.full_name`, else the PAT — never to
+    /// the installation id the payload happens to name.
+    #[tokio::test]
+    async fn webhook_delivery_bucket_follows_the_selected_credential() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: CancellationToken::new(),
+        });
         let bucket = |payload: &str| {
-            webhook_delivery_bucket(&WebhookDeliveryRecord {
+            let shared = shared.clone();
+            let delivery = WebhookDeliveryRecord {
                 delivery_id: "delivery".to_owned(),
                 event: "push".to_owned(),
                 payload: payload.as_bytes().to_vec(),
@@ -7032,21 +7151,20 @@ mod tests {
                 lease_until_us: None,
                 lease_token: None,
                 last_error: None,
-            })
+            };
+            async move { webhook_delivery_bucket(&shared, &delivery).await }
         };
+        // No App configured: every delivery's calls use the PAT, whatever
+        // `installation.id` the payload claims.
         assert_eq!(
-            bucket(r#"{"installation":{"id":9}}"#),
-            GithubCredentialBucket::Installation(9)
-        );
-        assert_eq!(
-            bucket(r#"{"ref":"refs/heads/main"}"#),
+            bucket(r#"{"installation":{"id":9},"repository":{"full_name":"owner/repo"}}"#).await,
             GithubCredentialBucket::Pat
         );
         assert_eq!(
-            bucket(r#"{"installation":{"id":"9"}}"#),
+            bucket(r#"{"ref":"refs/heads/main"}"#).await,
             GithubCredentialBucket::Pat
         );
-        assert_eq!(bucket("not json"), GithubCredentialBucket::Pat);
+        assert_eq!(bucket("not json").await, GithubCredentialBucket::Pat);
     }
 
     /// A delivery whose ref SHA cannot be resolved is retried internally rather than dropped.
