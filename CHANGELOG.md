@@ -21,6 +21,15 @@ Releases before v0.27.0 predate the changelog.
   of inheriting Axum's 2 MiB default. Oversized requests still get a
   deterministic 413 without buffering the whole cache chunk in RAM.
 
+- **Runner-side `github.event` arrays decode correctly** (#571): the
+  runner's typed-context decoder used a legacy `{"t":1,"d":…}` tag map while
+  the wire codec serializes arrays as `{"t":1,"a":[…]}`. Nested arrays inside
+  `github.event` (labels, commits, head-commit fields) arrived as `null`, so
+  step env/condition expressions such as
+  `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
+  false and label-gated workflows never saw their labels.
+
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed
