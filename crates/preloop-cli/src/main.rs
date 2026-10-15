@@ -1413,7 +1413,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_origin: None,
         control_socket: None,
         control_upstream: None,
-        dns: Some(runner_dns()),
+        dns: runner_dns_for(vm_backend()?),
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -2786,7 +2786,7 @@ fn local_runner_pool_config(
         control_origin,
         control_socket,
         control_upstream,
-        dns: Some(runner_dns()),
+        dns: runner_dns_for(vm_backend()?),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus,
@@ -2901,6 +2901,18 @@ fn runner_dns() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "8.8.8.8".to_owned())
+}
+
+/// The guest DNS resolver to request, if this backend takes one.
+///
+/// AgentENV sandboxes always use the node's resolver and refuse a per-sandbox
+/// `dns`, so the runner default is not sent to them: sending it fails every
+/// golden build and runner-pool start on that backend.
+fn runner_dns_for(backend: VmBackend) -> Option<String> {
+    match backend {
+        VmBackend::Smolvm => Some(runner_dns()),
+        VmBackend::Agentenv => None,
+    }
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.
@@ -5774,6 +5786,12 @@ fn find_debug_machine(
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn runner_dns_is_requested_only_where_the_backend_can_honour_it() {
+        assert_eq!(runner_dns_for(VmBackend::Agentenv), None);
+        assert_eq!(runner_dns_for(VmBackend::Smolvm), Some(runner_dns()));
+    }
 
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
         tokio::spawn(std::future::pending())
