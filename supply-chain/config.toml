@@ -1101,11 +1101,11 @@ criteria = "safe-to-deploy"
 
 [[exemptions.proptest]]
 version = "1.12.0"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.proptest]]
 version = "1.12.0"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.prost]]
 version = "0.14.4"
@@ -1181,11 +1181,11 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rand_xorshift]]
 version = "0.5.0"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.rand_xorshift]]
 version = "0.5.0"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.rcgen]]
 version = "0.13.2"
