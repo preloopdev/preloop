@@ -4,7 +4,7 @@ use preloop_gha_protocol::azdo::{
     ActionDownloadInfo, ActionDownloadInfoCollection, ActionReferenceList,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 
@@ -1020,7 +1020,7 @@ async fn local_snapshot_declared_actions(
         return BTreeSet::new();
     };
 
-    let mut pending = Vec::new();
+    let mut pending = VecDeque::new();
     let mut visited_workflows = BTreeSet::new();
     collect_workflow_local_action_paths(
         &workflow,
@@ -1032,7 +1032,7 @@ async fn local_snapshot_declared_actions(
 
     let mut declared = BTreeSet::new();
     let mut visited_actions = BTreeSet::new();
-    while let Some((action_path, depth)) = pending.pop() {
+    while let Some((action_path, depth)) = pending.pop_front() {
         if depth > MAX_LOCAL_ACTION_DEPTH
             || visited_actions.len() >= MAX_LOCAL_ACTION_MANIFESTS
             || !visited_actions.insert(action_path.clone())
@@ -1047,8 +1047,14 @@ async fn local_snapshot_declared_actions(
         let (remote, nested_local) = manifest_nested_uses_from_yaml(&manifest);
         declared.extend(remote);
         for uses in nested_local {
-            if let Some(nested_path) = resolve_local_action_path(&action_path, &uses) {
-                pending.push((nested_path, depth + 1));
+            // The runner runs a nested `./` beside its composite when that
+            // directory is itself a composite, and from the workspace root
+            // otherwise (GitHub resolves it from the root). Admit both, so the
+            // allowlist covers whichever the run uses.
+            for base in [action_path.as_path(), std::path::Path::new("")] {
+                if let Some(nested_path) = resolve_local_action_path(base, &uses) {
+                    pending.push_back((nested_path, depth + 1));
+                }
             }
         }
     }
@@ -1058,7 +1064,7 @@ async fn local_snapshot_declared_actions(
 fn collect_workflow_local_action_paths(
     workflow: &preloop_gha_parser::Workflow,
     reusable_workflows: &BTreeMap<String, String>,
-    pending: &mut Vec<(std::path::PathBuf, usize)>,
+    pending: &mut VecDeque<(std::path::PathBuf, usize)>,
     visited: &mut BTreeSet<String>,
     depth: usize,
 ) {
@@ -1083,12 +1089,15 @@ fn collect_workflow_local_action_paths(
             if let Some(uses) = step.uses.as_deref()
                 && let Some(path) = resolve_local_action_path(std::path::Path::new(""), uses)
             {
-                pending.push((path, 0));
+                pending.push_back((path, 0));
             }
         }
     }
 }
 
+/// Normalize a local `uses:` (`./`, `../`, or the self-repository `$/`) to a
+/// repository-relative action directory; the empty path is the repository
+/// root. `None` for remote references and for paths that escape the root.
 fn resolve_local_action_path(base: &std::path::Path, uses: &str) -> Option<std::path::PathBuf> {
     let path = if let Some(relative) = uses.strip_prefix("$/") {
         std::path::PathBuf::from(relative)
@@ -1112,7 +1121,7 @@ fn resolve_local_action_path(base: &std::path::Path, uses: &str) -> Option<std::
             std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
         }
     }
-    (!normalized.as_os_str().is_empty()).then_some(normalized)
+    Some(normalized)
 }
 
 fn snapshot_repository_path(
@@ -2272,11 +2281,16 @@ jobs:
         );
     }
 
-    /// A local composite's remote dependency is read from the immutable
-    /// checked-out tree and admitted, while an unrelated action remains
-    /// forbidden. This exercises the same allowlist used by runnerresolve.
-    #[tokio::test]
-    async fn local_composite_dependency_is_allowed_but_unlisted_action_denied() {
+    /// Commit `files` as one snapshot and mirror it into a fresh engine state,
+    /// the way a run's workspace snapshot is stored. The returned temp dir
+    /// keeps that state directory alive for the test.
+    async fn local_snapshot_fixture(
+        files: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        AppState,
+        crate::snapshots::WorkspaceSnapshot,
+    ) {
         fn git(dir: &std::path::Path, args: &[&str]) -> String {
             let output = std::process::Command::new("git")
                 .arg("-C")
@@ -2293,14 +2307,13 @@ jobs:
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let state = test_state().await;
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let source = temp.path().join("source");
-        std::fs::create_dir_all(source.join(".github/actions/setup")).unwrap();
-        std::fs::write(
-            source.join(".github/actions/setup/action.yml"),
-            "name: setup\nruns:\n  using: composite\n  steps:\n    - uses: dtolnay/rust-toolchain@stable\n",
-        )
-        .unwrap();
+        for (path, body) in files {
+            let file = source.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
         git(&source, &["init", "-q"]);
         git(&source, &["config", "user.name", "test"]);
         git(&source, &["config", "user.email", "test@example.invalid"]);
@@ -2310,11 +2323,10 @@ jobs:
 
         let repository = state.state_dir.join("snapshots/local-action-test");
         std::fs::create_dir_all(repository.parent().unwrap()).unwrap();
-        let repository_text = repository.to_string_lossy().into_owned();
         let clone = std::process::Command::new("git")
             .args(["clone", "--bare"])
             .arg(&source)
-            .arg(&repository_text)
+            .arg(&repository)
             .output()
             .unwrap();
         assert!(
@@ -2325,20 +2337,29 @@ jobs:
 
         let snapshot = crate::snapshots::WorkspaceSnapshot {
             commit_sha: commit,
-            tree_sha: String::new(),
-            head_sha: None,
             repository: "snapshots/local-action-test".to_owned(),
-            default_branch: None,
-            before_sha: None,
-            snapshot_timing: None,
-            storage_repository: None,
-            source: crate::snapshots::SnapshotSource::LocalWorkspace,
-            cache_namespace: None,
-            upstream_repository: None,
-            upstream_repository_id: None,
-            upstream_private: None,
-            merge: None,
+            ..Default::default()
         };
+        (temp, state, snapshot)
+    }
+
+    /// A composite action manifest whose steps are the given `uses:` values.
+    fn composite_manifest(uses: &[&str]) -> String {
+        let steps: String = uses
+            .iter()
+            .map(|step| format!("    - uses: {step}\n"))
+            .collect();
+        format!("runs:\n  using: composite\n  steps:\n{steps}")
+    }
+
+    /// A local composite's remote dependency is read from the immutable
+    /// checked-out tree and admitted, while an unrelated action remains
+    /// forbidden. This exercises the same allowlist used by runnerresolve.
+    #[tokio::test]
+    async fn local_composite_dependency_is_allowed_but_unlisted_action_denied() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let (_temp, state, snapshot) =
+            local_snapshot_fixture(&[(".github/actions/setup/action.yml", setup.as_str())]).await;
         let workflow = r#"
 name: ci
 on: push
@@ -2370,6 +2391,97 @@ jobs:
                 .await
                 .expect_err("an action absent from workflow and manifests must be denied");
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A `./` step nested in a local composite resolves as the runner does: the
+    /// composite beside the referencing one wins when it exists, otherwise the
+    /// path is taken from the workspace root. A root-level `uses: ./` action is
+    /// read too.
+    #[tokio::test]
+    async fn local_nested_composites_resolve_beside_then_from_the_root() {
+        let outer = composite_manifest(&["./.github/actions/inner", "./beside"]);
+        let inner = composite_manifest(&["root/inner@v1"]);
+        let beside = composite_manifest(&["beside/dep@v1"]);
+        let root = composite_manifest(&["root/action-dep@v1"]);
+        let (_temp, state, snapshot) = local_snapshot_fixture(&[
+            (".github/actions/outer/action.yml", outer.as_str()),
+            (".github/actions/inner/action.yml", inner.as_str()),
+            (".github/actions/outer/beside/action.yml", beside.as_str()),
+            ("action.yml", root.as_str()),
+        ])
+        .await;
+        let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/outer
+      - uses: ./
+"#;
+        let declared =
+            local_snapshot_declared_actions(&state, Some(&snapshot), workflow, &BTreeMap::new())
+                .await;
+        for expected in ["root/inner", "beside/dep", "root/action-dep"] {
+            assert!(
+                declared.contains(expected),
+                "{expected} must enter the declared set: {declared:?}"
+            );
+        }
+    }
+
+    /// An action's depth is the shallowest path that reaches it. Here `shared`
+    /// is a direct step (depth 0) and also the end of a nine-composite chain
+    /// (depth 9); its dependency two levels below it must still be admitted.
+    #[tokio::test]
+    async fn local_composite_depth_is_taken_from_the_shallowest_path() {
+        let mut manifests: Vec<(String, String)> = Vec::new();
+        for index in 0..9 {
+            let next = if index == 8 {
+                "./.github/actions/shared".to_owned()
+            } else {
+                format!("./.github/actions/chain{}", index + 1)
+            };
+            manifests.push((
+                format!(".github/actions/chain{index}/action.yml"),
+                composite_manifest(&[next.as_str()]),
+            ));
+        }
+        manifests.push((
+            ".github/actions/shared/action.yml".to_owned(),
+            composite_manifest(&["./.github/actions/s1"]),
+        ));
+        manifests.push((
+            ".github/actions/s1/action.yml".to_owned(),
+            composite_manifest(&["./.github/actions/s2"]),
+        ));
+        manifests.push((
+            ".github/actions/s2/action.yml".to_owned(),
+            composite_manifest(&["deep/dep@v1"]),
+        ));
+        let files: Vec<(&str, &str)> = manifests
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect();
+        let (_temp, state, snapshot) = local_snapshot_fixture(&files).await;
+        let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/shared
+      - uses: ./.github/actions/chain0
+"#;
+        let declared =
+            local_snapshot_declared_actions(&state, Some(&snapshot), workflow, &BTreeMap::new())
+                .await;
+        assert!(
+            declared.contains("deep/dep"),
+            "deep/dep must enter the declared set: {declared:?}"
+        );
     }
 
     /// Ticket TTL is ~20 minutes, not 6 hours: a leaked bearerless ticket URL
