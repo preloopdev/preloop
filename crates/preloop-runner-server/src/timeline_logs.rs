@@ -585,7 +585,9 @@ pub async fn console_log(
                 )
                 .await;
             }
-            None => crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper).await,
+            None => {
+                crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper, None).await
+            }
         }
     }
     StatusCode::OK

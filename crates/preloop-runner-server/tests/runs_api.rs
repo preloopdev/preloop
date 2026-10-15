@@ -778,6 +778,7 @@ async fn live_run_logs_native_route_rejects_uuid_from_other_run() {
             count: 1,
             value: vec!["must stay private".into()],
         },
+        None,
     )
     .await;
 
@@ -868,6 +869,7 @@ async fn live_log_stream_ends_when_job_completes() {
             count: 1,
             value: vec!["building...".into()],
         },
+        None,
     )
     .await;
 
@@ -908,6 +910,7 @@ async fn live_log_stream_for_already_completed_job_serves_snapshot_and_ends() {
             count: 1,
             value: vec!["already done".into()],
         },
+        None,
     )
     .await;
     // Complete BEFORE anyone connects — the late follower must still get the
@@ -965,6 +968,7 @@ async fn live_log_reopens_when_a_completed_job_streams_again() {
             count: 1,
             value: vec!["second attempt".into()],
         },
+        None,
     )
     .await;
 
