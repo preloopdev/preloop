@@ -12,3 +12,10 @@ rules:
   unpinned-images:
     ignore:
       - release.yml
+  # pullfrog.yml runs on issue_comment by design: it is a review bot that
+  # only fires on `/pullfrog review` from a comment, and its job filter also
+  # refuses renovate/dependabot/pullfrog actors. zizmor 1.31 flags the
+  # trigger itself; the workflow's guard is the control.
+  dangerous-triggers:
+    ignore:
+      - pullfrog.yml
