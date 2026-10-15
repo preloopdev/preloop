@@ -4445,3 +4445,64 @@ fn same_repository_refs_stay_inside_the_callee_repository() {
         None
     );
 }
+
+#[test]
+fn plain_paths_refuse_every_spelling_a_url_parser_could_reinterpret() {
+    for path in [
+        "build.yml",
+        ".github/workflows/build.yml",
+        "v1.2.3",
+        "release/2026-10",
+        "my.workflow-1_x.yml",
+    ] {
+        assert!(is_plain_path(path), "`{path}` is plain");
+    }
+    for path in [
+        "", "/abs", "a//b", "a/", "..", "a/../b", "./a", "a/./b", "a\\b", "a%2e%2e", "a?b", "a#b",
+        "a b", "a\tb", "a\nb", "a+b",
+    ] {
+        assert!(!is_plain_path(path), "{path:?} must be refused");
+    }
+    assert!(is_plain_segment("octo-org"));
+    assert!(!is_plain_segment("a/b"));
+    assert!(!is_plain_segment(".."));
+}
+
+#[test]
+fn same_repository_paths_must_be_reusable_workflow_paths() {
+    assert_eq!(
+        same_repository_path("$/.github/workflows/build.yml"),
+        Some(".github/workflows/build.yml")
+    );
+    assert_eq!(
+        same_repository_path("./.github/workflows/build.yml"),
+        Some(".github/workflows/build.yml")
+    );
+    for uses in [
+        "$/../../../../repos/other/private/contents/.github/workflows/x.yml",
+        "$/.github/workflows/../../x.yml",
+        "$//.github/workflows/x.yml",
+        "$/.github/workflows/x.yml/",
+        "$/x.yml",
+        "$/.github/workflows/a b.yml",
+        "$/",
+        "octo/demo/.github/workflows/build.yml@v1",
+    ] {
+        assert_eq!(same_repository_path(uses), None, "`{uses}`");
+    }
+}
+
+#[test]
+fn same_repository_refs_must_name_a_workflow_file_under_github_workflows() {
+    assert_eq!(
+        same_repository_path("$/.github/workflows/ci.yml"),
+        Some(".github/workflows/ci.yml")
+    );
+    for uses in [
+        "$/../../../repos/other/private/contents/.github/workflows/x.yml",
+        "./../x.yml",
+        "$/src/x.yml",
+    ] {
+        assert_eq!(same_repository_path(uses), None, "`{uses}` must be refused");
+    }
+}

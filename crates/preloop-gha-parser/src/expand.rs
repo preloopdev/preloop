@@ -1399,23 +1399,53 @@ pub fn is_local_workflow_ref(uses: &str) -> bool {
     uses.starts_with("./") || uses.starts_with("$/")
 }
 
+/// Whether a path segment is a plain name: non-empty ASCII letters, digits,
+/// `-`, `_` or `.`, and neither `.` nor `..`. A URL parser can reinterpret the
+/// other characters (separators, backslashes, `%`-escapes, `?`, `#`, whitespace,
+/// control characters), and a dot segment climbs out of the path it sits in, so
+/// anything else is refused before it reaches a request URL.
+pub fn is_plain_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Whether `path` is a plain relative path: `/`-separated plain segments with no
+/// leading, trailing, or doubled separator.
+pub fn is_plain_path(path: &str) -> bool {
+    !path.is_empty() && path.split('/').all(is_plain_segment)
+}
+
+/// Whether `path` names a reusable workflow file in a repository: a plain path
+/// under `.github/workflows/`. Every reusable reference path, same-repository or
+/// remote, is checked against this one rule before it reaches a request URL.
+pub fn is_reusable_workflow_path(path: &str) -> bool {
+    path.starts_with(".github/workflows/") && is_plain_path(path)
+}
+
+/// The repository-relative path a same-repository reference (`./` or `$/`)
+/// names. `None` when `uses` is not same-repository or its path is not a
+/// reusable workflow path (see `is_reusable_workflow_path`).
+pub fn same_repository_path(uses: &str) -> Option<&str> {
+    let path = uses
+        .strip_prefix("./")
+        .or_else(|| uses.strip_prefix("$/"))?;
+    is_reusable_workflow_path(path).then_some(path)
+}
+
 /// The key a same-repository reference names when it is written inside the
 /// reusable workflow `origin` (an `owner/repo/path@ref` key) pinned to
 /// `origin_pin`: the same file in that repository at that commit. Returns
-/// `None` for a reference that is not same-repository, a malformed `origin`,
-/// or a path that climbs out of the repository with `..`.
+/// `None` for a reference whose path is not plain, a malformed `origin`, or a
+/// pin that is not a plain ref.
 pub fn scope_same_repository_ref(uses: &str, origin: &str, origin_pin: &str) -> Option<String> {
-    if !is_local_workflow_ref(uses) {
-        return None;
-    }
+    let path = same_repository_path(uses)?;
     let (owner, rest) = origin.split_once('/')?;
     let (repo, _) = rest.split_once('/')?;
-    let path = normalize_reusable_path(uses);
-    if owner.is_empty()
-        || repo.is_empty()
-        || origin_pin.is_empty()
-        || path.split('/').any(|segment| segment == "..")
-    {
+    if !is_plain_segment(owner) || !is_plain_segment(repo) || !is_plain_path(origin_pin) {
         return None;
     }
     Some(format!("{owner}/{repo}/{path}@{origin_pin}"))
@@ -1467,7 +1497,7 @@ fn reusable_workflow_repository(uses: &str) -> Option<String> {
 
 /// Normalized repository path of a reusable reference: `./` and `$/` stripped
 /// and any `@ref` dropped.
-pub fn normalize_reusable_path(uses: &str) -> String {
+fn normalize_reusable_path(uses: &str) -> String {
     let without_ref = uses.split('@').next().unwrap_or(uses);
     let path = without_ref
         .strip_prefix("./")

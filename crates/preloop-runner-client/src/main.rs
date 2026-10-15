@@ -448,13 +448,18 @@ async fn resolve_remote_workflows(
                 _ => declared.to_owned(),
             };
             if preloop_gha_parser::is_local_workflow_ref(&reference) {
-                // A workspace file is already in `workflows`. Scan it once so the
-                // remote references it makes are fetched as well.
-                if visited.insert(reference.clone()) {
-                    let path = preloop_gha_parser::normalize_reusable_path(&reference);
-                    if let Some(local) = workflows.get(&path) {
-                        queue.push((local.clone(), depth + 1, None));
-                    }
+                // A workspace file is already in `workflows`, keyed by its path in
+                // the repository. The path is validated before the lookup, then the
+                // file is scanned once so the remote references it makes are fetched.
+                let path = preloop_gha_parser::same_repository_path(&reference).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "reusable workflow reference `{reference}` must name a plain path under `.github/workflows/`"
+                    )
+                })?;
+                if visited.insert(reference.clone())
+                    && let Some(local) = workflows.get(path)
+                {
+                    queue.push((local.clone(), depth + 1, None));
                 }
                 continue;
             }
@@ -500,7 +505,11 @@ fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
     let owner = parts.next()?;
     let repo = parts.next()?;
     let path = parts.next()?;
-    if owner.is_empty() || repo.is_empty() || !path.starts_with(".github/workflows/") {
+    if !preloop_gha_parser::is_plain_segment(owner)
+        || !preloop_gha_parser::is_plain_segment(repo)
+        || !preloop_gha_parser::is_reusable_workflow_path(path)
+        || !preloop_gha_parser::is_plain_path(git_ref)
+    {
         return None;
     }
     Some((owner, repo, path, git_ref))
@@ -813,5 +822,102 @@ mod tests {
         let call = nested.reusable_call.as_ref().expect("reusable call");
         assert_eq!(call.uses, "octo/shared/.github/workflows/inner.yml@v1");
         assert_eq!(call.workflow_repository.as_deref(), Some("octo/shared"));
+    }
+
+    /// Remote references build the contents URL, so the owner, repository, path
+    /// and ref must each be plain: a `..` in any of them would escape the named
+    /// repository.
+    #[test]
+    fn remote_reference_components_must_be_plain() {
+        assert!(parse_remote_reference("octo/demo/.github/workflows/build.yml@v1").is_some());
+        for reference in [
+            "octo/demo/.github/workflows/../../../../repos/other/private/contents/x.yml@v1",
+            "../demo/.github/workflows/build.yml@v1",
+            "octo/../.github/workflows/build.yml@v1",
+            "octo/demo/.github/workflows/build.yml@../../repos/other/commits/main",
+            "octo/demo/.github/workflows/build.yml@",
+        ] {
+            assert!(
+                parse_remote_reference(reference).is_none(),
+                "`{reference}` must be refused"
+            );
+        }
+    }
+
+    /// A top-level `$/` reference must name a plain path under `.github/workflows/`
+    /// before the workspace is searched for it. Each candidate below is in the
+    /// workspace under the path it would normalize to, so an unchecked lookup
+    /// would resolve it.
+    #[tokio::test]
+    async fn resolve_remote_workflows_refuses_same_repository_paths_that_are_not_plain() {
+        const CALLEE: &str = "on: workflow_call\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let client = reqwest::Client::new();
+        for uses in [
+            "$/../../escape.yml",
+            "$/.github/workflows/../../escape.yml",
+            "$/x.yml",
+            "$/.github/workflows/a b.yml",
+        ] {
+            let workflows = BTreeMap::from([
+                ("../../escape.yml".to_owned(), CALLEE.to_owned()),
+                (
+                    ".github/workflows/../../escape.yml".to_owned(),
+                    CALLEE.to_owned(),
+                ),
+                ("x.yml".to_owned(), CALLEE.to_owned()),
+                (".github/workflows/a b.yml".to_owned(), CALLEE.to_owned()),
+            ]);
+            let root = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
+            let result = with_test_env(
+                &[
+                    (
+                        "PRELOOP_GITHUB_API_URL",
+                        Some("http://127.0.0.1:1".to_owned()),
+                    ),
+                    ("PRELOOP_GITHUB_TOKEN", None),
+                ],
+                resolve_remote_workflows(workflows, &root, &client),
+            )
+            .await;
+            assert!(result.is_err(), "`{uses}` must be refused");
+        }
+    }
+
+    /// A top-level `$/` reference resolves from the workspace only when it names a
+    /// file under `.github/workflows/`. Every other spelling is refused before the
+    /// workspace is searched.
+    #[tokio::test]
+    async fn resolve_remote_workflows_accepts_only_workflow_files_under_github_workflows() {
+        const CI: &str = "on: workflow_call\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ci\n";
+        let client = reqwest::Client::new();
+        let env = [
+            (
+                "PRELOOP_GITHUB_API_URL",
+                Some("http://127.0.0.1:1".to_owned()),
+            ),
+            ("PRELOOP_GITHUB_TOKEN", None),
+        ];
+        let workflows = BTreeMap::from([(".github/workflows/ci.yml".to_owned(), CI.to_owned())]);
+        let root = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/ci.yml\n";
+        let resolved = with_test_env(
+            &env,
+            resolve_remote_workflows(workflows.clone(), root, &client),
+        )
+        .await
+        .expect("a workflow file under .github/workflows/ resolves from the workspace");
+        assert_eq!(resolved, workflows);
+        for uses in [
+            "$/src/x.yml",
+            "./../x.yml",
+            "$/../../../repos/other/private/contents/.github/workflows/x.yml",
+        ] {
+            let root = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
+            let result = with_test_env(
+                &env,
+                resolve_remote_workflows(workflows.clone(), &root, &client),
+            )
+            .await;
+            assert!(result.is_err(), "`{uses}` must be refused");
+        }
     }
 }

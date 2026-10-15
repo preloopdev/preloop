@@ -87,7 +87,10 @@ Releases before v0.27.0 predate the changelog.
   rejected it as unsupported. `$/` and `./` now name a file in the submitting
   repository: the client resolves them from the workspace, the server fetches
   them at the submitted commit, and a call inside a remote reusable workflow
-  resolves in that workflow's repository at its pinned commit.
+  resolves in that workflow's repository at its pinned commit. The path must
+  be under `.github/workflows/`, with segments of letters, digits, `-`, `_` and
+  `.` only: a `..` segment, an empty or absolute path, or any other character
+  is refused before a request is sent.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

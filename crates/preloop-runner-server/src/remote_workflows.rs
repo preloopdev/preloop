@@ -81,14 +81,25 @@ pub async fn resolve_remote_workflows(
                 _ => declared.to_owned(),
             };
             let same_repository = preloop_gha_parser::is_local_workflow_ref(&reference);
-            let supplied = if same_repository {
-                let path = preloop_gha_parser::normalize_reusable_path(&reference);
-                submission
+            // A same-repository reference is validated before anything is looked
+            // up or requested: its path must be a plain reusable workflow path.
+            let same_repository_path = if same_repository {
+                Some(
+                    preloop_gha_parser::same_repository_path(&reference).ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "reusable workflow reference `{reference}` must name a plain path under `.github/workflows/`"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
+            let supplied = match same_repository_path {
+                Some(path) => submission
                     .reusable_workflows
                     .get(&reference)
-                    .or_else(|| submission.reusable_workflows.get(&path))
-            } else {
-                submission.reusable_workflows.get(&reference)
+                    .or_else(|| submission.reusable_workflows.get(path)),
+                None => submission.reusable_workflows.get(&reference),
             };
             if let Some(contents) = supplied.cloned() {
                 if visited.insert(reference.clone()) {
@@ -108,19 +119,27 @@ pub async fn resolve_remote_workflows(
             }
             // A same-repository reference names the submitted repository at the
             // submitted commit; any other reference names its own repository.
-            let (owner, repo, path, git_ref) = if same_repository {
-                let (owner, repo) = submission.repository.split_once('/').ok_or_else(|| {
-                    ApiError::bad_request(format!(
-                        "reusable workflow `{reference}` is in the submission repository, but `{}` is not `owner/repo`",
-                        submission.repository
-                    ))
-                })?;
-                (
-                    owner.to_owned(),
-                    repo.to_owned(),
-                    preloop_gha_parser::normalize_reusable_path(&reference),
-                    submitted_git_ref(submission),
-                )
+            let (owner, repo, path, git_ref) = if let Some(path) = same_repository_path {
+                let (owner, repo) = submission
+                    .repository
+                    .split_once('/')
+                    .filter(|(owner, repo)| {
+                        preloop_gha_parser::is_plain_segment(owner)
+                            && preloop_gha_parser::is_plain_segment(repo)
+                    })
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "reusable workflow `{reference}` is in the submission repository, but `{}` is not a plain `owner/repo`",
+                            submission.repository
+                        ))
+                    })?;
+                let git_ref = submitted_git_ref(submission);
+                if !preloop_gha_parser::is_plain_path(&git_ref) {
+                    return Err(ApiError::bad_request(format!(
+                        "reusable workflow `{reference}` cannot be fetched at the submitted ref `{git_ref}`"
+                    )));
+                }
+                (owner.to_owned(), repo.to_owned(), path.to_owned(), git_ref)
             } else {
                 let Some((owner, repo, path, git_ref)) = parse_remote_reference(&reference) else {
                     return Err(ApiError::bad_request(format!(
@@ -286,7 +305,11 @@ fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
     let owner = parts.next()?;
     let repo = parts.next()?;
     let path = parts.next()?;
-    if owner.is_empty() || repo.is_empty() || !path.starts_with(".github/workflows/") {
+    if !preloop_gha_parser::is_plain_segment(owner)
+        || !preloop_gha_parser::is_plain_segment(repo)
+        || !preloop_gha_parser::is_reusable_workflow_path(path)
+        || !preloop_gha_parser::is_plain_path(git_ref)
+    {
         return None;
     }
     Some((owner, repo, path, git_ref))
@@ -484,17 +507,23 @@ mod same_repository_tests {
     use base64::Engine;
     use std::sync::Arc;
 
-    /// A GitHub stand-in that answers each `(path and query, body)` route and
-    /// returns 404 for anything else, so an unexpected fetch fails resolution.
-    async fn serve_github(routes: Vec<(String, String)>) -> String {
+    /// A GitHub stand-in that answers each `(path and query, body)` route,
+    /// returns 404 for anything else, and records every request target it gets.
+    async fn serve_github_recording(
+        routes: Vec<(String, String)>,
+    ) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
         let routes = Arc::new(routes);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
         let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
             let routes = routes.clone();
+            let recorded = recorded.clone();
             async move {
                 let target = request
                     .uri()
                     .path_and_query()
                     .map_or_else(String::new, |path| path.as_str().to_owned());
+                recorded.lock().push(target.clone());
                 let (status, body) = match routes.iter().find(|(route, _)| *route == target) {
                     Some((_, body)) => (axum::http::StatusCode::OK, body.clone()),
                     None => (axum::http::StatusCode::NOT_FOUND, String::new()),
@@ -509,7 +538,13 @@ mod same_repository_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        api
+        (api, seen)
+    }
+
+    /// A GitHub stand-in that answers each `(path and query, body)` route and
+    /// returns 404 for anything else, so an unexpected fetch fails resolution.
+    async fn serve_github(routes: Vec<(String, String)>) -> String {
+        serve_github_recording(routes).await.0
     }
 
     fn contents_json(text: &str) -> String {
@@ -692,5 +727,176 @@ mod same_repository_tests {
             ..Default::default()
         };
         assert_eq!(submitted_git_ref(&pushed), "a".repeat(40));
+    }
+
+    /// The engine token is sent only to the submitted repository's own
+    /// endpoints. A top-level `$/` reference that climbs out of the repository
+    /// with `..` must be refused before any request is built. The stand-in also
+    /// serves the endpoint the traversal reaches, so an unchecked path succeeds.
+    #[tokio::test]
+    async fn top_level_same_repository_path_cannot_leave_the_repository() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
+        let other = "on: workflow_call\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo other\n";
+        let (api, seen) = serve_github_recording(vec![
+            (format!("/repos/o/r/commits/{sha}"), commit_json(sha)),
+            // Where the traversal lands once the URL parser removes the dot segments.
+            (
+                format!("/repos/other/private/contents/.github/workflows/x.yml?ref={sha}"),
+                contents_json(other),
+            ),
+        ])
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let (_temp, shared) = test_shared().await;
+
+        let yaml = "on: push\njobs:\n  call:\n    uses: $/../../../../repos/other/private/contents/.github/workflows/x.yml\n";
+        let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
+        let mut submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            repository: "o/r".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            sha: sha.to_owned(),
+            ..Default::default()
+        };
+        let outcome = resolve_remote_workflows(&shared, &mut submission, &workflow, None).await;
+        let requests = seen.lock().to_vec();
+        assert!(
+            requests.is_empty(),
+            "a refused path must not build a request, but the server sent {requests:?}"
+        );
+        let error = outcome.expect_err("a path that leaves the submitted repository is refused");
+        assert!(
+            error.message().contains("plain path"),
+            "the refusal must say why, got: {}",
+            error.message()
+        );
+    }
+
+    /// Every same-repository spelling a URL parser could reinterpret is refused
+    /// before a request is built: `.` and `..` segments, empty segments, absolute
+    /// paths, backslashes, percent-escapes, query and fragment delimiters,
+    /// whitespace, and paths outside `.github/workflows/`.
+    #[tokio::test]
+    async fn top_level_same_repository_path_must_be_plain() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
+        let (api, seen) = serve_github_recording(vec![(
+            format!("/repos/o/r/commits/{sha}"),
+            commit_json(sha),
+        )])
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let (_temp, shared) = test_shared().await;
+        for uses in [
+            "$/.github/workflows/../../x.yml",
+            "$/../.github/workflows/x.yml",
+            "$/.github/workflows/..\\..\\x.yml",
+            "$/.github\\workflows\\x.yml",
+            "$/%2e%2e/%2e%2e/x.yml",
+            "$/.github/workflows/%2e%2e/x.yml",
+            "$//.github/workflows/x.yml",
+            "$/.github/workflows//x.yml",
+            "$/.github/workflows/x.yml/",
+            "$/.github/workflows/./x.yml",
+            "$/.github/workflows/x.yml?ref=main",
+            "$/.github/workflows/x.yml#frag",
+            "$/.github/workflows/a b.yml",
+            "$/x.yml",
+            "./../x.yml",
+        ] {
+            seen.lock().clear();
+            let yaml = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
+            let workflow = preloop_gha_parser::parse_workflow(&yaml).expect("the workflow parses");
+            let mut submission = preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: yaml.clone(),
+                repository: "o/r".to_owned(),
+                git_ref: "refs/heads/main".to_owned(),
+                sha: sha.to_owned(),
+                ..Default::default()
+            };
+            let outcome = resolve_remote_workflows(&shared, &mut submission, &workflow, None).await;
+            let requests = seen.lock().to_vec();
+            assert!(requests.is_empty(), "`{uses}` built requests: {requests:?}");
+            assert!(outcome.is_err(), "`{uses}` must be refused");
+        }
+    }
+
+    /// Remote references build the same contents URLs, so the owner, repository,
+    /// path and ref must each be plain: a `..` in any of them would escape the
+    /// named repository.
+    #[test]
+    fn remote_reference_components_must_be_plain() {
+        assert!(parse_remote_reference("octo/demo/.github/workflows/build.yml@v1").is_some());
+        for reference in [
+            "octo/demo/.github/workflows/../../../../repos/other/private/contents/x.yml@v1",
+            "../demo/.github/workflows/build.yml@v1",
+            "octo/../.github/workflows/build.yml@v1",
+            "octo/demo/.github/workflows/build.yml@../../repos/other/commits/main",
+            "octo/demo/.github/workflows/build.yml@",
+        ] {
+            assert!(
+                parse_remote_reference(reference).is_none(),
+                "`{reference}` must be refused"
+            );
+        }
+    }
+
+    /// A top-level `$/` or `./` reference resolves only when it names a file under
+    /// `.github/workflows/`, and that file is fetched from the submitted repository
+    /// at the submitted commit. Every other spelling is refused before a request.
+    #[tokio::test]
+    async fn top_level_same_repository_refs_must_name_a_workflow_file() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let sha = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
+        let ci = "on: workflow_call\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ci\n";
+        let (api, seen) = serve_github_recording(vec![
+            (format!("/repos/o/r/commits/{sha}"), commit_json(sha)),
+            (
+                format!("/repos/o/r/contents/.github/workflows/ci.yml?ref={sha}"),
+                contents_json(ci),
+            ),
+        ])
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let (_temp, shared) = test_shared().await;
+
+        let yaml = "on: push\njobs:\n  call:\n    uses: $/.github/workflows/ci.yml\n";
+        let workflow = preloop_gha_parser::parse_workflow(yaml).unwrap();
+        let mut submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            repository: "o/r".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            sha: sha.to_owned(),
+            ..Default::default()
+        };
+        resolve_remote_workflows(&shared, &mut submission, &workflow, None)
+            .await
+            .expect("a workflow file under .github/workflows/ resolves");
+        assert_eq!(
+            submission.reusable_workflows["$/.github/workflows/ci.yml"],
+            ci
+        );
+
+        for uses in [
+            "$/src/x.yml",
+            "./../x.yml",
+            "$/../../../repos/other/private/contents/.github/workflows/x.yml",
+        ] {
+            seen.lock().clear();
+            let yaml = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
+            let workflow = preloop_gha_parser::parse_workflow(&yaml).expect("the workflow parses");
+            let mut submission = preloop_gha_protocol::WorkflowSubmission {
+                workflow_yaml: yaml.clone(),
+                repository: "o/r".to_owned(),
+                git_ref: "refs/heads/main".to_owned(),
+                sha: sha.to_owned(),
+                ..Default::default()
+            };
+            let outcome = resolve_remote_workflows(&shared, &mut submission, &workflow, None).await;
+            let requests = seen.lock().to_vec();
+            assert!(requests.is_empty(), "`{uses}` built requests: {requests:?}");
+            assert!(outcome.is_err(), "`{uses}` must be refused");
+        }
     }
 }
