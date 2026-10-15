@@ -665,7 +665,7 @@ fork) is tens of GiB and declares `USER=runner`. Building a golden from it
 locally exercises several smolvm/preloop sharp edges. All were fixed in
 smolvm's `src/cli/internal_boot.rs`,
 `src/cli/machine.rs`, `src/pack_export.rs`, `crates/smolvm-agent/src/…`, and
-`crates/preloop-cli`/`preloop-vm`; the notes below describe the failure each
+`crates/preloop-cli`/`crates/preloop-sandbox`; the notes below describe the failure each
 one produced so a regression is recognizable.
 
 - **`krun_start_enter returned: -22 (EINVAL)` — `Building the microVM failed:

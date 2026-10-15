@@ -63,7 +63,7 @@
 <text x="1090" y="663.4" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#a21caf" font-weight="600">preloop-runner</text>
 <text x="1090" y="682.1" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#a21caf" font-weight="600">Rust runner engine</text>
 <rect x="1255" y="630" width="270" height="75" rx="10" fill="#eebefa" stroke="#a21caf" stroke-width="2"/>
-<text x="1390" y="663.4" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#a21caf" font-weight="600">preloop-vm</text>
+<text x="1390" y="663.4" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#a21caf" font-weight="600">preloop-sandbox</text>
 <text x="1390" y="682.1" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#a21caf" font-weight="600">smolvm / libkrun microVM</text>
 <rect x="350" y="780" width="1200" height="140" rx="10" fill="#e5dbff" fill-opacity="0.25" stroke="#7c3aed" stroke-width="1.5"/>
 <text x="370" y="813.0" font-size="18" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="500">Shared Libraries &amp; Protocol Workspace</text>

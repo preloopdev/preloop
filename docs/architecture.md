@@ -23,11 +23,13 @@ state machine, debugger attachment for paused jobs).
 - `preloop-runner` is the Rust reimplementation of the GitHub Actions runner
 (Listener + Worker). Single binary with `configure`/`run`/`worker` subcommands;
 the listener spawns a worker child process per job via stdin NDJSON IPC.
-- `preloop-vm` defines the `VmProvider` trait (crates/preloop-vm/src/lib.rs:349)
-abstracting runner-host substrates — SmolVM (libkrun, the default) and AgentENV
-(Firecracker).
-- `preloop-orchestrator` owns job scheduling and VM lifecycle orchestration on
-top of `preloop-vm`.
+- `preloop-sandbox` is the Sandbox Service: templates, pools, leases,
+placement, host agents and drivers behind a Connect API
+(`proto/preloop/sandbox/v1/sandbox.proto`; see [sandbox-service.md](sandbox-service.md)).
+The public build ships the SmolVM driver in `drivers/smolvm`; AgentENV is supplied
+by the private build. The crate does not depend on the control plane.
+- `preloop-orchestrator` owns the CI runner pool; `fleet::SandboxMachines` gets
+every VM from the Sandbox Service.
 - `preloop-observability` owns metrics, logs, traces, and status snapshots.
 - `preloop-socket-activation` owns systemd-style socket activation support.
 - `runner-watch` tracks upstream `actions/runner` releases, diffs source, emits
@@ -36,8 +38,8 @@ TOML specs, and replays golden wire captures for protocol conformance.
 ## Pluggable backends
 
 preloop is execution-agnostic. The only thing that differs between runner hosts
-is how a runner instance is created and destroyed. This is modeled as the
-`preloop_vm::VmProvider` trait (crates/preloop-vm/src/lib.rs:349); the
+is how a runner instance is created and destroyed. Machines come from the
+Sandbox Service, whose drivers own the substrates (docs/sandbox-service.md); the
 `ControlBackend` trait (control/backend.rs) covers durable state. (The `RunnerProvider`/`AuthProvider`
 design in fidelity-gap §4 is aspirational.)
 

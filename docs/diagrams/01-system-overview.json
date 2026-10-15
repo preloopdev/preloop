@@ -437,7 +437,7 @@
    "type": 3
   },
   "label": {
-   "text": "preloop-vm\nsmolvm / libkrun microVM",
+   "text": "preloop-sandbox\nsmolvm / libkrun microVM",
    "fontSize": 15
   }
  },

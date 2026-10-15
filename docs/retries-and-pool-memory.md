@@ -55,7 +55,7 @@ use GitHub's delivery redelivery action or API after the store recovers.
 | golden download | Release/OCI asset | single attempt, 1 h timeout, then local-build fallback | n/a |
 | `preload_images` / `docker_start_command` | dockerd readiness / start | shell polls (30 s / 10 s+5 s), start retried once | yes |
 
-## SmolVM provider (`preloop-vm`)
+## SmolVM driver (`preloop-sandbox::drivers::smolvm`)
 
 | Site | What | Policy | Bounded? |
 |---|---|---|---|

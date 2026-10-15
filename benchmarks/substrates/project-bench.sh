@@ -36,8 +36,8 @@ mkdir -p "$OUTDIR"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUTDIR/driver.log" >&2; }
 
 case "$SUBSTRATE" in
-  aenv) export PRELOOP_VM_BACKEND=agentenv ;;
-  smolvm) export PRELOOP_VM_BACKEND=smolvm ;;
+  aenv) export PRELOOP_SANDBOX_DRIVERS=agentenv PRELOOP_SANDBOX_POOL_DRIVER=agentenv ;;
+  smolvm) export PRELOOP_SANDBOX_POOL_DRIVER=smolvm ;;
   *) echo "unknown substrate: $SUBSTRATE" >&2; exit 2 ;;
 esac
 

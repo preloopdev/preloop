@@ -76,7 +76,7 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 ///
 /// The configured floor is the first release that satisfies all runtime
 /// invariants: packed-machine ownership preservation (v1.8.1) and
-/// `machine fork --freeze-source` (v1.18.1), which preloop-vm passes on every
+/// `machine fork --freeze-source` (v1.18.1), which the SmolVM driver passes on every
 /// fork so goldens keep a frozen reusable branch base instead of
 /// live-forking the source. Newer stable releases satisfy it without another
 /// code change.
@@ -383,7 +383,7 @@ fn smolvm_platform() -> Option<&'static str> {
 ///
 /// The wrapper scripts can report a recent `--version` while resolving to
 /// an old binary, so the flag's presence in the help text is the reliable
-/// check (the same probe preloop-vm runs before provisioning).
+/// check (the same probe the SmolVM driver runs before provisioning).
 async fn probe_mount_socket(binary: &Path) -> bool {
     let mut command = tokio::process::Command::new(binary);
     command
