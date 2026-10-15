@@ -449,6 +449,34 @@ control backend replaced) into a fresh control database. See
 | `--active <POLICY>` | In-flight work on unfinished jobs: `refuse` (default), `requeue`, or `cancel`. Claims on already-terminal jobs are settled as history without an override |
 | `--json` | Print the machine-readable report |
 
+## `preloop runner-volumes <COMMAND>`
+
+Read-only volumes that AgentENV runners mount. The engine creates one per
+distinct runner tree (the runner bundle, the Node externals), named
+`preloop-runner-<digest>` after the digest of the tree, so a new bundle is a new
+volume. Nothing removes a superseded volume on its own; these commands do. They
+are offline: they talk to AgentENV (`PRELOOP_AENV_BINARY`, default `aenv`) and
+never bootstrap the engine.
+
+### `preloop runner-volumes list`
+
+Lists the runner volumes AgentENV holds, with mode, size and status.
+
+### `preloop runner-volumes prune [--keep <DIR>]... [--dry-run]`
+
+Deletes every runner volume that no sandbox mounts, except the trees named with
+`--keep`. Without `--keep` the trees are `PRELOOP_RUNNER_BUNDLE` and the
+externals beside it (`PRELOOP_RUNNER_EXTERNALS`, else `$PRELOOP_HOME/externals`,
+then `externals/`). AgentENV refuses to delete a mounted volume, and that is
+reported as `in use`, not as a failure. Run it while no engine is starting
+runners: a volume deleted between a populate and its first mount fails that
+start.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable) |
+| `--dry-run` | Print what would be deleted without deleting it |
+
 ## `preloop update [OPTIONS]`
 
 Poll GitHub Releases and atomically install the matching binary.

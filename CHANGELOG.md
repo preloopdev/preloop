@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **AgentENV runners mount the runner bundle as a read-only volume**: the
+  complete bundle (including Node externals) is archived once into a
+  content-addressed volume named `preloop-runner-<digest>`, and clones mount it
+  at start with `aenv start --volume`. Fork bases stay volume-free because
+  AgentENV 0.2.1 cannot snapshot a sandbox with a read-only volume; a new
+  bundle is therefore a new volume rather than a golden rebuild. Writable host
+  mounts are refused, and volume create/populate failures are reported by name
+  with no tar fallback. `preloop runner-volumes list|prune` manages leftovers.
+
 ### Fixed
 
 - **Large replay step logs are retained** (#599): signed
