@@ -6609,7 +6609,12 @@ async fn provision_runner<P: VmProvider + 'static>(
             .fork_with_volumes(golden, name, &fork_volumes)
             .await
         {
-            Ok(()) => Some(golden),
+            Ok(()) => {
+                if provider.capabilities().runner_bundle_carries_externals {
+                    link_runner_externals(provider.as_ref(), name).await?;
+                }
+                Some(golden)
+            }
             Err(error) if managed_golden(config, golden) => {
                 if fork_base_unusable(&error) {
                     // The base is spent. Re-arm it atomically with forking:
@@ -6631,7 +6636,12 @@ async fn provision_runner<P: VmProvider + 'static>(
                                 .fork_with_volumes(golden, name, &fork_volumes)
                                 .await
                             {
-                                Ok(()) => Some(golden),
+                                Ok(()) => {
+                                    if provider.capabilities().runner_bundle_carries_externals {
+                                        link_runner_externals(provider.as_ref(), name).await?;
+                                    }
+                                    Some(golden)
+                                }
                                 Err(retry_error) => {
                                     error!(
                                         machine = name.as_str(),
@@ -6695,7 +6705,12 @@ async fn provision_runner<P: VmProvider + 'static>(
                                     .fork_with_volumes(golden, name, &fork_volumes)
                                     .await
                                 {
-                                    Ok(()) => Some(golden),
+                                    Ok(()) => {
+                                        if provider.capabilities().runner_bundle_carries_externals {
+                                            link_runner_externals(provider.as_ref(), name).await?;
+                                        }
+                                        Some(golden)
+                                    }
                                     Err(retry_error) => {
                                         error!(
                                             machine = name.as_str(),
@@ -6753,6 +6768,9 @@ async fn provision_runner<P: VmProvider + 'static>(
                             .await
                         {
                             Ok(()) => {
+                                if provider.capabilities().runner_bundle_carries_externals {
+                                    link_runner_externals(provider.as_ref(), name).await?;
+                                }
                                 retried = Some(golden);
                                 break;
                             }
