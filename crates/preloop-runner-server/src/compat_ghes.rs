@@ -283,7 +283,7 @@ pub async fn finish_job_org(
     headers: HeaderMap,
     Json(event): Json<azdo::JobCompletedEvent>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::timeline_logs::authorize_reporting_callback(
+    let request = crate::timeline_logs::authorize_reporting_callback(
         &shared,
         &headers,
         &plan_id,
@@ -291,7 +291,13 @@ pub async fn finish_job_org(
         Some(event.job_id),
     )
     .await?;
-    Ok(finish_job(State(shared), Path((scope, hub, plan_id)), Json(event)).await)
+    Ok(finish_job(
+        State(shared),
+        Path((scope, hub, plan_id)),
+        Json(event),
+        request,
+    )
+    .await)
 }
 
 pub async fn action_download_info_org(
