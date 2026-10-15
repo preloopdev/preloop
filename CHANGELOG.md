@@ -10,6 +10,12 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Action credential minting is liveness- and identity-bound** (#468):
+  ActionDownloadInfo and runnerresolve accept only the system credential or a
+  Results job runtime token, bind that token to the requested plan/job, and
+  re-check job liveness after action-reference resolution before signing
+  bearerless download tickets.
+
 - **Large replay step logs are retained** (#599): signed
   `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
   inheriting Axum's 2 MiB default, so long failing steps remain available for

@@ -136,11 +136,17 @@ pub fn build_app(
         )
         .route(
             "/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
-            post(action_download_info),
+            post(action_download_info).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_results_protocol_bearer,
+            )),
         )
         .route(
             "/actions/build/{orchestration_id}/jobs/{job_id}/runnerresolve/actions",
-            post(runnerresolve_actions),
+            post(runnerresolve_actions).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_results_protocol_bearer,
+            )),
         )
         .route(
             "/runner/server/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
@@ -164,7 +170,10 @@ pub fn build_app(
         )
         .route(
             "/runner/server/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
-            post(action_download_info),
+            post(action_download_info).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_results_protocol_bearer,
+            )),
         )
         .route(
             "/api/v1/runs/{run_id}/jobs/{job_id}/logs/live",
@@ -486,7 +495,7 @@ pub fn build_app(
             "/{org}/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
             post(action_download_info_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
-                require_protocol_bearer,
+                require_results_protocol_bearer,
             )),
         )
         .route("/_apis/v1/oauth2/token", post(oauth2_token))

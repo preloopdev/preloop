@@ -4153,3 +4153,96 @@ async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
         "dispatch inputs must still reach the caller's own if:/name: context"
     );
 }
+/// Action-resolution routes accept only the system credential or a Results
+/// job runtime credential, and a job credential is bound to the route target.
+/// This covers the cross-class bearer bypass and the settled-job mint path.
+#[tokio::test]
+async fn action_resolution_requires_bound_live_results_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let workflow = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#;
+    let (run_a, plan_a, job_a) = submit_run_first_job(&app, &state, workflow).await;
+    let token_a = state.mint_runtime_token(&plan_a, &job_a);
+    let sha = "abc123def456abc123def456abc123def456abc1";
+    let uri = format!("/_apis/v1/ActionDownloadInfo/scope/actions/{plan_a}");
+    let body = json!({
+        "actions": [{"nameWithOwner": "actions/checkout", "ref": sha}]
+    });
+
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &token_a).await,
+        StatusCode::OK,
+        "a live job token must reach action resolution"
+    );
+    assert_eq!(
+        request_status_with_bearer(
+            &app,
+            Method::POST,
+            &uri,
+            body.clone(),
+            DEFAULT_PRELOOP_SYSTEM_TOKEN,
+        )
+        .await,
+        StatusCode::OK,
+        "the system credential must retain control-plane access"
+    );
+
+    let blob_token = state
+        .local_jwt_with_lifetime(
+            blob_jwt_claims(
+                "artifact",
+                BLOB_OP_WRITE,
+                &job_a.to_string(),
+                &uuid::Uuid::new_v4().to_string(),
+            ),
+            SIGNED_BLOB_URL_TTL,
+        )
+        .unwrap();
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &blob_token).await,
+        StatusCode::UNAUTHORIZED,
+        "a blob JWT must not be repurposed as an action bearer"
+    );
+
+    let malformed_results = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{job_a}"),
+            "scp": "Actions.Results:malformed",
+        }))
+        .unwrap();
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &malformed_results,)
+            .await,
+        StatusCode::UNAUTHORIZED,
+        "a malformed Results token must fail closed"
+    );
+
+    let (_run_b, plan_b, job_b) = submit_run_first_job(&app, &state, workflow).await;
+    let token_b = state.mint_runtime_token(&plan_b, &job_b);
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body.clone(), &token_b).await,
+        StatusCode::FORBIDDEN,
+        "a job token must not resolve another plan"
+    );
+
+    complete_job(
+        &state,
+        run_a.parse().unwrap(),
+        "build",
+        ExecutionStatus::Success,
+    )
+    .await;
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &uri, body, &token_a).await,
+        StatusCode::FORBIDDEN,
+        "a settled job token must not mint an action ticket"
+    );
+}

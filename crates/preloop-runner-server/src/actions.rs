@@ -6,41 +6,62 @@ use preloop_gha_protocol::azdo::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+fn require_action_plan(
+    identity: &crate::auth::ResultsIdentity,
+    plan_id: &str,
+) -> Result<(), ApiError> {
+    match identity {
+        crate::auth::ResultsIdentity::System => Ok(()),
+        crate::auth::ResultsIdentity::Job(job) if job.plan_id == plan_id => Ok(()),
+        crate::auth::ResultsIdentity::Job(_) => Err(ApiError::forbidden(
+            "results-service token is not bound to that plan",
+        )),
+    }
+}
+
 /// POST action download info — resolve action references to download URLs.
 ///
 /// Tickets are minted only for actions declared in the run's workflow
 /// (`uses:`, transitively through reusable callees and composite nests);
 /// any other requested action fails the whole batch with 403 — a job
-/// runtime token must not turn the engine into a fetch oracle for
-/// arbitrary repositories on the operator's API quota. The run is
-/// identified by the `plan_id` path segment; an unknown plan fails closed.
+/// runtime token must not turn the engine into a fetch oracle for arbitrary
+/// repositories on the operator's API quota. The caller is also bound to the
+/// plan in the URL before resolution starts.
 pub async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    action_download_info_for_plan(&shared, &plan_id, &request).await
+    action_download_info_for_plan(&shared, &identity, &plan_id, &request).await
 }
 
 pub(crate) async fn action_download_info_for_plan(
     shared: &Arc<SharedState>,
+    identity: &crate::auth::ResultsIdentity,
     plan_id: &str,
     request: &serde_json::Value,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let collection = collect_action_download_infos(&shared.state, plan_id, request).await?;
+    require_action_plan(identity, plan_id)?;
+    crate::auth::require_live_results_job(&shared.state, identity).await?;
+    let collection =
+        collect_action_download_infos(&shared.state, identity, plan_id, request).await?;
     Ok(Json(
         serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })),
     ))
 }
-
 pub async fn runnerresolve_actions(
     State(shared): State<Arc<SharedState>>,
     Path((orchestration_id, job_id)): Path<(String, String)>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::auth::require_results_job(&identity, &orchestration_id, &job_id)?;
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let mut actions = serde_json::Map::new();
     collect_runnerresolve_refs(
         &shared.state,
+        &identity,
         &orchestration_id,
         &job_id,
         &request,
@@ -646,8 +667,11 @@ pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 /// Maximum concurrent outbound GitHub ref resolution requests.
 pub const MAX_ACTION_CONCURRENCY: usize = 16;
 
+type ResolvedActionParts = (String, String, String, Option<String>, String);
+
 pub async fn collect_runnerresolve_refs(
     state: &AppState,
+    identity: &crate::auth::ResultsIdentity,
     orchestration_id: &str,
     job_id: &str,
     value: &serde_json::Value,
@@ -664,13 +688,16 @@ pub async fn collect_runnerresolve_refs(
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        runnerresolve_action(state, &action, version.as_deref()).await
+        resolve_action_download_parts(state, &action, version.as_deref()).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
-    let resolved: Vec<Option<(String, serde_json::Value)>> = stream.collect().await;
-    for (key, value) in resolved.into_iter().flatten() {
-        actions.entry(key).or_insert(value);
+    let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
+    crate::auth::require_live_results_job(state, identity).await?;
+    for parts in resolved.into_iter().flatten() {
+        if let Some((key, value)) = runnerresolve_action_from_parts(state, parts) {
+            actions.entry(key).or_insert(value);
+        }
     }
     Ok(())
 }
@@ -682,6 +709,7 @@ pub async fn collect_runnerresolve_refs(
 /// batch with 403 instead of minting a ticket.
 pub async fn collect_action_download_infos(
     state: &AppState,
+    identity: &crate::auth::ResultsIdentity,
     plan_id: &str,
     value: &serde_json::Value,
 ) -> Result<ActionDownloadInfoCollection, ApiError> {
@@ -709,14 +737,17 @@ pub async fn collect_action_download_infos(
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        action_download_info_entry(state, &action, version.as_deref()).await
+        resolve_action_download_parts(state, &action, version.as_deref()).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
-    let resolved: Vec<Option<(String, ActionDownloadInfo)>> = stream.collect().await;
+    let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
+    crate::auth::require_live_results_job(state, identity).await?;
     let mut actions = BTreeMap::new();
-    for (key, value) in resolved.into_iter().flatten() {
-        actions.insert(key, value);
+    for parts in resolved.into_iter().flatten() {
+        if let Some((key, value)) = action_download_info_from_parts(state, parts) {
+            actions.insert(key, value);
+        }
     }
 
     Ok(ActionDownloadInfoCollection { actions })
@@ -1326,11 +1357,11 @@ fn collect_runnerresolve_requests(
 /// fresh download, and the stale archive is never served again. When the
 /// lookup is unavailable the ref itself is used, preserving the historical
 /// ref-keyed behavior.
-async fn resolve_action_download(
+async fn resolve_action_download_parts(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
-) -> Option<(String, String, String, Option<String>, String)> {
+) -> Option<ResolvedActionParts> {
     let (key, _) = action_download_ticket(state, action, version_override)?;
     let (name, git_ref) = key.split_once('@')?;
     let name = name.to_string();
@@ -1346,9 +1377,48 @@ async fn resolve_action_download(
 
     let pinned = resolve_ref_to_sha(state, &owner, &repo, &git_ref).await;
     let effective_ref = pinned.as_deref().unwrap_or(&git_ref).to_owned();
-    let (_, ticket) = action_download_ticket(state, action, Some(&effective_ref))?;
+    Some((key, name, git_ref, pinned, effective_ref))
+}
+
+fn runnerresolve_action_from_parts(
+    state: &AppState,
+    (key, name, git_ref, resolved_sha_opt, effective_ref): ResolvedActionParts,
+) -> Option<(String, serde_json::Value)> {
+    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
     let tar_url = ticket.get("url")?.as_str()?.to_string();
-    Some((key, name, git_ref, pinned, tar_url))
+    let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
+    let mut entry = json!({
+        "name": name,
+        "version": git_ref,
+        "tar_url": tar_url,
+        "authentication": null,
+        "archive_sha256": archive_sha256_pin,
+    });
+    if let Some(resolved_sha) = resolved_sha_opt {
+        entry["resolved_sha"] = json!(resolved_sha);
+    }
+    Some((key, entry))
+}
+
+fn action_download_info_from_parts(
+    state: &AppState,
+    (key, name, git_ref, resolved_sha, effective_ref): ResolvedActionParts,
+) -> Option<(String, ActionDownloadInfo)> {
+    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
+    let tar_url = ticket.get("url")?.as_str()?.to_string();
+    Some((
+        key,
+        ActionDownloadInfo {
+            name_with_owner: Some(name.clone()),
+            resolved_name_with_owner: Some(name),
+            resolved_sha,
+            r#ref: Some(git_ref),
+            tarball_url: Some(tar_url),
+            zipball_url: None,
+            authentication: None,
+            package_details: None,
+        },
+    ))
 }
 
 /// Look up the engine-authoritative archive checksum pin for a resolved
@@ -1383,32 +1453,8 @@ pub async fn runnerresolve_action(
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
-    let (key, name, git_ref, resolved_sha_opt, tar_url) =
-        resolve_action_download(state, action, version_override).await?;
-    // Never echo the mutable ref back as `resolved_sha`. A caller that trusts the
-    // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
-    // explicit on the wire, and the runner refuses the download instead of fetching
-    // the mutable ref.
-    //
-    // `archive_sha256` carries the engine-authoritative pin for this exact
-    // (owner, repo, sha): the SHA-256 the engine computed while fetching
-    // the tarball itself. A present null means the server supports
-    // checksums but has not fetched this version yet — the engine pins it
-    // during the download this resolve triggers, so later resolves hand
-    // the runner a pin to verify against. The key is always present so
-    // runners can distinguish "supported" from a pre-checksum server.
-    let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
-    let mut entry = json!({
-        "name": name,
-        "version": git_ref,
-        "tar_url": tar_url,
-        "authentication": null,
-        "archive_sha256": archive_sha256_pin,
-    });
-    if let Some(resolved_sha) = resolved_sha_opt {
-        entry["resolved_sha"] = json!(resolved_sha);
-    }
-    Some((key, entry))
+    let parts = resolve_action_download_parts(state, action, version_override).await?;
+    runnerresolve_action_from_parts(state, parts)
 }
 
 /// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.
@@ -1417,25 +1463,8 @@ pub async fn action_download_info_entry(
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, ActionDownloadInfo)> {
-    let (key, name, git_ref, resolved_sha, tar_url) =
-        resolve_action_download(state, action, version_override).await?;
-    // Preloop download capability URLs are HMAC-signed and bearerless.
-    // Operator PAT is kept server-side to avoid leaking broad credentials to untrusted workflows.
-    let authentication = None;
-
-    Some((
-        key,
-        ActionDownloadInfo {
-            name_with_owner: Some(name.clone()),
-            resolved_name_with_owner: Some(name),
-            resolved_sha,
-            r#ref: Some(git_ref),
-            tarball_url: Some(tar_url),
-            zipball_url: None,
-            authentication,
-            package_details: None,
-        },
-    ))
+    let parts = resolve_action_download_parts(state, action, version_override).await?;
+    action_download_info_from_parts(state, parts)
 }
 
 #[cfg(test)]
