@@ -758,6 +758,22 @@ pub type ActionResolvedUses =
 /// [`ActionResolvedUses`].
 pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
 
+/// Nested `uses:` of composite manifests read through the GitHub contents API
+/// for runs without a workspace snapshot: (`owner/repo` lowercased, commit,
+/// composite directory) → the manifest's nested references, or `None` when the
+/// commit has no readable manifest there. Only definitive reads are memoised;
+/// a transient failure is retried on the next adjudication.
+pub type LocalCompositeNestedUses = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String, String),
+        Option<(std::collections::BTreeSet<String>, Vec<String>)>,
+    >,
+>;
+
+/// Maximum entries in [`LocalCompositeNestedUses`]. A full memo is cleared
+/// rather than evicted entry by entry; clearing only costs re-reads.
+pub const MAX_LOCAL_COMPOSITE_MEMO: usize = 4096;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -1041,6 +1057,9 @@ pub struct AppState {
     /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
     /// see [`ActionResolvedUses`].
     pub action_resolved_uses: Arc<ActionResolvedUses>,
+    /// Memo for composite manifests read through the GitHub contents API for
+    /// runs without a workspace snapshot; see [`LocalCompositeNestedUses`].
+    pub local_composite_nested_uses: Arc<LocalCompositeNestedUses>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1734,6 +1753,9 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            local_composite_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
