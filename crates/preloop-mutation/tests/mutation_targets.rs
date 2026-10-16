@@ -304,8 +304,11 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         .args(["--exclude-re", target.exclude_re])
         .arg("--output")
         .arg(&out)
-        .args(target.args)
-        .arg("--")
+        .args(target.args);
+    if let Some(shard) = shard() {
+        cmd.args(["--shard", &shard]);
+    }
+    cmd.arg("--")
         .args(target.tests)
         .current_dir(root)
         .env("TMPDIR", &scratch)
@@ -360,6 +363,26 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         started.elapsed()
     );
     status.success()
+}
+
+fn shard() -> Option<String> {
+    let raw = std::env::var("PRELOOP_MUTANTS_SHARD").ok()?;
+    let (index, count) = raw
+        .split_once('/')
+        .unwrap_or_else(|| panic!("PRELOOP_MUTANTS_SHARD must be <index>/<count>, got {raw}"));
+    let index: u32 = index
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("PRELOOP_MUTANTS_SHARD index must be a number, got {raw}"));
+    let count: u32 = count
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("PRELOOP_MUTANTS_SHARD count must be a number, got {raw}"));
+    assert!(
+        index >= 1 && index <= count,
+        "PRELOOP_MUTANTS_SHARD must be 1..={count}, got {raw}"
+    );
+    Some(format!("{index}/{count}"))
 }
 
 fn initdb_available() -> bool {

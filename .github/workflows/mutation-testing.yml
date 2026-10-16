@@ -17,11 +17,16 @@ env:
 
 jobs:
   mutants-T1-job-binding-lifecycle:
-    name: mutants-T1-job-binding-lifecycle
+    name: mutants-T1-job-binding-lifecycle-${{ matrix.shard }}-of-6
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 360
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     env:
       CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -97,7 +102,7 @@ jobs:
         run: |
           out=mutants.out/T1/mutants.out
           {
-            echo "## T1 job/binding lifecycle"
+            echo "## T1 job/binding lifecycle (shard $PRELOOP_MUTANTS_SHARD)"
             echo ""
             echo "| outcome | mutants |"
             echo "| --- | --- |"
@@ -117,18 +122,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-T1-job-binding-lifecycle
+          name: mutants-T1-job-binding-lifecycle-${{ matrix.shard }}-of-6
           path: mutants.out/T1
       - name: Remove PostgreSQL container
         if: always()
         run: docker rm -f postgres || true
 
   mutants-T2-webhook-signature:
-    name: mutants-T2-webhook-signature
+    name: mutants-T2-webhook-signature-${{ matrix.shard }}-of-3
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 360
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/3
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -204,7 +214,7 @@ jobs:
         run: |
           out=mutants.out/T2/mutants.out
           {
-            echo "## T2 webhook signature verification and event dispatch"
+            echo "## T2 webhook signature verification and event dispatch (shard $PRELOOP_MUTANTS_SHARD)"
             echo ""
             echo "| outcome | mutants |"
             echo "| --- | --- |"
@@ -224,18 +234,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-T2-webhook-signature
+          name: mutants-T2-webhook-signature-${{ matrix.shard }}-of-3
           path: mutants.out/T2
       - name: Remove PostgreSQL container
         if: always()
         run: docker rm -f postgres || true
 
   mutants-T3-pool-warm-sizing:
-    name: mutants-T3-pool-warm-sizing
+    name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-3
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 720
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/3
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -311,7 +326,7 @@ jobs:
         run: |
           out=mutants.out/T3/mutants.out
           {
-            echo "## T3 pool/waitlist ordering and warm-pool sizing"
+            echo "## T3 pool/waitlist ordering and warm-pool sizing (shard $PRELOOP_MUTANTS_SHARD)"
             echo ""
             echo "| outcome | mutants |"
             echo "| --- | --- |"
@@ -331,18 +346,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-T3-pool-warm-sizing
+          name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-3
           path: mutants.out/T3
       - name: Remove PostgreSQL container
         if: always()
         run: docker rm -f postgres || true
 
   mutants-T4-queue-status:
-    name: mutants-T4-queue-status
+    name: mutants-T4-queue-status-${{ matrix.shard }}-of-6
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 480
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     env:
       CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -418,7 +438,7 @@ jobs:
         run: |
           out=mutants.out/T4/mutants.out
           {
-            echo "## T4 queue depth and run status aggregation"
+            echo "## T4 queue depth and run status aggregation (shard $PRELOOP_MUTANTS_SHARD)"
             echo ""
             echo "| outcome | mutants |"
             echo "| --- | --- |"
@@ -438,7 +458,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-T4-queue-status
+          name: mutants-T4-queue-status-${{ matrix.shard }}-of-6
           path: mutants.out/T4
       - name: Remove PostgreSQL container
         if: always()
@@ -447,7 +467,7 @@ jobs:
   mutants-T5-cli-parsing:
     name: mutants-T5-cli-parsing
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 240
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: "4"
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
