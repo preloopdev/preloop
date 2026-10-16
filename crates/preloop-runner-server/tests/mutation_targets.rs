@@ -395,8 +395,8 @@ fn shard() -> Option<String> {
         .parse()
         .unwrap_or_else(|_| panic!("PRELOOP_MUTANTS_SHARD count must be a number, got {raw}"));
     assert!(
-        index >= 1 && index <= count,
-        "PRELOOP_MUTANTS_SHARD must be 1..={count}, got {raw}"
+        index < count,
+        "PRELOOP_MUTANTS_SHARD must be 0..{count}, got {raw}"
     );
     Some(format!("{index}/{count}"))
 }

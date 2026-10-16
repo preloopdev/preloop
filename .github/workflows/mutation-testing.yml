@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [0, 1, 2, 3, 4, 5]
     env:
       CARGO_BUILD_JOBS: "4"
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
@@ -51,8 +51,10 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
         run: |
-          docker rm -f postgres >/dev/null 2>&1 || true
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -64,17 +66,17 @@ jobs:
             fi
             sleep 5
           done
-          docker run -d --name postgres --network host \
+          docker run -d --name "$PG_NAME" --network host \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             "$image" -c max_connections=400
           for _ in $(seq 1 30); do
-            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
           done
           echo "PostgreSQL did not become ready" >&2
-          docker logs postgres --tail 50 >&2 || true
+          docker logs "$PG_NAME" --tail 50 >&2 || true
           exit 1
       - name: Install cargo-mutants
         run: |
@@ -126,7 +128,9 @@ jobs:
           path: mutants.out/T1
       - name: Remove PostgreSQL container
         if: always()
-        run: docker rm -f postgres || true
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
 
   mutants-T2-webhook-signature:
     name: mutants-T2-webhook-signature-${{ matrix.shard }}-of-3
@@ -135,7 +139,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [0, 1, 2]
     env:
       CARGO_BUILD_JOBS: "4"
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/3
@@ -163,8 +167,10 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
         run: |
-          docker rm -f postgres >/dev/null 2>&1 || true
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -176,17 +182,17 @@ jobs:
             fi
             sleep 5
           done
-          docker run -d --name postgres --network host \
+          docker run -d --name "$PG_NAME" --network host \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             "$image" -c max_connections=400
           for _ in $(seq 1 30); do
-            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
           done
           echo "PostgreSQL did not become ready" >&2
-          docker logs postgres --tail 50 >&2 || true
+          docker logs "$PG_NAME" --tail 50 >&2 || true
           exit 1
       - name: Install cargo-mutants
         run: |
@@ -238,7 +244,9 @@ jobs:
           path: mutants.out/T2
       - name: Remove PostgreSQL container
         if: always()
-        run: docker rm -f postgres || true
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
 
   mutants-T3-pool-warm-sizing:
     name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-3
@@ -247,7 +255,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [0, 1, 2]
     env:
       CARGO_BUILD_JOBS: "4"
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/3
@@ -275,8 +283,10 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
         run: |
-          docker rm -f postgres >/dev/null 2>&1 || true
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -288,17 +298,17 @@ jobs:
             fi
             sleep 5
           done
-          docker run -d --name postgres --network host \
+          docker run -d --name "$PG_NAME" --network host \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             "$image" -c max_connections=400
           for _ in $(seq 1 30); do
-            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
           done
           echo "PostgreSQL did not become ready" >&2
-          docker logs postgres --tail 50 >&2 || true
+          docker logs "$PG_NAME" --tail 50 >&2 || true
           exit 1
       - name: Install cargo-mutants
         run: |
@@ -354,7 +364,9 @@ jobs:
             mutants.out/T3c
       - name: Remove PostgreSQL container
         if: always()
-        run: docker rm -f postgres || true
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
 
   mutants-T4-queue-status:
     name: mutants-T4-queue-status-${{ matrix.shard }}-of-6
@@ -363,7 +375,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [0, 1, 2, 3, 4, 5]
     env:
       CARGO_BUILD_JOBS: "4"
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
@@ -391,8 +403,10 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
         run: |
-          docker rm -f postgres >/dev/null 2>&1 || true
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -404,17 +418,17 @@ jobs:
             fi
             sleep 5
           done
-          docker run -d --name postgres --network host \
+          docker run -d --name "$PG_NAME" --network host \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             "$image" -c max_connections=400
           for _ in $(seq 1 30); do
-            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
           done
           echo "PostgreSQL did not become ready" >&2
-          docker logs postgres --tail 50 >&2 || true
+          docker logs "$PG_NAME" --tail 50 >&2 || true
           exit 1
       - name: Install cargo-mutants
         run: |
@@ -466,7 +480,9 @@ jobs:
           path: mutants.out/T4
       - name: Remove PostgreSQL container
         if: always()
-        run: docker rm -f postgres || true
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
 
   mutants-T5-cli-parsing:
     name: mutants-T5-cli-parsing
@@ -498,8 +514,10 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
         run: |
-          docker rm -f postgres >/dev/null 2>&1 || true
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -511,17 +529,17 @@ jobs:
             fi
             sleep 5
           done
-          docker run -d --name postgres --network host \
+          docker run -d --name "$PG_NAME" --network host \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             "$image" -c max_connections=400
           for _ in $(seq 1 30); do
-            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
           done
           echo "PostgreSQL did not become ready" >&2
-          docker logs postgres --tail 50 >&2 || true
+          docker logs "$PG_NAME" --tail 50 >&2 || true
           exit 1
       - name: Install cargo-mutants
         run: |
@@ -573,4 +591,6 @@ jobs:
           path: mutants.out/T5
       - name: Remove PostgreSQL container
         if: always()
-        run: docker rm -f postgres || true
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
