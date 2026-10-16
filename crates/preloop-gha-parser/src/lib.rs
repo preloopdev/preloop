@@ -8,6 +8,8 @@ pub mod dag;
 pub mod eval;
 /// Build `AgentJobRequestMessage` from parsed workflow data.
 pub mod job_builder;
+/// GitHub Actions dependency lockfile (`actions.lock`): parsing, pin keys and job-message wire strings.
+pub mod lockfile;
 
 mod expand;
 mod matrix_expand;
@@ -19,13 +21,13 @@ mod yaml;
 
 pub use expand::{
     DEFAULT_TOKEN_PERMISSIONS, MAX_REUSABLE_WORKFLOW_DEPTH, MAX_UNIQUE_REUSABLE_WORKFLOWS,
-    MAX_WORKFLOW_DEPTH, PERMISSION_SCOPES, READ_ONLY_SCOPES, effective_token_permissions,
-    expand_deferred_matrix_job, expand_deferred_reusable_call, expand_jobs,
-    expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
+    MAX_WORKFLOW_DEPTH, PERMISSION_SCOPES, READ_ONLY_SCOPES, callee_reference,
+    effective_token_permissions, expand_deferred_matrix_job, expand_deferred_reusable_call,
+    expand_jobs, expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
     expand_jobs_with_reusables_and_shas_and_inputs,
     expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
     is_local_workflow_ref, is_plain_path, is_plain_segment, is_reusable_workflow_path,
-    same_repository_path, scope_same_repository_ref,
+    normalize_reusable_path, same_repository_path, scope_same_repository_ref,
 };
 pub use models::*;
 pub use secrets::{

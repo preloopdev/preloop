@@ -566,6 +566,13 @@ impl AppState {
         failing
     }
 
+    /// Test hook: replace the `[actions_policy]` this state enforces. The
+    /// policy is otherwise loaded once from the config file at startup, so a
+    /// test sets it here instead of writing a config file.
+    pub fn test_set_actions_policy(&mut self, policy: crate::actions_policy::ActionsPolicy) {
+        self.actions_policy = policy;
+    }
+
     /// Test hook: drive exactly one run-history archive pass instead of
     /// racing the interval, returning how many settled runs moved.
     pub async fn test_archive_finished_runs_once(&self) -> usize {
@@ -1016,6 +1023,10 @@ pub struct AppState {
     /// and bounds GitHub API pressure; entries expire after
     /// [`ACTION_SHA_CACHE_TTL`].
     pub action_sha_cache: Arc<ActionShaCache>,
+    /// Positive-only memo of GitHub verdicts for action pins (see
+    /// [`crate::action_verify`]): reachability entries last one hour, and whole
+    /// locked-pin verdicts last five minutes. Failures are never recorded.
+    pub action_verify_cache: Arc<crate::action_verify::VerifyCache>,
     /// Trust-on-first-use pins of action archive checksums
     /// (`owner`, `repo`, `sha`) → hex SHA-256 of the tarball bytes. The
     /// engine computes the digest while fetching the tarball from the
@@ -1033,6 +1044,9 @@ pub struct AppState {
     /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
     /// see [`ActionResolvedUses`].
     pub action_resolved_uses: Arc<ActionResolvedUses>,
+    /// Actions each job resolved, kept for the job's check-run summary; see
+    /// [`crate::actions::JobActionLedger`].
+    pub job_action_ledger: Arc<crate::actions::JobActionLedger>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1094,6 +1108,11 @@ pub struct AppState {
     /// change takes effect on restart, like the other policy tables in the
     /// config file.
     pub execution_protection: crate::config::ExecutionProtectionConfig,
+    /// `[actions_policy]` loaded from the config file at startup. Private:
+    /// read it through [`AppState::actions_policy`], and set it in tests with
+    /// `AppState::test_set_actions_policy`. A config change takes effect on
+    /// restart, like the other policy tables in the config file.
+    actions_policy: crate::actions_policy::ActionsPolicy,
     /// One-time provision tokens issued by the embedded runner pool, one per
     /// machine provisioning event, forwarded by the runner's `configure`
     /// call inside the fresh VM. Registration presenting a matching token is
@@ -1441,6 +1460,7 @@ impl AppState {
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
         let checkout_cache = crate::config::checkout_cache_config(&config)?;
+        let actions_policy = crate::config::actions_policy_config(&config)?;
         // Actions-cache quota: operator-overridable, 10 GiB default.
         // Enforced at startup too, so entries committed under a larger quota
         // are evicted LRU-first on the next boot.
@@ -1715,6 +1735,7 @@ impl AppState {
             github_urls,
             pr_config,
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            action_verify_cache: Arc::new(crate::action_verify::VerifyCache::default()),
             action_archive_sha256_pins: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1722,10 +1743,12 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            job_action_ledger: Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new())),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
+            actions_policy,
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         })
     }
@@ -1899,6 +1922,12 @@ impl AppState {
                 tracing::warn!(?error, "completed-run runtime-state trim failed");
             }
         }
+    }
+
+    /// The `[actions_policy]` loaded from the config file at startup. Read-only:
+    /// a policy change takes effect on restart.
+    pub fn actions_policy(&self) -> &crate::actions_policy::ActionsPolicy {
+        &self.actions_policy
     }
 
     /// Plaintext static PAT for job tokens, when one is configured.

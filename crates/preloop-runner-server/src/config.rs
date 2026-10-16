@@ -14,6 +14,7 @@
 //! with mode 0600 and secret values are never echoed back by
 //! `preloop secret list` or `preloop doctor`.
 
+use crate::actions_policy::ActionsPolicy;
 use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
 use anyhow::Context;
 use base64::Engine as _;
@@ -850,6 +851,15 @@ pub struct ConfigFile {
     /// other policy tables in the config file.
     #[serde(default)]
     pub execution_protection: ExecutionProtectionConfig,
+    /// Actions policy (`[actions_policy]`): operator controls over the
+    /// `uses:` references a run may execute. Every control is off by default,
+    /// except the impostor-commit check (`verify_commit_reachability`), which
+    /// is on. `allowed_actions` entries follow the grammar documented on
+    /// [`crate::actions_policy::ActionsPolicy::allowed_actions`]: an entry's path names reusable
+    /// workflows only. A config change takes effect on restart, like the other
+    /// policy tables in the config file.
+    #[serde(default)]
+    pub actions_policy: crate::actions_policy::ActionsPolicy,
     /// Run/check/status retention, in days, mirroring GitHub's Actions
     /// retention setting. A background sweep deletes terminal runs — and
     /// their check-run records, commit statuses, artifacts, and logs —
@@ -1079,6 +1089,123 @@ pub fn cache_config(config: &ConfigFile) -> anyhow::Result<CacheConfig> {
         })?;
     }
     Ok(effective)
+}
+
+/// Env override for `[actions_policy] require_sha_pinning`.
+pub const ACTIONS_POLICY_REQUIRE_SHA_PINNING_ENV: &str =
+    "PRELOOP_ACTIONS_POLICY_REQUIRE_SHA_PINNING";
+/// Env override for `[actions_policy] require_lockfile`.
+pub const ACTIONS_POLICY_REQUIRE_LOCKFILE_ENV: &str = "PRELOOP_ACTIONS_POLICY_REQUIRE_LOCKFILE";
+/// Env override for `[actions_policy] verify_commit_reachability`.
+pub const ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY_ENV: &str =
+    "PRELOOP_ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY";
+
+/// Resolve the effective actions policy. Each boolean's env override
+/// (`1|true|yes` or `0|false|no`, case-insensitive) wins over its
+/// `[actions_policy]` key, and a blank variable counts as unset. An
+/// unrecognized value is an error: a typo must fail closed, never silently
+/// leave a hardening control off. `allowed_actions` has no env override; the
+/// config load validates it.
+pub fn actions_policy_config(config: &ConfigFile) -> anyhow::Result<ActionsPolicy> {
+    actions_policy_with_lookup(config, &|name| std::env::var(name).ok())
+}
+
+/// [`actions_policy_config`] with the environment read through `lookup`, so
+/// tests resolve without mutating process-wide variables that parallel tests
+/// read.
+fn actions_policy_with_lookup(
+    config: &ConfigFile,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<ActionsPolicy> {
+    let mut effective = config.actions_policy.clone();
+    effective.require_sha_pinning = bool_override(
+        lookup,
+        ACTIONS_POLICY_REQUIRE_SHA_PINNING_ENV,
+        effective.require_sha_pinning,
+    )?;
+    effective.require_lockfile = bool_override(
+        lookup,
+        ACTIONS_POLICY_REQUIRE_LOCKFILE_ENV,
+        effective.require_lockfile,
+    )?;
+    effective.verify_commit_reachability = bool_override(
+        lookup,
+        ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY_ENV,
+        effective.verify_commit_reachability,
+    )?;
+    Ok(effective)
+}
+
+/// The boolean that `lookup` finds under `name`, else `configured`.
+fn bool_override(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    configured: bool,
+) -> anyhow::Result<bool> {
+    let Some(raw) = lookup(name).filter(|value| !value.trim().is_empty()) else {
+        return Ok(configured);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => anyhow::bail!("invalid boolean in {name} (`{raw}`); expected 1|true|yes|0|false|no"),
+    }
+}
+
+#[cfg(test)]
+mod actions_policy_config_tests {
+    use super::*;
+
+    /// Resolves with `pairs` standing in for the environment, so no test
+    /// mutates process-wide variables.
+    fn resolve(config: &ConfigFile, pairs: &[(&str, &str)]) -> anyhow::Result<ActionsPolicy> {
+        let vars: BTreeMap<&str, &str> = pairs.iter().copied().collect();
+        actions_policy_with_lookup(config, &|name| {
+            vars.get(name).map(|value| value.to_string())
+        })
+    }
+
+    #[test]
+    fn env_overrides_win_over_the_table_and_typos_fail_closed() {
+        let config: ConfigFile = toml::from_str(
+            "[actions_policy]\nrequire_lockfile = true\nverify_commit_reachability = true\n",
+        )
+        .unwrap();
+        let sha = ACTIONS_POLICY_REQUIRE_SHA_PINNING_ENV;
+        let lockfile = ACTIONS_POLICY_REQUIRE_LOCKFILE_ENV;
+        let reachability = ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY_ENV;
+
+        // Absent variables keep the table value, and the defaults elsewhere.
+        let effective = resolve(&config, &[]).unwrap();
+        assert!(!effective.require_sha_pinning);
+        assert!(effective.require_lockfile);
+        assert!(effective.verify_commit_reachability);
+
+        // Recognized values win over the table, case-insensitively.
+        assert!(
+            resolve(&config, &[(sha, "YES")])
+                .unwrap()
+                .require_sha_pinning
+        );
+        assert!(
+            !resolve(&config, &[(lockfile, "0")])
+                .unwrap()
+                .require_lockfile
+        );
+        assert!(
+            !resolve(&config, &[(reachability, "False")])
+                .unwrap()
+                .verify_commit_reachability
+        );
+
+        // A blank value is unset; a typo fails the resolve instead of keeping the control off.
+        assert!(
+            !resolve(&config, &[(sha, "   ")])
+                .unwrap()
+                .require_sha_pinning
+        );
+        assert!(resolve(&config, &[(sha, "ture")]).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1394,7 +1521,7 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, golden: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
+            "ConfigFile {{ github: {:?}, golden: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules), actions_policy: {:?} }}",
             self.github,
             self.golden,
             self.secrets.len(),
@@ -1412,7 +1539,8 @@ impl std::fmt::Debug for ConfigFile {
             self.fork_policy,
             self.execution_protection.mode,
             self.execution_protection.event_rules.len(),
-            self.execution_protection.actor_rules.len()
+            self.execution_protection.actor_rules.len(),
+            self.actions_policy,
         )
     }
 }
@@ -2047,6 +2175,7 @@ mod tests {
             environment_rules: BTreeMap::new(),
             fork_policy: ForkPolicyConfig::default(),
             execution_protection: ExecutionProtectionConfig::default(),
+            actions_policy: crate::actions_policy::ActionsPolicy::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
             cache: CacheConfig::default(),

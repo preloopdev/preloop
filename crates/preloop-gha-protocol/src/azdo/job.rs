@@ -96,6 +96,21 @@ pub struct AgentJobRequestMessage {
     #[serde(rename = "steps", default)]
     pub steps: Vec<TaskStep>,
 
+    /// Pinned dependencies of the job's workflow from its `actions.lock`, as
+    /// `OWNER/REPO@REF` pin strings with the locked commit (see
+    /// `preloop_gha_parser::lockfile::ActionsLock::wire_dependencies`). Empty
+    /// unless the job's workflow is onboarded; then omitted from the wire.
+    ///
+    /// Upstream: `AgentJobRequestMessage.ActionsDependencies`, serialized as
+    /// `dependencies` with `EmitDefaultValue = false` (actions/runner v2.336.0,
+    /// `src/Sdk/DTPipelines/Pipelines/AgentJobRequestMessage.cs`).
+    #[serde(
+        rename = "dependencies",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub dependencies: Vec<String>,
+
     /// Whether this is a retry attempt.
     #[serde(rename = "retryCount", skip_serializing_if = "Option::is_none")]
     pub retry_count: Option<i32>,

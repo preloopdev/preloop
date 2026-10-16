@@ -3067,13 +3067,23 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
                 let seen_ref = seen_ref.clone();
                 move |axum::extract::Query(
                     params,
-                ): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                ): axum::extract::Query<std::collections::HashMap<String, String>>,
+                      uri: axum::http::Uri| async move {
+                    // The callee repository has no `actions.lock`.
+                    if uri.path().ends_with("/actions.lock") {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({"message": "Not Found"})),
+                        )
+                            .into_response();
+                    }
                     *seen_ref.lock().unwrap() = params.get("ref").cloned();
                     // base64("on: push\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"echo hi\"\n")
                     axum::Json(serde_json::json!({
                         "content": "b246IHB1c2gKam9iczoKICBjYWxsZWU6CiAgICBydW5zLW9uOiB1YnVudHUtbGF0ZXN0CiAgICBzdGVwczoKICAgICAgLSBydW46ICJlY2hvIGhpIgo=",
                         "encoding": "base64",
                     }))
+                    .into_response()
                 }
             }),
         );
@@ -3301,7 +3311,13 @@ async fn action_download_info_denies_undeclared_action() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // These tests resolve full-SHA refs. The impostor-commit check would ask
+    // GitHub about them, so the fixture keeps the reachability check off.
+    state.test_set_actions_policy(crate::actions_policy::ActionsPolicy {
+        verify_commit_reachability: false,
+        ..Default::default()
+    });
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -3406,7 +3422,12 @@ async fn action_download_info_job_token_cannot_mint_undeclared() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // Full-SHA refs; the impostor-commit check stays off (see the fixture above).
+    state.test_set_actions_policy(crate::actions_policy::ActionsPolicy {
+        verify_commit_reachability: false,
+        ..Default::default()
+    });
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
@@ -3476,7 +3497,12 @@ async fn runnerresolve_denies_undeclared_action() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // Full-SHA refs; the impostor-commit check stays off (see the fixture above).
+    state.test_set_actions_policy(crate::actions_policy::ActionsPolicy {
+        verify_commit_reachability: false,
+        ..Default::default()
+    });
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, agent_job_id) = submit_run_first_job(
@@ -3575,7 +3601,12 @@ async fn action_download_allows_transitive_composite_nested() {
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    // Full-SHA refs; the impostor-commit check stays off (see the fixture above).
+    state.test_set_actions_policy(crate::actions_policy::ActionsPolicy {
+        verify_commit_reachability: false,
+        ..Default::default()
+    });
     let app = app(state.clone(), CancellationToken::new());
 
     let (_run_id, plan_id, _agent_job_id) = submit_run_first_job(
@@ -4162,9 +4193,12 @@ async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
 /// This covers the cross-class bearer bypass and the settled-job mint path.
 #[tokio::test]
 async fn action_resolution_requires_bound_live_results_identity() {
-    let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let app = app(state.clone(), CancellationToken::new());
+    // The pinned SHA is checked against its repository, so the mock vouches
+    // for it: this test is about who may resolve, not which commit.
+    let sha = "abc123def456abc123def456abc123def456abc1";
+    let fixture = LockFixture::new(checkout_routes(&[sha], &[sha], 200)).await;
+    let state = fixture.state.clone();
+    let app = fixture.app.clone();
     let workflow = r#"
 on: push
 jobs:
@@ -4175,7 +4209,6 @@ jobs:
 "#;
     let (run_a, plan_a, job_a) = submit_run_first_job(&app, &state, workflow).await;
     let token_a = state.mint_runtime_token(&plan_a, &job_a);
-    let sha = "abc123def456abc123def456abc123def456abc1";
     let uri = format!("/_apis/v1/ActionDownloadInfo/scope/actions/{plan_a}");
     let body = json!({
         "actions": [{"nameWithOwner": "actions/checkout", "ref": sha}]
@@ -4248,5 +4281,689 @@ jobs:
         request_status_with_bearer(&app, Method::POST, &uri, body, &token_a).await,
         StatusCode::FORBIDDEN,
         "a settled job token must not mint an action ticket"
+    );
+}
+
+// ── actions.lock and the impostor-commit check ───────────────────────────────
+//
+// Each test serves a hermetic mock GitHub API, so verification and live ref
+// lookups are observable and never reach a real forge.
+
+/// The commit `actions.lock` pins `actions/checkout@v4` to, and the commit a
+/// moved `v4` tag names now. Full SHAs the mock serves as real commits.
+const LOCKED_COMMIT: &str = "1111111111111111111111111111111111111111";
+const MOVED_COMMIT: &str = "2222222222222222222222222222222222222222";
+/// The head of `actions/checkout`'s default branch, a descendant of `LOCKED_COMMIT`.
+const CHECKOUT_HEAD: &str = "3333333333333333333333333333333333333333";
+/// A merge base that is no commit the tests pin, so a comparison against it
+/// proves the commit is not an ancestor of the default branch.
+const FORK_BASE: &str = "4444444444444444444444444444444444444444";
+/// The numeric identity GitHub reports for `actions/checkout`, which a lock records.
+const CHECKOUT_OWNER_ID: u64 = 33_333;
+const CHECKOUT_REPO_ID: u64 = 44_444;
+/// The workflow the lock tests run: one remote action pinned at `v4`.
+const CHECKOUT_WORKFLOW: &str = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n";
+/// The path the lock tests submit their workflow under.
+const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
+
+/// A mock GitHub API serving `routes` by exact path; any other path answers
+/// 404. Every request is recorded, so a test can see which lookups happened.
+struct MockGithub {
+    base: String,
+    seen: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl MockGithub {
+    async fn serve(routes: Vec<(String, u16, serde_json::Value)>) -> Self {
+        let routes: std::sync::Arc<std::collections::BTreeMap<String, (u16, serde_json::Value)>> =
+            std::sync::Arc::new(
+                routes
+                    .into_iter()
+                    .map(|(path, status, body)| (path, (status, body)))
+                    .collect(),
+            );
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let app = axum::Router::new().fallback({
+            let routes = routes.clone();
+            let seen = seen.clone();
+            move |uri: axum::http::Uri| {
+                let routes = routes.clone();
+                let seen = seen.clone();
+                async move {
+                    seen.lock().push(uri.to_string());
+                    let (status, body) = routes
+                        .get(uri.path())
+                        .cloned()
+                        .unwrap_or((404, serde_json::json!({"message": "Not Found"})));
+                    let status = axum::http::StatusCode::from_u16(status).unwrap();
+                    (status, axum::Json(body)).into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { base, seen }
+    }
+
+    /// Whether any request reached `path`, ignoring its query.
+    fn received(&self, path: &str) -> bool {
+        self.seen
+            .lock()
+            .iter()
+            .any(|uri| uri.split('?').next() == Some(path))
+    }
+}
+
+/// `actions/checkout` as GitHub serves it: the identity GitHub reports (with
+/// `repository_status` for the identity read), the commits the mock knows, a
+/// default branch at `CHECKOUT_HEAD`, and each commit in `ancestors` as an
+/// ancestor of that branch.
+fn checkout_routes(
+    commits: &[&str],
+    ancestors: &[&str],
+    repository_status: u16,
+) -> Vec<(String, u16, serde_json::Value)> {
+    let mut routes = vec![
+        (
+            "/repos/actions/checkout".to_owned(),
+            repository_status,
+            serde_json::json!({"id": CHECKOUT_REPO_ID, "owner": {"id": CHECKOUT_OWNER_ID}}),
+        ),
+        (
+            "/repos/actions/checkout/branches".to_owned(),
+            200,
+            serde_json::json!([{"name": "main", "commit": {"sha": CHECKOUT_HEAD}}]),
+        ),
+        (
+            "/repos/actions/checkout/tags".to_owned(),
+            200,
+            serde_json::json!([]),
+        ),
+    ];
+    for commit in commits {
+        let merge_base = if ancestors.contains(commit) {
+            *commit
+        } else {
+            FORK_BASE
+        };
+        routes.push((
+            format!("/repos/actions/checkout/commits/{commit}"),
+            200,
+            serde_json::json!({"sha": commit}),
+        ));
+        routes.push((
+            format!("/repos/actions/checkout/compare/{commit}...{CHECKOUT_HEAD}"),
+            200,
+            serde_json::json!({"merge_base_commit": {"sha": merge_base}}),
+        ));
+    }
+    routes
+}
+
+/// An `actions.lock` onboarding `workflow` with the one pin `actions/checkout@v4`,
+/// locked to `commit` and recording the given repository identity.
+fn checkout_lockfile(workflow: &str, commit: &str, owner_id: u64, repo_id: u64) -> String {
+    format!(
+        "version: v0.0.3\nworkflows:\n  {workflow}:\n    - actions/checkout@v4\n\
+         dependencies:\n  actions/checkout@v4:\n    ref: v4\n    commit: sha1-{commit}\n\
+         \x20   owner_id: {owner_id}\n    repo_id: {repo_id}\n"
+    )
+}
+
+/// Everything a lock test holds for its lifetime: the API override and env lock
+/// (process-global), the mock, and a server whose GitHub endpoints point at it.
+/// Fields drop in declaration order, so the override is restored before the lock
+/// is released.
+struct LockFixture {
+    _api_url: crate::state::TestEnvVar,
+    _env: tokio::sync::MutexGuard<'static, ()>,
+    _temp: tempfile::TempDir,
+    mock: MockGithub,
+    state: AppState,
+    app: axum::Router,
+}
+
+impl LockFixture {
+    async fn new(routes: Vec<(String, u16, serde_json::Value)>) -> Self {
+        let env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let mock = MockGithub::serve(routes).await;
+        let api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &mock.base);
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let app = app(state.clone(), CancellationToken::new());
+        Self {
+            _api_url: api_url,
+            _env: env,
+            _temp: temp,
+            mock,
+            state,
+            app,
+        }
+    }
+}
+
+/// Submit `yaml` as a push of `owner/repo` at `CI_WORKFLOW_PATH`, carrying
+/// `actions_lockfile` when given. Returns the raw status and body.
+async fn submit_at_ci(
+    app: &axum::Router,
+    yaml: &str,
+    actions_lockfile: Option<&str>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    request_json_status(
+        app,
+        axum::http::Method::POST,
+        "/api/v1/runs",
+        serde_json::json!({
+            "workflow_yaml": yaml,
+            "event": "push",
+            "repository": "owner/repo",
+            "workflow_path": CI_WORKFLOW_PATH,
+            "actions_lockfile": actions_lockfile,
+        }),
+    )
+    .await
+}
+
+/// The plan id of the first job of a run that `accepted` names.
+async fn first_plan_id(state: &AppState, accepted: &serde_json::Value) -> String {
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let inner = state.test_tx().await;
+    inner
+        .job_requests
+        .values()
+        .find(|request| request.run_id == run_id)
+        .expect("submit must create a job request")
+        .plan_id
+        .clone()
+}
+
+/// `ActionDownloadInfo` for one `name@git_ref` through a job's plan.
+async fn resolve_through(
+    app: &axum::Router,
+    plan_id: &str,
+    name: &str,
+    git_ref: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    request_json_status(
+        app,
+        axum::http::Method::POST,
+        &format!("/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/{plan_id}"),
+        serde_json::json!({"actions": [{"nameWithOwner": name, "ref": git_ref, "path": ""}]}),
+    )
+    .await
+}
+
+fn response_message(body: &serde_json::Value) -> &str {
+    body["error"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default()
+}
+
+/// A locked pin resolves to the locked commit even after its tag moves: the
+/// engine never asks GitHub what `v4` names now.
+#[tokio::test]
+async fn locked_pin_resolves_the_locked_commit_after_its_tag_moves() {
+    let mut routes = checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 200);
+    routes.push((
+        "/repos/actions/checkout/commits/v4".to_owned(),
+        200,
+        serde_json::json!({"sha": MOVED_COMMIT}),
+    ));
+    let fixture = LockFixture::new(routes).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "actions/checkout", "v4").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["actions"]["actions/checkout@v4"]["resolvedSha"],
+        LOCKED_COMMIT
+    );
+    assert!(
+        !fixture.mock.received("/repos/actions/checkout/commits/v4"),
+        "a locked ref must never be looked up live"
+    );
+}
+
+/// A job whose workflow is onboarded may not resolve an action its lock does
+/// not pin. The batch fails closed and the refusal names the action, the
+/// workflow and the remedy.
+#[tokio::test]
+async fn onboarded_job_with_an_unlocked_action_fails_closed() {
+    let fixture = LockFixture::new(checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 200)).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v4\n";
+    let (status, accepted) = submit_at_ci(&fixture.app, yaml, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "actions/setup-node", "v4").await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let message = response_message(&body);
+    assert!(message.contains("actions/setup-node@v4"), "{message}");
+    assert!(message.contains(CI_WORKFLOW_PATH), "{message}");
+    assert!(message.contains("gh actions-lock"), "{message}");
+}
+
+/// A lock recording another owner id than GitHub reports (a transferred
+/// repository) blocks the job.
+#[tokio::test]
+async fn pin_identity_mismatch_blocks_resolution() {
+    let fixture = LockFixture::new(checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 200)).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID + 1,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "actions/checkout", "v4").await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let message = response_message(&body);
+    assert!(message.contains("failed verification"), "{body}");
+}
+
+/// A job whose workflow no lock onboards resolves its refs live, as it did
+/// before lockfiles existed.
+#[tokio::test]
+async fn workflow_outside_the_lock_resolves_live_as_before_lockfiles() {
+    let mut routes = checkout_routes(&[LOCKED_COMMIT, MOVED_COMMIT], &[], 200);
+    routes.push((
+        "/repos/actions/checkout/commits/v4".to_owned(),
+        200,
+        serde_json::json!({"sha": MOVED_COMMIT}),
+    ));
+    let fixture = LockFixture::new(routes).await;
+    // The lock onboards another workflow; this run's workflow is not governed.
+    let lockfile = checkout_lockfile(
+        ".github/workflows/release.yml",
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "actions/checkout", "v4").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["actions"]["actions/checkout@v4"]["resolvedSha"],
+        MOVED_COMMIT
+    );
+    assert!(fixture.mock.received("/repos/actions/checkout/commits/v4"));
+}
+
+/// `require_sha_pinning` refuses a step `uses:` that is neither a full SHA nor
+/// covered by its workflow's lock, before the run is accepted.
+#[tokio::test]
+async fn policy_refuses_an_unpinned_action_at_submission() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.test_set_actions_policy(crate::actions_policy::ActionsPolicy {
+        require_sha_pinning: true,
+        ..Default::default()
+    });
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = submit_at_ci(&app, CHECKOUT_WORKFLOW, None).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("require_sha_pinning") && message.contains("actions/checkout@v4"),
+        "{message}"
+    );
+}
+
+/// A full SHA that exists in the named repository but on no branch or tag (a
+/// fork's commit) is refused by the impostor-commit check.
+#[tokio::test]
+async fn impostor_commit_is_refused_for_a_plain_sha() {
+    let fork_commit = "5555555555555555555555555555555555555555";
+    let fixture = LockFixture::new(checkout_routes(&[fork_commit], &[], 200)).await;
+    let yaml = format!(
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{fork_commit}\n"
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, &yaml, None).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) =
+        resolve_through(&fixture.app, &plan_id, "actions/checkout", fork_commit).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let message = response_message(&body);
+    assert!(message.contains("impostor-commit check"), "{body}");
+}
+
+/// When GitHub cannot answer the reachability check, a plain full-SHA pin still
+/// resolves: availability over a hardening check.
+#[tokio::test]
+async fn unavailable_commit_check_tolerates_a_plain_sha() {
+    let fixture = LockFixture::new(checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 500)).await;
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, None).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) =
+        resolve_through(&fixture.app, &plan_id, "actions/checkout", LOCKED_COMMIT).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["actions"][format!("actions/checkout@{LOCKED_COMMIT}")]["resolvedSha"],
+        LOCKED_COMMIT
+    );
+}
+
+/// The same outage blocks a locked pin: a job never runs on an unverified pin.
+#[tokio::test]
+async fn unavailable_verification_blocks_a_locked_pin() {
+    let fixture = LockFixture::new(checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 500)).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "actions/checkout", "v4").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{body}"
+    );
+    let message = response_message(&body);
+    assert!(message.contains("could not be verified"), "{body}");
+}
+
+/// Intake reads `actions.lock` at the commit the workflows came from. A
+/// repository without one yields none, and that is not an error.
+#[tokio::test]
+async fn intake_reads_the_actions_lock_at_the_run_sha() {
+    use base64::Engine as _;
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let sha = "6666666666666666666666666666666666666666";
+    let mock = MockGithub::serve(vec![(
+        "/repos/owner/repo/contents/.github/workflows/actions.lock".to_owned(),
+        200,
+        serde_json::json!({
+            "content": base64::engine::general_purpose::STANDARD.encode(lockfile.as_bytes()),
+            "encoding": "base64",
+            "size": lockfile.len(),
+        }),
+    )])
+    .await;
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &mock.base);
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "intake-pat");
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shared = state.shared();
+
+    let fetched = crate::github::fetch_actions_lockfile_at(&shared, "owner/repo", sha, &mock.base)
+        .await
+        .unwrap();
+    assert_eq!(fetched.as_deref(), Some(lockfile.as_str()));
+    let expected = format!("/repos/owner/repo/contents/.github/workflows/actions.lock?ref={sha}");
+    assert!(
+        mock.seen.lock().iter().any(|uri| *uri == expected),
+        "{:?}",
+        mock.seen.lock()
+    );
+    let plain = crate::github::fetch_actions_lockfile_at(&shared, "owner/plain", sha, &mock.base)
+        .await
+        .unwrap();
+    assert_eq!(plain, None, "a repository without actions.lock has none");
+}
+
+/// A present `actions.lock` that does not parse rejects the submission with a
+/// clear 4xx; it is never ignored.
+#[tokio::test]
+async fn broken_actions_lock_rejects_the_submission() {
+    let fixture = LockFixture::new(Vec::new()).await;
+    let (status, body) = submit_at_ci(
+        &fixture.app,
+        CHECKOUT_WORKFLOW,
+        Some("version: v9.9.9\nworkflows: {}\n"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("actions.lock does not parse"),
+        "{body}"
+    );
+}
+
+/// Only an onboarded job's message announces the lock's pins as `dependencies`;
+/// a job of a workflow no lock onboards carries none.
+#[tokio::test]
+async fn job_message_announces_dependencies_only_for_onboarded_jobs() {
+    let fixture = LockFixture::new(checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 200)).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, onboarded) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{onboarded}");
+    let (status, plain) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, None).await;
+    assert!(status.is_success(), "{plain}");
+
+    let tx = fixture.state.test_tx().await;
+    let locked_message = queued_message_for(&tx, onboarded["run_id"].as_str().unwrap());
+    let open_message = queued_message_for(&tx, plain["run_id"].as_str().unwrap());
+    assert_eq!(
+        locked_message.dependencies,
+        vec![format!("actions/checkout@v4:sha1-{LOCKED_COMMIT}")]
+    );
+    assert!(open_message.dependencies.is_empty());
+}
+
+// ── actions.lock review round 1: `$/`, locked-form policy, workflow paths ───────
+
+/// The commit the lock tests submit as the run's own commit, which `$/` names.
+const RUN_SHA: &str = "9999999999999999999999999999999999999999";
+/// Another commit of the same repository, which no lock pins.
+const OTHER_SHA: &str = "8888888888888888888888888888888888888888";
+
+impl LockFixture {
+    /// [`LockFixture::new`] with the actions policy set before the app is built.
+    async fn with_policy(
+        routes: Vec<(String, u16, serde_json::Value)>,
+        policy: crate::actions_policy::ActionsPolicy,
+    ) -> Self {
+        let env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let mock = MockGithub::serve(routes).await;
+        let api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &mock.base);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.test_set_actions_policy(policy);
+        let app = app(state.clone(), CancellationToken::new());
+        Self {
+            _api_url: api_url,
+            _env: env,
+            _temp: temp,
+            mock,
+            state,
+            app,
+        }
+    }
+}
+
+/// A `$/` reference names the job's own repository at the job's own commit. Under a
+/// lock it resolves to that commit, while another repository, or another commit of
+/// this one, stays governed by the lock and is refused.
+#[tokio::test]
+async fn self_repository_references_resolve_under_a_lock_and_others_are_refused() {
+    let fixture = LockFixture::new(Vec::new()).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: $/.github/actions/x\n      - uses: actions/checkout@v4\n";
+    let (status, accepted) = request_json_status(
+        &fixture.app,
+        axum::http::Method::POST,
+        "/api/v1/runs",
+        serde_json::json!({
+            "workflow_yaml": yaml,
+            "event": "push",
+            "repository": "owner/repo",
+            "workflow_path": CI_WORKFLOW_PATH,
+            "actions_lockfile": lockfile,
+            "resolved_sha": RUN_SHA,
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(
+        &fixture.app,
+        &plan_id,
+        "owner/repo/.github/actions/x",
+        RUN_SHA,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["actions"][format!("owner/repo/.github/actions/x@{RUN_SHA}")]["resolvedSha"],
+        RUN_SHA
+    );
+    for (name, git_ref) in [
+        ("other/repo/.github/actions/x", RUN_SHA),
+        ("owner/repo/.github/actions/x", OTHER_SHA),
+    ] {
+        let (status, body) = resolve_through(&fixture.app, &plan_id, name, git_ref).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "{name}@{git_ref}: {body}"
+        );
+    }
+}
+
+/// An allow entry on the locked commit admits a tag-pinned action whose lock names that
+/// commit: the policy judges the commit that runs, not the tag the workflow writes.
+#[tokio::test]
+async fn allow_entry_on_the_locked_commit_admits_a_tag_pinned_action() {
+    let policy = crate::actions_policy::ActionsPolicy {
+        allowed_actions: vec![format!("actions/checkout@{LOCKED_COMMIT}")],
+        ..Default::default()
+    };
+    let fixture = LockFixture::with_policy(
+        checkout_routes(&[LOCKED_COMMIT], &[LOCKED_COMMIT], 200),
+        policy,
+    )
+    .await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "actions/checkout", "v4").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body["actions"]["actions/checkout@v4"]["resolvedSha"],
+        LOCKED_COMMIT
+    );
+}
+
+/// A block entry on a locked commit refuses the nested dependency the lock pins to it,
+/// even though the workflow itself never names that dependency.
+#[tokio::test]
+async fn block_entry_on_the_locked_commit_refuses_a_nested_dependency() {
+    let policy = crate::actions_policy::ActionsPolicy {
+        allowed_actions: vec![format!("!owner/nested@{OTHER_SHA}")],
+        ..Default::default()
+    };
+    let fixture = LockFixture::with_policy(Vec::new(), policy).await;
+    let lockfile = format!(
+        "version: v0.0.3\nworkflows:\n  {CI_WORKFLOW_PATH}:\n    - actions/checkout@v4\n    - owner/nested@v1\ndependencies:\n  actions/checkout@v4:\n    ref: v4\n    commit: sha1-{LOCKED_COMMIT}\n    owner_id: {CHECKOUT_OWNER_ID}\n    repo_id: {CHECKOUT_REPO_ID}\n  owner/nested@v1:\n    ref: v1\n    commit: sha1-{OTHER_SHA}\n    owner_id: 1\n    repo_id: 2\n"
+    );
+    let (status, accepted) = submit_at_ci(&fixture.app, CHECKOUT_WORKFLOW, Some(&lockfile)).await;
+    assert!(status.is_success(), "{accepted}");
+    let plan_id = first_plan_id(&fixture.state, &accepted).await;
+
+    let (status, body) = resolve_through(&fixture.app, &plan_id, "owner/nested", "v1").await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let message = response_message(&body);
+    assert!(message.contains("not permitted"), "{body}");
+}
+
+/// A lockfile for a workflow path outside the repository is refused with 422, rather
+/// than leaving the run's workflow silently ungoverned.
+#[tokio::test]
+async fn lockfile_with_a_workflow_path_outside_the_repository_is_rejected() {
+    let fixture = LockFixture::new(Vec::new()).await;
+    let lockfile = checkout_lockfile(
+        CI_WORKFLOW_PATH,
+        LOCKED_COMMIT,
+        CHECKOUT_OWNER_ID,
+        CHECKOUT_REPO_ID,
+    );
+    let (status, body) = request_json_status(
+        &fixture.app,
+        axum::http::Method::POST,
+        "/api/v1/runs",
+        serde_json::json!({
+            "workflow_yaml": CHECKOUT_WORKFLOW,
+            "event": "push",
+            "repository": "owner/repo",
+            "workflow_path": "/abs/ci.yml",
+            "actions_lockfile": lockfile,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("repository-relative"),
+        "{body}"
     );
 }

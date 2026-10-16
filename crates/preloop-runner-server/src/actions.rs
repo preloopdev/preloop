@@ -4,7 +4,16 @@ use preloop_gha_protocol::azdo::{
     ActionDownloadInfo, ActionDownloadInfoCollection, ActionReferenceList,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::action_verify::{
+    LockedPinCheck, RefScope, VerifyError, verify_commit_reachable, verify_locked_pin,
+};
+use crate::models::TaskAgentJobRequestRecord;
+use preloop_gha_parser::lockfile::{
+    ActionsLock, LockedDependency, MAX_LOCKFILE_BYTES, pin_key_for_uses,
+};
+use preloop_gha_protocol::{JobId, JobPlan, RunId, WorkflowSubmission};
 
 fn require_action_plan(
     identity: &crate::auth::ResultsIdentity,
@@ -262,26 +271,32 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Resolve an action ref (branch, tag, or short SHA) to the commit SHA GitHub
 /// would pin for the job. Cached briefly in memory so a matrix fan-out
-/// resolves each `uses:` once per window. Returns `None` on any failure
-/// (offline, rate-limited, private repo without a PAT) so callers fall back
-/// to the ref itself — the historical behavior.
+/// resolves each `uses:` once per window.
+///
+/// `Ok(None)` on any lookup failure (offline, rate-limited, private repo
+/// without a PAT) so callers fall back to the ref itself — the historical
+/// behavior. `Err` only when a full commit SHA is refused by the impostor-commit
+/// check (see [`verify_plain_commit`]).
 async fn resolve_ref_to_sha(
     state: &AppState,
     owner: &str,
     repo: &str,
     git_ref: &str,
-) -> Option<String> {
-    // Already a full SHA: no lookup needed. The all-zero sentinel is not a
-    // real commit, so it must not short-circuit as "resolved".
+) -> Result<Option<String>, ApiError> {
+    // Already a full SHA: no ref lookup is needed, but the commit must be real
+    // and reachable from the repository the reference names. The all-zero
+    // sentinel is not a real commit, so it must not short-circuit as "resolved".
     if preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
-        return Some(git_ref.to_owned());
+        let subject = format!("action `{owner}/{repo}@{git_ref}`");
+        verify_plain_commit(state, owner, repo, git_ref, &subject).await?;
+        return Ok(Some(git_ref.to_owned()));
     }
     let cache_key = (owner.to_owned(), repo.to_owned(), git_ref.to_owned());
     if let Ok(cache) = state.action_sha_cache.lock()
         && let Some((sha, at)) = cache.get(&cache_key)
         && sha_entry_fresh(sha, *at)
     {
-        return sha.clone();
+        return Ok(sha.clone());
     }
 
     let enc_owner = percent_encode_path_segment(owner);
@@ -314,7 +329,7 @@ async fn resolve_ref_to_sha(
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(%owner, %repo, %git_ref, %error, "action ref resolution request failed; falling back to ref");
-            return None;
+            return Ok(None);
         }
     };
     state.github_consumption.record_advertised_bytes(
@@ -344,7 +359,38 @@ async fn resolve_ref_to_sha(
         cache.retain(|_, (cached, at)| sha_entry_fresh(cached, *at));
         cache.insert(cache_key, (sha.clone(), std::time::Instant::now()));
     }
-    sha
+    Ok(sha)
+}
+
+/// The impostor-commit check for a full-SHA pin: the commit must exist in the
+/// repository the reference names and be reachable from one of its branches or
+/// tags. This is what refuses a commit that exists only in a fork.
+///
+/// Asymmetric on purpose. A definitive refusal fails closed. `Unavailable`
+/// (network, auth, rate limit, 5xx) only warns and proceeds: this is a
+/// hardening check, and blocking every action while GitHub is unreachable would
+/// trade availability for it. Lockfile pins never take this path; they go
+/// through `verify_locked_pin`, which fails closed on `Unavailable`.
+pub(crate) async fn verify_plain_commit(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+    subject: &str,
+) -> Result<(), ApiError> {
+    if !state.actions_policy().verify_commit_reachability {
+        return Ok(());
+    }
+    match verify_commit_reachable(state, owner, repo, sha, RefScope::BranchesOrTags).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_definitive() => Err(ApiError::actions_policy(format!(
+            "{subject} is refused by the impostor-commit check: {error}. A pinned commit must be reachable from a branch or tag of the repository it names"
+        ))),
+        Err(error) => {
+            tracing::warn!(%owner, %repo, %sha, %error, "impostor-commit check unavailable; proceeding");
+            Ok(())
+        }
+    }
 }
 
 /// Percent-encode a path component for RFC 3986 URL safety.
@@ -669,8 +715,6 @@ pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 /// Maximum concurrent outbound GitHub ref resolution requests.
 pub const MAX_ACTION_CONCURRENCY: usize = 16;
 
-type ResolvedActionParts = (String, String, String, Option<String>, String);
-
 pub async fn collect_runnerresolve_refs(
     state: &AppState,
     identity: &crate::auth::ResultsIdentity,
@@ -685,20 +729,21 @@ pub async fn collect_runnerresolve_refs(
     requests.retain(|request| seen.insert(request.clone()));
     requests.truncate(MAX_ACTION_BATCH_SIZE);
 
-    let (run_id, declared) =
-        declared_actions_for_runnerresolve(state, orchestration_id, job_id).await?;
-    enforce_declared_actions(state, run_id, &declared, &requests).await?;
-
-    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        resolve_action_download_parts(state, &action, version.as_deref()).await
-    }))
-    .buffer_unordered(MAX_ACTION_CONCURRENCY);
-
-    let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
+    let request = runnerresolve_request(state, orchestration_id, job_id).await?;
+    let scope = resolve_scope(state, request).await?;
+    // A pinned job's requests are judged by its lock's pins in `resolve_batch`.
+    // The declared allowlist, and its manifest closure (which reads action.yml at
+    // the requested, mutable ref), apply only to ungoverned jobs.
+    if matches!(scope.governance, Governance::Open) {
+        enforce_declared_actions(state, scope.run_id, &scope.declared, &requests).await?;
+    }
+    let downloads = resolve_batch(state, &scope, &requests).await?;
+    // The job may have settled while the batch resolved: re-check liveness
+    // before signing any download ticket.
     crate::auth::require_live_results_job(state, identity).await?;
-    for parts in resolved.into_iter().flatten() {
-        if let Some((key, value)) = runnerresolve_action_from_parts(state, parts) {
-            actions.entry(key).or_insert(value);
+    for download in &downloads {
+        if let Some((key, entry)) = runnerresolve_entry(state, download) {
+            actions.entry(key).or_insert(entry);
         }
     }
     Ok(())
@@ -735,23 +780,24 @@ pub async fn collect_action_download_infos(
     requests.retain(|request| seen.insert(request.clone()));
     requests.truncate(MAX_ACTION_BATCH_SIZE);
 
-    let (run_id, declared) = declared_actions_for_plan(state, plan_id).await?;
-    enforce_declared_actions(state, run_id, &declared, &requests).await?;
-
-    let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        resolve_action_download_parts(state, &action, version.as_deref()).await
-    }))
-    .buffer_unordered(MAX_ACTION_CONCURRENCY);
-
-    let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
+    let request = plan_request(state, plan_id).await?;
+    let scope = resolve_scope(state, request).await?;
+    // A pinned job's requests are judged by its lock's pins in `resolve_batch`.
+    // The declared allowlist, and its manifest closure (which reads action.yml at
+    // the requested, mutable ref), apply only to ungoverned jobs.
+    if matches!(scope.governance, Governance::Open) {
+        enforce_declared_actions(state, scope.run_id, &scope.declared, &requests).await?;
+    }
+    let downloads = resolve_batch(state, &scope, &requests).await?;
+    // The job may have settled while the batch resolved: re-check liveness
+    // before signing any download ticket.
     crate::auth::require_live_results_job(state, identity).await?;
     let mut actions = BTreeMap::new();
-    for parts in resolved.into_iter().flatten() {
-        if let Some((key, value)) = action_download_info_from_parts(state, parts) {
-            actions.insert(key, value);
+    for download in &downloads {
+        if let Some((key, info)) = action_download_info_wire(state, download) {
+            actions.insert(key, info);
         }
     }
-
     Ok(ActionDownloadInfoCollection { actions })
 }
 
@@ -820,7 +866,7 @@ fn normalize_repo_slug(slug: &str) -> Option<String> {
 /// collecting a run's declared actions. Mirrors the submit-time
 /// `MAX_REUSABLE_WORKFLOW_DEPTH` so the allowlist sees the same tree the
 /// expander did.
-const DECLARED_ACTION_REUSABLE_DEPTH: usize = 4;
+pub(crate) const DECLARED_ACTION_REUSABLE_DEPTH: usize = 4;
 
 /// The actions a run may download, named directly by its workflow: every
 /// `owner/repo` in a step `uses:` or a job-level reusable `uses:`
@@ -903,7 +949,7 @@ fn collect_workflow_declared(
 /// Callee YAML for a job-level reusable `uses:`: remote callees are keyed
 /// by the full reference string (stashed by submit-time fetching); local
 /// callees (`./`, `$/`) are keyed by repository-relative path.
-fn reusable_callee_yaml<'a>(
+pub(crate) fn reusable_callee_yaml<'a>(
     uses: &str,
     reusable_workflows: &'a BTreeMap<String, String>,
 ) -> Option<&'a String> {
@@ -926,83 +972,466 @@ fn reusable_callee_yaml<'a>(
         .or_else(|| reusable_workflows.get(path))
 }
 
-/// Resolve the run behind a JobServer `plan_id` path segment and return its
-/// declared action allowlist. An unknown plan fails closed: without a run
-/// there is no declared set to mint against.
-async fn declared_actions_for_plan(
+/// The request a JobServer `plan_id` names. An unknown plan fails closed:
+/// without a request there is no run, and so no declared set to mint against.
+async fn plan_request(
     state: &AppState,
     plan_id: &str,
-) -> Result<(RunId, BTreeSet<String>), ApiError> {
+) -> Result<TaskAgentJobRequestRecord, ApiError> {
     use crate::control::backend::RequestKey;
-    let run_id = match state
+    match state
         .backend
         .request(RequestKey::PlanId(plan_id.to_owned()))
         .await
     {
-        Ok(request) => request.run_id,
-        Err(crate::control::ControlError::NotFound(_)) => {
-            return Err(ApiError::forbidden(format!(
-                "action downloads are not permitted for unknown plan `{plan_id}`"
-            )));
-        }
-        Err(error) => return Err(ApiError::from(error)),
-    };
-    let declared = declared_actions_for_run_id(state, run_id).await?;
-    Ok((run_id, declared))
+        Ok(request) => Ok(request),
+        Err(crate::control::ControlError::NotFound(_)) => Err(ApiError::forbidden(format!(
+            "action downloads are not permitted for unknown plan `{plan_id}`"
+        ))),
+        Err(error) => Err(ApiError::from(error)),
+    }
 }
 
-/// Resolve the run behind a `runnerresolve` (`orchestration_id`, `job_id`)
-/// path pair and return its declared action allowlist. Prefers the job id
-/// (exact), falling back to the orchestration plan id.
-async fn declared_actions_for_runnerresolve(
+/// The request a `runnerresolve` (`orchestration_id`, `job_id`) path pair
+/// names. Prefers the job id (exact), falling back to the orchestration plan id.
+async fn runnerresolve_request(
     state: &AppState,
     orchestration_id: &str,
     job_id: &str,
-) -> Result<(RunId, BTreeSet<String>), ApiError> {
+) -> Result<TaskAgentJobRequestRecord, ApiError> {
     use crate::control::backend::RequestKey;
-    let mut run_id = None;
     if let Ok(agent_job_id) = job_id.parse::<uuid::Uuid>()
         && let Ok(request) = state
             .backend
             .request(RequestKey::AgentJobId(agent_job_id))
             .await
     {
-        run_id = Some(request.run_id);
+        return Ok(request);
     }
-    let run_id = match run_id {
-        Some(run_id) => run_id,
-        None => match state
-            .backend
-            .request(RequestKey::PlanId(orchestration_id.to_owned()))
-            .await
-        {
-            Ok(request) => request.run_id,
-            Err(crate::control::ControlError::NotFound(_)) => {
-                return Err(ApiError::forbidden(format!(
-                    "action downloads are not permitted for unknown job `{job_id}`"
-                )));
-            }
-            Err(error) => return Err(ApiError::from(error)),
-        },
-    };
-    let declared = declared_actions_for_run_id(state, run_id).await?;
-    Ok((run_id, declared))
+    match state
+        .backend
+        .request(RequestKey::PlanId(orchestration_id.to_owned()))
+        .await
+    {
+        Ok(request) => Ok(request),
+        Err(crate::control::ControlError::NotFound(_)) => Err(ApiError::forbidden(format!(
+            "action downloads are not permitted for unknown job `{job_id}`"
+        ))),
+        Err(error) => Err(ApiError::from(error)),
+    }
 }
 
-async fn declared_actions_for_run_id(
-    state: &AppState,
+/// Which remote actions a job may name, and which pins they must match.
+#[derive(Debug)]
+enum Governance {
+    /// No `actions.lock` of the run onboards the job's workflow: resolution is
+    /// unchanged from before lockfiles existed.
+    Open,
+    /// The job's workflow is onboarded: the job may name only that workflow's
+    /// pins, each resolved to its locked commit.
+    Pinned {
+        /// The pins the job may use, keyed by canonical pin key.
+        pins: BTreeMap<String, LockedDependency>,
+        /// Names the workflow in the remedy message.
+        workflow: String,
+    },
+}
+
+/// The job a resolve request belongs to, and what it may resolve.
+struct ResolveScope {
     run_id: RunId,
-) -> Result<BTreeSet<String>, ApiError> {
+    job_id: JobId,
+    /// The run's directly declared actions: the allowlist of an `Open` job.
+    declared: BTreeSet<String>,
+    governance: Governance,
+    /// The `owner/repo` (lowercased) and commit the job's `$/` references
+    /// resolve to, when the job's workflow is known.
+    self_repository: Option<(String, String)>,
+}
+
+/// The scope a resolve request runs under, derived from the run's stored
+/// submission and run record, so it needs no per-run state and survives engine
+/// restarts. A run that cannot be re-parsed yields an empty declared set; a
+/// lockfile that cannot be parsed fails the request.
+async fn resolve_scope(
+    state: &AppState,
+    request: TaskAgentJobRequestRecord,
+) -> Result<ResolveScope, ApiError> {
     let run = state
         .backend
-        .run_record(run_id)
+        .run_record(request.run_id)
         .await
         .map_err(ApiError::from)?;
-    Ok(direct_declared_actions(
-        &run.submission.workflow_yaml,
-        &run.submission.reusable_workflows,
-        &run.submission.repository,
+    let submission: &WorkflowSubmission = &run.submission;
+    let (governance, self_repository) = job_governance(
+        submission,
+        &run.head_sha,
+        &run.job_base_ids,
+        &request.job_id,
+    )?;
+    Ok(ResolveScope {
+        run_id: request.run_id,
+        declared: direct_declared_actions(
+            &submission.workflow_yaml,
+            &submission.reusable_workflows,
+            &submission.repository,
+        ),
+        governance,
+        self_repository,
+        job_id: request.job_id,
+    })
+}
+
+/// The governance of one job, and the commit its `$/` references resolve to.
+///
+/// A run that carries no `actions.lock` is ungoverned. Otherwise the job is
+/// placed in its workflow ([`job_plan_of`]). A job whose workflow an
+/// `actions.lock` onboards may name only that workflow's pins. A job of a
+/// workflow no lock onboards is ungoverned, whatever the run's other locks say.
+/// A job that cannot be placed fails closed: it is never ungoverned, and it is
+/// never judged by another workflow's lock.
+fn job_governance(
+    submission: &WorkflowSubmission,
+    head_sha: &str,
+    job_base_ids: &BTreeMap<JobId, String>,
+    job_id: &JobId,
+) -> Result<(Governance, Option<(String, String)>), ApiError> {
+    let lockfiles = RunLockfiles::from_submission(submission)?;
+    if lockfiles.is_empty() {
+        return Ok((Governance::Open, None));
+    }
+    let plan =
+        job_plan_of(submission, job_base_ids, job_id).ok_or_else(|| unattributed_job(job_id))?;
+    let origin = origin_of_plan(submission, &plan).ok_or_else(|| unattributed_job(job_id))?;
+    let governance = match lockfiles.governing(&origin) {
+        Some(lock) if lock.is_onboarded(&origin.workflow_path) => Governance::Pinned {
+            pins: pins_of(lock, &origin.workflow_path),
+            workflow: origin.describe(),
+        },
+        _ => Governance::Open,
+    };
+    Ok((governance, self_repository_of(submission, head_sha, &plan)))
+}
+
+/// The refusal for a job the run's stored workflow cannot place.
+fn unattributed_job(job_id: &JobId) -> ApiError {
+    ApiError::actions_policy(format!(
+        "job `{}` cannot be matched to a workflow of this run, so its actions cannot be checked against actions.lock and it may not resolve any. The run's stored workflow does not describe the job; re-run the workflow",
+        job_id.0
     ))
+}
+
+/// The plan that decides which workflow a runtime job belongs to, found from the
+/// run's stored submission.
+///
+/// A job the submission expands is its own plan. A needs-driven matrix leg
+/// (`build (x)`) takes its base job's plan: the leg is that plan's fan-out at
+/// runtime. A job of a callee materialized from a needs-driven caller takes the
+/// caller's plan, whose `uses:` names the callee's workflow. A reusable caller's
+/// own job runs no steps, so it never answers. `None` when the job cannot be
+/// placed.
+fn job_plan_of(
+    submission: &WorkflowSubmission,
+    job_base_ids: &BTreeMap<JobId, String>,
+    job_id: &JobId,
+) -> Option<JobPlan> {
+    let plans = expanded_plans(submission)?;
+    if let Some(plan) = plans.get(&job_id.0) {
+        return runnable_plan(plan);
+    }
+    if let Some(plan) = job_base_ids.get(job_id).and_then(|base| plans.get(base)) {
+        return runnable_plan(plan);
+    }
+    // A callee job's id is its caller's job id, a `/`, and the callee's own id.
+    // The innermost caller the run knows is the longest such prefix.
+    let caller = job_base_ids
+        .keys()
+        .map(|id| id.0.as_str())
+        .filter(|caller| {
+            job_id
+                .0
+                .strip_prefix(*caller)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|caller| caller.len())?;
+    let base = job_base_ids
+        .get(&JobId(caller.to_owned()))
+        .map_or(caller, String::as_str);
+    let placeholder = plans.get(base)?;
+    placeholder.reusable_call.as_ref()?;
+    Some(placeholder.clone())
+}
+
+/// A plan a job can run as: every plan except a reusable caller's placeholder.
+fn runnable_plan(plan: &JobPlan) -> Option<JobPlan> {
+    plan.reusable_call.is_none().then(|| plan.clone())
+}
+
+/// Every job plan the stored submission expands to, keyed by plan id: the
+/// expansion submit makes, with the reusable callee subtrees expanded the way
+/// runtime materialization expands them. A needs-driven matrix's legs and the
+/// callees of a needs-driven caller exist only once the run's outputs do; they
+/// are placed through their base job by [`job_plan_of`].
+fn expanded_plans(submission: &WorkflowSubmission) -> Option<BTreeMap<String, JobPlan>> {
+    let workflow = preloop_gha_parser::parse_workflow(&submission.workflow_yaml).ok()?;
+    let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
+        &workflow,
+        &submission.reusable_workflows,
+        &submission.reusable_workflow_shas,
+        (!submission.dispatch_inputs.is_empty()).then_some(&submission.dispatch_inputs),
+        Some(submission.event.as_str()),
+    )
+    .ok()?;
+    let mut plans = BTreeMap::new();
+    collect_plans(submission, expanded.jobs, 0, &mut plans);
+    Some(plans)
+}
+
+/// Insert `jobs` into `plans`, then the callee subtree of each reusable caller
+/// among them, down to the declared-action walk's depth bound. A callee that
+/// cannot be found or expanded contributes nothing: the jobs it would have run
+/// then fail to place, which fails closed.
+fn collect_plans(
+    submission: &WorkflowSubmission,
+    jobs: Vec<JobPlan>,
+    depth: usize,
+    plans: &mut BTreeMap<String, JobPlan>,
+) {
+    for job in jobs {
+        let callee_jobs = match (&job.reusable_call, &job.deferred_matrix) {
+            (Some(call), None) if depth < DECLARED_ACTION_REUSABLE_DEPTH => {
+                reusable_callee_yaml(&call.uses, &submission.reusable_workflows)
+                    .and_then(|yaml| preloop_gha_parser::parse_workflow(yaml).ok())
+                    .and_then(|callee| {
+                        preloop_gha_parser::expand_reusable_call(
+                            &callee,
+                            &job,
+                            &submission.reusable_workflows,
+                            &submission.reusable_workflow_shas,
+                        )
+                        .ok()
+                    })
+                    .map(|expanded| expanded.jobs)
+            }
+            _ => None,
+        };
+        plans.insert(job.id.0.clone(), job);
+        if let Some(callee_jobs) = callee_jobs {
+            collect_plans(submission, callee_jobs, depth + 1, plans);
+        }
+    }
+}
+
+/// The workflow a plan's steps come from, named as the lockfile names it: the
+/// run's own workflow, a same-repository callee of it, or a remote callee and its
+/// path in the callee's repository. `None` only for a remote callee whose plan
+/// lacks its reference or its path.
+fn origin_of_plan(submission: &WorkflowSubmission, plan: &JobPlan) -> Option<LockOrigin> {
+    match (
+        plan.workflow_file.as_deref(),
+        plan.workflow_repository.as_deref(),
+    ) {
+        (None, _) => Some(LockOrigin {
+            uses: None,
+            workflow_path: submission_workflow_path(submission),
+        }),
+        // A same-repository callee of the run's own workflow.
+        (Some(file), None) => Some(LockOrigin {
+            uses: None,
+            workflow_path: file.to_owned(),
+        }),
+        // A callee of a remote reusable workflow: `file` is `owner/repo/path`.
+        (Some(file), Some(repository)) => Some(LockOrigin {
+            uses: Some(plan.workflow_ref.clone()?),
+            workflow_path: file.strip_prefix(repository)?.strip_prefix('/')?.to_owned(),
+        }),
+    }
+}
+
+/// The `owner/repo` (lowercased) and commit a plan's `$/` references resolve to.
+/// This is the runner's rule: a callee's `job.workflow_repository` and
+/// `job.workflow_sha` (`self_repository_identity`). The job message leaves both
+/// empty for the run's own workflow, which GitHub names as the run's repository
+/// at the run's commit, so that is the identity used for it.
+fn self_repository_of(
+    submission: &WorkflowSubmission,
+    head_sha: &str,
+    plan: &JobPlan,
+) -> Option<(String, String)> {
+    match plan.workflow_repository.as_deref() {
+        None => Some((
+            submission.repository.to_ascii_lowercase(),
+            head_sha.to_owned(),
+        )),
+        Some(repository) => Some((repository.to_ascii_lowercase(), plan.workflow_sha.clone()?)),
+    }
+}
+
+/// Whether a resolve request names the job's own repository at the job's own
+/// commit: a `$/` reference, as the runner rewrites it. Such a request is trusted
+/// by identity, so no lock covers it and no policy judges it.
+fn own_commit(scope: &ResolveScope, action: &str, version: Option<&str>) -> Option<String> {
+    let (repository, sha) = scope.self_repository.as_ref()?;
+    let uses = requested_uses(action, version);
+    let (_, git_ref) = uses.split_once('@')?;
+    (normalize_action_owner_repo(&uses)? == *repository && git_ref == sha.as_str())
+        .then(|| sha.clone())
+}
+
+/// Judges one `uses:` form against the actions policy's allow and block lists.
+/// `checked` is the form the policy sees: the locked commit's form under a lock.
+/// `subject` is the reference the job named, for the message.
+fn check_actions_policy(
+    policy: &crate::actions_policy::ActionsPolicy,
+    checked: &str,
+    subject: &str,
+) -> Result<(), ApiError> {
+    policy.check_uses(checked).map_err(|violation| {
+        ApiError::actions_policy(format!(
+            "action `{subject}` is not permitted by the actions policy: {violation}"
+        ))
+    })
+}
+
+/// The lock that governs a job, and the workflow file inside that lock's
+/// repository.
+struct LockOrigin {
+    /// `None` for the run repository's own lock; `Some(uses)` for a remote
+    /// reusable workflow's lock, keyed as `reusable_workflow_lockfiles` keys it.
+    uses: Option<String>,
+    /// The workflow's path in the lock's repository: the key `actions.lock`
+    /// lists it under.
+    workflow_path: String,
+}
+
+impl LockOrigin {
+    /// The workflow as the remedy message names it.
+    fn describe(&self) -> String {
+        self.uses
+            .clone()
+            .unwrap_or_else(|| self.workflow_path.clone())
+    }
+}
+
+/// The parsed `actions.lock` files of one submission: the run repository's, and
+/// each remote reusable workflow repository's, keyed by its `uses:` reference.
+pub(crate) struct RunLockfiles {
+    root: Option<ActionsLock>,
+    remote: BTreeMap<String, ActionsLock>,
+}
+
+impl RunLockfiles {
+    /// Parse every lockfile the submission carries. A lockfile that is present
+    /// but does not parse, or exceeds the size cap, rejects the submission: a
+    /// broken lock is never silently ignored. The run's own lockfile is matched
+    /// by the workflow path, so that path must be repository-relative.
+    pub(crate) fn from_submission(submission: &WorkflowSubmission) -> Result<Self, ApiError> {
+        let root = match submission.actions_lockfile.as_deref() {
+            Some(text) => {
+                let path = submission_workflow_path(submission);
+                if !is_repository_relative(&path) {
+                    return Err(ApiError::actions_lockfile(format!(
+                        "workflow path `{path}` is not repository-relative, so the run cannot be checked against actions.lock. Name the workflow by its path inside the repository, such as `.github/workflows/ci.yml`"
+                    )));
+                }
+                Some(parse_actions_lockfile(text)?)
+            }
+            None => None,
+        };
+        let remote = submission
+            .reusable_workflow_lockfiles
+            .iter()
+            .map(|(uses, text)| Ok((uses.clone(), parse_actions_lockfile(text)?)))
+            .collect::<Result<BTreeMap<String, ActionsLock>, ApiError>>()?;
+        Ok(Self { root, remote })
+    }
+
+    /// The run repository's lock, when it has one.
+    pub(crate) fn root(&self) -> Option<&ActionsLock> {
+        self.root.as_ref()
+    }
+
+    /// Each remote reusable workflow's lock, keyed by its `uses:` reference.
+    pub(crate) fn remote(&self) -> &BTreeMap<String, ActionsLock> {
+        &self.remote
+    }
+
+    fn is_empty(&self) -> bool {
+        self.root.is_none() && self.remote.is_empty()
+    }
+
+    fn governing(&self, origin: &LockOrigin) -> Option<&ActionsLock> {
+        match &origin.uses {
+            None => self.root.as_ref(),
+            Some(uses) => self.remote.get(uses),
+        }
+    }
+
+    /// The `dependencies` a job's message announces: its workflow's pins when the
+    /// workflow is onboarded, none otherwise. A caller placeholder runs no steps
+    /// and announces none.
+    pub(crate) fn job_dependencies(
+        &self,
+        submission: &WorkflowSubmission,
+        job: &JobPlan,
+    ) -> Vec<String> {
+        if job.reusable_call.is_some() {
+            return Vec::new();
+        }
+        origin_of_plan(submission, job)
+            .and_then(|origin| {
+                self.governing(&origin)
+                    .and_then(|lock| lock.wire_dependencies(&origin.workflow_path))
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Whether `path` is repository-relative: not absolute, with no drive letter,
+/// backslash or NUL, and no empty or `..` segment.
+fn is_repository_relative(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains(['\\', '\0', ':'])
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "..")
+}
+
+/// Parse one `actions.lock` the submission carries, under the size cap.
+fn parse_actions_lockfile(text: &str) -> Result<ActionsLock, ApiError> {
+    if text.len() > MAX_LOCKFILE_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "actions.lock is {} bytes; the limit is {MAX_LOCKFILE_BYTES} bytes",
+            text.len()
+        )));
+    }
+    ActionsLock::parse(text).map_err(|error| {
+        ApiError::actions_lockfile(format!(
+            "actions.lock does not parse: {error}. Fix it with `gh actions-lock` and submit again"
+        ))
+    })
+}
+
+/// The pins a workflow of `lock` may use, keyed by canonical pin key.
+fn pins_of(lock: &ActionsLock, workflow_path: &str) -> BTreeMap<String, LockedDependency> {
+    lock.workflow_pins(workflow_path)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|key| {
+            lock.dependency(key)
+                .map(|dependency| (key.clone(), dependency.clone()))
+        })
+        .collect()
+}
+
+/// The repository-relative path of the submission's top-level workflow. A
+/// submission that names none is recorded at the default path `runs.rs` uses.
+pub(crate) fn submission_workflow_path(submission: &WorkflowSubmission) -> String {
+    submission
+        .workflow_path
+        .clone()
+        .unwrap_or_else(|| ".github/workflows/workflow.yml".to_owned())
 }
 
 /// Cap on a fetched action manifest's decoded bytes. Manifests are small
@@ -1333,7 +1762,17 @@ fn collect_runnerresolve_requests(
                 requests.push((action.to_owned(), version.map(str::to_owned)));
             }
 
-            for nested in map.values() {
+            // A scalar under an action object is one of its attributes (`version`,
+            // `ref`, `name`), never a request of its own; only nested containers are
+            // walked. The runner's dependency announcement (`actions_dependencies` on
+            // Launch, `dependencies` on JobServer) lists pins, not actions to resolve:
+            // pins come only from the run's stored lockfile, never from the request.
+            for (key, nested) in map {
+                if nested.is_string()
+                    || matches!(key.as_str(), "actions_dependencies" | "dependencies")
+                {
+                    continue;
+                }
                 collect_runnerresolve_requests(nested, requests);
             }
         }
@@ -1341,95 +1780,155 @@ fn collect_runnerresolve_requests(
     }
 }
 
-/// Resolve one action reference to its pinned download parts, shared by both
-/// the JobServer (`ActionDownloadInfo`) and Launch (`runnerresolve`) wire
-/// shapes. Returns `(lookup_key, name_with_owner, ref, resolved_sha,
-/// tar_url)`.
+/// Where a resolved action's commit came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// The run's `actions.lock` named the commit; no live ref lookup happened.
+    Locked,
+    /// The ref was resolved through GitHub at job time.
+    Live,
+    /// The job's own repository at the job's own commit: a `$/` reference.
+    SelfRepository,
+}
+
+/// How one requested action's commit is established.
+enum ActionCommit {
+    /// A live lookup of the ref.
+    Live,
+    /// The commit an `actions.lock` pin names; no lookup happens.
+    Locked(String),
+    /// The job's own repository at the job's own commit.
+    Own(String),
+}
+
+/// One action a job resolved, kept for the job's check-run summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAction {
+    /// The lookup key the runner asked by: `owner/repo[/path]@ref`.
+    pub uses: String,
+    /// The commit the job ran; `None` when the ref could not be resolved.
+    pub sha: Option<String>,
+    /// Whether the commit came from the lock or a live lookup.
+    pub source: PinSource,
+}
+
+/// Actions each job resolved, by run and job. In-memory and best-effort, like
+/// the other per-run maps: a restart forgets it, and the summary then lists
+/// nothing for earlier jobs.
+pub type JobActionLedger =
+    parking_lot::Mutex<BTreeMap<(RunId, JobId), BTreeMap<String, ResolvedAction>>>;
+
+/// Most jobs the ledger remembers. Beyond it, one job is forgotten to make room.
+pub const MAX_LEDGER_JOBS: usize = 16_384;
+/// Most distinct actions remembered per job.
+pub const MAX_LEDGER_ACTIONS_PER_JOB: usize = 256;
+
+/// What a job resolved, in `uses` order, for its check-run summary.
+pub fn job_resolved_actions(
+    state: &AppState,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Vec<ResolvedAction> {
+    let ledger = state.job_action_ledger.lock();
+    ledger
+        .get(&(run_id, job_id.clone()))
+        .map(|actions| actions.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// One requested action a resolve batch answered for.
+struct ActionDownload {
+    /// Lookup key the runner asked by: `owner/repo[/path]@ref`.
+    key: String,
+    /// `owner/repo` the archive is fetched from.
+    name: String,
+    /// The ref as requested.
+    git_ref: String,
+    /// The commit the archive is pinned to, when one was established.
+    resolved_sha: Option<String>,
+    /// Whether that commit is locked or live.
+    source: PinSource,
+    /// The ref a download ticket is signed for: the commit when one was
+    /// established, else the ref as requested. The ticket itself is signed only
+    /// after the job's liveness is re-checked (see `download_ticket_url`).
+    effective_ref: String,
+}
+
+/// The `uses:` form of a requested action: the name with the version the runner
+/// sent apart from it, or the name as sent, which already carries its `@ref`.
+fn requested_uses(action: &str, version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!("{action}@{version}"),
+        None => action.to_owned(),
+    }
+}
+
+/// Resolve one action reference to its download parts, shared by both the
+/// JobServer (`ActionDownloadInfo`) and Launch (`runnerresolve`) wire shapes.
 ///
-/// The first `action_download_ticket` call is the validation gate as well as
-/// the key source: it rejects `./`, `../` and `docker://` references, so those
-/// never reach the network lookup below. Its ticket is discarded because the
-/// final URL has to carry the resolved SHA, which is not known until after
-/// resolution.
+/// The first `action_download_ticket` call is the validation gate as well as the
+/// key source: it rejects `./`, `../` and `docker://` references, so those never
+/// reach the network. Its ticket is discarded because the final URL has to carry
+/// the commit, which is not known until it is resolved.
 ///
-/// Pin the ref to the SHA GitHub would resolve at job time. The ticket URL
-/// then carries the SHA, so both the server-side tarball cache and the
-/// runner's `_actions/{owner}/{repo}/{sha}` extraction dir are keyed by
-/// content identity: when the ref moves, the next job gets a fresh SHA, a
-/// fresh download, and the stale archive is never served again. When the
+/// `commit` says how the commit is established. A lockfile pin or the job's own
+/// repository names it, so no ref lookup happens. Otherwise the ref is pinned to
+/// the SHA GitHub would resolve at job time, so the ticket URL, the server-side
+/// tarball cache and the runner's `_actions/{owner}/{repo}/{sha}` directory are
+/// keyed by content identity: when the ref moves, the next job gets a fresh SHA,
+/// a fresh download, and the stale archive is never served again. When the
 /// lookup is unavailable the ref itself is used, preserving the historical
 /// ref-keyed behavior.
-async fn resolve_action_download_parts(
+async fn resolve_action_download(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
-) -> Option<ResolvedActionParts> {
-    let (key, _) = action_download_ticket(state, action, version_override)?;
-    let (name, git_ref) = key.split_once('@')?;
-    let name = name.to_string();
-    let git_ref = git_ref.to_string();
-    let repo_part = if version_override.is_some() {
-        action.to_owned()
-    } else {
-        action.split_once('@')?.0.to_owned()
+    commit: ActionCommit,
+) -> Result<Option<ActionDownload>, ApiError> {
+    let Some((key, _)) = action_download_ticket(state, action, version_override) else {
+        return Ok(None);
+    };
+    let Some((name, git_ref)) = key.split_once('@') else {
+        return Ok(None);
+    };
+    let (name, git_ref) = (name.to_owned(), git_ref.to_owned());
+    let repo_part = match version_override {
+        Some(_) => action,
+        None => match action.split_once('@') {
+            Some((repo_part, _)) => repo_part,
+            None => return Ok(None),
+        },
     };
     let mut parts = repo_part.split('/');
-    let owner = parts.next()?.to_owned();
-    let repo = parts.next()?.to_owned();
-
-    let pinned = resolve_ref_to_sha(state, &owner, &repo, &git_ref).await;
-    let effective_ref = pinned.as_deref().unwrap_or(&git_ref).to_owned();
-    Some((key, name, git_ref, pinned, effective_ref))
-}
-
-fn runnerresolve_action_from_parts(
-    state: &AppState,
-    (key, name, git_ref, resolved_sha_opt, effective_ref): ResolvedActionParts,
-) -> Option<(String, serde_json::Value)> {
-    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
-    let tar_url = ticket.get("url")?.as_str()?.to_string();
-    let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
-    let mut entry = json!({
-        "name": name,
-        "version": git_ref,
-        "tar_url": tar_url,
-        "authentication": null,
-        "archive_sha256": archive_sha256_pin,
-    });
-    if let Some(resolved_sha) = resolved_sha_opt {
-        entry["resolved_sha"] = json!(resolved_sha);
-    }
-    Some((key, entry))
-}
-
-fn action_download_info_from_parts(
-    state: &AppState,
-    (key, name, git_ref, resolved_sha, effective_ref): ResolvedActionParts,
-) -> Option<(String, ActionDownloadInfo)> {
-    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
-    let tar_url = ticket.get("url")?.as_str()?.to_string();
-    Some((
+    let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
+        return Ok(None);
+    };
+    let (resolved_sha, source) = match commit {
+        ActionCommit::Locked(sha) => (Some(sha), PinSource::Locked),
+        ActionCommit::Own(sha) => (Some(sha), PinSource::SelfRepository),
+        ActionCommit::Live => (
+            resolve_ref_to_sha(state, owner, repo, &git_ref).await?,
+            PinSource::Live,
+        ),
+    };
+    let effective_ref = resolved_sha.as_deref().unwrap_or(&git_ref).to_owned();
+    Ok(Some(ActionDownload {
         key,
-        ActionDownloadInfo {
-            name_with_owner: Some(name.clone()),
-            resolved_name_with_owner: Some(name),
-            resolved_sha,
-            r#ref: Some(git_ref),
-            tarball_url: Some(tar_url),
-            zipball_url: None,
-            authentication: None,
-            package_details: None,
-        },
-    ))
+        name,
+        git_ref,
+        resolved_sha,
+        source,
+        effective_ref,
+    }))
 }
 
 /// Look up the engine-authoritative archive checksum pin for a resolved
 /// action. Returns `Some(digest)` when the engine has fetched this exact
-/// (owner, repo, sha) tarball itself and pinned its SHA-256, `None` when
-/// the server supports checksums but has no pin for this (owner, repo,
-/// sha) yet. The caller serializes `None` as an explicit JSON null so
-/// runners can distinguish "supported but unpinned" from a pre-checksum
-/// server that omits the key.
+/// (owner, repo, sha) tarball itself and pinned its SHA-256, `None` when the
+/// server supports checksums but has no pin for this (owner, repo, sha) yet.
+/// The caller serializes `None` as an explicit JSON null so runners can
+/// distinguish "supported but unpinned" from a pre-checksum server that omits
+/// the key.
 pub fn archive_sha256_pin_for(
     state: &AppState,
     name: &str,
@@ -1450,23 +1949,281 @@ pub fn archive_sha256_pin_for(
         .cloned()
 }
 
-pub async fn runnerresolve_action(
+/// One `runnerresolve` entry: the Launch wire shape, keyed by the lookup key.
+///
+/// Never echo the mutable ref back as `resolved_sha`. A caller that trusts the
+/// field would treat `v4` as a pinned commit. Omitting it makes the unresolved
+/// case explicit on the wire, and the runner refuses the download instead of
+/// fetching the mutable ref.
+///
+/// `archive_sha256` carries the engine-authoritative pin for this exact
+/// (owner, repo, sha). The key is always present so runners can distinguish
+/// "supported" from a pre-checksum server.
+fn runnerresolve_entry(
     state: &AppState,
-    action: &str,
-    version_override: Option<&str>,
+    download: &ActionDownload,
 ) -> Option<(String, serde_json::Value)> {
-    let parts = resolve_action_download_parts(state, action, version_override).await?;
-    runnerresolve_action_from_parts(state, parts)
+    let tar_url = download_ticket_url(state, download)?;
+    let archive_sha256_pin =
+        archive_sha256_pin_for(state, &download.name, download.resolved_sha.as_deref());
+    let mut entry = json!({
+        "name": download.name,
+        "version": download.git_ref,
+        "tar_url": tar_url,
+        "authentication": null,
+        "archive_sha256": archive_sha256_pin,
+    });
+    if let Some(resolved_sha) = &download.resolved_sha {
+        entry["resolved_sha"] = json!(resolved_sha);
+    }
+    Some((download.key.clone(), entry))
 }
 
 /// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.
-pub async fn action_download_info_entry(
+fn action_download_info_wire(
     state: &AppState,
-    action: &str,
-    version_override: Option<&str>,
+    download: &ActionDownload,
 ) -> Option<(String, ActionDownloadInfo)> {
-    let parts = resolve_action_download_parts(state, action, version_override).await?;
-    action_download_info_from_parts(state, parts)
+    // Preloop download capability URLs are HMAC-signed and bearerless.
+    // Operator PAT is kept server-side to avoid leaking broad credentials to untrusted workflows.
+    let tar_url = download_ticket_url(state, download)?;
+    Some((
+        download.key.clone(),
+        ActionDownloadInfo {
+            name_with_owner: Some(download.name.clone()),
+            resolved_name_with_owner: Some(download.name.clone()),
+            resolved_sha: download.resolved_sha.clone(),
+            r#ref: Some(download.git_ref.clone()),
+            tarball_url: Some(tar_url),
+            zipball_url: None,
+            authentication: None,
+            package_details: None,
+        },
+    ))
+}
+
+/// The signed, short-lived, bearerless download URL for the archive a resolved
+/// action names. Collectors call this only after re-checking that the job is
+/// still live, so a job that settled while its batch resolved is never handed a
+/// ticket.
+fn download_ticket_url(state: &AppState, download: &ActionDownload) -> Option<String> {
+    let (_, ticket) = action_download_ticket(state, &download.name, Some(&download.effective_ref))?;
+    ticket
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Resolve one batch of action requests for the job that asked.
+///
+/// Each remote request must pass the actions policy (`check_uses`). Under a
+/// pinned governance each must also name a pin of the job's workflow: the locked
+/// commit is used, and no live ref lookup happens. Before anything resolves, the
+/// pins the job is held to are verified, and any failure fails the whole batch
+/// closed. What resolved is recorded on the job for its check-run summary.
+/// A `$/` reference names the job's own repository at its own commit, which no
+/// lock or policy judges: GitHub does not restrict an action in the workflow's
+/// own repository.
+async fn resolve_batch(
+    state: &AppState,
+    scope: &ResolveScope,
+    requests: &[(String, Option<String>)],
+) -> Result<Vec<ActionDownload>, ApiError> {
+    let policy = state.actions_policy();
+    // Each request's commit is settled first, then the policy judges the commit
+    // that will run. Under a lock that is the locked commit, which GitHub matches
+    // in place of the tag the workflow writes.
+    let mut work: Vec<(String, Option<String>, ActionCommit)> = Vec::with_capacity(requests.len());
+    for (action, version) in requests {
+        let version = version.as_deref();
+        let commit = if normalize_action_owner_repo(action).is_none() {
+            // Local, docker and malformed references never reach the network:
+            // `resolve_action_download` refuses them.
+            ActionCommit::Live
+        } else if let Some(sha) = own_commit(scope, action, version) {
+            ActionCommit::Own(sha)
+        } else {
+            let uses = requested_uses(action, version);
+            match &scope.governance {
+                Governance::Open => {
+                    check_actions_policy(policy, &uses, &uses)?;
+                    ActionCommit::Live
+                }
+                Governance::Pinned { pins, workflow } => {
+                    let (key, dependency) = pin_key_for_uses(&uses)
+                        .and_then(|key| pins.get(&key).map(|dependency| (key, dependency)))
+                        .ok_or_else(|| unpinned_action(&uses, workflow))?;
+                    let sha = dependency.commit.as_git_sha().to_owned();
+                    let path = key.split_once('@').map_or(key.as_str(), |(path, _)| path);
+                    check_actions_policy(policy, &format!("{path}@{sha}"), &uses)?;
+                    ActionCommit::Locked(sha)
+                }
+            }
+        };
+        work.push((action.clone(), version.map(str::to_owned), commit));
+    }
+
+    if let Governance::Pinned { pins, .. } = &scope.governance
+        && work
+            .iter()
+            .any(|(_, _, commit)| matches!(commit, ActionCommit::Locked(_)))
+    {
+        verify_pins(state, pins, pins.keys().cloned().collect()).await?;
+    }
+
+    // Items are owned, not borrowed from `requests`: a stream of async blocks
+    // that borrow its items makes rustc lose the `Send` bound the axum handlers
+    // need ("implementation of `Send` is not general enough").
+    let stream = futures::stream::iter(work.into_iter().map(
+        |(action, version, commit)| async move {
+            resolve_action_download(state, &action, version.as_deref(), commit).await
+        },
+    ))
+    .buffer_unordered(MAX_ACTION_CONCURRENCY);
+    let resolved: Vec<Result<Option<ActionDownload>, ApiError>> = stream.collect().await;
+    let mut downloads = Vec::with_capacity(resolved.len());
+    for download in resolved {
+        if let Some(download) = download? {
+            downloads.push(download);
+        }
+    }
+    record_resolved_actions(state, scope.run_id, &scope.job_id, &downloads);
+    Ok(downloads)
+}
+
+/// The batch error for a remote action its job's workflow does not pin.
+fn unpinned_action(uses: &str, workflow: &str) -> ApiError {
+    ApiError::actions_policy(format!(
+        "action `{uses}` is not pinned in the actions.lock of `{workflow}`, so the job cannot run it. Run `gh actions-lock` to pin it, then re-run"
+    ))
+}
+
+/// Verify the named pins against GitHub, concurrently and bounded by
+/// `MAX_ACTION_CONCURRENCY`. Every failure is reported in the batch error.
+async fn verify_pins(
+    state: &AppState,
+    pins: &BTreeMap<String, LockedDependency>,
+    keys: Vec<String>,
+) -> Result<(), ApiError> {
+    let checks: Vec<(String, LockedDependency)> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let dependency = pins.get(&key)?.clone();
+            Some((key, dependency))
+        })
+        .collect();
+    let results: Vec<Result<(), ApiError>> = futures::stream::iter(
+        checks
+            .into_iter()
+            .map(|(key, dependency)| async move { verify_pin(state, &key, &dependency).await }),
+    )
+    .buffer_unordered(MAX_ACTION_CONCURRENCY)
+    .collect()
+    .await;
+    results.into_iter().collect()
+}
+
+/// Verify one locked pin: the repository's identity, the commit's reachability
+/// from a branch, and, for a full-version tag, that the tag still points at the
+/// locked commit. `verify_locked_pin` checks all three.
+async fn verify_pin(
+    state: &AppState,
+    key: &str,
+    dependency: &LockedDependency,
+) -> Result<(), ApiError> {
+    let Some((owner, repo)) = pin_owner_repo(key) else {
+        return Err(ApiError::actions_lockfile(format!(
+            "pinned action `{key}` is not an `OWNER/REPO@REF` key"
+        )));
+    };
+    if !pin_is_hosted_here(state, dependency) {
+        let host = dependency.hostname.as_deref().unwrap_or_default();
+        return Err(verify_failure(
+            key,
+            VerifyError::Invalid(format!(
+                "the pin is hosted on `{host}`, which this engine does not verify against"
+            )),
+        ));
+    }
+    let check = LockedPinCheck {
+        owner,
+        repo,
+        reference: &dependency.reference,
+        sha: dependency.commit.as_git_sha(),
+        owner_id: dependency.owner_id,
+        repo_id: dependency.repo_id,
+    };
+    verify_locked_pin(state, &check)
+        .await
+        .map_err(|error| verify_failure(key, error))
+}
+
+/// The `OWNER` and `REPO` of a canonical pin key, `OWNER/REPO@REF`. The ref may
+/// itself contain `@` or `/`, so the split is taken at the first `@`.
+fn pin_owner_repo(key: &str) -> Option<(&str, &str)> {
+    let (path, _) = key.split_once('@')?;
+    path.split_once('/')
+}
+
+/// Whether a pin is hosted where this engine verifies. A pin without a
+/// `hostname` is on the home host. One naming another host cannot be verified
+/// here, so it is refused rather than assumed to match.
+fn pin_is_hosted_here(state: &AppState, dependency: &LockedDependency) -> bool {
+    let Some(host) = dependency.hostname.as_deref() else {
+        return true;
+    };
+    reqwest::Url::parse(&state.github_urls.server_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|home| home.eq_ignore_ascii_case(host))
+}
+
+/// The batch error for a pin that failed verification. A definitive failure
+/// blocks with 403. An unavailable GitHub blocks with 503: the job waits and is
+/// retried, and it never runs unverified.
+fn verify_failure(key: &str, error: VerifyError) -> ApiError {
+    if error.is_definitive() {
+        ApiError::actions_policy(format!(
+            "pinned action `{key}` failed verification, so the job is blocked: {error}. Run `gh actions-lock` to update actions.lock, then re-run"
+        ))
+    } else {
+        ApiError::service_unavailable(format!(
+            "pinned action `{key}` could not be verified, so the job is blocked until GitHub answers: {error}"
+        ))
+    }
+}
+
+/// Record what a batch resolved on the job, for the job's check-run summary.
+fn record_resolved_actions(
+    state: &AppState,
+    run_id: RunId,
+    job_id: &JobId,
+    downloads: &[ActionDownload],
+) {
+    if downloads.is_empty() {
+        return;
+    }
+    let mut ledger = state.job_action_ledger.lock();
+    let job = (run_id, job_id.clone());
+    if !ledger.contains_key(&job) && ledger.len() >= MAX_LEDGER_JOBS {
+        // Best effort: forget one job rather than grow without bound.
+        if let Some(evicted) = ledger.keys().next().cloned() {
+            ledger.remove(&evicted);
+        }
+    }
+    let actions = ledger.entry(job).or_default();
+    for download in downloads {
+        if actions.len() < MAX_LEDGER_ACTIONS_PER_JOB || actions.contains_key(&download.key) {
+            actions.insert(
+                download.key.clone(),
+                ResolvedAction {
+                    uses: download.key.clone(),
+                    sha: download.resolved_sha.clone(),
+                    source: download.source,
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2122,5 +2879,250 @@ jobs:
             (15 * 60..=30 * 60).contains(&ttl),
             "ticket TTL {ttl}s is outside the 15–30 minute window"
         );
+    }
+
+    /// `actions.lock` onboarding `.github/workflows/ci.yml` with one pin.
+    const CI_LOCK: &str = "version: v0.0.3\nworkflows:\n  .github/workflows/ci.yml:\n    - actions/checkout@v4\ndependencies:\n  actions/checkout@v4:\n    ref: v4\n    commit: sha1-1111111111111111111111111111111111111111\n    owner_id: 33333\n    repo_id: 44444\n";
+
+    /// The runner's `actions` entries are the requests. An action object's own
+    /// scalars (`action`, `version`) and the dependency announcement are not.
+    #[test]
+    fn runnerresolve_requests_are_actions_not_their_attributes() {
+        let body = json!({
+            "actions": [
+                {"action": "actions/checkout", "version": "v4"},
+                "owner/repo@main",
+            ],
+            "actions_dependencies": ["actions/checkout@v4:sha1-00"],
+        });
+        let mut requests = Vec::new();
+        collect_runnerresolve_requests(&body, &mut requests);
+        assert_eq!(
+            requests,
+            vec![
+                ("actions/checkout".to_owned(), Some("v4".to_owned())),
+                ("owner/repo@main".to_owned(), None),
+            ]
+        );
+    }
+
+    /// A separate version joins the name with `@`; a name that carries its own
+    /// `@ref` is kept as written.
+    #[test]
+    fn requested_uses_joins_the_version_the_runner_sent_apart() {
+        assert_eq!(
+            requested_uses("actions/checkout", Some("v4")),
+            "actions/checkout@v4"
+        );
+        assert_eq!(
+            requested_uses("owner/repo/path@main", None),
+            "owner/repo/path@main"
+        );
+    }
+
+    /// A pin key is `OWNER/REPO@REF`. The split is at the first `@`, so a ref
+    /// that itself contains `@` or `/` stays whole.
+    #[test]
+    fn pin_owner_repo_splits_at_the_first_at_sign() {
+        assert_eq!(
+            pin_owner_repo("actions/checkout@v4"),
+            Some(("actions", "checkout"))
+        );
+        assert_eq!(
+            pin_owner_repo("actions/checkout@feature/x@y"),
+            Some(("actions", "checkout"))
+        );
+        assert_eq!(pin_owner_repo("no-slash@v4"), None);
+    }
+
+    /// A job's message announces its workflow's pins only when a lock onboards
+    /// that workflow. A job of a workflow no lock onboards announces none.
+    #[test]
+    fn job_dependencies_follow_the_workflow_the_lock_onboards() {
+        let submission = WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n".to_owned(),
+            event: "push".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            actions_lockfile: Some(CI_LOCK.to_owned()),
+            ..WorkflowSubmission::default()
+        };
+        let workflow = preloop_gha_parser::parse_workflow(&submission.workflow_yaml).unwrap();
+        let expanded =
+            preloop_gha_parser::expand_jobs_with_reusables(&workflow, &BTreeMap::new()).unwrap();
+        let job = expanded.jobs.first().unwrap();
+
+        let lockfiles = RunLockfiles::from_submission(&submission).unwrap();
+        assert_eq!(
+            lockfiles.job_dependencies(&submission, job),
+            vec!["actions/checkout@v4:sha1-1111111111111111111111111111111111111111".to_owned()]
+        );
+
+        let elsewhere = WorkflowSubmission {
+            workflow_path: Some(".github/workflows/release.yml".to_owned()),
+            ..submission.clone()
+        };
+        assert!(
+            RunLockfiles::from_submission(&elsewhere)
+                .unwrap()
+                .job_dependencies(&elsewhere, job)
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod governance_tests {
+    use super::*;
+
+    const HEAD: &str = "7777777777777777777777777777777777777777";
+    /// A needs-driven matrix: `build` expands only once `plan`'s outputs exist.
+    const NEEDS_MATRIX: &str = "on: push\njobs:\n  plan:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo plan\n  build:\n    needs: plan\n    strategy:\n      matrix:\n        v: ${{ fromJSON(needs.plan.outputs.list) }}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n";
+
+    /// An `actions.lock` onboarding `workflow` with the pin `actions/checkout@v4`.
+    fn checkout_lock(workflow: &str) -> String {
+        format!(
+            "version: v0.0.3\nworkflows:\n  {workflow}:\n    - actions/checkout@v4\ndependencies:\n  actions/checkout@v4:\n    ref: v4\n    commit: sha1-1111111111111111111111111111111111111111\n    owner_id: 33333\n    repo_id: 44444\n"
+        )
+    }
+
+    fn run_submission(
+        workflow_yaml: &str,
+        workflow_path: &str,
+        lock: Option<String>,
+    ) -> WorkflowSubmission {
+        WorkflowSubmission {
+            workflow_yaml: workflow_yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(workflow_path.to_owned()),
+            actions_lockfile: lock,
+            ..WorkflowSubmission::default()
+        }
+    }
+
+    /// The base job of a runtime matrix leg, as the run record keeps it.
+    fn leg_bases(leg: &str) -> BTreeMap<JobId, String> {
+        BTreeMap::from([(JobId(leg.to_owned()), "build".to_owned())])
+    }
+
+    /// A needs-driven matrix leg runs its base job's plan, so a leg of an onboarded
+    /// workflow is governed by that workflow's pins, with the run's repository as its
+    /// `$/` identity.
+    #[test]
+    fn needs_driven_matrix_legs_are_governed_by_their_base_job() {
+        let submission = run_submission(
+            NEEDS_MATRIX,
+            ".github/workflows/ci.yml",
+            Some(checkout_lock(".github/workflows/ci.yml")),
+        );
+        let (governance, self_repository) = job_governance(
+            &submission,
+            HEAD,
+            &leg_bases("build (x)"),
+            &JobId("build (x)".to_owned()),
+        )
+        .unwrap();
+        match governance {
+            Governance::Pinned { pins, .. } => assert!(pins.contains_key("actions/checkout@v4")),
+            Governance::Open => panic!("a leg of an onboarded workflow must be pinned"),
+        }
+        assert_eq!(
+            self_repository,
+            Some(("owner/repo".to_owned(), HEAD.to_owned()))
+        );
+    }
+
+    /// The same leg of a workflow no lock onboards stays ungoverned, although the run
+    /// carries a lock for another of its workflows.
+    #[test]
+    fn non_onboarded_legs_stay_open_beside_another_locked_workflow() {
+        let submission = run_submission(
+            NEEDS_MATRIX,
+            ".github/workflows/ci.yml",
+            Some(checkout_lock(".github/workflows/release.yml")),
+        );
+        let (governance, _) = job_governance(
+            &submission,
+            HEAD,
+            &leg_bases("build (x)"),
+            &JobId("build (x)".to_owned()),
+        )
+        .unwrap();
+        assert!(matches!(governance, Governance::Open));
+    }
+
+    /// A remote callee's job is governed by the lock of the repository the callee is
+    /// defined in, and its `$/` references name that repository at the callee's commit.
+    #[test]
+    fn callee_jobs_are_governed_by_the_callee_repositorys_lock() {
+        const CALLEE: &str = "octo/hello/.github/workflows/inner.yml@main";
+        let callee_sha = "5".repeat(40);
+        let submission = WorkflowSubmission {
+            reusable_workflows: BTreeMap::from([(
+                CALLEE.to_owned(),
+                "on: workflow_call\njobs:\n  leaf:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n".to_owned(),
+            )]),
+            reusable_workflow_shas: BTreeMap::from([(CALLEE.to_owned(), callee_sha.clone())]),
+            reusable_workflow_lockfiles: BTreeMap::from([(
+                CALLEE.to_owned(),
+                checkout_lock(".github/workflows/inner.yml"),
+            )]),
+            ..run_submission(
+                "on: push\njobs:\n  call:\n    uses: octo/hello/.github/workflows/inner.yml@main\n",
+                ".github/workflows/ci.yml",
+                None,
+            )
+        };
+        let (governance, self_repository) = job_governance(
+            &submission,
+            HEAD,
+            &BTreeMap::new(),
+            &JobId("call/leaf".to_owned()),
+        )
+        .unwrap();
+        assert!(matches!(governance, Governance::Pinned { .. }));
+        assert_eq!(self_repository, Some(("octo/hello".to_owned(), callee_sha)));
+    }
+
+    /// A job the run's workflow cannot place fails closed while the run carries a lock,
+    /// and is ungoverned when the run carries none.
+    #[test]
+    fn unplaceable_jobs_fail_closed_only_when_the_run_carries_a_lock() {
+        let locked = run_submission(
+            NEEDS_MATRIX,
+            ".github/workflows/ci.yml",
+            Some(checkout_lock(".github/workflows/ci.yml")),
+        );
+        assert!(
+            job_governance(
+                &locked,
+                HEAD,
+                &BTreeMap::new(),
+                &JobId("mystery".to_owned())
+            )
+            .is_err()
+        );
+        let plain = run_submission(NEEDS_MATRIX, ".github/workflows/ci.yml", None);
+        let (governance, _) =
+            job_governance(&plain, HEAD, &BTreeMap::new(), &JobId("mystery".to_owned())).unwrap();
+        assert!(matches!(governance, Governance::Open));
+    }
+
+    /// The workflow path a lockfile is matched by must be repository-relative.
+    #[test]
+    fn workflow_paths_must_be_repository_relative() {
+        assert!(is_repository_relative(".github/workflows/ci.yml"));
+        assert!(is_repository_relative("./.github/workflows/ci.yml"));
+        for path in [
+            "/etc/ci.yml",
+            "../ci.yml",
+            ".github/../ci.yml",
+            "a\\b.yml",
+            "C:/ci.yml",
+            "",
+            "a//b.yml",
+        ] {
+            assert!(!is_repository_relative(path), "{path:?} must be refused");
+        }
     }
 }

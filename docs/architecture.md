@@ -176,6 +176,7 @@ Known limitations:
 | `eval.rs`        | Expression context builder, `resolve_string`                                                                 |
 | `dag.rs`         | Workflow dependency graph validation                                                                         |
 | `job_builder.rs` | Build `AgentJobRequestMessage` from parsed workflow data                                                     |
+| `lockfile.rs`      | GitHub Actions dependency-lockfile parsing, pin lookup, and runner wire entries |
 
 
 ### `preloop-gha-expressions/src/`
@@ -202,6 +203,10 @@ Known limitations:
 | `models.rs`             | `QueuedJob`, `WebhookDeliveryRecord` and wire-facing run/job models       |
 | `runs.rs`               | `/api/v1/runs` handlers: submit, get, cancel, rerun, events             |
 | `github.rs`             | GitHub webhook receiver, durable queue worker, check runs               |
+| `actions.rs`           | Action resolution, lockfile governance, declared-action checks, and provenance ledger |
+| `action_verify.rs`     | GitHub action commit reachability, repository identity, tag verification, and caches |
+| `actions_policy.rs`    | Configured SHA-pinning, lockfile, and allow/block policy evaluation |
+| `remote_workflows.rs`  | Remote reusable-workflow SHA resolution, content fetch, and callee lockfiles |
 | `rerequest.rs`         | `check_run`/`check_suite` rerequest webhook handling: in-place run reruns |
 | `github_breaker.rs`     | Circuit breaker + rate-limit classification for GitHub calls           |
 | `webhook_watchdog.rs`   | Delivery-history poll, phantom-ack join, redelivery                    |

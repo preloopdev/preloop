@@ -65,6 +65,13 @@ pub async fn workflow_dispatch(
         .map_err(|error| {
             ApiError::bad_gateway(format!("failed to fetch workflows at {git_ref}: {error}"))
         })?;
+    let actions_lockfile = crate::github::fetch_actions_lockfile(&shared, &repository, &git_ref)
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!(
+                "failed to fetch actions.lock at {git_ref}: {error}"
+            ))
+        })?;
     let filename = find_workflow(&workflows, &workflow_id).ok_or_else(|| {
         ApiError::not_found(format!(
             "workflow {workflow_id} not found in {repository} at {git_ref}"
@@ -119,6 +126,7 @@ pub async fn workflow_dispatch(
         &filename,
         &sha,
         resolve_ref_protected(&shared, &repository, &git_ref).await,
+        actions_lockfile.clone(),
         &identity,
     );
     submit_and_report(&shared, submission, &repository, &sha).await?;
@@ -172,6 +180,13 @@ pub async fn repository_dispatch(
         .map_err(|error| {
             ApiError::bad_gateway(format!("failed to fetch workflows at {git_ref}: {error}"))
         })?;
+    let actions_lockfile = crate::github::fetch_actions_lockfile(&shared, &repository, &git_ref)
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!(
+                "failed to fetch actions.lock at {git_ref}: {error}"
+            ))
+        })?;
 
     // Every workflow this broadcast fans out to runs on the default branch.
     let ref_protected = resolve_ref_protected(&shared, &repository, &git_ref).await;
@@ -202,6 +217,7 @@ pub async fn repository_dispatch(
             &filename,
             &sha,
             ref_protected,
+            actions_lockfile.clone(),
             &identity,
         );
         match submit_and_report(&shared, submission, &repository, &sha).await {
@@ -749,6 +765,7 @@ fn submission_from_effective(
     filename: &str,
     sha: &str,
     ref_protected: bool,
+    actions_lockfile: Option<String>,
     identity: &DispatchIdentity,
 ) -> WorkflowSubmission {
     WorkflowSubmission {
@@ -763,8 +780,10 @@ fn submission_from_effective(
         secrets: BTreeMap::new(),
         run_secret_names: std::collections::BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
+        actions_lockfile,
         triggering_actor: None,
         reusable_workflow_shas: BTreeMap::new(),
+        reusable_workflow_lockfiles: BTreeMap::new(),
         enable_debugger: false,
         debugger_welcome_message: None,
         sha: sha.to_owned(),

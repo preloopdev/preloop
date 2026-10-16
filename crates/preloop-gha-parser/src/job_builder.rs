@@ -743,6 +743,9 @@ pub fn build_agent_job_message_with_normalized_context(
         preloop_snapshot_token_steps: None,
         preloop_snapshot_origin_rewrite: None,
         preloop_secret_spec: None,
+        // Pinned `actions.lock` dependencies are attached by the server, which
+        // owns the run's lockfile; the builder knows only the job plan.
+        dependencies: Vec::new(),
     })
 }
 

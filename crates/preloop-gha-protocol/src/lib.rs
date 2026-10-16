@@ -280,6 +280,16 @@ pub struct WorkflowSubmission {
     /// Resolved commit SHA for each remote reusable workflow reference.
     #[serde(default)]
     pub reusable_workflow_shas: BTreeMap<String, String>,
+    /// Raw `.github/workflows/actions.lock` of the run's repository at the
+    /// run's commit: the GitHub Actions workflow dependency lockfile. Absent
+    /// when the repository has no lockfile. The server parses and enforces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions_lockfile: Option<String>,
+    /// Raw `actions.lock` of each remote reusable workflow's repository at the
+    /// commit recorded in `reusable_workflow_shas`, keyed by the same `uses:`
+    /// reference. A callee repository without a lockfile has no entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reusable_workflow_lockfiles: BTreeMap<String, String>,
     /// Enable DAP debugger for the run's jobs.
     #[serde(default)]
     pub enable_debugger: bool,
@@ -1252,5 +1262,46 @@ mod tests {
         assert_eq!(value["end_column"], 9);
         assert_eq!(value["title"], "Compiler");
         assert!(value.get("step_id").is_none());
+    }
+
+    /// The lockfile fields are snake_case on the wire, omitted when absent so
+    /// today's submissions keep their JSON, and default to empty when a client
+    /// does not send them.
+    #[test]
+    fn submission_lockfile_fields_round_trip_on_the_wire() {
+        let plain = serde_json::to_value(WorkflowSubmission::default()).unwrap();
+        assert!(plain.get("actions_lockfile").is_none());
+        assert!(plain.get("reusable_workflow_lockfiles").is_none());
+
+        let callee = "o/r/.github/workflows/build.yml@0123456789abcdef0123456789abcdef01234567";
+        let mut submission = WorkflowSubmission {
+            actions_lockfile: Some("version: v0.0.3\n".to_owned()),
+            ..WorkflowSubmission::default()
+        };
+        submission
+            .reusable_workflow_lockfiles
+            .insert(callee.to_owned(), "version: v0.0.3\n".to_owned());
+        let json = serde_json::to_value(&submission).unwrap();
+        assert_eq!(json["actions_lockfile"], "version: v0.0.3\n");
+        assert_eq!(
+            json["reusable_workflow_lockfiles"][callee],
+            "version: v0.0.3\n"
+        );
+
+        let back: WorkflowSubmission = serde_json::from_value(json).unwrap();
+        assert_eq!(back.actions_lockfile, submission.actions_lockfile);
+        assert_eq!(
+            back.reusable_workflow_lockfiles,
+            submission.reusable_workflow_lockfiles
+        );
+
+        let legacy: WorkflowSubmission = serde_json::from_value(serde_json::json!({
+            "workflow_yaml": "on: push\n",
+            "event": "push",
+            "repository": "o/r",
+        }))
+        .unwrap();
+        assert!(legacy.actions_lockfile.is_none());
+        assert!(legacy.reusable_workflow_lockfiles.is_empty());
     }
 }

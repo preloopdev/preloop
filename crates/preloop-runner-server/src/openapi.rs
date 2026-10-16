@@ -60,6 +60,11 @@ pub struct WorkflowSubmissionRequest {
     pub reusable_workflows: Option<std::collections::BTreeMap<String, String>>,
     /// Resolved commit SHA for each remote reusable workflow reference.
     pub reusable_workflow_shas: Option<std::collections::BTreeMap<String, String>>,
+    /// Raw `.github/workflows/actions.lock` of the run's repository at the run's commit.
+    pub actions_lockfile: Option<String>,
+    /// Raw `actions.lock` of each remote reusable workflow's repository at its
+    /// resolved commit, keyed by the same `uses:` reference as `reusable_workflow_shas`.
+    pub reusable_workflow_lockfiles: Option<std::collections::BTreeMap<String, String>>,
     /// Enable DAP debugger for the run's jobs.
     pub enable_debugger: Option<bool>,
     /// Welcome message shown when the debugger attaches.

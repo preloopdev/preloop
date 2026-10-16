@@ -758,6 +758,31 @@ async fn cron_loop(
             &format!("refs/heads/{default_branch}"),
         )
         .await;
+        // The lockfile is read at the commit the workflow was captured from, so
+        // the lock and the workflow come from one revision. A failed read skips
+        // this fire and records why, rather than running the workflow unlocked.
+        let lock_ref = resolved_sha
+            .clone()
+            .unwrap_or_else(|| format!("refs/heads/{default_branch}"));
+        let actions_lockfile =
+            match crate::github::fetch_actions_lockfile(&shared, &repository, &lock_ref).await {
+                Ok(lockfile) => lockfile,
+                Err(error) => {
+                    warn!("scheduler: actions.lock fetch failed for [{workflow_path}]: {error:?}");
+                    scheduler
+                        .record_fire(ScheduleFire {
+                            workflow_path: workflow_path.clone(),
+                            cron_expr: cron_expr.clone(),
+                            fired_at,
+                            run_id: None,
+                            error: Some(format!(
+                                "failed to fetch actions.lock at {lock_ref}: {error:?}"
+                            )),
+                        })
+                        .await;
+                    continue;
+                }
+            };
         let submission = WorkflowSubmission {
             workflow_yaml: workflow_yaml.clone(),
             event: "schedule".to_owned(),
@@ -770,7 +795,9 @@ async fn cron_loop(
             secrets: Default::default(),
             run_secret_names: Default::default(),
             reusable_workflows: Default::default(),
+            actions_lockfile,
             reusable_workflow_shas: Default::default(),
+            reusable_workflow_lockfiles: Default::default(),
             enable_debugger: false,
             triggering_actor: None,
             debugger_welcome_message: None,

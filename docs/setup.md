@@ -480,6 +480,43 @@ AWS_CREDS = "…"
 DB_PASSWORD = "…"
 ```
 
+### Workflow action pinning
+
+Preloop reads `.github/workflows/actions.lock` when the submitted workflow is
+onboarded in the lockfile. It runs the recorded commits rather than resolving
+mutable tags or branches at job time. Composite-action dependencies are
+covered transitively; a remote reusable workflow uses the lockfile from the
+repository that defines it. Workflows not listed in `workflows` retain normal
+resolution behaviour.
+
+The lockfile is generated and maintained by GitHub's `gh actions-lock`
+extension. Preloop accepts lockfiles up to 1 MiB and rejects malformed files,
+missing dependency entries, repository identity mismatches, moved full-version
+tags, and commits that cannot be verified against the source repository.
+
+Operators can add a server-side policy:
+
+```toml
+[actions_policy]
+require_sha_pinning = false
+require_lockfile = false
+verify_commit_reachability = true
+allowed_actions = []       # `owner/repo@ref`, wildcards, and `!` blocks
+```
+
+`require_sha_pinning` accepts either a full commit SHA or coverage by an
+onboarded lockfile. `require_lockfile` requires each workflow to be onboarded.
+Allow entries and `!` block entries follow GitHub-style precedence, with blocks
+winning. Local (`./`, `../`, `$/`) and `docker://` references are outside the
+lockfile action policy.
+
+Boolean policy keys can be overridden with
+`PRELOOP_ACTIONS_POLICY_REQUIRE_SHA_PINNING`,
+`PRELOOP_ACTIONS_POLICY_REQUIRE_LOCKFILE`, and
+`PRELOOP_ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY`. Accepted values are
+`1|true|yes` and `0|false|no`; invalid values fail startup.
+
+
 Every field is overridable by its environment variable
 (`PRELOOP_GITHUB_APP_ID`, `PRELOOP_GITHUB_APP_PEM`,
 `PRELOOP_GITHUB_APP_MINT_FAILURE`, `PRELOOP_GITHUB_TOKEN`,
