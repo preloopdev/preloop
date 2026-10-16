@@ -164,8 +164,8 @@ preloop-runner remove --token <REMOVE_TOKEN>
 ## Quick start
 
 ```sh
-preloop init             # wizard: credentials, golden image, how to run
-preloop serve            # engine on 127.0.0.1:9090
+preloop init --mode none # configure without starting the engine
+preloop serve            # start the engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event push
 ```
