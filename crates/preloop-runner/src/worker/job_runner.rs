@@ -842,10 +842,18 @@ pub async fn run_job(
     // Upload job log (concatenation of all step logs)
     if let Some(ref rpt) = reporting {
         let mut q = queue.lock().await;
-        let all_logs = q.all_step_log_content();
+        let all_logs = match q.all_step_log_content() {
+            Ok(content) => Some(content),
+            Err(error) => {
+                warn!(%error, "Failed to assemble merged job log; skipping upload");
+                None
+            }
+        };
         drop(q);
-        if !all_logs.is_empty() {
-            upload_job_log(rpt, &all_logs).await;
+        if let Some(all_logs) = all_logs {
+            if !all_logs.is_empty() {
+                upload_job_log(rpt, &all_logs).await;
+            }
         }
     }
 

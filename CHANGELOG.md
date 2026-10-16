@@ -33,6 +33,12 @@ Releases before v0.27.0 predate the changelog.
   of inheriting Axum's 2 MiB default. Oversized requests still get a
   deterministic 413 without buffering the whole cache chunk in RAM.
 
+- **Partial merged job logs no longer hide step logs**: a failed temporary
+  log-file flush no longer produces an apparently complete but truncated
+  merged upload, and the logs endpoint falls back to the larger per-step
+  representation when one exists. This preserves mutation and other
+  heavy-step output after guest temporary-storage pressure.
+
 - **Post hooks of skipped actions no longer run**: a workflow step that did
   not run, because its `if:` was false or an earlier step failed, no longer
   runs its action's `post` hook. The official runner registers a post hook
