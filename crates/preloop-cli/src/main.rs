@@ -7,8 +7,7 @@ use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{OFFICIAL_GOLDEN, is_official_golden};
 use preloop_orchestrator::{
-    ControlPlaneHooks, Demand, RegistrationSource, RunnerPool, RunnerPoolConfig,
-    artifact_payload,
+    ControlPlaneHooks, Demand, RegistrationSource, RunnerPool, RunnerPoolConfig, artifact_payload,
 };
 use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;

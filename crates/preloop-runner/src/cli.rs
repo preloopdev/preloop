@@ -237,7 +237,10 @@ mod tests {
     #[test]
     fn version_string_contains_protocol_compat() {
         let version = Cli::command().get_version().unwrap().to_string();
-        assert!(version.contains(&format!("protocol-compat {}", crate::PROTOCOL_COMPAT_VERSION)));
+        assert!(version.contains(&format!(
+            "protocol-compat {}",
+            crate::PROTOCOL_COMPAT_VERSION
+        )));
     }
 
     #[test]

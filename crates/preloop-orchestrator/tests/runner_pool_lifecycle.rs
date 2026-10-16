@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use preloop_orchestrator::{
-    ControlPlaneHooks, Demand, DEBUG_MARKER_IDLE, JobVmDiskReserve, RegistrationSource,
-    RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig, artifact_payload, node_externals,
+    ControlPlaneHooks, DEBUG_MARKER_IDLE, Demand, JobVmDiskReserve, RUNNER_BUSY_LINE,
+    RegistrationSource, RunnerPool, RunnerPoolConfig, artifact_payload, node_externals,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
@@ -459,6 +459,7 @@ impl Fixture {
                 token_env: token_env.clone(),
             },
             control_plane_hooks: ControlPlaneHooks::default(),
+            cpus: 1,
             memory_mib: 256,
             storage_gib: 10,
             overlay_gib: None,

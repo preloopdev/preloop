@@ -6954,18 +6954,16 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--no-externals".into(),
     ]);
     let (registration_secret, registration_token_file) = match &config.registration {
-        RegistrationSource::Engine { token_env } => (
-            SecretSource::HostEnv(token_env.clone()),
-            None,
-        ),
+        RegistrationSource::Engine { token_env } => {
+            (SecretSource::HostEnv(token_env.clone()), None)
+        }
         RegistrationSource::PerVm(mint) => {
-            let token = mint
-                .mint()
-                .await
-                .map_err(|error| OrchestratorError::Pool(format!(
+            let token = mint.mint().await.map_err(|error| {
+                OrchestratorError::Pool(format!(
                     "minting registration credential for {} failed: {error}",
                     name.as_str()
-                )))?;
+                ))
+            })?;
             let directory = config
                 .runner_key_dir
                 .clone()
@@ -10475,7 +10473,10 @@ done
                     .map(|(_, value)| value)
             })
             .collect::<Vec<_>>();
-        assert!(values.len() >= 2, "expected at least two generations: {values:?}");
+        assert!(
+            values.len() >= 2,
+            "expected at least two generations: {values:?}"
+        );
         assert_ne!(values[0], values[1], "every VM needs a fresh credential");
         assert!(
             values.iter().all(|value| !value.contains("test")),

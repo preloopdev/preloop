@@ -807,7 +807,7 @@ fn deprecation_url(target: &str) -> Option<String> {
     if parsed.scheme() != "https" {
         return None;
     }
-    let mut base = parsed;
+    let mut base = parsed.clone();
     base.set_path("");
     base.set_query(None);
     base.set_fragment(None);
@@ -817,7 +817,9 @@ fn deprecation_url(target: &str) -> Option<String> {
         [org] => format!("orgs/{org}"),
         [] => String::new(),
     };
-    let scope = (!scope.is_empty()).then_some(format!("{scope}/")).unwrap_or_default();
+    let scope = (!scope.is_empty())
+        .then_some(format!("{scope}/"))
+        .unwrap_or_default();
     Some(format!(
         "{base}/api/v3/{scope}actions/runners/deprecations/{version}"
     ))
@@ -846,12 +848,10 @@ fn parse_deprecation_response(value: &serde_json::Value) -> DeprecationCheck {
         parse_field(value, "runtime_deprecates_at"),
         parse_field(value, "registration_deprecates_at"),
     ) {
-        (Ok(runtime_deprecates_at), Ok(registration_deprecates_at)) => {
-            DeprecationCheck::Known {
-                runtime_deprecates_at,
-                registration_deprecates_at,
-            }
-        }
+        (Ok(runtime_deprecates_at), Ok(registration_deprecates_at)) => DeprecationCheck::Known {
+            runtime_deprecates_at,
+            registration_deprecates_at,
+        },
         (Err(error), _) | (_, Err(error)) => DeprecationCheck::Unverified(error),
     }
 }
@@ -863,13 +863,14 @@ fn deprecation_notice(
     now: chrono::DateTime<chrono::Utc>,
     check: &DeprecationCheck,
 ) -> Option<DeprecationNotice> {
-    let DeprecationCheck::Known {
-        runtime_deprecates_at,
-        registration_deprecates_at,
-    } = check
-    else {
-        let DeprecationCheck::Unverified(reason) = check;
-        return Some(DeprecationNotice::Unverified(reason.clone()));
+    let (runtime_deprecates_at, registration_deprecates_at) = match check {
+        DeprecationCheck::Known {
+            runtime_deprecates_at,
+            registration_deprecates_at,
+        } => (runtime_deprecates_at, registration_deprecates_at),
+        DeprecationCheck::Unverified(reason) => {
+            return Some(DeprecationNotice::Unverified(reason.clone()));
+        }
     };
 
     let deadline = now + chrono::Duration::days(DEPRECATION_WARNING_DAYS);
@@ -884,10 +885,7 @@ fn deprecation_notice(
         .as_ref()
         .filter(|date| **date <= deadline)
     {
-        fields.push(format!(
-            "registration_deprecates_at={}",
-            date.to_rfc3339()
-        ));
+        fields.push(format!("registration_deprecates_at={}", date.to_rfc3339()));
     }
     (!fields.is_empty()).then(|| {
         DeprecationNotice::Warning(format!(
@@ -916,9 +914,7 @@ async fn warn_if_runner_version_deprecated(http: &HttpClient, target: &str) {
     match deprecation_notice(chrono::Utc::now(), &check) {
         Some(DeprecationNotice::Warning(message)) => warn!("{message}"),
         Some(DeprecationNotice::Unverified(reason)) => {
-            info!(
-                "runner version deprecation status is unverified (non-fatal): {reason}"
-            );
+            info!("runner version deprecation status is unverified (non-fatal): {reason}");
         }
         None => {}
     }
@@ -989,7 +985,6 @@ mod deprecation_tests {
         );
         assert!(deprecation_url("http://127.0.0.1:9191").is_none());
     }
-
 }
 
 #[cfg(all(test, unix))]
