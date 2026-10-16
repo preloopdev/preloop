@@ -33,13 +33,15 @@ Preloop normalizes workflow YAML, builds the dependency graph, expands matrices,
 
 ![Expression engine](/diagrams/05-expression-engine.svg)
 
-## Protocol and execution backends
+## Protocol and VM providers
 
-The protocol layer carries runner messages and job events. The orchestrator connects job scheduling to the configured execution substrate, including local processes, microVMs, or external runners.
+The protocol layer carries runner messages and job events. The shipped VM abstraction is `VmProvider`, with SmolVM as the default provider and AgentENV as another supported provider. Durable control-plane state uses `ControlBackend` with SQLite by default or Postgres for shared deployments.
 
 ![Protocol layer](/diagrams/06-protocol-layer.svg)
 
-![Orchestrator backends](/diagrams/07-orchestrator-backends.svg)
+The next diagram is a future design sketch, not the current implementation: `AuthProvider` and `RunnerProvider` abstractions and the process, container, Kubernetes, and cloud-VM backends shown are not shipped interfaces.
+
+![Aspirational backend design, not implemented](/diagrams/07-orchestrator-backends.svg)
 
 ## Related pages
 

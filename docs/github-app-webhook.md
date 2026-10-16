@@ -89,7 +89,7 @@ The system is configured using the following environment variables:
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
 | `PRELOOP_WEBHOOK_SECRET`            | Secret key configured on the GitHub App to verify payload signatures.                                                                        | `my-secure-webhook-secret`                 |
 | `PRELOOP_LOCAL_WORKSPACE`           | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts.                                         | `/path/to/my-repo`                         |
-| `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available. When no App is configured the PAT is also embedded as every non-fork job's `GITHUB_TOKEN`, but only when its OAuth scopes are introspected and don't exceed declared `permissions:`; otherwise it is withheld (`runs.rs`) or the run is refused. Prefer a GitHub App so tokens are minted least-privilege. | `ghp_...`                                  |
+| `PRELOOP_GITHUB_TOKEN`              | Fallback Personal Access Token for workflow retrieval, changed-file lookups, and job `GITHUB_TOKEN` when no App is configured. A PAT does not publish Check Runs; that requires a GitHub App installation token with `checks: write`. Job-token scope checks still apply. | `ghp_...`                                  |
 | `PRELOOP_GITHUB_APPS_JSON`          | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
 | `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`.                                         | `push,pull_request`                        |
 
@@ -105,8 +105,6 @@ The system is configured using the following environment variables:
 ---
 
 ## 3. Webhook signature verification (`X-Hub-Signature-256`)
-
-<!-- Trigger Webhook Event Test 2026-07-01 13:38 -->
 
 `preloop` verifies that incoming webhooks are authentic:
 
@@ -162,15 +160,17 @@ current worktree.
 
 ## 5. GitHub Checks API Reporting
 
-The system maps the lifecycle of each job to a GitHub Check Run:
+When a GitHub App is configured with `checks: write`, the system maps each
+job's lifecycle to a GitHub Check Run:
 
 1. **Queued**: When a run is accepted, a check run is created via `POST /repos/{owner}/{repo}/check-runs` with status `queued`. The check run ID is recorded in `RunRecord.job_check_run_ids`.
 2. **In Progress**: When the runner fetches and starts the job, the status is updated to `in_progress`.
 3. **Completed**: When the runner finishes (or `preloop` reaps it due to timeout/lease expiration), the check run is updated to `completed` with the corresponding conclusion (`success`, `failure`, or `cancelled`).
 
-If neither a configured GitHub App nor `PRELOOP_GITHUB_TOKEN` is available,
-these requests are simulated in-memory and logged to the console, allowing
-fully offline execution.
+GitHub's Checks API requires GitHub App authentication. A PAT is not sufficient
+to publish Check Runs; configure the App for commit and pull-request check
+reporting. Without an App installation token, jobs can still run locally, but
+Check Runs are not published to GitHub.
 
 ---
 
@@ -213,7 +213,7 @@ or trigger any other subscribed event. `preloop` will:
 - Fetch the workflows.
 - Match filters (branches, tags, paths).
 - Queue jobs for any registered runners matching `runs-on` labels.
-- Create check runs on GitHub.
+- Create Check Runs on GitHub when the GitHub App has `checks: write`.
 
 ---
 
@@ -255,9 +255,9 @@ or trigger any other subscribed event. `preloop` will:
    # Or: export PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/preloop-app.pem
   ```
 
-   When these values are set, preloop signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `PRELOOP_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. See [GitHub Tokens](./github-tokens.md).
+   When these values are set, preloop signs a GitHub App JWT and exchanges it for a per-job installation access token scoped to the run's repository and to that job's effective `permissions:`. A job declaring no `permissions:` gets GitHub's restricted default (`contents`, `metadata`, `packages` at `read`), never the installation's full grant. If no App configuration is present at all, `PRELOOP_GITHUB_TOKEN` is the job token. If an App *is* configured but minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` decides — `local` (the default) keeps the job on the local HMAC JWT rather than silently widening its authority to the PAT. Published Check Runs still require a GitHub App installation token with `checks: write`; a PAT may support other GitHub API calls but does not publish Checks API runs. See [GitHub Tokens](./github-tokens.md).
 6. **Confirm delivery and job credential use**:
-Push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. For remote workflow retrieval and GitHub Check Run reporting, preloop selects the configured GitHub App credentials; `PRELOOP_GITHUB_TOKEN` is used only as the fallback when no App is available. App-only deployments do not need to provide a PAT for these server-side calls.
+Push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. The installed App's scoped token is supplied to the runner job. For Check Run reporting, preloop uses a GitHub App installation token with `checks: write`; `PRELOOP_GITHUB_TOKEN` can be used for workflow retrieval and other supported API calls, but is not a Check Runs credential. App-only deployments do not need to provide a PAT for these server-side calls.
 
 ---
 

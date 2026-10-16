@@ -268,9 +268,10 @@ export PRELOOP_GITHUB_TOKEN="github_pat_..."
 - Classic PATs are the only kind whose bounds can be introspected
   (`X-OAuth-Scopes`); a fine-grained PAT's bounds are unverifiable, so it is
   withheld from jobs — use a GitHub App instead.
-- The same `PRELOOP_GITHUB_TOKEN` is also used server-side for Check Run
-  create/update, remote workflow fetching, and pull-request changed-file
-  lookups. With it unset, check runs are simulated in-memory and logged instead.
+- `PRELOOP_GITHUB_TOKEN` is used server-side for remote workflow fetching and
+  pull-request changed-file lookups. Published Check Runs require a GitHub App
+  installation token with `checks: write`; a PAT is not sufficient for the
+  Checks API. Without an App token, Check Runs are not published to GitHub.
 
 ---
 

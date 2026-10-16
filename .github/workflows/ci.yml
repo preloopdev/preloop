@@ -227,6 +227,8 @@ jobs:
             | tee "$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
         env:
           RUSTFLAGS: "-A warnings"
+          # Test tempdirs must land on the runner's disk-backed scratch volume.
+          TMPDIR: ${{ runner.temp }}
       - name: Shard failure summary
         if: failure()
         run: |

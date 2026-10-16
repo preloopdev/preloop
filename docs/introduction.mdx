@@ -7,7 +7,7 @@ Preloop runs your existing GitHub Actions workflows on hardware-isolated microVM
 
 The engine speaks the official `actions/runner` protocol. The official runner can register, poll for jobs, execute them, and report results against Preloop. Preloop also includes a Rust runner that installs 36× smaller and uses up to 19× less peak memory in the published comparison.
 
-When a job fails, Preloop can preserve the live job environment for inspection and repair. Attach with `preloop dap <run-id>` to inspect runtime context, fix the source, and retry from the failed step instead of rerunning the whole workflow.
+For a failed step, run with `preloop run --debug` and attach with `preloop debug <run-id>` to inspect the paused session and retry from that step. If you use `--preserve-on-failure` instead, inspect the retained VM with `preloop shell`.
 
 Preloop is in beta. Source code and releases are available on [GitHub](https://github.com/preloopdev/preloop).
 

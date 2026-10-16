@@ -204,15 +204,16 @@ Classic (`ghp_…`) and OAuth (`gho_…`) tokens **work but are warned against**
 they carry every scope the account has. The wizard refuses nothing but tells
 you what you are doing.
 
-Decide first whether you need webhooks:
+Decide whether you need inbound webhooks:
 
-- Just running CI that talks to GitHub (checkout, `gh`, `GITHUB_TOKEN`,
-  API steps): create the App and stop there. No public address is needed;
-  you start runs yourself with `preloop run`.
-- Check runs on GitHub (the checks on commits and pull requests): you also
-  need webhooks, and webhooks need a publicly accessible HTTP address for
-  the engine. This applies to laptops too, not just servers: a tunnel from
-  your machine is enough.
+- To run CI that talks to GitHub (checkout, `gh`, `GITHUB_TOKEN`, API steps),
+  start runs yourself with `preloop run`; no public address is needed.
+- To publish Check Runs on GitHub commits, use a GitHub App with the `checks`
+  permission. This is an outbound API call, so manual runs do not require a
+  public address or webhooks.
+- To start runs automatically from `push` or `pull_request` events, configure
+  webhook delivery with `--public-url`; GitHub needs a publicly reachable
+  address for the engine. A tunnel works for a laptop.
 
 The App and its webhook are one object; the webhook only adds GitHub's
 ability to call you. You can enable it later with `--public-url`, so
@@ -292,9 +293,9 @@ checkbox, so an App created without `--public-url` needs that ticked once in
 its settings.
 
 Already have an App or your org blocks manifest creation? Create it by hand
-at <https://github.com/settings/apps/new> (name it, leave webhooks off,
-download the PEM), install it on the accounts whose repos you run at
-<https://github.com/apps/YOUR-APP/installations/new>, then:
+at [GitHub App settings](https://github.com/settings/apps/new) (name it, leave webhooks off,
+download the PEM), install it on the accounts whose repos you run at the
+[GitHub App installations page](https://github.com/apps/YOUR-APP/installations/new), then:
 
 ```sh
 preloop setup github --via app --app-id 123456 --pem-file app.pem

@@ -3,8 +3,8 @@
   "theme": "mint",
   "name": "Preloop",
   "colors": {
-    "primary": "#0485F7",
-    "light": "#0485F7",
+    "primary": "#0067C5",
+    "light": "#0067C5",
     "dark": "#0485F7"
   },
   "logo": {
@@ -66,7 +66,7 @@
       },
       {
         "group": "Demos",
-        "pages": ["demo/dap/README", "demo/dap/agent-prompt"]
+        "pages": ["demo/dap/readme", "demo/dap/agent-prompt"]
       }
     ]
   }

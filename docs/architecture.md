@@ -35,20 +35,17 @@ TOML specs, and replays golden wire captures for protocol conformance.
 
 ## Pluggable backends
 
-preloop is execution-agnostic. The only thing that differs between runner hosts
-is how a runner instance is created and destroyed. This is modeled as the
-`preloop_vm::VmProvider` trait (crates/preloop-vm/src/lib.rs:349); the
-`ControlBackend` trait (control/backend.rs) covers durable state. (The `RunnerProvider`/`AuthProvider`
-design in fidelity-gap §4 is aspirational.)
+The shipped extension points are `ControlBackend` for durable control-plane
+state and `VmProvider` for VM provisioning. `ControlBackend` has SQLite as the
+default and Postgres for shared deployments; `VmProvider` currently supports
+SmolVM (the default) and AgentENV. See [State Model](#state-model) and [VM
+substrates](/vm-substrates).
 
-- `**ControlBackend**` — durable control-plane state behind one trait: SQLite
-  (default) or Postgres (shared nodes). See [State Model](#state-model).
-- `**AuthProvider**` — loopback-trust (local) or OAuth plus bearer tokens
-  (system token or minted job JWTs).
-- `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
-cloud VM, k8s pod, bare BYO). Optional — preloop works with external runners.
-
-See [fidelity-gap.md §4](fidelity-gap.md) for the full design.
+The `AuthProvider` and `RunnerProvider` interfaces, plus process, container,
+Kubernetes, cloud-VM, and bare-BYO runner providers described in
+[fidelity-gap.md §4](fidelity-gap.md), are aspirational design ideas and are
+not implemented by the shipped system. This page and the architecture diagrams
+label them as such.
 
 ## State Model
 
