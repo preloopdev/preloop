@@ -3180,7 +3180,10 @@ async fn pr_head_commit_skips_ci(
                     (Some(token), bucket)
                 }
                 Err(error) => {
-                    warn!(?error, "failed to mint token for [skip ci] check; running CI");
+                    warn!(
+                        ?error,
+                        "failed to mint token for [skip ci] check; running CI"
+                    );
                     return false;
                 }
             }
@@ -3208,7 +3211,10 @@ async fn pr_head_commit_skips_ci(
     {
         Ok(response) => response,
         Err(error) => {
-            warn!(?error, "failed to fetch PR head commit for [skip ci] check; running CI");
+            warn!(
+                ?error,
+                "failed to fetch PR head commit for [skip ci] check; running CI"
+            );
             return false;
         }
     };
@@ -4663,7 +4669,10 @@ async fn process_delivery_payload_with_lease(
     // (both the pull_request_target and pull_request fan-out). Fork PRs are
     // never eligible — untrusted code cannot opt itself out of scrutiny. This
     // runs before the changed-files lookup so a skipped PR burns no API call.
-    if matches!(delivery.event.as_str(), "pull_request" | "pull_request_target") {
+    if matches!(
+        delivery.event.as_str(),
+        "pull_request" | "pull_request_target"
+    ) {
         let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_owned());
         if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, &api_base).await {
@@ -6044,7 +6053,15 @@ mod tests {
         // newer head and offers no merge this payload could use.
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let polls_for_stub = polls.clone();
+        let head_for_stub = head.clone();
         let (api, requests) = start_github_stub(move |_method, path, _body| {
+            if path == format!("/repos/owner/repo/commits/{head_for_stub}") {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({"commit": {"message": "regular change"}}),
+                );
+            }
             if path == "/repos/owner/repo/pulls/42" {
                 polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return (
@@ -6106,12 +6123,16 @@ mod tests {
             polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
             "a head the API never offers a merge for is polled through the budget, not decided on first sight"
         );
-        assert!(
-            !requests
-                .lock()
-                .iter()
-                .any(|(_, path, _)| path.contains("/commits/")),
-            "the API offers no merge of this head to verify"
+        let commit_paths: Vec<String> = requests
+            .lock()
+            .iter()
+            .filter(|(_, path, _)| path.contains("/commits/"))
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            commit_paths,
+            vec![format!("/repos/owner/repo/commits/{head}")],
+            "only the head commit is fetched for [skip ci] evaluation"
         );
     }
 
@@ -7371,7 +7392,9 @@ mod tests {
         .await;
         let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let shared = poll_only_shared(&temp, Duration::from_secs(1)).await;
+        // Leave wall time for the stub request when nextest is CPU-contended;
+        // the 20ms poll interval still exercises the retry budget.
+        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
         let slots = shared.state.fresh_merge_poll_slots.clone();
         let total = slots.available_permits();
         assert!(
