@@ -218,6 +218,9 @@ fn run(target: &Target) {
     // runner guests' temp is one). cargo-mutants deletes them on exit.
     let scratch = root.join("target").join("mutants-tmp").join(target.id);
     fs::create_dir_all(&scratch).expect("create mutation scratch dir");
+    // cargo-mutants writes its report into this directory but does not create
+    // the parent chain.
+    fs::create_dir_all(&out).expect("create mutants.out target directory");
 
     let pg_url = std::env::var("PRELOOP_TEST_POSTGRES_URL").ok();
     let mut cmd = Command::new("cargo");
