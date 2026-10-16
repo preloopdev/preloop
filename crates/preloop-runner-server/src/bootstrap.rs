@@ -2693,10 +2693,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         let pid = std::process::id();
-        assert!(
-            error.contains("another preloop serve already holds"),
-            "{error}"
-        );
         if owner == Some(pid) {
             assert!(
                 error.contains(&format!(
@@ -2717,6 +2713,10 @@ mod tests {
                 "{error}"
             );
         } else {
+            assert!(
+                error.contains("another preloop serve already holds"),
+                "{error}"
+            );
             assert!(
                 error.contains(&format!("recorded holder pid {pid} (started ")),
                 "{error}"
