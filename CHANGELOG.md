@@ -23,6 +23,11 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Runner configure/remove match GitHub registration APIs** (#627):
+  runner-group names resolve to their self-hosted pools, removal uses a
+  remove-scoped credential and the distributed-task agent endpoint, and the
+  server's FIPS property is persisted with its actual boolean value.
+
 - **A GitHub App's private key survives an OS keychain failure.** With
   `credential_store = "os"`, an unavailable keychain or a refused write now
   stores the credential in the file store, prints a warning naming the
