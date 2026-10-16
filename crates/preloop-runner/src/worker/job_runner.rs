@@ -850,10 +850,10 @@ pub async fn run_job(
             }
         };
         drop(q);
-        if let Some(all_logs) = all_logs {
-            if !all_logs.is_empty() {
-                upload_job_log(rpt, &all_logs).await;
-            }
+        if let Some(all_logs) = all_logs
+            && !all_logs.is_empty()
+        {
+            upload_job_log(rpt, &all_logs).await;
         }
     }
 
