@@ -10,7 +10,8 @@
 //!     --ignored --exact t1_job_binding_lifecycle --nocapture
 //! ```
 //!
-//! Reports land in `mutants.out/<target>/` (`missed.txt` lists survivors).
+//! Reports land in `mutants.out/<target>/mutants.out/` (`missed.txt` lists
+//! survivors); `t3` merges its three package-scoped sub-runs there.
 //!
 //! Both the lite and the Postgres-backed `control/pg/` implementations are
 //! mutated. The pg suites use `PRELOOP_TEST_POSTGRES_URL` when it is set (each
@@ -18,6 +19,13 @@
 //! a disposable cluster from `initdb`; the tests refuse to run when neither is
 //! available, because a skipped pg suite would make every `control/pg` mutant
 //! survive and drown the real gaps.
+//!
+//! Per-mutant test runs are scoped to the test targets listed in `Target::tests`
+//! instead of the whole package suite: those are the targets that exercise the
+//! scoped functions, and running the rest per mutant only adds hours. The one
+//! failure mode is over-reporting a gap — a mutant killed only by a test target
+//! outside the list would show up as missed — so survivors are checked against
+//! the code before conclusions are drawn.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,8 +34,8 @@ use std::time::Instant;
 
 /// Process-global variables read by the test suites. An ambient value changes
 /// test behavior (see `preloop-runner-server`'s `state.rs` guards), so they are
-/// stripped from the mutation run and only the Postgres URL is restored when
-/// the caller opted into pg coverage.
+/// stripped from the mutation run and only the Postgres settings are restored
+/// when the caller provided them.
 const SCOPED_ENV: [&str; 7] = [
     "PRELOOP_GITHUB_TOKEN",
     "PRELOOP_GITHUB_API_URL",
@@ -46,7 +54,7 @@ const INITDB_DIRS: [&str; 3] = [
     "/usr/local/bin",
 ];
 
-/// One mutation-testing target: a package/file scope narrowed by a regex over
+/// One mutation-testing sub-run: a package/file scope narrowed by a regex over
 /// the mutant names that `cargo mutants --list` shows.
 struct Target {
     /// Report directory name under `mutants.out/` and scratch dir name.
@@ -56,6 +64,9 @@ struct Target {
     /// Mutants to drop: process-, network- or VM-bound code that host tests
     /// cannot kill, so keeping it would only add noise to the survival rate.
     exclude_re: &'static str,
+    /// Arguments forwarded to `cargo test` for the mutated package, selecting
+    /// the test targets that cover this scope (see the module docs).
+    tests: &'static [&'static str],
 }
 
 const T1: Target = Target {
@@ -85,6 +96,17 @@ const T1: Target = Target {
         "claim_one|claim_candidate|on_job_enqueued|clear_assignment|runner_matches|sweep_stale_bindings|requeue_claimed",
     ],
     exclude_re: "^$",
+    tests: &[
+        "--lib",
+        "--test",
+        "concurrency",
+        "--test",
+        "webhooks",
+        "--test",
+        "registration",
+        "--test",
+        "broker",
+    ],
 };
 
 const T2: Target = Target {
@@ -102,33 +124,74 @@ const T2: Target = Target {
         "verify_signature|decode_hex|claimed_repository|webhook_retry_backoff|handle_github_webhook|adapter_for|make_default_branch_events",
     ],
     exclude_re: "all_event_names|send_github_check_request|resolve_repo_token|resolve_check_run_token|find_existing_check_run|report_check_run_queued|report_existing_check_run_queued|ensure_check_run_mapped|drain_check_run_sender|github_api_base",
+    tests: &[
+        "--lib",
+        "--test",
+        "broker",
+        "--test",
+        "registration",
+        "--test",
+        "webhooks",
+    ],
 };
 
-const T3: Target = Target {
-    id: "T3",
+/// Waitlist ordering (runner-server half of T3).
+const T3A: Target = Target {
+    id: "T3a",
     args: &[
         "--package",
         "preloop-runner-server",
-        "--package",
-        "preloop-orchestrator",
-        "--package",
-        "preloop-cli",
         "--features",
-        "preloop-runner-server/test-support",
+        "test-support",
         "--file",
         "crates/preloop-runner-server/src/control/logic.rs",
         "--file",
         "crates/preloop-runner-server/src/control/lite/lifecycle.rs",
         "--file",
         "crates/preloop-runner-server/src/control/pg/lifecycle.rs",
-        "--file",
-        "crates/preloop-orchestrator/src/lib.rs",
+        "--re",
+        "claim_preference|job_labels_covered_exactly|pair_runner",
+    ],
+    exclude_re: "^$",
+    tests: &[
+        "--lib",
+        "--test",
+        "webhooks",
+        "--test",
+        "registration",
+        "--test",
+        "broker",
+    ],
+};
+
+/// Warm-pool sizing (CLI half of T3).
+const T3B: Target = Target {
+    id: "T3b",
+    args: &[
+        "--package",
+        "preloop-cli",
         "--file",
         "crates/preloop-cli/src/main.rs",
         "--re",
-        "claim_preference|job_labels_covered_exactly|pair_runner|host_runner_pool_size|on_demand_memory_cap|host_vm_capacity",
+        "host_runner_pool_size",
     ],
-    exclude_re: "host_memory_mib|local_runner_pool_config|run_on_demand|golden_budget|wait_for_|ensure_host_externals|preload_images|ensure_golden_payload",
+    exclude_re: "host_memory_mib|local_runner_pool_config",
+    tests: &["--lib"],
+};
+
+/// On-demand memory cap (orchestrator half of T3).
+const T3C: Target = Target {
+    id: "T3c",
+    args: &[
+        "--package",
+        "preloop-orchestrator",
+        "--file",
+        "crates/preloop-orchestrator/src/lib.rs",
+        "--re",
+        "on_demand_memory_cap|host_vm_capacity",
+    ],
+    exclude_re: "host_memory_mib|run_on_demand|golden_budget|wait_for_|ensure_host_externals|preload_images|ensure_golden_payload",
+    tests: &["--lib", "--test", "runner_pool_lifecycle"],
 };
 
 const T4: Target = Target {
@@ -158,6 +221,9 @@ const T4: Target = Target {
         "build_operational_snapshot_sync|read_snapshot_inputs|sample_state_once|count_run_statuses|status_inputs|list_runners|\\bqueue_stats\\b",
     ],
     exclude_re: "run_state_sampler|publish_snapshot|collect_storage_components",
+    tests: &[
+        "--lib", "--test", "broker", "--test", "logs", "--test", "runs_api", "--test", "recovery",
+    ],
 };
 
 const T5: Target = Target {
@@ -171,6 +237,7 @@ const T5: Target = Target {
         "env_flag|parse_flag|logs_query",
     ],
     exclude_re: "cmd_engine|cmd_build_golden|cmd_logs|local_runner_pool_config|fetch_run_job_logs|follow_run_logs",
+    tests: &["--lib"],
 };
 
 /// Job/binding lifecycle: claim gating, assignment exclusivity, stale-binding
@@ -178,49 +245,39 @@ const T5: Target = Target {
 #[test]
 #[ignore = "hours: run one target at a time, see module docs"]
 fn t1_job_binding_lifecycle() {
-    run(&T1);
+    run_target_set("T1", &[&T1]);
 }
 
 /// GitHub webhook HMAC verification (`X-Hub-Signature-256`) and event dispatch.
 #[test]
 #[ignore = "hours: run one target at a time, see module docs"]
 fn t2_webhook_signature() {
-    run(&T2);
+    run_target_set("T2", &[&T2]);
 }
 
 /// Pool/waitlist ordering and warm-pool sizing across server, orchestrator, CLI.
 #[test]
 #[ignore = "hours: run one target at a time, see module docs"]
 fn t3_pool_warm_sizing() {
-    run(&T3);
+    run_target_set("T3", &[&T3A, &T3B, &T3C]);
 }
 
 /// Queue depth and run-status aggregation behind `preloop status`.
 #[test]
 #[ignore = "hours: run one target at a time, see module docs"]
 fn t4_queue_status_aggregation() {
-    run(&T4);
+    run_target_set("T4", &[&T4]);
 }
 
 /// CLI argument parsing helpers and their boolean/filter parsing.
 #[test]
 #[ignore = "hours: run one target at a time, see module docs"]
 fn t5_cli_parsing() {
-    run(&T5);
+    run_target_set("T5", &[&T5]);
 }
 
-fn run(target: &Target) {
+fn run_target_set(id: &str, targets: &[&Target]) {
     let root = workspace_root();
-    let out = root.join("mutants.out").join(target.id);
-    // Scratch trees live under target/ — same filesystem as the workspace,
-    // gitignored, and on real disk even when $TMPDIR is a small tmpfs (the
-    // runner guests' temp is one). cargo-mutants deletes them on exit.
-    let scratch = root.join("target").join("mutants-tmp").join(target.id);
-    fs::create_dir_all(&scratch).expect("create mutation scratch dir");
-    // cargo-mutants writes its report into this directory but does not create
-    // the parent chain.
-    fs::create_dir_all(&out).expect("create mutants.out target directory");
-
     let pg_url = std::env::var("PRELOOP_TEST_POSTGRES_URL").ok();
     let pg_required = std::env::var("PRELOOP_TEST_REQUIRE_POSTGRES").ok();
     if pg_url.is_none() {
@@ -234,13 +291,89 @@ fn run(target: &Target) {
              or install one (initdb must be discoverable)"
         );
     }
+
+    let started = Instant::now();
+    let mut merged = std::collections::BTreeMap::from([
+        ("caught", String::new()),
+        ("missed", String::new()),
+        ("timeout", String::new()),
+        ("unviable", String::new()),
+    ]);
+    let mut exit_ok = true;
+    for target in targets {
+        let outcome = run_sub(
+            root.as_path(),
+            target,
+            pg_url.as_deref(),
+            pg_required.as_deref(),
+        );
+        let report = root.join("mutants.out").join(target.id).join("mutants.out");
+        for kind in ["caught", "missed", "timeout", "unviable"] {
+            let text = fs::read_to_string(report.join(format!("{kind}.txt"))).unwrap_or_default();
+            merged.get_mut(kind).unwrap().push_str(&text);
+        }
+        exit_ok &= outcome;
+    }
+
+    // Merged report, so every target's summary step reads the same layout.
+    let merged_dir = root.join("mutants.out").join(id).join("mutants.out");
+    fs::create_dir_all(&merged_dir).expect("create merged report directory");
+    for (kind, text) in &merged {
+        fs::write(merged_dir.join(format!("{kind}.txt")), text).expect("write merged report");
+    }
+
+    let summary = merged
+        .iter()
+        .map(|(kind, text)| {
+            format!(
+                "{kind}={}",
+                text.lines().filter(|line| !line.trim().is_empty()).count()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "mutation target {id}: {summary} in {:.1?} ({})",
+        started.elapsed(),
+        if exit_ok {
+            "clean exit"
+        } else {
+            "cargo mutants failed"
+        }
+    );
+
+    let missed = merged["missed"].clone();
+    assert!(
+        missed.trim().is_empty(),
+        "target {id}: surviving mutants (no test failed with them applied):\n{missed}"
+    );
+    assert!(exit_ok, "target {id}: cargo mutants exited with an error");
+}
+
+/// Runs one cargo-mutants sub-run. Returns whether cargo-mutants exited
+/// cleanly; the report is read back from `mutants.out/<id>/mutants.out/`.
+fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Option<&str>) -> bool {
+    let out = root.join("mutants.out").join(target.id);
+    // Scratch trees live under target/ — same filesystem as the workspace,
+    // gitignored, and on real disk even when $TMPDIR is a small tmpfs (the
+    // runner guests' temp is one). cargo-mutants deletes them on exit.
+    let scratch = root.join("target").join("mutants-tmp").join(target.id);
+    fs::create_dir_all(&scratch).expect("create mutation scratch dir");
+    // cargo-mutants writes its report into this directory but does not create
+    // the parent chain.
+    fs::create_dir_all(&out).expect("create mutants.out target directory");
+
     let mut cmd = Command::new("cargo");
-    cmd.args(["mutants", "--baseline", "run", "--test-tool", test_tool()])
+    cmd.args(["mutants", "--baseline", "run"])
         .args(["--exclude-re", target.exclude_re])
         .arg("--output")
         .arg(&out)
         .args(target.args)
-        .current_dir(&root)
+        // Scoping the per-mutant test run: only these test targets are built
+        // and run for each mutant (see the module docs).
+        .arg("--")
+        .args(target.tests)
+        .current_dir(root)
         .env("TMPDIR", &scratch)
         // Keep test runs deterministic and bounded, like ci.yml's fast shards.
         .env("PROPTEST_CASES", "8")
@@ -257,60 +390,31 @@ fn run(target: &Target) {
     }
 
     eprintln!(
-        "mutation target {}: cargo mutants {}",
+        "mutation sub-run {}: cargo mutants {} -- {}",
         target.id,
-        target.args.join(" ")
+        target.args.join(" "),
+        target.tests.join(" ")
     );
     let started = Instant::now();
     let status = cmd
         .status()
         .expect("failed to start cargo mutants; install it with `brew install cargo-mutants`");
-    let elapsed = started.elapsed();
-
-    // cargo-mutants nests its report at `<output>/mutants.out/`.
     let report = out.join("mutants.out");
-    let counts: Vec<(String, usize)> = ["caught", "missed", "timeout", "unviable"]
-        .iter()
-        .map(|kind| {
-            let n = fs::read_to_string(report.join(format!("{kind}.txt")))
-                .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
-                .unwrap_or(0);
-            ((*kind).to_string(), n)
-        })
-        .collect();
-    let summary = counts
-        .iter()
-        .map(|(kind, n)| format!("{kind}={n}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    eprintln!(
-        "mutation target {}: {} in {:.1?} (cargo mutants exit {})",
-        target.id,
-        summary,
-        elapsed,
-        status
-            .code()
-            .map_or_else(|| "signal".to_string(), |c| c.to_string())
-    );
-
     assert!(
         report.join("outcomes.json").exists(),
-        "target {}: cargo-mutants produced no report in {}",
+        "sub-run {}: cargo-mutants produced no report in {}",
         target.id,
         report.display()
     );
-    let missed = fs::read_to_string(report.join("missed.txt")).unwrap_or_default();
-    assert!(
-        missed.trim().is_empty(),
-        "target {}: surviving mutants (no test failed with them applied):\n{}",
+    eprintln!(
+        "mutation sub-run {}: cargo mutants exit {} in {:.1?}",
         target.id,
-        missed
+        status
+            .code()
+            .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+        started.elapsed()
     );
-    assert!(
-        status.success(),
-        "target {}: cargo mutants exited without survivors listed in missed.txt",
-        target.id
-    );
+    status.success()
 }
 
 /// Whether the pg suites can bootstrap their disposable clusters here.
@@ -331,16 +435,4 @@ fn workspace_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("workspace root")
-}
-
-/// The mutation runs execute the affected package's suite per mutant; nextest
-/// is faster at that than plain `cargo test`, and CI installs it, but fall back
-/// so the tests stay runnable in a bare checkout.
-fn test_tool() -> &'static str {
-    let nextest = Command::new("cargo")
-        .args(["nextest", "--version"])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false);
-    if nextest { "nextest" } else { "cargo" }
 }
