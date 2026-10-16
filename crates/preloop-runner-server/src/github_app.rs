@@ -534,7 +534,10 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let store = crate::credential_store::store_from_env(&cred_base);
+            let store = crate::credential_store::selected_store(
+                &cred_base,
+                file_config.credential_store.as_deref(),
+            )?;
             let store = store.as_ref();
             for app in &mut env_apps {
                 if let Some(reference) = &app.pem_ref
@@ -1044,7 +1047,7 @@ pub fn sign_app_jwt(app_id: &str, key: &rsa::RsaPrivateKey) -> anyhow::Result<St
     });
     let signing_input = format!("{}.{}", base64_json(&header)?, base64_json(&claims)?);
     let signature = SigningKey::<Sha256>::new(key.clone())
-        .sign_with_rng(&mut rand::thread_rng(), signing_input.as_bytes());
+        .sign_with_rng(&mut rsa::rand_core::OsRng, signing_input.as_bytes());
     Ok(format!(
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(signature.to_bytes())
@@ -1898,7 +1901,7 @@ mod tests {
     use super::*;
 
     fn test_key() -> rsa::RsaPrivateKey {
-        rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("generate test RSA key")
+        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate test RSA key")
     }
 
     #[test]
@@ -2129,7 +2132,7 @@ mod tests {
                 }),
             )
             .route(
-                "/app/installations/:installation_id/access_tokens",
+                "/app/installations/{installation_id}/access_tokens",
                 post(
                     move |Path(installation_id): Path<u64>,
                           headers: HeaderMap,
@@ -2345,7 +2348,7 @@ mod tests {
                 get(|| async { Json(json!([{ "id": 77, "account": { "login": "preloop" } }])) }),
             )
             .route(
-                "/app/installations/:installation_id/access_tokens",
+                "/app/installations/{installation_id}/access_tokens",
                 post(move |Json(body): Json<serde_json::Value>| {
                     let calls = Arc::clone(&calls);
                     async move {

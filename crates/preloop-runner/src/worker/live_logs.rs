@@ -5,7 +5,7 @@
 //! normal step-log blob upload remains the durable source of truth.
 
 use futures::SinkExt;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -341,7 +341,7 @@ impl WebSocketSender {
                         return false;
                     }
                 };
-                self.ws.send(Message::Text(payload)).await.is_ok()
+                self.ws.send(Message::Text(payload.into())).await.is_ok()
             };
             if sent {
                 return true;
@@ -410,7 +410,7 @@ async fn connect_websocket(
 }
 
 async fn random_backoff() {
-    let delay_ms = rand::thread_rng().gen_range(100..500);
+    let delay_ms = rand::rng().random_range(100..500);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
 

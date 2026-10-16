@@ -832,7 +832,7 @@ mod tests {
     /// 2048-bit key generation costs about a second; every test in this
     /// module only needs *a* valid key, so it is generated once.
     static TEST_KEY: std::sync::LazyLock<rsa::RsaPrivateKey> = std::sync::LazyLock::new(|| {
-        rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("test key")
+        rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("test key")
     });
 
     #[derive(Clone)]
@@ -904,7 +904,7 @@ mod tests {
                 }),
             )
             .route(
-                "/app/hook/deliveries/:id/attempts",
+                "/app/hook/deliveries/{id}/attempts",
                 post(|State(state): State<StubState>| async move {
                     state.attempts.fetch_add(1, Ordering::SeqCst);
                     (axum::http::StatusCode::ACCEPTED, Json(json!({})))

@@ -39,20 +39,24 @@ pub struct AzdoReportingContext {
     pub timeline_id: String,
 }
 
-/// The OAuth token the worker presents for renew/complete/reporting.
+/// The job-scoped token the worker presents for renew/complete/reporting: the
+/// `SystemVssConnection` `AccessToken` carried by the job message.
 ///
-/// The server mints runner OAuth tokens with a ~50-minute TTL
-/// (`PRELOOP_TOKEN_TTL_SECS`, default 2999s). The listener refreshes its own
-/// copy proactively, but the worker is a separate process spawned with the
-/// token frozen into the job message — so a job that runs past the TTL loses
-/// its lease the moment the token expires: renewjob 401s forever and the
-/// final completejob 401s too, leaving the run stuck `in_progress` with a
-/// pinned VM.
+/// It is minted once per attempt and cannot be exchanged for another while the
+/// job runs: the one credential the worker can re-acquire on its own — the
+/// runner listen token, through the client-credentials exchange below — is
+/// refused on the job-lifecycle routes by design (`broker.rs`
+/// `authenticated_runner_id_for_job` answers 403), so the server mints this
+/// token to outlive the attempt (the six-hour job limit plus the queue and
+/// pause allowance the server bounds jobs by). A token that expires mid-job
+/// takes the lease with it: `renewjob` 401s, the reaper fails the job three
+/// minutes later, and the still-running step's output never reaches the
+/// durable step log.
 ///
 /// The official runner renews from the listener, which holds a live token.
-/// Preloop's renew loop lives in the worker, so the worker re-acquires the
-/// token itself through the same client-credentials exchange the listener
-/// uses — the runner root it was configured from is its current directory.
+/// Preloop's renew loop lives in the worker, so the worker re-acquires a token
+/// itself through the same client-credentials exchange the listener uses — the
+/// runner root it was configured from is its current directory.
 #[derive(Clone)]
 pub struct LiveToken {
     inner: Arc<std::sync::Mutex<LiveTokenInner>>,
@@ -838,9 +842,17 @@ pub async fn run_job(
     // Upload job log (concatenation of all step logs)
     if let Some(ref rpt) = reporting {
         let mut q = queue.lock().await;
-        let all_logs = q.all_step_log_content();
+        let all_logs = match q.all_step_log_content() {
+            Ok(content) => Some(content),
+            Err(error) => {
+                warn!(%error, "Failed to assemble merged job log; skipping upload");
+                None
+            }
+        };
         drop(q);
-        if !all_logs.is_empty() {
+        if let Some(all_logs) = all_logs
+            && !all_logs.is_empty()
+        {
             upload_job_log(rpt, &all_logs).await;
         }
     }
@@ -981,11 +993,13 @@ fn spawn_renew_loop(
                 "jobId": rpt.job_id,
             });
 
-            // The server-issued OAuth token expires mid-job (default TTL
-            // 2999s). Refresh proactively before it does; a stale token makes
-            // renewjob 401 forever and the run hangs `in_progress` with a
-            // pinned VM. A refresh failure is not fatal — renew with what we
-            // have and let the 401 path retry.
+            // Renewal is only as durable as the job runtime token's lifetime:
+            // the route accepts that token and refuses a runner listen token,
+            // and the exchange below can only obtain the latter. The server
+            // mints the runtime token to outlive the attempt for exactly this
+            // reason; the 401 path stays as a recovery for a token that was
+            // truncated some other way (and re-acquiring is still worth a try
+            // before the lease goes stale).
             if rpt.access_token.due_for_refresh() {
                 match refresh_worker_oauth_token().await {
                     Some((fresh, refresh_at)) => {
@@ -1080,7 +1094,7 @@ fn spawn_renew_loop(
                         // Sec-WebSocket-Key (random), Sec-WebSocket-Version: 13
                         use base64::Engine;
                         let mut nonce = [0u8; 16];
-                        rand::Rng::fill(&mut rand::thread_rng(), &mut nonce);
+                        rand::RngExt::fill(&mut rand::rng(), &mut nonce);
                         let ws_key = base64::engine::general_purpose::STANDARD.encode(nonce);
                         http.client_for(&results_ws)
                             .get(&results_ws)
@@ -1238,8 +1252,8 @@ async fn first_renew_gate(
                     _ = tokio::time::sleep(match timing.first_renew_backoff {
                         RenewBackoff::Fixed(delay) => delay,
                         RenewBackoff::Official => {
-                            Duration::from_secs(rand::Rng::gen_range(
-                                &mut rand::thread_rng(),
+                            Duration::from_secs(rand::RngExt::random_range(
+                                &mut rand::rng(),
                                 1..=10,
                             ))
                         }
@@ -1332,7 +1346,7 @@ fn renew_backoff(encountering_error: u32) -> Duration {
     } else {
         (5, 15)
     };
-    Duration::from_secs(rand::Rng::gen_range(&mut rand::thread_rng(), min..=max))
+    Duration::from_secs(rand::RngExt::random_range(&mut rand::rng(), min..=max))
 }
 
 fn parse_lease_deadline(value: &str) -> Option<DateTime<Utc>> {

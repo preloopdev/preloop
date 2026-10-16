@@ -42,6 +42,24 @@ stock bake, so the label keeps the configured image (the official golden when
 nothing is configured) instead of silently selecting a 24.04 one. `ubuntu-slim`
 has no separate slim image either, and resolves the same way.
 
+### Ubuntu 26.04
+
+GitHub currently provides `ubuntu-26.04` and `ubuntu-26.04-arm` as
+GitHub-hosted labels, but preloop's official path is still a 24.04 guest.
+The `ubuntu-latest` alias is also currently 24.04; an alias move to 26.04
+needs the same golden migration rather than silently changing the guest.
+The checked-in image pins, runtime probes, packed artifact names, and
+release/OCI lookup code all describe the 24.04 golden. A workflow that asks
+for `ubuntu-26.04` therefore MUST NOT be treated as 26.04 parity by the
+default preloop pool; a configured custom image MAY serve it, as with any
+Linux hosted label.
+
+Moving the official path to 26.04 requires new per-architecture image pins,
+runtime probes, packed goldens and release assets, plus resolver and
+documentation updates. Changing a `runs-on` label or the standalone runner
+container base alone is not sufficient. Release workflows stay on the
+supported `ubuntu-24.04` label until that complete migration is published.
+
 ## What the golden contains
 
 A golden is a pre-provisioned microVM image, packed by smolvm into a single

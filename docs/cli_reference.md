@@ -23,7 +23,7 @@ Usage: preloop <COMMAND>
 | `setup` | Configure GitHub credentials (App or fine-grained PAT) |
 | `doctor` | Verify the GitHub credential configuration |
 | `server` | Install/remove the control plane as a supervised service |
-| `store` | Control-database operations: import a legacy `preloop.db` |
+| `store` | Initialize/upgrade or inspect the control database; import a legacy `preloop.db` |
 | `shell` | Open a shell in a preserved VM |
 | `debug` | Attach to a job paused at a failed step |
 | `dap` | Attach an interactive DAP client to a debugger-enabled run |
@@ -57,13 +57,44 @@ Submit a workflow and stream its events until terminal.
 | `--push` | After the run completes, push the tested commit and publish the result (pull request + check runs) |
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
 | `--pr-draft` | Create new pull requests as drafts (default true; `--pr-draft=false` opens them ready for review) |
+| `--no-merge` | `--event pull_request` only: test the branch alone instead of the merge of the current base tip into it |
+| `-m, --message <TEXT>` | Commit message for the commit `--push` creates when the working tree is dirty. Without it, `$EDITOR` opens prefilled in an interactive terminal; otherwise a generated message is used |
 
 Behavior notes:
-- **Pausing**: pausing is the SmolVM default in an interactive terminal so you
-  can fix and retry; on the AgentENV backend pass `--debug` to open a session.
-  Non-interactive runs (pipes, CI, `--detach`) never pause.
+- **Pausing**: SmolVM may pause a failed job for interactive debugging when
+  run from a terminal; AgentENV requires `--debug` to open a session. Explicit
+  `--debug` opts in even for non-interactive or detached runs. Without that
+  flag, non-interactive runs do not pause implicitly. Check `preloop status`
+  for a detached run's current state.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
+- **Hosted dirty submits**: `--push` tests a commit made from the working tree
+  (tracked changes and untracked, non-ignored files; a tracked file stays in
+  the commit even if an ignore rule now matches it), then publishes that
+  commit after success. `--create-pr` also opens a PR and reports checks on
+  the tested commit; no check runs are created until the commit is published,
+  since GitHub rejects checks for a commit it does not have. The engine
+  receives a git bundle holding only that commit and its history — plus, for
+  `--event pull_request`, the tip of `origin/<base>` (fetched at submit; the
+  last fetched tip is used, with a warning, when `origin` is unreachable). No
+  other branch, stash or remote-tracking ref is uploaded. A bundle is
+  single-use, capped at 512 MiB, and removed from the engine as soon as the
+  submission has been accepted or refused. The local branch moves only by
+  explicit confirmation, after a successful push, when the tree is unchanged
+  (compared by content, not by `git status`); GitHub `origin` and publish
+  credentials are required.
+- **`pull_request` test merge**: like GitHub, a local `--event pull_request`
+  run tests the merge of the pull request's *current* base tip into the head
+  (the workspace `HEAD`, or the snapshot commit when the tree is dirty), not
+  the branch alone. The engine fetches the base branch from the workspace's
+  `origin`, so a base that moved since the branch was cut is picked up. The
+  run's `github.sha` is the merge commit and `github.ref` is
+  `refs/pull/<n>/merge`; the payload's `base.sha` is the fetched tip and
+  `head.sha` the merged head. A conflicted pull request fails the submission
+  with the conflicted files listed (GitHub runs no `pull_request` workflows on
+  a conflict), and an unfetchable base fails loudly — `--no-merge` tests the
+  branch alone in either case. `push` events are unaffected: they test the
+  commit itself.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
 - **Secret preflight**: before submitting, `preloop run` lists the secrets the
@@ -88,7 +119,7 @@ automatically, and an explicit `--payload` field always wins:
 |---|---|---|
 | changed files (`paths` / `paths-ignore` filters) | `git diff --name-only <base>...HEAD` plus uncommitted changes | The run tests the working tree, so the filter should judge the same files |
 | PR activity type (`types:` filters) | defaults to `synchronize` | One of GitHub's default `pull_request` types |
-| target branch (`branches:` filters on `pull_request`) | `--base`, else the branch's tracking ref | GitHub applies PR branch filters to the **target** branch, not the head branch |
+| target branch (`branches:` filters on `pull_request`) | `--base`, else local `remote/HEAD` or advertised `HEAD` (queried with `git ls-remote --symref` when needed) | GitHub applies PR branch filters to the **target** branch, not the head branch |
 | branch / tag | the current checkout | It is the ref being tested |
 
 The base for the diff is `--base` when given, otherwise the branch's tracking
@@ -405,11 +436,40 @@ and per-App webhook configuration drift.
 Control-database operations. They are offline and explicit — they never
 bootstrap the engine.
 
+| Command | Description |
+|---|---|
+| `migrate` | Initialize a fresh store or apply pending schema migrations |
+| `status` | Show applied, pending, and unknown migration versions |
+| `import-legacy` | Import a released v11 `preloop.db` into a fresh control database |
+
+### `preloop store migrate [OPTIONS]`
+
+Initialize or upgrade the schema. `preloop serve` never applies migrations;
+run this command explicitly. SQLite migrations take a pre-migration backup by
+default when the database exists and has pending migrations.
+
+| Flag | Description |
+|---|---|
+| `--store <URL>` | Store URL; defaults to `PRELOOP_STORE_URL`, then `<PRELOOP_HOME>/state/preloop.db` |
+| `--adopt-baseline` | Adopt a recognized pre-ledger schema after structural verification, then migrate |
+| `--no-backup` | Skip the automatic SQLite pre-migration backup |
+| `--dry-run` | Report planned migrations without applying SQL; SQLite may still create/open the file and normalize permissions |
+
+### `preloop store status [OPTIONS]`
+
+Report applied, pending, and unknown versions without applying migration SQL.
+SQLite may create the database file and normalize permissions while opening
+it, so this is not a strictly read-only filesystem probe.
+
+| Flag | Description |
+|---|---|
+| `--store <URL>` | Store URL; defaults to `PRELOOP_STORE_URL`, then `<PRELOOP_HOME>/state/preloop.db` |
+
 ### `preloop store import-legacy [OPTIONS]`
 
 One-time import of a released v11 `preloop.db` (the durable-state store the
 control backend replaced) into a fresh control database. See
-[Importing a legacy `preloop.db`](./setup.md#importing-a-legacy-preloopdb).
+[Importing a legacy `preloop.db`](./setup.md).
 
 | Flag | Description |
 |---|---|
@@ -530,10 +590,13 @@ uses the configured image, baked locally as-is.
 ### Engine token storage
 
 The native API administrator token is generated on first engine startup when
-`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the operating system's
-credential store, scoped to the engine home. On hosts without an available or
-readable OS credential service, it uses `$PRELOOP_HOME/engine.token` with private
-permissions instead. Managed CLI commands read this token automatically; do
+`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the engine's credential
+store, scoped to the engine home: private `0600` files under
+`$PRELOOP_HOME/credentials` by default, or the operating system's credential
+store with `credential_store = "os"`. With `os` selected, a credential the OS
+store cannot hold falls back to the file store under `$PRELOOP_HOME/credentials`;
+`$PRELOOP_HOME/engine.token` is a last resort, used only when the file store
+cannot hold the token either. Managed CLI commands read this token automatically; do
 not commit or print the file. Set `PRELOOP_SYSTEM_TOKEN` explicitly for a
 separate client or service.
 

@@ -6,41 +6,62 @@ use preloop_gha_protocol::azdo::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+fn require_action_plan(
+    identity: &crate::auth::ResultsIdentity,
+    plan_id: &str,
+) -> Result<(), ApiError> {
+    match identity {
+        crate::auth::ResultsIdentity::System => Ok(()),
+        crate::auth::ResultsIdentity::Job(job) if job.plan_id == plan_id => Ok(()),
+        crate::auth::ResultsIdentity::Job(_) => Err(ApiError::forbidden(
+            "results-service token is not bound to that plan",
+        )),
+    }
+}
+
 /// POST action download info — resolve action references to download URLs.
 ///
 /// Tickets are minted only for actions declared in the run's workflow
 /// (`uses:`, transitively through reusable callees and composite nests);
 /// any other requested action fails the whole batch with 403 — a job
-/// runtime token must not turn the engine into a fetch oracle for
-/// arbitrary repositories on the operator's API quota. The run is
-/// identified by the `plan_id` path segment; an unknown plan fails closed.
+/// runtime token must not turn the engine into a fetch oracle for arbitrary
+/// repositories on the operator's API quota. The caller is also bound to the
+/// plan in the URL before resolution starts.
 pub async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    action_download_info_for_plan(&shared, &plan_id, &request).await
+    action_download_info_for_plan(&shared, &identity, &plan_id, &request).await
 }
 
 pub(crate) async fn action_download_info_for_plan(
     shared: &Arc<SharedState>,
+    identity: &crate::auth::ResultsIdentity,
     plan_id: &str,
     request: &serde_json::Value,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let collection = collect_action_download_infos(&shared.state, plan_id, request).await?;
+    require_action_plan(identity, plan_id)?;
+    crate::auth::require_live_results_job(&shared.state, identity).await?;
+    let collection =
+        collect_action_download_infos(&shared.state, identity, plan_id, request).await?;
     Ok(Json(
         serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })),
     ))
 }
-
 pub async fn runnerresolve_actions(
     State(shared): State<Arc<SharedState>>,
     Path((orchestration_id, job_id)): Path<(String, String)>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::auth::require_results_job(&identity, &orchestration_id, &job_id)?;
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let mut actions = serde_json::Map::new();
     collect_runnerresolve_refs(
         &shared.state,
+        &identity,
         &orchestration_id,
         &job_id,
         &request,
@@ -474,7 +495,11 @@ pub async fn download_action_tarball(
         Ok(response) => response,
         // A tripped breaker fails fast with 503 instead of queueing behind
         // the outage; runners retry the download on the next attempt.
-        Err(error) if shared.state.github_breakers.breaker_for(bucket).is_open() => {
+        Err(error)
+            if error
+                .downcast_ref::<crate::github_breaker::BreakerOpen>()
+                .is_some() =>
+        {
             return Err(ApiError::service_unavailable(format!(
                 "GitHub is temporarily unavailable: {error:#}"
             )));
@@ -499,17 +524,21 @@ pub async fn download_action_tarball(
         .map_err(|e| ApiError::internal(format!("failed to create temporary action file: {e}")))?;
 
     let mut hasher = Sha256::new();
-    let mut streamed_bytes: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
             ApiError::internal(format!("failed to read chunk from GitHub response: {e}"))
         })?;
+        // Account each chunk as it arrives, so a stream that dies mid-download
+        // still charges the bytes GitHub already sent.
+        shared.state.github_consumption.record_bytes(
+            crate::github_breaker::GithubSubsystem::Actions,
+            chunk.len() as u64,
+        );
         // Hash the archive bytes as they arrive, so the digest the engine
         // pins is computed over exactly the bytes written to the cache —
         // no second read, no TOCTOU between write and hash.
         hasher.update(&chunk);
-        streamed_bytes = streamed_bytes.saturating_add(chunk.len() as u64);
         tokio::io::copy(&mut &chunk[..], &mut temp_file)
             .await
             .map_err(|e| {
@@ -517,12 +546,6 @@ pub async fn download_action_tarball(
             })?;
     }
     let digest = format!("{:x}", hasher.finalize());
-    // Exact byte count, measured off the stream — the one true number for
-    // tarball bandwidth accounting.
-    shared.state.github_consumption.record_bytes(
-        crate::github_breaker::GithubSubsystem::Actions,
-        streamed_bytes,
-    );
 
     // Atomically rename to final target path. A concurrent request may have
     // published the same action first — then the cached file is the winner's
@@ -646,8 +669,11 @@ pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 /// Maximum concurrent outbound GitHub ref resolution requests.
 pub const MAX_ACTION_CONCURRENCY: usize = 16;
 
+type ResolvedActionParts = (String, String, String, Option<String>, String);
+
 pub async fn collect_runnerresolve_refs(
     state: &AppState,
+    identity: &crate::auth::ResultsIdentity,
     orchestration_id: &str,
     job_id: &str,
     value: &serde_json::Value,
@@ -664,13 +690,16 @@ pub async fn collect_runnerresolve_refs(
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        runnerresolve_action(state, &action, version.as_deref()).await
+        resolve_action_download_parts(state, &action, version.as_deref()).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
-    let resolved: Vec<Option<(String, serde_json::Value)>> = stream.collect().await;
-    for (key, value) in resolved.into_iter().flatten() {
-        actions.entry(key).or_insert(value);
+    let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
+    crate::auth::require_live_results_job(state, identity).await?;
+    for parts in resolved.into_iter().flatten() {
+        if let Some((key, value)) = runnerresolve_action_from_parts(state, parts) {
+            actions.entry(key).or_insert(value);
+        }
     }
     Ok(())
 }
@@ -682,6 +711,7 @@ pub async fn collect_runnerresolve_refs(
 /// batch with 403 instead of minting a ticket.
 pub async fn collect_action_download_infos(
     state: &AppState,
+    identity: &crate::auth::ResultsIdentity,
     plan_id: &str,
     value: &serde_json::Value,
 ) -> Result<ActionDownloadInfoCollection, ApiError> {
@@ -709,14 +739,17 @@ pub async fn collect_action_download_infos(
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
-        action_download_info_entry(state, &action, version.as_deref()).await
+        resolve_action_download_parts(state, &action, version.as_deref()).await
     }))
     .buffer_unordered(MAX_ACTION_CONCURRENCY);
 
-    let resolved: Vec<Option<(String, ActionDownloadInfo)>> = stream.collect().await;
+    let resolved: Vec<Option<ResolvedActionParts>> = stream.collect().await;
+    crate::auth::require_live_results_job(state, identity).await?;
     let mut actions = BTreeMap::new();
-    for (key, value) in resolved.into_iter().flatten() {
-        actions.insert(key, value);
+    for parts in resolved.into_iter().flatten() {
+        if let Some((key, value)) = action_download_info_from_parts(state, parts) {
+            actions.insert(key, value);
+        }
     }
 
     Ok(ActionDownloadInfoCollection { actions })
@@ -1326,11 +1359,11 @@ fn collect_runnerresolve_requests(
 /// fresh download, and the stale archive is never served again. When the
 /// lookup is unavailable the ref itself is used, preserving the historical
 /// ref-keyed behavior.
-async fn resolve_action_download(
+async fn resolve_action_download_parts(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
-) -> Option<(String, String, String, Option<String>, String)> {
+) -> Option<ResolvedActionParts> {
     let (key, _) = action_download_ticket(state, action, version_override)?;
     let (name, git_ref) = key.split_once('@')?;
     let name = name.to_string();
@@ -1346,9 +1379,48 @@ async fn resolve_action_download(
 
     let pinned = resolve_ref_to_sha(state, &owner, &repo, &git_ref).await;
     let effective_ref = pinned.as_deref().unwrap_or(&git_ref).to_owned();
-    let (_, ticket) = action_download_ticket(state, action, Some(&effective_ref))?;
+    Some((key, name, git_ref, pinned, effective_ref))
+}
+
+fn runnerresolve_action_from_parts(
+    state: &AppState,
+    (key, name, git_ref, resolved_sha_opt, effective_ref): ResolvedActionParts,
+) -> Option<(String, serde_json::Value)> {
+    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
     let tar_url = ticket.get("url")?.as_str()?.to_string();
-    Some((key, name, git_ref, pinned, tar_url))
+    let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
+    let mut entry = json!({
+        "name": name,
+        "version": git_ref,
+        "tar_url": tar_url,
+        "authentication": null,
+        "archive_sha256": archive_sha256_pin,
+    });
+    if let Some(resolved_sha) = resolved_sha_opt {
+        entry["resolved_sha"] = json!(resolved_sha);
+    }
+    Some((key, entry))
+}
+
+fn action_download_info_from_parts(
+    state: &AppState,
+    (key, name, git_ref, resolved_sha, effective_ref): ResolvedActionParts,
+) -> Option<(String, ActionDownloadInfo)> {
+    let (_, ticket) = action_download_ticket(state, &name, Some(&effective_ref))?;
+    let tar_url = ticket.get("url")?.as_str()?.to_string();
+    Some((
+        key,
+        ActionDownloadInfo {
+            name_with_owner: Some(name.clone()),
+            resolved_name_with_owner: Some(name),
+            resolved_sha,
+            r#ref: Some(git_ref),
+            tarball_url: Some(tar_url),
+            zipball_url: None,
+            authentication: None,
+            package_details: None,
+        },
+    ))
 }
 
 /// Look up the engine-authoritative archive checksum pin for a resolved
@@ -1383,32 +1455,8 @@ pub async fn runnerresolve_action(
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
-    let (key, name, git_ref, resolved_sha_opt, tar_url) =
-        resolve_action_download(state, action, version_override).await?;
-    // Never echo the mutable ref back as `resolved_sha`. A caller that trusts the
-    // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
-    // explicit on the wire, and the runner refuses the download instead of fetching
-    // the mutable ref.
-    //
-    // `archive_sha256` carries the engine-authoritative pin for this exact
-    // (owner, repo, sha): the SHA-256 the engine computed while fetching
-    // the tarball itself. A present null means the server supports
-    // checksums but has not fetched this version yet — the engine pins it
-    // during the download this resolve triggers, so later resolves hand
-    // the runner a pin to verify against. The key is always present so
-    // runners can distinguish "supported" from a pre-checksum server.
-    let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
-    let mut entry = json!({
-        "name": name,
-        "version": git_ref,
-        "tar_url": tar_url,
-        "authentication": null,
-        "archive_sha256": archive_sha256_pin,
-    });
-    if let Some(resolved_sha) = resolved_sha_opt {
-        entry["resolved_sha"] = json!(resolved_sha);
-    }
-    Some((key, entry))
+    let parts = resolve_action_download_parts(state, action, version_override).await?;
+    runnerresolve_action_from_parts(state, parts)
 }
 
 /// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.
@@ -1417,25 +1465,8 @@ pub async fn action_download_info_entry(
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, ActionDownloadInfo)> {
-    let (key, name, git_ref, resolved_sha, tar_url) =
-        resolve_action_download(state, action, version_override).await?;
-    // Preloop download capability URLs are HMAC-signed and bearerless.
-    // Operator PAT is kept server-side to avoid leaking broad credentials to untrusted workflows.
-    let authentication = None;
-
-    Some((
-        key,
-        ActionDownloadInfo {
-            name_with_owner: Some(name.clone()),
-            resolved_name_with_owner: Some(name),
-            resolved_sha,
-            r#ref: Some(git_ref),
-            tarball_url: Some(tar_url),
-            zipball_url: None,
-            authentication,
-            package_details: None,
-        },
-    ))
+    let parts = resolve_action_download_parts(state, action, version_override).await?;
+    action_download_info_from_parts(state, parts)
 }
 
 #[cfg(test)]
@@ -1800,6 +1831,11 @@ mod tests {
     /// Pre-fix this path had no breaker at all and hammered the 429.
     #[tokio::test]
     async fn tarball_download_429_engages_breaker() {
+        // Held for the whole test, with the PAT cleared before the state is
+        // built: `AppState::new` reads `PRELOOP_GITHUB_TOKEN`, and a concurrent
+        // test that sets it would move this download into the Pat bucket.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
         let reset = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1845,7 +1881,8 @@ mod tests {
             .expect_err("breaker-open must fail fast");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            err.message().contains("circuit breaker is open"),
+            err.message()
+                .starts_with("GitHub is temporarily unavailable"),
             "unexpected error: {}",
             err.message()
         );
@@ -1869,6 +1906,22 @@ mod tests {
         {
             assert_eq!(other.requests, 0, "{} must not be charged", other.subsystem);
         }
+    }
+
+    /// Only a breaker refusal is a 503. A transport failure that never reached
+    /// GitHub stays an internal error, even though it also counts against the
+    /// breaker.
+    #[tokio::test]
+    async fn tarball_transport_failure_is_internal_not_unavailable() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+        // Port 1 on loopback is closed: connection refused, no HTTP exchange.
+        let (shared, _temp) = tarball_shared("http://127.0.0.1:1").await;
+        let (state, path, query) = download_call(&shared);
+        let err = download_action_tarball(state, path, query)
+            .await
+            .expect_err("a refused connection must fail the download");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A successful tarball download accounts the exact streamed byte count

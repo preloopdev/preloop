@@ -2106,22 +2106,20 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
 
-    let token = request_json(
-            &app,
-            Method::GET,
-            &format!("/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"),
-            Value::Null,
-        )
-        .await;
+    let oidc_uri = format!(
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://custom"
+    );
+    let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let token =
+        request_json_with_bearer(&app, Method::GET, &oidc_uri, Value::Null, &runtime_token).await;
     let jwt = token["value"].as_str().unwrap();
     let parts: Vec<&str> = jwt.split('.').collect();
     assert_eq!(parts.len(), 3);
@@ -2168,6 +2166,22 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
 
     // Verify the OIDC keypair is persisted.
     assert!(temp.path().join("oidc-key.json").exists());
+    request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/_apis/v1/plans/{plan_id}/events"),
+        json!({
+            "jobId": agent_job_id.to_string(),
+            "result": "succeeded"
+        }),
+        &runtime_token,
+    )
+    .await;
+    assert_eq!(
+        status_with_bearer(&app, &runtime_token, Method::GET, &oidc_uri, Value::Null).await,
+        StatusCode::FORBIDDEN,
+        "a settled job token must not mint fresh OIDC credentials"
+    );
 }
 
 #[tokio::test]
@@ -2190,12 +2204,11 @@ async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
     let alternate_scope_token = state
         .local_jwt(json!({
@@ -2279,13 +2292,12 @@ async fn oidc_default_audience_is_owner_url() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
 
     let token = request_json(
@@ -2316,13 +2328,12 @@ async fn oidc_forbidden_without_id_token_write() {
 
     let (plan_id, agent_job_id) = {
         let inner = state.test_tx().await;
-        let ids = inner
+        inner
             .ready()
             .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
-            .unwrap();
-        ids
+            .unwrap()
     };
     let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
 
@@ -2634,7 +2645,7 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         Vec::<(u64, serde_json::Value)>::new(),
     ));
     let mock_app = Router::new().route(
-        "/repos/owner/repo/check-runs/:id",
+        "/repos/owner/repo/check-runs/{id}",
         axum::routing::patch({
             let check_completions = check_completions.clone();
             move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
@@ -2738,7 +2749,7 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
             post(|| async { Json(json!({"id": CHECK_RUN_ID})) }),
         )
         .route(
-            "/repos/owner/repo/check-runs/:id",
+            "/repos/owner/repo/check-runs/{id}",
             axum::routing::patch({
                 let patches = patches.clone();
                 move |Path(_id): Path<u64>, body: axum::extract::Json<Value>| {
@@ -3078,6 +3089,76 @@ async fn timeline_read_surfaces_control_db_failures() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "a failed timeline read must not be answered as an empty timeline"
     );
+}
+/// A job's reporting credential remains valid only while its attempt is live.
+/// Timeline reads remain available after settlement; writes do not.
+#[tokio::test]
+async fn settled_job_token_cannot_mutate_timeline_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let job_id = JobId("build".to_owned());
+    let (_request_id, agent_job_id, timeline_id) = state
+        .test_db_mutate(move |tx| {
+            tx.request_key_for(run_id, &job_id)
+                .unwrap()
+                .expect("submitted request")
+        })
+        .await;
+    let plan_id = agent_job_id.to_string();
+    let token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let timeline_url = format!("/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records");
+    let patch = || {
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(&timeline_url)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"count":0,"value":[]}"#))
+            .unwrap()
+    };
+
+    let live = app.clone().oneshot(patch()).await.unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+
+    let completed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/plans/{plan_id}/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jobId": agent_job_id.to_string(),
+                        "result": "succeeded"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+
+    let settled = app.clone().oneshot(patch()).await.unwrap();
+    assert_eq!(settled.status(), StatusCode::FORBIDDEN);
+
+    let read = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&timeline_url)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
 }
 
 /// A timeline PATCH that the control DB rejects must not answer 200
@@ -3581,7 +3662,7 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
 async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -3774,7 +3855,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
 async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
@@ -3872,7 +3953,7 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
             get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post(
                 |Path(installation_id): Path<u64>, body: Json<Value>| async move {
                     assert_eq!(installation_id, 4242);
@@ -3897,7 +3978,7 @@ async fn broker_claim_patches_every_official_token_alias_with_the_minted_token()
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -4072,4 +4153,478 @@ async fn replay_step_log_upload_is_masked_before_persist() {
         "base64 secret persisted unmasked: {stored}"
     );
     assert_eq!(stored, "raw=*** b64=***\n");
+}
+
+#[tokio::test]
+async fn replay_result_upload_accepts_bodies_above_axum_default_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    // Axum's default Bytes extractor limit is 2 MiB. A real step log can
+    // exceed that while remaining well below the replay upload cap.
+    let body = vec![b'R'; 3 * 1024 * 1024];
+    let path = "/replay/results/plan-large/job-large/step-large.txt";
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sig = sign_replay_upload_ticket(&state, path, expires_at);
+    let uri = format!("{path}?se={expires_at}&sig={sig}");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let stored = tokio::fs::read(
+        temp.path()
+            .join("replay")
+            .join("results")
+            .join("plan-large")
+            .join("job-large")
+            .join("step-large.txt"),
+    )
+    .await
+    .expect("large replay upload must be persisted");
+    assert_eq!(stored, body);
+}
+
+#[tokio::test]
+async fn replay_result_upload_rejects_bodies_over_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let path = "/replay/results/plan-too-large/job-too-large/step-too-large.txt";
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let sig = sign_replay_upload_ticket(&state, path, expires_at);
+    let uri = format!("{path}?se={expires_at}&sig={sig}");
+
+    // Stream one byte over the cap without constructing a correspondingly
+    // oversized request buffer. The extractor must reject it with a visible
+    // 413 rather than letting the handler buffer an unbounded body.
+    let chunk = Bytes::from(vec![b'X'; 1024 * 1024]);
+    let chunks = (0..(MAX_REPLAY_RESULT_BYTES / chunk.len()))
+        .map(move |_| Ok::<Bytes, std::convert::Infallible>(chunk.clone()))
+        .chain(std::iter::once(Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from_static(b"X"),
+        )));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(Body::from_stream(stream::iter(chunks)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("Failed to buffer the request body"),
+        "oversized replay upload should explain the rejection to the caller"
+    );
+}
+
+/// A request body of exactly `len` bytes, streamed in 1 MiB chunks that share
+/// one buffer. An oversized body costs nothing to build, and the server, not
+/// the test, decides where the request is cut off.
+fn streamed_body(len: usize) -> Body {
+    const CHUNK: usize = 1024 * 1024;
+    let shared = Bytes::from(vec![b'L'; CHUNK]);
+    let mut chunks: Vec<Result<Bytes, std::convert::Infallible>> = vec![Ok(shared); len / CHUNK];
+    chunks.push(Ok(Bytes::from(vec![b'L'; len % CHUNK])));
+    Body::from_stream(stream::iter(chunks))
+}
+
+#[tokio::test]
+async fn log_append_accepts_bodies_above_axum_default_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/_apis/v1/Logfiles/s/h/p",
+        json!({"path": "logs/step"}),
+    )
+    .await;
+    let log_id = created["id"].as_i64().unwrap();
+
+    // Axum's default Bytes extractor limit is 2 MiB. The AzDO reporting path
+    // appends a whole step log in one call, so a 3 MiB step log must be kept.
+    let body = vec![b'L'; 3 * 1024 * 1024];
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/s/h/p/{log_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.logs.get(&format!("p/{log_id}")).map(Vec::as_slice),
+        Some(body.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn log_append_rejects_bodies_over_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/_apis/v1/Logfiles/s/h/p",
+        json!({"path": "logs/step"}),
+    )
+    .await;
+    let log_id = created["id"].as_i64().unwrap();
+
+    // One byte over the per-key window, streamed so the test never allocates
+    // it. The extractor must cut the request off with a visible 413.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/s/h/p/{log_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(streamed_body(MAX_LOG_BYTES_PER_KEY + 1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("Failed to buffer the request body"),
+        "oversized log append should explain the rejection to the caller"
+    );
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner.logs.get(&format!("p/{log_id}")).map_or(0, Vec::len),
+        0,
+        "a refused append must not reach the retained log"
+    );
+}
+
+#[tokio::test]
+async fn log_routes_share_one_body_limit_across_every_mount() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let created = request_json(
+        &app,
+        Method::POST,
+        "/_apis/v1/Logfiles/s/h/p",
+        json!({"path": "logs/step"}),
+    )
+    .await;
+    let log_id = created["id"].as_i64().unwrap();
+    let timeline = "00000000-0000-0000-0000-0000000000a1";
+    let record = "00000000-0000-0000-0000-0000000000a2";
+    // Every mount that buffers a log or console body, with the status an
+    // in-cap body earns: appends are accepted (202), console batches succeed
+    // (200). A layer missing from any one mount leaves it at Axum's 2 MiB, so
+    // the 3 MiB request below is refused there.
+    let mounts = [
+        (
+            Method::POST,
+            format!("/_apis/v1/Logfiles/s/h/p/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::POST,
+            format!("/runner/server/_apis/v1/Logfiles/s/h/p/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::PUT,
+            format!("/_apis/v1/plans/p/logs/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::PUT,
+            format!("/runner/server/_apis/v1/plans/p/logs/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::POST,
+            format!("/acme/_apis/v1/Logfiles/s/h/p/{log_id}"),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            Method::POST,
+            format!("/_apis/v1/TimeLineWebConsoleLog/s/h/p/{timeline}/{record}"),
+            StatusCode::OK,
+        ),
+        (
+            Method::POST,
+            format!("/runner/server/_apis/v1/TimeLineWebConsoleLog/s/h/p/{timeline}/{record}"),
+            StatusCode::OK,
+        ),
+        (
+            Method::POST,
+            format!("/acme/_apis/v1/TimeLineWebConsoleLog/s/h/p/{timeline}/{record}"),
+            StatusCode::OK,
+        ),
+    ];
+    for (method, uri, accepted) in mounts {
+        let request = |body: Body| {
+            Request::builder()
+                .method(method.clone())
+                .uri(uri.as_str())
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(body)
+                .unwrap()
+        };
+        let in_cap = app
+            .clone()
+            .oneshot(request(Body::from(vec![b'L'; 3 * 1024 * 1024])))
+            .await
+            .unwrap();
+        assert_eq!(
+            in_cap.status(),
+            accepted,
+            "3 MiB body refused on {method} {uri}"
+        );
+        let over_cap = app
+            .clone()
+            .oneshot(request(streamed_body(MAX_LOG_BYTES_PER_KEY + 1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            over_cap.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "cap+1 body accepted on {method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cache_upload_accepts_bodies_above_axum_default_limit() {
+    use base64::engine::Engine as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "large-chunk", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+
+    // Axum's default Bytes extractor limit is 2 MiB. A legacy cache chunk up to
+    // the per-upload budget must be staged, committed, and restored intact.
+    let body = vec![b'C'; 3 * 1024 * 1024];
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::ACCEPTED);
+
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/_apis/artifactcache/cache/{cache_id}"),
+        json!({"size": body.len()}),
+    )
+    .await;
+    let lookup = request_json(
+        &app,
+        Method::GET,
+        "/api/v1/cache?key=large-chunk&version=v1",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(lookup["hit"], true);
+    let expected = base64::engine::general_purpose::STANDARD.encode(&body);
+    assert_eq!(lookup["content_base64"], expected.as_str());
+}
+
+#[tokio::test]
+async fn cache_upload_rejects_bodies_over_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "too-large-chunk", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+
+    // One byte over the per-upload budget, streamed so the test never allocates
+    // it. The route's limit must cut the request off with a visible 413 before
+    // the handler stages anything.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(streamed_body(MAX_CACHE_UPLOAD_BYTES as usize + 1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let diagnostic = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&diagnostic).contains("per-upload cap"),
+        "oversized cache upload should explain the rejection to the caller"
+    );
+
+    let staging_path = {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.pending_caches[&cache_id].staging_len, 0,
+            "a refused chunk must not be counted as staged"
+        );
+        inner.pending_caches[&cache_id].staging_path.clone()
+    };
+    assert_eq!(
+        tokio::fs::metadata(&staging_path).await.unwrap().len(),
+        0,
+        "a refused chunk must be truncated before a retry"
+    );
+
+    let retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from("ok"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::ACCEPTED);
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/_apis/artifactcache/cache/{cache_id}"),
+        json!({"size": 2}),
+    )
+    .await;
+    let lookup = request_json(
+        &app,
+        Method::GET,
+        "/api/v1/cache?key=too-large-chunk&version=v1",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(lookup["content_base64"], "b2s=");
+}
+
+#[tokio::test]
+async fn cache_upload_cancellation_invalidates_partial_staging() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let reserve = request_json(
+        &app,
+        Method::POST,
+        "/_apis/artifactcache/cache",
+        json!({"key": "cancelled-chunk", "version": "v1"}),
+    )
+    .await;
+    let cache_id = reserve["cacheId"].as_i64().unwrap();
+    let staging_path = {
+        let inner = state.inner.lock().await;
+        inner.pending_caches[&cache_id].staging_path.clone()
+    };
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let body = stream::once(async move {
+        let _ = started_tx.send(());
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![b'X'; 1024]))
+    })
+    .chain(stream::once(async move {
+        let _ = release_rx.await;
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"never"))
+    }));
+    let request = Request::builder()
+        .method(Method::PATCH)
+        .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+        .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+        .body(Body::from_stream(body))
+        .unwrap();
+    let task = tokio::spawn(app.clone().oneshot(request));
+    started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    task.abort();
+    let _ = task.await;
+    drop(release_tx);
+
+    // Cancellation marks the reservation invalid synchronously, so a commit
+    // cannot observe a partial prefix even if async truncation is still
+    // finishing in the background.
+    let commit = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"size":1024}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .inner
+            .lock()
+            .await
+            .pending_caches
+            .contains_key(&cache_id),
+        "interrupted reservations must not remain committable"
+    );
+    assert!(
+        tokio::fs::metadata(staging_path).await.is_err(),
+        "invalidated staging must be removed when commit closes the reservation"
+    );
 }

@@ -8,17 +8,18 @@
 //!
 //! Secret values in the `[secrets]` tables are envelope-sealed at rest
 //! (see [`SEALED_SECRET_PREFIX`]): the file holds ciphertext, never the
-//! plaintext. The data-encryption key lives in the OS credential store when
-//! one is reachable, falling back to a 0600 `secrets.key` file next to the
-//! config otherwise (documented below). The config file itself is written
+//! plaintext. The data-encryption key lives in the engine's credential store
+//! (the private file store by default; see [`crate::credential_store`]), and a
+//! 0600 `secrets.key` file next to the config is used only when that store is
+//! unreachable (documented below). The config file itself is written
 //! with mode 0600 and secret values are never echoed back by
 //! `preloop secret list` or `preloop doctor`.
 
-use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
+use crate::credential_store::{CredentialRef, CredentialStore, SecretString};
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,14 +87,14 @@ pub struct GitHubConfig {
     pub app_id: Option<String>,
     /// GitHub App private key PEM, stored inline (legacy).
     ///
-    /// Read from disk and migrated into the OS credential store on the next
+    /// Read from disk and migrated into the selected credential store on the next
     /// `preloop serve`; never populated from the credential store, so a
     /// load/write round-trip can neither lose an unmigrated credential nor
     /// reintroduce plaintext for a migrated one. Use [`GitHubConfig::app_pem`]
     /// to read the effective value.
     #[serde(default, rename = "app_pem")]
     pub legacy_app_pem: Option<String>,
-    /// OS credential-store reference for the App private key.
+    /// Credential-store reference for the App private key.
     #[serde(default)]
     pub app_pem_ref: Option<String>,
     /// Value behind [`Self::app_pem_ref`], resolved at load. Never persisted.
@@ -112,7 +113,7 @@ pub struct GitHubConfig {
     /// Prefer a GitHub App so installation tokens are minted least-privilege.
     #[serde(default, rename = "pat")]
     pub legacy_pat: Option<String>,
-    /// OS credential-store reference for the PAT.
+    /// Credential-store reference for the PAT.
     #[serde(default)]
     pub pat_ref: Option<String>,
     /// Value behind [`Self::pat_ref`], resolved at load. Never persisted.
@@ -122,7 +123,7 @@ pub struct GitHubConfig {
     /// Stored inline (legacy); see [`Self::legacy_app_pem`].
     #[serde(default, rename = "webhook_secret")]
     pub legacy_webhook_secret: Option<String>,
-    /// OS credential-store reference for the webhook secret.
+    /// Credential-store reference for the webhook secret.
     #[serde(default)]
     pub webhook_secret_ref: Option<String>,
     /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
@@ -195,7 +196,7 @@ pub struct AppConfig {
     /// [`GitHubConfig::legacy_app_pem`]; read via [`AppConfig::pem`].
     #[serde(default, rename = "pem")]
     pub legacy_pem: String,
-    /// OS credential-store reference for the App private key.
+    /// Credential-store reference for the App private key.
     #[serde(default)]
     pub pem_ref: Option<String>,
     /// Value behind [`Self::pem_ref`], resolved at load. Never persisted.
@@ -206,7 +207,7 @@ pub struct AppConfig {
     /// App). Stored inline (legacy); read via [`AppConfig::webhook_secret`].
     #[serde(default, rename = "webhook_secret")]
     pub legacy_webhook_secret: Option<String>,
-    /// OS credential-store reference for the App webhook secret.
+    /// Credential-store reference for the App webhook secret.
     #[serde(default)]
     pub webhook_secret_ref: Option<String>,
     /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
@@ -865,6 +866,14 @@ pub struct ConfigFile {
     /// `PRELOOP_SECRETS_STORE` overrides this key.
     #[serde(default)]
     pub secrets_store: Option<String>,
+    /// Credential backend for the engine token and the GitHub App, PAT, and
+    /// webhook secrets. For config-backed GitHub credentials, `file` (the
+    /// default) stores `0600` files under the config file's parent
+    /// `credentials` directory; the engine token remains scoped to its engine
+    /// home. `os` uses the native keychain or secret-service.
+    /// `PRELOOP_CREDENTIAL_STORE` overrides this key.
+    #[serde(default)]
+    pub credential_store: Option<String>,
     /// Maximum jobs one run may expand to (after matrix expansion), a
     /// fail-fast DoS guard for the submit path: a run expanding past this
     /// is rejected with 400 before the insert transaction opens, so no
@@ -1453,6 +1462,29 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
     load_config_from(&config_path())
 }
 
+/// The `credential_store` key of the config file at `path`, read on its own.
+///
+/// The store has to be chosen before any credential reference can be resolved
+/// through it, so this reads only that key: no reference is resolved, and
+/// unrelated keys cannot fail the read. A missing file means the key is unset.
+pub fn credential_store_setting(path: &Path) -> anyhow::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Setting {
+        #[serde(default)]
+        credential_store: Option<String>,
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading config {}", path.display()));
+        }
+    };
+    let setting: Setting =
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    Ok(setting.credential_store)
+}
+
 /// Populate the `resolved_*` fields from the credential store.
 ///
 /// Only the `*_ref` fields are consulted and only the non-persisted
@@ -1528,23 +1560,20 @@ fn read_credential(
 /// being readable straight off disk.
 pub const SEALED_SECRET_PREFIX: &str = "sealed:v1:";
 
-/// File holding the config-secrets data-encryption key (hex-encoded) when
-/// the OS credential store is unreachable — headless Linux hosts and service
-/// accounts typically have no secret-service daemon. It is written with mode
-/// 0600 next to the config file; anyone who can read it (or the OS keychain
-/// entry) can unseal the secrets, so it protects against a stolen config
-/// file or backup, not against a compromised engine home.
+/// Legacy location of the config-secrets data-encryption key (hex-encoded),
+/// written when no credential store was reachable. It is written with mode 0600
+/// next to the config file, and anyone who can read it can unseal the secrets,
+/// so it protects against a stolen config file or backup, not against a
+/// compromised engine home. A leftover file is migrated into the selected store
+/// the next time the key is needed.
 pub const SECRETS_KEY_FILE: &str = "secrets.key";
 
 /// Resolve the 32-byte data-encryption key that seals `[secrets]` values at
-/// rest. The OS credential store is tried first (reference scoped by config
-/// directory, so two engine homes owned by one OS user do not share a key);
-/// the 0600 `secrets.key` file is the fallback. A file key is migrated into
-/// the store when the store becomes reachable.
-pub fn resolve_config_sealing_key(dir: &Path) -> anyhow::Result<[u8; 32]> {
-    resolve_config_sealing_key_with_store(dir, &OsCredentialStore)
-}
-
+/// rest, from `store` (the engine's selected credential store). The reference
+/// is scoped by config directory, so two engine homes owned by one OS user do
+/// not share a key. The 0600 `secrets.key` file is used only when the store is
+/// unreachable; a file key found beside a reachable store is migrated into it
+/// and retired.
 fn resolve_config_sealing_key_with_store(
     dir: &Path,
     store: &dyn CredentialStore,
@@ -1568,8 +1597,21 @@ fn resolve_config_sealing_key_with_store(
                         store.name(),
                         key_path.display()
                     );
-                    std::fs::remove_file(&key_path)
-                        .with_context(|| format!("retiring {}", key_path.display()))?;
+                    // Retire the legacy file only once the store proves it can
+                    // hold the key. A value that was only read through — a
+                    // migration whose copy failed — must leave the file in
+                    // place as the last way to unseal the secrets.
+                    if store_confirms(store, &reference, &secret) {
+                        std::fs::remove_file(&key_path)
+                            .with_context(|| format!("retiring {}", key_path.display()))?;
+                    } else {
+                        tracing::warn!(
+                            store = store.name(),
+                            path = %key_path.display(),
+                            "could not verify a durable copy of the config-secrets key; \
+                             keeping the legacy key file"
+                        );
+                    }
                 }
                 return Ok(key);
             }
@@ -1583,7 +1625,7 @@ fn resolve_config_sealing_key_with_store(
                     .set(&reference, &SecretString::new(hex::encode(key)))
                     .with_context(|| format!("writing config-secrets key to {}", store.name()))?;
                 let read_back = store
-                    .get(&reference)
+                    .get_fresh(&reference)
                     .with_context(|| {
                         format!("verifying config-secrets key in {} store", store.name())
                     })?
@@ -1621,6 +1663,32 @@ fn resolve_config_sealing_key_with_store(
     Ok(key)
 }
 
+/// Whether `store` verifiably holds `value` under `reference`: the write is
+/// accepted and a fresh read returns the same bytes. Checked before retiring a
+/// legacy `secrets.key`, so a credential that was only read through (a
+/// migration whose copy failed) never causes the file to be deleted.
+fn store_confirms(
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    value: &SecretString,
+) -> bool {
+    match store
+        .set(reference, value)
+        .and_then(|()| store.get_fresh(reference))
+    {
+        Ok(Some(stored)) => stored.expose() == value.expose(),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                store = store.name(),
+                %error,
+                "credential store could not confirm a durable copy"
+            );
+            false
+        }
+    }
+}
+
 /// Credential-store reference for the config-secrets key, scoped by the
 /// canonical config directory so distinct engine homes never share a key.
 fn config_secrets_key_reference(dir: &Path) -> anyhow::Result<CredentialRef> {
@@ -1638,7 +1706,7 @@ fn config_secrets_key_reference(dir: &Path) -> anyhow::Result<CredentialRef> {
 
 fn generate_sealing_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     key
 }
 
@@ -1823,11 +1891,10 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         .with_context(|| format!("validating config {}", path.display()))?;
     validate_execution_protection(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
-    let cred_base = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let store = crate::credential_store::store_from_env(&cred_base);
+    let store = crate::credential_store::selected_store_for_config(
+        path,
+        config.credential_store.as_deref(),
+    )?;
     resolve_credential_references(&mut config, store.as_ref())?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1949,7 +2016,10 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         // Same store selection as `load_config_from`; sealing with a different
         // backend than unsealing makes the file unreadable.
-        let store = crate::credential_store::store_from_env(dir);
+        let store = crate::credential_store::selected_store_for_config(
+            path,
+            sealed.credential_store.as_deref(),
+        )?;
         seal_config_secrets(&mut sealed, dir, store.as_ref())
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
@@ -2048,6 +2118,7 @@ mod tests {
             fork_policy: ForkPolicyConfig::default(),
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
+            credential_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
             cache: CacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
@@ -2186,7 +2257,8 @@ mod tests {
     }
 
     use crate::credential_store::{
-        MemoryCredentialStore, UnavailableCredentialStore, github_reference,
+        CREDENTIAL_STORE_ENV, CredentialWriter, FileCredentialStore, MemoryCredentialStore,
+        UnavailableCredentialStore, credential_store_dir, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
@@ -2660,6 +2732,252 @@ REPO_OVERLAY = "repo-from-credential"
         assert!(
             !dir.path().join(SECRETS_KEY_FILE).exists(),
             "key file created for a secretless config"
+        );
+    }
+
+    /// The `credential_store` key is written and read back, and the unset default stays out of the file.
+    #[test]
+    fn credential_store_key_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = ConfigFile {
+            credential_store: Some("file".into()),
+            ..ConfigFile::default()
+        };
+        write_config_to(&path, &config).unwrap();
+        assert_eq!(
+            credential_store_setting(&path).unwrap().as_deref(),
+            Some("file")
+        );
+        assert_eq!(
+            load_config_from(&path).unwrap().credential_store.as_deref(),
+            Some("file")
+        );
+        write_config_to(&path, &ConfigFile::default()).unwrap();
+        assert_eq!(credential_store_setting(&path).unwrap(), None);
+    }
+
+    /// The store key is read on its own, so a reference that cannot resolve
+    /// cannot hide it. The full load does resolve references, so it still fails.
+    #[test]
+    fn credential_store_key_is_read_without_resolving_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "credential_store = \"file\"\n[github]\napp_pem_ref = \"not a valid reference!\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_store_setting(&path).unwrap().as_deref(),
+            Some("file")
+        );
+        assert!(load_config_from(&path).is_err());
+        assert_eq!(
+            credential_store_setting(&dir.path().join("missing.toml")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_credential_store_fails_the_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "credential_store = \"keychain\"\n").unwrap();
+        let error = format!("{:#}", load_config_from(&path).unwrap_err());
+        assert!(error.contains("credential_store"), "{error}");
+        assert!(error.contains("\"file\" or \"os\""), "{error}");
+    }
+
+    /// A PEM held by the file store reads back through the normal config load
+    /// byte-for-byte, with the file store selected by default.
+    #[tokio::test]
+    async fn pem_in_the_file_store_loads_through_the_config_file() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::unset(crate::credential_store::CREDENTIAL_STORE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nabc/def+ghi=\n-----END RSA PRIVATE KEY-----\n";
+        let pem_ref = github_reference("app-pem", Some("123")).unwrap();
+        crate::credential_store::FileCredentialStore::new(
+            crate::credential_store::FileCredentialStore::default_dir(dir.path()),
+        )
+        .set(&pem_ref, &SecretString::new(pem))
+        .unwrap();
+        let config = ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("123".into()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        let path = dir.path().join("config.toml");
+        write_config_to(&path, &config).unwrap();
+        let loaded = load_config_from(&path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some(pem));
+        assert_eq!(loaded.credential_store, None);
+    }
+    /// A setup fallback remains readable when the explicit environment
+    /// override still selects the OS-primary store on the next load.
+    #[tokio::test]
+    async fn os_env_reads_pem_and_pat_from_the_file_fallback() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::set(CREDENTIAL_STORE_ENV, "os");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let credentials = FileCredentialStore::new(credential_store_dir(&config_path));
+        let pem_ref = github_reference("app-pem", Some("777")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nFALLBACK-PEM\n-----END RSA PRIVATE KEY-----\n";
+        credentials.set(&pem_ref, &SecretString::new(pem)).unwrap();
+        credentials
+            .set(&pat_ref, &SecretString::new("fallback-pat"))
+            .unwrap();
+
+        let config = ConfigFile {
+            credential_store: Some("file".to_owned()),
+            github: GitHubConfig {
+                app_id: Some("777".to_owned()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        write_config_to(&config_path, &config).unwrap();
+
+        let loaded = load_config_from(&config_path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some(pem));
+        assert_eq!(loaded.github.pat(), Some("fallback-pat"));
+    }
+
+    /// Writers and readers use the config's parent when `PRELOOP_CONFIG` is
+    /// outside `PRELOOP_HOME`, for both App PEMs and PATs.
+    #[tokio::test]
+    async fn explicit_config_path_uses_its_sibling_credentials_directory() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _store_env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
+        let home = tempfile::tempdir().unwrap();
+        let _home_env = crate::state::TestEnvVar::set("PRELOOP_HOME", home.path());
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("config.toml");
+        let mut writer = CredentialWriter::for_config(&config_path, None).unwrap();
+        let pem_ref = github_reference("app-pem", Some("888")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        writer
+            .write(&pem_ref, &SecretString::new("external-pem"))
+            .unwrap();
+        writer
+            .write(&pat_ref, &SecretString::new("external-pat"))
+            .unwrap();
+
+        let config = ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("888".to_owned()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        write_config_to(&config_path, &config).unwrap();
+        assert!(credential_store_dir(&config_path).exists());
+        assert!(!home.path().join("credentials").exists());
+
+        let loaded = load_config_from(&config_path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some("external-pem"));
+        assert_eq!(loaded.github.pat(), Some("external-pat"));
+    }
+
+    /// Sealed secrets survive the move to the file store: a key an earlier
+    /// build kept in the OS store is found, copied, and reused, not replaced.
+    #[test]
+    fn sealing_key_is_migrated_from_a_legacy_os_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        let key = [0x5a; 32];
+        legacy
+            .set(&reference, &SecretString::new(hex::encode(key)))
+            .unwrap();
+        let store = crate::credential_store::FileCredentialStore::new(
+            crate::credential_store::FileCredentialStore::default_dir(dir.path()),
+        )
+        .migrating_from(std::sync::Arc::new(legacy));
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store).unwrap(),
+            key
+        );
+        assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    /// A store that reads a value but cannot keep one — the shape a failed
+    /// OS-to-file migration copy leaves behind.
+    struct ReadOnlyStore {
+        value: String,
+    }
+
+    impl CredentialStore for ReadOnlyStore {
+        fn get(&self, _reference: &CredentialRef) -> anyhow::Result<Option<SecretString>> {
+            Ok(Some(SecretString::new(self.value.clone())))
+        }
+
+        fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> anyhow::Result<()> {
+            anyhow::bail!("credentials directory is not writable")
+        }
+
+        fn delete(&self, _reference: &CredentialRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "read-only store"
+        }
+    }
+
+    /// A durable copy retires the legacy `secrets.key`: the store writes the
+    /// key and reads it back before the file goes away.
+    #[test]
+    fn secrets_key_file_is_retired_once_the_store_confirms_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x5a; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &key).unwrap();
+        let legacy = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        legacy
+            .set(&reference, &SecretString::new(hex::encode(key)))
+            .unwrap();
+        let store = FileCredentialStore::new(dir.path().join("credentials"))
+            .migrating_from(std::sync::Arc::new(legacy));
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store).unwrap(),
+            key
+        );
+        assert!(
+            !key_path.exists(),
+            "a confirmed durable copy may retire the legacy file"
+        );
+    }
+
+    /// A store that cannot keep the copy must not retire `secrets.key`: the
+    /// file is then the only durable way to unseal the config secrets.
+    #[test]
+    fn secrets_key_file_survives_a_store_that_cannot_keep_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x5a; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &key).unwrap();
+        let store = ReadOnlyStore {
+            value: hex::encode(key),
+        };
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store).unwrap(),
+            key
+        );
+        assert!(
+            key_path.exists(),
+            "an unconfirmed copy must leave the legacy key file in place"
         );
     }
 }

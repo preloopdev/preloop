@@ -8,6 +8,10 @@ env:
 
 on:
   pull_request:
+    # A labeled run re-checks the head after a maintainer applies the
+    # dependency-migration exception. synchronize runs never honor it, so
+    # every new push needs the label re-applied.
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   schedule:
@@ -22,7 +26,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # Full history: the policy guard diffs the merge base, which a
@@ -34,6 +38,11 @@ jobs:
 
       - name: Guard policy files
         if: github.event_name == 'pull_request'
+        env:
+          # Honored only on the labeled event for this exact label, so the
+          # approval covers the head SHA that existed when a maintainer
+          # applied it. Later pushes (synchronize) fail until re-labeled.
+          DEPENDENCY_MIGRATION: ${{ github.event.action == 'labeled' && github.event.label.name == 'dependency-migration' && contains(github.event.pull_request.labels.*.name, 'dependency-migration') }}
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha }}"
@@ -53,8 +62,15 @@ jobs:
           # Adding a Rust dependency necessarily changes Cargo.lock *and* the
           # manifests that declare it. Permit that dedicated PR shape, but no
           # source changes or other policy files alongside the lockfile.
+          # Exception: a maintainer applying dependency-migration to the
+          # current head lets that head carry the source changes a breaking
+          # upgrade needs, as long as Cargo.lock is still its only policy
+          # file.
           dependency_only=false
-          if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" ]]; then
+          if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" && "$DEPENDENCY_MIGRATION" == "true" ]]; then
+            echo "dependency-migration label: Cargo.lock may ship with source changes"
+            dependency_only=true
+          elif [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" ]]; then
             dependency_only=true
             while IFS= read -r file; do
               if [[ "$file" != "Cargo.toml" && ! "$file" =~ ^crates/[^/]+/Cargo\.toml$ ]]; then
@@ -80,11 +96,11 @@ jobs:
             echo "Policy file guard: OK (no policy files modified)"
           fi
 
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
 
-      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-vet@0.10.1,cargo-audit@0.22.2,cargo-deny@0.20.2
 
@@ -103,7 +119,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -112,7 +128,7 @@ jobs:
 
       - name: Upload SBOM artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-node-externals
           path: sbom-node-externals.cdx.json
@@ -124,7 +140,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

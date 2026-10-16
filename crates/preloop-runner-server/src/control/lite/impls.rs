@@ -570,13 +570,13 @@ impl ControlBackend for LiteBackend {
     ) -> Result<Option<String>, ControlError> {
         self.submission_json_for_attempt(agent_job_id).await
     }
-    async fn published_run(
+    async fn published_runs(
         &self,
         repository: &str,
         sha: &str,
         workflow_path: &str,
-    ) -> Result<Option<RunId>, ControlError> {
-        self.published_run(repository, sha, workflow_path).await
+    ) -> Result<Vec<PublishedRun>, ControlError> {
+        self.published_runs(repository, sha, workflow_path).await
     }
     async fn run_for_webhook_delivery(
         &self,

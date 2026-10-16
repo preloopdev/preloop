@@ -1,0 +1,44 @@
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-docs:
+    name: validate-docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install Mintlify CLI
+        run: npm install --prefix "$RUNNER_TEMP/mintlify" mint@4.2.1046
+      - name: Validate Mintlify build
+        run: |
+          "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" validate
+        working-directory: docs
+      - name: Check internal links and anchors
+        run: |
+          "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" broken-links --check-anchors
+        working-directory: docs
+      - name: Check documentation accessibility
+        run: |
+          "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" a11y
+        working-directory: docs

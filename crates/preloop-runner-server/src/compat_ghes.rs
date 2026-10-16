@@ -182,7 +182,7 @@ pub async fn patch_timeline_records_org(
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    crate::timeline_logs::authorize_reporting_callback(
+    crate::timeline_logs::authorize_live_reporting_callback(
         &shared,
         &headers,
         &plan_id,
@@ -227,8 +227,10 @@ pub async fn create_log_org(
     headers: HeaderMap,
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
-        .await?;
+    crate::timeline_logs::authorize_live_reporting_callback(
+        &shared, &headers, &plan_id, None, None,
+    )
+    .await?;
     create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
@@ -238,8 +240,10 @@ pub async fn append_log_org(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
-        .await?;
+    crate::timeline_logs::authorize_live_reporting_callback(
+        &shared, &headers, &plan_id, None, None,
+    )
+    .await?;
     Ok(append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await)
 }
 
@@ -257,7 +261,7 @@ pub async fn console_log_org(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
-    crate::timeline_logs::authorize_reporting_callback(
+    crate::timeline_logs::authorize_live_reporting_callback(
         &shared,
         &headers,
         &plan_id,
@@ -279,7 +283,7 @@ pub async fn finish_job_org(
     headers: HeaderMap,
     Json(event): Json<azdo::JobCompletedEvent>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    crate::timeline_logs::authorize_reporting_callback(
+    let request = crate::timeline_logs::authorize_reporting_callback(
         &shared,
         &headers,
         &plan_id,
@@ -287,13 +291,20 @@ pub async fn finish_job_org(
         Some(event.job_id),
     )
     .await?;
-    Ok(finish_job(State(shared), Path((scope, hub, plan_id)), Json(event)).await)
+    Ok(finish_job(
+        State(shared),
+        Path((scope, hub, plan_id)),
+        Json(event),
+        request,
+    )
+    .await)
 }
 
 pub async fn action_download_info_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, _scope, _hub, plan_id)): Path<(String, String, String, String)>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    super::actions::action_download_info_for_plan(&shared, &plan_id, &request).await
+    super::actions::action_download_info_for_plan(&shared, &identity, &plan_id, &request).await
 }
