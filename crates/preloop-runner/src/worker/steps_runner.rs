@@ -35,6 +35,10 @@ pub struct Step {
     pub raw: serde_json::Value,
     /// Background steps run without DAP step-pauses, matching the official runner.
     pub is_background: bool,
+    /// For a generated post hook: the `id` of the action step it cleans up after.
+    /// The official runner registers a post hook only while its action runs
+    /// (`ActionRunner.RunAsync`), so the hook is skipped while that step has not started.
+    pub post_of: Option<String>,
 }
 
 /// What kind of step this is.
@@ -186,6 +190,10 @@ pub async fn run_steps(
     let mut init_failed = false;
     let mut cancelled = false;
     let mut background = BackgroundStepCoordinator::new(10);
+    // Ids of steps whose condition passed, i.e. whose action has started. A post
+    // hook runs only if its action is in this set, as the official runner
+    // registers post hooks at run time.
+    let mut started_steps: std::collections::HashSet<String> = std::collections::HashSet::new();
     let now = crate::worker::helpers::iso_now();
 
     // Queue initial "Set up job" step as completed (number 1, official convention)
@@ -454,14 +462,25 @@ pub async fn run_steps(
         }
 
         // Evaluate the step condition. Official runner treats expression
-        // evaluation errors as step failures, not skips.
-        match should_run_step(step, job) {
-            Ok(true) => {}
+        // evaluation errors as step failures, not skips. A post hook whose
+        // action never started is skipped without evaluating its condition.
+        let orphaned_post_hook = post_hook_orphaned(step, &started_steps);
+        let decision = if orphaned_post_hook {
+            Ok(false)
+        } else {
+            should_run_step(step, job)
+        };
+        match decision {
+            Ok(true) => {
+                started_steps.insert(step.id.clone());
+            }
             Ok(false) => {
-                info!(
-                    "Skipping step '{}' (condition not met)",
-                    resolved_display_name
-                );
+                let reason = if orphaned_post_hook {
+                    "its action step did not run"
+                } else {
+                    "condition not met"
+                };
+                info!("Skipping step '{}' ({reason})", resolved_display_name);
                 job.steps.insert(
                     step.context_name.clone(),
                     StepResult {
@@ -1375,6 +1394,11 @@ pub async fn run_steps(
             // re-run. Restoring only the target snapshot leaves saveState and
             // annotations from later steps visible during their second pass.
             clear_replayed_step_state(step_ctx.job, &job_step_summaries, target, idx);
+            // A replayed step registers its post hook again only if it runs again,
+            // so its earlier registration is stale for the range about to re-run.
+            for replayed in &steps[target..=idx] {
+                started_steps.remove(&replayed.id);
+            }
             // Restore the snapshot captured before the *target* step, not
             // the current step. Without this, the target step's prior
             // GITHUB_ENV/GITHUB_PATH/state writes remain and are doubled.
@@ -1546,6 +1570,13 @@ fn clear_replayed_step_state(
         job.state.remove(&summary.context_name);
         job.step_annotations.remove(&summary.context_name);
     }
+}
+
+/// Whether `step` is a post hook whose action step has not started.
+fn post_hook_orphaned(step: &Step, started: &std::collections::HashSet<String>) -> bool {
+    step.post_of
+        .as_ref()
+        .is_some_and(|action| !started.contains(action))
 }
 
 fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {

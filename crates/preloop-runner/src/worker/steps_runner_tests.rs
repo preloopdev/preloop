@@ -22,6 +22,7 @@ fn test_step(name: &str, condition: Option<&str>) -> Step {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: None,
     }
 }
 
@@ -146,6 +147,7 @@ fn synthetic_classification_follows_declared_step_membership() {
         env: Default::default(),
         raw,
         is_background: false,
+        post_of: None,
     };
 
     for (case, id, context, raw, expected) in [
@@ -1559,6 +1561,184 @@ async fn post_step_executes_for_node_action_with_post_entrypoint() {
         post_updates >= 2,
         "expected Post steps in queue updates, got {post_updates}"
     );
+}
+
+/// Stages a `node24` runtime under the runner root `root`: the host Node when
+/// one is on PATH, otherwise `mock` as the executable, so the test does not
+/// depend on the host Node version.
+fn stage_node24_runtime(root: &std::path::Path, mock: &str) {
+    let externals_bin = root.join("externals").join("node24").join("bin");
+    std::fs::create_dir_all(&externals_bin).unwrap();
+    let host_node = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+            candidate.is_file().then_some(candidate)
+        })
+    });
+    if let Some(host_node) = host_node {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&host_node, externals_bin.join("node")).unwrap();
+        #[cfg(windows)]
+        std::fs::copy(&host_node, externals_bin.join("node.exe")).unwrap();
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mock_path = externals_bin.join("node");
+        std::fs::write(&mock_path, mock).unwrap();
+        std::fs::set_permissions(&mock_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn post_hook_waits_for_its_action_step_to_start() {
+    let mut hook = test_step("__post_action", None);
+    hook.post_of = Some("action-id".to_string());
+    let mut started = std::collections::HashSet::new();
+    assert!(post_hook_orphaned(&hook, &started));
+    started.insert("action-id".to_string());
+    assert!(!post_hook_orphaned(&hook, &started));
+    assert!(!post_hook_orphaned(
+        &test_step("plain", None),
+        &std::collections::HashSet::new()
+    ));
+}
+
+/// A post hook whose action never started must not run, even though its
+/// `post-if` defaults to `always()`, and must be recorded as skipped. The fake
+/// workflow skips `action-a` with `if: false`, runs `action-b`, fails on `boom`,
+/// and skips `action-c` behind that failure. Only `action-b` may execute.
+#[tokio::test]
+async fn post_hooks_of_skipped_actions_are_recorded_skipped_and_never_run() {
+    use crate::worker::server_queue::{step_conclusion, step_status};
+
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let exec_log = dir.path().join("exec.log");
+    // Every entry point appends "<action directory> <entry file>" to $EXEC_LOG.
+    stage_node24_runtime(
+        dir.path(),
+        "#!/bin/sh\n\
+         for a in \"$@\"; do\n\
+           case \"$a\" in\n\
+             *.js) echo \"$(basename \"$(dirname \"$a\")\") $(basename \"$a\")\" >> \"$EXEC_LOG\" ;;\n\
+           esac\n\
+         done\n",
+    );
+    for name in ["action-a", "action-b", "action-c"] {
+        let action_dir = workspace.join(name);
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            format!(
+                "name: {name}\ndescription: test\nruns:\n  using: node24\n  main: main.js\n  post: post.js\n"
+            ),
+        )
+        .unwrap();
+        for entry in ["main.js", "post.js"] {
+            std::fs::write(
+                action_dir.join(entry),
+                format!(
+                    "require('fs').appendFileSync(process.env.EXEC_LOG, \
+                     require('path').basename(__dirname) + ' {entry}\\n');\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some(workspace.to_str().unwrap().to_string());
+    job.env.insert(
+        "EXEC_LOG".to_string(),
+        exec_log.to_str().unwrap().to_string(),
+    );
+
+    let action = |name: &str, condition: Option<&str>| {
+        let mut step = test_step(name, condition);
+        step.step_type = StepType::Action {
+            uses: format!("./{name}"),
+            with: serde_json::json!({}),
+        };
+        step
+    };
+    let mut boom = test_step("boom", None);
+    boom.step_type = StepType::Script {
+        script: "exit 1".to_string(),
+        shell: Some("bash".to_string()),
+        working_directory: None,
+    };
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![
+            action("action-a", Some("false")),
+            action("action-b", None),
+            boom,
+            action("action-c", None),
+        ],
+        workspace.to_str().unwrap(),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(ordered.len(), 7, "four main steps and three post hooks");
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let result = run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, "Failed");
+
+    // Only action-b's entry points executed; action-a and action-c never started.
+    let executed = std::fs::read_to_string(&exec_log).unwrap();
+    assert_eq!(
+        executed.lines().collect::<Vec<_>>(),
+        ["action-b main.js", "action-b post.js"]
+    );
+
+    for (key, expected) in [
+        ("action-a", "Skipped"),
+        ("__post_action-a", "Skipped"),
+        ("action-b", "Success"),
+        ("__post_action-b", "Success"),
+        ("action-c", "Skipped"),
+        ("__post_action-c", "Skipped"),
+    ] {
+        assert_eq!(
+            job.steps.get(key).map(|step| step.conclusion.as_str()),
+            Some(expected),
+            "recorded conclusion of {key}"
+        );
+    }
+
+    let updates = queue.lock().await;
+    let reported = |name: &str| {
+        updates
+            .all_queued_updates()
+            .iter()
+            .rev()
+            .find(|update| update.name == name && update.status == step_status::COMPLETED)
+            .map(|update| update.conclusion)
+    };
+    assert_eq!(reported("Post action-a"), Some(step_conclusion::SKIPPED));
+    assert_eq!(reported("Post action-b"), Some(step_conclusion::SUCCEEDED));
+    assert_eq!(reported("Post action-c"), Some(step_conclusion::SKIPPED));
 }
 
 #[test]

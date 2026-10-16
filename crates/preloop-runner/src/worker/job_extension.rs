@@ -839,6 +839,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             env,
             raw: step.clone(),
             is_background,
+            post_of: None,
         });
     }
 
@@ -850,7 +851,9 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 /// Official runner builds three lists:
 /// - pre steps: declared order, `pre-if` defaults to `always()`
 /// - main steps: the workflow steps
-/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
+/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`;
+///   each names its action step in `post_of`, and `run_steps` runs it only once that
+///   step has started (the official runner registers post hooks at run time)
 ///
 /// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
 /// via `save-state`; `StepContext::build_env()` exposes those values as
@@ -918,6 +921,7 @@ pub fn build_step_list_with_lifecycle(
                         "uses": uses,
                     }),
                     is_background: false,
+                    post_of: None,
                 });
             }
         }
@@ -948,6 +952,7 @@ pub fn build_step_list_with_lifecycle(
                     "uses": uses,
                 }),
                 is_background: false,
+                post_of: Some(step.id.clone()),
             });
         }
     }

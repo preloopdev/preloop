@@ -10,6 +10,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Local composite actions may call remote actions**: a workflow's local
+  composite (`uses: ./.github/actions/…`) that runs a remote action, such as
+  `dtolnay/rust-toolchain@stable`, was refused at download with HTTP 403
+  (`not declared in this run's workflow uses:`) because the declared-action
+  allowlist did not read local composite manifests. The engine now reads the
+  run's own commit for local composites, including the composites nested in
+  them, and admits their remote `uses:`. A run with a workspace snapshot reads
+  the snapshot; a GitHub-sourced run without one reads its own repository at
+  its head commit through the contents API, with a `contents: read`
+  installation token for that repository. A manifest that cannot be read still
+  fails closed, and every other action stays denied.
+
 - **Large replay step logs are retained** (#599): signed
   `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
   inheriting Axum's 2 MiB default, so long failing steps remain available for
@@ -20,6 +32,15 @@ Releases before v0.27.0 predate the changelog.
   cache chunks stream to disk up to the existing 512 MiB upload budget instead
   of inheriting Axum's 2 MiB default. Oversized requests still get a
   deterministic 413 without buffering the whole cache chunk in RAM.
+
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  only when its action starts, but the engine ran every post hook under its
+  `always()` default, so cleanup hooks of skipped steps ran for minutes and
+  their failures were recorded beside the real first failure. A post hook
+  whose action did not run is now recorded as `skipped`; hooks of actions that
+  ran are unchanged.
 
 ## [0.34.4] - 2026-10-13
 

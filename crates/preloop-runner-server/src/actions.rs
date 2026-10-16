@@ -4,7 +4,9 @@ use preloop_gha_protocol::azdo::{
     ActionDownloadInfo, ActionDownloadInfoCollection, ActionReferenceList,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 
 /// POST action download info — resolve action references to download URLs.
 ///
@@ -27,7 +29,7 @@ pub(crate) async fn action_download_info_for_plan(
     plan_id: &str,
     request: &serde_json::Value,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let collection = collect_action_download_infos(&shared.state, plan_id, request).await?;
+    let collection = collect_action_download_infos(shared, plan_id, request).await?;
     Ok(Json(
         serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })),
     ))
@@ -39,14 +41,7 @@ pub async fn runnerresolve_actions(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut actions = serde_json::Map::new();
-    collect_runnerresolve_refs(
-        &shared.state,
-        &orchestration_id,
-        &job_id,
-        &request,
-        &mut actions,
-    )
-    .await?;
+    collect_runnerresolve_refs(&shared, &orchestration_id, &job_id, &request, &mut actions).await?;
 
     Ok(Json(json!({ "actions": actions })))
 }
@@ -647,12 +642,13 @@ pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 pub const MAX_ACTION_CONCURRENCY: usize = 16;
 
 pub async fn collect_runnerresolve_refs(
-    state: &AppState,
+    shared: &SharedState,
     orchestration_id: &str,
     job_id: &str,
     value: &serde_json::Value,
     actions: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ApiError> {
+    let state = &shared.state;
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     collect_runnerresolve_requests(value, &mut requests);
     let mut seen = std::collections::HashSet::new();
@@ -660,7 +656,7 @@ pub async fn collect_runnerresolve_refs(
     requests.truncate(MAX_ACTION_BATCH_SIZE);
 
     let (run_id, declared) =
-        declared_actions_for_runnerresolve(state, orchestration_id, job_id).await?;
+        declared_actions_for_runnerresolve(shared, orchestration_id, job_id).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
@@ -681,10 +677,11 @@ pub async fn collect_runnerresolve_refs(
 /// [`enforce_declared_actions`]); an undeclared action fails the whole
 /// batch with 403 instead of minting a ticket.
 pub async fn collect_action_download_infos(
-    state: &AppState,
+    shared: &SharedState,
     plan_id: &str,
     value: &serde_json::Value,
 ) -> Result<ActionDownloadInfoCollection, ApiError> {
+    let state = &shared.state;
     let mut requests: Vec<(String, Option<String>)> = Vec::new();
     if let Ok(list) = serde_json::from_value::<ActionReferenceList>(value.clone()) {
         for item in list.actions.into_iter() {
@@ -705,7 +702,7 @@ pub async fn collect_action_download_infos(
     requests.retain(|request| seen.insert(request.clone()));
     requests.truncate(MAX_ACTION_BATCH_SIZE);
 
-    let (run_id, declared) = declared_actions_for_plan(state, plan_id).await?;
+    let (run_id, declared) = declared_actions_for_plan(shared, plan_id).await?;
     enforce_declared_actions(state, run_id, &declared, &requests).await?;
 
     let stream = futures::stream::iter(requests.into_iter().map(|(action, version)| async move {
@@ -897,9 +894,10 @@ fn reusable_callee_yaml<'a>(
 /// declared action allowlist. An unknown plan fails closed: without a run
 /// there is no declared set to mint against.
 async fn declared_actions_for_plan(
-    state: &AppState,
+    shared: &SharedState,
     plan_id: &str,
 ) -> Result<(RunId, BTreeSet<String>), ApiError> {
+    let state = &shared.state;
     use crate::control::backend::RequestKey;
     let run_id = match state
         .backend
@@ -914,7 +912,7 @@ async fn declared_actions_for_plan(
         }
         Err(error) => return Err(ApiError::from(error)),
     };
-    let declared = declared_actions_for_run_id(state, run_id).await?;
+    let declared = declared_actions_for_run_id(shared, run_id).await?;
     Ok((run_id, declared))
 }
 
@@ -922,10 +920,11 @@ async fn declared_actions_for_plan(
 /// path pair and return its declared action allowlist. Prefers the job id
 /// (exact), falling back to the orchestration plan id.
 async fn declared_actions_for_runnerresolve(
-    state: &AppState,
+    shared: &SharedState,
     orchestration_id: &str,
     job_id: &str,
 ) -> Result<(RunId, BTreeSet<String>), ApiError> {
+    let state = &shared.state;
     use crate::control::backend::RequestKey;
     let mut run_id = None;
     if let Ok(agent_job_id) = job_id.parse::<uuid::Uuid>()
@@ -952,29 +951,552 @@ async fn declared_actions_for_runnerresolve(
             Err(error) => return Err(ApiError::from(error)),
         },
     };
-    let declared = declared_actions_for_run_id(state, run_id).await?;
+    let declared = declared_actions_for_run_id(shared, run_id).await?;
     Ok((run_id, declared))
 }
 
 async fn declared_actions_for_run_id(
-    state: &AppState,
+    shared: &SharedState,
     run_id: RunId,
 ) -> Result<BTreeSet<String>, ApiError> {
+    let state = &shared.state;
     let run = state
         .backend
         .run_record(run_id)
         .await
         .map_err(ApiError::from)?;
-    Ok(direct_declared_actions(
+    // `direct_declared_actions` covers workflow/YAML references. Local
+    // composites are not in that YAML, so add only the remote dependencies
+    // reachable from their manifests at the run's own commit.
+    let mut declared = direct_declared_actions(
         &run.submission.workflow_yaml,
         &run.submission.reusable_workflows,
         &run.submission.repository,
-    ))
+    );
+    let source = match run.workspace_snapshot.as_ref() {
+        Some(snapshot) => Some(LocalManifests::Snapshot(snapshot)),
+        // A GitHub-sourced run reads its manifests from its own repository at
+        // its head commit. A local submission without a snapshot has no such
+        // commit to read.
+        None if run.submission.local_workspace.is_none() => Some(LocalManifests::Forge {
+            repository: &run.submission.repository,
+            commit: &run.head_sha,
+        }),
+        None => None,
+    };
+    if let Some(source) = source {
+        declared.extend(
+            local_composite_declared_actions(
+                shared,
+                source,
+                &run.submission.workflow_yaml,
+                &run.submission.reusable_workflows,
+            )
+            .await,
+        );
+    }
+    Ok(declared)
 }
 
 /// Cap on a fetched action manifest's decoded bytes. Manifests are small
 /// YAML files; anything larger is not a manifest we should parse.
 const ACTION_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+
+/// Bound local-manifest traversal to the same practical action depth as the
+/// runner. A submitted tree can contain arbitrary files, but only manifests
+/// reachable from a workflow's local `uses:` are inspected.
+const MAX_LOCAL_ACTION_MANIFESTS: usize = 256;
+const MAX_LOCAL_ACTION_DEPTH: usize = 10;
+
+/// Where a run's local composite manifests are read from.
+#[derive(Clone, Copy)]
+enum LocalManifests<'a> {
+    /// The run's immutable workspace snapshot, a git object store on disk.
+    Snapshot(&'a crate::snapshots::WorkspaceSnapshot),
+    /// A run without a workspace snapshot (webhook and other GitHub-sourced
+    /// runs): the run's own repository at its head commit, read through the
+    /// contents API.
+    Forge {
+        repository: &'a str,
+        commit: &'a str,
+    },
+}
+
+/// The nested `uses:` of one composite manifest: remote `owner/repo` scopes,
+/// then the local `./`, `../`, and `$/` references to resolve in the tree.
+type NestedUses = (BTreeSet<String>, Vec<String>);
+
+/// Add remote actions nested in the local composite manifests that a run's
+/// workflow reaches, read from the run's own commit: its snapshot when it has
+/// one, otherwise its GitHub repository at its head commit. Nothing a runner
+/// sends selects the repository or ref, and a manifest that cannot be read adds
+/// nothing, so its nested actions stay denied.
+async fn local_composite_declared_actions(
+    shared: &SharedState,
+    source: LocalManifests<'_>,
+    workflow_yaml: &str,
+    reusable_workflows: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut reader = match source {
+        LocalManifests::Snapshot(snapshot) => {
+            let Some(repository) = snapshot_repository_path(&shared.state, snapshot) else {
+                return BTreeSet::new();
+            };
+            if !valid_snapshot_commit(&snapshot.commit_sha) {
+                return BTreeSet::new();
+            }
+            ManifestReader::Snapshot {
+                repository,
+                commit: snapshot.commit_sha.clone(),
+            }
+        }
+        LocalManifests::Forge { repository, commit } => {
+            let Some((owner, repo)) = forge_repository_slug(repository) else {
+                warn!(
+                    repository,
+                    "run repository is not a plain owner/repo slug; its local composite manifests cannot be read"
+                );
+                return BTreeSet::new();
+            };
+            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(commit) {
+                return BTreeSet::new();
+            }
+            ManifestReader::Forge(ForgeManifests {
+                shared,
+                owner: owner.to_owned(),
+                repo: repo.to_owned(),
+                commit: commit.to_owned(),
+                credential: None,
+            })
+        }
+    };
+    let Some(workflow) = preloop_gha_parser::parse_workflow(workflow_yaml).ok() else {
+        return BTreeSet::new();
+    };
+
+    let mut pending = VecDeque::new();
+    let mut visited_workflows = BTreeSet::new();
+    collect_workflow_local_action_paths(
+        &workflow,
+        reusable_workflows,
+        &mut pending,
+        &mut visited_workflows,
+        0,
+    );
+
+    let mut declared = BTreeSet::new();
+    let mut visited_actions = BTreeSet::new();
+    while let Some((action_path, depth)) = pending.pop_front() {
+        if depth > MAX_LOCAL_ACTION_DEPTH
+            || visited_actions.len() >= MAX_LOCAL_ACTION_MANIFESTS
+            || !visited_actions.insert(action_path.clone())
+        {
+            continue;
+        }
+        let Some((remote, nested_local)) = reader.nested_uses(&action_path).await else {
+            continue;
+        };
+        declared.extend(remote);
+        for uses in nested_local {
+            // The runner runs a nested `./` beside its composite when that
+            // directory is itself a composite, and from the workspace root
+            // otherwise (GitHub resolves it from the root). Admit both, so the
+            // allowlist covers whichever the run uses.
+            for base in [action_path.as_path(), std::path::Path::new("")] {
+                if let Some(nested_path) = resolve_local_action_path(base, &uses) {
+                    pending.push_back((nested_path, depth + 1));
+                }
+            }
+        }
+    }
+    declared
+}
+
+/// Reads the composite manifests of one traversal from the run's source.
+enum ManifestReader<'a> {
+    Snapshot {
+        repository: std::path::PathBuf,
+        commit: String,
+    },
+    Forge(ForgeManifests<'a>),
+}
+
+impl ManifestReader<'_> {
+    /// The nested `uses:` of the composite at `action_path`, or `None` when no
+    /// readable manifest is there or the read failed.
+    async fn nested_uses(&mut self, action_path: &std::path::Path) -> Option<NestedUses> {
+        match self {
+            Self::Snapshot { repository, commit } => {
+                let manifest = read_local_action_manifest(repository, commit, action_path).await?;
+                Some(manifest_nested_uses_from_yaml(&manifest))
+            }
+            Self::Forge(forge) => forge.nested_uses(action_path).await,
+        }
+    }
+}
+
+/// A run's own GitHub repository at its head commit. Composite manifests are
+/// read through the contents API with the repository's installation token.
+struct ForgeManifests<'a> {
+    shared: &'a SharedState,
+    owner: String,
+    repo: String,
+    commit: String,
+    /// The `contents: read` credential, minted on first use and kept for the
+    /// rest of the traversal. `Some(None)` records a failed mint, so the
+    /// failure is logged once and fails closed.
+    credential: Option<Option<(String, crate::github_breaker::GithubCredentialBucket)>>,
+}
+
+impl ForgeManifests<'_> {
+    async fn nested_uses(&mut self, action_path: &std::path::Path) -> Option<NestedUses> {
+        let key = (
+            format!("{}/{}", self.owner, self.repo).to_lowercase(),
+            self.commit.clone(),
+            action_path.to_string_lossy().into_owned(),
+        );
+        if let Ok(memo) = self.shared.state.local_composite_nested_uses.lock()
+            && let Some(cached) = memo.get(&key)
+        {
+            return cached.clone();
+        }
+        // A transient failure returns without memoising, so the next
+        // adjudication asks GitHub again.
+        let (token, bucket) = self.credential().await?;
+        let nested = match fetch_contents_manifest(
+            self.shared,
+            &token,
+            bucket,
+            &self.owner,
+            &self.repo,
+            &self.commit,
+            action_path,
+        )
+        .await
+        {
+            ManifestFetch::Found(manifest) => Some(manifest_nested_uses_from_yaml(&manifest)),
+            ManifestFetch::Absent => None,
+            ManifestFetch::Transient => return None,
+        };
+        if let Ok(mut memo) = self.shared.state.local_composite_nested_uses.lock() {
+            if memo.len() >= crate::state::MAX_LOCAL_COMPOSITE_MEMO {
+                memo.clear();
+            }
+            memo.insert(key, nested.clone());
+        }
+        nested
+    }
+
+    /// The run repository's contents-read credential, minted on first use.
+    async fn credential(
+        &mut self,
+    ) -> Option<(String, crate::github_breaker::GithubCredentialBucket)> {
+        if self.credential.is_none() {
+            let repository = format!("{}/{}", self.owner, self.repo);
+            self.credential = Some(contents_read_credential(self.shared, &repository).await);
+        }
+        self.credential.clone().flatten()
+    }
+}
+
+/// One contents-API read of a composite manifest.
+enum ManifestFetch {
+    /// The manifest's bytes.
+    Found(Vec<u8>),
+    /// Neither manifest name is a readable file at this commit.
+    Absent,
+    /// GitHub could not answer; the read fails closed and is not memoised.
+    Transient,
+}
+
+/// Read the composite manifest at `action_path` in `owner/repo` at `commit`
+/// through the contents API, trying `action.yml` and then `action.yaml` as the
+/// runner does.
+async fn fetch_contents_manifest(
+    shared: &SharedState,
+    token: &str,
+    bucket: crate::github_breaker::GithubCredentialBucket,
+    owner: &str,
+    repo: &str,
+    commit: &str,
+    action_path: &std::path::Path,
+) -> ManifestFetch {
+    let Some(directory) = contents_api_path(action_path) else {
+        return ManifestFetch::Absent;
+    };
+    let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
+    let enc_owner = percent_encode_path_segment(owner);
+    let enc_repo = percent_encode_path_segment(repo);
+    let enc_commit = percent_encode_path_segment(commit);
+    for manifest in ["action.yml", "action.yaml"] {
+        let path = if directory.is_empty() {
+            manifest.to_owned()
+        } else {
+            format!("{directory}/{manifest}")
+        };
+        let url =
+            format!("{api_base}/repos/{enc_owner}/{enc_repo}/contents/{path}?ref={enc_commit}");
+        let request = crate::shared_http::CLIENT
+            .get(&url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json");
+        let response = match crate::github_breaker::send_observed_labeled(
+            &shared.state.github_breakers,
+            bucket,
+            &shared.state.github_consumption,
+            crate::github_breaker::GithubSubsystem::Actions,
+            request,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%owner, %repo, %commit, %error, "local composite manifest fetch failed; its nested uses stay denied");
+                return ManifestFetch::Transient;
+            }
+        };
+        shared
+            .state
+            .github_consumption
+            .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Actions, &response);
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            continue;
+        }
+        if !status.is_success() {
+            warn!(%owner, %repo, %commit, %status, "local composite manifest fetch was refused; its nested uses stay denied");
+            return ManifestFetch::Transient;
+        }
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return ManifestFetch::Transient;
+        };
+        if let Some(bytes) = contents_file_bytes(&body) {
+            return ManifestFetch::Found(bytes);
+        }
+    }
+    ManifestFetch::Absent
+}
+
+/// `path` as a percent-encoded contents-API path; `""` names the repository
+/// root. `None` for any component that is not a plain UTF-8 name.
+fn contents_api_path(path: &std::path::Path) -> Option<String> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        segments.push(percent_encode_path_segment(name.to_str()?));
+    }
+    Some(segments.join("/"))
+}
+
+/// The credential that reads `repository`'s contents: a `contents: read`
+/// installation token scoped to that repository, minted from the GitHub App
+/// installed on its owner, with the installation as its rate-limit bucket.
+/// `None` when no App covers the repository or the mint fails, so the caller
+/// fails closed. Unlike action downloads there is no static-PAT fallback.
+async fn contents_read_credential(
+    shared: &SharedState,
+    repository: &str,
+) -> Option<(String, crate::github_breaker::GithubCredentialBucket)> {
+    let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await else {
+        warn!(
+            repository,
+            "no GitHub App installation covers this repository; its local composite manifests cannot be read, so their nested actions stay denied"
+        );
+        return None;
+    };
+    let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
+    let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+    let token = match crate::github_app::get_or_mint_token_at(
+        api_base,
+        &app,
+        repository,
+        &permissions,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(
+                repository,
+                %error,
+                "could not mint a contents-read installation token; its local composite manifests cannot be read, so their nested actions stay denied"
+            );
+            return None;
+        }
+    };
+    // The installation is the rate-limit identity, so never invent one.
+    match crate::github_app::installation_for_repo(&app, repository).await {
+        Ok(installation) if installation != 0 => Some((
+            token,
+            crate::github_breaker::GithubCredentialBucket::Installation(installation),
+        )),
+        _ => {
+            warn!(
+                repository,
+                "could not resolve the installation for this repository; its local composite manifests cannot be read, so their nested actions stay denied"
+            );
+            None
+        }
+    }
+}
+
+/// The owner and repository of a plain `owner/repo` slug. Anything the
+/// contents-API path could carry unsafely (empty, `.`/`..`, separators,
+/// whitespace) is rejected.
+fn forge_repository_slug(repository: &str) -> Option<(&str, &str)> {
+    let (owner, repo) = repository.split_once('/')?;
+    let plain = |name: &str| {
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains(['/', '\\', '\0'])
+            && !name.chars().any(char::is_whitespace)
+    };
+    (plain(owner) && plain(repo)).then_some((owner, repo))
+}
+
+fn collect_workflow_local_action_paths(
+    workflow: &preloop_gha_parser::Workflow,
+    reusable_workflows: &BTreeMap<String, String>,
+    pending: &mut VecDeque<(std::path::PathBuf, usize)>,
+    visited: &mut BTreeSet<String>,
+    depth: usize,
+) {
+    if depth > DECLARED_ACTION_REUSABLE_DEPTH {
+        return;
+    }
+    for job in workflow.jobs.values() {
+        if let Some(uses) = job.uses.as_deref()
+            && visited.insert(uses.to_owned())
+            && let Some(yaml) = reusable_callee_yaml(uses, reusable_workflows)
+            && let Ok(callee) = preloop_gha_parser::parse_workflow(yaml)
+        {
+            collect_workflow_local_action_paths(
+                &callee,
+                reusable_workflows,
+                pending,
+                visited,
+                depth + 1,
+            );
+        }
+        for step in &job.steps {
+            if let Some(uses) = step.uses.as_deref()
+                && let Some(path) = resolve_local_action_path(std::path::Path::new(""), uses)
+            {
+                pending.push_back((path, 0));
+            }
+        }
+    }
+}
+
+/// Normalize a local `uses:` (`./`, `../`, or the self-repository `$/`) to a
+/// repository-relative action directory; the empty path is the repository
+/// root. `None` for remote references and for paths that escape the root.
+fn resolve_local_action_path(base: &std::path::Path, uses: &str) -> Option<std::path::PathBuf> {
+    let path = if let Some(relative) = uses.strip_prefix("$/") {
+        std::path::PathBuf::from(relative)
+    } else if uses.starts_with("./") || uses.starts_with("../") {
+        base.join(uses)
+    } else {
+        return None;
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::CurDir => {}
+            // A nested local action may walk to another path in the same
+            // snapshot, but it may never escape the repository root.
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn snapshot_repository_path(
+    state: &AppState,
+    snapshot: &crate::snapshots::WorkspaceSnapshot,
+) -> Option<std::path::PathBuf> {
+    let relative = snapshot
+        .storage_repository
+        .as_deref()
+        .unwrap_or(&snapshot.repository);
+    let path = std::path::Path::new(relative);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(state.state_dir.join(normalized))
+}
+
+fn valid_snapshot_commit(commit: &str) -> bool {
+    (40..=64).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn read_local_action_manifest(
+    repository: &std::path::Path,
+    commit: &str,
+    action_path: &std::path::Path,
+) -> Option<Vec<u8>> {
+    for manifest in ["action.yml", "action.yaml"] {
+        let path = action_path.join(manifest);
+        if let Some(bytes) = read_snapshot_file(repository, commit, &path).await {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+async fn read_snapshot_file(
+    repository: &std::path::Path,
+    commit: &str,
+    path: &std::path::Path,
+) -> Option<Vec<u8>> {
+    let object = format!("{}:{}", commit, path.to_string_lossy());
+    let mut child = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .arg("show")
+        .arg("--format=")
+        .arg("--no-ext-diff")
+        .arg(&object)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let mut bytes = Vec::with_capacity(ACTION_MANIFEST_MAX_BYTES + 1);
+    let read_result = stdout
+        .take((ACTION_MANIFEST_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await;
+    if read_result.is_err() || bytes.len() > ACTION_MANIFEST_MAX_BYTES {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    }
+    let status = child.wait().await.ok()?;
+    if !status.success() {
+        return None;
+    }
+    Some(bytes)
+}
 
 /// Nested `uses:` scopes from a composite action's manifest, memoized per
 /// (`owner`, `repo`, `ref`). Only definitive answers are cached (see
@@ -1096,24 +1618,48 @@ fn yaml_get<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yam
 /// nest remote `uses:`; anything else — Node/Docker actions, unparseable
 /// bodies — yields an empty set.
 fn manifest_nested_uses(body: &serde_json::Value) -> BTreeSet<String> {
-    let mut nested = BTreeSet::new();
-    let content = body.get("content").and_then(|value| value.as_str());
-    let Some(encoded) = content else {
-        return nested;
-    };
+    contents_manifest_bytes(body).map_or_else(BTreeSet::new, |decoded| {
+        manifest_nested_uses_from_yaml(&decoded).0
+    })
+}
+
+/// Decoded bytes of a contents-API body's `content`, capped at
+/// [`ACTION_MANIFEST_MAX_BYTES`]; `None` when absent, undecodable, or oversized.
+fn contents_manifest_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
+    let encoded = body.get("content").and_then(|value| value.as_str())?;
     // The contents API wraps base64 at 60 columns; strip whitespace before
     // decoding and cap the decoded size — this is a small YAML file.
     let cleaned: String = encoded.chars().filter(|ch| !ch.is_whitespace()).collect();
-    let decoded = match base64::Engine::decode(
+    match base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         cleaned.as_bytes(),
     ) {
-        Ok(decoded) if decoded.len() <= ACTION_MANIFEST_MAX_BYTES => decoded,
-        _ => return nested,
-    };
-    let manifest: serde_yaml::Value = match serde_yaml::from_slice(&decoded) {
+        Ok(decoded) if decoded.len() <= ACTION_MANIFEST_MAX_BYTES => Some(decoded),
+        _ => None,
+    }
+}
+
+/// Decoded bytes of a contents-API body for a file the forge serves inline.
+/// Directory listings are arrays, and the API withholds content for files over
+/// 1 MB (`encoding: "none"`); neither is a manifest we can read.
+fn contents_file_bytes(body: &serde_json::Value) -> Option<Vec<u8>> {
+    let inline_file = body.get("type").and_then(serde_json::Value::as_str) == Some("file")
+        && body.get("encoding").and_then(serde_json::Value::as_str) == Some("base64");
+    if !inline_file {
+        return None;
+    }
+    contents_manifest_bytes(body)
+}
+
+/// Extract remote and local nested `uses:` references from a composite action
+/// manifest. Local references are returned separately so callers can resolve
+/// them against a checked-out tree rather than treating them as repositories.
+fn manifest_nested_uses_from_yaml(decoded: &[u8]) -> (BTreeSet<String>, Vec<String>) {
+    let mut nested = BTreeSet::new();
+    let mut local = Vec::new();
+    let manifest: serde_yaml::Value = match serde_yaml::from_slice(decoded) {
         Ok(manifest) => manifest,
-        Err(_) => return nested,
+        Err(_) => return (nested, local),
     };
     let runs = yaml_get(&manifest, "runs");
     let using_is_composite = runs
@@ -1121,20 +1667,23 @@ fn manifest_nested_uses(body: &serde_json::Value) -> BTreeSet<String> {
         .and_then(|using| using.as_str())
         .is_some_and(|using| using == "composite");
     if !using_is_composite {
-        return nested;
+        return (nested, local);
     }
     let steps = runs.and_then(|runs| yaml_get(runs, "steps"));
     let Some(steps) = steps.and_then(|steps| steps.as_sequence()) else {
-        return nested;
+        return (nested, local);
     };
     for step in steps {
-        if let Some(uses) = yaml_get(step, "uses").and_then(|uses| uses.as_str())
-            && let Some(owner_repo) = normalize_action_owner_repo(uses)
-        {
+        let Some(uses) = yaml_get(step, "uses").and_then(|uses| uses.as_str()) else {
+            continue;
+        };
+        if let Some(owner_repo) = normalize_action_owner_repo(uses) {
             nested.insert(owner_repo);
+        } else if uses.starts_with("./") || uses.starts_with("../") || uses.starts_with("$/") {
+            local.push(uses.to_owned());
         }
     }
-    nested
+    (nested, local)
 }
 
 /// Enforce the run's declared-action allowlist on one resolution batch.
@@ -2044,6 +2593,221 @@ jobs:
         );
     }
 
+    /// Commit `files` as one snapshot and mirror it into a fresh engine state,
+    /// the way a run's workspace snapshot is stored. The returned temp dir
+    /// keeps that state directory alive for the test.
+    async fn local_snapshot_fixture(
+        files: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        AppState,
+        crate::snapshots::WorkspaceSnapshot,
+    ) {
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let source = temp.path().join("source");
+        for (path, body) in files {
+            let file = source.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["config", "user.email", "test@example.invalid"]);
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "snapshot"]);
+        let commit = git(&source, &["rev-parse", "HEAD"]);
+
+        let repository = state.state_dir.join("snapshots/local-action-test");
+        std::fs::create_dir_all(repository.parent().unwrap()).unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source)
+            .arg(&repository)
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "git clone --bare: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+
+        let snapshot = crate::snapshots::WorkspaceSnapshot {
+            commit_sha: commit,
+            repository: "snapshots/local-action-test".to_owned(),
+            ..Default::default()
+        };
+        (temp, state, snapshot)
+    }
+
+    /// A composite action manifest whose steps are the given `uses:` values.
+    fn composite_manifest(uses: &[&str]) -> String {
+        let steps: String = uses
+            .iter()
+            .map(|step| format!("    - uses: {step}\n"))
+            .collect();
+        format!("runs:\n  using: composite\n  steps:\n{steps}")
+    }
+
+    /// A local composite's remote dependency is read from the immutable
+    /// checked-out tree and admitted, while an unrelated action remains
+    /// forbidden. This exercises the same allowlist used by runnerresolve.
+    #[tokio::test]
+    async fn local_composite_dependency_is_allowed_but_unlisted_action_denied() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let (_temp, state, snapshot) =
+            local_snapshot_fixture(&[(".github/actions/setup/action.yml", setup.as_str())]).await;
+        let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+"#;
+        let declared = local_composite_declared_actions(
+            &state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            workflow,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert!(
+            declared.contains("dtolnay/rust-toolchain"),
+            "local composite dependency must enter the declared set: {declared:?}"
+        );
+
+        let allowed = vec![(
+            "dtolnay/rust-toolchain".to_owned(),
+            Some("stable".to_owned()),
+        )];
+        enforce_declared_actions(&state, RunId(uuid::Uuid::new_v4()), &declared, &allowed)
+            .await
+            .expect("local composite dependency should be authorized");
+
+        let denied = vec![("attacker/unlisted".to_owned(), Some("main".to_owned()))];
+        let error =
+            enforce_declared_actions(&state, RunId(uuid::Uuid::new_v4()), &declared, &denied)
+                .await
+                .expect_err("an action absent from workflow and manifests must be denied");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A `./` step nested in a local composite resolves as the runner does: the
+    /// composite beside the referencing one wins when it exists, otherwise the
+    /// path is taken from the workspace root. A root-level `uses: ./` action is
+    /// read too.
+    #[tokio::test]
+    async fn local_nested_composites_resolve_beside_then_from_the_root() {
+        let outer = composite_manifest(&["./.github/actions/inner", "./beside"]);
+        let inner = composite_manifest(&["root/inner@v1"]);
+        let beside = composite_manifest(&["beside/dep@v1"]);
+        let root = composite_manifest(&["root/action-dep@v1"]);
+        let (_temp, state, snapshot) = local_snapshot_fixture(&[
+            (".github/actions/outer/action.yml", outer.as_str()),
+            (".github/actions/inner/action.yml", inner.as_str()),
+            (".github/actions/outer/beside/action.yml", beside.as_str()),
+            ("action.yml", root.as_str()),
+        ])
+        .await;
+        let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/outer
+      - uses: ./
+"#;
+        let declared = local_composite_declared_actions(
+            &state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            workflow,
+            &BTreeMap::new(),
+        )
+        .await;
+        for expected in ["root/inner", "beside/dep", "root/action-dep"] {
+            assert!(
+                declared.contains(expected),
+                "{expected} must enter the declared set: {declared:?}"
+            );
+        }
+    }
+
+    /// An action's depth is the shallowest path that reaches it. Here `shared`
+    /// is a direct step (depth 0) and also the end of a nine-composite chain
+    /// (depth 9); its dependency two levels below it must still be admitted.
+    #[tokio::test]
+    async fn local_composite_depth_is_taken_from_the_shallowest_path() {
+        let mut manifests: Vec<(String, String)> = Vec::new();
+        for index in 0..9 {
+            let next = if index == 8 {
+                "./.github/actions/shared".to_owned()
+            } else {
+                format!("./.github/actions/chain{}", index + 1)
+            };
+            manifests.push((
+                format!(".github/actions/chain{index}/action.yml"),
+                composite_manifest(&[next.as_str()]),
+            ));
+        }
+        manifests.push((
+            ".github/actions/shared/action.yml".to_owned(),
+            composite_manifest(&["./.github/actions/s1"]),
+        ));
+        manifests.push((
+            ".github/actions/s1/action.yml".to_owned(),
+            composite_manifest(&["./.github/actions/s2"]),
+        ));
+        manifests.push((
+            ".github/actions/s2/action.yml".to_owned(),
+            composite_manifest(&["deep/dep@v1"]),
+        ));
+        let files: Vec<(&str, &str)> = manifests
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect();
+        let (_temp, state, snapshot) = local_snapshot_fixture(&files).await;
+        let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/shared
+      - uses: ./.github/actions/chain0
+"#;
+        let declared = local_composite_declared_actions(
+            &state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            workflow,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert!(
+            declared.contains("deep/dep"),
+            "deep/dep must enter the declared set: {declared:?}"
+        );
+    }
+
     /// Ticket TTL is ~20 minutes, not 6 hours: a leaked bearerless ticket URL
     /// is a briefly-open window.
     #[tokio::test]
@@ -2069,5 +2833,472 @@ jobs:
             (15 * 60..=30 * 60).contains(&ttl),
             "ticket TTL {ttl}s is outside the 15–30 minute window"
         );
+    }
+
+    use axum::response::IntoResponse;
+
+    /// One App key for every forge test: a fresh 2048-bit key per test is slow.
+    static FORGE_TEST_KEY: std::sync::LazyLock<rsa::RsaPrivateKey> =
+        std::sync::LazyLock::new(|| {
+            rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap()
+        });
+
+    /// Installation id the forge stub reports for owner `o`.
+    const STUB_INSTALLATION: u64 = 4242;
+
+    /// The workflow the forge tests run: one local composite step.
+    const FORGE_WORKFLOW: &str = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/setup
+"#;
+
+    /// GitHub stand-in for a webhook run's repository `o/r`: App installation
+    /// discovery, the installation-token mint, and the contents API serving
+    /// `files` at any ref. Records every contents request and mint body.
+    #[derive(Default)]
+    struct ForgeStub {
+        /// Whether the App is installed on `o`.
+        installed: bool,
+        /// Repository-relative path to file text.
+        files: BTreeMap<String, String>,
+        /// Answer every contents request with HTTP 500.
+        fail_contents: bool,
+        /// `(path, ref, authorization)` for each contents request.
+        contents: parking_lot::Mutex<Vec<(String, String, String)>>,
+        /// Body of each installation-token mint.
+        mints: parking_lot::Mutex<Vec<serde_json::Value>>,
+    }
+
+    async fn forge_installations(
+        axum::extract::State(stub): axum::extract::State<Arc<ForgeStub>>,
+    ) -> axum::Json<serde_json::Value> {
+        if !stub.installed {
+            return axum::Json(serde_json::json!([]));
+        }
+        axum::Json(serde_json::json!([
+            { "id": STUB_INSTALLATION, "account": { "login": "o" } }
+        ]))
+    }
+
+    async fn forge_mint(
+        axum::extract::State(stub): axum::extract::State<Arc<ForgeStub>>,
+        axum::extract::Path(installation): axum::extract::Path<u64>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        stub.mints.lock().push(body);
+        if !stub.installed || installation != STUB_INSTALLATION {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        axum::Json(serde_json::json!({
+            "token": "ghs_forge_stub",
+            "expires_at": "2999-01-01T00:00:00Z",
+        }))
+        .into_response()
+    }
+
+    async fn forge_contents(
+        axum::extract::State(stub): axum::extract::State<Arc<ForgeStub>>,
+        axum::extract::Path((_owner, _repo, path)): axum::extract::Path<(String, String, String)>,
+        axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let git_ref = query.get("ref").cloned().unwrap_or_default();
+        stub.contents
+            .lock()
+            .push((path.clone(), git_ref, authorization));
+        if stub.fail_contents {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        match stub.files.get(&path) {
+            Some(text) => axum::Json(serde_json::json!({
+                "type": "file",
+                "encoding": "base64",
+                "size": text.len(),
+                "content": base64::engine::general_purpose::STANDARD.encode(text),
+            }))
+            .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    /// Serve `stub` on a loopback port; returns the stub for assertions and
+    /// the API base to point the engine at.
+    async fn spawn_forge_stub(stub: ForgeStub) -> (Arc<ForgeStub>, String) {
+        let stub = Arc::new(stub);
+        let app = axum::Router::new()
+            .route(
+                "/app/installations",
+                axum::routing::get(forge_installations),
+            )
+            .route(
+                "/app/installations/{installation}/access_tokens",
+                axum::routing::post(forge_mint),
+            )
+            .route(
+                "/repos/{owner}/{repo}/contents/{*path}",
+                axum::routing::get(forge_contents),
+            )
+            .with_state(Arc::clone(&stub));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (stub, base)
+    }
+
+    /// A webhook-style run's engine: no workspace snapshot, the stub App
+    /// configured when `with_app`, and the GitHub API pointed at the stub. The
+    /// guards hold the process-wide env lock and restore `PRELOOP_GITHUB_API_URL`
+    /// when dropped, so one fixture at a time per test.
+    struct ForgeFixture {
+        shared: Arc<SharedState>,
+        stub: Arc<ForgeStub>,
+        _temp: tempfile::TempDir,
+        _env: (
+            crate::state::TestEnvVar,
+            tokio::sync::MutexGuard<'static, ()>,
+        ),
+    }
+
+    async fn forge_fixture(stub: ForgeStub, with_app: bool) -> ForgeFixture {
+        let (stub, base) = spawn_forge_stub(stub).await;
+        let lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let var = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &base);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        state.github_urls = crate::state::GitHubUrls {
+            server_url: base.clone(),
+            api_url: base.clone(),
+            graphql_url: base,
+        };
+        if with_app {
+            state.github_app = Some(crate::github_app::GitHubAppCredentials::for_tests(
+                "424",
+                FORGE_TEST_KEY.clone(),
+                crate::github_app::MintFailurePolicy::LocalJwt,
+            ));
+        }
+        ForgeFixture {
+            shared: state.shared(),
+            stub,
+            _temp: temp,
+            _env: (var, lock),
+        }
+    }
+
+    fn forge_files(files: &[(&str, &str)]) -> BTreeMap<String, String> {
+        files
+            .iter()
+            .map(|(path, text)| ((*path).to_owned(), (*text).to_owned()))
+            .collect()
+    }
+
+    /// The declared set a forge run of `FORGE_WORKFLOW` reaches at `SHA`.
+    async fn forge_declared(shared: &SharedState) -> BTreeSet<String> {
+        local_composite_declared_actions(
+            shared,
+            LocalManifests::Forge {
+                repository: "o/r",
+                commit: SHA,
+            },
+            FORGE_WORKFLOW,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// A webhook run has no snapshot, so its local composite manifests come
+    /// from its own repository at its head commit, through the contents API.
+    /// The remote action that composite calls is admitted, an unlisted action
+    /// stays forbidden, and every read is pinned to that commit and sent with
+    /// the run's installation token.
+    #[tokio::test]
+    async fn forge_local_composite_dependency_is_allowed_but_unlisted_action_denied() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[(".github/actions/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let shared = &fixture.shared;
+        let declared = forge_declared(shared).await;
+        assert!(
+            declared.contains("dtolnay/rust-toolchain"),
+            "local composite dependency must enter the declared set: {declared:?}"
+        );
+
+        let allowed = vec![(
+            "dtolnay/rust-toolchain".to_owned(),
+            Some("stable".to_owned()),
+        )];
+        enforce_declared_actions(
+            &shared.state,
+            RunId(uuid::Uuid::new_v4()),
+            &declared,
+            &allowed,
+        )
+        .await
+        .expect("local composite dependency should be authorized");
+
+        let denied = vec![("attacker/unlisted".to_owned(), Some("main".to_owned()))];
+        let error = enforce_declared_actions(
+            &shared.state,
+            RunId(uuid::Uuid::new_v4()),
+            &declared,
+            &denied,
+        )
+        .await
+        .expect_err("an action absent from workflow and manifests must be denied");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+
+        assert_eq!(
+            *fixture.stub.contents.lock(),
+            vec![(
+                ".github/actions/setup/action.yml".to_owned(),
+                SHA.to_owned(),
+                "Bearer ghs_forge_stub".to_owned(),
+            )],
+        );
+        let mints = fixture.stub.mints.lock();
+        assert_eq!(mints.len(), 1);
+        assert_eq!(mints[0]["repositories"], serde_json::json!(["r"]));
+        assert_eq!(
+            mints[0]["permissions"],
+            serde_json::json!({ "contents": "read" })
+        );
+    }
+
+    /// The forge reader resolves nested `./` references as the snapshot reader
+    /// does: a webhook run and the same commit submitted with a snapshot get
+    /// the same declared set, and every read stays inside the repository at
+    /// that commit.
+    #[tokio::test]
+    async fn forge_nested_composites_resolve_like_the_snapshot() {
+        let outer = composite_manifest(&["./.github/actions/inner", "./beside"]);
+        let inner = composite_manifest(&["root/inner@v1"]);
+        let beside = composite_manifest(&["beside/dep@v1"]);
+        let root = composite_manifest(&["root/action-dep@v1"]);
+        let files = [
+            (".github/actions/outer/action.yml", outer.as_str()),
+            (".github/actions/inner/action.yml", inner.as_str()),
+            (".github/actions/outer/beside/action.yml", beside.as_str()),
+            ("action.yml", root.as_str()),
+        ];
+        let workflow = r#"
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/outer
+      - uses: ./
+"#;
+        let (_temp, snapshot_state, snapshot) = local_snapshot_fixture(&files).await;
+        let from_snapshot = local_composite_declared_actions(
+            &snapshot_state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            workflow,
+            &BTreeMap::new(),
+        )
+        .await;
+
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&files),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let from_forge = local_composite_declared_actions(
+            &fixture.shared,
+            LocalManifests::Forge {
+                repository: "o/r",
+                commit: &snapshot.commit_sha,
+            },
+            workflow,
+            &BTreeMap::new(),
+        )
+        .await;
+
+        assert_eq!(from_forge, from_snapshot);
+        for expected in ["root/inner", "beside/dep", "root/action-dep"] {
+            assert!(
+                from_forge.contains(expected),
+                "{expected} must enter the declared set: {from_forge:?}"
+            );
+        }
+        let contents = fixture.stub.contents.lock();
+        assert!(!contents.is_empty());
+        for (path, git_ref, _) in contents.iter() {
+            assert!(!path.contains(".."), "read escaped the tree: {path}");
+            assert_eq!(git_ref, &snapshot.commit_sha);
+        }
+    }
+
+    /// A failed contents read adds nothing, so the nested action stays denied.
+    /// The failure is not memoised: the next adjudication reads GitHub again.
+    #[tokio::test]
+    async fn forge_contents_failure_leaves_nested_action_denied() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                fail_contents: true,
+                files: forge_files(&[(".github/actions/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let declared = forge_declared(&fixture.shared).await;
+        assert!(!declared.contains("dtolnay/rust-toolchain"), "{declared:?}");
+
+        let requested = vec![(
+            "dtolnay/rust-toolchain".to_owned(),
+            Some("stable".to_owned()),
+        )];
+        let error = enforce_declared_actions(
+            &fixture.shared.state,
+            RunId(uuid::Uuid::new_v4()),
+            &declared,
+            &requested,
+        )
+        .await
+        .expect_err("a nested action whose manifest could not be read must stay denied");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+
+        let _ = forge_declared(&fixture.shared).await;
+        assert_eq!(
+            fixture.stub.contents.lock().len(),
+            2,
+            "a failed read must not be memoised"
+        );
+    }
+
+    /// A repository no App installation covers gets no contents read at all,
+    /// so the nested action stays denied, with or without an App configured.
+    #[tokio::test]
+    async fn forge_without_an_installation_token_reads_nothing() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let files = forge_files(&[(".github/actions/setup/action.yml", setup.as_str())]);
+        {
+            let uninstalled = forge_fixture(
+                ForgeStub {
+                    installed: false,
+                    files: files.clone(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await;
+            assert!(forge_declared(&uninstalled.shared).await.is_empty());
+            assert!(uninstalled.stub.contents.lock().is_empty());
+        }
+        let no_app = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files,
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        assert!(forge_declared(&no_app.shared).await.is_empty());
+        assert!(no_app.stub.contents.lock().is_empty());
+    }
+
+    /// A manifest is read once per commit: a second adjudication of the same
+    /// run is served from the memo, with no GitHub read and no token mint.
+    #[tokio::test]
+    async fn forge_manifests_are_memoised_per_commit() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[(".github/actions/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        for _ in 0..2 {
+            assert!(
+                forge_declared(&fixture.shared)
+                    .await
+                    .contains("dtolnay/rust-toolchain")
+            );
+        }
+        assert_eq!(fixture.stub.contents.lock().len(), 1);
+        assert_eq!(fixture.stub.mints.lock().len(), 1);
+    }
+
+    /// A head commit that is not a real commit, or a repository that is not a
+    /// plain `owner/repo`, reads nothing.
+    #[tokio::test]
+    async fn forge_requires_a_real_commit_and_a_plain_repository() {
+        let setup = composite_manifest(&["dtolnay/rust-toolchain@stable"]);
+        let fixture = forge_fixture(
+            ForgeStub {
+                installed: true,
+                files: forge_files(&[(".github/actions/setup/action.yml", setup.as_str())]),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let zeros = "0".repeat(40);
+        for (repository, commit) in [
+            ("o/r", zeros.as_str()),
+            ("o/r", "not-a-commit"),
+            ("solo", SHA),
+            ("o/../r", SHA),
+        ] {
+            let declared = local_composite_declared_actions(
+                &fixture.shared,
+                LocalManifests::Forge { repository, commit },
+                FORGE_WORKFLOW,
+                &BTreeMap::new(),
+            )
+            .await;
+            assert!(
+                declared.is_empty(),
+                "{repository} at {commit}: {declared:?}"
+            );
+        }
+        assert!(fixture.stub.contents.lock().is_empty());
+    }
+
+    /// Only plain `owner/repo` slugs reach the contents API path.
+    #[test]
+    fn forge_repository_slug_accepts_only_plain_owner_and_repo() {
+        assert_eq!(
+            forge_repository_slug("preloopdev/AgentENV-private"),
+            Some(("preloopdev", "AgentENV-private"))
+        );
+        for bad in [
+            "", "solo", "/repo", "owner/", "o/r/x", "o/..", "./r", "o/r s", "o\\x/r",
+        ] {
+            assert_eq!(
+                forge_repository_slug(bad),
+                None,
+                "{bad:?} must not name a repository"
+            );
+        }
     }
 }
