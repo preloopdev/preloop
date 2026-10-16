@@ -19,7 +19,7 @@ jobs:
   mutants-T1-job-binding-lifecycle:
     name: mutants-T1-job-binding-lifecycle-${{ matrix.shard }}-of-6
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 240
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -131,7 +131,7 @@ jobs:
   mutants-T2-webhook-signature:
     name: mutants-T2-webhook-signature-${{ matrix.shard }}-of-3
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 180
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -243,7 +243,7 @@ jobs:
   mutants-T3-pool-warm-sizing:
     name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-3
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 180
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -355,7 +355,7 @@ jobs:
   mutants-T4-queue-status:
     name: mutants-T4-queue-status-${{ matrix.shard }}-of-6
     runs-on: [self-hosted, preloop-cpane]
-    timeout-minutes: 240
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
