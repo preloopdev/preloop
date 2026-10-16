@@ -47,6 +47,30 @@ const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
     ("pull_requests", "read"),
 ];
 
+/// The one optional permission: `Administration: write` on repositories.
+///
+/// A GitHub-mode runner pool mints registration/remove tokens, JIT configs,
+/// and deletes runners through `…/actions/runners/*`, and every one of those
+/// endpoints requires `administration: write` at repo scope (org scope uses
+/// the organization `Self-hosted runners` permission instead). It is *not*
+/// in [`DEFAULT_PERMISSIONS`]: nothing else needs it, and widening the App's
+/// permissions later means every existing installation has to accept a
+/// permission review in the GitHub UI — so the operator opts in at creation
+/// (`preloop setup github --runner-admin`, or `PRELOOP_GITHUB_RUNNER_ADMIN`),
+/// when adding the scope costs nothing.
+const RUNNER_ADMIN_PERMISSION: (&str, &str) = ("administration", "write");
+
+/// [`DEFAULT_PERMISSIONS`] plus [`RUNNER_ADMIN_PERMISSION`] when the operator
+/// opted a GitHub-mode runner pool in.
+fn permissions(runner_admin: bool) -> Vec<(&'static str, &'static str)> {
+    let mut permissions = DEFAULT_PERMISSIONS.to_vec();
+    if runner_admin {
+        permissions.push(RUNNER_ADMIN_PERMISSION);
+        permissions.sort_unstable();
+    }
+    permissions
+}
+
 /// How long to wait for the operator to finish in the browser.
 const BROWSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -142,8 +166,9 @@ pub(crate) fn manifest(
     name: &str,
     redirect_url: &str,
     public_url: Option<&str>,
+    runner_admin: bool,
 ) -> serde_json::Value {
-    let permissions: serde_json::Map<String, serde_json::Value> = DEFAULT_PERMISSIONS
+    let permissions: serde_json::Map<String, serde_json::Value> = permissions(runner_admin)
         .iter()
         .map(|(scope, access)| ((*scope).to_owned(), serde_json::Value::from(*access)))
         .collect();
@@ -178,6 +203,9 @@ struct Flow {
     /// originate from the form this process served.
     state: String,
     name: String,
+    /// `administration: write` joins the manifest permissions when the
+    /// operator opted the App into runner administration.
+    runner_admin: bool,
     public_url: Option<String>,
     redirect_url: String,
     api_base: String,
@@ -211,6 +239,7 @@ pub(crate) async fn register(
     org: Option<&str>,
     port: u16,
     public_url: Option<&str>,
+    runner_admin: bool,
     open_browser: bool,
 ) -> Result<Registration> {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
@@ -229,7 +258,7 @@ pub(crate) async fn register(
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://api.github.com".to_owned());
-    register_on(listener, name, org, public_url, &api_base).await
+    register_on(listener, name, org, public_url, &api_base, runner_admin).await
 }
 
 /// [`register`] against an already-bound listener, so a test can learn the
@@ -240,6 +269,7 @@ async fn register_on(
     org: Option<&str>,
     public_url: Option<&str>,
     api_base: &str,
+    runner_admin: bool,
 ) -> Result<Registration> {
     let local = listener
         .local_addr()
@@ -250,6 +280,7 @@ async fn register_on(
     let flow = Arc::new(Flow {
         state: nonce(),
         name: name.to_owned(),
+        runner_admin,
         public_url: public_url.map(str::to_owned),
         redirect_url: format!("{base}/callback"),
         api_base: api_base.to_owned(),
@@ -298,7 +329,12 @@ async fn register_on(
 /// The form page: GitHub only accepts a manifest as a form POST, so this is
 /// a self-submitting form rather than a link.
 async fn page_form(State((flow, org)): State<(Arc<Flow>, Option<String>)>) -> impl IntoResponse {
-    let manifest = manifest(&flow.name, &flow.redirect_url, flow.public_url.as_deref());
+    let manifest = manifest(
+        &flow.name,
+        &flow.redirect_url,
+        flow.public_url.as_deref(),
+        flow.runner_admin,
+    );
     let action = creation_url(org.as_deref(), &flow.state);
     let scope = match &org {
         Some(org) => format!("the <strong>{}</strong> organization", escape(org)),
@@ -327,7 +363,7 @@ async fn page_form(State((flow, org)): State<(Arc<Flow>, Option<String>)>) -> im
         name = escape(&flow.name),
         scope = scope,
         permissions = escape(
-            &DEFAULT_PERMISSIONS
+            &permissions(flow.runner_admin)
                 .iter()
                 .map(|(scope, access)| format!("{scope}: {access}"))
                 .collect::<Vec<_>>()
@@ -549,10 +585,9 @@ mod tests {
             .await
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, None, &api).await },
-            );
+        let flow = tokio::spawn(async move {
+            register_on(listener, "preloop-local", None, None, &api, false).await
+        });
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -655,10 +690,9 @@ mod tests {
             );
             axum::serve(api_listener, router).await
         });
-        let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, None, &api).await },
-            );
+        let flow = tokio::spawn(async move {
+            register_on(listener, "preloop-local", None, None, &api, false).await
+        });
 
         let client = reqwest::Client::new();
         let form = client
@@ -691,7 +725,7 @@ mod tests {
 
     #[test]
     fn manifest_disables_webhooks_without_a_public_url() {
-        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None);
+        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None, false);
         assert!(
             manifest.get("hook_attributes").is_none(),
             "GitHub rejects hook URLs it cannot reach over the public \
@@ -713,6 +747,7 @@ mod tests {
             "preloop",
             "http://127.0.0.1:4000/callback",
             Some("https://ci.example.com/"),
+            false,
         );
         assert_eq!(
             manifest["hook_attributes"]["url"],
@@ -722,6 +757,39 @@ mod tests {
         let events = manifest["default_events"].as_array().unwrap();
         assert!(events.iter().any(|e| e == "push"));
         assert!(events.iter().any(|e| e == "pull_request"));
+    }
+
+    #[test]
+    fn the_default_manifest_stays_narrow_without_runner_admin() {
+        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None, false);
+        let permissions = manifest["default_permissions"].as_object().unwrap();
+        assert_eq!(
+            permissions,
+            &serde_json::Map::from_iter([
+                ("checks".to_owned(), "write".into()),
+                ("contents".to_owned(), "read".into()),
+                ("metadata".to_owned(), "read".into()),
+                ("pull_requests".to_owned(), "read".into()),
+            ]),
+            "a GitHub-mode runner pool opt-in is the only thing allowed to \
+             widen the manifest"
+        );
+    }
+
+    #[test]
+    fn runner_admin_adds_exactly_administration_write() {
+        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None, true);
+        let permissions = manifest["default_permissions"].as_object().unwrap();
+        assert_eq!(
+            permissions.len(),
+            DEFAULT_PERMISSIONS.len() + 1,
+            "runner admin adds one scope, nothing else"
+        );
+        assert_eq!(
+            permissions.get("administration").unwrap(),
+            "write",
+            "repo-scoped …/actions/runners endpoints need administration: write"
+        );
     }
 
     #[test]

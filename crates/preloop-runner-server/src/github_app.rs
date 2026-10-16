@@ -136,7 +136,7 @@ fn clamp_to_grants(
 }
 
 /// Scopes in `requested` the installation does not hold, for error messages.
-fn ungranted_scopes(
+pub(crate) fn ungranted_scopes(
     requested: &BTreeMap<String, String>,
     granted: &BTreeMap<String, String>,
 ) -> Vec<String> {
@@ -966,7 +966,7 @@ async fn mint_for_repository(
 }
 
 /// Permission scopes this installation currently holds, keyed snake_case.
-async fn installation_grants(
+pub(crate) async fn installation_grants(
     api_base: &str,
     app_jwt: &str,
     installation_id: u64,
@@ -1151,7 +1151,7 @@ pub async fn mint_installation_token(
 }
 
 /// Installation id for `owner`, served from cache when already discovered.
-async fn installation_id_for(
+pub(crate) async fn installation_id_for(
     api_base: &str,
     creds: &GitHubAppCredentials,
     app_jwt: &str,
@@ -1273,7 +1273,7 @@ fn installation_id_override() -> anyhow::Result<Option<u64>> {
 /// object cannot be trusted to mean "no permissions" — so the result falls back
 /// to [`MINIMUM_PERMISSION`], the narrowest token GitHub will issue, instead of
 /// a body GitHub might read as a request for everything.
-fn installation_permissions(
+pub(crate) fn installation_permissions(
     permissions: &BTreeMap<String, String>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let scoped: serde_json::Map<String, serde_json::Value> = permissions
@@ -1317,7 +1317,7 @@ fn parse_private_key(pem: &str) -> anyhow::Result<rsa::RsaPrivateKey> {
 }
 
 /// GitHub REST API base, overridable for GitHub Enterprise Server and tests.
-fn api_base() -> String {
+pub(crate) fn api_base() -> String {
     env_non_empty("PRELOOP_GITHUB_API_URL")
         .map(|base| base.trim_end_matches('/').to_owned())
         .unwrap_or_else(|| "https://api.github.com".to_owned())

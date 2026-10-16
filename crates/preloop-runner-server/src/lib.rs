@@ -22,6 +22,7 @@ pub mod github;
 pub mod github_app;
 pub mod github_breaker;
 pub mod github_pr;
+pub mod github_runner_admin;
 pub mod github_push;
 pub mod scheduler;
 pub mod shared_http;

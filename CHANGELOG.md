@@ -10,6 +10,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+
+- **GitHub runner administration is available as an explicit App opt-in**
+  (#623): the host-side client mints repository- or organization-scoped
+  registration/remove tokens, JIT configuration, runner lists/deletions, and
+  version-deprecation responses. `preloop setup github --runner-admin` (or
+  `PRELOOP_GITHUB_RUNNER_ADMIN=true`) adds only repository
+  `Administration: write`; existing installations must accept GitHub's
+  permission review, and organization pools require the organization
+  `Self-hosted runners: write` grant.
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and

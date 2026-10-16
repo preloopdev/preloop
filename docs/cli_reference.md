@@ -332,6 +332,7 @@ Configure GitHub credentials.
 | `--token <TOKEN>` | PAT to store (with `--via pat`). Falls back to `PRELOOP_GITHUB_PAT`, then an interactive prompt |
 | `--repo <REPOS>` | Repository to verify the credential against (repeatable) |
 | `--workspace <WORKSPACE>` | Workspace whose workflows should drive the permission checklist |
+| `--runner-admin` | Add repository `Administration: write` for GitHub-mode runner administration when creating the App. Existing installations must accept GitHub's permission review; organization scope requires the organization `Self-hosted runners` permission |
 
 ## `preloop doctor [OPTIONS]`
 
@@ -529,6 +530,7 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_PUBLIC_URL` | Default public base URL; also used for check-run details links |
 | `PRELOOP_STORE_URL` | Default durable-state backend |
 | `PRELOOP_GITHUB_PAT` | PAT fallback for `setup github --via pat` |
+| `PRELOOP_GITHUB_RUNNER_ADMIN` | Boolean equivalent of `preloop setup github --runner-admin` |
 | `PRELOOP_RELEASE_REPOSITORY` | Release source for `update` |
 | `PRELOOP_HOME` | State directory (default `~/.preloop`) |
 | `PRELOOP_RUNNER_POOL_ENABLED` | Enable the local microVM runner pool (default off) |
