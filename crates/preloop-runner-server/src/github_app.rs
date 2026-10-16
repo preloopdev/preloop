@@ -1826,14 +1826,18 @@ async fn send_app_jwt(
 ) -> anyhow::Result<reqwest::Response> {
     match accounting {
         Some((registry, consumption)) => {
-            crate::github_breaker::send_observed_labeled(
+            let response = crate::github_breaker::send_observed_labeled(
                 registry,
                 GithubCredentialBucket::for_app(app_id),
                 consumption,
                 subsystem,
                 request,
             )
-            .await
+            .await?;
+            // The labeled sender accounts the exchange but not its bytes;
+            // charge the advertised size before a caller consumes the body.
+            consumption.record_advertised_bytes(subsystem, &response);
+            Ok(response)
         }
         None => Ok(request.send().await?),
     }
@@ -2188,6 +2192,57 @@ mod tests {
             "env-flattened PEMs must round-trip"
         );
         assert!(parse_private_key("not a pem at all").is_err());
+    }
+
+    /// An App JWT response is charged its advertised `content-length` to the
+    /// subsystem that sent it: the labeled sender accounts the exchange but
+    /// not its bytes, so without the funnel doing it the `app-auth` counters
+    /// stay at zero no matter how much traffic flows.
+    #[tokio::test]
+    async fn app_jwt_responses_are_charged_their_advertised_bytes() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let payload = json!({ "events": ["push"], "permissions": { "contents": "read" } });
+        let body = payload.clone();
+        let stub = Router::new().route(
+            "/app",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub API");
+        let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
+
+        let registry = crate::github_breaker::GithubBreakerRegistry::default();
+        let consumption = crate::github_breaker::GithubConsumption::default();
+        let request = CLIENT.get(format!("{api_base}/app"));
+        send_app_jwt(
+            Some((&registry, &consumption)),
+            "424",
+            GithubSubsystem::AppAuth,
+            request,
+        )
+        .await
+        .expect("send an App JWT request");
+
+        let advertised = serde_json::to_vec(&payload)
+            .expect("serialize the stub body")
+            .len() as u64;
+        let usage = consumption
+            .snapshot()
+            .into_iter()
+            .find(|usage| usage.subsystem == GithubSubsystem::AppAuth.as_str())
+            .expect("app-auth usage row");
+        assert_eq!(usage.requests, 1);
+        assert_eq!(
+            usage.bytes, advertised,
+            "the response's advertised content-length must be charged to app-auth"
+        );
     }
 
     /// Records what the stub GitHub API was asked for.

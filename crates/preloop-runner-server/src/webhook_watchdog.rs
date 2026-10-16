@@ -263,6 +263,7 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
     // rate limit does not stall the others. Only a pass where every App is held
     // back stops here.
     let mut pollable = Vec::with_capacity(apps.len());
+    let mut held_back: Vec<String> = Vec::new();
     for app in apps {
         let bucket = crate::github_breaker::GithubCredentialBucket::for_app(&app.app_id);
         if let Some(retry_after) = shared.state.github_breakers.retry_after_for(bucket) {
@@ -271,6 +272,7 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
                 retry_in_secs = retry_after.as_secs(),
                 "GitHub breaker open; skipping this App's delivery watchdog poll"
             );
+            held_back.push(app.app_id.clone());
             continue;
         }
         pollable.push(app);
@@ -307,7 +309,10 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
         .await
         .map(|repairs| repairs.len() as u64)
         .unwrap_or_default();
-    let succeeded = errors.is_empty();
+    // Global success means every configured App's history was polled this
+    // pass: a partial pass must not clear staleness for the Apps that were
+    // skipped, whose deliveries are still going unwatched.
+    let succeeded = errors.is_empty() && held_back.is_empty();
     let redelivered = total.redelivered;
     let examined = total.examined;
     shared.state.webhook_status.update_watchdog(|status| {
@@ -319,7 +324,17 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
             status.last_examined = examined;
             status.last_error = None;
         } else {
-            status.last_error = Some(errors.join("; "));
+            let mut reason = errors.join("; ");
+            if !held_back.is_empty() {
+                if !reason.is_empty() {
+                    reason.push_str("; ");
+                }
+                reason.push_str(&format!(
+                    "GitHub breaker held back {} this pass; their delivery histories went unpolled",
+                    held_back.join(", ")
+                ));
+            }
+            status.last_error = Some(reason);
         }
     });
     if !errors.is_empty() {
@@ -1281,14 +1296,18 @@ mod tests {
                 .is_some(),
             "App 525 must still be polled"
         );
+        let status = shared.state.webhook_status.watchdog();
         assert!(
-            shared
-                .state
-                .webhook_status
-                .watchdog()
-                .last_success_at_us
-                .is_some(),
-            "a pass that polled an App succeeded"
+            status.last_success_at_us.is_none(),
+            "a pass that left an App unpolled must not report global watchdog success"
+        );
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("424"),
+            "the held-back App must be named so staleness stays explainable: {status:?}"
         );
     }
 

@@ -14,6 +14,12 @@ Releases before v0.27.0 predate the changelog.
   limit or outage no longer skips the webhook-health and delivery-watchdog
   checks of the other Apps, and installation lookup, token minting, and App
   reads now go through the breaker and the `app-auth` consumption counters.
+  A pass that skips an App behind its breaker no longer counts as a successful
+  watchdog poll, so `webhook_watchdog_stale` still fires while any App's
+  deliveries go unwatched; a held-back App stays visible in the health snapshot
+  as explicitly unchecked and keeps its own check time instead of inheriting
+  the pass's, and App JWT responses charge their advertised bytes to the
+  consumption counters.
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
