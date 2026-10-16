@@ -128,9 +128,9 @@ impl preloop_gha_protocol::crypto::RsaParamsLike for RsaParameters {
 
 // ─── File I/O ────────────────────────────────────────────────────────────
 
-const RUNNER_FILE: &str = ".runner";
-const CREDENTIALS_FILE: &str = ".credentials";
-const RSA_PARAMS_FILE: &str = ".credentials_rsaparams";
+pub(crate) const RUNNER_FILE: &str = ".runner";
+pub(crate) const CREDENTIALS_FILE: &str = ".credentials";
+pub(crate) const RSA_PARAMS_FILE: &str = ".credentials_rsaparams";
 
 /// Strip UTF-8 BOM if present (official runner writes BOM).
 fn strip_bom(s: &str) -> &str {
@@ -165,7 +165,7 @@ fn save_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     result
 }
 
-fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
 }
@@ -201,7 +201,7 @@ fn refresh_settings_object(
 /// `.credentials_rsaparams` to 0600 on Linux/macOS so the private RSA key
 /// is not readable by other users on a shared host.
 /// No-op on non-Unix platforms.
-fn restrict_permissions(path: &Path) -> Result<()> {
+pub(crate) fn restrict_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
+### Added
+
+- **JIT runner startup** (#628): `preloop-runner run --jitconfig <encoded>` now
+  decodes GitHub's single-use runner payload, hydrates the runner credentials
+  without registration-token or configure requests, and exits after one job.
+  JIT runners may be reclaimed by GitHub while idle, so the payload is intended
+  for provision-then-run-once hosts rather than a warm pool.
+
 
 ### Fixed
 
