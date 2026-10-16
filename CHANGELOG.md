@@ -14,7 +14,7 @@ Releases before v0.27.0 predate the changelog.
 - **GitHub runner administration is available as an explicit App opt-in**
   (#623): the host-side client mints repository- or organization-scoped
   registration/remove tokens, JIT configuration, runner lists/deletions, and
-  version-deprecation responses. `preloop setup github --runner-admin` (or
+  version-deprecation responses. `preloop setup github --github-runner-admin` (or
   `PRELOOP_GITHUB_RUNNER_ADMIN=true`) adds only repository
   `Administration: write`; existing installations must accept GitHub's
   permission review, and organization pools require the organization

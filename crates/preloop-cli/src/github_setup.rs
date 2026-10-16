@@ -98,7 +98,7 @@ pub struct GithubSetupArgs {
     /// default stays narrow: the manifest is the only place this can be
     /// granted at creation, and granting it on an existing App means every
     /// installation must accept a permission review in the GitHub UI.
-    #[arg(long = "runner-admin", env = "PRELOOP_GITHUB_RUNNER_ADMIN")]
+    #[arg(long = "github-runner-admin", env = "PRELOOP_GITHUB_RUNNER_ADMIN")]
     pub runner_admin: bool,
 }
 
@@ -388,13 +388,13 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     };
 
     if args.runner_admin {
-        // `--runner-admin` only changes the manifest an App is *created*
+        // `--github-runner-admin` only changes the manifest an App is *created*
         // from; App permissions are not something a CLI flag can edit after
         // the fact. The operator grants `Administration: write` in the App's
         // settings, and every existing installation must accept the pending
         // permission review before admin tokens carry it.
         println!(
-            "Note: --runner-admin only sets permissions at App creation. For an \
+            "Note: --github-runner-admin only sets permissions at App creation. For an \
              existing App, grant `Administration: write` on repositories in the \
              App's permission settings, then accept the pending permission review \
              on each installation — otherwise runner-admin token mints will fail \

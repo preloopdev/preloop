@@ -56,7 +56,7 @@ const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
 /// in [`DEFAULT_PERMISSIONS`]: nothing else needs it, and widening the App's
 /// permissions later means every existing installation has to accept a
 /// permission review in the GitHub UI — so the operator opts in at creation
-/// (`preloop setup github --runner-admin`, or `PRELOOP_GITHUB_RUNNER_ADMIN`),
+/// (`preloop setup github --github-runner-admin`, or `PRELOOP_GITHUB_RUNNER_ADMIN`),
 /// when adding the scope costs nothing.
 const RUNNER_ADMIN_PERMISSION: (&str, &str) = ("administration", "write");
 

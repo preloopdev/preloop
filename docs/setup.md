@@ -245,8 +245,8 @@ The private key never leaves the machine: the redirect target is
 | `--app-name NAME` | App name (GitHub requires global uniqueness). Default `preloop-local`. |
 | `--port N` | Pin the loopback port instead of taking a free one. |
 | `--no-browser` | Print the URL instead of opening a browser (headless/SSH). |
-| `--runner-admin` | Add repository `Administration: write` to the created App for a GitHub-mode runner pool. Existing installations must accept the permission review in GitHub. |
-| `PRELOOP_GITHUB_RUNNER_ADMIN=true` | Scripted equivalent of `--runner-admin`. |
+| `--github-runner-admin` | Add repository `Administration: write` to the created App for a GitHub-mode runner pool. Existing installations must accept the permission review in GitHub. |
+| `PRELOOP_GITHUB_RUNNER_ADMIN=true` | Scripted equivalent of `--github-runner-admin`. |
 
 
 
@@ -254,7 +254,7 @@ To host a GitHub-mode runner pool, opt the App into runner administration
 when creating it:
 
 ```sh
-preloop setup github --via app --runner-admin
+preloop setup github --via app --github-runner-admin
 ```
 
 This adds exactly the repository `Administration: write` permission needed for
