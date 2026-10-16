@@ -6,7 +6,10 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{OFFICIAL_GOLDEN, is_official_golden};
-use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
+use preloop_orchestrator::{
+    ControlPlaneHooks, Demand, RegistrationSource, RunnerPool, RunnerPoolConfig,
+    artifact_payload,
+};
 use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -1268,6 +1271,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     }
     let config = RunnerPoolConfig {
         size: 1,
+        demand: Demand::Engine,
         use_fork: false,
         // Unique per bake: smolvm keys a machine's data dir by a hash of its
         // name and reuses a dir left behind by a failed/interrupted run at its
@@ -1297,7 +1301,10 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_socket: None,
         control_upstream: None,
         dns: Some(runner_dns()),
-        registration_token_env: TOKEN_ENV.into(),
+        registration: RegistrationSource::Engine {
+            token_env: TOKEN_ENV.into(),
+        },
+        control_plane_hooks: ControlPlaneHooks::default(),
         labels: vec![
             "self-hosted".into(),
             "Linux".into(),
@@ -2575,6 +2582,7 @@ fn local_runner_pool_config(
         } else {
             0
         },
+        demand: Demand::Engine,
         // Forking is safe on every backend now: file-pack backends always
         // restore the packed golden, and AgentENV keeps immutable,
         // re-forkable snapshots. Size-zero mode still prepares one golden and
@@ -2631,7 +2639,10 @@ fn local_runner_pool_config(
         control_socket,
         control_upstream,
         dns: Some(runner_dns()),
-        registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
+        registration: RegistrationSource::Engine {
+            token_env: "PRELOOP_SYSTEM_TOKEN".into(),
+        },
+        control_plane_hooks: ControlPlaneHooks::default(),
         labels: runner_pool_labels(),
         cpus,
         memory_mib: runner_memory_mib(),

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use preloop_orchestrator::{
-    DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
-    artifact_payload, node_externals,
+    ControlPlaneHooks, Demand, DEBUG_MARKER_IDLE, JobVmDiskReserve, RegistrationSource,
+    RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig, artifact_payload, node_externals,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
@@ -439,6 +439,7 @@ impl Fixture {
         unsafe { std::env::set_var(&token_env, &token) };
         let config = RunnerPoolConfig {
             size: 1,
+            demand: Demand::Engine,
             use_fork: false,
             name_prefix: format!("pool-{label}-{id}"),
             pool_status: None,
@@ -453,9 +454,11 @@ impl Fixture {
             control_socket: None,
             control_upstream: None,
             dns: None,
-            registration_token_env: token_env.clone(),
             labels: vec!["self-hosted".to_owned(), "linux".to_owned()],
-            cpus: 2,
+            registration: RegistrationSource::Engine {
+                token_env: token_env.clone(),
+            },
+            control_plane_hooks: ControlPlaneHooks::default(),
             memory_mib: 256,
             storage_gib: 10,
             overlay_gib: None,

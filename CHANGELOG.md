@@ -9,6 +9,12 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
 ### Fixed
+- **RunnerPool external control-plane seams and runner-version freshness**:
+  GitHub/GHES pools can keep a queue-free warm set with a fresh registration
+  credential per VM and a caller-supplied teardown hook, while engine mode
+  retains queue demand and purge behavior. The runner advertises the
+  `versions.toml` `runner_version` pin everywhere and warns at configure time
+  when GitHub reports an approaching runtime deprecation.
 
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
