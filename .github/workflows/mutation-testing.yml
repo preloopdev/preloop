@@ -2,9 +2,6 @@ name: mutation-testing
 permissions:
   contents: read
 
-# Weekly and on demand only: each job drives one mutation-testing target
-# (crates/preloop-mutation) and runs every generated mutant against the test
-# suite of its package, which takes hours.
 on:
   workflow_dispatch:
   schedule:
@@ -15,7 +12,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The preinstalled rustup proxies use these runner-owned locations.
   CARGO_HOME: /home/runner/.cargo
   RUSTUP_HOME: /home/runner/.rustup
 
@@ -26,10 +22,6 @@ jobs:
     timeout-minutes: 360
     env:
       CARGO_BUILD_JOBS: "4"
-      # The pg suites run against this server; each test creates (and drops)
-      # its own database on it. Without a server they bootstrap disposable
-      # clusters from initdb, and skip when they cannot — which would make
-      # every control/pg mutant survive, so make the server mandatory here.
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -39,9 +31,6 @@ jobs:
           lfs: false
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          # Fresh microVMs start with an empty RUSTUP_HOME, so dtolnay would
-          # reinstall the toolchain on every run. Restore it from cache;
-          # bump the key together with `toolchain:` below.
           path: |
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
@@ -56,19 +45,8 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
-      # No kache step here on purpose: cargo-mutants builds each mutant in its
-      # own scratch tree (target/mutants-tmp, see crates/preloop-mutation), so
-      # workspace build-cache entries can never hit and would only churn the
-      # bucket. The cold build is a fixed per-job cost the weekly cadence
-      # absorbs.
       - name: Start PostgreSQL (container)
-        # Same pattern as control-plane.yml: the server runs in a container the
-        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
-        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
-        # clear the two-node race tests (roughly 204 connections).
         run: |
-          # A previous job may have died before its cleanup step ran; the
-          # runner host is reused and the container is detached.
           docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
@@ -98,8 +76,6 @@ jobs:
           set -euo pipefail
           version=27.1.0
           if [ "$(uname -m)" = x86_64 ]; then
-            # Published binary, pinned by version and verified by digest, like
-            # the cargo-nextest install above.
             archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
             curl -fsSL --retry 3 -o "$archive" \
               "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
@@ -109,8 +85,6 @@ jobs:
             "$HOME/.local/bin/cargo-mutants" --version
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           else
-            # No published binary for this architecture; compile the pinned
-            # crate version instead.
             cargo install cargo-mutants --version "$version" --locked
             cargo-mutants --version
           fi
@@ -146,10 +120,6 @@ jobs:
           name: mutants-T1-job-binding-lifecycle
           path: mutants.out/T1
       - name: Remove PostgreSQL container
-        # The runner host is reused across jobs and the container is detached:
-        # leave it behind and the next job's `docker run --name postgres` fails
-        # with "name is already in use". `always()` so a failing run still
-        # cleans up, exactly like control-plane.yml.
         if: always()
         run: docker rm -f postgres || true
 
@@ -159,10 +129,6 @@ jobs:
     timeout-minutes: 360
     env:
       CARGO_BUILD_JOBS: "4"
-      # The pg suites run against this server; each test creates (and drops)
-      # its own database on it. Without a server they bootstrap disposable
-      # clusters from initdb, and skip when they cannot — which would make
-      # every control/pg mutant survive, so make the server mandatory here.
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -187,13 +153,7 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
-        # Same pattern as control-plane.yml: the server runs in a container the
-        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
-        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
-        # clear the two-node race tests (roughly 204 connections).
         run: |
-          # A previous job may have died before its cleanup step ran; the
-          # runner host is reused and the container is detached.
           docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
@@ -267,10 +227,6 @@ jobs:
           name: mutants-T2-webhook-signature
           path: mutants.out/T2
       - name: Remove PostgreSQL container
-        # The runner host is reused across jobs and the container is detached:
-        # leave it behind and the next job's `docker run --name postgres` fails
-        # with "name is already in use". `always()` so a failing run still
-        # cleans up, exactly like control-plane.yml.
         if: always()
         run: docker rm -f postgres || true
 
@@ -280,10 +236,6 @@ jobs:
     timeout-minutes: 720
     env:
       CARGO_BUILD_JOBS: "4"
-      # The pg suites run against this server; each test creates (and drops)
-      # its own database on it. Without a server they bootstrap disposable
-      # clusters from initdb, and skip when they cannot — which would make
-      # every control/pg mutant survive, so make the server mandatory here.
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -308,13 +260,7 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
-        # Same pattern as control-plane.yml: the server runs in a container the
-        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
-        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
-        # clear the two-node race tests (roughly 204 connections).
         run: |
-          # A previous job may have died before its cleanup step ran; the
-          # runner host is reused and the container is detached.
           docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
@@ -388,10 +334,6 @@ jobs:
           name: mutants-T3-pool-warm-sizing
           path: mutants.out/T3
       - name: Remove PostgreSQL container
-        # The runner host is reused across jobs and the container is detached:
-        # leave it behind and the next job's `docker run --name postgres` fails
-        # with "name is already in use". `always()` so a failing run still
-        # cleans up, exactly like control-plane.yml.
         if: always()
         run: docker rm -f postgres || true
 
@@ -401,10 +343,6 @@ jobs:
     timeout-minutes: 480
     env:
       CARGO_BUILD_JOBS: "4"
-      # The pg suites run against this server; each test creates (and drops)
-      # its own database on it. Without a server they bootstrap disposable
-      # clusters from initdb, and skip when they cannot — which would make
-      # every control/pg mutant survive, so make the server mandatory here.
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -429,13 +367,7 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
-        # Same pattern as control-plane.yml: the server runs in a container the
-        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
-        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
-        # clear the two-node race tests (roughly 204 connections).
         run: |
-          # A previous job may have died before its cleanup step ran; the
-          # runner host is reused and the container is detached.
           docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
@@ -509,10 +441,6 @@ jobs:
           name: mutants-T4-queue-status
           path: mutants.out/T4
       - name: Remove PostgreSQL container
-        # The runner host is reused across jobs and the container is detached:
-        # leave it behind and the next job's `docker run --name postgres` fails
-        # with "name is already in use". `always()` so a failing run still
-        # cleans up, exactly like control-plane.yml.
         if: always()
         run: docker rm -f postgres || true
 
@@ -522,10 +450,6 @@ jobs:
     timeout-minutes: 240
     env:
       CARGO_BUILD_JOBS: "4"
-      # The pg suites run against this server; each test creates (and drops)
-      # its own database on it. Without a server they bootstrap disposable
-      # clusters from initdb, and skip when they cannot — which would make
-      # every control/pg mutant survive, so make the server mandatory here.
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
@@ -550,13 +474,7 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
       - name: Start PostgreSQL (container)
-        # Same pattern as control-plane.yml: the server runs in a container the
-        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
-        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
-        # clear the two-node race tests (roughly 204 connections).
         run: |
-          # A previous job may have died before its cleanup step ran; the
-          # runner host is reused and the container is detached.
           docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
@@ -630,9 +548,5 @@ jobs:
           name: mutants-T5-cli-parsing
           path: mutants.out/T5
       - name: Remove PostgreSQL container
-        # The runner host is reused across jobs and the container is detached:
-        # leave it behind and the next job's `docker run --name postgres` fails
-        # with "name is already in use". `always()` so a failing run still
-        # cleans up, exactly like control-plane.yml.
         if: always()
         run: docker rm -f postgres || true

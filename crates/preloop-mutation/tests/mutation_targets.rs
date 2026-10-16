@@ -1,41 +1,10 @@
-//! Mutation-testing targets: one `cargo-mutants` run per risk area.
-//!
-//! Each test here drives a full mutation run over a slice of the codebase and
-//! fails when any mutant survives. They are `#[ignore]`d because one target
-//! takes hours and they must not share the tree's scratch space, so run
-//! exactly one at a time:
-//!
-//! ```sh
-//! cargo test --locked -p preloop-mutation --test mutation_targets -- \
-//!     --ignored --exact t1_job_binding_lifecycle --nocapture
-//! ```
-//!
-//! Reports land in `mutants.out/<target>/mutants.out/` (`missed.txt` lists
-//! survivors); `t3` merges its three package-scoped sub-runs there.
-//!
-//! Both the lite and the Postgres-backed `control/pg/` implementations are
-//! mutated. The pg suites use `PRELOOP_TEST_POSTGRES_URL` when it is set (each
-//! test then creates its own database on that server) and otherwise bootstrap
-//! a disposable cluster from `initdb`; the tests refuse to run when neither is
-//! available, because a skipped pg suite would make every `control/pg` mutant
-//! survive and drown the real gaps.
-//!
-//! Per-mutant test runs are scoped to the test targets listed in `Target::tests`
-//! instead of the whole package suite: those are the targets that exercise the
-//! scoped functions, and running the rest per mutant only adds hours. The one
-//! failure mode is over-reporting a gap — a mutant killed only by a test target
-//! outside the list would show up as missed — so survivors are checked against
-//! the code before conclusions are drawn.
+#![allow(missing_docs)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-/// Process-global variables read by the test suites. An ambient value changes
-/// test behavior (see `preloop-runner-server`'s `state.rs` guards), so they are
-/// stripped from the mutation run and only the Postgres settings are restored
-/// when the caller provided them.
 const SCOPED_ENV: [&str; 7] = [
     "PRELOOP_GITHUB_TOKEN",
     "PRELOOP_GITHUB_API_URL",
@@ -46,26 +15,16 @@ const SCOPED_ENV: [&str; 7] = [
     "PRELOOP_TEST_REQUIRE_POSTGRES",
 ];
 
-/// Postgres installs the pg suites can bootstrap their disposable clusters
-/// from when no `PRELOOP_TEST_POSTGRES_URL` is set.
 const INITDB_DIRS: [&str; 3] = [
     "/Applications/Postgres.app/Contents/Versions/latest/bin",
     "/opt/homebrew/bin",
     "/usr/local/bin",
 ];
 
-/// One mutation-testing sub-run: a package/file scope narrowed by a regex over
-/// the mutant names that `cargo mutants --list` shows.
 struct Target {
-    /// Report directory name under `mutants.out/` and scratch dir name.
     id: &'static str,
-    /// Forwarded verbatim to `cargo mutants`.
     args: &'static [&'static str],
-    /// Mutants to drop: process-, network- or VM-bound code that host tests
-    /// cannot kill, so keeping it would only add noise to the survival rate.
     exclude_re: &'static str,
-    /// Arguments forwarded to `cargo test` for the mutated package, selecting
-    /// the test targets that cover this scope (see the module docs).
     tests: &'static [&'static str],
 }
 
@@ -135,7 +94,6 @@ const T2: Target = Target {
     ],
 };
 
-/// Waitlist ordering (runner-server half of T3).
 const T3A: Target = Target {
     id: "T3a",
     args: &[
@@ -164,7 +122,6 @@ const T3A: Target = Target {
     ],
 };
 
-/// Warm-pool sizing (CLI half of T3).
 const T3B: Target = Target {
     id: "T3b",
     args: &[
@@ -179,7 +136,6 @@ const T3B: Target = Target {
     tests: &["--lib"],
 };
 
-/// On-demand memory cap (orchestrator half of T3).
 const T3C: Target = Target {
     id: "T3c",
     args: &[
@@ -240,38 +196,32 @@ const T5: Target = Target {
     tests: &["--lib"],
 };
 
-/// Job/binding lifecycle: claim gating, assignment exclusivity, stale-binding
-/// release and requeue — the leaked-binding failure mode.
 #[test]
-#[ignore = "hours: run one target at a time, see module docs"]
+#[ignore = "hours: mutation run, invoke it explicitly"]
 fn t1_job_binding_lifecycle() {
     run_target_set("T1", &[&T1]);
 }
 
-/// GitHub webhook HMAC verification (`X-Hub-Signature-256`) and event dispatch.
 #[test]
-#[ignore = "hours: run one target at a time, see module docs"]
+#[ignore = "hours: mutation run, invoke it explicitly"]
 fn t2_webhook_signature() {
     run_target_set("T2", &[&T2]);
 }
 
-/// Pool/waitlist ordering and warm-pool sizing across server, orchestrator, CLI.
 #[test]
-#[ignore = "hours: run one target at a time, see module docs"]
+#[ignore = "hours: mutation run, invoke it explicitly"]
 fn t3_pool_warm_sizing() {
     run_target_set("T3", &[&T3A, &T3B, &T3C]);
 }
 
-/// Queue depth and run-status aggregation behind `preloop status`.
 #[test]
-#[ignore = "hours: run one target at a time, see module docs"]
+#[ignore = "hours: mutation run, invoke it explicitly"]
 fn t4_queue_status_aggregation() {
     run_target_set("T4", &[&T4]);
 }
 
-/// CLI argument parsing helpers and their boolean/filter parsing.
 #[test]
-#[ignore = "hours: run one target at a time, see module docs"]
+#[ignore = "hours: mutation run, invoke it explicitly"]
 fn t5_cli_parsing() {
     run_target_set("T5", &[&T5]);
 }
@@ -281,14 +231,9 @@ fn run_target_set(id: &str, targets: &[&Target]) {
     let pg_url = std::env::var("PRELOOP_TEST_POSTGRES_URL").ok();
     let pg_required = std::env::var("PRELOOP_TEST_REQUIRE_POSTGRES").ok();
     if pg_url.is_none() {
-        // The pg suites bootstrap disposable clusters from `initdb` when no
-        // server URL is given, and skip themselves when they cannot find it.
-        // A skipped pg suite would make every `control/pg` mutant survive and
-        // drown the real gaps, so refuse to run instead.
         assert!(
             initdb_available(),
-            "the pg test suites need a Postgres: set PRELOOP_TEST_POSTGRES_URL \
-             or install one (initdb must be discoverable)"
+            "the pg test suites need a Postgres: set PRELOOP_TEST_POSTGRES_URL or make initdb discoverable"
         );
     }
 
@@ -301,7 +246,7 @@ fn run_target_set(id: &str, targets: &[&Target]) {
     ]);
     let mut exit_ok = true;
     for target in targets {
-        let outcome = run_sub(
+        exit_ok &= run_sub(
             root.as_path(),
             target,
             pg_url.as_deref(),
@@ -312,10 +257,8 @@ fn run_target_set(id: &str, targets: &[&Target]) {
             let text = fs::read_to_string(report.join(format!("{kind}.txt"))).unwrap_or_default();
             merged.get_mut(kind).unwrap().push_str(&text);
         }
-        exit_ok &= outcome;
     }
 
-    // Merged report, so every target's summary step reads the same layout.
     let merged_dir = root.join("mutants.out").join(id).join("mutants.out");
     fs::create_dir_all(&merged_dir).expect("create merged report directory");
     for (kind, text) in &merged {
@@ -350,17 +293,10 @@ fn run_target_set(id: &str, targets: &[&Target]) {
     assert!(exit_ok, "target {id}: cargo mutants exited with an error");
 }
 
-/// Runs one cargo-mutants sub-run. Returns whether cargo-mutants exited
-/// cleanly; the report is read back from `mutants.out/<id>/mutants.out/`.
 fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Option<&str>) -> bool {
     let out = root.join("mutants.out").join(target.id);
-    // Scratch trees live under target/ — same filesystem as the workspace,
-    // gitignored, and on real disk even when $TMPDIR is a small tmpfs (the
-    // runner guests' temp is one). cargo-mutants deletes them on exit.
     let scratch = root.join("target").join("mutants-tmp").join(target.id);
     fs::create_dir_all(&scratch).expect("create mutation scratch dir");
-    // cargo-mutants writes its report into this directory but does not create
-    // the parent chain.
     fs::create_dir_all(&out).expect("create mutants.out target directory");
 
     let mut cmd = Command::new("cargo");
@@ -369,15 +305,11 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         .arg("--output")
         .arg(&out)
         .args(target.args)
-        // Scoping the per-mutant test run: only these test targets are built
-        // and run for each mutant (see the module docs).
         .arg("--")
         .args(target.tests)
         .current_dir(root)
         .env("TMPDIR", &scratch)
-        // Keep test runs deterministic and bounded, like ci.yml's fast shards.
         .env("PROPTEST_CASES", "8")
-        // Same flags as the rust-test shards so build fingerprints match.
         .env("RUSTFLAGS", "-A warnings");
     for var in SCOPED_ENV {
         cmd.env_remove(var);
@@ -406,9 +338,6 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         target.id,
         report.display()
     );
-    // The --file/--re filters are pinned names. When a refactor moves or
-    // renames the functions they match, the run silently tests nothing, so a
-    // sub-run that generated no mutants fails here instead.
     let mutants: usize = ["caught", "missed", "timeout", "unviable"]
         .iter()
         .map(|kind| {
@@ -419,8 +348,7 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         .sum();
     assert!(
         mutants > 0,
-        "sub-run {}: no mutants were generated — its --file/--re filters no longer \
-         match any code (stale names after a refactor)",
+        "sub-run {}: no mutants were generated — its --file/--re filters match no code",
         target.id
     );
     eprintln!(
@@ -434,7 +362,6 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
     status.success()
 }
 
-/// Whether the pg suites can bootstrap their disposable clusters here.
 fn initdb_available() -> bool {
     if INITDB_DIRS
         .iter()
