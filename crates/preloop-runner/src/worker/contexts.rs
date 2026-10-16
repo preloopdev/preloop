@@ -424,13 +424,14 @@ impl JobContext {
                 // That variable is only a GitHub credential when the control
                 // plane is GitHub; on a preloop engine it can be the job's
                 // runtime credential, which must stay off the step surface.
-                let variable_token = (self.control_plane == crate::settings::ControlPlane::GitHub)
-                    .then(|| {
-                        self.get_variable("system.github.token")
-                            .or_else(|| self.get_variable("github_token"))
-                            .unwrap_or("")
-                    })
-                    .unwrap_or("");
+                let variable_token = if self.control_plane == crate::settings::ControlPlane::GitHub
+                {
+                    self.get_variable("system.github.token")
+                        .or_else(|| self.get_variable("github_token"))
+                        .unwrap_or("")
+                } else {
+                    ""
+                };
                 if let Some(token) = self.env.get("GITHUB_TOKEN") {
                     obj.insert("token".to_string(), serde_json::json!(token));
                 } else if !variable_token.is_empty() {
