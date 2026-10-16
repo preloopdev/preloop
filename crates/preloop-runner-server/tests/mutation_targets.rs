@@ -323,6 +323,9 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
     if let Some(shard) = shard() {
         cmd.args(["--shard", &shard]);
     }
+    if let Some(jobs) = std::env::var_os("PRELOOP_MUTANTS_JOBS") {
+        cmd.arg("--jobs").arg(jobs);
+    }
     cmd.arg("--")
         .args(target.tests)
         .current_dir(root)
