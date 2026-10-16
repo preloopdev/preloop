@@ -438,7 +438,7 @@ bootstrap the engine.
 
 One-time import of a released v11 `preloop.db` (the durable-state store the
 control backend replaced) into a fresh control database. See
-[Importing a legacy `preloop.db`](./setup.md#importing-a-legacy-preloopdb).
+[Importing a legacy `preloop.db`](./setup.md).
 
 | Flag | Description |
 |---|---|
