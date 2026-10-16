@@ -132,10 +132,10 @@
     "y": 740,
     "width": 200,
     "height": 230,
-    "backgroundColor": "#ffc9c9",
+    "backgroundColor": "#d3f9d8",
     "fillStyle": "solid",
     "opacity": 30,
-    "strokeColor": "#ef4444",
+    "strokeColor": "#15803d",
     "strokeWidth": 1.5,
     "roundness": {
       "type": 3

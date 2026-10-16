@@ -168,6 +168,11 @@ preloop-runner remove --token <REMOVE_TOKEN>
 ```sh
 preloop init --mode none # configure without starting the engine
 preloop serve            # start the engine on 127.0.0.1:9090
+```
+
+Leave `preloop serve` running in this terminal. In a second terminal, run:
+
+```sh
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event push
 ```
@@ -265,8 +270,8 @@ you*; everything outbound still works:
 | | webhooks off (default) | `--public-url` |
 |---|---|---|
 | What starts a run | you do: `preloop run`, `just submit-ci` | a `push`/`pull_request` on GitHub |
-| Private-repo checkout, `gh`, API steps | App token per job, subject to the App's grants | A classic PAT may be embedded after a coarse scope check; a fine-grained PAT may be withheld |
-| Check runs on the commit | use `checks: write` for reliable publishing | the server may attempt PAT-backed calls, but GitHub may reject them |
+| Private-repo checkout, `gh`, API steps | App installation token per job, subject to the App's grants. A PAT is used only for a PAT-configured job or the explicit `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` fallback. Private reusable-workflow references require `PRELOOP_GITHUB_TOKEN` or `github.pat`. | Same credential behavior; `--public-url` only enables webhook delivery. A PAT is used only for a PAT-configured job or the explicit `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` fallback. Private reusable-workflow references require `PRELOOP_GITHUB_TOKEN` or `github.pat`. |
+| Check runs on the commit | Reliable publishing requires an App installation token with `checks: write`; a PAT may not publish Check Runs. | Same: reliable publishing requires an App installation token with `checks: write`; `--public-url` does not change the job credential. |
 
 So a laptop setup can be triggered manually. To add webhooks later, put a
 path-filtering proxy in front of a tunnel and expose only
@@ -541,12 +546,12 @@ to move off it.
 To use **Postgres**, initialize or upgrade its schema explicitly before
 starting the server:
 
+Configure `PRELOOP_STORE_URL` through a secret manager or protected environment before running these commands; do not put a live URL in shell history or command-line arguments.
+
 ```sh
-store_url='postgres://user:password@host:5432/preloop?sslmode=require'
-preloop store migrate --store "$store_url"
-preloop store status --store "$store_url"
-preloop serve --store "$store_url"
-# or, for systemd deployments, set PRELOOP_STORE_URL after migration
+preloop store migrate
+preloop store status
+preloop serve
 ```
 
 Fresh local SQLite stores are prepared by supported `preloop init`/`preloop run`

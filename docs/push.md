@@ -14,7 +14,7 @@ credentials.
 | Command                            | What it does                                                                        |
 | ---------------------------------- | ----------------------------------------------------------------------------------- |
 | `preloop run -f <workflow>`        | Submit a run directly without a webhook trigger; GitHub access may still be needed for workflow or job operations |
-| `preloop run --push -f <workflow>` | Same, then push the tested commit + create/update the PR + report checks            |
+| `preloop run --push -f <workflow>` | Same, then push the tested commit + create/update the PR; publishing Check Runs requires a GitHub App with `checks: write` |
 | `preloop run --push --create-pr`   | Push-back **and** create a PR when the branch has none open                         |
 | `preloop push`                     | Replay push-back for the **most recent** run (idempotent so safe to re-run)         |
 | `preloop push <run_id>`            | Replay for a specific run                                                           |
@@ -32,7 +32,7 @@ open one
 ```
 1. work locally on branch feat/x        (dirty trees are snapshotted; see below)
 2. preloop run --push --create-pr
-3. server runs CI on your workspace snapshot        ← no GitHub needed
+3. server runs CI on your workspace snapshot; no webhook is needed to start the run, though workflow or job operations may still need GitHub access
 4. run reaches a terminal state (any conclusion)
 5. CLI pushes the tested commit: git push <sha>:refs/heads/feat/x
 6. no open PR? server creates one (draft) — or the push updated the PR

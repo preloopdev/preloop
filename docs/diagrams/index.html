@@ -1,13 +1,14 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Preloop — Architecture Diagrams</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%}
-body{font-family:system-ui,sans-serif;background:#fafafa;display:grid;
-grid-template-columns:280px 1fr;height:100vh;overflow:hidden}
-nav{background:#1e1e1e;color:#e5e5e5;padding:24px 16px;overflow-y:auto}
-nav h1{font
-
+*{box-sizing:border-box}html,body{min-height:100%;margin:0}
+body{font-family:system-ui,sans-serif;background:#fafafa;padding:1rem}
+#host{max-width:1600px;margin:0 auto;display:grid;grid-template-columns:1fr;gap:1.5rem}
+.dia{width:100%;overflow:auto;background:#fff;border:1px solid #ddd}
+.dia svg{display:block;width:100%;height:auto}
+</style></head><body>
 <main id="host">
 <div class="dia" id="d_01-system-overview"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1150" width="1600" height="1150" style="background:#fff">
 <defs>
@@ -503,11 +504,11 @@ nav h1{font
 <rect x="70" y="600" width="200" height="75" rx="10" fill="#a5d8ff" stroke="#4a9eed" stroke-width="2"/>
 <text x="170" y="633.4" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">env, inputs, outputs</text>
 <text x="170" y="652.1" text-anchor="middle" font-size="15" font-family="system-ui, sans-serif" fill="#4a9eed" font-weight="600">context data lookups</text>
-<rect x="70" y="740" width="200" height="230" rx="10" fill="#ffc9c9" fill-opacity="0.3" stroke="#ef4444" stroke-width="1.5"/>
-<text x="170" y="833.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">Supported Features</text>
-<text x="170" y="851.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">• bracket access [a.b]</text>
-<text x="170" y="868.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">• object filter &#x27;*&#x27;</text>
-<text x="170" y="886.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#ef4444" font-weight="600">• format &#x27;{{&#x27; / &#x27;}}&#x27; escaping</text>
+<rect x="70" y="740" width="200" height="230" rx="10" fill="#d3f9d8" fill-opacity="0.3" stroke="#15803d" stroke-width="1.5"/>
+<text x="170" y="833.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">Supported Features</text>
+<text x="170" y="851.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">• bracket access [a.b]</text>
+<text x="170" y="868.6" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">• object filter &#x27;*&#x27;</text>
+<text x="170" y="886.1" text-anchor="middle" font-size="14" font-family="system-ui, sans-serif" fill="#15803d" font-weight="600">• format &#x27;{{&#x27; / &#x27;}}&#x27; escaping</text>
 <rect x="330" y="110" width="570" height="570" rx="10" fill="#e5dbff" fill-opacity="0.25" stroke="#7c3aed" stroke-width="1.5"/>
 <text x="350" y="143.0" font-size="18" font-family="system-ui, sans-serif" fill="#7c3aed" font-weight="500">Engine Parsing &amp; Evaluation Pipeline</text>
 <rect x="360" y="180" width="230" height="80" rx="10" fill="#d0bfff" stroke="#7c3aed" stroke-width="2"/>

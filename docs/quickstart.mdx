@@ -29,11 +29,11 @@ preloop init --mode none
 preloop serve
 ```
 
-`preloop init` configures GitHub credentials, selects the runner image, and chooses how the engine runs. It writes the resulting configuration to `~/.preloop/config.toml`. The commands above keep the engine in the foreground. For a background service, follow [Self-hosting](/self-hosting).
+`preloop init` configures GitHub credentials, selects the runner image, and chooses how the engine runs. It writes the resulting configuration to `~/.preloop/config.toml`. Leave `preloop serve` running in this terminal. Open a second terminal, change to your repository, and run the workflow there. For a background service, follow [Self-hosting](/self-hosting).
 
 ## Run a workflow
 
-In a repository with GitHub Actions workflows, run a workflow locally:
+In the second terminal, from a repository with GitHub Actions workflows, run a workflow locally:
 
 ```sh
 cd my-repo

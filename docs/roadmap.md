@@ -74,9 +74,12 @@ so strict-by-default needs an explicit opt-out for the harness.
 - #13 is mostly #12 plus TLS and pointing `PRELOOP_RUNNER_URL`/`PRELOOP_CONTROL_UPSTREAM`
 at a reachable address; the wire protocol already allows it, which is the whole point of
 the fidelity work.
-- #14's blocker is one field. Replacing the shared `next_job_runs_on` lock with a
-request ("what labels are queued?") is what lets the orchestrator run anywhere; the
-agent then terminates the control socket locally and proxies to the control plane, so
-guests still never touch the network. Bandwidth is the real constraint — a measured
-cache restore moved 791 MB, which is fine on a LAN and painful across a WAN.
+- #14 depends on #13. The built-in pool is shipped in-process and shares demand,
+  image-selection, preparation, and provision-token state with the server; the
+  standalone authenticated remote pool-agent integration is not shipped. Its
+  technical blocker is one field: replacing the shared `next_job_runs_on` lock with a
+  request ("what labels are queued?") is what lets the orchestrator run anywhere; the
+  agent then terminates the control socket locally and proxies to the control plane, so
+  guests still never touch the network. Bandwidth is the real constraint — a measured
+  cache restore moved 791 MB, which is fine on a LAN and painful across a WAN.
 
