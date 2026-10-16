@@ -534,7 +534,10 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let store = crate::credential_store::store_from_env(&cred_base);
+            let store = crate::credential_store::selected_store(
+                &cred_base,
+                file_config.credential_store.as_deref(),
+            )?;
             let store = store.as_ref();
             for app in &mut env_apps {
                 if let Some(reference) = &app.pem_ref

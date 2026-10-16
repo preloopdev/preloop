@@ -161,20 +161,22 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
 | `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
 | `PRELOOP_UNIX_SOCKET` | — | Control socket path (`preloop-server` only — `preloop serve` pins the socket at `$PRELOOP_HOME/preloop.sock`); mounted into runner VMs, serves the runner surface only |
-| `PRELOOP_SYSTEM_TOKEN` | generated and stored in the OS credential store; private `$PRELOOP_HOME/engine.token` fallback | Admin credential for `/api/v1/*`. Treat it as root for the control plane; strict external runner registration also uses this credential |
+| `PRELOOP_SYSTEM_TOKEN` | generated and stored in the credential store (`$PRELOOP_HOME/credentials` by default); with `os`, an OS store failure falls back to that file store, and `$PRELOOP_HOME/engine.token` only if the file store cannot hold it | Admin credential for `/api/v1/*`. Treat it as root for the control plane; strict external runner registration also uses this credential |
 | `PRELOOP_TOKEN_TTL_SECS` | `2999` | Issued runner token lifetime |
 | `PRELOOP_REGISTRATION_POLICY` | `strict` | Registration policy. `strict` requires the system credential (or a fresh pool provision token on legacy registration); `permissive` accepts any non-empty upstream token on TCP for conformance replay only, while the mounted socket remains strict — never use it on an exposed listener |
 | `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` | Config file path |
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
-| `PRELOOP_CREDENTIAL_STORE` | `os` | Credential backend for the engine token and GitHub App/PAT credentials. `os` uses the native keychain/secret-service; `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt — use for headless hosts, containers, and local iteration where repeated keychain prompts are unacceptable); `memory` is non-persistent (tests only) |
+| `PRELOOP_CREDENTIAL_STORE` | the config file's `credential_store`, else `file` | Credential backend for the engine token and GitHub App/PAT/webhook credentials. `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt; the default). `os` uses the native keychain/secret-service. `memory` is non-persistent (tests only). Overrides `credential_store` in `config.toml`; an unknown value is an error |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
 | `PRELOOP_MAX_JOBS_PER_RUN` | `500` | Fail-fast cap on jobs per run (counted after matrix expansion). API submits expanding past it are rejected with 400 before the insert transaction opens; `0` disables the cap. Webhook deliveries bypass it (a push is never refused) — see [Submit limits](#submit-limits) |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 
-Managed engines read their generated token from the OS credential store (or
-`$PRELOOP_HOME/engine.token` when that store is unavailable or unreadable). For
-a separate client or service, set `PRELOOP_SYSTEM_TOKEN` explicitly; never print
-or commit the fallback file.
+Managed engines read their generated token from the selected credential store
+(`$PRELOOP_HOME/credentials` by default). With `os` selected, a token the
+keychain cannot hold lands in that file store instead;
+`$PRELOOP_HOME/engine.token` is used only when the file store cannot hold it
+either. For a separate client or service, set `PRELOOP_SYSTEM_TOKEN`
+explicitly; never print or commit the fallback file.
 
 ### GitHub
 
@@ -573,7 +575,8 @@ Also worth knowing:
 | `state/cache/` | Actions cache entries |
 | `state/snapshots/` | Per-run immutable workspace snapshots; in-flight captures stage under `state/snapshots/.staging/` |
 | `vms/` | Golden images and per-machine state |
-| `engine.token` | Private fallback for the generated native API token when no OS credential service is available |
+| `credentials/` | Credentials in the default file store (App key, PAT, webhook secrets, engine token): `0600` files. Set `credential_store = "os"` to keep them in the OS keychain instead |
+| `engine.token` | Legacy last-resort file for the generated native API token, used only when the credential store cannot hold it |
 
 Keep the whole state directory on one filesystem. Everything the engine
 publishes — workspace snapshots, blob uploads, caches — is staged inside the
@@ -586,8 +589,9 @@ staging, so the common Linux layout — a tmpfs `/tmp` next to an LVM/ext4 state
 volume — is fine. Snapshot staging trees abandoned by a killed engine are
 collected at startup.
 
-Back up at least the database and `github-app.json`. Losing the database strands
-any check run GitHub is still waiting on; losing the key means re-keying the App.
+Back up at least the database and `credentials/` (the file credential store holds
+the App private key, PAT, webhook secrets, and engine token). Losing the database
+strands any check run GitHub is still waiting on; losing the key means re-keying the App.
 
 ### Restarts
 
@@ -616,6 +620,32 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
 | `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
+
+#### Another engine is already running
+
+Only one engine serves a state directory. A second `preloop serve` on the same
+`$PRELOOP_HOME` exits at once. When the operating system can prove that the PID
+recorded in `$PRELOOP_HOME/serve.lock` owns that exact lock, the error names
+the engine and the way to stop it:
+
+- **Started by a preloop command** (the autostart of `preloop status` and other
+  client commands): `kill <pid>` stops it, and then `preloop serve` can run in
+  this terminal.
+- **A systemd service**: stop both units. Stopping only `preloop.service` is not
+  enough, because `preloop.socket` starts it again on the next connection:
+  `sudo systemctl stop preloop.socket preloop.service`. Per-user installs use
+  the same commands with `systemctl --user` and no `sudo`.
+- **Running in another terminal**: stop it there with Ctrl-C, or `kill <pid>`.
+
+The PID in `serve.lock` is advisory and is never enough by itself to justify a
+`kill`: a stale record can name a live, unrelated process after PID reuse.
+PID remediation appears only when Linux proves the owner: Preloop checks the
+exact lock-file inode and owner in `/proc/locks`. macOS cannot prove the owner,
+because `lsof` does not report `flock` locks. There, a recorded PID that is
+still running is shown as unverified, with `ps -p <pid> -o lstart=,command=` to
+check it. To find the holder by hand, use `lslocks | grep serve.lock` on Linux
+or `ps -axo pid=,lstart=,command= | grep '[p]reloop serve'` on macOS. Re-run
+`preloop serve` after stopping the process.
 
 ---
 
