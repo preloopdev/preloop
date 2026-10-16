@@ -3917,3 +3917,42 @@ async fn runner_lease_expiration_disconnect_reaper() {
         assert_eq!(run.status, ExecutionStatus::Failure);
     }
 }
+
+/// The runner's distributed-task deregistration path uses pool `0`: GitHub's
+/// `DeleteAgentAsync(agentId)` treats the pool segment as server-side ignored.
+/// Keep the engine route covered with the exact wire path emitted by
+/// `preloop-runner --replace`/`remove`.
+#[tokio::test]
+async fn distributedtask_delete_pool_zero_purges_registered_runner() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, _listen_token) =
+        register_runner_with_token(&app, "pool-zero-delete-runner", &["self-hosted"], None).await;
+    let registration = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/api/v3/actions/runner-registration",
+        json!({
+            "url": "http://127.0.0.1/repository",
+            "runner_event": "register",
+        }),
+        DEFAULT_PRELOOP_SYSTEM_TOKEN,
+    )
+    .await;
+    let manager_token = registration["token"].as_str().unwrap();
+
+    request_json_with_bearer(
+        &app,
+        Method::DELETE,
+        &format!("/_apis/distributedtask/pools/0/agents/{runner_id}"),
+        Value::Null,
+        manager_token,
+    )
+    .await;
+
+    assert!(
+        !state.test_tx().await.runners.contains_key(&runner_id),
+        "pool-zero distributedtask delete must purge the runner identity",
+    );
+}

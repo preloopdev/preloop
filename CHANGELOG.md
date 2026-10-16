@@ -10,6 +10,11 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Runner configure/remove match GitHub registration APIs** (#627):
+  runner-group names resolve to their self-hosted pools, removal uses a
+  remove-scoped credential and the distributed-task agent endpoint, and the
+  server's FIPS property is persisted with its actual boolean value.
+
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and
