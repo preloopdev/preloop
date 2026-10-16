@@ -1595,6 +1595,7 @@ pub fn required_trigger_events() -> &'static [TriggerEvent] {
         event("pull_request", "pull_requests"),
         event("pull_request_review", "pull_requests"),
         event("workflow_dispatch", "contents"),
+        event("workflow_job", "actions"),
         event("workflow_run", "actions"),
         event("repository_dispatch", "contents"),
         event("issue_comment", "issues"),
@@ -1673,10 +1674,13 @@ pub fn warn_missing_trigger_events(app_id: &str, subscription: &AppSubscription)
             .map(|(permission, events)| format!("{permission} (for {})", events.join(", ")))
             .collect::<Vec<_>>()
             .join("; ");
+        let blocked_events = blocked.values().flatten().copied().collect::<Vec<_>>();
         steps.push(format!(
-            "These need a permission granted first — GitHub renders no checkbox \
-             until then, and the installation must accept the change before \
-             delivery starts: {grants}."
+            "Grant these permissions first — GitHub renders no checkbox until \
+             then: {grants}. After the installation accepts the permission \
+             change, tick the newly visible events under Subscribe to events: \
+             {}; delivery starts only after both steps.",
+            blocked_events.join(", ")
         ));
     }
     tracing::warn!(
@@ -2821,9 +2825,79 @@ mod tests {
         assert_eq!(blocked("issues").permission, "issues");
         assert!(!blocked("workflow_run").permission_granted);
         assert_eq!(blocked("workflow_run").permission, "actions");
+        // `workflow_job` is gated on the same Actions permission: without it
+        // GitHub renders no checkbox, so the warning must lead with the grant.
+        assert!(!blocked("workflow_job").permission_granted);
+        assert_eq!(blocked("workflow_job").permission, "actions");
         // Contents is granted, so `create` is tickable right now.
         assert!(blocked("create").permission_granted);
         assert_eq!(blocked("create").permission, "contents");
+    }
+
+    /// A `Write` sink that records every byte, so the test can assert on the
+    /// warning text operators actually see.
+    #[derive(Clone)]
+    struct RecordingWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// GitHub cannot fix event subscriptions through the API, so the warning
+    /// is the remediation: for an App missing `workflow_job` *and* its
+    /// `actions` permission it must lead with the grant (the checkbox is
+    /// otherwise invisible), not just name the event.
+    #[test]
+    fn missing_workflow_job_warning_leads_with_the_actions_grant() {
+        let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || RecordingWriter(sink.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Every required event subscribed except workflow_job, every gating
+        // permission granted except actions: workflow_job is the only gap.
+        let subscription = subscription(
+            &required_trigger_events()
+                .iter()
+                .map(|required| required.event)
+                .filter(|event| *event != "workflow_job")
+                .collect::<Vec<_>>(),
+            &required_trigger_events()
+                .iter()
+                .map(|required| required.permission)
+                .filter(|permission| *permission != "actions")
+                .map(|permission| (permission, "read"))
+                .collect::<Vec<_>>(),
+        );
+        warn_missing_trigger_events("424", &subscription);
+
+        let log = String::from_utf8(captured.lock().clone()).unwrap();
+        assert!(
+            log.contains("workflow_job"),
+            "the event must be named: {log}"
+        );
+        assert!(
+            log.contains("actions (for workflow_job)"),
+            "the grant-first step must name actions for workflow_job: {log}"
+        );
+        assert!(
+            log.contains("installation accepts the permission change"),
+            "the remediation must carry the installation-accept step: {log}"
+        );
+        assert!(
+            log.contains("tick the newly visible events"),
+            "the remediation must carry the post-permission event step: {log}"
+        );
     }
 
     #[tokio::test]

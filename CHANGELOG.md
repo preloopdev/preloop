@@ -10,6 +10,17 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **GitHub Apps created by the manifest flow now subscribe to
+  `workflow_job`** (#625): the per-job queued/in_progress/completed webhook
+  signal joins the creation-time `default_events`, and `actions: read` joins
+  the manifest's `default_permissions` because GitHub does not render the
+  `workflow_job` checkbox without it. The startup subscription read-back now
+  reports a missing `workflow_job` with the permission-gating remediation.
+  GitHub cannot change an App's event subscriptions through its API after
+  creation, so **Apps created before this change need a manual edit**: App
+  settings → Permissions & events → grant Actions: read (installation must
+  accept) → Webhooks → Edit → tick `workflow_job`.
+
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and

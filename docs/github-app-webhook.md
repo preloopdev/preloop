@@ -20,24 +20,29 @@ supports (`src/events/mod.rs`, `all_event_names()`):
 
 | Tier                        | Events                                                                                                                                                                                      |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A — CI-critical             | `push`, `pull_request`, `pull_request_target`, `pull_request_review`, `workflow_dispatch`, `workflow_run`, `check_run`, `check_suite`, `repository_dispatch`, `create`, `delete`, `release` |
+| A — CI-critical             | `push`, `pull_request`, `pull_request_target`, `pull_request_review`, `workflow_dispatch`, `workflow_run`, `workflow_job`, `check_run`, `check_suite`, `repository_dispatch`, `create`, `delete`, `release` |
 | B — issue/PR/social         | `issues`, `issue_comment`, `discussion`, `discussion_comment`, `label`, `milestone`                                                                                                         |
 | C — release/admin/fork/wiki | `watch`, `fork`, `deployment`, `deployment_status`, `member`, `public`, `gollum`, `page_build`                                                                                              |
 | Internal                    | `schedule` (synthesized by the cron scheduler, never delivered as a webhook)                                                                                                                |
 
 
 The App-manifest flow (`GET /api/v1/github/register`) defaults to the minimal
-CI event set: `push` and `pull_request`. Override the creation-time event list
+CI event set: `push`, `pull_request`, `check_run`, and `workflow_job`.
+Override the creation-time event list
 with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated) when the App needs
 additional or different events. GitHub cannot change an App's event
 subscriptions through its API after creation; add later events manually under
-the App's settings → Webhooks → Edit.
+the App's settings → Webhooks → Edit. Apps created before `workflow_job` was
+a default need it added exactly that way — and its checkbox only renders once
+the App holds `Actions: read` (the installation must accept the widened
+permission before delivery starts).
 
 At startup preloop reads an existing App's subscription back from GitHub
 (`GET /app`, App-JWT auth) and **warns loudly** when the trigger events it
 turns into runs are missing (`push`, `pull_request`, `pull_request_review`,
-`workflow_dispatch`, `workflow_run`, `repository_dispatch`, `issue_comment`,
-`issues`, `check_run`, `check_suite`, `create`, `delete`, `release`). GitHub
+`workflow_dispatch`, `workflow_job`, `workflow_run`, `repository_dispatch`,
+`issue_comment`, `issues`, `check_run`, `check_suite`, `create`, `delete`,
+`release`). GitHub
 cannot change an App's event subscription through the API — tick the missing
 events under the App's settings → Permissions & events → Subscribe to events.
 
@@ -46,7 +51,7 @@ configured App:
 
 - **Permissions gate the checkboxes.** GitHub only renders an event's checkbox
   once the App holds the permission that event requires (`issues` → Issues,
-  `workflow_run` → Actions, `create`/`delete`/`release`/`push`/
+  `workflow_run`/`workflow_job` → Actions, `create`/`delete`/`release`/`push`/
   `workflow_dispatch`/`repository_dispatch` → Contents, `pull_request*` → Pull
   requests). The warning names the permission to grant first; the installation
   must also accept the widened permissions before delivery starts.
@@ -91,7 +96,7 @@ The system is configured using the following environment variables:
 | `PRELOOP_LOCAL_WORKSPACE`           | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts.                                         | `/path/to/my-repo`                         |
 | `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available. When no App is configured the PAT is also embedded as every non-fork job's `GITHUB_TOKEN`, but only when its OAuth scopes are introspected and don't exceed declared `permissions:`; otherwise it is withheld (`runs.rs`) or the run is refused. Prefer a GitHub App so tokens are minted least-privilege. | `ghp_...`                                  |
 | `PRELOOP_GITHUB_APPS_JSON`          | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
-| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`.                                         | `push,pull_request`                        |
+| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request,check_run,workflow_job`.                 | `push,pull_request,check_run,workflow_job` |
 
 
 ### Security Best Practices
@@ -183,12 +188,13 @@ fully offline execution.
 3. Set the content type to `application/json`.
 4. Enter a secure Webhook Secret (e.g. `super-secret`).
 5. Select the events preloop should turn into runs. The manifest defaults to
-   `push` and `pull_request`. Before registering a new App, set
+   `push`, `pull_request`, `check_run`, and `workflow_job`. Before registering
+   a new App, set
    `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` to a comma-separated list when additional
    events are required. For an existing App, tick additional events manually
    under the App's settings → Webhooks → Edit.
  At minimum, tick the trigger events: `push`, `pull_request`,
- `pull_request_review`, `workflow_dispatch`, `workflow_run`,
+ `pull_request_review`, `workflow_dispatch`, `workflow_run`, `workflow_job`,
  `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
  `create`, `delete`, `release`.
 
