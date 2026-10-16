@@ -559,10 +559,13 @@ uses the configured image, baked locally as-is.
 ### Engine token storage
 
 The native API administrator token is generated on first engine startup when
-`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the operating system's
-credential store, scoped to the engine home. On hosts without an available or
-readable OS credential service, it uses `$PRELOOP_HOME/engine.token` with private
-permissions instead. Managed CLI commands read this token automatically; do
+`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the engine's credential
+store, scoped to the engine home: private `0600` files under
+`$PRELOOP_HOME/credentials` by default, or the operating system's credential
+store with `credential_store = "os"`. With `os` selected, a credential the OS
+store cannot hold falls back to the file store under `$PRELOOP_HOME/credentials`;
+`$PRELOOP_HOME/engine.token` is a last resort, used only when the file store
+cannot hold the token either. Managed CLI commands read this token automatically; do
 not commit or print the file. Set `PRELOOP_SYSTEM_TOKEN` explicitly for a
 separate client or service.
 
