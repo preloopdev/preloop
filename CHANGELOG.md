@@ -43,6 +43,15 @@ Releases before v0.27.0 predate the changelog.
   shown as unverified, with a command to find the holder, and no stop command is
   suggested.
 
+- **Immediate engine restarts wait for the predecessor to drain.** The
+  autostarted `preloop engine` waits up to 35 seconds for the existing
+  `serve.lock` holder to release its runner pool before binding or probing the
+  socket. A draining engine's `503` health response is no longer treated as
+  healthy, and auto-boot waits long enough for both the lock wait and server
+  readiness. Shutdown cancels server workers, joins the server task, removes
+  the old socket while the caller still holds the lock, and only then lets VM
+  cleanup run.
+
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and

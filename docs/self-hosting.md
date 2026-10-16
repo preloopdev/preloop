@@ -623,10 +623,14 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 
 #### Another engine is already running
 
-Only one engine serves a state directory. A second `preloop serve` on the same
-`$PRELOOP_HOME` exits at once. When the operating system can prove that the PID
-recorded in `$PRELOOP_HOME/serve.lock` owns that exact lock, the error names
-the engine and the way to stop it:
+Only one engine serves a state directory. A foreground `preloop serve` on the
+same `$PRELOOP_HOME` exits at once. The autostarted `preloop engine` instead
+waits up to 35 seconds for a predecessor that is still draining its runner
+pool, then starts after the kernel releases `serve.lock`. It does not treat a
+draining predecessor's `503 /healthz` response as a healthy replacement.
+When the operating system can prove that the PID recorded in
+`$PRELOOP_HOME/serve.lock` owns that exact lock, the error names the engine and
+the way to stop it:
 
 - **Started by a preloop command** (the autostart of `preloop status` and other
   client commands): `kill <pid>` stops it, and then `preloop serve` can run in
