@@ -1140,6 +1140,65 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     handle.abort();
 }
 
+/// A secret registered to an App is bound to that App's installations even
+/// when the same value also sits in the legacy `webhook_secret` slot — the
+/// fresh-engine shape, where the registration handoff's secret lands in the
+/// primary slot. A payload it signs claiming a repository outside the App's
+/// coverage must be rejected, not accepted through the unbound legacy signer.
+#[tokio::test]
+async fn a_secret_an_app_claims_is_bound_to_its_installations() {
+    use axum::routing::get;
+
+    let stub = Router::new()
+        .route(
+            "/repos/org-a/repo/installation",
+            get(|headers: axum::http::HeaderMap| async move {
+                if extract_iss(&headers) == "424" {
+                    (StatusCode::OK, Json(json!({"id": 2, "app_id": 424})))
+                } else {
+                    (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+                }
+            }),
+        )
+        .route(
+            "/repos/org-b/other-repo/installation",
+            get(|_headers: axum::http::HeaderMap| async move {
+                (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+            }),
+        );
+    let (base, handle) = spawn_github_stub(stub).await;
+    let _env = pin_api_base(&base).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().join("state").to_path_buf())
+        .await
+        .unwrap();
+    let (mut registry, _) = two_app_registry();
+    // The fresh-engine shape: the default App's secret is registered on the
+    // App and is also the value in the legacy slot.
+    registry.apps[0].webhook_secret = Some("default-secret".to_owned());
+    state.webhook_secret = Some("default-secret".to_owned());
+    state.github_apps = Some(registry);
+    let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
+
+    let ping = |repo: &str| json!({ "repository": { "full_name": repo } });
+
+    // The default App's own installation → accepted.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    // Outside that App's coverage: the secret is the App's, so the claim is
+    // bound and rejected. The unbound legacy signer would have accepted it.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &ping("org-b/other-repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "a secret the App claims must be bound to the App's installations"
+    );
+
+    handle.abort();
+}
+
 /// Deliver a signed webhook for `event` and return the status.
 async fn deliver_webhook(app: &Router, event: &str, payload: &Value, secret: &str) -> StatusCode {
     use hmac::Mac;

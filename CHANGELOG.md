@@ -48,7 +48,12 @@ Releases before v0.27.0 predate the changelog.
   GitHub. The credentials page is no longer cacheable, HTML-escapes every value
   GitHub returns, shows the owning account to confirm, and hands the webhook
   secret to `preloop setup github --via app --webhook-secret` rather than the
-  legacy `PRELOOP_WEBHOOK_SECRET` slot.
+  legacy `PRELOOP_WEBHOOK_SECRET` slot. That per-App secret — the first App's
+  included — verifies as the App itself, so a payload it signs is bound to the
+  App's installation coverage; only values no App claims keep the unbound
+  legacy signer. Refusals and failed code exchanges both answer with the same
+  uncachable, no-referrer page, and a request that cannot parse gets the
+  generic refusal rather than an extractor rejection.
 
 ## [0.34.0] - 2026-10-09
 

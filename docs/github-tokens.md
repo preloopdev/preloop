@@ -140,8 +140,8 @@ is `1`, `true`, or `on`; turn the flag off again once the App is registered.
    ```
 
    The secret is bound to this App's id. Do not set `PRELOOP_WEBHOOK_SECRET` for
-   this App: that variable is the legacy default-App slot and has no
-   repository-coverage binding.
+   this App: that variable is the single default-App slot and cannot address a
+   second App.
 
 ### Configuration reference
 

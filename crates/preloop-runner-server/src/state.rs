@@ -1372,16 +1372,7 @@ impl AppState {
         // Env wins over the config file, matching every other credential
         // here. An empty value in either source counts as unset: a blank
         // export must not disable signature verification silently.
-        let webhook_secret = env::var("PRELOOP_WEBHOOK_SECRET")
-            .ok()
-            .filter(|secret| !secret.is_empty())
-            .or_else(|| {
-                config
-                    .github
-                    .webhook_secret()
-                    .filter(|secret| !secret.is_empty())
-                    .map(str::to_owned)
-            });
+        let webhook_secret = crate::config::webhook_secret_from_env_or_config(&config);
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")

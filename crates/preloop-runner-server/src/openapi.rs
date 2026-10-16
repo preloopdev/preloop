@@ -858,7 +858,10 @@ fn webhook_health() {}
 /// GitHub App manifest registration page (browser-facing).
 #[utoipa::path(
     get, path = "/api/v1/github/register", tag = "GitHub",
-    responses((status = 200, content_type = "text/html", description = "Registration form", body = String))
+    responses(
+        (status = 200, content_type = "text/html", description = "Registration form", body = String),
+        (status = 404, description = "App registration is disabled")
+    )
 )]
 fn github_register() {}
 
@@ -876,8 +879,9 @@ fn github_register() {}
     ),
     responses(
         (status = 200, content_type = "text/html", description = "App credentials page", body = String),
-        (status = 400, description = "Missing, mismatched, or expired state"),
-        (status = 404, description = "App registration is disabled")
+        (status = 400, description = "Missing, mismatched, or expired state, or a malformed query"),
+        (status = 404, description = "App registration is disabled"),
+        (status = 500, description = "GitHub did not return the App credentials")
     )
 )]
 fn github_callback() {}

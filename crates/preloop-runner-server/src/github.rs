@@ -4411,8 +4411,10 @@ pub async fn github_register(
     Ok(manifest_page(StatusCode::OK, html, Some(cookie)))
 }
 
-/// Query parameters for GitHub callback. Both fields are optional on the wire, so a
-/// malformed request gets the generic refusal instead of an extractor rejection.
+/// Query parameters for GitHub callback. Both fields are optional on the wire
+/// and are parsed after the feature gate, so any request — including one that
+/// cannot parse — gets the disabled route's 404 or the generic refusal, never
+/// an extractor rejection.
 #[derive(Debug, Deserialize)]
 pub struct CallbackQuery {
     code: Option<String>,
@@ -4432,19 +4434,46 @@ const MANIFEST_REJECTED_PAGE: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
+/// Generic page for a failed code exchange. The browser URL still carries the
+/// one-time code, so the response is as protected as the handoff page.
+const MANIFEST_EXCHANGE_FAILED_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Registration could not be completed</title>
+</head>
+<body style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: auto;">
+    <h1>Registration could not be completed</h1>
+    <p>GitHub did not return the App credentials. Start again from the registration page on this engine.</p>
+</body>
+</html>"#;
+
 /// Callback endpoint for GitHub App Manifest conversion.
 ///
 /// The one-time `code` is exchanged only when the registration cookie and the
 /// `state` parameter are both present, equal, signed by this engine, and unexpired.
-/// Any other request is refused before GitHub is contacted.
+/// Any other request is refused before GitHub is contacted; a failed exchange
+/// answers with the same protected page as any refusal.
 pub async fn github_callback(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
-    Query(params): Query<CallbackQuery>,
+    uri: axum::http::Uri,
 ) -> Result<axum::response::Response, StatusCode> {
+    // The gate runs before query extraction: a request that cannot parse must
+    // still see the disabled route's 404, not an extractor rejection.
     if !app_registration_enabled() {
         return Err(StatusCode::NOT_FOUND);
     }
+    let params = match Query::<CallbackQuery>::try_from_uri(&uri) {
+        Ok(Query(params)) => params,
+        Err(_) => {
+            warn!("rejected GitHub App manifest callback: malformed query");
+            return Ok(manifest_page(
+                StatusCode::BAD_REQUEST,
+                MANIFEST_REJECTED_PAGE.to_owned(),
+                None,
+            ));
+        }
+    };
     let now = unix_now_secs();
     let bound = match (app_manifest_cookie_value(&headers), params.state.as_deref()) {
         (Some(cookie), Some(state)) => {
@@ -4463,7 +4492,17 @@ pub async fn github_callback(
         ));
     };
 
-    let credentials = exchange_manifest_code(code).await?;
+    let credentials = match exchange_manifest_code(code).await {
+        Ok(credentials) => credentials,
+        Err(status) => {
+            warn!("GitHub App manifest code exchange failed");
+            return Ok(manifest_page(
+                status,
+                MANIFEST_EXCHANGE_FAILED_PAGE.to_owned(),
+                None,
+            ));
+        }
+    };
     info!("Successfully registered GitHub App ID: {}", credentials.id);
 
     // The webhook secret is deliberately never logged: it is the only thing
@@ -4583,7 +4622,7 @@ fn app_credentials_page(credentials: &AppManifestConversion) -> String {
     <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto;">{pem}</pre>
     <p>Save the key to <code>./app.pem</code>, then run this on the machine running the engine and restart it:</p>
     <pre style="background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto;">{command}</pre>
-    <p><strong>Do not</strong> set <code>PRELOOP_WEBHOOK_SECRET</code> for this App. The per-App secret above is bound to this App's installations. The legacy variable has no repository-coverage binding.</p>
+    <p><strong>Do not</strong> set <code>PRELOOP_WEBHOOK_SECRET</code> for this App. The per-App secret above is bound to this App's installations. The variable is the single default-App slot and cannot address a second App.</p>
     <p>{install}</p>
     <p>On the machine running the engine, <code>preloop setup github --via app</code>
        does all of this without copying anything out of a browser.</p>
@@ -4755,9 +4794,18 @@ mod tests {
         }
 
         async fn harness(response: Value, registration: Option<&str>) -> Harness {
+            harness_at(response, 201, registration).await
+        }
+
+        /// [`harness`] with control over the conversion endpoint's status.
+        async fn harness_at(
+            response: Value,
+            upstream_status: u16,
+            registration: Option<&str>,
+        ) -> Harness {
             let env = crate::state::GITHUB_ENV_LOCK.lock().await;
             let (api, requests) =
-                start_github_stub(move |_, _, _| (201, vec![], response.clone())).await;
+                start_github_stub(move |_, _, _| (upstream_status, vec![], response.clone())).await;
             let flag = match registration {
                 Some(value) => crate::state::TestEnvVar::set(FLAG, value),
                 None => crate::state::TestEnvVar::unset(FLAG),
@@ -4855,6 +4903,16 @@ mod tests {
             let uri = format!("/api/v1/github/callback?code=c1&state={token}");
             let callback = get(&h.app, &uri, Some(cookie.as_str()), None).await;
             assert_eq!(callback.status(), StatusCode::NOT_FOUND);
+            // A query that cannot parse must still see the disabled route's
+            // 404, not an extractor rejection.
+            let malformed = get(
+                &h.app,
+                "/api/v1/github/callback?code=c1&code=c2&state=x",
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
             assert!(
                 upstream(&h.requests).is_empty(),
                 "a disabled route must not reach GitHub"
@@ -4917,6 +4975,57 @@ mod tests {
             assert!(
                 upstream(&h.requests).is_empty(),
                 "an expired state must not reach GitHub"
+            );
+        }
+
+        /// A malformed query gets the generic refusal — never an extractor
+        /// rejection — and never reaches GitHub.
+        #[tokio::test]
+        async fn malformed_query_gets_the_generic_refusal() {
+            let h = harness(conversion_response("acme", "s"), Some("1")).await;
+            let response = get(
+                &h.app,
+                "/api/v1/github/callback?code=c1&code=c2&state=x",
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            assert!(text(response).await.contains("Registration not accepted"));
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "a malformed query must not reach GitHub"
+            );
+        }
+
+        /// A failed code exchange answers with the protected page: the browser
+        /// URL still carries the one-time code, so the response is never
+        /// cacheable and never leaks through `Referer`.
+        #[tokio::test]
+        async fn exchange_failure_renders_a_protected_page() {
+            let h = harness_at(conversion_response("acme", "s"), 500, Some("1")).await;
+            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-exchange");
+            let uri = format!("/api/v1/github/callback?code=the-code&state={token}");
+            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                response.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                response.headers()["referrer-policy"].to_str().unwrap(),
+                "no-referrer"
+            );
+            let page = text(response).await;
+            assert!(page.contains("Registration could not be completed"));
+            assert_eq!(
+                upstream(&h.requests).len(),
+                1,
+                "the bound exchange is attempted exactly once"
             );
         }
 

@@ -183,7 +183,7 @@ or commit the fallback file.
 | `PRELOOP_GITHUB_APP_ID` | App id |
 | `PRELOOP_GITHUB_APP_PEM` / `_PEM_FILE` / `_PRIVATE_KEY` / `_PRIVATE_KEY_PATH` | Private key, inline or by path |
 | `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Installation id; skips discovery |
-| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` for the default App. Other Apps' secrets are set per App with `preloop setup github --via app --webhook-secret` |
+| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` for the default App; a payload it signs is bound to that App's installation coverage. Other Apps' secrets are set per App with `preloop setup github --via app --webhook-secret` |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback; also fetches **private remote reusable workflows** |
 | `PRELOOP_GITHUB_APP_MINT_FAILURE` | Policy when installation-token minting fails |
 | `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL` | Point at GitHub Enterprise Server |

@@ -245,9 +245,10 @@ pub struct GitHubAppCredentials {
     /// offline — without a github.com round-trip — when github.com is
     /// unreachable.
     pub mint_ledger: Arc<MintLedger>,
-    /// Webhook secret for `X-Hub-Signature-256` verification, when this App
-    /// has its own (the legacy single-App secret lives in
-    /// `AppState::webhook_secret` and covers the default App).
+    /// Webhook secret for `X-Hub-Signature-256` verification. The primary
+    /// slot's secret (`PRELOOP_WEBHOOK_SECRET` / `github.webhook_secret`) is
+    /// the default App's and is attached here at load; `AppState::webhook_secret`
+    /// carries the same value for the no-registry fallback.
     pub webhook_secret: Option<String>,
     /// Explicit installation id for single-installation deployments of this
     /// App, bypassing installation discovery.
@@ -297,17 +298,16 @@ impl GitHubApps {
 
     /// Every registered webhook secret paired with the signer it belongs
     /// to. Each App's secret maps to that App; the legacy
-    /// `AppState::webhook_secret` (if set) maps to [`WebhookSigner::Legacy`].
-    /// Deduplicated: a secret equal to the legacy secret is attributed to
-    /// the legacy signer, since it is not uniquely the App's.
+    /// `AppState::webhook_secret` (if set) fills in only values no App
+    /// claims and maps to [`WebhookSigner::Legacy`]. Deduplicated: a secret
+    /// registered to an App is that App's even when the same value also sits
+    /// in the legacy slot, so its deliveries get that App's
+    /// installation-coverage binding.
     pub fn webhook_signers(&self, legacy: Option<&str>) -> Vec<(String, WebhookSigner)> {
         let mut signers: Vec<(String, WebhookSigner)> = Vec::new();
         // An empty secret makes `X-Hub-Signature-256` verification pass
         // for the empty key — forgeable by anyone — so blank values are
         // never registered.
-        if let Some(legacy) = legacy.filter(|secret| !secret.is_empty()) {
-            signers.push((legacy.to_owned(), WebhookSigner::Legacy));
-        }
         for app in &self.apps {
             if let Some(secret) = &app.webhook_secret
                 && !secret.is_empty()
@@ -315,6 +315,11 @@ impl GitHubApps {
             {
                 signers.push((secret.clone(), WebhookSigner::App(app.app_id.clone())));
             }
+        }
+        if let Some(legacy) = legacy.filter(|secret| !secret.is_empty())
+            && !signers.iter().any(|(have, _)| have == legacy)
+        {
+            signers.push((legacy.to_owned(), WebhookSigner::Legacy));
         }
         signers
     }
@@ -341,9 +346,10 @@ pub enum WebhookSigner {
     /// resolves them with [`GitHubApps::app_by_id`]. Because no secret is
     /// held, `Debug` is safe to derive.
     App(String),
-    /// The legacy single `webhook_secret`: no App identity, no binding —
-    /// with no registry there is no cross-App confusion, and a legacy
-    /// secret alongside a registry is the operator's own credential.
+    /// The legacy single `webhook_secret`, for values no registered App
+    /// claims: no App identity, no binding — with no registry there is no
+    /// cross-App confusion to bind against, and alongside a registry it is
+    /// the operator's own credential.
     Legacy,
 }
 
@@ -498,9 +504,12 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 pat_fallback: pat_fallback.clone(),
                 installation_cache: Arc::new(RwLock::new(HashMap::new())),
                 mint_ledger: Arc::new(MintLedger::default()),
-                // The legacy App's webhook secret is `AppState::webhook_secret`
-                // (`PRELOOP_WEBHOOK_SECRET`); the receiver dedups.
-                webhook_secret: None,
+                // The primary slot's webhook secret belongs to this App — it
+                // is the default App's secret — so a payload it signs is bound
+                // to this App's installations like any registered App's. The
+                // receiver dedups against `AppState::webhook_secret`, which
+                // carries the same value.
+                webhook_secret: crate::config::webhook_secret_from_env_or_config(file_config),
                 installation_id: installation_id_override()?,
                 verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             });
@@ -1899,6 +1908,113 @@ mod tests {
 
     fn test_key() -> rsa::RsaPrivateKey {
         rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("generate test RSA key")
+    }
+
+    /// A secret registered to an App is that App's even when the same value
+    /// also sits in the legacy slot, so its deliveries get the App's
+    /// installation-coverage binding. Only values no App claims fall back to
+    /// the unbound legacy signer.
+    #[test]
+    fn signers_attribute_a_claimed_secret_to_its_app() {
+        let mut app =
+            GitHubAppCredentials::for_tests("987654", test_key(), MintFailurePolicy::LocalJwt);
+        app.webhook_secret = Some("claimed-secret".to_owned());
+        let registry = GitHubApps {
+            apps: vec![app],
+            default_index: 0,
+        };
+
+        let bound = registry.webhook_signers(Some("claimed-secret"));
+        assert!(
+            matches!(
+                bound.as_slice(),
+                [(secret, WebhookSigner::App(id))] if secret == "claimed-secret" && id == "987654"
+            ),
+            "a secret an App claims is bound to that App: {bound:?}"
+        );
+
+        let with_operator = registry.webhook_signers(Some("operator-secret"));
+        assert!(
+            matches!(
+                with_operator.as_slice(),
+                [(_, WebhookSigner::App(_)), (secret, WebhookSigner::Legacy)]
+                    if secret == "operator-secret"
+            ),
+            "only unclaimed values fall back to the legacy signer: {with_operator:?}"
+        );
+    }
+
+    /// Fresh-engine registration stores the webhook secret in the primary
+    /// slot, from the config file or the environment; it must load as the
+    /// default App's own secret so a payload it signs is bound to that App's
+    /// installations instead of falling back to the unbound legacy signer.
+    #[tokio::test]
+    async fn load_from_binds_the_primary_slots_secret_to_the_default_app() {
+        use rsa::pkcs1::EncodeRsaPrivateKey as _;
+
+        // Held for the whole test: every variable read here is process-global.
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _guards: Vec<crate::state::TestEnvVar> = [
+            "PRELOOP_GITHUB_APP_ID",
+            "PRELOOP_GITHUB_APP_PEM",
+            "PRELOOP_GITHUB_APP_PEM_FILE",
+            "PRELOOP_GITHUB_APP_PRIVATE_KEY",
+            "PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH",
+            "PRELOOP_GITHUB_APP_INSTALLATION_ID",
+            "PRELOOP_GITHUB_APP_MINT_FAILURE",
+            "PRELOOP_GITHUB_APPS_JSON",
+            "PRELOOP_GITHUB_TOKEN",
+            "PRELOOP_WEBHOOK_SECRET",
+        ]
+        .iter()
+        .map(|name| crate::state::TestEnvVar::unset(name))
+        .collect();
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        let pem = test_key()
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("encode test key");
+        let pem = pem.replace('\n', "\\n");
+
+        // The `--via app` write: the secret lands in the config file next to
+        // the App id it belongs to.
+        std::fs::write(
+            &config,
+            format!(
+                "[github]\napp_id = \"987654\"\napp_pem = \"{pem}\"\nwebhook_secret = \"from-config\"\n"
+            ),
+        )
+        .unwrap();
+        let file = crate::config::load_config_from(&config).unwrap();
+        let registry = load_from(&file).unwrap().expect("the primary App loads");
+        assert_eq!(registry.default_app().app_id, "987654");
+        assert_eq!(
+            registry.default_app().webhook_secret.as_deref(),
+            Some("from-config")
+        );
+        assert!(
+            matches!(
+                registry.webhook_signers(Some("from-config")).as_slice(),
+                [(secret, WebhookSigner::App(id))] if secret == "from-config" && id == "987654"
+            ),
+            "the primary slot's secret is the default App's"
+        );
+
+        // The environment variable is the same slot and binds the same way.
+        let env_secret = crate::state::TestEnvVar::set("PRELOOP_WEBHOOK_SECRET", "from-env");
+        std::fs::write(
+            &config,
+            format!("[github]\napp_id = \"987654\"\napp_pem = \"{pem}\"\n"),
+        )
+        .unwrap();
+        let file = crate::config::load_config_from(&config).unwrap();
+        let registry = load_from(&file).unwrap().expect("the primary App loads");
+        assert_eq!(
+            registry.default_app().webhook_secret.as_deref(),
+            Some("from-env")
+        );
+        drop(env_secret);
     }
 
     #[test]
