@@ -66,7 +66,7 @@
       },
       {
         "group": "Demos",
-        "pages": ["demo/dap/readme", "demo/dap/agent-prompt"]
+        "pages": ["demo/dap/omp-debugging-demo", "demo/dap/agent-prompt"]
       }
     ]
   }

@@ -336,7 +336,7 @@ Two things a PAT does not get you:
   preloop setup github --via pat --webhook-secret "$(openssl rand -hex 32)"
   ```
 
-Create the PAT at <https://github.com/settings/personal-access-tokens/new>
+Create the PAT at [GitHub personal access token settings](https://github.com/settings/personal-access-tokens/new).
 with **Repository access → Only select repositories** and the permissions the
 wizard prints. The checklist is derived from your own workflows' `permissions`
 blocks (union across `.github/workflows/*.yml`), so you can grant exactly what
