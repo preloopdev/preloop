@@ -21,7 +21,7 @@ problem, and everything below is how it gets fixed.
 | 4 | Phantom ack (restore from snapshot, corruption) | GitHub recorded success, no local row | **Delivery watchdog** (GUID join) |
 | 5 | Delayed / throttled delivery | Arrives minutes late | Delivery watchdog **grace window** |
 | 6 | GitHub API outage or rate limit mid-processing | Every queued delivery fails on the same dependency | **Circuit breaker** + parking |
-| 7 | No delivery ever generated | Nothing in the history to redeliver | No automatic repair; see `internal/opportunities.md` |
+| 7 | No delivery ever generated | Nothing in the history to redeliver | No automatic repair; operator intervention is required |
 | 8 | Silent misconfiguration (events narrowed, URL repointed) | Silence, indistinguishable from "no pushes" | **App health monitor** |
 | 9 | Payload older than GitHub's 3-day window | Redelivery impossible | **Local replay** (`preloop webhooks replay`) |
 

@@ -1,0 +1,50 @@
+---
+title: Quickstart
+description: Install Preloop and run your first GitHub Actions workflow locally.
+---
+
+Get from a clean machine to a workflow running locally in a few minutes. Your existing `.github/workflows` files run against your working tree, including uncommitted and untracked files.
+
+## Prerequisites
+
+- macOS (Apple Silicon or Intel) or Linux. Windows is supported through WSL2.
+- About 80 GB of free disk for the default packed runner image and its unpacked working data.
+- A GitHub App or fine-grained personal access token if you want workflow jobs to authenticate to GitHub and update checks. For local-only runs, initialize without a credential.
+
+## Install
+
+Install the Preloop CLI with Homebrew or npm. Both install the same release binaries:
+
+```sh
+brew install preloopdev/tap/preloop
+npm install -g @preloop-dev/cli
+```
+
+## Initialize and start the engine
+
+Run the setup wizard, then start the local engine:
+
+```sh
+preloop init
+preloop serve
+```
+
+`preloop init` configures GitHub credentials, selects the runner image, and chooses how the engine runs. It writes the resulting configuration to `~/.preloop/config.toml`. To run the engine in the background, add `-d` to `preloop serve`.
+
+## Run a workflow
+
+In a repository with GitHub Actions workflows, run a workflow locally:
+
+```sh
+cd my-repo
+preloop run -f .github/workflows/ci.yml --event pull_request
+```
+
+The first run downloads and prepares the default runner image. It is about 9 GB compressed and can use close to 50 GB unpacked, so allow about 80 GB of free disk. Subsequent jobs can start from the prepared image in about 300 ms.
+
+## Where to go next
+
+- [Setup and credentials](/setup)
+- [Full CLI reference](/cli_reference)
+- [Self-hosting and service configuration](/self-hosting)
+- [Architecture overview](/system-architecture)
