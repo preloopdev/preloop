@@ -249,6 +249,7 @@ pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()
                  and webhook secret are written to your config automatically.\n\
                  \x20 --org <NAME>       create it under an organization\n\
                  \x20 --public-url <URL> also enable webhook delivery to this engine\n\
+                 \x20 --github-runner-admin add Administration: write for runner pools\n\
                  \n\
                  Already have an App? Skip the browser:\n\
                  \x20 preloop setup github --via app --app-id <ID> --pem-file <KEY>"
