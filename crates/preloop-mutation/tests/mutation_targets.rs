@@ -258,10 +258,12 @@ fn run(target: &Target) {
         .expect("failed to start cargo mutants; install it with `brew install cargo-mutants`");
     let elapsed = started.elapsed();
 
+    // cargo-mutants nests its report at `<output>/mutants.out/`.
+    let report = out.join("mutants.out");
     let counts: Vec<(String, usize)> = ["caught", "missed", "timeout", "unviable"]
         .iter()
         .map(|kind| {
-            let n = fs::read_to_string(out.join(format!("{kind}.txt")))
+            let n = fs::read_to_string(report.join(format!("{kind}.txt")))
                 .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
                 .unwrap_or(0);
             ((*kind).to_string(), n)
@@ -283,12 +285,12 @@ fn run(target: &Target) {
     );
 
     assert!(
-        out.join("outcomes.json").exists(),
+        report.join("outcomes.json").exists(),
         "target {}: cargo-mutants produced no report in {}",
         target.id,
-        out.display()
+        report.display()
     );
-    let missed = fs::read_to_string(out.join("missed.txt")).unwrap_or_default();
+    let missed = fs::read_to_string(report.join("missed.txt")).unwrap_or_default();
     assert!(
         missed.trim().is_empty(),
         "target {}: surviving mutants (no test failed with them applied):\n{}",

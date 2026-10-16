@@ -108,7 +108,7 @@ jobs:
       - name: Report survivors
         if: always()
         run: |
-          out=mutants.out/T1
+          out=mutants.out/T1/mutants.out
           {
             echo "## T1 job/binding lifecycle"
             echo ""
@@ -209,7 +209,7 @@ jobs:
       - name: Report survivors
         if: always()
         run: |
-          out=mutants.out/T2
+          out=mutants.out/T2/mutants.out
           {
             echo "## T2 webhook signature verification and event dispatch"
             echo ""
@@ -310,7 +310,7 @@ jobs:
       - name: Report survivors
         if: always()
         run: |
-          out=mutants.out/T3
+          out=mutants.out/T3/mutants.out
           {
             echo "## T3 pool/waitlist ordering and warm-pool sizing"
             echo ""
@@ -411,7 +411,7 @@ jobs:
       - name: Report survivors
         if: always()
         run: |
-          out=mutants.out/T4
+          out=mutants.out/T4/mutants.out
           {
             echo "## T4 queue depth and run status aggregation"
             echo ""
@@ -512,7 +512,7 @@ jobs:
       - name: Report survivors
         if: always()
         run: |
-          out=mutants.out/T5
+          out=mutants.out/T5/mutants.out
           {
             echo "## T5 CLI argument parsing"
             echo ""
