@@ -29,13 +29,16 @@ jobs:
         with:
           node-version: 22
       - name: Install Mintlify CLI
-        run: npm install --prefix "$RUNNER_TEMP/mintlify" mint@latest
+        run: npm install --prefix "$RUNNER_TEMP/mintlify" mint@4.2.1046
       - name: Validate Mintlify build
-        run: "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" validate
+        run: |
+          "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" validate
         working-directory: docs
       - name: Check internal links and anchors
-        run: "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" broken-links --check-anchors
+        run: |
+          "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" broken-links --check-anchors
         working-directory: docs
       - name: Check documentation accessibility
-        run: "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" a11y
+        run: |
+          "$RUNNER_TEMP/mintlify/node_modules/.bin/mint" a11y
         working-directory: docs

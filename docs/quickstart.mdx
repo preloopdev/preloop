@@ -22,10 +22,10 @@ npm install -g @preloop-dev/cli
 
 ## Initialize and start the engine
 
-Run the setup wizard, then start the local engine:
+Configure the engine without starting it, then launch it in the foreground:
 
 ```sh
-preloop init
+preloop init --mode none
 preloop serve
 ```
 
@@ -40,7 +40,7 @@ cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
 
-The first run downloads and prepares the default runner image. It is about 9 GB compressed and can use close to 50 GB unpacked, so allow about 80 GB of free disk. Subsequent jobs can start from the prepared image in about 300 ms.
+The first run downloads and prepares the default VM image. It is about 9 GB compressed and can use close to 50 GB unpacked, so allow about 80 GB of free disk. Subsequent jobs can start from the prepared image in about 300 ms.
 
 ## Where to go next
 
