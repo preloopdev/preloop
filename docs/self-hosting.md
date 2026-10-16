@@ -190,6 +190,7 @@ explicitly; never print or commit the fallback file.
 | `PRELOOP_GITHUB_APP_MINT_FAILURE` | Policy when installation-token minting fails |
 | `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL` | Point at GitHub Enterprise Server |
 | `PRELOOP_GITHUB_REPOSITORY` | Repository the scheduler scans for `schedule:` workflows at startup |
+| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated event list the App-manifest flow subscribes at App creation; defaults to `push,pull_request,check_run,workflow_job`. GitHub cannot change subscriptions via API after creation — Apps created before `workflow_job` joined the defaults need it ticked manually in the App's webhook settings (grant `Actions: read` first so the checkbox renders) |
 
 ### Checkout cache
 

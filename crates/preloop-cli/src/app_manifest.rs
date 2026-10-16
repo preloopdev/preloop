@@ -45,6 +45,9 @@ const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
     ("contents", "read"),
     ("metadata", "read"),
     ("pull_requests", "read"),
+    // The `workflow_job` subscription needs this or GitHub never renders its
+    // checkbox (and can never be fixed via API after App creation).
+    ("actions", "read"),
 ];
 
 /// How long to wait for the operator to finish in the browser.
@@ -758,6 +761,14 @@ mod tests {
         let events = manifest["default_events"].as_array().unwrap();
         assert!(events.iter().any(|e| e == "push"));
         assert!(events.iter().any(|e| e == "pull_request"));
+        assert!(
+            events.iter().any(|e| e == "workflow_job"),
+            "workflow_job can only be subscribed at App creation time: {events:?}"
+        );
+        assert_eq!(
+            manifest["default_permissions"]["actions"], "read",
+            "workflow_job's checkbox does not render without actions: read"
+        );
     }
 
     #[test]

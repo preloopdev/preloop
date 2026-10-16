@@ -160,16 +160,19 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 
 ### Event subscription
 - Manifest `default_events` is configurable and defaults to the minimal CI set:
-  `push`, `pull_request`. Operators who need additional events must add them
+  `push`, `pull_request`, `check_run`, `workflow_job`. Operators who need
+  additional events must add them
   manually in the App settings UI because GitHub's API cannot change event
   subscriptions after App creation. The trigger events Apps may need include
-  `pull_request_review`, `workflow_dispatch`, `workflow_run`,
+  `pull_request_review`, `workflow_dispatch`, `workflow_run`, `workflow_job`,
   `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
   `create`, `delete`, `release`, plus the Tier B/C events the adapters already
   handle. `pull_request_target` is not among them: preloop synthesizes it from
   the `pull_request` webhook, and GitHub delivers no such event. `check_run`
   and `check_suite` need no explicit subscription when the App holds
   `checks: write` — GitHub auto-subscribes those and omits them from `events`.
+  `workflow_job` requires `actions: read` — without the permission GitHub does
+  not even render its checkbox.
 - **Caveat**: GitHub's `PATCH /app/hook/config` cannot change an App's event
   subscription (only url/content_type/secret). Event subscriptions are set at App
   creation (manifest) or in the App settings UI. So:
@@ -361,7 +364,8 @@ Milestone status and open-question decisions, updated as the work lands.
   fails closed on refusal; missing-trigger computation is canonical.
 
 **Open-question decisions so far:**
-- Manifest default: `push` and `pull_request`. Additional events can be
+- Manifest default: `push`, `pull_request`, `check_run`, `workflow_job`.
+  Additional events can be
   selected at creation time with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`; after
   creation, operators must add subscriptions manually in GitHub's App
   settings because the API cannot change them.

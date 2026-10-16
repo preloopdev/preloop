@@ -291,6 +291,14 @@ exposes no API for the webhook **Active**
 checkbox, so an App created without `--public-url` needs that ticked once in
 its settings.
 
+Event subscriptions are creation-time too: the manifest subscribes the App to
+`push`, `pull_request`, `check_run`, and `workflow_job` (the per-job
+queued/in_progress/completed signal, gated on the App's `Actions: read`
+permission, which the manifest also grants). GitHub exposes no API for them
+either — an App created before `workflow_job` joined the defaults must get it
+ticked by hand under the App's settings → Webhooks → Edit, after granting
+Actions: read so the checkbox renders.
+
 Already have an App or your org blocks manifest creation? Create it by hand
 at <https://github.com/settings/apps/new> (name it, leave webhooks off,
 download the PEM), install it on the accounts whose repos you run at
