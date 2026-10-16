@@ -8,8 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
-### Fixed
+### Changed
 
+- **The file credential store is the default.** The engine token, GitHub App
+  private key, PAT, and webhook secrets are written to `0600` files under
+  `$PRELOOP_HOME/credentials` instead of the OS keychain. GitHub credentials
+  follow the config file, so a `PRELOOP_CONFIG` outside `$PRELOOP_HOME` gets a
+  `credentials` directory beside it. Select the keychain with
+  `credential_store = "os"` in `config.toml` or `PRELOOP_CREDENTIAL_STORE=os`.
+  The environment variable overrides the config key, and an unknown value in
+  either is an error that names the valid choices. Credentials an earlier build
+  kept in the keychain are copied into the file store the first time they are
+  read; the keychain entry is left in place.
+
+### Fixed
 
 - **GitHub runner administration is available as an explicit App opt-in**
   (#623): the host-side client mints repository- or organization-scoped
@@ -19,6 +31,27 @@ Releases before v0.27.0 predate the changelog.
   `Administration: write`; existing installations must accept GitHub's
   permission review, and organization pools require the organization
   `Self-hosted runners: write` grant.
+
+- **A GitHub App's private key survives an OS keychain failure.** With
+  `credential_store = "os"`, an unavailable keychain or a refused write now
+  stores the credential in the file store, prints a warning naming the
+  directory, and records `credential_store = "file"` in `config.toml`. Before,
+  `preloop setup github` aborted after GitHub had issued the one-time App key,
+  and headless setups stored secrets inline in `config.toml`. Setup also loads
+  the config before creating the App, so a config error cannot strand the key.
+  The manifest flow also persists converted credentials before waiting for the
+  optional installation redirect, so an install timeout or Ctrl-C cannot lose
+  the one-time PEM.
+
+- **`preloop serve` explains a `serve.lock` collision.** A second engine on the same
+  state directory reports the recorded holder's pid, start time, and how it was
+  started (a preloop command's autostart, a systemd service, or another terminal).
+  On Linux, when `/proc/locks` proves that pid holds the lock, it also prints how to
+  stop it; for systemd that is `sudo systemctl stop preloop.socket preloop.service`,
+  since the socket unit would otherwise start the service again. Otherwise the pid is
+  shown as unverified, with a command to find the holder, and no stop command is
+  suggested.
+
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and

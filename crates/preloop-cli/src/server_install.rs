@@ -2338,6 +2338,7 @@ WantedBy=multi-user.target
 
     #[test]
     fn user_home_defaults_to_preloop_home() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let unique = std::env::temp_dir().join("preloop-home-test");
         unsafe { std::env::set_var("PRELOOP_HOME", &unique) };
         let home = resolve_home(None, true).unwrap();
@@ -2451,6 +2452,7 @@ WantedBy=multi-user.target
 
     #[test]
     fn user_launchd_target_is_gui_domain_in_home() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let unique = std::env::temp_dir().join("preloop-home-test");
         unsafe { std::env::set_var("HOME", &unique) };
         let (path, domain) = launchd_target(true);
