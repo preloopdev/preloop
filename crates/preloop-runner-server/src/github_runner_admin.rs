@@ -647,6 +647,104 @@ mod tests {
         .await
     }
 
+    async fn org_remove(
+        State(state): State<Arc<StubState>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> axum::response::Response {
+        admin_response(
+            State(state),
+            headers,
+            body,
+            "/orgs/acme/actions/runners/remove-token".to_owned(),
+            "POST",
+            json!({ "token": "org-remove-token", "expires_at": "2099-01-01T00:00:00Z" }),
+        )
+        .await
+    }
+
+    async fn org_jit(
+        State(state): State<Arc<StubState>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> axum::response::Response {
+        admin_response(
+            State(state),
+            headers,
+            body,
+            "/orgs/acme/actions/runners/generate-jitconfig".to_owned(),
+            "POST",
+            json!({
+                "encoded_jit_config": "org-encoded-jit",
+                "runner": { "id": 43, "name": "org-vm-43", "labels": [] },
+            }),
+        )
+        .await
+    }
+
+    async fn org_list(
+        State(state): State<Arc<StubState>>,
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let path = format!(
+            "/orgs/acme/actions/runners?page={}&per_page={}",
+            query.get("page").map(String::as_str).unwrap_or_default(),
+            query
+                .get("per_page")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        admin_response(
+            State(state),
+            headers,
+            String::new(),
+            path,
+            "GET",
+            json!({
+                "total_count": 1,
+                "runners": [{ "id": 43, "name": "org-vm-43", "status": "online", "busy": false, "labels": [] }],
+            }),
+        )
+        .await
+    }
+
+    async fn org_delete(
+        State(state): State<Arc<StubState>>,
+        headers: HeaderMap,
+        Path(id): Path<u64>,
+    ) -> axum::response::Response {
+        admin_response(
+            State(state),
+            headers,
+            String::new(),
+            format!("/orgs/acme/actions/runners/{id}"),
+            "DELETE",
+            Value::Null,
+        )
+        .await
+    }
+
+    async fn org_deprecation(
+        State(state): State<Arc<StubState>>,
+        headers: HeaderMap,
+        Path(version): Path<String>,
+    ) -> axum::response::Response {
+        admin_response(
+            State(state),
+            headers,
+            String::new(),
+            format!("/orgs/acme/actions/runners/deprecations/{version}"),
+            "GET",
+            json!({
+                "runner_version": version,
+                "runtime_deprecates_at": null,
+                "registration_deprecates_at": null,
+            }),
+        )
+        .await
+    }
+
     async fn repo_remove(
         State(state): State<Arc<StubState>>,
         headers: HeaderMap,
@@ -764,6 +862,17 @@ mod tests {
             .route(
                 "/orgs/acme/actions/runners/registration-token",
                 post(org_registration),
+            )
+            .route("/orgs/acme/actions/runners/remove-token", post(org_remove))
+            .route(
+                "/orgs/acme/actions/runners/generate-jitconfig",
+                post(org_jit),
+            )
+            .route("/orgs/acme/actions/runners", get(org_list))
+            .route("/orgs/acme/actions/runners/{id}", delete(org_delete))
+            .route(
+                "/orgs/acme/actions/runners/deprecations/{version}",
+                get(org_deprecation),
             )
             .route(
                 "/repos/acme/repo/actions/runners/remove-token",
@@ -911,6 +1020,87 @@ mod tests {
         assert_eq!(
             state.admin_requests.lock()[0].1,
             "/orgs/acme/actions/runners/registration-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn org_admin_calls_cover_each_endpoint_without_repository_scope() {
+        let (base, state) =
+            start_stub(json!({ "organization_self_hosted_runners": "write" }), None).await;
+        let admin = client(
+            &base,
+            RunnerAdminScope::Org {
+                org: "acme".to_owned(),
+            },
+        );
+        assert_eq!(
+            admin
+                .registration_token()
+                .await
+                .expect("registration")
+                .token,
+            "org-registration-token"
+        );
+        assert_eq!(
+            admin.remove_token().await.expect("remove").token,
+            "org-remove-token"
+        );
+        let jit = admin
+            .generate_jitconfig(&JitConfigRequest {
+                name: "org-vm-43".to_owned(),
+                runner_group_id: 7,
+                labels: vec!["self-hosted".to_owned()],
+                work_folder: "_work".to_owned(),
+            })
+            .await
+            .expect("jit config");
+        assert_eq!(jit.encoded_jit_config, "org-encoded-jit");
+        assert_eq!(admin.list_runners().await.expect("list")[0].id, 43);
+        admin.delete_runner(43).await.expect("delete");
+        assert_eq!(
+            admin
+                .deprecation("2.336.0")
+                .await
+                .expect("deprecation")
+                .runner_version,
+            "2.336.0"
+        );
+        let bodies = state.access_bodies.lock();
+        assert_eq!(bodies.len(), 6);
+        assert!(bodies.iter().all(|body| {
+            body["permissions"] == json!({ "organization_self_hosted_runners": "write" })
+                && body.get("repositories").is_none()
+        }));
+        let requests = state.admin_requests.lock();
+        assert!(
+            requests
+                .iter()
+                .all(|(_, path, _)| path.starts_with("/orgs/acme/"))
+        );
+        assert!(
+            requests.iter().any(|(method, path, _)| {
+                method == "POST" && path.ends_with("registration-token")
+            })
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| method == "POST" && path.ends_with("remove-token"))
+        );
+        assert!(
+            requests.iter().any(|(method, path, _)| {
+                method == "POST" && path.ends_with("generate-jitconfig")
+            })
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| method == "GET" && path.contains("deprecations/2.336.0"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| method == "DELETE" && path.ends_with("/43"))
         );
     }
 
