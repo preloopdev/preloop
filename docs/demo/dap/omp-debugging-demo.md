@@ -46,7 +46,9 @@ root before starting the engine:
 ```sh
 cargo build --release -p preloop-runner-server -p preloop-runner
 mkdir -p /tmp/dapdemo/runner
-cp docs/demo/dap/{demo.yml,payload-release.json,payload-prod.json,submit.sh,dapctl,agent-prompt.md} /tmp/dapdemo/
+cp docs/demo/dap/demo.yml docs/demo/dap/payload-release.json \
+  docs/demo/dap/payload-prod.json docs/demo/dap/submit.sh \
+  docs/demo/dap/dapctl docs/demo/dap/agent-prompt.md /tmp/dapdemo/
 cp target/release/preloop-runner /tmp/dapdemo/runner/
 chmod +x /tmp/dapdemo/submit.sh /tmp/dapdemo/dapctl
 ```
