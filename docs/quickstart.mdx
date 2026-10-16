@@ -40,7 +40,7 @@ cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
 
-The first run downloads and prepares the default VM image. It is about 9 GB compressed and can use close to 50 GB unpacked, so allow about 80 GB of free disk. Subsequent jobs can start from the prepared image in about 300 ms.
+The first run downloads and prepares Preloop's default packed golden VM image. It uses a GitHub-hosted Ubuntu base but bundles Preloop's Rust runner, not the official `actions/runner` binary. The image is about 9 GB compressed and can use close to 50 GB unpacked, so allow about 80 GB of free disk. Subsequent jobs can start from the prepared image in about 300 ms.
 
 ## Where to go next
 
