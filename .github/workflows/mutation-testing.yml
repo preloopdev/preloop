@@ -1,0 +1,538 @@
+name: mutation-testing
+permissions:
+  contents: read
+
+# Weekly and on demand only: each job drives one mutation-testing target
+# (crates/preloop-mutation) and runs every generated mutant against the test
+# suite of its package, which takes hours.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 0"
+
+concurrency:
+  group: mutation-testing
+  cancel-in-progress: false
+
+env:
+  # The preinstalled rustup proxies use these runner-owned locations.
+  CARGO_HOME: /home/runner/.cargo
+  RUSTUP_HOME: /home/runner/.rustup
+
+jobs:
+  mutants-T1-job-binding-lifecycle:
+    name: mutants-T1-job-binding-lifecycle
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          # Fresh microVMs start with an empty RUSTUP_HOME, so dtolnay would
+          # reinstall the toolchain on every run. Restore it from cache;
+          # bump the key together with `toolchain:` below.
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      # No kache step here on purpose: cargo-mutants builds each mutant in its
+      # own scratch tree (target/mutants-tmp, see crates/preloop-mutation), so
+      # workspace build-cache entries can never hit and would only churn the
+      # bucket. The cold build is a fixed per-job cost the weekly cadence
+      # absorbs.
+      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          version=0.9.144
+          case "$(uname -m)" in
+            x86_64)
+              asset=linux
+              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
+              ;;
+            aarch64|arm64)
+              asset=linux-arm
+              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
+              ;;
+            *)
+              echo "no pinned cargo-nextest build for $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
+          echo "${digest}  ${archive}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
+          "$HOME/.local/bin/cargo-nextest" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            # Published binary, pinned by version and verified by digest, like
+            # the cargo-nextest install above.
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            # No published binary for this architecture; compile the pinned
+            # crate version instead.
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T1 (job/binding lifecycle)
+        run: |
+          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+            --ignored --exact t1_job_binding_lifecycle --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T1
+          {
+            echo "## T1 job/binding lifecycle"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T1-job-binding-lifecycle
+          path: mutants.out/T1
+
+  mutants-T2-webhook-signature:
+    name: mutants-T2-webhook-signature
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          version=0.9.144
+          case "$(uname -m)" in
+            x86_64)
+              asset=linux
+              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
+              ;;
+            aarch64|arm64)
+              asset=linux-arm
+              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
+              ;;
+            *)
+              echo "no pinned cargo-nextest build for $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
+          echo "${digest}  ${archive}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
+          "$HOME/.local/bin/cargo-nextest" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T2 (webhook signature)
+        run: |
+          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+            --ignored --exact t2_webhook_signature --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T2
+          {
+            echo "## T2 webhook signature verification and event dispatch"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T2-webhook-signature
+          path: mutants.out/T2
+
+  mutants-T3-pool-warm-sizing:
+    name: mutants-T3-pool-warm-sizing
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 720
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          version=0.9.144
+          case "$(uname -m)" in
+            x86_64)
+              asset=linux
+              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
+              ;;
+            aarch64|arm64)
+              asset=linux-arm
+              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
+              ;;
+            *)
+              echo "no pinned cargo-nextest build for $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
+          echo "${digest}  ${archive}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
+          "$HOME/.local/bin/cargo-nextest" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T3 (pool/warm sizing)
+        run: |
+          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+            --ignored --exact t3_pool_warm_sizing --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T3
+          {
+            echo "## T3 pool/waitlist ordering and warm-pool sizing"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T3-pool-warm-sizing
+          path: mutants.out/T3
+
+  mutants-T4-queue-status:
+    name: mutants-T4-queue-status
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 480
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          version=0.9.144
+          case "$(uname -m)" in
+            x86_64)
+              asset=linux
+              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
+              ;;
+            aarch64|arm64)
+              asset=linux-arm
+              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
+              ;;
+            *)
+              echo "no pinned cargo-nextest build for $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
+          echo "${digest}  ${archive}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
+          "$HOME/.local/bin/cargo-nextest" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T4 (queue/status aggregation)
+        run: |
+          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+            --ignored --exact t4_queue_status_aggregation --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T4
+          {
+            echo "## T4 queue depth and run status aggregation"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T4-queue-status
+          path: mutants.out/T4
+
+  mutants-T5-cli-parsing:
+    name: mutants-T5-cli-parsing
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          version=0.9.144
+          case "$(uname -m)" in
+            x86_64)
+              asset=linux
+              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
+              ;;
+            aarch64|arm64)
+              asset=linux-arm
+              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
+              ;;
+            *)
+              echo "no pinned cargo-nextest build for $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
+          echo "${digest}  ${archive}" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
+          "$HOME/.local/bin/cargo-nextest" --version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T5 (CLI parsing)
+        run: |
+          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+            --ignored --exact t5_cli_parsing --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T5
+          {
+            echo "## T5 CLI argument parsing"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T5-cli-parsing
+          path: mutants.out/T5
