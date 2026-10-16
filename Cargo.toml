@@ -4,7 +4,6 @@ members = [
     "crates/preloop-cache",
     "crates/preloop-dap",
     "crates/preloop-conformance",
-    "crates/preloop-mutation",
     "crates/preloop-gha-expressions",
     "crates/preloop-gha-parser",
     "crates/preloop-gha-protocol",

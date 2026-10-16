@@ -2700,10 +2700,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "preloop-mutation"
-version = "0.1.0"
-
-[[package]]
 name = "preloop-observability"
 version = "0.1.0"
 dependencies = [

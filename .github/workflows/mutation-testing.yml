@@ -95,7 +95,7 @@ jobs:
           fi
       - name: Run mutation test T1 (job/binding lifecycle)
         run: |
-          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
             --ignored --exact t1_job_binding_lifecycle --nocapture
       - name: Report survivors
         if: always()
@@ -207,7 +207,7 @@ jobs:
           fi
       - name: Run mutation test T2 (webhook signature)
         run: |
-          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
             --ignored --exact t2_webhook_signature --nocapture
       - name: Report survivors
         if: always()
@@ -319,7 +319,7 @@ jobs:
           fi
       - name: Run mutation test T3 (pool/warm sizing)
         run: |
-          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
             --ignored --exact t3_pool_warm_sizing --nocapture
       - name: Report survivors
         if: always()
@@ -347,7 +347,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-3
-          path: mutants.out/T3
+          path: |
+            mutants.out/T3
+            mutants.out/T3a
+            mutants.out/T3b
+            mutants.out/T3c
       - name: Remove PostgreSQL container
         if: always()
         run: docker rm -f postgres || true
@@ -431,7 +435,7 @@ jobs:
           fi
       - name: Run mutation test T4 (queue/status aggregation)
         run: |
-          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
             --ignored --exact t4_queue_status_aggregation --nocapture
       - name: Report survivors
         if: always()
@@ -538,7 +542,7 @@ jobs:
           fi
       - name: Run mutation test T5 (CLI parsing)
         run: |
-          cargo test --locked -p preloop-mutation --test mutation_targets -- \
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
             --ignored --exact t5_cli_parsing --nocapture
       - name: Report survivors
         if: always()

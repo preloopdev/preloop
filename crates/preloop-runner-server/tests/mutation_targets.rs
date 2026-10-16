@@ -15,10 +15,17 @@ const SCOPED_ENV: [&str; 7] = [
     "PRELOOP_TEST_REQUIRE_POSTGRES",
 ];
 
-const INITDB_DIRS: [&str; 3] = [
+const INITDB_DIRS: [&str; 10] = [
     "/Applications/Postgres.app/Contents/Versions/latest/bin",
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
+    "/opt/homebrew/opt/postgresql@18/bin",
+    "/opt/homebrew/opt/postgresql@17/bin",
+    "/opt/homebrew/opt/postgresql@16/bin",
+    "/usr/local/opt/postgresql@18/bin",
+    "/usr/local/opt/postgresql@17/bin",
+    "/usr/local/opt/postgresql@16/bin",
+    "/usr/lib/postgresql/18/bin",
+    "/usr/lib/postgresql/17/bin",
+    "/usr/lib/postgresql/16/bin",
 ];
 
 struct Target {
@@ -26,6 +33,7 @@ struct Target {
     args: &'static [&'static str],
     exclude_re: &'static str,
     tests: &'static [&'static str],
+    needs_postgres: bool,
 }
 
 const T1: Target = Target {
@@ -66,6 +74,7 @@ const T1: Target = Target {
         "--test",
         "broker",
     ],
+    needs_postgres: true,
 };
 
 const T2: Target = Target {
@@ -92,6 +101,7 @@ const T2: Target = Target {
         "--test",
         "webhooks",
     ],
+    needs_postgres: true,
 };
 
 const T3A: Target = Target {
@@ -120,6 +130,7 @@ const T3A: Target = Target {
         "--test",
         "broker",
     ],
+    needs_postgres: true,
 };
 
 const T3B: Target = Target {
@@ -133,7 +144,8 @@ const T3B: Target = Target {
         "host_runner_pool_size",
     ],
     exclude_re: "host_memory_mib|local_runner_pool_config",
-    tests: &["--lib"],
+    tests: &["--bin", "preloop"],
+    needs_postgres: false,
 };
 
 const T3C: Target = Target {
@@ -148,6 +160,7 @@ const T3C: Target = Target {
     ],
     exclude_re: "host_memory_mib|run_on_demand|golden_budget|wait_for_|ensure_host_externals|preload_images|ensure_golden_payload",
     tests: &["--lib", "--test", "runner_pool_lifecycle"],
+    needs_postgres: false,
 };
 
 const T4: Target = Target {
@@ -180,6 +193,7 @@ const T4: Target = Target {
     tests: &[
         "--lib", "--test", "broker", "--test", "logs", "--test", "runs_api", "--test", "recovery",
     ],
+    needs_postgres: true,
 };
 
 const T5: Target = Target {
@@ -190,10 +204,11 @@ const T5: Target = Target {
         "--file",
         "crates/preloop-cli/src/main.rs",
         "--re",
-        "env_flag|parse_flag|logs_query",
+        "env_flag|parse_flag|logs_query|WorkflowSubmission",
     ],
     exclude_re: "cmd_engine|cmd_build_golden|cmd_logs|local_runner_pool_config|fetch_run_job_logs|follow_run_logs",
-    tests: &["--lib"],
+    tests: &["--bin", "preloop"],
+    needs_postgres: false,
 };
 
 #[test]
@@ -230,7 +245,7 @@ fn run_target_set(id: &str, targets: &[&Target]) {
     let root = workspace_root();
     let pg_url = std::env::var("PRELOOP_TEST_POSTGRES_URL").ok();
     let pg_required = std::env::var("PRELOOP_TEST_REQUIRE_POSTGRES").ok();
-    if pg_url.is_none() {
+    if pg_url.is_none() && targets.iter().any(|target| target.needs_postgres) {
         assert!(
             initdb_available(),
             "the pg test suites need a Postgres: set PRELOOP_TEST_POSTGRES_URL or make initdb discoverable"
