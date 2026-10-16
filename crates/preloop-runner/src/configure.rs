@@ -298,6 +298,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             skip_session_recover: false,
             monitor_socket_address: None,
             use_runner_admin_flow: false,
+            control_plane: crate::settings::control_plane_for_url(&args.url),
         },
         credentials: CredentialData {
             scheme: "OAuth".to_string(),

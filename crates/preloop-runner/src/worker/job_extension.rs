@@ -213,6 +213,23 @@ fn tool_cache_dir_for(workspace: &str, hosted: &Path) -> String {
 
 /// Inject GITHUB_* and RUNNER_* environment variables into the job context.
 pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
+    // Which control plane this runner registered against decides whether the
+    // job's `system.github.token` variable is a usable GitHub credential —
+    // CWD is the runner root, where `.runner` lives (see `RUNNER_NAME`).
+    let control_plane = crate::settings::RunnerConfig::load(Path::new("."))
+        .map(|config| config.settings.control_plane)
+        .unwrap_or_default();
+    inject_github_env_with_plane(job, msg, control_plane);
+}
+
+/// `inject_github_env` with the control plane supplied by the caller —
+/// tests use this instead of materializing a `.runner` file.
+fn inject_github_env_with_plane(
+    job: &mut JobContext,
+    msg: &serde_json::Value,
+    control_plane: crate::settings::ControlPlane,
+) {
+    job.control_plane = control_plane;
     let raw_github = msg
         .get("contextData")
         .and_then(|cd| cd.get("github"))
@@ -275,14 +292,29 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         ),
         ("GITHUB_ACTION", str_from_json(&github, "action")),
         ("GITHUB_TOKEN", {
-            // `github.token` only — never `variables.system.github.token`.
-            // That variable is the engine's job-scoped runtime JWT; exporting
-            // it sent a dead credential to api.github.com ("Bad credentials")
-            // on every job without an App/PAT. An empty GITHUB_TOKEN is the
-            // honest value: API clients go anonymous, and checkouts whose
-            // `token:` input defaults to `${{ github.token }}` fetch through
-            // the engine's forge relay.
-            str_from_json(&github, "token")
+            // The official runner builds `github.token` from the
+            // `system.github.token` variable (actions/runner
+            // `ExecutionContext.cs` `InitializeJob`:
+            // `githubContext["token"] = Variables.Get("system.github.token")`,
+            // with `contextData` overlaid on top). The variable is only a
+            // usable GitHub credential when the control plane is GitHub: on a
+            // preloop engine that slot can carry the job-scoped runtime JWT,
+            // a dead credential at api.github.com ("Bad credentials") and a
+            // control-plane secret workflow code must not receive. Engine
+            // registrations keep reading `github.token` (the context slot the
+            // engine patches with a minted App token) and leave the variable
+            // alone.
+            let context_token = str_from_json(&github, "token");
+            if context_token.is_empty() && control_plane == crate::settings::ControlPlane::GitHub {
+                // `github_token` mirrors the same value; it covers messages
+                // whose `system.*` spelling differs or whose producer only
+                // fills the canonical secret variable.
+                variable_value(msg, "system.github.token")
+                    .or_else(|| variable_value(msg, "github_token"))
+                    .unwrap_or_default()
+            } else {
+                context_token
+            }
         }),
         // Runner variables — runner name from.runner settings, not job name
         ("RUNNER_NAME", {
@@ -1139,6 +1171,26 @@ pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
         StepType::Action { uses, .. } if !uses.is_empty() => format!("Run {uses}"),
         _ => id.to_string(),
     }
+}
+
+/// Read the string value of one job-message `variables` entry.
+///
+/// Case-insensitive key match, mirroring `JobContext::get_variable`: the wire
+/// is camelCase-ish (`system.github.token`) while producers differ in
+/// spelling. Returns `None` when the variable is absent or its `value` is not
+/// a string.
+fn variable_value(msg: &serde_json::Value, key: &str) -> Option<String> {
+    let variables = msg.get("variables")?.as_object()?;
+    let key_lower = key.to_lowercase();
+    for (name, entry) in variables {
+        if name.to_lowercase() == key_lower {
+            return entry
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+        }
+    }
+    None
 }
 
 fn str_from_json(val: &serde_json::Value, key: &str) -> String {

@@ -227,6 +227,13 @@ pub async fn run_job(
         variables,
         context_data,
     );
+    // Resolve the persisted registration mode before any expression context
+    // is built. Container/service expressions are evaluated before workspace
+    // setup calls `inject_github_env`, but `${{ github.token }}` has the same
+    // control-plane semantics there as it does in steps.
+    job_ctx.control_plane = crate::settings::RunnerConfig::load(std::path::Path::new("."))
+        .map(|config| config.settings.control_plane)
+        .unwrap_or_default();
     // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
     if let Some(deps) = job_message
         .get("actionsDependencies")
