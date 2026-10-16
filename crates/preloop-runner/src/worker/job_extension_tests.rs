@@ -814,6 +814,7 @@ runs:
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: None,
     }];
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -839,6 +840,8 @@ runs:
             if with.get("__preloop_entry").and_then(|v| v.as_str()) == Some("cleanup.js")
     ));
     assert_eq!(ordered[2].condition.as_deref(), Some("always()"));
+    assert_eq!(ordered[2].post_of.as_deref(), Some("main-action"));
+    assert_eq!(ordered[1].post_of, None);
 }
 
 #[test]
@@ -866,6 +869,7 @@ fn lifecycle_registers_post_for_each_repeated_action_invocation() {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: None,
     };
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -916,6 +920,7 @@ fn lifecycle_local_actions_skip_pre_but_retain_main_and_post() {
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: None,
     };
     let main_steps = vec![
         action_step("local", "./.github/actions/local"),
@@ -991,6 +996,7 @@ runs:
         env: std::collections::HashMap::new(),
         raw: serde_json::json!({}),
         is_background: false,
+        post_of: None,
     }];
     let mut action_paths = std::collections::HashMap::new();
     action_paths.insert(
@@ -1207,6 +1213,7 @@ fn lifecycle_fixture(
             env,
             raw: serde_json::json!({"generated": index, "metadata": spec.metadata}),
             is_background: index % 2 == 0,
+            post_of: None,
         });
     }
 

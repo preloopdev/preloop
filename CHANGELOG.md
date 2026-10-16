@@ -33,6 +33,15 @@ Releases before v0.27.0 predate the changelog.
   of inheriting Axum's 2 MiB default. Oversized requests still get a
   deterministic 413 without buffering the whole cache chunk in RAM.
 
+- **Post hooks of skipped actions no longer run**: a workflow step that did
+  not run, because its `if:` was false or an earlier step failed, no longer
+  runs its action's `post` hook. The official runner registers a post hook
+  only when its action starts, but the engine ran every post hook under its
+  `always()` default, so cleanup hooks of skipped steps ran for minutes and
+  their failures were recorded beside the real first failure. A post hook
+  whose action did not run is now recorded as `skipped`; hooks of actions that
+  ran are unchanged.
+
 ## [0.34.4] - 2026-10-13
 
 ### Fixed
