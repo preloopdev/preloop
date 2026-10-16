@@ -221,8 +221,6 @@ jobs:
           # lose its output — including the failing test names — and the run
           # becomes undiagnosable. The summary step below re-prints just the
           # verdict, which always fits.
-          # Test tempdirs go to the disk-backed runner temp, not the small guest /tmp.
-          export TMPDIR="$RUNNER_TEMP"
           cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4 2>&1 \
             | tee "$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
         env:
@@ -259,8 +257,6 @@ jobs:
       - name: Server integration tests (test-support)
         run: |
           set -euo pipefail
-          # Test tempdirs go to the disk-backed runner temp, not the small guest /tmp.
-          export TMPDIR="$RUNNER_TEMP"
           shard=${{ matrix.shard }}
           crates="recovery runs_api logs registration broker security webhooks concurrency execution_protection_api runner_deprecations store_env"
           selected=""
