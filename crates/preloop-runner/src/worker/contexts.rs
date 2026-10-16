@@ -78,6 +78,11 @@ pub struct JobContext {
     /// v2.336.0 (#4527): Job-scoped artifact subjects from $GITHUB_ARTIFACTS.
     /// Keyed by canonical subject name; value is (digest, kind).
     pub artifact_subjects: IndexMap<String, ArtifactSubject>,
+    /// Control plane this runner registered against (`.runner` `controlPlane`),
+    /// set by `inject_github_env`. Decides whether the `system.github.token`
+    /// variable is a usable GitHub credential (github.com) or a control-plane
+    /// secret that must stay off the step surface (engine, the default).
+    pub control_plane: crate::settings::ControlPlane,
 }
 
 impl std::fmt::Debug for JobContext {
@@ -146,6 +151,17 @@ impl JobContext {
                     masks.insert(base64::engine::general_purpose::STANDARD_NO_PAD.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val));
+                    // actions/runner `ExecutionContext.InitializeJob` also
+                    // registers `base64("x-access-token:{token}")` for
+                    // `system.github.token`: that is the git extraheader
+                    // actions/checkout persists, and it would otherwise leak
+                    // verbatim in a log that echoes remote/auth config.
+                    if k == "system.github.token" {
+                        masks.insert(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(format!("x-access-token:{val}")),
+                        );
+                    }
                     // Register each non-empty trimmed CR/LF-delimited
                     // line too. Log masking runs per assembled line, so
                     // a multiline initial secret (PEM key, JSON blob)
@@ -192,6 +208,7 @@ impl JobContext {
             deprecated_node20_actions: Vec::new(),
             node20_warning_emitted: false,
             artifact_subjects: IndexMap::new(),
+            control_plane: crate::settings::ControlPlane::default(),
         }
     }
 
@@ -399,10 +416,31 @@ impl JobContext {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .is_empty()
-                && let Some(token) = self.env.get("GITHUB_TOKEN")
                 && let Some(obj) = gh.as_object_mut()
             {
-                obj.insert("token".to_string(), serde_json::json!(token));
+                // The official runner fills `github.token` from the
+                // `system.github.token` variable before overlaying
+                // `contextData.github` (`ExecutionContext.InitializeJob`).
+                // That variable is only a GitHub credential when the control
+                // plane is GitHub; on a preloop engine it can be the job's
+                // runtime credential, which must stay off the step surface.
+                let variable_token = (self.control_plane == crate::settings::ControlPlane::GitHub)
+                    .then(|| {
+                        self.get_variable("system.github.token")
+                            .or_else(|| self.get_variable("github_token"))
+                            .unwrap_or("")
+                    })
+                    .unwrap_or("");
+                if let Some(token) = self.env.get("GITHUB_TOKEN") {
+                    obj.insert("token".to_string(), serde_json::json!(token));
+                } else if !variable_token.is_empty() {
+                    obj.insert("token".to_string(), serde_json::json!(variable_token));
+                } else if !obj.contains_key("token") {
+                    // `StringContextData(null)` in the official runner
+                    // renders as the empty string; keep the key present when
+                    // no credential exists instead of exposing a null.
+                    obj.insert("token".to_string(), serde_json::json!(""));
+                }
             }
             tracing::info!(
                 context_token_len,

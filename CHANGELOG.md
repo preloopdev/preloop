@@ -10,6 +10,19 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **`github.token` and `GITHUB_TOKEN` populate on github.com registrations**
+  (#626): `preloop-runner configure` now records which control plane the
+  runner registered against (`.runner` `controlPlane`, derived from the
+  `--url` host). When the control plane is github.com or a managed
+  `*.ghe.com` endpoint, `github.token` and the `GITHUB_TOKEN` env var
+  resolve from the job's `system.github.token` variable — mirroring the
+  official runner, which builds `githubContext["token"]` from that variable
+  in `ExecutionContext.InitializeJob` — so `gh`, `github-script`, and
+  checkout's `${{ github.token }}` default authenticate instead of seeing an
+  empty value. Engine registrations keep the fence: `system.github.token`
+  can carry the job's runtime credential there and is still never exported;
+  `secrets.GITHUB_TOKEN` resolution is unchanged in both modes.
+
 - **Action credential minting is liveness- and identity-bound** (#468):
   ActionDownloadInfo and runnerresolve accept only the system credential or a
   Results job runtime token, bind that token to the requested plan/job, and

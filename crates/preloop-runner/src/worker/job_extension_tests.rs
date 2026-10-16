@@ -1482,8 +1482,8 @@ fn test_golden_acquirejob_payloads_parsing() {
         let mut job = JobContext::new(
             "job1".into(),
             "test-job".into(),
-            serde_json::json!({}),
-            serde_json::json!({}),
+            msg.get("variables").cloned().unwrap_or_default(),
+            msg.get("contextData").cloned().unwrap_or_default(),
         );
         job.workspace = Some("_work/repo/repo".into());
         inject_github_env(&mut job, &msg);
@@ -1496,14 +1496,68 @@ fn test_golden_acquirejob_payloads_parsing() {
             "mismatched GITHUB_REPOSITORY in {scenario}"
         );
 
-        // GITHUB_TOKEN mirrors `github.token` only — never the engine's
-        // runtime JWT. The golden captures carry no `github.token` context,
-        // so the env is empty here (anonymous mode): exporting the JWT sent a
-        // dead credential to api.github.com on engines without an App/PAT.
+        // Token resolution is control-plane dependent (#626). On a preloop
+        // engine `system.github.token` can carry the job's runtime credential,
+        // so it must never surface as `github.token`/`GITHUB_TOKEN`. On
+        // github.com the same variable IS the job's GitHub credential — the
+        // official runner builds `github.token` from exactly this variable
+        // (`ExecutionContext.cs` `InitializeJob`).
+        let wire_token = msg
+            .get("variables")
+            .and_then(|v| v.get("system.github.token"))
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // Engine registration: keep the fence.
         let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
         assert_eq!(
             token, None,
-            "GITHUB_TOKEN must not export when github.token is empty ({scenario}) — the old fallback leaked the engine's runtime JWT to api.github.com"
+            "GITHUB_TOKEN must not export when registered against an engine ({scenario}) — the old fallback leaked the job's runtime credential to api.github.com"
+        );
+        let engine_ctx = job.build_expression_context();
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("github.token", &engine_ctx)
+                .unwrap()
+                .as_str(),
+            Some(""),
+            "github.token must stay empty in engine mode ({scenario})"
+        );
+
+        // github.com registration: the variable the server sent is the job's
+        // real credential. Golden captures redact it, so assert it reaches
+        // the step surface byte-for-byte rather than comparing literals.
+        let mut github_job = JobContext::new(
+            "job1".into(),
+            "test-job".into(),
+            msg.get("variables").cloned().unwrap_or_default(),
+            msg.get("contextData").cloned().unwrap_or_default(),
+        );
+        github_job.workspace = job.workspace.clone();
+        inject_github_env_with_plane(&mut github_job, &msg, crate::settings::ControlPlane::GitHub);
+        assert_eq!(
+            github_job.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some(wire_token.as_str()),
+            "github.com mode must export system.github.token as GITHUB_TOKEN ({scenario})"
+        );
+        let github_ctx = github_job.build_expression_context();
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("github.token", &github_ctx)
+                .unwrap()
+                .as_str(),
+            Some(wire_token.as_str()),
+            "github.token must resolve from system.github.token in github.com mode ({scenario})"
+        );
+        assert_eq!(
+            preloop_gha_expressions::eval_expression("secrets.GITHUB_TOKEN", &github_ctx)
+                .unwrap()
+                .as_str(),
+            msg.get("variables")
+                .and_then(|v| v.get("github_token"))
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            "secrets.GITHUB_TOKEN resolves from github_token in both modes ({scenario})"
         );
 
         // 3. Scenario-specific checks

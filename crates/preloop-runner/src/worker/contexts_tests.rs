@@ -754,6 +754,70 @@ fn secrets_context_resolves_in_expressions() {
 }
 
 #[test]
+fn github_token_resolves_from_system_variable_only_on_github() {
+    // actions/runner `ExecutionContext.InitializeJob` fills `github.token`
+    // from the `system.github.token` variable, then overlays `contextData`
+    // — so on github.com the context resolves the wire credential even
+    // though contextData.github has no `token` key. On a preloop engine the
+    // same variable can carry the job's runtime credential, which must stay
+    // fenced off the step surface (#626).
+    let build = |control_plane: crate::settings::ControlPlane| {
+        let mut ctx = JobContext::new(
+            "job1".into(),
+            "Test".into(),
+            serde_json::json!({
+                "system.github.token": {"value": "ghs_wire", "isSecret": true},
+                "github_token": {"value": "ghs_wire", "isSecret": true}
+            }),
+            serde_json::json!({"github": {"repository": "owner/repo"}}),
+        );
+        ctx.control_plane = control_plane;
+        ctx.build_expression_context()
+    };
+
+    // Engine registration (default): the variable is not projected.
+    let engine_ctx = build(crate::settings::ControlPlane::Engine);
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &engine_ctx)
+            .unwrap()
+            .as_str(),
+        Some("")
+    );
+
+    // github.com registration: `github.token` mirrors system.github.token,
+    // independent of the GITHUB_TOKEN env var (not populated here).
+    let github_ctx = build(crate::settings::ControlPlane::GitHub);
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &github_ctx)
+            .unwrap()
+            .as_str(),
+        Some("ghs_wire")
+    );
+}
+
+#[test]
+fn github_token_context_value_wins_over_system_variable_on_github() {
+    // Upstream overlays contextData.github on top of the variable-derived
+    // token, so an explicit context token stays authoritative.
+    let mut ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({
+            "system.github.token": {"value": "ghs_wire", "isSecret": true}
+        }),
+        serde_json::json!({"github": {"repository": "o/r", "token": "context_wins"}}),
+    );
+    ctx.control_plane = crate::settings::ControlPlane::GitHub;
+    let expr_ctx = ctx.build_expression_context();
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("github.token", &expr_ctx)
+            .unwrap()
+            .as_str(),
+        Some("context_wins")
+    );
+}
+
+#[test]
 fn secrets_context_excludes_system_plumbing_variables() {
     let ctx = JobContext::new(
         "job1".into(),
