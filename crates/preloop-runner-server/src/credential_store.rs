@@ -190,8 +190,7 @@ impl CredentialStore for OsCredentialStore {
     /// before binding its listener when run over SSH on a Mac Studio). Probe
     /// the login keychain's lock state with `security show-keychain-info`;
     /// "User interaction is not allowed" means writes would hang, so report
-    /// the store unavailable and let callers fall back to inline/file
-    /// credentials.
+    /// the store unavailable so that callers fall back to the file store.
     fn available(&self) -> Result<()> {
         match keyring::Entry::store_status() {
             Ok(()) => {}
@@ -215,7 +214,7 @@ fn deny_helpful_error(error: keyring::Error, reference: &CredentialRef, op: &str
     if cfg!(target_os = "macos") && matches!(error, keyring::Error::NoStorageAccess(_)) {
         return anyhow::anyhow!(
             "credential store denied {} of {:?} ({}): approve the macOS keychain dialog for the `preloop` service with Always Allow (one approval per item covers the process); \
-             headless or background sessions cannot approve dialogs and will hang or fail here — set PRELOOP_CREDENTIAL_STORE=file instead",
+             headless or background sessions cannot approve dialogs and will hang or fail here — use the default file store (`credential_store = \"file\"`) instead",
             op,
             reference,
             error,
@@ -244,7 +243,7 @@ fn deny_helpful_error(error: keyring::Error, reference: &CredentialRef, op: &str
 /// deadline.
 ///
 /// A nonzero exit for any other reason is also treated as unavailable: the
-/// probe is cheap and the fallback (inline/file credentials) is always safe.
+/// probe is cheap and the fallback (the file store) is always safe.
 #[cfg(target_os = "macos")]
 fn macos_keychain_writable() -> Result<()> {
     use std::io::Read;
@@ -288,7 +287,7 @@ fn macos_keychain_writable() -> Result<()> {
                 let _ = child.wait();
                 anyhow::bail!(
                     "login keychain write probe timed out after {}s (keychain locked or \
-                     securityd unreachable); using inline/file credentials",
+                     securityd unreachable); using the file credential store",
                     PROBE_TIMEOUT.as_secs()
                 );
             }
@@ -314,7 +313,7 @@ fn macos_keychain_writable() -> Result<()> {
         }
         anyhow::bail!(
             "login keychain is not writable in this session ({}); \
-             using inline/file credentials",
+             using the file credential store",
             stderr.trim()
         );
     }
@@ -348,30 +347,15 @@ pub fn engine_token_reference(storage_dir: &Path) -> Result<CredentialRef> {
     CredentialRef::new(format!("{ENGINE_TOKEN_REFERENCE_PREFIX}{digest:x}"))
 }
 
-/// Load an existing engine token without creating or changing credentials.
+/// Load the engine token from the store selected for this home, without
+/// creating or changing credentials. The CLI and the runner client use this to
+/// find a local engine's admin token.
 ///
-/// The OS credential store is authoritative when available. A private
-/// `engine.token` file remains the fallback for headless/service environments.
+/// The selected store is authoritative when reachable. A private `engine.token`
+/// file remains the fallback for headless and service environments.
 pub fn load_engine_token(storage_dir: &Path) -> Result<Option<String>> {
-    load_engine_token_with_store(storage_dir, &OsCredentialStore)
-}
-
-/// Like [`load_engine_token`], but the backend is chosen by
-/// `PRELOOP_CREDENTIAL_STORE` (`file`/`memory`/`os`). Use this from binaries
-/// so a dev or headless process can avoid the OS keychain prompt entirely.
-pub fn load_engine_token_from_env(storage_dir: &Path) -> Result<Option<String>> {
-    let store = store_from_env(storage_dir);
+    let store = engine_store(storage_dir)?;
     load_engine_token_with_store(storage_dir, store.as_ref())
-}
-
-/// Resolve the engine token, generating and persisting one when absent.
-///
-/// An explicitly supplied token is validated and returned without copying it
-/// into another backend; externally managed secrets should not be duplicated.
-/// Generated or migrated tokens use the OS credential store when available and
-/// fall back to a private `engine.token` file when it is not.
-pub fn resolve_engine_token(storage_dir: &Path, configured: Option<String>) -> Result<String> {
-    resolve_engine_token_with_store(storage_dir, configured, &OsCredentialStore)
 }
 
 /// Resolve an engine token against a supplied backend.
@@ -724,24 +708,87 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
-/// File-backed credential store: one `0600` file per credential under a
-/// private directory. Selected with `PRELOOP_CREDENTIAL_STORE=file` so a dev
-/// or headless server never touches the OS keychain with no per-binary access
-/// prompt, and credentials survive rebuilds and restarts.
+/// File-backed credential store and the default backend: one `0600` file per
+/// credential under a private directory. No OS prompt and no keychain entry,
+/// and credentials survive rebuilds and restarts. When configured to migrate
+/// from the OS store, a miss consults that store and copies the value in; its
+/// reachability is probed at most once per process.
 ///
-/// Security note: this is the same trust level as the existing
-/// `engine.token` file fallback — a private file in the state dir, readable
-/// only by the owning user. It is *not* the OS keychain; use it where a
-/// keychain prompt is unacceptable (local iteration, containers, CI).
+/// Security note: this is the same trust level as the `engine.token` file
+/// fallback — a private file readable only by the owning user. It is *not* the
+/// OS keychain; choose `credential_store = "os"` where the keychain's access
+/// control matters more than avoiding prompts.
 #[derive(Clone)]
 pub struct FileCredentialStore {
     dir: PathBuf,
+    /// Consulted on a miss; a value found there is copied in. See
+    /// [`FileCredentialStore::migrating_from`].
+    migrate_from: Option<Arc<dyn CredentialStore>>,
 }
 
 impl FileCredentialStore {
     /// Store rooted at `dir` (created `0700` on first write).
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            migrate_from: None,
+        }
+    }
+
+    /// Read through to `legacy` on a miss. A value found there is copied into
+    /// this store and returned, so credentials an earlier build kept in the OS
+    /// store keep resolving. `legacy` is only read, never written or deleted,
+    /// and it is consulted only while it reports itself available. A read error
+    /// there counts as a miss.
+    pub fn migrating_from(mut self, legacy: Arc<dyn CredentialStore>) -> Self {
+        self.migrate_from = Some(legacy);
+        self
+    }
+
+    /// The directory the credentials live in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Copy a miss in from the legacy store, when one is configured and
+    /// reachable. The legacy entry is kept.
+    fn migrate_in(&self, reference: &CredentialRef) -> Option<SecretString> {
+        let legacy = self.migrate_from.as_ref()?;
+        if let Err(error) = legacy.available() {
+            tracing::debug!(
+                store = legacy.name(),
+                %error,
+                "legacy credential store unavailable; not migrating"
+            );
+            return None;
+        }
+        let value = match legacy.get(reference) {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    store = legacy.name(),
+                    reference = reference.as_str(),
+                    %error,
+                    "could not read the legacy credential; treating it as missing"
+                );
+                return None;
+            }
+        };
+        match self.set(reference, &value) {
+            Ok(()) => tracing::info!(
+                reference = reference.as_str(),
+                from = legacy.name(),
+                to = self.name(),
+                "migrated credential into the file credential store; the legacy entry was kept"
+            ),
+            Err(error) => tracing::warn!(
+                reference = reference.as_str(),
+                %error,
+                "could not copy the legacy credential into the file store; using it for this run only"
+            ),
+        }
+        Some(value)
     }
 
     /// The default directory: `<state_dir>/credentials`.
@@ -757,6 +804,32 @@ impl FileCredentialStore {
         let digest = Sha256::digest(reference.as_str().as_bytes());
         self.dir.join(format!("{digest:x}.cred"))
     }
+
+    /// Sidecar for [`Self::mark_primary_lost`], beside the credential file.
+    fn marker_path_for(&self, reference: &CredentialRef) -> PathBuf {
+        let digest = Sha256::digest(reference.as_str().as_bytes());
+        self.dir.join(format!("{digest:x}.primary-lost"))
+    }
+
+    /// Record that the primary store lost this reference: it could not hold
+    /// the value, and the file copy is now the credential of record. A stale
+    /// or corrupted primary entry that stayed readable would otherwise be
+    /// treated as authoritative on the next read and shadow this copy.
+    pub fn mark_primary_lost(&self, reference: &CredentialRef) -> Result<()> {
+        let path = self.marker_path_for(reference);
+        write_private_file(
+            &path,
+            "the primary credential store could not hold this value\n",
+        )
+        .with_context(|| format!("write fallback marker {}", path.display()))
+    }
+
+    /// Whether [`Self::mark_primary_lost`] recorded this reference. Callers
+    /// that mix a primary and this file store must read a marked reference
+    /// from here, whatever the primary reports.
+    pub fn primary_lost(&self, reference: &CredentialRef) -> bool {
+        self.marker_path_for(reference).exists()
+    }
 }
 
 impl CredentialStore for FileCredentialStore {
@@ -764,7 +837,7 @@ impl CredentialStore for FileCredentialStore {
         let path = self.path_for(reference);
         match std::fs::read_to_string(&path) {
             Ok(value) => Ok(Some(SecretString::new(value))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(self.migrate_in(reference)),
             Err(e) => Err(e).context(format!("read credential file {}", path.display())),
         }
     }
@@ -782,9 +855,15 @@ impl CredentialStore for FileCredentialStore {
     fn delete(&self, reference: &CredentialRef) -> Result<()> {
         let path = self.path_for(reference);
         match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context(format!("delete credential file {}", path.display())),
+        }
+        let marker = self.marker_path_for(reference);
+        match std::fs::remove_file(&marker) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).context(format!("delete credential file {}", path.display())),
+            Err(e) => Err(e).context(format!("delete fallback marker {}", marker.display())),
         }
     }
 
@@ -805,11 +884,15 @@ impl CredentialStore for FileCredentialStore {
 /// held across each backend call, so a read's cache fill cannot interleave
 /// with a concurrent write or delete of the same reference and resurrect a
 /// stale value. Operations are serialized; keychain prompts already were.
-/// [`store_from_env`] shares one instance process-wide.
+/// Availability is probed at most once per process: on the OS backend the
+/// probe is the expensive macOS write test, and a file-store migration check
+/// runs it on every miss otherwise.
+/// [`selected_store`] shares one instance process-wide.
 #[derive(Debug, Default)]
 pub struct CachedCredentialStore<S> {
     inner: S,
     cache: parking_lot::Mutex<HashMap<CredentialRef, SecretString>>,
+    available: parking_lot::Mutex<Option<std::result::Result<(), String>>>,
 }
 
 impl<S> CachedCredentialStore<S> {
@@ -818,6 +901,7 @@ impl<S> CachedCredentialStore<S> {
         Self {
             inner,
             cache: parking_lot::Mutex::new(HashMap::new()),
+            available: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -868,47 +952,447 @@ impl<S: CredentialStore> CredentialStore for CachedCredentialStore<S> {
     }
 
     fn available(&self) -> Result<()> {
-        self.inner.available()
+        let cached = self
+            .available
+            .lock()
+            .get_or_insert_with(|| self.inner.available().map_err(|error| format!("{error:#}")))
+            .clone();
+        match cached {
+            Ok(()) => Ok(()),
+            Err(message) => Err(anyhow::anyhow!(message)),
+        }
     }
 }
 
-/// Select the credential store for this process.
+/// Environment variable that overrides the configured credential store.
+pub const CREDENTIAL_STORE_ENV: &str = "PRELOOP_CREDENTIAL_STORE";
+
+/// A primary credential store with a private file fallback.
 ///
-/// `PRELOOP_CREDENTIAL_STORE`:
-/// - `os` (default) — the native keychain / secret-service / credential manager.
-/// - `file` — a private directory of `0600` files under `state_dir`; no OS
-///   prompt, survives rebuilds. Recommended for local dev and headless hosts.
-/// - `memory` — non-persistent; secrets vanish on restart (tests only).
-///
-/// Returns a boxed store so the server and CLI share one selection point.
-pub fn store_from_env(state_dir: &Path) -> Arc<dyn CredentialStore> {
-    match std::env::var("PRELOOP_CREDENTIAL_STORE")
-        .unwrap_or_default()
-        .as_str()
-    {
-        // File and memory backends are local and cost no prompt, so they are
-        // not cached: a cache would only hide changes made by other processes.
-        "file" => Arc::new(FileCredentialStore::new(FileCredentialStore::default_dir(
-            state_dir,
-        ))),
-        // The memory backend is shared across `store_from_env` calls: a
-        // long-lived process (or a test that loads a config it just wrote)
-        // resolves and writes credentials through separate calls, and a
-        // fresh store per call would forget every credential the moment the
-        // caller's `Arc` drops — the write path would seal data under a key
-        // the read path can never recover.
-        "memory" => shared_memory_store(),
-        _ => os_credential_store(),
+/// The primary remains authoritative whenever it returns a value for a
+/// reference it did not lose. A missing entry, an unavailable store, or an
+/// individual read failure falls through to the file store for that reference
+/// only, so a setup write that had to fall back remains readable even while
+/// `PRELOOP_CREDENTIAL_STORE=os` is still exported. A fallback write marks the
+/// reference as lost by the primary, and a marked reference reads from the
+/// file store even when the primary still returns a stale or corrupted value.
+#[derive(Clone)]
+pub struct FallbackCredentialStore {
+    primary: Arc<dyn CredentialStore>,
+    fallback: FileCredentialStore,
+    primary_available: Arc<parking_lot::Mutex<Option<bool>>>,
+}
+
+impl FallbackCredentialStore {
+    /// Wrap `primary`, using `fallback` for misses and primary-store errors.
+    pub fn new(primary: Arc<dyn CredentialStore>, fallback: FileCredentialStore) -> Self {
+        Self {
+            primary,
+            fallback,
+            primary_available: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    fn primary_is_available(&self) -> bool {
+        let mut available = self.primary_available.lock();
+        if let Some(available) = *available {
+            return available;
+        }
+        let result = self.primary.available().is_ok();
+        *available = Some(result);
+        result
+    }
+
+    /// Write `value` to the file fallback and mark the reference as lost by
+    /// the primary store, so later reads of it prefer the fallback copy.
+    fn set_fallback(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        self.fallback.set(reference, value)?;
+        self.fallback.mark_primary_lost(reference)
     }
 }
 
-/// The OS store's single process-wide read cache. Every caller shares it, so
-/// one keychain item prompts at most once per process no matter how many
-/// subsystems load configuration.
+impl CredentialStore for FallbackCredentialStore {
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        // A reference the primary lost to a fallback write reads from the
+        // fallback even while the primary still returns a stale or corrupted
+        // value for it.
+        if self.fallback.primary_lost(reference) {
+            return self.fallback.get(reference);
+        }
+        if self.primary_is_available() {
+            match self.primary.get(reference) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        store = self.primary.name(),
+                        reference = reference.as_str(),
+                        %error,
+                        "primary credential read failed for this reference; trying private file fallback"
+                    );
+                }
+            }
+        }
+        self.fallback.get(reference)
+    }
+
+    fn get_fresh(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        if self.fallback.primary_lost(reference) {
+            return self.fallback.get_fresh(reference);
+        }
+        if self.primary_is_available() {
+            match self.primary.get_fresh(reference) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        store = self.primary.name(),
+                        reference = reference.as_str(),
+                        %error,
+                        "primary credential readback failed for this reference; trying private file fallback"
+                    );
+                }
+            }
+        }
+        self.fallback.get_fresh(reference)
+    }
+
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        if self.primary_is_available() {
+            match self.primary.set(reference, value) {
+                Ok(()) => {
+                    // The primary holds the value again: retire the fallback
+                    // copy and its marker so it cannot shadow later reads.
+                    let _ = self.fallback.delete(reference);
+                    return Ok(());
+                }
+                Err(error) => {
+                    return self.set_fallback(reference, value).with_context(|| {
+                        format!(
+                            "store the credential in the file fallback after {} failed: \
+                                 {error:#}",
+                            self.primary.name()
+                        )
+                    });
+                }
+            }
+        }
+        self.set_fallback(reference, value)
+    }
+
+    fn delete(&self, reference: &CredentialRef) -> Result<()> {
+        let primary_error = if self.primary_is_available() {
+            self.primary.delete(reference).err()
+        } else {
+            None
+        };
+        // Also clears any primary-lost marker for the reference.
+        let fallback_result = self.fallback.delete(reference);
+        match primary_error {
+            Some(error) => {
+                fallback_result?;
+                Err(error).context("delete credential from primary store")
+            }
+            None => fallback_result,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.primary.name()
+    }
+
+    fn available(&self) -> Result<()> {
+        // The file backend is part of this composite store, so an unavailable
+        // primary is not an unavailable selected store.
+        let _ = self.primary_is_available();
+        self.fallback.available()
+    }
+}
+
+/// A credential backend, as chosen by [`selected_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStoreKind {
+    /// The host keychain: macOS Keychain, Windows Credential Manager, or the
+    /// Secret Service on Linux. Chosen only explicitly.
+    Os,
+    /// `0600` files under `<state_dir>/credentials`. The default.
+    File,
+    /// Process-lifetime only. Tests and embedders.
+    Memory,
+}
+
+/// Choose the credential backend for this process.
+///
+/// Precedence: `PRELOOP_CREDENTIAL_STORE` (`os`, `file`, or `memory`; a blank
+/// value counts as unset), then the config file's `credential_store` (`os` or
+/// `file`), then `file`. Both sources are validated even when the environment
+/// wins, so a typo in the file never hides behind an override. An unknown value
+/// is an error that names the valid ones; it never selects the OS store.
+pub fn selected_kind(configured: Option<&str>) -> Result<CredentialStoreKind> {
+    let env = std::env::var(CREDENTIAL_STORE_ENV).ok();
+    kind_from(env.as_deref(), configured)
+}
+
+/// [`selected_kind`] over explicit inputs, so precedence can be tested without
+/// touching the process environment.
+fn kind_from(env: Option<&str>, configured: Option<&str>) -> Result<CredentialStoreKind> {
+    let from_config = match configured.map(str::trim) {
+        None => None,
+        Some("os") => Some(CredentialStoreKind::Os),
+        Some("file") => Some(CredentialStoreKind::File),
+        Some(other) => anyhow::bail!(
+            "invalid credential_store {other:?} in config.toml (expected \"file\" or \"os\"; \
+             \"memory\" is only available through {CREDENTIAL_STORE_ENV})"
+        ),
+    };
+    let from_env = match env.map(str::trim).filter(|value| !value.is_empty()) {
+        None => None,
+        Some("os") => Some(CredentialStoreKind::Os),
+        Some("file") => Some(CredentialStoreKind::File),
+        Some("memory") => Some(CredentialStoreKind::Memory),
+        Some(other) => anyhow::bail!(
+            "invalid {CREDENTIAL_STORE_ENV} value {other:?} (expected \"os\", \"file\", or \"memory\")"
+        ),
+    };
+    Ok(from_env
+        .or(from_config)
+        .unwrap_or(CredentialStoreKind::File))
+}
+
+/// The credential store for the engine whose state lives in `state_dir`: the
+/// backend [`selected_kind`] picks, with the file store under
+/// `<state_dir>/credentials`. Callers reach a store only through this function
+/// or [`engine_store`], so precedence is decided in one place.
+///
+/// The file store reads through to the OS store on a miss, so a credential an
+/// earlier build wrote to the keychain stays reachable: a value found there is
+/// copied into the file store, and the OS entry is never deleted. When `os` is
+/// selected, the OS store is primary and this function still keeps the private
+/// file store as a read/write fallback.
+pub fn selected_store(
+    state_dir: &Path,
+    configured: Option<&str>,
+) -> Result<Arc<dyn CredentialStore>> {
+    selected_store_at(FileCredentialStore::default_dir(state_dir), configured)
+}
+
+/// Return the private credential directory associated with a config file.
+///
+/// Credentials live beside the config, not beside an unrelated
+/// `PRELOOP_HOME`: `<config-parent>/credentials`. A relative config filename
+/// with no parent uses `./credentials`.
+pub fn credential_store_dir(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    FileCredentialStore::default_dir(parent)
+}
+
+/// [`selected_store`] using the credential directory beside `config_path`.
+pub fn selected_store_for_config(
+    config_path: &Path,
+    configured: Option<&str>,
+) -> Result<Arc<dyn CredentialStore>> {
+    selected_store_at(credential_store_dir(config_path), configured)
+}
+
+fn selected_store_at(
+    credentials_dir: PathBuf,
+    configured: Option<&str>,
+) -> Result<Arc<dyn CredentialStore>> {
+    let file = FileCredentialStore::new(credentials_dir);
+    Ok(match selected_kind(configured)? {
+        // Not cached: a cache would only hide changes made by other processes.
+        CredentialStoreKind::File => Arc::new(file.migrating_from(os_credential_store())),
+        CredentialStoreKind::Os => {
+            Arc::new(FallbackCredentialStore::new(os_credential_store(), file))
+        }
+        // Shared across calls: a long-lived process (or a test that loads a
+        // config it just wrote) resolves and writes credentials through
+        // separate calls, and a fresh store per call would forget every
+        // credential the moment the caller's `Arc` drops.
+        CredentialStoreKind::Memory => shared_memory_store(),
+    })
+}
+
+/// [`selected_store`] for the engine whose config is active. An explicit
+/// `PRELOOP_CONFIG` wins; otherwise the config is next to `state_dir`, so a
+/// custom `PRELOOP_HOME` does not accidentally read `$HOME/.preloop/config.toml`.
+/// Callers that already hold a parsed config pass its `credential_store` to
+/// [`selected_store`] directly.
+pub fn engine_store(state_dir: &Path) -> Result<Arc<dyn CredentialStore>> {
+    let config_path = std::env::var_os(crate::config::CONFIG_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("config.toml"));
+    let configured = crate::config::credential_store_setting(&config_path)?;
+    selected_store(state_dir, configured.as_deref())
+}
+
+/// Where a credential write landed.
+#[derive(Debug)]
+pub enum Written {
+    /// The selected backend holds the value.
+    Selected,
+    /// The OS store could not hold the value, so the private file store does.
+    /// `reason` says why the OS store was bypassed.
+    FileFallback { reason: anyhow::Error },
+}
+
+/// Writes new credentials for an engine.
+///
+/// The selected backend takes each write when it can. An OS store that is
+/// unavailable, refuses the write, or does not read the value back hands that
+/// write to the private file store, and the writer stays on the file store
+/// after that. On [`Written::FileFallback`] the caller records
+/// `credential_store = "file"`, so the next start reads from the same place.
+pub struct CredentialWriter {
+    store: Arc<dyn CredentialStore>,
+    file: FileCredentialStore,
+    /// `store` is the OS store and may fall back to `file`.
+    may_fall_back: bool,
+    /// Writes currently land in `file`.
+    on_file: bool,
+}
+
+impl CredentialWriter {
+    /// The writer for the engine whose state lives in `state_dir`, under the
+    /// backend [`selected_kind`] picks.
+    pub fn for_home(state_dir: &Path, configured: Option<&str>) -> Result<Self> {
+        Self::from_file_store(
+            FileCredentialStore::new(FileCredentialStore::default_dir(state_dir)),
+            configured,
+        )
+    }
+
+    /// The writer for credentials associated with `config_path`.
+    ///
+    /// The private file fallback is always the `credentials` sibling of the
+    /// config file, matching [`selected_store_for_config`].
+    pub fn for_config(config_path: &Path, configured: Option<&str>) -> Result<Self> {
+        Self::from_file_store(
+            FileCredentialStore::new(credential_store_dir(config_path)),
+            configured,
+        )
+    }
+
+    fn from_file_store(file: FileCredentialStore, configured: Option<&str>) -> Result<Self> {
+        Ok(match selected_kind(configured)? {
+            CredentialStoreKind::Os => Self {
+                store: os_credential_store(),
+                file,
+                may_fall_back: true,
+                on_file: false,
+            },
+            CredentialStoreKind::File => Self {
+                store: Arc::new(file.clone()),
+                file,
+                may_fall_back: false,
+                on_file: true,
+            },
+            CredentialStoreKind::Memory => Self {
+                store: shared_memory_store(),
+                file,
+                may_fall_back: false,
+                on_file: false,
+            },
+        })
+    }
+
+    /// A writer whose first choice is `store` and whose fallback is `file`.
+    /// Embedders and tests supply the OS-style backend this way.
+    pub fn with_fallback(store: Arc<dyn CredentialStore>, file: FileCredentialStore) -> Self {
+        Self {
+            store,
+            file,
+            may_fall_back: true,
+            on_file: false,
+        }
+    }
+
+    /// The private file store's directory, where a fallback lands.
+    pub fn file_dir(&self) -> &Path {
+        self.file.dir()
+    }
+
+    /// Where the next write lands, for operator messages.
+    pub fn destination(&self) -> String {
+        if self.on_file {
+            format!("the private file store at {}", self.file.dir().display())
+        } else {
+            format!("the {}", self.store.name())
+        }
+    }
+
+    /// Store `value` under `reference`, reading it back to confirm.
+    pub fn write(&mut self, reference: &CredentialRef, value: &SecretString) -> Result<Written> {
+        if !self.may_fall_back {
+            write_verified(self.store.as_ref(), reference, value)?;
+            return Ok(Written::Selected);
+        }
+        let reason = match write_verified(self.store.as_ref(), reference, value) {
+            Ok(()) => {
+                // The primary holds the verified value: retire any fallback
+                // copy from an earlier failure so it cannot shadow it.
+                let _ = self.file.delete(reference);
+                return Ok(Written::Selected);
+            }
+            Err(reason) => reason,
+        };
+        write_verified(&self.file, reference, value).with_context(|| {
+            format!("store the credential in the file store after the OS store failed: {reason:#}")
+        })?;
+        // The primary could not hold this value (it may still return a stale
+        // or corrupted one): mark the reference so reads prefer the file copy.
+        self.file.mark_primary_lost(reference)?;
+        self.store = Arc::new(self.file.clone());
+        self.may_fall_back = false;
+        self.on_file = true;
+        Ok(Written::FileFallback { reason })
+    }
+}
+
+/// Write `value` through `store`, then require a fresh read to return it. A
+/// write that does not persist is an error, not a success.
+fn write_verified(
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    value: &SecretString,
+) -> Result<()> {
+    store.available()?;
+    store.set(reference, value)?;
+    match store.get_fresh(reference)? {
+        Some(stored) if stored.expose() == value.expose() => Ok(()),
+        Some(_) => anyhow::bail!(
+            "{} returned a different value than was written for {reference:?}",
+            store.name()
+        ),
+        None => anyhow::bail!(
+            "{} did not keep the value written for {reference:?}",
+            store.name()
+        ),
+    }
+}
+
+/// The OS store, shared process-wide so one keychain item prompts at most once
+/// per process no matter how many subsystems load configuration.
 fn os_credential_store() -> Arc<dyn CredentialStore> {
     static OS_STORE: std::sync::LazyLock<Arc<dyn CredentialStore>> =
-        std::sync::LazyLock::new(|| Arc::new(CachedCredentialStore::new(OsCredentialStore)));
+        std::sync::LazyLock::new(os_backend);
     OS_STORE.clone()
+}
+
+/// The real keychain, read through a cache so repeated reads cost one lookup.
+#[cfg(not(any(test, feature = "test-support")))]
+fn os_backend() -> Arc<dyn CredentialStore> {
+    Arc::new(CachedCredentialStore::new(OsCredentialStore))
+}
+
+/// Test builds never reach the host keychain: the OS backend is an in-memory
+/// stand-in, because the macOS probe writes a throwaway keychain item.
+#[cfg(any(test, feature = "test-support"))]
+fn os_backend() -> Arc<dyn CredentialStore> {
+    Arc::new(MemoryCredentialStore::default())
 }
 
 /// The process-wide memory credential store behind `PRELOOP_CREDENTIAL_STORE=memory`.
@@ -1028,7 +1512,7 @@ mod tests {
         assert_eq!(store.get(&reference).unwrap(), None);
     }
 
-    /// `store_from_env("memory")` hands every caller the same process-wide
+    /// `selected_store` with `PRELOOP_CREDENTIAL_STORE=memory` hands every caller the same process-wide
     /// store: a value written through one selection must be readable through
     /// the next. A fresh instance per call made the config-secrets key
     /// written at seal time unrecoverable when the load path asked a
@@ -1040,12 +1524,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let reference = CredentialRef::new("round-trip-across-store-from-env").unwrap();
-        let writer = store_from_env(dir.path());
+        let writer = selected_store(dir.path(), None).unwrap();
         writer
             .set(&reference, &SecretString::new("shared-secret"))
             .unwrap();
 
-        let reader = store_from_env(dir.path());
+        let reader = selected_store(dir.path(), None).unwrap();
         assert_eq!(
             reader
                 .get(&reference)
@@ -1053,7 +1537,7 @@ mod tests {
                 .as_ref()
                 .map(|secret| secret.expose()),
             Some("shared-secret"),
-            "a second store_from_env call must see credentials written through the first"
+            "a second selected_store call must see credentials written through the first"
         );
 
         // Cleanup for other tests that share the process-wide memory store.
@@ -1600,6 +2084,701 @@ mod tests {
                 .mode()
                 & 0o777,
             0o700
+        );
+    }
+
+    /// Stand-in for the OS store in the migration and fallback tests:
+    /// reachability and read failures are scripted, and reads are counted.
+    #[derive(Clone)]
+    struct LegacyOsStore {
+        inner: MemoryCredentialStore,
+        reachable: bool,
+        fail_reads: bool,
+        reads: Arc<parking_lot::Mutex<usize>>,
+    }
+
+    impl LegacyOsStore {
+        fn reachable() -> Self {
+            Self {
+                inner: MemoryCredentialStore::default(),
+                reachable: true,
+                fail_reads: false,
+                reads: Arc::default(),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            *self.reads.lock()
+        }
+    }
+
+    impl CredentialStore for LegacyOsStore {
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+            *self.reads.lock() += 1;
+            if self.fail_reads {
+                anyhow::bail!("keychain denied the read");
+            }
+            self.inner.get(reference)
+        }
+
+        fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+            self.inner.set(reference, value)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<()> {
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "legacy os store"
+        }
+
+        fn available(&self) -> Result<()> {
+            if self.reachable {
+                Ok(())
+            } else {
+                anyhow::bail!("no keychain")
+            }
+        }
+    }
+
+    /// Refuses every write, like a keychain that says no.
+    #[derive(Clone, Copy, Default)]
+    struct RefusingCredentialStore;
+
+    impl CredentialStore for RefusingCredentialStore {
+        fn get(&self, _reference: &CredentialRef) -> Result<Option<SecretString>> {
+            Ok(None)
+        }
+
+        fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> Result<()> {
+            anyhow::bail!("keychain refused the write")
+        }
+
+        fn delete(&self, _reference: &CredentialRef) -> Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "refusing credential store"
+        }
+    }
+
+    #[test]
+    fn os_primary_reads_and_writes_through_file_fallbacks() {
+        let reference = CredentialRef::new("github-pat-fallback").unwrap();
+        let mut read_error = LegacyOsStore::reachable();
+        read_error.fail_reads = true;
+        let cases: [(&str, Arc<dyn CredentialStore>); 3] = [
+            ("unavailable", Arc::new(UnavailableCredentialStore)),
+            ("read error", Arc::new(read_error)),
+            ("write error", Arc::new(RefusingCredentialStore)),
+        ];
+
+        for (case, primary) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let fallback = FileCredentialStore::new(dir.path().join("credentials"));
+            fallback
+                .set(&reference, &SecretString::new("file-value"))
+                .unwrap();
+            let store = FallbackCredentialStore::new(primary, fallback.clone());
+            assert_eq!(
+                store
+                    .get(&reference)
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.expose()),
+                Some("file-value"),
+                "{case}: file fallback was not readable"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = FileCredentialStore::new(dir.path().join("credentials"));
+        let store =
+            FallbackCredentialStore::new(Arc::new(RefusingCredentialStore), fallback.clone());
+        store
+            .set(&reference, &SecretString::new("written-through"))
+            .unwrap();
+        assert_eq!(
+            fallback
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some("written-through"),
+            "a primary write failure must persist to the file fallback"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = FileCredentialStore::new(dir.path().join("credentials"));
+        fallback
+            .set(&reference, &SecretString::new("file-value"))
+            .unwrap();
+        let primary = LegacyOsStore::reachable();
+        primary
+            .inner
+            .set(&reference, &SecretString::new("os-value"))
+            .unwrap();
+        let store = FallbackCredentialStore::new(Arc::new(primary), fallback);
+        assert_eq!(
+            store
+                .get(&reference)
+                .unwrap()
+                .as_ref()
+                .map(|value| value.expose()),
+            Some("os-value"),
+            "a successful OS value must remain authoritative over the file fallback"
+        );
+    }
+
+    #[test]
+    fn env_beats_config_which_beats_the_file_default() {
+        assert_eq!(kind_from(None, None).unwrap(), CredentialStoreKind::File);
+        assert_eq!(
+            kind_from(None, Some("os")).unwrap(),
+            CredentialStoreKind::Os
+        );
+        assert_eq!(
+            kind_from(None, Some(" file ")).unwrap(),
+            CredentialStoreKind::File
+        );
+        assert_eq!(
+            kind_from(Some("os"), Some("file")).unwrap(),
+            CredentialStoreKind::Os
+        );
+        assert_eq!(
+            kind_from(Some("file"), Some("os")).unwrap(),
+            CredentialStoreKind::File
+        );
+        assert_eq!(
+            kind_from(Some("memory"), Some("os")).unwrap(),
+            CredentialStoreKind::Memory
+        );
+    }
+
+    #[test]
+    fn a_blank_env_value_counts_as_unset() {
+        assert_eq!(
+            kind_from(Some("  "), Some("os")).unwrap(),
+            CredentialStoreKind::Os
+        );
+        assert_eq!(
+            kind_from(Some(""), None).unwrap(),
+            CredentialStoreKind::File
+        );
+    }
+
+    #[test]
+    fn unknown_values_are_errors_and_never_select_the_os_store() {
+        let env_error = format!("{:#}", kind_from(Some("keychain"), None).unwrap_err());
+        assert!(
+            env_error.contains("PRELOOP_CREDENTIAL_STORE")
+                && env_error.contains("\"os\", \"file\", or \"memory\""),
+            "{env_error}"
+        );
+        assert!(
+            kind_from(Some("OS"), None).is_err(),
+            "values are case-sensitive"
+        );
+        assert!(
+            kind_from(Some("keychain"), Some("os")).is_err(),
+            "a bad env value must not fall through to the config"
+        );
+        let config_error = format!("{:#}", kind_from(None, Some("ops")).unwrap_err());
+        assert!(
+            config_error.contains("credential_store")
+                && config_error.contains("\"file\" or \"os\""),
+            "{config_error}"
+        );
+        assert!(
+            kind_from(None, Some("memory")).is_err(),
+            "memory is only selectable through the environment"
+        );
+        assert!(kind_from(None, Some("")).is_err());
+        assert!(
+            kind_from(Some("file"), Some("ops")).is_err(),
+            "a bad config value is reported even when the environment overrides it"
+        );
+    }
+
+    #[test]
+    fn file_store_reads_through_a_legacy_entry_once_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        let reference = CredentialRef::new("github-app-pem-123").unwrap();
+        let legacy = LegacyOsStore::reachable();
+        legacy
+            .inner
+            .set(&reference, &SecretString::new("LEGACY\n"))
+            .unwrap();
+        let store = FileCredentialStore::new(&credentials).migrating_from(Arc::new(legacy.clone()));
+
+        assert_eq!(store.get(&reference).unwrap().unwrap().expose(), "LEGACY\n");
+        assert_eq!(
+            FileCredentialStore::new(&credentials)
+                .get(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "LEGACY\n",
+            "the migrated value must now live in the file store"
+        );
+        assert_eq!(legacy.reads(), 1);
+        // Served from the file store from now on: the legacy store is not asked again.
+        assert_eq!(store.get(&reference).unwrap().unwrap().expose(), "LEGACY\n");
+        assert_eq!(legacy.reads(), 1);
+        // The legacy entry is never deleted.
+        assert_eq!(
+            legacy.inner.get(&reference).unwrap().unwrap().expose(),
+            "LEGACY\n"
+        );
+    }
+
+    #[test]
+    fn file_store_ignores_an_unreachable_or_failing_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        let reference = CredentialRef::new("github-pat").unwrap();
+
+        let mut unreachable = LegacyOsStore::reachable();
+        unreachable.reachable = false;
+        unreachable
+            .inner
+            .set(&reference, &SecretString::new("hidden"))
+            .unwrap();
+        let store =
+            FileCredentialStore::new(&credentials).migrating_from(Arc::new(unreachable.clone()));
+        assert!(store.get(&reference).unwrap().is_none());
+        assert_eq!(
+            unreachable.reads(),
+            0,
+            "an unreachable store must not be read"
+        );
+
+        let mut failing = LegacyOsStore::reachable();
+        failing.fail_reads = true;
+        let store = FileCredentialStore::new(&credentials).migrating_from(Arc::new(failing));
+        assert!(
+            store.get(&reference).unwrap().is_none(),
+            "a legacy read error is treated as a miss"
+        );
+        assert!(
+            FileCredentialStore::new(&credentials)
+                .get(&reference)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn engine_token_is_migrated_from_a_legacy_os_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = LegacyOsStore::reachable();
+        let reference = engine_token_reference(dir.path()).unwrap();
+        legacy
+            .inner
+            .set(&reference, &SecretString::new("legacy-admin-token"))
+            .unwrap();
+        let store = FileCredentialStore::new(FileCredentialStore::default_dir(dir.path()))
+            .migrating_from(Arc::new(legacy));
+
+        let token = resolve_engine_token_with_store(dir.path(), None, &store).unwrap();
+        assert_eq!(
+            token, "legacy-admin-token",
+            "an existing token must be kept"
+        );
+        assert_eq!(
+            load_engine_token_with_store(dir.path(), &store).unwrap(),
+            Some("legacy-admin-token".to_owned())
+        );
+        assert!(!dir.path().join(ENGINE_TOKEN_FILE).exists());
+    }
+
+    #[test]
+    fn file_store_round_trips_multiline_pem_byte_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(dir.path().join("credentials"));
+        let reference = CredentialRef::new("github-app-pem-55").unwrap();
+        for pem in [
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nabc/def+ghi=\n-----END RSA PRIVATE KEY-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\r\nMIIEpAIBAAKCAQEA\r\n-----END RSA PRIVATE KEY-----",
+        ] {
+            store.set(&reference, &SecretString::new(pem)).unwrap();
+            assert_eq!(store.get(&reference).unwrap().unwrap().expose(), pem);
+        }
+    }
+
+    #[test]
+    fn writer_falls_back_to_the_file_store_when_the_os_store_cannot_keep_a_write() {
+        let cases: [(&str, Arc<dyn CredentialStore>); 4] = [
+            ("unavailable", Arc::new(UnavailableCredentialStore)),
+            ("refuses the write", Arc::new(RefusingCredentialStore)),
+            ("does not persist", Arc::new(NonPersistingCredentialStore)),
+            ("cannot read back", Arc::new(WriteOnlyCredentialStore)),
+        ];
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\nBBBB\n-----END RSA PRIVATE KEY-----\n";
+        for (case, primary) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let credentials = dir.path().join("credentials");
+            let mut writer =
+                CredentialWriter::with_fallback(primary, FileCredentialStore::new(&credentials));
+            let reference = CredentialRef::new("github-app-pem-7").unwrap();
+
+            let Written::FileFallback { reason } =
+                writer.write(&reference, &SecretString::new(pem)).unwrap()
+            else {
+                panic!("{case}: expected a file-store fallback");
+            };
+            assert!(!format!("{reason:#}").is_empty(), "{case}");
+            assert_eq!(
+                FileCredentialStore::new(&credentials)
+                    .get(&reference)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                pem,
+                "{case}: the PEM must be stored byte-exactly in the file store"
+            );
+            assert_eq!(writer.file_dir(), credentials.as_path(), "{case}");
+            assert!(
+                writer
+                    .destination()
+                    .starts_with("the private file store at "),
+                "{case}"
+            );
+
+            // Later writes stay on the file store and report no fallback.
+            let next = CredentialRef::new("github-app-webhook-7").unwrap();
+            assert!(
+                matches!(
+                    writer.write(&next, &SecretString::new("hook")).unwrap(),
+                    Written::Selected
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    /// Without an OS store there is nothing to fall back to: a failed write is reported.
+    #[tokio::test]
+    async fn file_writer_reports_its_own_failures() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        // A plain file where the credentials directory belongs makes every write fail.
+        std::fs::write(dir.path().join("credentials"), "not a directory").unwrap();
+        let mut writer = CredentialWriter::for_home(dir.path(), None).unwrap();
+        let reference = CredentialRef::new("github-pat").unwrap();
+        assert!(writer.write(&reference, &SecretString::new("pat")).is_err());
+    }
+
+    #[tokio::test]
+    async fn writer_for_home_defaults_to_the_file_store_under_the_home() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = CredentialRef::new("github-app-pem-9").unwrap();
+        let mut writer = CredentialWriter::for_home(dir.path(), None).unwrap();
+        assert!(matches!(
+            writer.write(&reference, &SecretString::new("pem")).unwrap(),
+            Written::Selected
+        ));
+        let credentials = dir.path().join("credentials");
+        assert_eq!(
+            FileCredentialStore::new(&credentials)
+                .get(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "pem"
+        );
+        assert_eq!(
+            writer.destination(),
+            format!("the private file store at {}", credentials.display())
+        );
+    }
+
+    /// The environment override beats the config key, and the config key beats
+    /// the default. Callers reach these through `selected_store`.
+    #[tokio::test]
+    async fn selected_store_applies_env_then_config_then_default() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
+            assert_eq!(
+                selected_store(dir.path(), None).unwrap().name(),
+                "file credential store"
+            );
+        }
+        {
+            let _env = crate::state::TestEnvVar::set(CREDENTIAL_STORE_ENV, "memory");
+            assert_eq!(
+                selected_store(dir.path(), Some("file")).unwrap().name(),
+                "memory credential store"
+            );
+        }
+    }
+
+    /// A store that corrupts every write — the motivating failure: a keychain
+    /// that accepts the write and hands back mangled bytes afterwards.
+    struct CorruptingStore {
+        stored: parking_lot::Mutex<Option<String>>,
+    }
+
+    impl CredentialStore for CorruptingStore {
+        fn get(&self, _reference: &CredentialRef) -> Result<Option<SecretString>> {
+            Ok(self
+                .stored
+                .lock()
+                .as_ref()
+                .map(|value| SecretString::new(value.clone())))
+        }
+
+        fn set(&self, _reference: &CredentialRef, value: &SecretString) -> Result<()> {
+            let raw = value.expose();
+            *self.stored.lock() = Some(raw[..raw.len() / 2].to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, _reference: &CredentialRef) -> Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "corrupting store"
+        }
+    }
+
+    /// A store that keeps its values but refuses every write, like a keychain
+    /// that will not accept a rotation.
+    struct RefusingWriteStore {
+        inner: MemoryCredentialStore,
+    }
+
+    impl CredentialStore for RefusingWriteStore {
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+            self.inner.get(reference)
+        }
+
+        fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> Result<()> {
+            anyhow::bail!("keychain refused the write")
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<()> {
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "refusing-write store"
+        }
+    }
+
+    /// A store whose reads fail only for chosen references: one denied
+    /// keychain item must not disable the rest of the store.
+    struct SelectiveReadStore {
+        inner: MemoryCredentialStore,
+        denied: std::collections::HashSet<String>,
+    }
+
+    impl CredentialStore for SelectiveReadStore {
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+            if self.denied.contains(reference.as_str()) {
+                anyhow::bail!("keychain denied the read of {reference:?}");
+            }
+            self.inner.get(reference)
+        }
+
+        fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+            self.inner.set(reference, value)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<()> {
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "selective-read store"
+        }
+    }
+
+    /// Counts `available` probes so the cache can be asserted on.
+    struct CountingProbeStore {
+        inner: MemoryCredentialStore,
+        probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fails: bool,
+    }
+
+    impl CredentialStore for CountingProbeStore {
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+            self.inner.get(reference)
+        }
+
+        fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+            self.inner.set(reference, value)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<()> {
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "counting probe store"
+        }
+
+        fn available(&self) -> Result<()> {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fails {
+                anyhow::bail!("probe failed");
+            }
+            Ok(())
+        }
+    }
+
+    /// The motivating failure end to end: the primary corrupts the write, the
+    /// verified fallback file copy holds the real value, and a later read
+    /// through the composite store returns it — not the corrupt primary entry.
+    #[test]
+    fn a_fallback_write_is_authoritative_over_a_corrupt_primary_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileCredentialStore::new(dir.path().join("credentials"));
+        let reference = CredentialRef::new("github-app-pem-4242").unwrap();
+        let os = Arc::new(CorruptingStore {
+            stored: parking_lot::Mutex::new(None),
+        });
+        let mut writer = CredentialWriter::with_fallback(os.clone(), file.clone());
+        assert!(
+            matches!(
+                writer
+                    .write(&reference, &SecretString::new("GOOD-PEM-VALUE"))
+                    .unwrap(),
+                Written::FileFallback { .. }
+            ),
+            "a corrupting store must fail the verified write"
+        );
+        assert_eq!(
+            file.get(&reference).unwrap().unwrap().expose(),
+            "GOOD-PEM-VALUE"
+        );
+        let load = FallbackCredentialStore::new(os, file);
+        assert_eq!(
+            load.get(&reference).unwrap().unwrap().expose(),
+            "GOOD-PEM-VALUE",
+            "the corrupt primary entry must not shadow the verified file copy"
+        );
+    }
+
+    /// A refused rotation must not leave the old primary value in force: the
+    /// new value lands in the file fallback and reads prefer it.
+    #[test]
+    fn a_refused_rotation_leaves_the_new_value_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileCredentialStore::new(dir.path().join("credentials"));
+        let reference = CredentialRef::new("github-webhook-1").unwrap();
+        let os = Arc::new(RefusingWriteStore {
+            inner: MemoryCredentialStore::default(),
+        });
+        os.inner.set(&reference, &SecretString::new("old")).unwrap();
+        let mut writer = CredentialWriter::with_fallback(os.clone(), file.clone());
+        assert!(
+            matches!(
+                writer.write(&reference, &SecretString::new("new")).unwrap(),
+                Written::FileFallback { .. }
+            ),
+            "a refusing store must fail the verified write"
+        );
+        let load = FallbackCredentialStore::new(os, file);
+        assert_eq!(
+            load.get(&reference).unwrap().unwrap().expose(),
+            "new",
+            "the refused rotation must not leave the old value in force"
+        );
+    }
+
+    /// One denied keychain item falls back for that reference only; the rest
+    /// of the store keeps working.
+    #[test]
+    fn a_primary_read_failure_stays_scoped_to_one_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileCredentialStore::new(dir.path().join("credentials"));
+        let denied = CredentialRef::new("denied-item").unwrap();
+        let healthy = CredentialRef::new("healthy-item").unwrap();
+        let os = Arc::new(SelectiveReadStore {
+            inner: MemoryCredentialStore::default(),
+            denied: [denied.as_str().to_owned()].into_iter().collect(),
+        });
+        os.inner
+            .set(&healthy, &SecretString::new("os-value"))
+            .unwrap();
+        file.set(&denied, &SecretString::new("file-value")).unwrap();
+        let store = FallbackCredentialStore::new(os, file);
+        assert_eq!(
+            store.get(&denied).unwrap().unwrap().expose(),
+            "file-value",
+            "the denied reference falls back to the file store"
+        );
+        assert_eq!(
+            store.get(&healthy).unwrap().unwrap().expose(),
+            "os-value",
+            "one denied item must not disable the OS store for the rest"
+        );
+    }
+
+    /// A successful primary write retires the fallback copy and its marker,
+    /// so a stale file value cannot shadow the fresh primary one.
+    #[test]
+    fn a_successful_primary_write_retires_the_fallback_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileCredentialStore::new(dir.path().join("credentials"));
+        let reference = CredentialRef::new("github-pat").unwrap();
+        file.set(&reference, &SecretString::new("stale-file-value"))
+            .unwrap();
+        file.mark_primary_lost(&reference).unwrap();
+        let primary = Arc::new(MemoryCredentialStore::default());
+        let store = FallbackCredentialStore::new(primary, file.clone());
+        store
+            .set(&reference, &SecretString::new("fresh-os-value"))
+            .unwrap();
+        assert!(!file.primary_lost(&reference), "the marker must be gone");
+        assert_eq!(
+            file.get(&reference).unwrap(),
+            None,
+            "the stale fallback copy must be gone"
+        );
+        assert_eq!(
+            store.get(&reference).unwrap().unwrap().expose(),
+            "fresh-os-value"
+        );
+    }
+
+    /// The reachability probe is cached: a file-store migration miss must not
+    /// re-probe the keychain on every miss.
+    #[test]
+    fn the_availability_probe_is_cached_per_process() {
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = CachedCredentialStore::new(CountingProbeStore {
+            inner: MemoryCredentialStore::default(),
+            probes: probes.clone(),
+            fails: false,
+        });
+        store.available().unwrap();
+        store.available().unwrap();
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let failing_probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failing = CachedCredentialStore::new(CountingProbeStore {
+            inner: MemoryCredentialStore::default(),
+            probes: failing_probes.clone(),
+            fails: true,
+        });
+        assert!(failing.available().is_err());
+        assert!(failing.available().is_err());
+        assert_eq!(
+            failing_probes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a failing probe is cached too"
         );
     }
 }
