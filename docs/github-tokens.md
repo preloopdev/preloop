@@ -16,7 +16,7 @@ whole point of this document.
 | Credential | Runner env | Source | Always local? |
 |---|---|---|---|
 | Runner/service token | `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | `endpoint.authorization.parameters.AccessToken` | Yes — always the local HMAC JWT |
-| Job token | `GITHUB_TOKEN` | `system.github.token` / `github_token` | No — becomes a real GitHub credential when an App or PAT is configured |
+| Job token | `GITHUB_TOKEN` | `system.github.token` / `github_token` | GitHub App token, an accepted static PAT, or empty; never the runtime JWT |
 
 The runner message uses the official lower-case `github_token` variable. The
 runner maps that built-in variable to the canonical
@@ -46,9 +46,11 @@ directly onto the step's `token` input rather than letting it default to
 `fetch-depth`/`fetch-tags`); a user `token` input is replaced by the pinned
 local JWT.
 
-When no App and no PAT are configured, `GITHUB_TOKEN` is also a local HMAC JWT.
-It is a placeholder in that case: nothing in a job needs it, and any call it
-makes to `api.github.com` will fail.
+When no GitHub credential is available, the job's `GITHUB_TOKEN` and
+`${{ github.token }}` are empty. The local HMAC JWT remains a separate runtime
+credential used to authenticate to Preloop; it is never passed to GitHub as the
+job token. A step that reads an empty token may make an anonymous API request;
+private or write operations that need authentication will fail.
 
 ---
 
@@ -82,15 +84,19 @@ meaningless:
 - `actions/checkout` against a private **remote** repo — one not served from the local workspace snapshot
 - Any other action that calls `api.github.com`
 
-Without a real token these fail at the API call with `401`/`403`, not at job
-setup: Preloop always supplies *some* `GITHUB_TOKEN` value.
+Without a usable GitHub credential, these calls receive an empty token and may
+be anonymous. Public unauthenticated reads can still work; private or
+write-authorized operations require a credential with the necessary access.
 
 ---
 
 ## 4. Setting up a GitHub App (recommended)
 
-A GitHub App gives each job a short-lived installation token scoped to the
-repository the run belongs to and to the permissions that job declares.
+A GitHub App gives each job an installation token for that repository,
+requested with the job's effective permissions after the operator's configured
+ceiling. If GitHub rejects the request with `422`, Preloop narrows it to the
+installation's available grants and retries; the resulting token can therefore
+carry fewer permissions than the workflow declared.
 
 On the machine running the engine, one command does the whole thing:
 
@@ -163,8 +169,9 @@ so a typo cannot quietly select a different policy.
 - The installation is resolved from the repository owner by paging
   `GET /app/installations` (100 per page, up to 10 pages) and matching
   `account.login` case-insensitively. The resulting id is cached in-process for
-  the server's lifetime; `PRELOOP_GITHUB_APP_INSTALLATION_ID` skips discovery
-  altogether.
+  the server's lifetime. `PRELOOP_GITHUB_APP_INSTALLATION_ID` skips list
+  discovery, but Preloop still verifies that the installation belongs to the
+  configured App.
 - The token is minted with **both** `repositories` and `permissions` always
   present in the request body. `repositories` holds the single repository from
   the run's `owner/repo` slug, and `permissions` holds the job's effective
@@ -177,27 +184,26 @@ so a typo cannot quietly select a different policy.
   per job. Every job mints a fresh one.
 - The App authenticates with an RS256 JWT that is backdated 60 seconds for clock
   skew and expires 10 minutes out, regenerated for each mint.
-- Tokens expire after **1 hour** and are not refreshed in place. A job running
-  longer than an hour may see `$GITHUB_TOKEN` expire mid-run.
+- Preloop uses the `expires_at` returned with the installation token and does
+  not refresh that token in place. Long-running jobs should not assume the
+  token remains valid indefinitely.
 - Installation tokens are minted per job when the broker dispatches it — not
   at submission — so downstream jobs never wait on a short-lived token.
 
 ### When minting fails
 
 A mint can fail for many reasons: the App is not installed on that owner, the
-key was revoked, the API is rate-limited, the requested permissions exceed the
-installation's grant, or the run's `repository` is not a real slug.
-
-Falling back to `PRELOOP_GITHUB_TOKEN` automatically would be a silent privilege
-escalation — it trades a repository-scoped, `permissions:`-bounded token for a
-static PAT that is neither. `PRELOOP_GITHUB_APP_MINT_FAILURE` therefore makes the
-choice explicit:
+key was revoked, the API is rate-limited, or the run's `repository` is not a
+real slug. If GitHub returns `422` for the requested permissions, Preloop fetches
+the installation's grants, narrows the request, retries, and reports the
+permissions actually minted. If that retry also fails, the configured
+`PRELOOP_GITHUB_APP_MINT_FAILURE` policy applies:
 
 | Value | Behavior |
 |---|---|
-| `local` (default) | The job keeps the local HMAC JWT. It runs normally but cannot reach `api.github.com`. Scope can never widen. |
-| `error` | The mint failure is terminal: the job claim fails with `502 Bad Gateway` and the job fails instead of running with fallback authority. |
-| `pat` | The job receives `PRELOOP_GITHUB_TOKEN`, accepting that the PAT ignores `permissions:` and is not repository-scoped. |
+| `local` (default) | The App mint failure does not itself fail the job. The intended result is no App-issued job token. **Current implementation caveat:** if a static `PRELOOP_GITHUB_TOKEN` is also configured, a later broker fallback can still supply it; do not rely on `local` to withhold that PAT. Use `error` or remove the static PAT if you require fail-closed behavior. |
+| `error` | The mint failure is terminal: the job claim fails instead of running with fallback authority. |
+| `pat` | The job receives `PRELOOP_GITHUB_TOKEN` without per-job or per-repository narrowing; fork-restricted jobs do not receive this fallback. |
 
 ### How `permissions:` maps to token scopes
 
@@ -234,9 +240,11 @@ That is the narrowest token GitHub will issue, and it is used instead of an empt
 `permissions` object because an empty object is not a documented way to request
 an empty token.
 
-A token can never exceed what the App was granted at install time. The converse
-matters too: requesting a scope the App was *not* granted fails the mint with a
-`422`, so grant the App at least the permissions your workflows declare.
+An installation token cannot exceed the App's grants. If a requested scope is
+not granted, Preloop reads the installation permissions, narrows the request,
+and retries. The resulting token may be weaker than the workflow's declaration;
+check the reported effective permissions when a workflow depends on a write
+scope. Grant the App the permissions your workflows need to avoid narrowing.
 
 ### Enterprise considerations
 
@@ -259,18 +267,21 @@ Set a Personal Access Token when starting the server:
 export PRELOOP_GITHUB_TOKEN="github_pat_..."
 ```
 
-- The PAT is embedded as `GITHUB_TOKEN` only when its classic OAuth scopes
-  are introspected and don't exceed declared `permissions:`; broader PATs
-  refuse the run, and unverifiable bounds withhold the PAT (the job then runs
-  with no `GITHUB_TOKEN` at all). It is not scoped per repository. This is exactly why a
-  failed App mint does not reach for the PAT unless
-  `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` says so.
-- Classic PATs are the only kind whose bounds can be introspected
-  (`X-OAuth-Scopes`); a fine-grained PAT's bounds are unverifiable, so it is
-  withheld from jobs — use a GitHub App instead.
-- The same `PRELOOP_GITHUB_TOKEN` is also used server-side for Check Run
-  create/update, remote workflow fetching, and pull-request changed-file
-  lookups. With it unset, check runs are simulated in-memory and logged instead.
+- When no default App is configured, Preloop introspects a classic PAT's
+  `X-OAuth-Scopes` and applies a coarse read/write admission check against the
+  workflow's effective `permissions:`. This is not a per-scope comparison and
+  does not narrow the PAT per job or repository. A fine-grained PAT normally
+  has no `X-OAuth-Scopes` header, so its bounds are unverifiable and it is
+  withheld from jobs in this path. It may still be used for supported
+  server-side GitHub API calls.
+- An explicit App-mint fallback of `pat` bypasses that normal PAT admission
+  check. The static credential is not repository-scoped and may exceed a job's
+  declared permissions. Fork-restricted jobs never receive it.
+- `PRELOOP_GITHUB_TOKEN` is used server-side for supported GitHub API calls,
+  including remote workflow fetching and pull-request changed-file lookups.
+  The server may also attempt Check Run calls with a resolved static PAT, but
+  GitHub may reject that credential. For reliable published Check Runs, use a
+  GitHub App installation token with `checks: write`.
 
 ---
 
@@ -278,28 +289,28 @@ export PRELOOP_GITHUB_TOKEN="github_pat_..."
 
 ```
 GitHub App installation token
-  (scoped to one repository and to `permissions:`, fresh per job, 1h TTL)
-  ↓ configured? no App at all
-PRELOOP_GITHUB_TOKEN PAT (static, scope-checked against `permissions:` at submission; unscoped per-repository)
-  ↓ neither available
-empty `GITHUB_TOKEN` — API clients go anonymous
+  (one repository; effective permissions after the operator ceiling and any
+   install-grant narrowing; minted per job)
+  ↓ no App, or an App mint returns no token
+PRELOOP_GITHUB_TOKEN PAT
+  (classic scopes checked coarsely when the default App is absent; a fine-grained
+   PAT is normally withheld because its bounds cannot be verified)
+  ↓ neither credential is usable
+empty `GITHUB_TOKEN` — clients may make anonymous API calls
 ```
 
-With App credentials configured, the App path is the *only* path a successful
-job token comes from — the PAT is not a silent second choice. A failed mint is
-resolved by `PRELOOP_GITHUB_APP_MINT_FAILURE` (see §4), which defaults to no
-GitHub token at all. With no App configured at all, the PAT is the primary job
-token. A job that ends up with neither receives *no* `GITHUB_TOKEN` — the same
-value the official runner yields when its message carries no
-`system.github.token` variable — so `${{ github.token }}` inputs such as
-`actions/checkout`'s and maturin-action's `token` resolve empty and their API
-calls are anonymous. The job-scoped runtime JWT is never handed out as
-`GITHUB_TOKEN`: it authenticates to this engine only, so exporting it made every
-step that read the token fail against github.com with `Bad credentials`.
+There is an implementation caveat when an App and a static PAT are both
+configured: the broker's later fallback can still supply a verified PAT even
+when the App policy is `local`. Use `PRELOOP_GITHUB_APP_MINT_FAILURE=error` or
+remove the static PAT if a failed App mint must stop the job. The explicit
+`pat` policy also supplies the static credential without repository or per-job
+narrowing. Fork-restricted jobs do not receive the PAT fallback.
 
-Regardless of which branch is taken, `ACTIONS_RUNTIME_TOKEN` and the pinned
-`actions/checkout` token stay local HMAC JWTs, so cache, artifacts, logs, OIDC,
-and local-workspace checkout behave identically in all three cases.
+With no usable GitHub credential, the job receives an empty `GITHUB_TOKEN`; the
+job-scoped runtime JWT is never handed out as that token. It authenticates to
+Preloop only. `ACTIONS_RUNTIME_TOKEN` and the pinned `actions/checkout` token
+remain separate local HMAC JWTs, so cache, artifacts, logs, OIDC, and
+local-workspace checkout do not depend on the GitHub job token.
 
 ## 7. Dispatch API authentication (GitHub App API compatibility)
 

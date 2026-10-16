@@ -1,11 +1,13 @@
 # Control database migrations
 
 The control schema is created and upgraded by **refinery 0.10** over the
-embedded migration sets in `migrations/{sqlite,postgres}`. A running server
-never writes schema state: it verifies at open and refuses anything that is
-not exactly this build's migration set. There is no down/rollback: refinery is
-forward-only, so rollback is a backup restore or a forward corrective
-migration.
+embedded migration sets in `migrations/{sqlite,postgres}`. `preloop serve`
+checks the applied migration ledger against the versions expected by this build
+and refuses an uninitialized or incompatible schema; it never applies
+migrations. Checksum validation is performed when migrations are applied, not
+as a full historical SQL audit on every server open. There is no
+down/rollback: refinery is forward-only, so rollback is a backup restore or a
+forward corrective migration.
 
 ## Ledger
 
@@ -61,23 +63,29 @@ structurally identical to a fresh run.
 ## Operating
 
 - `preloop store migrate` — initialize a fresh store or apply pending
-  migrations. SQLite runs take a consistent backup first
-  (`VACUUM INTO <db>.pre-migrate-<unix>.bak`); restore that file to roll back.
-  Postgres restores from the operator's backup. `--dry-run` reports only;
+  migrations. For an existing, non-empty SQLite store with pending migrations,
+  the command creates a consistent backup first
+  (`VACUUM INTO <db>.pre-migrate-<unix>.bak`); fresh stores and runs with no
+  pending migrations do not need that backup. Restore the backup to roll back.
+  Postgres restores from the operator's backup. `--dry-run` does not apply
+  migration SQL, but opens SQLite read/write and may create an empty database
+  or normalize file permissions, so it is not a strictly read-only probe.
   `--adopt-baseline` adopts a pre-ledger control database **after** verifying
   its structure matches a known migration point (never silently).
-- `preloop store status` — applied / pending / unknown versions, read-only.
+- `preloop store status` — reports applied / pending / unknown versions and
+  does not apply migration SQL. Opening SQLite can create the database file
+  (and parent directory) and normalize its permissions, so it is not a
+  strictly read-only filesystem probe.
 - `preloop serve` **never** migrates: an uninitialized, older, newer or
   divergent database refuses with `preloop store migrate` in the message. A
   legacy store (`PRAGMA user_version` 11 / `schema_migrations`, or the
   Postgres `public` legacy tables) refuses with
   `preloop store import-legacy --source <old> --target <new>`.
-- Brand-new local installs stay zero-config: `preloop run`, `preloop init`
-  (foreground) and `preloop server install` initialize an absent SQLite store
-  through the same embedded migrations (a system install runs that step as
-  the service account, after the state tree is handed over to it). An
-  existing store is never touched by those paths — upgrading is always the
-  explicit `store migrate`.
+- Some local setup/start paths initialize a missing SQLite store through the
+  embedded migration set. Do not rely on every service-install or foreground
+  mode to do this: `preloop serve` does not migrate. Provision and upgrade
+  stores explicitly with `preloop store migrate`; existing stores are not
+  upgraded implicitly.
 
 ## CI
 

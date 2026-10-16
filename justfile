@@ -91,10 +91,10 @@ supply-chain:
 #lint (ast-grep structural rules)
 
 sg-scan:
-    sg scan
+    ast-grep scan
 
 sg-scan-strict:
-    sg scan --error
+    ast-grep scan --error
 
 #dogfood (e2e against preloop with real runner) 
 

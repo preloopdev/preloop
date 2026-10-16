@@ -434,8 +434,26 @@ proxy. Do **not** point it directly at Preloop: Funnel would publish the
 unauthenticated runner-registration surface described in §6. Put a
 path-filtering proxy in front and publish only the webhook path.
 
+Keep Preloop on loopback and place a path-filtering proxy on a separate local
+port. For example, Caddy can forward only the webhook path to Preloop:
+
+```caddy
+# /etc/caddy/Caddyfile
+127.0.0.1:8080 {
+    @webhook path /api/v1/github/webhooks
+    handle @webhook {
+        reverse_proxy 127.0.0.1:9090
+    }
+    handle {
+        respond 404
+    }
+}
+```
+
+Expose only that proxy port through Funnel, not the engine listener:
+
 ```sh
-tailscale funnel --bg 9090
+tailscale funnel --bg 8080
 PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
 ```
 

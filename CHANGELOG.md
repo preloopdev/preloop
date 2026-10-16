@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
+  the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
+  release digest and GitHub artifact attestation. Pin a release with
+  `mise use -g github:preloopdev/preloop@<version>`. See the
+  [Quick start](README.md#quick-start).
+
+- **Dev tools pinned in `mise.toml`.** `mise install` provides zig, cargo-zigbuild,
+  ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
+  cargo-zigbuild match `release-runner.yml`.
+
 ### Changed
 
 - **The file credential store is the default.** The engine token, GitHub App
@@ -77,6 +89,11 @@ Releases before v0.27.0 predate the changelog.
   `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
   false and label-gated workflows never saw their labels.
 
+- **Partial merged job logs no longer hide step logs**: a failed temporary
+  log-file flush no longer produces an apparently complete but truncated
+  merged upload, and the logs endpoint falls back to the larger per-step
+  representation when one exists. This preserves mutation and other
+  heavy-step output after guest temporary-storage pressure.
 
 ## [0.34.4] - 2026-10-13
 
@@ -154,6 +171,28 @@ Releases before v0.27.0 predate the changelog.
   stops claiming while a half-open probe is in flight. A failed delivery is
   parked without spending an attempt only when GitHub is down or its own
   credential bucket is throttled, not whenever any bucket is.
+
+- **Pull-request runs read their workflows from the merge they check out**: a
+  webhook `pull_request` run on a merge preloop built itself took its workflow
+  files from the pull request head, so a workflow the base branch had changed
+  (and the head had not) ran its older copy, while GitHub's own `pull_request`
+  run executes the merge's copy. The files now come from that merge commit in
+  the engine's mirror; only a failed mirror read falls back to the head's copies,
+  with a warning. Check runs still report on the pull request head.
+
+- **A webhook worker is no longer parked for the whole merge poll under load**:
+  a pull-request delivery that waited for GitHub's test merge held its worker for
+  up to the 30-second budget, and every superseded head polled to the full
+  budget, so a burst of pushes (fork pull requests included) could occupy all
+  `PRELOOP_WEBHOOK_WORKERS` and stall every other webhook. At most a quarter of
+  the workers (and at least one) may probe GitHub's merge state at once, and at
+  most that many may wait between probes. A probe waits up to two seconds for a
+  permit; a delivery whose GitHub merge is already available still uses it once
+  it gets one, and otherwise builds the engine's merge, as the budget-expiry
+  fallback does. A delivery that finds no wait slot builds it at once. Each
+  permit and slot is released when its probe or wait ends, including on failure
+  or cancellation.
+
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`

@@ -885,6 +885,15 @@ pub struct AppState {
     /// State rather than constants so tests drive the poll without sleeping
     /// through the production budget.
     pub fresh_merge_poll: crate::github::FreshMergePoll,
+    /// Concurrent-wait slots for [`crate::github::FreshMergePoll`]: how many
+    /// webhook deliveries may park on GitHub's test merge at once (see
+    /// [`crate::github::fresh_merge_poll_capacity`]). Shared by every clone of
+    /// the state, so the bound holds across the whole worker pool.
+    pub fresh_merge_poll_slots: Arc<tokio::sync::Semaphore>,
+    /// Concurrent-probe permits for [`crate::github::FreshMergePoll`]: how many
+    /// merge-state probes may be in flight at once across the worker pool (see
+    /// [`crate::github::fresh_merge_poll_capacity`]).
+    pub fresh_merge_probe_permits: Arc<tokio::sync::Semaphore>,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -1666,6 +1675,12 @@ impl AppState {
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             fresh_merge_poll: crate::github::FreshMergePoll::default(),
+            fresh_merge_poll_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::github::fresh_merge_poll_capacity(),
+            )),
+            fresh_merge_probe_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::github::fresh_merge_poll_capacity(),
+            )),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),

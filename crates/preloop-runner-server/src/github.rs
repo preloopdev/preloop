@@ -1839,6 +1839,127 @@ pub async fn fetch_workflows(
     fetch_workflows_at(shared, repo, git_ref, &api_base).await
 }
 
+/// The workflow files `git_ref` holds under `.github/workflows`, read with `git`
+/// from the repository at `repo_dir`: a local worktree, or the engine's mirror
+/// that holds a self-built merge.
+async fn workflows_at_git_ref(
+    repo_dir: &std::path::Path,
+    git_ref: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    if git_ref.starts_with('-') {
+        anyhow::bail!("workflow revision {git_ref:?} is not a valid Git ref");
+    }
+    let commitish = format!("{git_ref}^{{commit}}");
+    let resolved = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["rev-parse", "--verify", &commitish])
+        .output()
+        .await?;
+    if !resolved.status.success() {
+        anyhow::bail!(
+            "workflow revision {git_ref:?} is unavailable in {}: {}",
+            repo_dir.display(),
+            String::from_utf8_lossy(&resolved.stderr),
+        );
+    }
+    let listing = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            git_ref,
+            "--",
+            ".github/workflows",
+        ])
+        .output()
+        .await?;
+    if !listing.status.success() {
+        anyhow::bail!(
+            "git ls-tree for ref {git_ref:?} in {} failed: {}",
+            repo_dir.display(),
+            String::from_utf8_lossy(&listing.stderr),
+        );
+    }
+    let mut workflows = BTreeMap::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if name.ends_with(".yml") || name.ends_with(".yaml") {
+            let path_ref = format!("{git_ref}:{path}");
+            let content = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_dir)
+                .args(["show", &path_ref])
+                .output()
+                .await?;
+            if !content.status.success() {
+                anyhow::bail!(
+                    "git show {path_ref:?} in {} failed: {}",
+                    repo_dir.display(),
+                    String::from_utf8_lossy(&content.stderr),
+                );
+            }
+            workflows.insert(
+                name.to_owned(),
+                String::from_utf8_lossy(&content.stdout).into_owned(),
+            );
+        }
+    }
+    Ok(workflows)
+}
+
+/// The workflows of a self-built pull-request merge, read from the merge commit
+/// in the engine's mirror where it was built. GitHub has no copy of that commit,
+/// and its own `pull_request` runs read their workflows from the merge, so this
+/// is the workflow set the run executes.
+async fn fetch_merge_workflows(
+    shared: &Arc<SharedState>,
+    merge: &PrebuiltMerge,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mirror = shared.state.state_dir.join(&merge.mirror_repository);
+    workflows_at_git_ref(&mirror, &merge.sha).await
+}
+
+/// The workflows one effective event's runs are submitted from.
+///
+/// A pull-request run on an engine-built merge takes its workflows from that
+/// merge, the tree it checks out. Only a failed mirror read falls back to the
+/// pull request head's workflows, with a warning.
+async fn event_workflows(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    effective: &EffectiveEvent,
+    engine_built_merge: Option<&PrebuiltMerge>,
+    resolved_sha: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    match (engine_built_merge, is_pull_request_run_event(effective)) {
+        (Some(merge), true) => match fetch_merge_workflows(shared, merge).await {
+            Ok(workflows) => Ok(workflows),
+            Err(error) => {
+                let head = effective
+                    .status_check_sha
+                    .as_deref()
+                    .unwrap_or(resolved_sha);
+                warn!(
+                    repository = %repo,
+                    merge = %merge.sha,
+                    head = %head,
+                    ?error,
+                    "could not read the workflows at the engine-built merge; using the pull request head's"
+                );
+                fetch_workflows(shared, repo, head).await
+            }
+        },
+        _ => fetch_workflows(shared, repo, resolved_sha).await,
+    }
+}
+
 pub async fn fetch_workflows_at(
     shared: &Arc<SharedState>,
     repo: &str,
@@ -1846,76 +1967,12 @@ pub async fn fetch_workflows_at(
     api_base: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     if let Some(base_path) = &shared.state.local_workspace {
-        let mut workflows = BTreeMap::new();
         // A dispatch for a branch other than the checked-out tree must read
         // the workflow definitions from that ref, not from the working tree.
         if !git_ref.is_empty() {
-            if git_ref.starts_with('-') {
-                anyhow::bail!("workflow revision {git_ref:?} is not a valid Git ref");
-            }
-            let commitish = format!("{git_ref}^{{commit}}");
-            let resolved = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(base_path)
-                .args(["rev-parse", "--verify", &commitish])
-                .output()
-                .await?;
-            if !resolved.status.success() {
-                anyhow::bail!(
-                    "workflow revision {git_ref:?} is unavailable in local workspace {}: {}",
-                    base_path.display(),
-                    String::from_utf8_lossy(&resolved.stderr),
-                );
-            }
-            let listing = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(base_path)
-                .args([
-                    "ls-tree",
-                    "-r",
-                    "--name-only",
-                    git_ref,
-                    "--",
-                    ".github/workflows",
-                ])
-                .output()
-                .await?;
-            if !listing.status.success() {
-                anyhow::bail!(
-                    "git ls-tree for ref {git_ref:?} in {} failed: {}",
-                    base_path.display(),
-                    String::from_utf8_lossy(&listing.stderr),
-                );
-            }
-            for line in String::from_utf8_lossy(&listing.stdout).lines() {
-                let path = line.trim();
-                if path.is_empty() {
-                    continue;
-                }
-                let name = path.rsplit('/').next().unwrap_or(path);
-                if name.ends_with(".yml") || name.ends_with(".yaml") {
-                    let path_ref = format!("{git_ref}:{path}");
-                    let content = tokio::process::Command::new("git")
-                        .arg("-C")
-                        .arg(base_path)
-                        .args(["show", &path_ref])
-                        .output()
-                        .await?;
-                    if !content.status.success() {
-                        anyhow::bail!(
-                            "git show {path_ref:?} in {} failed: {}",
-                            base_path.display(),
-                            String::from_utf8_lossy(&content.stderr),
-                        );
-                    }
-                    workflows.insert(
-                        name.to_owned(),
-                        String::from_utf8_lossy(&content.stdout).into_owned(),
-                    );
-                }
-            }
-            return Ok(workflows);
+            return workflows_at_git_ref(base_path, git_ref).await;
         }
+        let mut workflows = BTreeMap::new();
         let workflows_dir = base_path.join(".github/workflows");
         if workflows_dir.exists() {
             let mut dir = tokio::fs::read_dir(workflows_dir).await?;
@@ -2374,12 +2431,12 @@ enum FreshMergePlacement {
     /// not run on pull_request activity for a conflicted pull request, so
     /// this delivery creates no pull_request runs.
     Conflict,
-    /// GitHub's own test merge was out of reach (head race, probe failure, or
-    /// the poll budget ran out). The runs check out `refs/pull/{n}/merge` at
-    /// a merge this engine built from the current base tip and the payload
-    /// head, served from the engine's mirror — GitHub does not have the
-    /// commit. Never the bare `refs/pull/{n}/head`: a run there tests a tree
-    /// the pull request does not have.
+    /// GitHub's own test merge was out of reach (head race, probe failure, the
+    /// poll budget ran out, or no probe permit or poll slot came free). The runs check out
+    /// `refs/pull/{n}/merge` at a merge this engine built from the current base
+    /// tip and the payload head, served from the engine's mirror — GitHub does
+    /// not have the commit. Never the bare `refs/pull/{n}/head`: a run there
+    /// tests a tree the pull request does not have.
     SelfMerge(Box<PrebuiltMerge>),
 }
 
@@ -2776,23 +2833,76 @@ impl FreshMergeFailure {
 
 /// Resolve where this delivery's pull-request runs check out.
 ///
-/// The first probe runs immediately, then re-probes every
-/// [`FreshMergePoll::poll_interval`] until the budget is spent — a bounded
-/// wait (tens of seconds) that stays inside the delivery's lease and is
-/// aborted with the processing task if the lease is lost. Every path that
-/// cannot use GitHub's merge ends at the engine's own merge of the current
-/// base tip and the payload head — never at the bare `refs/pull/{n}/head`,
-/// which is not the pull request's tree. `Err` means no placement could be
-/// produced at all; the delivery is retried or dead-lettered.
+/// Every probe of GitHub's merge state takes one of the node's probe permits
+/// ([`take_probe_permit`]), so a bounded number of webhook workers can be inside
+/// GitHub's API at once. A merge GitHub already offers is used as soon as a
+/// probe sees it. A delivery that must wait takes one of the node's poll slots
+/// ([`fresh_merge_poll_capacity`]) and re-probes every
+/// [`FreshMergePoll::poll_interval`] until the budget is spent. Waiting parks a
+/// webhook worker for the whole budget, so a delivery that cannot get a slot
+/// stops waiting and builds its own merge at once. Every path that cannot use
+/// GitHub's merge ends at the engine's own merge of the current base tip and
+/// the payload head — never at the bare `refs/pull/{n}/head`, which is not the
+/// pull request's tree. `Err` means no placement could be produced at all; the
+/// delivery is retried or dead-lettered.
 async fn resolve_fresh_merge(
     shared: &Arc<SharedState>,
     target: &FreshMergeTarget,
 ) -> Result<FreshMergePlacement, FreshMergeFailure> {
+    match poll_fresh_merge(shared, target).await {
+        Some(placement) => Ok(placement),
+        None => self_merge(shared, target).await,
+    }
+}
+
+/// How long a delivery waits for one of the node's probe permits before it
+/// gives up on GitHub's merge state and builds its own merge.
+const FRESH_MERGE_PROBE_WAIT: Duration = Duration::from_secs(2);
+
+/// Take one of the node's probe permits for a single merge-state probe.
+///
+/// A probe can take as long as the client's own timeout, and it runs on a
+/// webhook worker. Without this bound, slow GitHub answers could hold every
+/// worker inside the API. `None` when no permit came free within
+/// [`FRESH_MERGE_PROBE_WAIT`].
+async fn take_probe_permit(shared: &Arc<SharedState>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permits = shared.state.fresh_merge_probe_permits.clone();
+    match tokio::time::timeout(FRESH_MERGE_PROBE_WAIT, permits.acquire_owned()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // The wait ran out, or the semaphore closed (it never is).
+        _ => None,
+    }
+}
+
+/// Poll GitHub's merge state for `target` until it answers or the budget ends.
+///
+/// `None` means GitHub's merge cannot be used, and the caller builds the merge
+/// itself: the merge state is unavailable, the budget ran out, or no probe
+/// permit or poll slot came free. Both are RAII permits: each probe holds its
+/// permit only while it runs, and the poll slot is held across the whole wait.
+/// Every exit drops them, including the processing task being aborted when the
+/// delivery's lease is lost, so neither can leak.
+async fn poll_fresh_merge(
+    shared: &Arc<SharedState>,
+    target: &FreshMergeTarget,
+) -> Option<FreshMergePlacement> {
     let poll = &shared.state.fresh_merge_poll;
     let deadline = Instant::now() + poll.budget;
+    let mut slot = None;
     loop {
-        match probe_fresh_merge(shared, target).await {
-            MergeProbe::Resolved(placement) => return Ok(placement),
+        let probe = {
+            let Some(_permit) = take_probe_permit(shared).await else {
+                info!(
+                    repository = %target.repo,
+                    pull_request = target.number,
+                    "every merge-state probe permit is busy; building the test merge ourselves"
+                );
+                return None;
+            };
+            probe_fresh_merge(shared, target).await
+        };
+        match probe {
+            MergeProbe::Resolved(placement) => return Some(placement),
             MergeProbe::Unavailable(reason) => {
                 warn!(
                     repository = %target.repo,
@@ -2800,7 +2910,7 @@ async fn resolve_fresh_merge(
                     reason = %reason,
                     "pull request merge state is unavailable; building the test merge ourselves"
                 );
-                return self_merge(shared, target).await;
+                return None;
             }
             MergeProbe::Waiting(reason) => {
                 debug!(
@@ -2815,6 +2925,24 @@ async fn resolve_fresh_merge(
         if now >= deadline {
             break;
         }
+        if slot.is_none() {
+            match shared
+                .state
+                .fresh_merge_poll_slots
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(permit) => slot = Some(permit),
+                Err(_) => {
+                    info!(
+                        repository = %target.repo,
+                        pull_request = target.number,
+                        "every merge-state poll slot is busy; building the test merge ourselves"
+                    );
+                    return None;
+                }
+            }
+        }
         tokio::time::sleep(poll.poll_interval.min(deadline - now)).await;
     }
     warn!(
@@ -2824,7 +2952,7 @@ async fn resolve_fresh_merge(
         "GitHub did not surface the pull request's test merge within the budget; \
          building the test merge ourselves"
     );
-    self_merge(shared, target).await
+    None
 }
 
 /// Build this engine's own test merge of the payload head into the current
@@ -2997,6 +3125,111 @@ async fn freshen_pull_request_events(
         placement,
         target.number,
     ))
+}
+
+/// Whether a pull-request delivery's head commit carries a `[skip ci]` label.
+///
+/// The pull-request webhook payload carries only `head.sha`, never the commit
+/// message, so the head commit must be fetched here — this gate lives in the
+/// async dispatcher, not the pure `project()` adapters (which cannot make
+/// network calls).
+///
+/// Fork PRs are never eligible: a fork's commit message is attacker-controlled,
+/// so untrusted code must not be able to opt itself out of scrutiny. Every
+/// failure to read the commit (auth, network, missing data) fails open and
+/// runs CI; skipping is never inferred from an error.
+async fn pr_head_commit_skips_ci(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    payload: &Value,
+    api_base: &str,
+) -> bool {
+    let pr_head = payload.get("pull_request").and_then(|pr| pr.get("head"));
+
+    // Fork PRs always run. `head.repo.fork` missing fails closed to fork.
+    let is_fork = pr_head
+        .and_then(|head| head.get("repo"))
+        .and_then(|repo| repo.get("fork"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if is_fork {
+        return false;
+    }
+
+    let Some(head_sha) = pr_head
+        .and_then(|head| head.get("sha"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+
+    let (token, bucket) = match crate::github_app::select_app_for_repo(shared, repo).await {
+        Some(app) => {
+            let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+            match crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await
+            {
+                Ok(token) => {
+                    let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                        Ok(installation) if installation != 0 => {
+                            crate::github_breaker::GithubCredentialBucket::Installation(
+                                installation,
+                            )
+                        }
+                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                    };
+                    (Some(token), bucket)
+                }
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "failed to mint token for [skip ci] check; running CI"
+                    );
+                    return false;
+                }
+            }
+        }
+        None => (
+            std::env::var("PRELOOP_GITHUB_TOKEN").ok(),
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        ),
+    };
+    let Some(token) = token else {
+        return false;
+    };
+
+    let response = match crate::github_breaker::send_observed(
+        &shared.state.github_breakers,
+        bucket,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!("{api_base}/repos/{repo}/commits/{head_sha}"))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(
+                ?error,
+                "failed to fetch PR head commit for [skip ci] check; running CI"
+            );
+            return false;
+        }
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(commit) = response.json::<Value>().await else {
+        return false;
+    };
+
+    commit
+        .get("commit")
+        .and_then(|c| c.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(crate::events::has_skip_label)
 }
 
 const WEBHOOK_ACK_BUDGET: Duration = Duration::from_secs(8);
@@ -3815,6 +4048,15 @@ fn webhook_workers() -> usize {
         .max(1)
 }
 
+/// Deliveries that may wait on GitHub's test merge at once, and merge-state
+/// probes that may be in flight at once, per node: a quarter of the webhook
+/// workers, and at least one. A waiting delivery holds its worker for up to the
+/// whole poll budget, so most workers stay free for every other delivery; the
+/// rest build the engine's own merge without waiting.
+pub fn fresh_merge_poll_capacity() -> usize {
+    (webhook_workers() / 4).max(1)
+}
+
 /// Drain pending webhook deliveries (oldest received first) with
 /// [`webhook_workers`] concurrent claim loops.
 pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
@@ -4423,6 +4665,22 @@ async fn process_delivery_payload_with_lease(
         }
     };
 
+    // [skip ci] on an internal PR's head commit suppresses the whole delivery
+    // (both the pull_request_target and pull_request fan-out). Fork PRs are
+    // never eligible — untrusted code cannot opt itself out of scrutiny. This
+    // runs before the changed-files lookup so a skipped PR burns no API call.
+    if matches!(
+        delivery.event.as_str(),
+        "pull_request" | "pull_request_target"
+    ) {
+        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
+            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, &api_base).await {
+            info!("[skip ci] on internal pull-request head commit — suppressing delivery");
+            return WebhookOutcome::Success;
+        }
+    }
+
     let (changed_paths, changed_paths_known) = if matches!(
         delivery.event.as_str(),
         "pull_request" | "pull_request_target" | "pull_request_review"
@@ -4539,23 +4797,21 @@ async fn process_delivery_payload_with_lease(
             },
         };
 
-        // A self-built merge does not exist on GitHub, so its workflow
-        // inventory is read at the pull request's head commit — the tree
-        // whose workflows a run on the merge executes.
-        let inventory_sha = match (&engine_built_merge, is_pull_request_run_event(effective)) {
-            (Some(_), true) => effective
-                .status_check_sha
-                .clone()
-                .unwrap_or_else(|| resolved_sha.clone()),
-            _ => resolved_sha.clone(),
-        };
-
-        let workflows = match fetch_workflows(shared, &repo_full_name, &inventory_sha).await {
+        // The workflows are those at the commit the run checks out; see `event_workflows`.
+        let workflows = match event_workflows(
+            shared,
+            &repo_full_name,
+            effective,
+            engine_built_merge.as_ref(),
+            &resolved_sha,
+        )
+        .await
+        {
             Ok(w) => w,
             Err(error) => {
                 error!(
                     event = %effective.event,
-                    sha = %inventory_sha,
+                    sha = %resolved_sha,
                     source_ref = %workflow_ref,
                     ?error,
                     "Failed to fetch workflows at the event commit"
@@ -5422,8 +5678,7 @@ mod tests {
     /// previous head's test merge — exactly what the payload still carries on
     /// `synchronize`; `current_merge` is the live merge of `head` into the
     /// current base tip, and `current_base` is that first parent. All four
-    /// values are real commits so the local-workspace workflow inventory can
-    /// read them.
+    /// values are real commits, so the local workspace can resolve each of them.
     fn build_pull_request_graph(ws_dir: &std::path::Path) -> (String, String, String, String) {
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -6703,6 +6958,629 @@ mod tests {
             }),
             "a policy-skipped fork delivery must not probe the merge state at all: {probes:?}"
         );
+    }
+
+    /// One-workflow file whose only step echoes `marker`, so a test can tell
+    /// which revision of the file a run executed.
+    fn marked_pull_request_workflow(marker: &str) -> String {
+        format!(
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo {marker}\n"
+        )
+    }
+
+    /// A pull-request graph in which the base changed `.github/workflows/ci.yml`
+    /// after the pull request branched, and the head never touched that file.
+    /// Returns the head sha. Once the fixture commits the workspace, the base
+    /// tip is `main`.
+    fn build_base_advanced_workflow_graph(ws_dir: &std::path::Path) -> String {
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/ci.yml"),
+            marked_pull_request_workflow("head-version"),
+        )
+        .unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "github-tests@example.invalid"][..],
+            &["config", "user.name", "GitHub Tests"][..],
+        ] {
+            git_output(ws_dir, args);
+        }
+        git_output(ws_dir, &["add", "-A"]);
+        git_output(ws_dir, &["commit", "-qm", "base"]);
+        git_output(ws_dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(ws_dir.join("feature.txt"), "feature\n").unwrap();
+        git_output(ws_dir, &["add", "-A"]);
+        git_output(ws_dir, &["commit", "-qm", "head"]);
+        let head = git_output(ws_dir, &["rev-parse", "HEAD"]);
+        git_output(ws_dir, &["checkout", "-q", "main"]);
+        std::fs::write(
+            ws_dir.join(".github/workflows/ci.yml"),
+            marked_pull_request_workflow("merge-version"),
+        )
+        .unwrap();
+        git_output(ws_dir, &["add", "-A"]);
+        git_output(ws_dir, &["commit", "-qm", "base advances the workflow"]);
+        // `WebhookFixture` commits the workspace itself; leave it something to commit.
+        std::fs::write(ws_dir.join(".fixture-marker"), "marker\n").unwrap();
+        head
+    }
+
+    /// A self-built merge runs the workflow revision at that merge. The base
+    /// changed a workflow file the head never touched; GitHub's own
+    /// `pull_request` run would execute the base's copy, so the engine's run
+    /// must too, not the head's older one.
+    #[tokio::test]
+    async fn self_built_merge_runs_the_workflow_revision_at_the_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        let head = build_base_advanced_workflow_graph(&ws_dir);
+
+        // GitHub never offers a merge for this head, so the engine builds its own.
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        // The fixture commits the workspace, so the base tip is read after it.
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &"1".repeat(40), &base_tip);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-base-workflow", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1, "exactly the pull_request run");
+        let run = inner.runs.values().next().unwrap();
+        assert!(
+            run.submission.workflow_yaml.contains("merge-version"),
+            "the run must execute the workflow revision at the merge, got:\n{}",
+            run.submission.workflow_yaml
+        );
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+    }
+
+    /// When the engine's mirror cannot serve the merge's workflows, they come
+    /// from the pull request head instead, so the delivery is not lost.
+    #[tokio::test]
+    async fn unreadable_merge_mirror_falls_back_to_the_head_workflows() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        let head = build_base_advanced_workflow_graph(&ws_dir);
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let shared = Arc::new(SharedState {
+            state: fixture.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let merge = PrebuiltMerge {
+            sha: "2".repeat(40),
+            tree: "3".repeat(40),
+            base_sha: "4".repeat(40),
+            head_sha: head.clone(),
+            repository: "owner/repo".to_owned(),
+            // Never created, so the merge cannot be read from this mirror.
+            mirror_repository: "checkout-cache/repositories/missing.git".to_owned(),
+            pull_request_number: Some(42),
+        };
+        let effective = EffectiveEvent {
+            event: "pull_request".to_owned(),
+            git_ref: "refs/pull/42/merge".to_owned(),
+            sha: Some(merge.sha.clone()),
+            status_check_sha: Some(head.clone()),
+            activity_type: Some("synchronize".to_owned()),
+            trust_tier: None,
+            skip: false,
+            payload: Value::Null,
+            upstream_workflow_names: Vec::new(),
+        };
+
+        let workflows =
+            event_workflows(&shared, "owner/repo", &effective, Some(&merge), &merge.sha)
+                .await
+                .unwrap();
+        let ci = workflows
+            .get("ci.yml")
+            .expect("ci.yml at the pull request head");
+        assert!(
+            ci.contains("head-version"),
+            "a failed mirror read must fall back to the head's workflows, got:\n{ci}"
+        );
+    }
+
+    /// Engine state for driving [`poll_fresh_merge`] directly: a poll schedule
+    /// and the environment's stubbed API, with no repository or merge needed.
+    async fn poll_only_shared(temp: &tempfile::TempDir, budget: Duration) -> Arc<SharedState> {
+        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        state.fresh_merge_poll = FreshMergePoll {
+            budget,
+            poll_interval: Duration::from_millis(20),
+        };
+        // Some probes here fail on purpose; keep the breaker out of the way.
+        state.github_breakers = Arc::new(crate::github_breaker::GithubBreakerRegistry::new(
+            crate::github_breaker::BreakerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        ));
+        Arc::new(SharedState {
+            state,
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    /// The poll target for the pull request at `head`.
+    fn poll_target(head: &str) -> FreshMergeTarget {
+        FreshMergeTarget {
+            repo: "owner/repo".to_owned(),
+            number: 42,
+            head: head.to_owned(),
+            base_branch: "main".to_owned(),
+        }
+    }
+
+    /// With every poll slot held by other deliveries, a delivery whose GitHub
+    /// merge is not ready does not park a webhook worker for the poll budget:
+    /// it builds the engine's own merge at once, and the held slots stay held.
+    #[tokio::test]
+    async fn saturated_poll_slots_build_the_merge_without_waiting_for_the_budget() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = pr_workspace(
+            &temp,
+            "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        );
+        let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
+
+        // GitHub's merge is never ready for this head.
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let api_head = head.clone();
+        let api_base = current_base.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": api_base.clone() },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let budget = Duration::from_secs(10);
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget,
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        // Other deliveries hold every poll slot.
+        let slots = fixture.state.fresh_merge_poll_slots.clone();
+        let total = slots.available_permits();
+        let held: Vec<_> = (0..total)
+            .map(|_| slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(slots.available_permits(), 0);
+
+        let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-saturated", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
+            "a delivery that cannot take a poll slot must not poll"
+        );
+
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1, "exactly the pull_request run");
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(run.submission.git_ref, "refs/pull/42/merge");
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the held slots stay held by their owners"
+        );
+        drop(held);
+        assert_eq!(slots.available_permits(), total);
+    }
+
+    /// A poll that resolves to GitHub's merge gives its slot back.
+    #[tokio::test]
+    async fn poll_slot_is_released_once_github_offers_the_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let (head, base, merge) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let commits_path = format!("/repos/owner/repo/commits/{merge}");
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let (api_head, api_base, api_merge) = (head.clone(), base.clone(), merge.clone());
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                // Not computed on the first probe; offered on the second.
+                let first = polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                let answer = if first {
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": api_base.clone() },
+                    })
+                } else {
+                    serde_json::json!({
+                        "mergeable": true,
+                        "merge_commit_sha": api_merge.clone(),
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": api_base.clone() },
+                    })
+                };
+                return (200, vec![], answer);
+            }
+            if path == commits_path.as_str() {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "sha": api_merge.clone(),
+                        "parents": [{ "sha": api_base.clone() }, { "sha": api_head.clone() }],
+                    }),
+                );
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
+        let slots = shared.state.fresh_merge_poll_slots.clone();
+        let total = slots.available_permits();
+        match poll_fresh_merge(&shared, &poll_target(&head)).await {
+            Some(FreshMergePlacement::Merge(sha)) => assert_eq!(sha, merge),
+            other => panic!("GitHub's merge must be used once offered, got {other:?}"),
+        }
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            slots.available_permits(),
+            total,
+            "a poll that resolves releases its slot"
+        );
+    }
+
+    /// A poll whose probe turns fatal after waiting gives its slot back.
+    #[tokio::test]
+    async fn poll_slot_is_released_when_the_probe_turns_fatal() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let head = "a".repeat(40);
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return match polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => (
+                        200,
+                        vec![],
+                        serde_json::json!({
+                            "mergeable": null,
+                            "merge_commit_sha": null,
+                            "head": { "sha": api_head.clone() },
+                            "base": { "sha": null },
+                        }),
+                    ),
+                    _ => (403, vec![], serde_json::json!({ "message": "forbidden" })),
+                };
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
+        let slots = shared.state.fresh_merge_poll_slots.clone();
+        let total = slots.available_permits();
+        assert!(
+            poll_fresh_merge(&shared, &poll_target(&head))
+                .await
+                .is_none(),
+            "an unavailable merge state is not waited out"
+        );
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            slots.available_permits(),
+            total,
+            "the slot is released when the poll fails"
+        );
+    }
+
+    /// A poll that runs out of budget gives its slot back too.
+    #[tokio::test]
+    async fn poll_slot_is_released_when_the_budget_runs_out() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let head = "a".repeat(40);
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (500, vec![], serde_json::json!({ "message": "boom" }));
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        // Leave wall time for the stub request when nextest is CPU-contended;
+        // the 20ms poll interval still exercises the retry budget.
+        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
+        let slots = shared.state.fresh_merge_poll_slots.clone();
+        let total = slots.available_permits();
+        assert!(
+            poll_fresh_merge(&shared, &poll_target(&head))
+                .await
+                .is_none()
+        );
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "the probe is retried within the budget"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            total,
+            "the slot is released when the budget runs out"
+        );
+    }
+
+    /// Cancelling a waiting delivery (its processing task aborted when the
+    /// lease is lost) drops the slot it holds.
+    #[tokio::test]
+    async fn poll_slot_is_released_when_the_waiting_delivery_is_cancelled() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let head = "a".repeat(40);
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let shared = poll_only_shared(&temp, Duration::from_secs(30)).await;
+        let slots = shared.state.fresh_merge_poll_slots.clone();
+        let total = slots.available_permits();
+        let target = poll_target(&head);
+        let waiting = tokio::spawn({
+            let shared = shared.clone();
+            async move { poll_fresh_merge(&shared, &target).await }
+        });
+        for _ in 0..500 {
+            if polls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            polls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the delivery must be polling before it is cancelled"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            total - 1,
+            "a waiting delivery holds one slot"
+        );
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            slots.available_permits(),
+            total,
+            "cancelling the wait releases the slot"
+        );
+    }
+
+    /// However many deliveries poll at once, merge-state probes in flight never
+    /// exceed the node's probe capacity, and every probe permit comes back. The
+    /// stub answers slowly so probes overlap, and it counts how many run at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merge_state_probes_in_flight_stay_within_the_probe_capacity() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (in_flight_for_stub, peak_for_stub) = (in_flight, peak.clone());
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                let now = in_flight_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak_for_stub.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                in_flight_for_stub.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": "a".repeat(40) },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let shared = poll_only_shared(&temp, Duration::from_millis(600)).await;
+        let permits = shared.state.fresh_merge_probe_permits.clone();
+        let total = permits.available_permits();
+        let head = "a".repeat(40);
+        let polls: Vec<_> = (0..fresh_merge_poll_capacity() * 4)
+            .map(|_| {
+                let shared = shared.clone();
+                let target = poll_target(&head);
+                tokio::spawn(async move { poll_fresh_merge(&shared, &target).await })
+            })
+            .collect();
+        for poll in polls {
+            poll.await.unwrap();
+        }
+
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak >= 1, "the polls must reach GitHub");
+        assert!(
+            peak <= fresh_merge_poll_capacity(),
+            "{peak} merge-state probes were in flight at once"
+        );
+        assert_eq!(
+            permits.available_permits(),
+            total,
+            "every probe permit is returned"
+        );
+    }
+
+    /// With every probe permit held by other probes, a delivery does not ask
+    /// GitHub at all. It gives up after the probe wait, well inside the budget,
+    /// and builds its own merge.
+    #[tokio::test]
+    async fn saturated_probe_permits_skip_the_probe_and_build_the_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": "a".repeat(40) },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let budget = Duration::from_secs(10);
+        let shared = poll_only_shared(&temp, budget).await;
+        let permits = shared.state.fresh_merge_probe_permits.clone();
+        let total = permits.available_permits();
+        let held: Vec<_> = (0..total)
+            .map(|_| permits.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        let started = Instant::now();
+        let placement = poll_fresh_merge(&shared, &poll_target(&"a".repeat(40))).await;
+        assert!(
+            placement.is_none(),
+            "without a probe permit the merge is built locally"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "the delivery must give up at the probe wait, not the poll budget"
+        );
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a delivery without a probe permit must not ask GitHub"
+        );
+        drop(held);
+        assert_eq!(permits.available_permits(), total);
     }
 
     /// A delivery whose workflow inventory cannot be fetched fails internally

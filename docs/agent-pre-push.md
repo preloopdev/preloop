@@ -5,8 +5,7 @@ A coding agent can run the check jobs of a repository's own workflows with
 on the machine, and the agent reads the log or opens the failed VM instead of
 waiting for a CI run on GitHub.
 
-For people, [`contrib/pre-push`](../contrib/pre-push) gates `git push` with a
-full `preloop run` (see [CI Gate + Auto-PR](ci-gate-auto-pr.md#pre-push-hook)).
+For people, [`contrib/pre-push`](https://github.com/preloopdev/preloop/blob/main/contrib/pre-push) gates `git push` with a full `preloop run` (see [CI Gate + Auto-PR](ci-gate-auto-pr.md#pre-push-hook)).
 This page covers a narrower loop for agents: run the jobs that check code, one
 at a time, and leave out the jobs that deploy.
 

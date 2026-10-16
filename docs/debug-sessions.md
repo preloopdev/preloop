@@ -3,10 +3,11 @@
 **Status:** implemented (minimum lovable slice); core agent control API is shipped; `:verify` and VM/source agent operations remain outstanding
 **Scope:** `preloop-runner`, `preloop-dap`, `preloop-runner-server`, `preloop-orchestrator`, `preloop-cli`
 
-A failed job becomes a live debugging session. You diagnose and repair it inside
-the same microVM, then re-run only what is necessary. The expensive setup —
-checkout, toolchain, dependency install, compiler caches, prior successful steps
-— is still there and stays there.
+An opted-in failed job can become a live debugging session in the same
+microVM. The shipped slice supports attaching, inspecting steps, retrying or
+continuing, aborting, and safely detaching. Broader autonomous repair,
+persistence, and clean verification flows described below are design work,
+not shipped functionality.
 
 ---
 
@@ -40,7 +41,10 @@ follow from this, and conflating them is the primary design hazard:
 
 > Iterate dirty. Confirm clean.
 
-A repaired run is never reported as an ordinary pass. See §7.
+The current protocol has no distinct `Passed after repair` outcome or `:verify`
+command. A repaired retry can finish with the ordinary successful job outcome;
+that is not independent evidence of a clean run. For clean verification, submit
+a new run.
 
 ### How a run opts in
 
@@ -56,7 +60,7 @@ Two flags on the wire carry two different intents:
 | `preloop run --debug` | debug session; attach with `preloop debug` |
 | `preloop run --preserve-on-failure` | no pause; the VM is held for a later `preloop shell` |
 | `preloop run --detach --debug` | debug session; attach from another terminal |
-| `preloop run` (no flags) | failed jobs are cleaned up normally |
+| `preloop run` (no flags) | pauses implicitly only in the interactive SmolVM terminal flow; otherwise normal cleanup |
 | `preloop run` at a terminal, SmolVM | historical default retained: pauses; attach with `preloop debug` |
 
 Debugging is now explicit. The old terminal-attached default remains only on
@@ -332,13 +336,16 @@ produces a reviewable patch.
 
 ## 7. Provenance and verification
 
-A repaired run gets a distinct outcome. This is non-negotiable — silently
-promoting a mutated run to green destroys the signal, and it matters more once
-agents are performing repairs unattended.
+> **Planned, not shipped:** the current wire enum has no `Passed after repair`
+> outcome, and the CLI has no `:verify` command. The design below is a proposal,
+> not an available workflow. A successful retry currently ends in the ordinary
+> successful outcome; use a new run for independent verification.
+
+The proposed outcome set is:
 
 ```
 Passed
-Passed after repair     ← source and/or environment differed from run start
+Passed after repair     ← proposed: source and/or environment differed from run start
 Failed
 Aborted
 Expired
