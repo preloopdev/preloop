@@ -1363,7 +1363,9 @@ impl AppState {
         };
         #[cfg(not(any(test, feature = "test-support")))]
         let system_token = {
-            let store = crate::credential_store::store_from_env(&state_dir);
+            let configured_store = crate::config::credential_store_setting(&config_path)?;
+            let store =
+                crate::credential_store::selected_store(&token_dir, configured_store.as_deref())?;
             crate::credential_store::resolve_engine_token_with_store(
                 &token_dir,
                 configured_token,

@@ -100,7 +100,7 @@ preloop setup github --via app          # add --org NAME for an org App
 
 It serves the manifest from a single-use loopback listener, GitHub redirects
 the one-time code back to it, and the App id, private key, and webhook secret
-are stored in the operating-system credential store. `~/.preloop/config.toml`
+are stored in the engine's credential store (`~/.preloop/credentials` by default, or the operating-system keychain with `credential_store = "os"`). `~/.preloop/config.toml`
 (mode 0600) keeps only non-secret references. Add `--public-url https://…` to
 create the App with webhook delivery enabled; without it webhooks are off,
 since GitHub cannot reach `localhost`. Restart the engine to pick the

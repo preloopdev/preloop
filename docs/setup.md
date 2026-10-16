@@ -230,7 +230,8 @@ The command binds a single-use listener on loopback, opens it in your
 browser, and uses it as the manifest's redirect target. You click **Create on
 GitHub**; GitHub redirects back with a one-time code, and the CLI converts it
 into the App id, private key, and webhook secret and stores the secrets in the
-operating-system credential store. The config file retains only non-secret
+credential store (private `0600` files under `$PRELOOP_HOME/credentials` by
+default). The config file retains only non-secret
 credential references (and remains mode 0600). The browser then lands on the
 installation page, pick the repositories you run, and the CLI reports the
 installation id and exits.
@@ -285,7 +286,7 @@ preloop setup github --via app --public-url https://ci.example.com
 
 On an already-configured App, `--public-url` updates the webhook
 (`PATCH /app/hook/config`) instead of creating a second App, and stores the
-secret in the operating-system credential store so deliveries verify. GitHub
+secret in the credential store so deliveries verify. GitHub
 exposes no API for the webhook **Active**
 checkbox, so an App created without `--public-url` needs that ticked once in
 its settings.
@@ -433,31 +434,44 @@ not hold plaintext at rest, two options:
 
 Everything lives in `~/.preloop/config.toml` (mode 0600; `PRELOOP_CONFIG`
 overrides the path, `PRELOOP_HOME` the default directory). GitHub App keys,
-PATs, and webhook secrets are held in the operating-system credential store
-(Keychain on macOS, Credential Manager on Windows, Secret Service on Linux);
-the config file keeps only a `*_ref` name pointing at each one. Credentials
-still stored inline are migrated on the next `preloop serve`, which rewrites
-the config to reference them instead. A missing or empty file is fine
-(everything defaults); a malformed one fails startup, so a typo is caught
-before a mint or a job hits it. `preloop setup github`
-writes the `[github]` section; `preloop secret` writes the secret tables;
-`preloop init` writes the `[golden]` section and runs `setup` for the
-credentials.
+PATs, and webhook secrets are held in the engine's credential store: private
+`0600` files in `<config-parent>/credentials` by default
+(`$PRELOOP_HOME/credentials` when the config is the default
+`$PRELOOP_HOME/config.toml`). If `PRELOOP_CONFIG` points elsewhere, the
+credential directory follows it — for example,
+`PRELOOP_CONFIG=/srv/preloop/config.toml` uses `/srv/preloop/credentials`.
+Set `credential_store = "os"` to hold them in the operating-system credential
+store instead (Keychain on macOS, Credential Manager on Windows, Secret Service
+on Linux). The config file keeps only a `*_ref` name pointing at each one.
+Credentials still stored inline are migrated on the next `preloop serve`, which
+rewrites the config to reference them instead. A missing or empty file is fine
+(everything defaults); a malformed one fails startup, so a typo is caught before
+a mint or a job hits it. `preloop setup github` writes the `[github]` section;
+`preloop secret` writes the secret tables; `preloop init` writes the `[golden]`
+section and runs `setup` for the credentials.
 
-On a host with no reachable credential store — a headless Linux box without a
-Secret Service daemon, for example — startup logs a warning and falls back to
-any inline values plus the `PRELOOP_GITHUB_*` environment variables, which
-always take precedence. Nothing is migrated there, so the config is left
-exactly as written.
+With `credential_store = "os"`, a keychain that is unavailable (a headless Linux
+box without a Secret Service daemon, or an SSH session that cannot unlock it)
+or that refuses a write does not lose the credential. Preloop stores it in the
+file store instead, prints a warning naming the directory, and sets
+`credential_store = "file"` in the config. An explicit
+`PRELOOP_CREDENTIAL_STORE=os` still wins over that config key, but the selected
+OS-primary store reads the sibling file store when the OS store is unavailable,
+the read fails, or the entry is absent. A successful OS value is authoritative,
+except for a reference whose write had to fall back: that reference is marked,
+and its file copy is read even while a stale or corrupted OS entry stays
+readable. This keeps setup's file fallback readable without requiring the
+environment override to be removed.
 
 Fields:
 
 ```toml
 secrets_store = "file"      # "file" (default) | "memory" (see above)
+credential_store = "file"   # "file" (default) | "os" (keychain); PRELOOP_CREDENTIAL_STORE overrides
 
 [github]
 app_id = "123456"
-app_pem_ref = "github-app-pem-123456"   # written by setup; key lives in the OS store
+app_pem_ref = "github-app-pem-123456"   # written by setup; key lives in the credential store
 mint_failure = "pat"        # "local" | "error" | "pat"
 pat_ref = "github-pat"      # fallback under `pat` policy; `--via pat` credential
 webhook_secret_ref = "github-app-webhook-123456"  # written by `setup github --via app`
