@@ -153,16 +153,19 @@ Releases before v0.27.0 predate the changelog.
   run executes the merge's copy. The files now come from that merge commit in
   the engine's mirror; only a failed mirror read falls back to the head's copies,
   with a warning. Check runs still report on the pull request head.
+
 - **A webhook worker is no longer parked for the whole merge poll under load**:
   a pull-request delivery that waited for GitHub's test merge held its worker for
   up to the 30-second budget, and every superseded head polled to the full
   budget, so a burst of pushes (fork pull requests included) could occupy all
   `PRELOOP_WEBHOOK_WORKERS` and stall every other webhook. At most a quarter of
-  the workers (and at least one) may wait at once. A delivery whose GitHub merge
-  is already available still uses it without taking a slot; one that finds every
-  slot busy builds the engine's merge at once, as the budget-expiry fallback
-  does. A slot is released when its wait ends, including on failure or
-  cancellation.
+  the workers (and at least one) may probe GitHub's merge state at once, and at
+  most that many may wait between probes. A probe waits up to two seconds for a
+  permit; a delivery whose GitHub merge is already available still uses it once
+  it gets one, and otherwise builds the engine's merge, as the budget-expiry
+  fallback does. A delivery that finds no wait slot builds it at once. Each
+  permit and slot is released when its probe or wait ends, including on failure
+  or cancellation.
 
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment

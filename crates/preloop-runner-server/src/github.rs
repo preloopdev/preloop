@@ -2432,7 +2432,7 @@ enum FreshMergePlacement {
     /// this delivery creates no pull_request runs.
     Conflict,
     /// GitHub's own test merge was out of reach (head race, probe failure, the
-    /// poll budget ran out, or no poll slot was free). The runs check out
+    /// poll budget ran out, or no probe permit or poll slot came free). The runs check out
     /// `refs/pull/{n}/merge` at a merge this engine built from the current base
     /// tip and the payload head, served from the engine's mirror — GitHub does
     /// not have the commit. Never the bare `refs/pull/{n}/head`: a run there
@@ -2833,9 +2833,11 @@ impl FreshMergeFailure {
 
 /// Resolve where this delivery's pull-request runs check out.
 ///
-/// The first probe runs immediately and needs no slot, so GitHub's merge is
-/// used whenever it is already there. A delivery that must wait takes one of
-/// the node's poll slots ([`fresh_merge_poll_capacity`]) and re-probes every
+/// Every probe of GitHub's merge state takes one of the node's probe permits
+/// ([`take_probe_permit`]), so a bounded number of webhook workers can be inside
+/// GitHub's API at once. A merge GitHub already offers is used as soon as a
+/// probe sees it. A delivery that must wait takes one of the node's poll slots
+/// ([`fresh_merge_poll_capacity`]) and re-probes every
 /// [`FreshMergePoll::poll_interval`] until the budget is spent. Waiting parks a
 /// webhook worker for the whole budget, so a delivery that cannot get a slot
 /// stops waiting and builds its own merge at once. Every path that cannot use
@@ -2853,13 +2855,33 @@ async fn resolve_fresh_merge(
     }
 }
 
+/// How long a delivery waits for one of the node's probe permits before it
+/// gives up on GitHub's merge state and builds its own merge.
+const FRESH_MERGE_PROBE_WAIT: Duration = Duration::from_secs(2);
+
+/// Take one of the node's probe permits for a single merge-state probe.
+///
+/// A probe can take as long as the client's own timeout, and it runs on a
+/// webhook worker. Without this bound, slow GitHub answers could hold every
+/// worker inside the API. `None` when no permit came free within
+/// [`FRESH_MERGE_PROBE_WAIT`].
+async fn take_probe_permit(shared: &Arc<SharedState>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permits = shared.state.fresh_merge_probe_permits.clone();
+    match tokio::time::timeout(FRESH_MERGE_PROBE_WAIT, permits.acquire_owned()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // The wait ran out, or the semaphore closed (it never is).
+        _ => None,
+    }
+}
+
 /// Poll GitHub's merge state for `target` until it answers or the budget ends.
 ///
 /// `None` means GitHub's merge cannot be used, and the caller builds the merge
-/// itself: the merge state is unavailable, the budget ran out, or every poll
-/// slot was busy. The slot is an RAII permit held only while this delivery
-/// waits. Every exit drops it, including the processing task being aborted
-/// when the delivery's lease is lost, so a slot cannot leak.
+/// itself: the merge state is unavailable, the budget ran out, or no probe
+/// permit or poll slot came free. Both are RAII permits: each probe holds its
+/// permit only while it runs, and the poll slot is held across the whole wait.
+/// Every exit drops them, including the processing task being aborted when the
+/// delivery's lease is lost, so neither can leak.
 async fn poll_fresh_merge(
     shared: &Arc<SharedState>,
     target: &FreshMergeTarget,
@@ -2868,7 +2890,18 @@ async fn poll_fresh_merge(
     let deadline = Instant::now() + poll.budget;
     let mut slot = None;
     loop {
-        match probe_fresh_merge(shared, target).await {
+        let probe = {
+            let Some(_permit) = take_probe_permit(shared).await else {
+                info!(
+                    repository = %target.repo,
+                    pull_request = target.number,
+                    "every merge-state probe permit is busy; building the test merge ourselves"
+                );
+                return None;
+            };
+            probe_fresh_merge(shared, target).await
+        };
+        match probe {
             MergeProbe::Resolved(placement) => return Some(placement),
             MergeProbe::Unavailable(reason) => {
                 warn!(
@@ -3910,10 +3943,11 @@ fn webhook_workers() -> usize {
         .max(1)
 }
 
-/// Deliveries that may wait on GitHub's test merge at once, per node: a quarter
-/// of the webhook workers, and at least one. A waiting delivery holds its worker
-/// for up to the whole poll budget, so most workers stay free for every other
-/// delivery; the rest build the engine's own merge without waiting.
+/// Deliveries that may wait on GitHub's test merge at once, and merge-state
+/// probes that may be in flight at once, per node: a quarter of the webhook
+/// workers, and at least one. A waiting delivery holds its worker for up to the
+/// whole poll budget, so most workers stay free for every other delivery; the
+/// rest build the engine's own merge without waiting.
 pub fn fresh_merge_poll_capacity() -> usize {
     (webhook_workers() / 4).max(1)
 }
@@ -7310,6 +7344,125 @@ mod tests {
             total,
             "cancelling the wait releases the slot"
         );
+    }
+
+    /// However many deliveries poll at once, merge-state probes in flight never
+    /// exceed the node's probe capacity, and every probe permit comes back. The
+    /// stub answers slowly so probes overlap, and it counts how many run at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merge_state_probes_in_flight_stay_within_the_probe_capacity() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (in_flight_for_stub, peak_for_stub) = (in_flight, peak.clone());
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                let now = in_flight_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak_for_stub.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                in_flight_for_stub.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": "a".repeat(40) },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let shared = poll_only_shared(&temp, Duration::from_millis(600)).await;
+        let permits = shared.state.fresh_merge_probe_permits.clone();
+        let total = permits.available_permits();
+        let head = "a".repeat(40);
+        let polls: Vec<_> = (0..fresh_merge_poll_capacity() * 4)
+            .map(|_| {
+                let shared = shared.clone();
+                let target = poll_target(&head);
+                tokio::spawn(async move { poll_fresh_merge(&shared, &target).await })
+            })
+            .collect();
+        for poll in polls {
+            poll.await.unwrap();
+        }
+
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak >= 1, "the polls must reach GitHub");
+        assert!(
+            peak <= fresh_merge_poll_capacity(),
+            "{peak} merge-state probes were in flight at once"
+        );
+        assert_eq!(
+            permits.available_permits(),
+            total,
+            "every probe permit is returned"
+        );
+    }
+
+    /// With every probe permit held by other probes, a delivery does not ask
+    /// GitHub at all. It gives up after the probe wait, well inside the budget,
+    /// and builds its own merge.
+    #[tokio::test]
+    async fn saturated_probe_permits_skip_the_probe_and_build_the_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_for_stub = polls.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                polls_for_stub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": "a".repeat(40) },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let budget = Duration::from_secs(10);
+        let shared = poll_only_shared(&temp, budget).await;
+        let permits = shared.state.fresh_merge_probe_permits.clone();
+        let total = permits.available_permits();
+        let held: Vec<_> = (0..total)
+            .map(|_| permits.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        let started = Instant::now();
+        let placement = poll_fresh_merge(&shared, &poll_target(&"a".repeat(40))).await;
+        assert!(
+            placement.is_none(),
+            "without a probe permit the merge is built locally"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "the delivery must give up at the probe wait, not the poll budget"
+        );
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a delivery without a probe permit must not ask GitHub"
+        );
+        drop(held);
+        assert_eq!(permits.available_permits(), total);
     }
 
     /// A delivery whose workflow inventory cannot be fetched fails internally

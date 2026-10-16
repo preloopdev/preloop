@@ -890,6 +890,10 @@ pub struct AppState {
     /// [`crate::github::fresh_merge_poll_capacity`]). Shared by every clone of
     /// the state, so the bound holds across the whole worker pool.
     pub fresh_merge_poll_slots: Arc<tokio::sync::Semaphore>,
+    /// Concurrent-probe permits for [`crate::github::FreshMergePoll`]: how many
+    /// merge-state probes may be in flight at once across the worker pool (see
+    /// [`crate::github::fresh_merge_poll_capacity`]).
+    pub fresh_merge_probe_permits: Arc<tokio::sync::Semaphore>,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -1672,6 +1676,9 @@ impl AppState {
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             fresh_merge_poll: crate::github::FreshMergePoll::default(),
             fresh_merge_poll_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::github::fresh_merge_poll_capacity(),
+            )),
+            fresh_merge_probe_permits: Arc::new(tokio::sync::Semaphore::new(
                 crate::github::fresh_merge_poll_capacity(),
             )),
             observability: preloop_observability::Observability::noop(),
