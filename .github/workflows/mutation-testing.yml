@@ -26,6 +26,12 @@ jobs:
     timeout-minutes: 360
     env:
       CARGO_BUILD_JOBS: "4"
+      # The pg suites run against this server; each test creates (and drops)
+      # its own database on it. Without a server they bootstrap disposable
+      # clusters from initdb, and skip when they cannot — which would make
+      # every control/pg mutant survive, so make the server mandatory here.
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,6 +61,35 @@ jobs:
       # workspace build-cache entries can never hit and would only churn the
       # bucket. The cold build is a fixed per-job cost the weekly cadence
       # absorbs.
+      - name: Start PostgreSQL (container)
+        # Same pattern as control-plane.yml: the server runs in a container the
+        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
+        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
+        # clear the two-node race tests (roughly 204 connections).
+        run: |
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs postgres --tail 50 >&2 || true
+          exit 1
       - name: Install cargo-nextest
         run: |
           set -euo pipefail
@@ -139,6 +174,12 @@ jobs:
     timeout-minutes: 360
     env:
       CARGO_BUILD_JOBS: "4"
+      # The pg suites run against this server; each test creates (and drops)
+      # its own database on it. Without a server they bootstrap disposable
+      # clusters from initdb, and skip when they cannot — which would make
+      # every control/pg mutant survive, so make the server mandatory here.
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,6 +201,35 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        # Same pattern as control-plane.yml: the server runs in a container the
+        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
+        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
+        # clear the two-node race tests (roughly 204 connections).
+        run: |
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs postgres --tail 50 >&2 || true
+          exit 1
       - name: Install cargo-nextest
         run: |
           set -euo pipefail
@@ -240,6 +310,12 @@ jobs:
     timeout-minutes: 720
     env:
       CARGO_BUILD_JOBS: "4"
+      # The pg suites run against this server; each test creates (and drops)
+      # its own database on it. Without a server they bootstrap disposable
+      # clusters from initdb, and skip when they cannot — which would make
+      # every control/pg mutant survive, so make the server mandatory here.
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -261,6 +337,35 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        # Same pattern as control-plane.yml: the server runs in a container the
+        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
+        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
+        # clear the two-node race tests (roughly 204 connections).
+        run: |
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs postgres --tail 50 >&2 || true
+          exit 1
       - name: Install cargo-nextest
         run: |
           set -euo pipefail
@@ -341,6 +446,12 @@ jobs:
     timeout-minutes: 480
     env:
       CARGO_BUILD_JOBS: "4"
+      # The pg suites run against this server; each test creates (and drops)
+      # its own database on it. Without a server they bootstrap disposable
+      # clusters from initdb, and skip when they cannot — which would make
+      # every control/pg mutant survive, so make the server mandatory here.
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -362,6 +473,35 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        # Same pattern as control-plane.yml: the server runs in a container the
+        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
+        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
+        # clear the two-node race tests (roughly 204 connections).
+        run: |
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs postgres --tail 50 >&2 || true
+          exit 1
       - name: Install cargo-nextest
         run: |
           set -euo pipefail
@@ -442,6 +582,12 @@ jobs:
     timeout-minutes: 240
     env:
       CARGO_BUILD_JOBS: "4"
+      # The pg suites run against this server; each test creates (and drops)
+      # its own database on it. Without a server they bootstrap disposable
+      # clusters from initdb, and skip when they cannot — which would make
+      # every control/pg mutant survive, so make the server mandatory here.
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -463,6 +609,35 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        # Same pattern as control-plane.yml: the server runs in a container the
+        # job owns — no apt, no pgdg repo, no host cluster. Trust auth on
+        # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
+        # clear the two-node race tests (roughly 204 connections).
+        run: |
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs postgres --tail 50 >&2 || true
+          exit 1
       - name: Install cargo-nextest
         run: |
           set -euo pipefail

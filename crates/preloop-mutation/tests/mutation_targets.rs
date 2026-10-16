@@ -12,10 +12,12 @@
 //!
 //! Reports land in `mutants.out/<target>/` (`missed.txt` lists survivors).
 //!
-//! The Postgres-backed implementations under `control/pg/` are only mutated
-//! when `PRELOOP_TEST_POSTGRES_URL` points at a live database: without one the
-//! pg tests skip themselves and every pg mutant would falsely survive. With
-//! the variable set, both implementations are mutated.
+//! Both the lite and the Postgres-backed `control/pg/` implementations are
+//! mutated. The pg suites use `PRELOOP_TEST_POSTGRES_URL` when it is set (each
+//! test then creates its own database on that server) and otherwise bootstrap
+//! a disposable cluster from `initdb`; the tests refuse to run when neither is
+//! available, because a skipped pg suite would make every `control/pg` mutant
+//! survive and drown the real gaps.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,8 +38,13 @@ const SCOPED_ENV: [&str; 7] = [
     "PRELOOP_TEST_REQUIRE_POSTGRES",
 ];
 
-/// Root-anchored glob for the Postgres-only implementation files.
-const PG_FILES: &str = "crates/preloop-runner-server/src/control/pg/**";
+/// Postgres installs the pg suites can bootstrap their disposable clusters
+/// from when no `PRELOOP_TEST_POSTGRES_URL` is set.
+const INITDB_DIRS: [&str; 3] = [
+    "/Applications/Postgres.app/Contents/Versions/latest/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+];
 
 /// One mutation-testing target: a package/file scope narrowed by a regex over
 /// the mutant names that `cargo mutants --list` shows.
@@ -49,9 +56,6 @@ struct Target {
     /// Mutants to drop: process-, network- or VM-bound code that host tests
     /// cannot kill, so keeping it would only add noise to the survival rate.
     exclude_re: &'static str,
-    /// Whether the file scope reaches `control/pg/` and therefore needs the
-    /// database-gated exclusion above.
-    pg_selected: bool,
 }
 
 const T1: Target = Target {
@@ -81,7 +85,6 @@ const T1: Target = Target {
         "claim_one|claim_candidate|on_job_enqueued|clear_assignment|runner_matches|sweep_stale_bindings|requeue_claimed",
     ],
     exclude_re: "^$",
-    pg_selected: true,
 };
 
 const T2: Target = Target {
@@ -99,7 +102,6 @@ const T2: Target = Target {
         "verify_signature|decode_hex|claimed_repository|webhook_retry_backoff|handle_github_webhook|adapter_for|make_default_branch_events",
     ],
     exclude_re: "all_event_names|send_github_check_request|resolve_repo_token|resolve_check_run_token|find_existing_check_run|report_check_run_queued|report_existing_check_run_queued|ensure_check_run_mapped|drain_check_run_sender|github_api_base",
-    pg_selected: false,
 };
 
 const T3: Target = Target {
@@ -127,7 +129,6 @@ const T3: Target = Target {
         "claim_preference|job_labels_covered_exactly|pair_runner|host_runner_pool_size|on_demand_memory_cap|host_vm_capacity",
     ],
     exclude_re: "host_memory_mib|local_runner_pool_config|run_on_demand|golden_budget|wait_for_|ensure_host_externals|preload_images|ensure_golden_payload",
-    pg_selected: true,
 };
 
 const T4: Target = Target {
@@ -157,7 +158,6 @@ const T4: Target = Target {
         "build_operational_snapshot_sync|read_snapshot_inputs|sample_state_once|count_run_statuses|status_inputs|list_runners|\\bqueue_stats\\b",
     ],
     exclude_re: "run_state_sampler|publish_snapshot|collect_storage_components",
-    pg_selected: true,
 };
 
 const T5: Target = Target {
@@ -171,7 +171,6 @@ const T5: Target = Target {
         "env_flag|parse_flag|logs_query",
     ],
     exclude_re: "cmd_engine|cmd_build_golden|cmd_logs|local_runner_pool_config|fetch_run_job_logs|follow_run_logs",
-    pg_selected: false,
 };
 
 /// Job/binding lifecycle: claim gating, assignment exclusivity, stale-binding
@@ -223,6 +222,18 @@ fn run(target: &Target) {
     fs::create_dir_all(&out).expect("create mutants.out target directory");
 
     let pg_url = std::env::var("PRELOOP_TEST_POSTGRES_URL").ok();
+    let pg_required = std::env::var("PRELOOP_TEST_REQUIRE_POSTGRES").ok();
+    if pg_url.is_none() {
+        // The pg suites bootstrap disposable clusters from `initdb` when no
+        // server URL is given, and skip themselves when they cannot find it.
+        // A skipped pg suite would make every `control/pg` mutant survive and
+        // drown the real gaps, so refuse to run instead.
+        assert!(
+            initdb_available(),
+            "the pg test suites need a Postgres: set PRELOOP_TEST_POSTGRES_URL \
+             or install one (initdb must be discoverable)"
+        );
+    }
     let mut cmd = Command::new("cargo");
     cmd.args(["mutants", "--baseline", "run", "--test-tool", test_tool()])
         .args(["--exclude-re", target.exclude_re])
@@ -240,11 +251,9 @@ fn run(target: &Target) {
     }
     if let Some(url) = pg_url {
         cmd.env("PRELOOP_TEST_POSTGRES_URL", url);
-    } else if target.pg_selected {
-        // Without a database the pg tests skip, which would make every pg
-        // mutant survive and drown the real gaps. Mutate the lite
-        // implementation only.
-        cmd.args(["--exclude", PG_FILES]);
+    }
+    if let Some(required) = pg_required {
+        cmd.env("PRELOOP_TEST_REQUIRE_POSTGRES", required);
     }
 
     eprintln!(
@@ -302,6 +311,19 @@ fn run(target: &Target) {
         "target {}: cargo mutants exited without survivors listed in missed.txt",
         target.id
     );
+}
+
+/// Whether the pg suites can bootstrap their disposable clusters here.
+fn initdb_available() -> bool {
+    if INITDB_DIRS
+        .iter()
+        .any(|dir| Path::new(dir).join("initdb").exists())
+    {
+        return true;
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("initdb").exists()))
+        .unwrap_or(false)
 }
 
 fn workspace_root() -> PathBuf {
