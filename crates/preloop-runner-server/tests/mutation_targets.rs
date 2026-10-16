@@ -28,6 +28,8 @@ const INITDB_DIRS: [&str; 10] = [
     "/usr/lib/postgresql/16/bin",
 ];
 
+const FLAKY_PG_TEST: &str = "control::tests::pg::prune_outbox_respects_slowest_consumer";
+
 struct Target {
     id: &'static str,
     args: &'static [&'static str],
@@ -328,6 +330,9 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
     }
     cmd.arg("--")
         .args(target.tests)
+        .arg("--")
+        .arg("--skip")
+        .arg(FLAKY_PG_TEST)
         .current_dir(root)
         .env("TMPDIR", &scratch)
         .env("PROPTEST_CASES", "8")
@@ -368,6 +373,17 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
                 .unwrap_or(0)
         })
         .sum();
+    if !status.success() && mutants == 0 {
+        panic!(
+            "sub-run {}: cargo mutants exited {} without scoring a single mutant — the unmutated \
+             baseline failed (report in {})",
+            target.id,
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            report.display()
+        );
+    }
     assert!(
         mutants > 0,
         "sub-run {}: no mutants were generated — its --file/--re filters match no code",
