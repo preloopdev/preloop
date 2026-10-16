@@ -67,6 +67,9 @@ jobs:
         # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
         # clear the two-node race tests (roughly 204 connections).
         run: |
+          # A previous job may have died before its cleanup step ran; the
+          # runner host is reused and the container is detached.
+          docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -90,31 +93,6 @@ jobs:
           echo "PostgreSQL did not become ready" >&2
           docker logs postgres --tail 50 >&2 || true
           exit 1
-      - name: Install cargo-nextest
-        run: |
-          set -euo pipefail
-          version=0.9.144
-          case "$(uname -m)" in
-            x86_64)
-              asset=linux
-              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
-              ;;
-            aarch64|arm64)
-              asset=linux-arm
-              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
-              ;;
-            *)
-              echo "no pinned cargo-nextest build for $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
-          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
-          echo "${digest}  ${archive}" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
-          "$HOME/.local/bin/cargo-nextest" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install cargo-mutants
         run: |
           set -euo pipefail
@@ -167,6 +145,13 @@ jobs:
         with:
           name: mutants-T1-job-binding-lifecycle
           path: mutants.out/T1
+      - name: Remove PostgreSQL container
+        # The runner host is reused across jobs and the container is detached:
+        # leave it behind and the next job's `docker run --name postgres` fails
+        # with "name is already in use". `always()` so a failing run still
+        # cleans up, exactly like control-plane.yml.
+        if: always()
+        run: docker rm -f postgres || true
 
   mutants-T2-webhook-signature:
     name: mutants-T2-webhook-signature
@@ -207,6 +192,9 @@ jobs:
         # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
         # clear the two-node race tests (roughly 204 connections).
         run: |
+          # A previous job may have died before its cleanup step ran; the
+          # runner host is reused and the container is detached.
+          docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -230,31 +218,6 @@ jobs:
           echo "PostgreSQL did not become ready" >&2
           docker logs postgres --tail 50 >&2 || true
           exit 1
-      - name: Install cargo-nextest
-        run: |
-          set -euo pipefail
-          version=0.9.144
-          case "$(uname -m)" in
-            x86_64)
-              asset=linux
-              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
-              ;;
-            aarch64|arm64)
-              asset=linux-arm
-              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
-              ;;
-            *)
-              echo "no pinned cargo-nextest build for $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
-          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
-          echo "${digest}  ${archive}" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
-          "$HOME/.local/bin/cargo-nextest" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install cargo-mutants
         run: |
           set -euo pipefail
@@ -303,6 +266,13 @@ jobs:
         with:
           name: mutants-T2-webhook-signature
           path: mutants.out/T2
+      - name: Remove PostgreSQL container
+        # The runner host is reused across jobs and the container is detached:
+        # leave it behind and the next job's `docker run --name postgres` fails
+        # with "name is already in use". `always()` so a failing run still
+        # cleans up, exactly like control-plane.yml.
+        if: always()
+        run: docker rm -f postgres || true
 
   mutants-T3-pool-warm-sizing:
     name: mutants-T3-pool-warm-sizing
@@ -343,6 +313,9 @@ jobs:
         # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
         # clear the two-node race tests (roughly 204 connections).
         run: |
+          # A previous job may have died before its cleanup step ran; the
+          # runner host is reused and the container is detached.
+          docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -366,31 +339,6 @@ jobs:
           echo "PostgreSQL did not become ready" >&2
           docker logs postgres --tail 50 >&2 || true
           exit 1
-      - name: Install cargo-nextest
-        run: |
-          set -euo pipefail
-          version=0.9.144
-          case "$(uname -m)" in
-            x86_64)
-              asset=linux
-              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
-              ;;
-            aarch64|arm64)
-              asset=linux-arm
-              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
-              ;;
-            *)
-              echo "no pinned cargo-nextest build for $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
-          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
-          echo "${digest}  ${archive}" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
-          "$HOME/.local/bin/cargo-nextest" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install cargo-mutants
         run: |
           set -euo pipefail
@@ -439,6 +387,13 @@ jobs:
         with:
           name: mutants-T3-pool-warm-sizing
           path: mutants.out/T3
+      - name: Remove PostgreSQL container
+        # The runner host is reused across jobs and the container is detached:
+        # leave it behind and the next job's `docker run --name postgres` fails
+        # with "name is already in use". `always()` so a failing run still
+        # cleans up, exactly like control-plane.yml.
+        if: always()
+        run: docker rm -f postgres || true
 
   mutants-T4-queue-status:
     name: mutants-T4-queue-status
@@ -479,6 +434,9 @@ jobs:
         # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
         # clear the two-node race tests (roughly 204 connections).
         run: |
+          # A previous job may have died before its cleanup step ran; the
+          # runner host is reused and the container is detached.
+          docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -502,31 +460,6 @@ jobs:
           echo "PostgreSQL did not become ready" >&2
           docker logs postgres --tail 50 >&2 || true
           exit 1
-      - name: Install cargo-nextest
-        run: |
-          set -euo pipefail
-          version=0.9.144
-          case "$(uname -m)" in
-            x86_64)
-              asset=linux
-              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
-              ;;
-            aarch64|arm64)
-              asset=linux-arm
-              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
-              ;;
-            *)
-              echo "no pinned cargo-nextest build for $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
-          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
-          echo "${digest}  ${archive}" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
-          "$HOME/.local/bin/cargo-nextest" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install cargo-mutants
         run: |
           set -euo pipefail
@@ -575,6 +508,13 @@ jobs:
         with:
           name: mutants-T4-queue-status
           path: mutants.out/T4
+      - name: Remove PostgreSQL container
+        # The runner host is reused across jobs and the container is detached:
+        # leave it behind and the next job's `docker run --name postgres` fails
+        # with "name is already in use". `always()` so a failing run still
+        # cleans up, exactly like control-plane.yml.
+        if: always()
+        run: docker rm -f postgres || true
 
   mutants-T5-cli-parsing:
     name: mutants-T5-cli-parsing
@@ -615,6 +555,9 @@ jobs:
         # loopback matches PRELOOP_TEST_POSTGRES_URL, and max_connections must
         # clear the two-node race tests (roughly 204 connections).
         run: |
+          # A previous job may have died before its cleanup step ran; the
+          # runner host is reused and the container is detached.
+          docker rm -f postgres >/dev/null 2>&1 || true
           image="mirror.gcr.io/library/postgres:18"
           for attempt in 1 2 3; do
             if docker pull -q "$image"; then
@@ -638,31 +581,6 @@ jobs:
           echo "PostgreSQL did not become ready" >&2
           docker logs postgres --tail 50 >&2 || true
           exit 1
-      - name: Install cargo-nextest
-        run: |
-          set -euo pipefail
-          version=0.9.144
-          case "$(uname -m)" in
-            x86_64)
-              asset=linux
-              digest=8a4f726272b0a1c499bd87ca3978bfbb1a8c20bb08ccf075b9996e2081bd1e1e
-              ;;
-            aarch64|arm64)
-              asset=linux-arm
-              digest=7fecfd431b810c05c589d800524286b8f80ce2fe9fb1fef05caf16d095cea407
-              ;;
-            *)
-              echo "no pinned cargo-nextest build for $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
-          curl -fsSL --retry 3 -o "$archive" "https://get.nexte.st/${version}/${asset}"
-          echo "${digest}  ${archive}" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
-          "$HOME/.local/bin/cargo-nextest" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install cargo-mutants
         run: |
           set -euo pipefail
@@ -711,3 +629,10 @@ jobs:
         with:
           name: mutants-T5-cli-parsing
           path: mutants.out/T5
+      - name: Remove PostgreSQL container
+        # The runner host is reused across jobs and the container is detached:
+        # leave it behind and the next job's `docker run --name postgres` fails
+        # with "name is already in use". `always()` so a failing run still
+        # cleans up, exactly like control-plane.yml.
+        if: always()
+        run: docker rm -f postgres || true

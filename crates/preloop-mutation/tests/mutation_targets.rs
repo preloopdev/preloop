@@ -406,6 +406,23 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         target.id,
         report.display()
     );
+    // The --file/--re filters are pinned names. When a refactor moves or
+    // renames the functions they match, the run silently tests nothing, so a
+    // sub-run that generated no mutants fails here instead.
+    let mutants: usize = ["caught", "missed", "timeout", "unviable"]
+        .iter()
+        .map(|kind| {
+            fs::read_to_string(report.join(format!("{kind}.txt")))
+                .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+                .unwrap_or(0)
+        })
+        .sum();
+    assert!(
+        mutants > 0,
+        "sub-run {}: no mutants were generated — its --file/--re filters no longer \
+         match any code (stale names after a refactor)",
+        target.id
+    );
     eprintln!(
         "mutation sub-run {}: cargo mutants exit {} in {:.1?}",
         target.id,
