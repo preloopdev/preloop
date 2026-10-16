@@ -9,16 +9,16 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 ### Added
 
-- **Workflow dependency lockfiles**: workflows with a matching
+- **Workflow dependency lockfiles** (#641): workflows with a matching
   `.github/workflows/actions.lock` now execute recorded action commits,
   including transitive composite-action dependencies and remote reusable
   workflow locks fetched at their resolved commit. Missing pins, invalid
   lockfiles, identity mismatches, moved full-version tags, and unverifiable
   locked commits fail closed.
-- **Action pinning policy**: `[actions_policy]` can require full commit-SHA
+- **Action pinning policy** (#641): `[actions_policy]` can require full commit-SHA
   pins or lockfile coverage, restrict `uses:` references with allow/block
   patterns, and verify that SHA pins belong to the named repository.
-- **Action provenance**: Set up job output announces lockfile use and records
+- **Action provenance** (#641): Set up job output announces lockfile use and records
   each downloaded action's resolved SHA; completed job summaries expose the
   resolved action list.
 
@@ -30,7 +30,7 @@ Releases before v0.27.0 predate the changelog.
   re-check job liveness after action-reference resolution before signing
   bearerless download tickets.
 
-- **Locked dependency wire key**: the Rust runner now reads the official
+- **Locked dependency wire key** (#641): the Rust runner now reads the official
   `dependencies` job-message field and forwards it as `actions_dependencies`
   during action resolution. The previous `actionsDependencies` lookup never
   observed lockfile pins.
