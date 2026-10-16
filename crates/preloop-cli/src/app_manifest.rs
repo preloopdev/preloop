@@ -287,17 +287,16 @@ async fn register_on(
     api_base: &str,
     runner_admin: bool,
 ) -> Result<Registration> {
-    let (registration, ()) =
-        register_on_with_persist(
-            listener,
-            name,
-            org,
-            public_url,
-            api_base,
-            runner_admin,
-            |_| Ok(()),
-        )
-        .await?;
+    let (registration, ()) = register_on_with_persist(
+        listener,
+        name,
+        org,
+        public_url,
+        api_base,
+        runner_admin,
+        |_| Ok(()),
+    )
+    .await?;
     Ok(registration)
 }
 

@@ -1587,6 +1587,7 @@ mod tests {
                     token: Some("github_pat_external".to_owned()),
                     repos: Vec::new(),
                     workspace: None,
+                    runner_admin: false,
                 })
                 .await?;
                 preloop_runner_server::config::load_config_from(&config_path)
