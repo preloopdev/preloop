@@ -1,7 +1,7 @@
 # Conformance
 
-preloop treats compatibility as a test artifact. The evidence lives in four layers, from raw wire bytes to whole-repo
-behavior.
+preloop treats compatibility as a test artifact. The evidence lives in five
+layers, from raw wire bytes to whole-repo behavior.
 
 ```
 Layer 5  whole-repo behavior   ~28 real-world repos, 39-scenario benchmark
