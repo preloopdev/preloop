@@ -480,6 +480,48 @@ control backend replaced) into a fresh control database. See
 | `--active <POLICY>` | In-flight work on unfinished jobs: `refuse` (default), `requeue`, or `cancel`. Claims on already-terminal jobs are settled as history without an override |
 | `--json` | Print the machine-readable report |
 
+## `preloop volumes <COMMAND>`
+
+Read-only volumes the engine mounts. Each holds one host tree — today the runner
+bundle, including the Node externals it carries — named
+`preloop-runner-<digest>` after the digest of the tree, so a new bundle is a new
+volume. Nothing removes a superseded volume on its own; these commands do. They
+are offline: they talk to AgentENV (`PRELOOP_AENV_BINARY`, default `aenv`) and
+never bootstrap the engine.
+
+### `preloop volumes list`
+
+Lists the volumes AgentENV holds, with kind, mode, size, status, and the
+runner/Node versions each one was populated from. AgentENV cannot be asked what
+is inside a volume, so the versions come from the index the engine writes when
+it populates one: a volume populated before that index existed, or by another
+host, reports `unknown (pre-manifest or created elsewhere)`.
+
+### `preloop volumes prune [--keep <DIR>]... [--dry-run]`
+
+Deletes every volume that no sandbox mounts, except the tree the engine would
+mount. Without `--keep` that tree is the same selection the pool makes —
+`PRELOOP_RUNNER_BUNDLE` when it names a usable Linux runner bundle, otherwise
+the installed or development bundle beside the binary, including the engine's own
+mirror — plus the standalone Node externals
+(`PRELOOP_RUNNER_EXTERNALS`, else `$PRELOOP_HOME/externals`) when one is
+installed.
+
+AgentENV refuses to delete a mounted volume, and that is reported as `in use`,
+not as a failure. A dry run cannot tell which volumes a sandbox holds (the server
+only reveals a reservation when a delete is attempted), so it reports
+`candidate` instead of claiming a deletion.
+
+Pruning is safe while an engine is running: the provider re-checks that a
+remembered volume still exists before reusing it, and populates it again if it
+was deleted. It is not safe while a volume is being populated: one deleted
+between a populate's create and its first mount fails that populate.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable) |
+| `--dry-run` | Report candidates without deleting anything |
+
 ## `preloop update [OPTIONS]`
 
 Poll GitHub Releases and atomically install the matching binary.

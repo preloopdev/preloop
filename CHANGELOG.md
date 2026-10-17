@@ -33,6 +33,18 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **AgentENV runners mount the runner bundle as a read-only volume**: the
+  complete bundle (including Node externals) is archived once into a
+  content-addressed volume named `preloop-runner-<digest>`, stamped with a
+  `.preloop-bundle.json` manifest saying which runner and Node versions it
+  holds, and clones mount it at start with `aenv start --volume`. Fork bases stay
+  volume-free because AgentENV 0.2.1 cannot snapshot a sandbox with a read-only
+  volume; a new bundle is therefore a new volume rather than a golden rebuild.
+  Writable host mounts are refused, symlinks that would leave the tree and
+  set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
+  failures are reported by name with no tar fallback. `preloop volumes
+  list|prune` manages leftovers.
+
 ### Fixed
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.

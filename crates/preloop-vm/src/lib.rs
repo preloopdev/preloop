@@ -310,8 +310,9 @@ pub enum VmError {
 pub struct ProviderCapabilities {
     /// Host directories can be mounted into a guest and stay live.
     ///
-    /// `false` means [`MachineSpec::volumes`] is satisfied by copying at
-    /// start time: correct for read-mostly mounts like the runner bundle,
+    /// `false` means a read-only [`MachineSpec::volumes`] entry is delivered as an
+    /// immutable snapshot of the directory, with no live view, and a writable entry
+    /// is refused. That suits read-mostly mounts like the runner bundle, and is
     /// wrong for anything the host mutates while the guest runs.
     pub live_host_volumes: bool,
     /// Host Unix sockets can be forwarded into a guest.
@@ -332,6 +333,18 @@ pub struct ProviderCapabilities {
     /// state when resumed. Backends without this must not auto-suspend a live
     /// debug session.
     pub preserves_runtime_state_on_suspend: bool,
+    /// A fork base may mount read-only volumes, and its clones inherit them.
+    ///
+    /// `false` means a sandbox that mounts a read-only volume cannot be
+    /// snapshotted (AgentENV refuses it), so the fork base must boot without one
+    /// and each clone mounts its volumes at start through
+    /// [`VmProvider::fork_with_volumes`]. That also keeps a changed read-only
+    /// volume from forcing the fork base to be rebuilt.
+    pub fork_bases_may_mount_read_only_volumes: bool,
+    /// The runner bundle already carries the Node externals tree, so callers
+    /// should mount only the bundle and link the runner root's externals path
+    /// into it. This avoids a second AgentENV volume mount at `/home/runner`.
+    pub runner_bundle_carries_externals: bool,
 }
 
 impl Default for ProviderCapabilities {
@@ -342,6 +355,8 @@ impl Default for ProviderCapabilities {
             file_packs: true,
             fork_inherits_guest_writes: false,
             preserves_runtime_state_on_suspend: false,
+            fork_bases_may_mount_read_only_volumes: true,
+            runner_bundle_carries_externals: false,
         }
     }
 }
@@ -361,6 +376,17 @@ pub trait VmProvider: Send + Sync {
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError>;
     /// Fork a running forkable machine into a new clone with CoW memory and disks.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError>;
+    /// Fork a clone, attaching `volumes` when the backend cannot carry
+    /// read-only volumes through its fork-base snapshot. Backends whose
+    /// snapshots already carry the mounts use the default implementation.
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        _volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
+        self.fork(golden, clone).await
+    }
     /// Remove `pack/` build intermediates from a machine's data directory once
     /// its finished disk exists (issue #295).
     ///
@@ -475,6 +501,14 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     }
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
         (**self).fork(golden, clone).await
+    }
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
+        (**self).fork_with_volumes(golden, clone, volumes).await
     }
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         (**self).stop(name).await
