@@ -289,6 +289,59 @@ pub fn strip_url_userinfo(url: &str) -> String {
     }
 }
 
+/// Mask values for the password in a URL's userinfo (`user:password@`).
+///
+/// For log paths that print a URL as given, such as a `docker create`
+/// command line carrying `-e HTTPS_PROXY=<url>`. The official runner splits
+/// a proxy URL's userinfo at the first `:` and registers the password with
+/// its secret masker (`RunnerWebProxy`, `HostContext`), so those lines read
+/// `user:***@host`. Returns the password as written in the URL and, when it
+/// differs, its percent-decoded form; empty when the URL has no password.
+/// The authority is found the same way as in [`strip_url_userinfo`].
+pub fn url_password_masks(url: &str) -> Vec<String> {
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let rest = &url[after_scheme..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let Some((_, password)) = authority
+        .rfind('@')
+        .and_then(|at| authority[..at].split_once(':'))
+    else {
+        return Vec::new();
+    };
+    if password.is_empty() {
+        return Vec::new();
+    }
+    let mut masks = vec![password.to_owned()];
+    if let Some(decoded) = percent_decode(password)
+        && !decoded.is_empty()
+        && decoded != password
+    {
+        masks.push(decoded);
+    }
+    masks
+}
+
+/// Decode `%XX` escapes; any other byte, including a malformed escape, is
+/// kept as is. `None` when the decoded bytes are not UTF-8.
+fn percent_decode(input: &str) -> Option<String> {
+    let hex = |byte: Option<&u8>| byte.and_then(|b| (*b as char).to_digit(16));
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(high), Some(low)) = (hex(bytes.get(i + 1)), hex(bytes.get(i + 2)))
+        {
+            out.push((high * 16 + low) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Transform-aware masking for chunked writers.
 ///
 /// Secrets can split across write-chunk boundaries, where per-chunk naive
@@ -714,6 +767,30 @@ mod tests {
         assert_eq!(strip_url_userinfo(""), "");
         // Userinfo-like text without a scheme still strips at the last @.
         assert_eq!(strip_url_userinfo("user:pass@host"), "host");
+    }
+
+    #[test]
+    fn url_password_masks_returns_raw_and_decoded_password() {
+        assert_eq!(
+            url_password_masks("http://proxyuser:s3cr3t-pw@proxy.corp:8080/"),
+            ["s3cr3t-pw"]
+        );
+        // As written in the URL and percent-decoded: a tool may echo either.
+        assert_eq!(
+            url_password_masks("http://user:p%40ss%3Aw0rd@proxy.example:8080"),
+            ["p%40ss%3Aw0rd", "p@ss:w0rd"]
+        );
+        // The password runs to the last `@` and may itself contain `:`.
+        assert_eq!(url_password_masks("http://u:a:b@c@proxy:1"), ["a:b@c"]);
+        // No scheme: the official runner prepends `http://`, same authority.
+        assert_eq!(url_password_masks("user:pw@proxy:3128"), ["pw"]);
+        // No password: nothing to mask, the username stays visible.
+        assert!(url_password_masks("http://user@proxy.example:8080").is_empty());
+        assert!(url_password_masks("http://user:@proxy.example:8080").is_empty());
+        assert!(url_password_masks("http://proxy.example:8080").is_empty());
+        // An `@` past the authority is not userinfo.
+        assert!(url_password_masks("http://proxy.example/a:b@c").is_empty());
+        assert!(url_password_masks("").is_empty());
     }
 
     // ── StreamingMasker ──────────────────────────────────────────────
