@@ -184,6 +184,10 @@ fn unreachable_engine(engine: &str, error: &reqwest::Error) -> anyhow::Error {
 pub(crate) fn insecure_public_url_warning(public_url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(public_url).ok()?;
     let loopback = parsed.host_str().is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
         host.eq_ignore_ascii_case("localhost")
             || host
                 .parse::<std::net::IpAddr>()
