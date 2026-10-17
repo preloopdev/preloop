@@ -25,7 +25,7 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Conformance goldens are LFS-tracked; without this they arrive
           # as pointer stubs and every test that reads them fails.
@@ -35,7 +35,7 @@ jobs:
         run: python3 benchmarks/real-world/runner-conformance.py --mode light
       - name: Upload light report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runner-light-conformance
           path: benchmarks/compatibility/runner/behavior/RUNNER-CONFORMANCE-REPORT.md
@@ -51,7 +51,7 @@ jobs:
       GH_TOKEN: ${{ secrets.RUNNER_CONFORMANCE_TOKEN }}
       PRELOOP_RUNNER_HOST: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/preloop-runner
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # Same as the light job: the deep batch replays live runners, not the
@@ -66,7 +66,7 @@ jobs:
           python3 benchmarks/real-world/runner-conformance.py --mode deep
       - name: Upload deep report and captures
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runner-deep-conformance
           path: |

@@ -18,7 +18,7 @@
 use super::logic::{BuiltExpansion, SchedulingOutcome};
 use super::types::*;
 use crate::models::{
-    EnvironmentGateState, JobDetail, PushState, QueuedJob, RunRecord, StepRecord,
+    EnvironmentGateState, JobDetail, PublishedRun, PushState, QueuedJob, RunRecord, StepRecord,
     TaskAgentJobRequestRecord, WebhookDeliveryRecord, WebhookDeliveryStatus,
     WebhookDeliverySummary, WebhookQueueStats, WebhookRedeliveryRecord, WebhookWatchdogCursor,
 };
@@ -260,7 +260,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// `NotFound` when the run does not exist (nothing is written). The
     /// outcome carries the post-transition run record, every job of the run
     /// now `Cancelled` (job-id order), and the global ready-queue depth and
-    /// front `runs-on` labels for the pool wake gauges.
+    /// front `runs-on` labels for the pool wake gauges. `run_cancelled` reports
+    /// whether this call transitioned a live run under the same lock;
+    /// cancelling an already-terminal run remains an idempotent no-op.
     async fn cancel_run(
         &self,
         run_id: RunId,
@@ -913,15 +915,16 @@ pub(crate) trait ControlBackend: Send + Sync {
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<String>, ControlError>;
 
-    /// The push that already published `sha` for `workflow_path` on
-    /// `repository` — a concluded run with a recorded `push_state`, matched
-    /// on the submitted sha or the push's `effective_sha`.
-    async fn published_run(
+    /// Every push that already published `sha` for `workflow_path` on
+    /// `repository` (a concluded run with a recorded `push_state`, matched on
+    /// the submitted sha or the push's `effective_sha`), oldest first, with
+    /// what each run tested.
+    async fn published_runs(
         &self,
         repository: &str,
         sha: &str,
         workflow_path: &str,
-    ) -> Result<Option<RunId>, ControlError>;
+    ) -> Result<Vec<PublishedRun>, ControlError>;
 
     /// The committed run a webhook delivery produced (`webhook_delivery_id`
     /// + `workflow_path` uniqueness), if any. Submit checks it before
@@ -2813,15 +2816,15 @@ impl ControlBackend for Backend {
             }
         }
     }
-    async fn published_run(
+    async fn published_runs(
         &self,
         repository: &str,
         sha: &str,
         workflow_path: &str,
-    ) -> Result<Option<RunId>, ControlError> {
+    ) -> Result<Vec<PublishedRun>, ControlError> {
         match self {
-            Self::Sqlite(b) => b.published_run(repository, sha, workflow_path).await,
-            Self::Postgres(b) => b.published_run(repository, sha, workflow_path).await,
+            Self::Sqlite(b) => b.published_runs(repository, sha, workflow_path).await,
+            Self::Postgres(b) => b.published_runs(repository, sha, workflow_path).await,
         }
     }
     async fn run_for_webhook_delivery(

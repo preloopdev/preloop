@@ -1,0 +1,29 @@
+---
+title: Introduction
+description: Run GitHub Actions workflows locally or on your own CI infrastructure with Preloop.
+---
+
+Preloop runs your existing GitHub Actions workflows on hardware-isolated microVMs. Keep your `.github/workflows` files unchanged, run them locally against your working tree, and use the same engine in your own CI environment.
+
+The engine speaks the official `actions/runner` protocol. The official runner can register, poll for jobs, execute them, and report results against Preloop. Preloop also includes a Rust runner that installs 36× smaller and uses up to 19× less peak memory in the published comparison.
+
+For a failed step, run with `preloop run --debug` and attach with `preloop debug <run-id>` to inspect the paused session and retry from that step. If you use `--preserve-on-failure` instead, inspect the retained VM with `preloop shell`.
+
+Preloop is in beta. Source code and releases are available on [GitHub](https://github.com/preloopdev/preloop).
+
+## Key capabilities
+
+- Drop-in workflow compatibility: adoption starts by changing where jobs run, not rewriting workflow YAML.
+- Hardware-isolated microVMs for jobs, with warm jobs able to fork from a prepared image in about 300 ms.
+- Local runs use the working tree, including uncommitted and untracked files.
+- Pause-on-failure debugging with DAP and step-level retries.
+- GitHub App credentials and per-job tokens for least-privilege GitHub access.
+- NDJSON event output for agents and developer tooling.
+- A webhook watchdog that reconciles deliveries against GitHub when webhook events drift.
+
+## Next steps
+
+- [Quickstart](/quickstart): install the CLI and run your first workflow.
+- [Setup guide](/setup): configure GitHub credentials, secrets, and engine settings.
+- [Architecture overview](/system-architecture): explore the system diagrams and components.
+- [CLI reference](/cli_reference): browse commands and flags.

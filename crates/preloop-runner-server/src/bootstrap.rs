@@ -128,11 +128,11 @@ pub struct SelfSignedCert {
 /// Generate an ephemeral self-signed TLS certificate valid for localhost.
 pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    let rcgen::CertifiedKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names)
+    let rcgen::CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names)
         .map_err(|e| anyhow::anyhow!("self-signed cert generation failed: {e}"))?;
     Ok(SelfSignedCert {
         cert: cert.pem(),
-        key: key_pair.serialize_pem(),
+        key: signing_key.serialize_pem(),
     })
 }
 
@@ -172,11 +172,12 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             })
             .map(|(k, _)| k.clone())
             .collect();
-        let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
         // Diag upload tokens: the map key is the JWT `jti`, which is also
         // the staging directory name under `blobs/diag/`. Sweeping the map
         // entry without the directory would leak the staged bytes — the
-        // same accumulation the TTL sweep fixes for cache/artifact.
+        // same accumulation the TTL sweep fixes for cache/artifact. The
+        // list is taken before `sweep_pending_uploads`, which drops the
+        // expired entries from the map too.
         let expired_diag: Vec<String> = inner
             .diag_upload_tokens
             .iter()
@@ -185,6 +186,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             })
             .map(|(k, _)| k.clone())
             .collect();
+        let swept_staging_files = sweep_pending_uploads(&mut inner, now_u);
         // Release lock before doing I/O.
         (
             expired_cache,
@@ -300,7 +302,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         let timed_out = request.started_at.is_some()
             && !request.timeout_triggered
             && elapsed(request.started_at)
-                >= Duration::from_secs(request.job_timeout_s.unwrap_or(21600).max(0) as u64);
+                >= Duration::from_secs(
+                    preloop_gha_parser::job_builder::effective_job_timeout_seconds(
+                        request.job_timeout_s,
+                    ) as u64,
+                );
         let lease_expired = request.last_renewed_at.is_some()
             && elapsed(request.last_renewed_at)
                 >= Duration::from_secs(if request.session_live {
@@ -422,6 +428,32 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         };
         match shared.state.backend.reap_sweep(sweep).await {
             Ok(outcome) => {
+                // A lease that stopped being renewed is the one failure with
+                // no runner-side report behind it: the step is still running,
+                // its output only ever went to the live feed, and the job is
+                // failed from here. Without this line the only trace is a job
+                // that went from running to failed, with nothing in the log to
+                // say why — say why, with the numbers.
+                for lease in &outcome.expired {
+                    let stale = inputs
+                        .active
+                        .iter()
+                        .find(|request| request.request_id == lease.request_id);
+                    warn!(
+                        run_id = %lease.run_id,
+                        job_id = %lease.job_id,
+                        request_id = lease.request_id,
+                        last_renewed_at = ?stale.and_then(|request| request.last_renewed_at),
+                        session_live = stale.map(|request| request.session_live),
+                        lease_seconds = stale.map(|request| if request.session_live {
+                            crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
+                        } else {
+                            crate::distributed_task::DEAD_SESSION_LEASE_SECONDS
+                        }),
+                        "failing an attempt whose lease stopped being renewed: the worker is \
+                         dead, wedged, or no longer able to authenticate its `renewjob`"
+                    );
+                }
                 let completions: Vec<JobCompletion> = outcome
                     .expired
                     .into_iter()
@@ -1442,7 +1474,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // fail fast, not overwrite the unix socket + PID file and orphan the
     // path the guest bridges mount. The lock file is held for the process
     // lifetime; the OS releases it on exit, so a crash leaves no stale lock.
-    let _serve_lock = acquire_serve_lock(&config.state_dir)?;
+    // The record names this engine, and its listen address when that is the one
+    // it binds, so a second engine can say how to stop it.
+    let listen = (!config.systemd_socket_activation).then_some(config.listen);
+    let _serve_lock = acquire_serve_lock(&config.state_dir, EngineOrigin::current(), listen)?;
     let mut state = AppState::new_with_store(
         config.state_dir.clone(),
         crate::config::config_path(),
@@ -1986,18 +2021,31 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
 /// socket and the runner goes deaf. The lock makes the second instance
 /// fail fast instead.
 ///
+/// Once the lock is held, the file is replaced with this engine's
+/// [`LockHolder`] record, so a second engine can name the holder and the way
+/// to stop it. The record is advisory: the lock alone excludes a second
+/// engine.
+///
 /// Returns the open file so the caller holds the lock; the OS releases it
 /// on process exit, so a crash leaves no stale lock behind.
-#[cfg(unix)]
-fn acquire_serve_lock(state_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+fn acquire_serve_lock(
+    state_dir: &std::path::Path,
+    origin: EngineOrigin,
+    listen: Option<SocketAddr>,
+) -> anyhow::Result<std::fs::File> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
     let lock_path = state_dir.join("serve.lock");
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
-        // The lock file carries no content; opening it must never clobber it.
+        // Never truncate on open: a second engine must not erase the record of
+        // the one holding the lock. The record is rewritten below, once this
+        // process holds the lock.
         .truncate(false)
         .open(&lock_path)
         .context(format!("opening serve lock {}", lock_path.display()))?;
@@ -2007,15 +2055,384 @@ fn acquire_serve_lock(state_dir: &std::path::Path) -> anyhow::Result<std::fs::Fi
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            anyhow::bail!(
-                "another preloop serve already holds {} — \
-                 refusing to start a second engine on the same state dir",
-                lock_path.display()
-            );
+            // Read from the inode we tried to lock, not from the path: a
+            // replacement of serve.lock must not make us describe a different
+            // file than the one that caused the contention.
+            let recorded = read_lock_record(&file).unwrap_or_default();
+            anyhow::bail!("{}", lock_held_message(&file, &lock_path, &recorded));
         }
         Err(error @ std::fs::TryLockError::Error(_)) => return Err(error.into()),
     }
+    let holder = LockHolder {
+        pid: std::process::id(),
+        started: Some(chrono::Utc::now()),
+        origin,
+        state_dir: Some(state_dir.to_path_buf()),
+        listen,
+    };
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(holder.render().as_bytes())?;
+    file.sync_data()?;
     Ok(file)
+}
+
+fn read_lock_record(file: &std::fs::File) -> std::io::Result<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut record_file = file.try_clone()?;
+    record_file.seek(SeekFrom::Start(0))?;
+    let mut recorded = String::new();
+    record_file.read_to_string(&mut recorded)?;
+    Ok(recorded)
+}
+
+/// How this engine was started. A second engine reads it back from
+/// `serve.lock` and names the matching way to stop the first one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineOrigin {
+    /// Started in a terminal: `preloop serve`, or `preloop engine` run by hand.
+    Foreground,
+    /// Spawned by a `preloop` client command that found no engine running.
+    Background,
+    /// Started by systemd (`INVOCATION_ID` is set).
+    Systemd,
+}
+
+/// Environment variable the CLI sets on the engine it autostarts, so that
+/// engine records itself as [`EngineOrigin::Background`].
+pub const ENGINE_ORIGIN_ENV: &str = "PRELOOP_ENGINE_ORIGIN";
+
+impl EngineOrigin {
+    /// The origin of this process. These two signals are read here and nowhere else.
+    pub fn current() -> Self {
+        origin_from(
+            std::env::var(ENGINE_ORIGIN_ENV).ok().as_deref(),
+            std::env::var_os("INVOCATION_ID").is_some(),
+        )
+    }
+
+    /// The spelling used in the environment variable and in `serve.lock`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+            Self::Systemd => "systemd",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "foreground" => Some(Self::Foreground),
+            "background" => Some(Self::Background),
+            "systemd" => Some(Self::Systemd),
+            _ => None,
+        }
+    }
+}
+
+/// [`EngineOrigin::current`] over explicit inputs, so both precedence rules can
+/// be tested. The explicit `background` marker wins: a client command started
+/// from inside a systemd unit inherits `INVOCATION_ID`, but the engine it
+/// autostarts is still a background engine.
+fn origin_from(marker: Option<&str>, invoked_by_systemd: bool) -> EngineOrigin {
+    if marker.map(str::trim) == Some(EngineOrigin::Background.as_str()) {
+        EngineOrigin::Background
+    } else if invoked_by_systemd {
+        EngineOrigin::Systemd
+    } else {
+        EngineOrigin::Foreground
+    }
+}
+
+/// What a running engine records in `serve.lock` once it holds the lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockHolder {
+    pid: u32,
+    started: Option<chrono::DateTime<chrono::Utc>>,
+    origin: EngineOrigin,
+    state_dir: Option<std::path::PathBuf>,
+    listen: Option<SocketAddr>,
+}
+
+impl LockHolder {
+    /// One `key=value` fact per line. Readers ignore keys they do not know.
+    fn render(&self) -> String {
+        let mut lines = vec![
+            format!("pid={}", self.pid),
+            format!("origin={}", self.origin.as_str()),
+        ];
+        if let Some(started) = self.started {
+            lines.push(format!(
+                "started={}",
+                started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ));
+        }
+        if let Some(dir) = &self.state_dir {
+            lines.push(format!("state_dir={}", dir.display()));
+        }
+        if let Some(listen) = self.listen {
+            lines.push(format!("listen={listen}"));
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    /// Parse a record. Without a usable pid and origin it is not a record, so a
+    /// damaged or older file yields `None` rather than a guess.
+    fn parse(text: &str) -> Option<Self> {
+        let mut pid = None;
+        let mut origin = None;
+        let mut started = None;
+        let mut state_dir = None;
+        let mut listen: Option<SocketAddr> = None;
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "pid" => pid = value.trim().parse::<u32>().ok().filter(|pid| *pid > 0),
+                "origin" => origin = EngineOrigin::parse(value.trim()),
+                "started" => {
+                    started = chrono::DateTime::parse_from_rfc3339(value.trim())
+                        .ok()
+                        .map(|time| time.with_timezone(&chrono::Utc));
+                }
+                "state_dir" => state_dir = Some(std::path::PathBuf::from(value)),
+                "listen" => listen = value.trim().parse().ok(),
+                _ => {}
+            }
+        }
+        Some(Self {
+            pid: pid?,
+            started,
+            origin: origin?,
+            state_dir,
+            listen,
+        })
+    }
+}
+
+/// Return the PID that the operating system proves owns this exact flock.
+///
+/// A process-existence check is not ownership evidence: a stale record can
+/// outlive its process and its PID can be reused. The platform probes below
+/// therefore match the inode opened by this contender to the kernel's lock
+/// metadata, and return `None` whenever that proof is unavailable.
+#[cfg(unix)]
+fn lock_owner_pid(lock_file: &std::fs::File, lock_path: &std::path::Path) -> Option<u32> {
+    let owner = lock_owner_pid_probe(lock_file, lock_path)?;
+
+    // The probe is necessarily a snapshot. Re-check that the lock is still
+    // held, then take the ownership snapshot again. If the original holder
+    // exited or another PID took the lock in between, refuse targeted
+    // remediation rather than risk a stale PID. This still cannot make a PID
+    // an enduring identity after this function returns; the message remains
+    // advisory and a caller should re-run the command after any race.
+    match lock_file.try_lock() {
+        Ok(()) => {
+            let _ = lock_file.unlock();
+            None
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let confirmed = lock_owner_pid_probe(lock_file, lock_path);
+            (confirmed == Some(owner)).then_some(owner)
+        }
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_owner_pid(_lock_file: &std::fs::File, _lock_path: &std::path::Path) -> Option<u32> {
+    None
+}
+
+/// Linux's `/proc/locks` reports the owner PID, lock kind, and device/inode
+/// tuple for `flock(2)` locks. The exact inode match is what distinguishes the
+/// recorded holder from a live but unrelated process.
+#[cfg(target_os = "linux")]
+fn lock_owner_pid_probe(lock_file: &std::fs::File, _lock_path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = lock_file.metadata().ok()?;
+    let proc_locks = std::fs::read_to_string("/proc/locks").ok()?;
+    linux_proc_locks_owner(&proc_locks, metadata.dev(), metadata.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_locks_owner(proc_locks: &str, device: u64, inode: u64) -> Option<u32> {
+    let expected_major = u64::from(libc::major(device as libc::dev_t));
+    let expected_minor = u64::from(libc::minor(device as libc::dev_t));
+
+    proc_locks.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 6
+            || fields[1] != "FLOCK"
+            || fields[2] != "ADVISORY"
+            || fields[3] != "WRITE"
+        {
+            return None;
+        }
+        let owner = fields[4].parse::<u32>().ok().filter(|pid| *pid > 0)?;
+        let mut device_inode = fields[5].split(':');
+        let major = u64::from_str_radix(device_inode.next()?, 16).ok()?;
+        let minor = u64::from_str_radix(device_inode.next()?, 16).ok()?;
+        let lock_inode = device_inode.next()?.parse::<u64>().ok()?;
+        (major == expected_major && minor == expected_minor && lock_inode == inode).then_some(owner)
+    })
+}
+
+/// Only Linux exposes the flock owner, through `/proc/locks`. Other unix systems
+/// have no probe that proves ownership, so their recorded holder stays unverified.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn lock_owner_pid_probe(_lock_file: &std::fs::File, _lock_path: &std::path::Path) -> Option<u32> {
+    None
+}
+
+/// What a second engine reports when `serve.lock` is already held.
+fn lock_held_message(
+    lock_file: &std::fs::File,
+    lock_path: &std::path::Path,
+    recorded: &str,
+) -> String {
+    render_lock_held_message(lock_path, recorded, lock_owner_pid(lock_file, lock_path))
+}
+
+/// Render the lock diagnostic from explicit ownership evidence. Keeping this
+/// separate makes the safety rule testable without a host lock table. Process
+/// existence only chooses the wording of an unverified record, never ownership.
+fn render_lock_held_message(
+    lock_path: &std::path::Path,
+    recorded: &str,
+    owner_pid: Option<u32>,
+) -> String {
+    match LockHolder::parse(recorded) {
+        Some(holder) if owner_pid == Some(holder.pid) => holder_message(&holder),
+        Some(holder) => unidentified_holder_message(lock_path, Some(&holder)),
+        None => unidentified_holder_message(lock_path, None),
+    }
+}
+
+/// The message for a lock held by a live engine. The holder's origin decides
+/// which way to stop it is named.
+fn holder_message(holder: &LockHolder) -> String {
+    let pid = holder.pid;
+    let started = holder
+        .started
+        .map(|started| {
+            format!(
+                ", started {}",
+                started.with_timezone(&chrono::Local).format("%H:%M")
+            )
+        })
+        .unwrap_or_default();
+    let mut lines = vec![match holder.origin {
+        EngineOrigin::Background => format!(
+            "a preloop engine is already running (pid {pid}{started}, in the background by a preloop command)"
+        ),
+        EngineOrigin::Systemd => format!(
+            "a preloop engine is already running as a systemd service (preloop.service, pid {pid})"
+        ),
+        EngineOrigin::Foreground => {
+            format!("a preloop engine is already running in another terminal (pid {pid}{started})")
+        }
+    }];
+    if let Some(dir) = &holder.state_dir {
+        lines.push(format!("  state dir: {}", dir.display()));
+    }
+    match holder.origin {
+        EngineOrigin::Background => {
+            if let Some(listen) = holder.listen {
+                lines.push(format!(
+                    "  It is serving http://{listen} — `preloop status` already uses it."
+                ));
+            }
+            lines.push(format!(
+                "  To run it in this terminal instead:  kill {pid} && preloop serve"
+            ));
+        }
+        EngineOrigin::Systemd => {
+            lines.push("  Restart it:  sudo systemctl restart preloop.service".to_owned());
+            // The socket unit starts the service again on the next connection,
+            // so stopping only the service does not stop the engine.
+            lines.push(
+                "  Stop it:     sudo systemctl stop preloop.socket preloop.service".to_owned(),
+            );
+            lines.push(
+                "  (per-user install: the same with `systemctl --user` and no sudo)".to_owned(),
+            );
+        }
+        EngineOrigin::Foreground => {
+            lines.push(format!("  Stop it there with Ctrl-C, or:  kill {pid}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Whether a process with this PID is running. Existence is not ownership:
+/// this only chooses the wording for an unverified record, and never decides
+/// that a PID holds the lock. Linux answers from `/proc`; elsewhere `ps` does.
+fn pid_is_running(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    } else {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .args(["-o", "pid="])
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+    }
+}
+
+/// The message for a lock whose holder cannot be named: the record is missing
+/// or damaged, or the operating system could not prove that its PID owns this
+/// lock. A recorded PID is only ever shown as unverified, and the advice names
+/// tools that find the holder; it never suggests killing a PID.
+fn unidentified_holder_message(
+    lock_path: &std::path::Path,
+    recorded: Option<&LockHolder>,
+) -> String {
+    let path = lock_path.display();
+    let mut lines = vec![format!(
+        "another preloop serve already holds {path} — refusing to start a second engine on the same state dir"
+    )];
+    lines.push(match recorded {
+        Some(holder) if pid_is_running(holder.pid) => {
+            let pid = holder.pid;
+            let started = holder
+                .started
+                .map(|started| {
+                    format!(
+                        " (started {})",
+                        started.with_timezone(&chrono::Local).format("%H:%M")
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "  recorded holder pid {pid}{started} — not verified as the lock owner on this OS; check with: ps -p {pid} -o lstart=,command="
+            )
+        }
+        Some(holder) => format!(
+            "  the record names pid {}, but it could not be verified as this lock's owner",
+            holder.pid
+        ),
+        None => "  the holder left no usable record of itself (an older build, or a damaged file)"
+            .to_owned(),
+    });
+    if cfg!(target_os = "linux") {
+        lines.push("  find the process holding it:  lslocks | grep serve.lock".to_owned());
+    } else {
+        lines.push(
+            "  find the process holding it:  ps -axo pid=,lstart=,command= | grep '[p]reloop serve'"
+                .to_owned(),
+        );
+        lines.push(
+            "  (lsof cannot show flock locks on macOS, so the lock owner cannot be verified here)"
+                .to_owned(),
+        );
+    }
+    lines.join("\n")
 }
 
 async fn shutdown_signal(shutdown: CancellationToken) {
@@ -2164,5 +2581,300 @@ mod tests {
             preloop_observability::status::Overall::Degraded
         );
         assert_eq!(snapshot.conditions[0].code, "github_check_update_failure");
+    }
+
+    #[test]
+    fn origin_prefers_the_background_marker_over_systemd() {
+        assert_eq!(
+            origin_from(Some("background"), true),
+            EngineOrigin::Background
+        );
+        assert_eq!(
+            origin_from(Some(" background "), false),
+            EngineOrigin::Background
+        );
+        assert_eq!(origin_from(None, true), EngineOrigin::Systemd);
+        assert_eq!(
+            origin_from(Some("unknown"), false),
+            EngineOrigin::Foreground
+        );
+        assert_eq!(origin_from(None, false), EngineOrigin::Foreground);
+    }
+
+    #[test]
+    fn holder_record_round_trips_and_rejects_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let listen: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Background, Some(listen)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("serve.lock")).unwrap();
+        let holder = LockHolder::parse(&text).expect("the holder record must parse");
+        assert_eq!(holder.pid, std::process::id());
+        assert_eq!(holder.origin, EngineOrigin::Background);
+        assert_eq!(holder.state_dir.as_deref(), Some(dir.path()));
+        assert_eq!(holder.listen, Some(listen));
+        assert!(holder.started.is_some());
+        assert_eq!(LockHolder::parse(""), None);
+        assert_eq!(LockHolder::parse("pid=0\norigin=foreground\n"), None);
+        assert_eq!(LockHolder::parse("pid=12\norigin=elsewhere\n"), None);
+    }
+
+    /// A second engine names the holder's pid and the fix for how it was
+    /// started only when lock metadata proves that PID owns the lock.
+    #[test]
+    fn second_engine_names_the_background_holder_and_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("serve.lock");
+        let listen: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Background, Some(listen)).unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let owner = lock_owner_pid(&contender, &lock_path);
+        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None)
+            .unwrap_err()
+            .to_string();
+        let pid = std::process::id();
+        if owner == Some(pid) {
+            assert!(
+                error.contains(&format!(
+                    "a preloop engine is already running (pid {pid}, started "
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("in the background by a preloop command"),
+                "{error}"
+            );
+            assert!(
+                error.contains("It is serving http://127.0.0.1:9090"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("kill {pid} && preloop serve")),
+                "{error}"
+            );
+        } else {
+            assert!(
+                error.contains("another preloop serve already holds"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("recorded holder pid {pid} (started ")),
+                "{error}"
+            );
+            assert!(
+                error.contains("not verified as the lock owner on this OS"),
+                "{error}"
+            );
+            assert!(!error.contains(&format!("kill {pid}")), "{error}");
+            assert!(error.contains(platform_lookup_hint()), "{error}");
+        }
+    }
+
+    #[test]
+    fn foreground_and_systemd_holders_get_their_own_fix() {
+        let lock_path = std::path::Path::new("/tmp/preloop-test/serve.lock");
+        let foreground = LockHolder {
+            pid: 48123,
+            started: None,
+            origin: EngineOrigin::Foreground,
+            state_dir: None,
+            listen: None,
+        };
+        let message =
+            render_lock_held_message(lock_path, &foreground.render(), Some(foreground.pid));
+        assert!(message.contains("in another terminal"), "{message}");
+        assert!(
+            message.contains("Stop it there with Ctrl-C, or:  kill "),
+            "{message}"
+        );
+
+        let systemd = LockHolder {
+            origin: EngineOrigin::Systemd,
+            state_dir: Some("/var/lib/preloop/state".into()),
+            ..foreground
+        };
+        let message = render_lock_held_message(lock_path, &systemd.render(), Some(systemd.pid));
+        assert!(
+            message.contains("as a systemd service (preloop.service, pid"),
+            "{message}"
+        );
+        assert!(
+            message.contains("sudo systemctl stop preloop.socket preloop.service"),
+            "{message}"
+        );
+        assert!(message.contains("systemctl --user"), "{message}");
+    }
+
+    /// A holder that left no usable record gets the generic hint.
+    #[test]
+    fn unreadable_holder_record_gets_the_generic_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("serve.lock");
+        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None).unwrap();
+        // An older build holds the lock and wrote no record.
+        std::fs::write(&lock_path, "").unwrap();
+        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no usable record of itself"), "{error}");
+        assert!(error.contains(platform_lookup_hint()), "{error}");
+    }
+
+    /// A record whose PID is not the kernel owner cannot name a live holder,
+    /// even if that PID happens to belong to another process.
+    #[test]
+    fn record_naming_an_unverified_pid_gets_the_generic_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("serve.lock");
+        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None).unwrap();
+        // The owner evidence below is deliberately absent from this record.
+        std::fs::write(&lock_path, "pid=2147483646\norigin=background\n").unwrap();
+        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "the record names pid 2147483646, but it could not be verified as this lock's owner"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("kill 2147483646"), "{error}");
+        assert!(error.contains(platform_lookup_hint()), "{error}");
+    }
+
+    /// A live PID in the record is still unsafe to target when lock metadata
+    /// identifies another owner.
+    #[test]
+    fn live_unrelated_pid_never_gets_targeted_kill_guidance() {
+        let lock_path = std::path::Path::new("/tmp/preloop-test/serve.lock");
+        let holder = LockHolder {
+            pid: std::process::id(),
+            started: None,
+            origin: EngineOrigin::Background,
+            state_dir: None,
+            listen: None,
+        };
+        let message = render_lock_held_message(
+            lock_path,
+            &holder.render(),
+            Some(holder.pid.saturating_add(1)),
+        );
+        assert!(
+            message.contains("not verified as the lock owner on this OS"),
+            "{message}"
+        );
+        assert!(
+            !message.contains(&format!("kill {}", holder.pid)),
+            "{message}"
+        );
+        assert!(message.contains(platform_lookup_hint()), "{message}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_lock_owner_requires_exact_flock_inode() {
+        let device = libc::makedev(8, 2) as u64;
+        let proc_locks = "\
+1: POSIX  ADVISORY  WRITE 77 08:02:111 0 EOF
+2: FLOCK  ADVISORY  WRITE 123 08:02:456 0 EOF
+";
+        assert_eq!(linux_proc_locks_owner(proc_locks, device, 456), Some(123));
+        assert_eq!(linux_proc_locks_owner(proc_locks, device, 457), None);
+    }
+
+    /// The lookup hint this platform must print. `lslocks` names the flock
+    /// owner on Linux; elsewhere lsof cannot, so the engines are listed instead.
+    fn platform_lookup_hint() -> &'static str {
+        if cfg!(target_os = "linux") {
+            "find the process holding it:  lslocks | grep serve.lock"
+        } else {
+            "find the process holding it:  ps -axo pid=,lstart=,command= | grep '[p]reloop serve'"
+        }
+    }
+
+    /// Unverified messages name a way to look and never a PID to kill. They are
+    /// deterministic on every platform, so macOS exercises them too.
+    #[test]
+    fn unverified_holder_messages_never_suggest_a_kill() {
+        let lock_path = std::path::Path::new("/tmp/preloop-test/serve.lock");
+        let live = LockHolder {
+            pid: std::process::id(),
+            started: None,
+            origin: EngineOrigin::Background,
+            state_dir: None,
+            listen: None,
+        };
+        let live_record = live.render();
+        let dead_record = "pid=2147483646\norigin=background\n";
+        let messages = [
+            render_lock_held_message(lock_path, "", None),
+            render_lock_held_message(lock_path, dead_record, None),
+            render_lock_held_message(lock_path, &live_record, None),
+            render_lock_held_message(lock_path, &live_record, Some(live.pid.saturating_add(1))),
+        ];
+        for message in messages {
+            assert!(!message.contains("kill "), "{message}");
+            assert!(message.contains(platform_lookup_hint()), "{message}");
+            assert!(
+                !message.contains(&format!("lsof {}", lock_path.display())),
+                "{message}"
+            );
+        }
+    }
+
+    /// A live recorded PID is named with the command that checks that process.
+    /// A dead one is reported only as unverified, never as running.
+    #[test]
+    fn live_recorded_pid_is_shown_as_unverified() {
+        let lock_path = std::path::Path::new("/tmp/preloop-test/serve.lock");
+        let pid = std::process::id();
+        assert!(pid_is_running(pid));
+        assert!(!pid_is_running(2147483646));
+
+        let holder = LockHolder {
+            pid,
+            started: None,
+            origin: EngineOrigin::Background,
+            state_dir: None,
+            listen: None,
+        };
+        let alive = render_lock_held_message(lock_path, &holder.render(), None);
+        assert!(
+            alive.contains(&format!(
+                "recorded holder pid {pid} — not verified as the lock owner on this OS; check with: ps -p {pid} -o lstart=,command="
+            )),
+            "{alive}"
+        );
+
+        let dead_record = "pid=2147483646\norigin=background\n";
+        let dead = render_lock_held_message(lock_path, dead_record, None);
+        assert!(
+            dead.contains(
+                "the record names pid 2147483646, but it could not be verified as this lock's owner"
+            ),
+            "{dead}"
+        );
+        assert!(!dead.contains("recorded holder pid"), "{dead}");
+    }
+
+    #[test]
+    fn systemd_holder_is_told_to_stop_the_socket_as_well() {
+        let holder = LockHolder {
+            pid: 48213,
+            started: None,
+            origin: EngineOrigin::Systemd,
+            state_dir: Some("/var/lib/preloop/state".into()),
+            listen: None,
+        };
+        let message = holder_message(&holder);
+        assert!(message.contains("preloop.service, pid 48213"), "{message}");
+        assert!(
+            message.contains("sudo systemctl stop preloop.socket preloop.service"),
+            "{message}"
+        );
+        assert!(!message.contains("It is serving"), "{message}");
     }
 }

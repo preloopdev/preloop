@@ -561,58 +561,83 @@ fn is_internal_job_variable(key: &str) -> bool {
         || lower.starts_with("actions_")
 }
 
-/// Decode an Azure DevOps typed-dictionary value.
+/// Decode a typed `PipelineContextData` value into plain JSON.
 ///
-/// GitHub/AzDO contextData uses `{"t": TYPE, "d": DATA}` encoding:
-/// - `t=1` (string): `{"t": 1, "d": "value"}` → `"value"`
-/// - `t=2` (dictionary): `{"t": 2, "d": [{"k": "key", "v": VALUE},...]}` → `{"key": decoded(VALUE),...}`
-/// - `t=3` (array): `{"t": 3, "d": [VALUE,...]}` → `[decoded(VALUE),...]`
-/// - `t=4` (bool): `{"t": 4, "d": true/false}` → `true/false`
-/// - `t=5` (number): `{"t": 5, "d": N}` → `N`
+/// The wire codec (`preloop-gha-protocol::azdo::context_data`, matching the
+/// official SDK) tags values with `t`: 0/None-string `{"t":0,"s":…}`,
+/// 1 array `{"t":1,"a":[…]}`, 2 dictionary `{"t":2,"d":[{"k":…,"v":…}]}`,
+/// 3 bool `{"t":3,"b":…}`, 4 number `{"t":4,"n":…}`. Tag 5 also arrives as a
+/// dictionary (legacy ContextDictionary).
 ///
-/// If the value is already a plain JSON object (e.g. from local aksh), it is returned as-is.
+/// For backward compatibility this also accepts the older `{"t":N,"d":…}`
+/// encoding where `d` carried the payload for every tag: 1 string, 2 dict
+/// pairs, 3 array, 4 bool, 5 number.
+///
+/// Nested containers recurse through the same decoder, so a dictionary that
+/// contains an array (e.g. `github.event.pull_request.labels`) decodes the
+/// array instead of collapsing it to null.
+///
+/// If the value has no `t` tag it is already plain JSON and returned as-is.
 pub(crate) fn decode_typed_value(val: &serde_json::Value) -> serde_json::Value {
-    match val.get("t").and_then(|t| t.as_u64()) {
-        Some(1) => {
-            // String
-            val.get("d").cloned().unwrap_or(serde_json::Value::Null)
-        }
-        Some(2) => {
-            // Dictionary
-            let mut obj = serde_json::Map::new();
-            if let Some(entries) = val.get("d").and_then(|d| d.as_array()) {
-                for entry in entries {
-                    if let Some(key) = entry.get("k").and_then(|k| k.as_str()) {
-                        let value = entry
-                            .get("v")
-                            .map(decode_typed_value)
-                            .unwrap_or(serde_json::Value::Null);
-                        obj.insert(key.to_string(), value);
-                    }
-                }
-            }
-            serde_json::Value::Object(obj)
-        }
-        Some(3) => {
-            // Array
-            if let Some(items) = val.get("d").and_then(|d| d.as_array()) {
+    let Some(tag) = val.get("t").and_then(|t| t.as_u64()) else {
+        // Not typed — plain JSON (local aksh or a decoded value written back
+        // into the context by `set_github_context_value`).
+        return val.clone();
+    };
+    match tag {
+        0 => val
+            .get("s")
+            .or_else(|| val.get("d"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        1 => {
+            // Wire arrays carry their items in "a"; legacy strings in "d".
+            if let Some(items) = val.get("a").and_then(|a| a.as_array()) {
                 serde_json::Value::Array(items.iter().map(decode_typed_value).collect())
             } else {
-                serde_json::Value::Array(vec![])
+                val.get("d").cloned().unwrap_or(serde_json::Value::Null)
             }
         }
-        Some(4) => {
-            // Boolean
-            val.get("d").cloned().unwrap_or(serde_json::Value::Null)
+        2 | 5 => {
+            // Dictionary pairs. A scalar `d` under tag 5 is the legacy number
+            // encoding, so pass it through instead of forcing an object.
+            let data = val.get("d").cloned().unwrap_or(serde_json::Value::Null);
+            match data {
+                serde_json::Value::Array(entries) => {
+                    let mut obj = serde_json::Map::new();
+                    for entry in entries {
+                        if let Some(key) = entry.get("k").and_then(|k| k.as_str()) {
+                            let value = entry
+                                .get("v")
+                                .map(decode_typed_value)
+                                .unwrap_or(serde_json::Value::Null);
+                            obj.insert(key.to_string(), value);
+                        }
+                    }
+                    serde_json::Value::Object(obj)
+                }
+                scalar => scalar,
+            }
         }
-        Some(5) => {
-            // Number
-            val.get("d").cloned().unwrap_or(serde_json::Value::Null)
+        3 => {
+            // Wire bools carry `b`; legacy arrays carried `d` as an array.
+            if let Some(b) = val.get("b") {
+                b.clone()
+            } else {
+                match val.get("d").cloned() {
+                    Some(serde_json::Value::Array(items)) => {
+                        serde_json::Value::Array(items.iter().map(decode_typed_value).collect())
+                    }
+                    other => other.unwrap_or(serde_json::Value::Null),
+                }
+            }
         }
-        _ => {
-            // Not typed — return as-is (plain JSON from aksh)
-            val.clone()
-        }
+        4 => val
+            .get("n")
+            .or_else(|| val.get("d"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        _ => val.clone(),
     }
 }
 

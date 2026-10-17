@@ -182,6 +182,23 @@ pub fn make_default_branch_events(event_name: &str, payload: &Value) -> Vec<Effe
     }]
 }
 
+/// [skip ci] labels that suppress CI runs.
+///
+/// Source: Runner.Server/Controllers/MessageController.cs:6258-6259,6283-6285.
+pub(crate) const SKIP_CI_LABELS: &[&str] = &[
+    "[skip ci]",
+    "[ci skip]",
+    "[no ci]",
+    "[skip actions]",
+    "[actions skip]",
+    "***NO_CI***",
+];
+
+/// Whether a single commit message carries any skip-CI label.
+pub(crate) fn has_skip_label(message: &str) -> bool {
+    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
+}
+
 #[cfg(test)]
 #[path = "property_tests.rs"]
 mod property_tests;

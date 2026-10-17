@@ -19,6 +19,23 @@ use tokio_util::io::ReaderStream;
 const SNAPSHOT_REF: &str = "refs/heads/snapshot";
 const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
+/// Subdirectory of `state/snapshots/` holding in-flight snapshot repositories.
+///
+/// A snapshot is published with `rename(2)`, which the kernel refuses across
+/// filesystems (`EXDEV`). Staging under the state directory makes staging and
+/// destination one device by construction; staging in `std::env::temp_dir()`
+/// did not — on the common production layout (`/tmp` a tmpfs, state on
+/// LVM/ext4) every publish failed and the snapshot the run was supposed to
+/// test was never created.
+const SNAPSHOT_STAGING_DIR: &str = ".staging";
+
+/// How long a staging heartbeat may be stale before the startup sweep treats
+/// its entry as abandoned. Snapshot capture is seconds to minutes even for
+/// large repositories; a heartbeat keeps long captures safe while the process
+/// is alive, and an old heartbeat means the owner died between staging and
+/// publish.
+const SNAPSHOT_STAGING_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// TTL for cached GitHub repository metadata (numeric ID + visibility).
 /// Repo metadata changes rarely; five minutes bounds staleness for renames
 /// while keeping repeated local submissions off the network.
@@ -36,6 +53,9 @@ pub enum SnapshotSource {
     LocalWorkspace,
     RemoteRunScoped,
     RemoteRepository,
+    /// A self-built pull-request test merge (the commit exists only in the
+    /// engine). Served from a per-run repository; released with the run.
+    SelfBuiltMerge,
 }
 
 /// Security namespace for remote Git objects. `tenant_id` is deliberately
@@ -106,6 +126,37 @@ pub struct WorkspaceSnapshot {
     /// on-demand fetching fails closed instead of trying anonymous access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_private: Option<bool>,
+    /// The self-built pull-request test merge this run checks out, when it
+    /// tests a merge rather than the head commit itself. [`Self::commit_sha`]
+    /// is then the merge commit; [`Self::head_sha`] stays the pull request's
+    /// head, and the payload's `base.sha`/`head.sha` are labelled from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<SnapshotMerge>,
+}
+
+/// The self-built pull-request test merge a run checks out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMerge {
+    /// The two-parent merge commit (equals [`WorkspaceSnapshot::commit_sha`]).
+    pub sha: String,
+    /// First parent: the base tip the merge was built against.
+    pub base_sha: String,
+    /// Second parent: the pull request's head commit.
+    pub head_sha: String,
+    /// State-directory-relative path of the mirror the served repository
+    /// alternates to, when that mirror is prunable (a checkout-cache
+    /// repository). The run's ownership ref there is dropped at release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_repository: Option<String>,
+}
+
+impl WorkspaceSnapshot {
+    /// Whether this snapshot captured uncommitted edits: its tree differs
+    /// from the workspace `HEAD`'s tree, which is exactly the case where
+    /// `before_sha` (the diff base) is the workspace `HEAD` itself.
+    pub fn captures_dirty_tree(&self) -> bool {
+        self.head_sha.is_some() && self.before_sha.as_deref() == self.head_sha.as_deref()
+    }
 }
 
 /// Parse a GitHub `owner/repo` slug from a git remote URL.
@@ -317,6 +368,14 @@ async fn detect_workspace_upstream(
     Some((slug, repository_id, private))
 }
 
+/// Staging root for one snapshot, under the destination directory tree so the
+/// publish is always a same-filesystem [`tokio::fs::rename`].
+fn snapshot_staging_root(snapshots_dir: &FsPath, run_id: RunId) -> PathBuf {
+    snapshots_dir
+        .join(SNAPSHOT_STAGING_DIR)
+        .join(format!("{run_id}-{}", uuid::Uuid::new_v4()))
+}
+
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
 ///
 /// A private index and a temporary bare object database keep the user's index,
@@ -330,6 +389,7 @@ pub async fn create_workspace_snapshot(
     run_id: RunId,
     shared: Option<&SharedState>,
     github_pat: Option<&str>,
+    merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
 ) -> Result<WorkspaceSnapshot, ApiError> {
     let started = std::time::Instant::now();
     let workspace = std::fs::canonicalize(workspace).map_err(|error| {
@@ -356,12 +416,11 @@ pub async fn create_workspace_snapshot(
         )));
     }
 
-    // Keep the staging repository outside the source worktree. Otherwise a
-    // state directory that is not ignored could recursively snapshot itself.
-    let staging_root = std::env::temp_dir().join(format!(
-        "preloop-workspace-snapshot-{run_id}-{}",
-        uuid::Uuid::new_v4()
-    ));
+    // Keep the staging repository outside the source worktree (a state
+    // directory that is not ignored could otherwise recursively snapshot
+    // itself) and on the destination's own filesystem, so the publish below
+    // is a device-local `rename(2)` rather than an `EXDEV` failure.
+    let staging_root = snapshot_staging_root(&snapshots_dir, run_id);
     let staging_repository = staging_root.join("repository.git");
     let staging_index = staging_root.join("index");
     tokio::fs::create_dir_all(&staging_root)
@@ -372,11 +431,48 @@ pub async fn create_workspace_snapshot(
                 staging_root.display()
             ))
         })?;
+    let heartbeat_path = staging_root.join(".heartbeat");
+    tokio::fs::write(&heartbeat_path, b"")
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to create snapshot staging heartbeat {}: {error}",
+                heartbeat_path.display()
+            ))
+        })?;
+    let heartbeat_staging_root = staging_root.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                tokio::fs::write(heartbeat_staging_root.join(".heartbeat"), b"").await
+            {
+                debug!(%error, "Snapshot staging heartbeat stopped");
+                break;
+            }
+        }
+    });
 
     // Detect the workspace's GitHub upstream concurrently with snapshot
     // creation. Best-effort: a missing remote or unresolvable slug leaves
     // the snapshot without upstream coordinates and LFS on-demand fetching
     // stays disabled, as before.
+    //
+    // The merge path needs the workspace's `origin` URL to fetch the current
+    // base tip from, and the configured forge host so the engine credential
+    // rides only to the operator's own forge. Resolved before the join so
+    // the snapshot future receives them by value.
+    let (origin_url, forge_host) = if merge.is_some() {
+        let forge_host = shared
+            .map(|shared| shared.state.github_urls.server_url.clone())
+            .and_then(|url| reqwest::Url::parse(&url).ok())
+            .and_then(|url| url.host_str().map(str::to_owned));
+        (workspace_origin_url(&workspace).await, forge_host)
+    } else {
+        (None, None)
+    };
     let (result, upstream) = tokio::join!(
         create_workspace_snapshot_inner(
             state_dir,
@@ -384,11 +480,15 @@ pub async fn create_workspace_snapshot(
             &staging_repository,
             &staging_index,
             &final_repository,
-            run_id,
             github_pat,
+            merge,
+            origin_url.as_deref(),
+            forge_host.as_deref(),
         ),
         detect_workspace_upstream(&workspace, shared, github_pat),
     );
+    heartbeat.abort();
+    let _ = heartbeat.await;
     if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await
         && staging_root.exists()
     {
@@ -405,6 +505,7 @@ pub async fn create_workspace_snapshot(
         head_sha,
         default_branch,
         before_sha,
+        merge,
     } = result?;
     let timing = match snapshot_repo_timing(&final_repository) {
         Ok(mut stats) => {
@@ -443,7 +544,24 @@ pub async fn create_workspace_snapshot(
         upstream_repository: upstream.as_ref().map(|(slug, _, _)| slug.clone()),
         upstream_repository_id: upstream.as_ref().and_then(|(_, id, _)| *id),
         upstream_private: upstream.as_ref().and_then(|(_, _, private)| *private),
+        merge,
     })
+}
+
+/// `remote.origin.url` of the workspace, when it has one.
+async fn workspace_origin_url(workspace: &FsPath) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Forge credential for one cacheable repository. The token crosses only the
@@ -1000,6 +1118,7 @@ pub async fn create_remote_checkout_snapshot(
             .and_then(serde_json::Value::as_u64)
             .filter(|id| *id > 0),
         upstream_private: Some(repository_private),
+        merge: None,
     }))
 }
 
@@ -1064,8 +1183,10 @@ async fn create_workspace_snapshot_inner(
     staging_repository: &FsPath,
     staging_index: &FsPath,
     final_repository: &FsPath,
-    run_id: RunId,
     github_pat: Option<&str>,
+    merge: Option<&crate::merge_builder::LocalPullRequestMerge>,
+    origin_url: Option<&str>,
+    forge_host: Option<&str>,
 ) -> Result<SnapshotResult, ApiError> {
     // Creating the staging repository does not depend on anything we learn
     // from the workspace, so pay for both spawns at once. Every millisecond
@@ -1627,6 +1748,112 @@ async fn create_workspace_snapshot_inner(
         }
     }
 
+    // A local `pull_request` run tests the merge of the CURRENT base tip into
+    // the head — the workspace HEAD, or the synthetic snapshot commit when the
+    // tree is dirty — exactly like GitHub's `refs/pull/<n>/merge`. The base tip
+    // is fetched from the workspace's origin into the shared object cache this
+    // repository alternates to, and the merge commit is written here, so the
+    // run's jobs fetch it from the engine. `push` events are untouched: they
+    // test the commit itself, never a merge.
+    let merge = if let Some(local) = merge {
+        let Some(origin_url) = origin_url else {
+            return Err(ApiError::bad_request(format!(
+                "cannot build the pull-request test merge: the workspace has no `origin` \
+                 remote to fetch the base branch `{}` from. Add an origin remote, or re-run \
+                 with --no-merge to test the branch alone.",
+                local.base_branch
+            )));
+        };
+        let mirror = cached_objects
+            .parent()
+            .ok_or_else(|| ApiError::internal("snapshot object cache has no parent"))?
+            .to_path_buf();
+        let head = if Some(tree.as_str()) != source_tree.as_deref() {
+            // Dirty tree: the synthetic snapshot commit carries the edits and
+            // is the head GitHub would see pushed.
+            crate::merge_builder::MergeHead::Commit(commit_sha.clone())
+        } else {
+            let head = source_head.clone().ok_or_else(|| {
+                ApiError::bad_request(
+                    "cannot build the pull-request test merge: the workspace has no commits \
+                     (unborn HEAD). Commit your changes, or re-run with --no-merge.",
+                )
+            })?;
+            crate::merge_builder::MergeHead::Commit(head)
+        };
+        if Some(tree.as_str()) != source_tree.as_deref() {
+            // The dirty snapshot commit is engine-created and intentionally
+            // is not on origin. Import its objects into the merge mirror
+            // before the shared builder resolves the head; only the base is
+            // fetched from the forge.
+            let mut import = Command::new("git");
+            import
+                .env("GIT_DIR", &mirror)
+                .args(["fetch", "--no-tags"])
+                .arg(staging_repository.as_os_str())
+                .arg(&commit_sha);
+            run_git(&mut import, "import dirty snapshot into merge mirror").await?;
+        }
+        let source = crate::merge_builder::MergeSource {
+            mirror,
+            fetch_url: Some(origin_url.to_owned()),
+            token: github_pat.map(str::to_owned),
+            forge_host: forge_host.map(str::to_owned),
+        };
+        let request = crate::merge_builder::MergeRequest {
+            repository: local.repository.clone(),
+            pull_request_number: local.pull_request_number,
+            base_branch: local.base_branch.clone(),
+            head,
+        };
+        match crate::merge_builder::build_merge(&source, &request, staging_repository).await {
+            Ok(crate::merge_builder::MergeOutcome::Merged(merged)) => {
+                // Changed-file actions resolve their diff base from the base
+                // branch ref; publish the fetched tip so `origin/<base>` is
+                // the base this merge was actually built against, not the
+                // workspace's possibly-stale local ref.
+                let mut publish_base = snapshot_git_command(
+                    workspace,
+                    staging_repository,
+                    staging_index,
+                    &cached_objects,
+                );
+                publish_base.args([
+                    "update-ref",
+                    &format!("refs/heads/{}", local.base_branch),
+                    &merged.base_sha,
+                ]);
+                if let Err(error) = run_git(&mut publish_base, "publish merge base ref").await {
+                    warn!(error = ?error, "failed to publish the fetched base tip in the snapshot");
+                }
+                Some(SnapshotMerge {
+                    sha: merged.sha.clone(),
+                    base_sha: merged.base_sha.clone(),
+                    head_sha: merged.head_sha.clone(),
+                    mirror_repository: None,
+                })
+            }
+            Ok(crate::merge_builder::MergeOutcome::Conflict { paths, .. }) => {
+                return Err(ApiError::conflict(format!(
+                    "the pull request has merge conflicts with `{}`: {}. GitHub does not run \
+                     pull_request workflows on a conflicted pull request; resolve the \
+                     conflicts, or re-run with --no-merge to test the branch alone.",
+                    local.base_branch,
+                    paths.join(", ")
+                )));
+            }
+            Err(error) => return Err(error.into_api_error()),
+        }
+    } else {
+        None
+    };
+    // A merged run checks out the merge commit; `tree_sha` stays the head
+    // tree (what push-back materializes from), and `head_sha` stays the head.
+    let commit_sha = match &merge {
+        Some(merge) => merge.sha.clone(),
+        None => commit_sha,
+    };
+
     // Allow clients to fetch arbitrary commits that exist in the snapshot's
     // object store, not just advertised ref tips: workflows that deep-fetch a
     // concrete SHA (`git fetch origin <sha>`, `fetch-depth: 0` checkouts of a
@@ -1669,13 +1896,7 @@ async fn create_workspace_snapshot_inner(
     // `lfs: true` can download through the snapshot Git HTTP endpoint.
     copy_lfs_objects_into_snapshot(&common_dir, staging_repository).await?;
 
-    tokio::fs::rename(staging_repository, final_repository)
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "failed to publish snapshot repository for run {run_id}: {error}"
-            ))
-        })?;
+    publish_staged_repository(staging_repository, final_repository).await?;
     Ok(SnapshotResult {
         commit_sha,
         // The snapshot commit's tree — the exact staged dirty tree CI tests,
@@ -1685,7 +1906,161 @@ async fn create_workspace_snapshot_inner(
         head_sha: source_head,
         default_branch,
         before_sha,
+        merge,
     })
+}
+
+/// Publish a staged snapshot repository at its final path.
+///
+/// The publish is a `rename(2)`: atomic, and the reason staging exists at all —
+/// a half-written repository must never be visible to a run. Callers stage
+/// under [`SNAPSHOT_STAGING_DIR`] so the rename stays on one device. A staging
+/// tree that landed elsewhere anyway (an operator bind-mount over the staging
+/// directory, a future caller) is copied into the destination directory and
+/// renamed from there, which keeps the atomicity while paying for a copy
+/// instead of failing every run.
+async fn publish_staged_repository(staging: &FsPath, destination: &FsPath) -> Result<(), ApiError> {
+    match rename_staged(staging, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            #[cfg(test)]
+            CROSS_DEVICE_PUBLISHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            warn!(
+                staging = %staging.display(),
+                destination = %destination.display(),
+                %error,
+                "Snapshot staging directory is on another filesystem; copying it into the state directory to publish"
+            );
+            let in_place = destination
+                .parent()
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "snapshot repository has no parent directory: {}",
+                        destination.display()
+                    ))
+                })?
+                .join(format!(".publish-{}", uuid::Uuid::new_v4()));
+            let source = staging.to_path_buf();
+            let staged = in_place.clone();
+            let copied = tokio::task::spawn_blocking(move || copy_dir_recursive(&source, &staged))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("snapshot publish copy task failed: {error}"))
+                })?;
+            if let Err(error) = copied {
+                let _ = tokio::fs::remove_dir_all(&in_place).await;
+                return Err(publish_failure(
+                    "copying the staging tree into the state directory",
+                    staging,
+                    destination,
+                    &error,
+                ));
+            }
+            match tokio::fs::rename(&in_place, destination).await {
+                Ok(()) => {
+                    // The staging tree sat on another device; removing it is
+                    // best-effort and cannot invalidate the published copy.
+                    if let Err(error) = tokio::fs::remove_dir_all(staging).await {
+                        warn!(
+                            staging = %staging.display(),
+                            %error,
+                            "Failed to remove the cross-filesystem snapshot staging directory"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_dir_all(&in_place).await;
+                    Err(publish_failure(
+                        "renaming the staged copy into place",
+                        staging,
+                        destination,
+                        &error,
+                    ))
+                }
+            }
+        }
+        Err(error) => Err(publish_failure("renaming", staging, destination, &error)),
+    }
+}
+
+/// Log a publish failure with both paths and the OS error, then hand the same
+/// detail to the caller.
+///
+/// A failed publish denies the run its only source of the tested tree, so it
+/// must never be reduced to a warning: the operator sees the OS error and the
+/// two paths here, and a local submission is refused with the message.
+fn publish_failure(
+    step: &str,
+    staging: &FsPath,
+    destination: &FsPath,
+    error: &std::io::Error,
+) -> ApiError {
+    error!(
+        staging = %staging.display(),
+        destination = %destination.display(),
+        %error,
+        "Failed to publish workspace snapshot repository"
+    );
+    ApiError::internal(format!(
+        "failed to publish workspace snapshot repository: {step} {} -> {} failed: {error}",
+        staging.display(),
+        destination.display()
+    ))
+}
+
+/// Publish rename with the test seam in front of it.
+async fn rename_staged(staging: &FsPath, destination: &FsPath) -> std::io::Result<()> {
+    if let Some(error) = injected_rename_failure(destination) {
+        return Err(error);
+    }
+    tokio::fs::rename(staging, destination).await
+}
+
+/// Publish renames still to answer with `EXDEV`, for one destination path.
+///
+/// Only a genuine cross-filesystem rename makes the kernel return `EXDEV`, and
+/// a host with a spare filesystem exercises the recovery for real (the tests
+/// mount a RAM disk on macOS and use `/dev/shm` where it exists). Where no
+/// second filesystem can be had, this reproduces the kernel's answer without
+/// one. Scoped to a destination path so a test cannot fail a rename another
+/// test is running, and counted down so the recovery's own rename — which
+/// targets that same path — still succeeds.
+#[cfg(test)]
+static INJECTED_RENAME_FAILURES: parking_lot::Mutex<Option<(PathBuf, usize)>> =
+    parking_lot::Mutex::new(None);
+
+/// Number of publishes that took the cross-device recovery, for tests.
+#[cfg(test)]
+static CROSS_DEVICE_PUBLISHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn inject_rename_failure(destination: &FsPath, count: usize) {
+    *INJECTED_RENAME_FAILURES.lock() = Some((destination.to_path_buf(), count));
+}
+
+#[cfg(test)]
+fn cross_device_publishes() -> usize {
+    CROSS_DEVICE_PUBLISHES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Take one injected failure for `destination`, if any are pending. Compiled
+/// out of production builds, which have no way to fake a device boundary.
+fn injected_rename_failure(destination: &FsPath) -> Option<std::io::Error> {
+    #[cfg(test)]
+    {
+        let mut pending = INJECTED_RENAME_FAILURES.lock();
+        if let Some((path, remaining)) = pending.as_mut()
+            && path == destination
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Some(std::io::Error::from_raw_os_error(libc::EXDEV));
+        }
+    }
+    let _ = destination;
+    None
 }
 
 /// The immutable snapshot commit plus the workspace facts needed to present
@@ -1696,6 +2071,9 @@ struct SnapshotResult {
     head_sha: Option<String>,
     default_branch: Option<String>,
     before_sha: Option<String>,
+    /// The self-built test merge written into this repository, when the run
+    /// tests a merge rather than the head commit.
+    merge: Option<SnapshotMerge>,
 }
 
 /// What one `git rev-parse` tells us about the source workspace.
@@ -2630,7 +3008,7 @@ async fn deepen_object_cache_from_remote(
 /// `https://user:token@github.com/owner/repo` becomes
 /// `https://github.com/owner/repo`. Schemeless (SSH) remotes carry no
 /// userinfo and are returned untouched.
-fn sanitize_remote_url(remote_url: &str) -> String {
+pub(crate) fn sanitize_remote_url(remote_url: &str) -> String {
     let Some((scheme, rest)) = remote_url.split_once("://") else {
         return remote_url.to_owned();
     };
@@ -2666,6 +3044,21 @@ fn scoped_fetch_auth_header(upstream_url: &str, token: &str) -> Option<(String, 
         format!("http.{scheme}://{host}/.extraHeader"),
         format!("Authorization: basic {encoded}"),
     ))
+}
+
+/// The engine's read credential for one repository: a contents-read App
+/// installation token first, then the static PAT. `None` means anonymous
+/// access (a public repository, or no credential configured at all).
+pub(crate) async fn forge_read_token(shared: &SharedState, repository: &str) -> Option<String> {
+    if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        if let Ok(token) =
+            crate::github_app::get_or_mint_token(&app, repository, &permissions).await
+        {
+            return Some(token);
+        }
+    }
+    shared.state.static_github_pat()
 }
 
 /// Extra-header config that authenticates a deepen fetch against the engine's
@@ -2791,8 +3184,14 @@ pub async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
 ///   exists in memory, are deleted now;
 /// - an unparseable or very young entry is left alone: a snapshot being
 ///   written right now must not be swept out from under its run.
+///
+/// Abandoned staging trees under [`SNAPSHOT_STAGING_DIR`] are collected in the
+/// same pass: the success and error paths both remove theirs, so anything left
+/// is a kill between staging and publish — a full repository copy nothing else
+/// ever revisits.
 pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
     let retention = std::time::Duration::from_secs(shared.state.snapshot_retention_seconds);
+    sweep_abandoned_snapshot_staging(&shared.state.state_dir.join("snapshots")).await;
     let runs: std::collections::BTreeMap<
         RunId,
         (ExecutionStatus, Option<chrono::DateTime<chrono::Utc>>),
@@ -2903,6 +3302,72 @@ pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
     }
 }
 
+/// Delete snapshot staging trees abandoned by an earlier engine.
+///
+/// [`create_workspace_snapshot`] removes its staging root on both the success
+/// and the observed-error path, so a surviving entry means the process was
+/// killed mid-capture. Nothing else enumerates this directory, and a staging
+/// tree is a full copy of a bare repository — left alone they accumulate at
+/// the size of the repositories being snapshotted.
+///
+/// The `.heartbeat` file is refreshed throughout each capture, so a live
+/// capture is spared even when child-file writes do not update the staging
+/// root's mtime. Entries without a heartbeat use the root mtime for backwards
+/// compatibility.
+async fn sweep_abandoned_snapshot_staging(snapshots_dir: &FsPath) {
+    let staging_root = snapshots_dir.join(SNAPSHOT_STAGING_DIR);
+    let mut entries = match tokio::fs::read_dir(&staging_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(
+                path = %staging_root.display(),
+                %error,
+                "Failed to list snapshot staging directories for startup sweep"
+            );
+            return;
+        }
+    };
+    let mut swept = 0usize;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    path = %staging_root.display(),
+                    %error,
+                    "Failed to read entry during snapshot staging sweep"
+                );
+                break;
+            }
+        };
+        let path = entry.path();
+        match snapshot_staging_age(&path).await {
+            Some(age) if age < SNAPSHOT_STAGING_GRACE => continue,
+            Some(_) => {}
+            // Unreadable metadata is not a reason to delete: the age is the
+            // only evidence the tree is abandoned.
+            None => continue,
+        }
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => swept += 1,
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "Failed to remove abandoned snapshot staging directory"
+            ),
+        }
+    }
+    if swept > 0 {
+        info!(
+            swept,
+            root = %staging_root.display(),
+            "Removed abandoned snapshot staging directories"
+        );
+    }
+}
+
 /// Marker file recording when a run-scoped cache became releasable.
 const RELEASED_MARKER: &str = "preloop-released-at";
 
@@ -2918,11 +3383,32 @@ pub async fn release_remote_checkout_snapshot(
     run_id: RunId,
 ) {
     let Some(relative) = snapshot.storage_repository.as_deref() else {
+        // A self-built merge's served repository is the run's own
+        // `snapshots/<run_id>` (deleted with the run snapshot), but the
+        // mirror it alternates to is prunable: drop this run's ownership ref
+        // there so the size sweep may reclaim the mirror once no run needs it.
+        if let Some(merge) = &snapshot.merge
+            && snapshot.source == SnapshotSource::SelfBuiltMerge
+            && let Some(mirror) = merge.mirror_repository.as_deref()
+        {
+            let repository = state_dir.join(mirror);
+            let mut delete = Command::new("git");
+            delete
+                .arg("--git-dir")
+                .arg(&repository)
+                .arg("update-ref")
+                .arg("-d")
+                .arg(format!("refs/preloop/runs/{run_id}"));
+            if let Err(error) = run_git(&mut delete, "release merge mirror run ref").await {
+                debug!(%run_id, error = ?error, "Failed to drop merge mirror run ref");
+            }
+        }
         return;
     };
     let repository = state_dir.join(relative);
     match snapshot.source {
         SnapshotSource::LocalWorkspace => {}
+        SnapshotSource::SelfBuiltMerge => {}
         SnapshotSource::RemoteRunScoped => {
             let marker = repository.join(RELEASED_MARKER);
             if let Err(error) = tokio::fs::write(&marker, crate::store::now_us().to_string()).await
@@ -3077,6 +3563,13 @@ async fn entry_age(path: &FsPath) -> Option<std::time::Duration> {
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.elapsed().ok())
+}
+async fn snapshot_staging_age(path: &FsPath) -> Option<std::time::Duration> {
+    let heartbeat = path.join(".heartbeat");
+    match entry_age(&heartbeat).await {
+        Some(age) => Some(age),
+        None => entry_age(path).await,
+    }
 }
 
 async fn remove_cache_entry(path: &FsPath) {
@@ -3674,8 +4167,8 @@ pub fn redirect_primary_checkout(
 /// already-redirected steps are untouched.
 ///
 /// Rewritten ids are appended to `preloop_snapshot_token_steps` — the list
-/// the broker re-mints at claim — because the pinned credential is a
-/// ~50-minute JWT and a queued job outlives it; an expired token turns the
+/// the broker re-mints at claim — because the pinned credential is minted at
+/// submission and a queued job can outlive it; an expired token turns the
 /// relay into a 401 the step can never recover from.
 pub fn reroute_forge_checkouts(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
@@ -3883,7 +4376,7 @@ pub async fn snapshot_git_http(
     // The Bearer challenge tells git the failure is an authentication
     // rejection, so it reports it instead of prompting.
     let storage_repository = match storage_repository {
-        Ok(repository) => repository,
+        Ok(snapshot) => snapshot_storage_repository(&snapshot).to_owned(),
         Err(error) if error.status() == StatusCode::UNAUTHORIZED => {
             return Ok(snapshot_unauthorized_response(error.message()));
         }
@@ -4139,11 +4632,17 @@ fn snapshot_unauthorized_response(message: &str) -> Response<Body> {
         .expect("static 401 response is valid")
 }
 
+/// The run's checkout snapshot, authorized for this token.
+///
+/// Callers get the whole snapshot rather than only its storage repository so
+/// the archive endpoint can bind what it serves to the run's own commit; a
+/// repository-scoped cache's object store holds every cached run's commits
+/// (see [`build_snapshot_archive`]).
 async fn authorize_snapshot_token(
     state: &AppState,
     token: &str,
     run_id: RunId,
-) -> Result<String, ApiError> {
+) -> Result<WorkspaceSnapshot, ApiError> {
     let identity = match crate::auth::results_identity(state, token) {
         Ok(crate::auth::ResultsIdentity::Job(identity)) => identity,
         Ok(crate::auth::ResultsIdentity::System) => {
@@ -4178,6 +4677,19 @@ async fn authorize_snapshot_token(
             "snapshot Git token does not belong to this run",
         ));
     }
+    // The credential is spent with its attempt. This token is exported to
+    // workflow code as `ACTIONS_RUNTIME_TOKEN` and pinned into checkout steps,
+    // and the snapshot is otherwise reachable only by the jobs that hold one —
+    // so a completed (or purged) job's token must not keep fetching the run's
+    // snapshot for the rest of its lifetime. Liveness follows the request
+    // record, exactly like the Results writes (`auth::job_is_live`): an
+    // attempt stays live through a debug session, whose retry replays the
+    // checkout with a freshly minted token from `debug_sessions::poll_verdict`.
+    if !crate::auth::job_is_live(state, identity.job_id).await? {
+        return Err(ApiError::forbidden(
+            "snapshot Git token belongs to a completed job",
+        ));
+    }
     let run = state
         .backend
         .run_record(run_id)
@@ -4187,11 +4699,20 @@ async fn authorize_snapshot_token(
         .workspace_snapshot
         .as_ref()
         .ok_or_else(|| ApiError::not_found("checkout snapshot not found"))?;
-    Ok(snapshot
-        .storage_repository
-        .clone()
-        .unwrap_or_else(|| snapshot.repository.clone()))
+    Ok(snapshot.clone())
 }
+
+/// The bare repository backing a snapshot, relative to the state directory.
+///
+/// Older local snapshots carry no `storage_repository`; theirs is derived
+/// from the snapshot's `repository` (`snapshots/{run-id}`).
+fn snapshot_storage_repository(snapshot: &WorkspaceSnapshot) -> &str {
+    snapshot
+        .storage_repository
+        .as_deref()
+        .unwrap_or(&snapshot.repository)
+}
+
 fn snapshot_authorization_token(value: &str) -> Option<String> {
     let (scheme, credentials) = value.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") {
@@ -4381,6 +4902,231 @@ pub async fn forge_git_http(
         format!("{upstream}?{query}")
     };
     forge_relay_forward(request, &upstream).await
+}
+
+/// REST archive endpoint for checkouts that cannot run Git.
+///
+/// `actions/checkout` derives `{github-server-url}/api/v3` as its API base
+/// when the engine is the run's GHES-shaped server, and without a `git`
+/// binary in the image it downloads the repository through
+/// `GET /repos/{owner}/{repo}/tarball/{ref}` instead of fetching over Git.
+/// Host images have `git`, so only container jobs on minimal images take
+/// this path — and until now the engine answered it with
+/// "not available on this endpoint" (the socket surface refused `/api/v3/*`
+/// and no tarball route existed), which made every `container:` job whose
+/// first step was a redirected `actions/checkout` fail even after the
+/// container could reach the engine.
+///
+/// Two upstreams, mirroring the Git relay's split:
+/// - `snapshots/{run-id}` archives the run's immutable local-workspace
+///   snapshot (`git archive` of the same bare repository the snapshot Git
+///   endpoint serves), authenticated with the pinned job runtime token.
+/// - any other repository is an anonymous forge fetch, relayed to the
+///   forge's own API host with the caller's credential stripped
+///   ([`authorize_forge_relay`] pins the job runtime token; private
+///   repositories keep failing closed on the upstream 404). The forge
+///   answers with a redirect to its archive host, which the engine's relay
+///   client follows and streams back, so the job never needs egress to the
+///   archive host itself.
+pub async fn forge_api_repo_tarball(
+    State(shared): State<Arc<SharedState>>,
+    Path((owner, repo, git_ref)): Path<(String, String, String)>,
+    request: Request,
+) -> Result<Response<Body>, ApiError> {
+    if !valid_repo_segment(&owner) || !valid_repo_segment(&repo) || !valid_archive_ref(&git_ref) {
+        return Err(ApiError::bad_request("invalid archive path"));
+    }
+    if owner == "snapshots" {
+        // The request body is not `Sync`: keep only the credential, and let the
+        // request go before awaiting, or the handler future is not `Send`.
+        let token = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(snapshot_authorization_token);
+        drop(request);
+        return snapshot_repo_tarball(&shared, &repo, &git_ref, token).await;
+    }
+    if let Err(response) = authorize_forge_relay(&shared.state, &request) {
+        return Ok(*response);
+    }
+    // The API base is the forge's own api host (`api.github.com` for the
+    // github.com default), never the server URL — the same rule the Git
+    // relay and the repository lookup follow.
+    let api_base = shared
+        .state
+        .github_urls
+        .api_url
+        .trim_end_matches('/')
+        .to_owned();
+    let upstream = format!("{api_base}/repos/{owner}/{repo}/tarball/{git_ref}");
+    forge_relay_forward(request, &upstream).await
+}
+
+/// `git archive` of a run's local-workspace snapshot, shaped like the forge's
+/// own tarball so `actions/checkout`'s extractor sees a single top-level
+/// `{owner}-{repo}-{sha}/` directory.
+async fn snapshot_repo_tarball(
+    shared: &Arc<SharedState>,
+    run_id_raw: &str,
+    git_ref: &str,
+    token: Option<String>,
+) -> Result<Response<Body>, ApiError> {
+    let run_id = snapshot_route_run_id(run_id_raw)?;
+    let token =
+        token.ok_or_else(|| ApiError::unauthorized("snapshot archive authentication required"))?;
+    let snapshot = match authorize_snapshot_token(&shared.state, &token, run_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.status() == StatusCode::UNAUTHORIZED => {
+            return Ok(snapshot_unauthorized_response(error.message()));
+        }
+        Err(error) => return Err(error),
+    };
+    let repository = shared
+        .state
+        .state_dir
+        .join(snapshot_storage_repository(&snapshot));
+    if !repository.is_dir() {
+        return Err(ApiError::not_found("checkout snapshot not found"));
+    }
+    let archive = build_snapshot_archive(&repository, run_id_raw, git_ref, &snapshot).await?;
+    Ok(archive)
+}
+
+/// Build the snapshot archive response: a gzipped `git archive` written to a
+/// private temp file and streamed back.
+///
+/// Written to disk rather than held in memory: a snapshot can be a whole
+/// repository tree, and the response is streamed to the client anyway.
+///
+/// `git_ref` must resolve to one of the run's own snapshot commits. A
+/// repository-scoped checkout cache is shared by every run of the repository:
+/// its object store holds all cached commits, and the Git endpoint hides
+/// every run ref (`uploadpack.hideRefs refs/preloop/runs`) so a job fetches
+/// only its own commit. The archive endpoint is a second door into the same
+/// store and serves the same set — without the check, any commit in the
+/// cache (another run's tree) could be archived by naming its SHA.
+async fn build_snapshot_archive(
+    repository: &FsPath,
+    run_id_raw: &str,
+    git_ref: &str,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Response<Body>, ApiError> {
+    let sha = resolve_archive_commit(repository, git_ref).await?;
+    if !archive_commit_belongs_to_run(snapshot, &sha) {
+        // The same answer as an unresolvable ref: a request must not learn
+        // whether the commit exists in the shared cache.
+        return Err(ApiError::not_found("snapshot archive ref not found"));
+    }
+    let prefix = archive_prefix("snapshots", run_id_raw, &sha);
+    // Archive the resolved SHA, not the caller's spelling: what was checked
+    // is what gets archived.
+    let archive_path = write_snapshot_archive(repository, &sha, &prefix).await?;
+    let file = tokio::fs::File::open(&archive_path)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to open snapshot archive: {error}")))?;
+    // The handle keeps the data; the directory entry goes away now so a
+    // client that never finishes reading leaves nothing behind.
+    let _ = tokio::fs::remove_file(&archive_path).await;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to stat snapshot archive: {error}")))?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-gzip")
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .unwrap())
+}
+
+/// Run `git archive` for a snapshot into a private file and return its path.
+async fn write_snapshot_archive(
+    repository: &FsPath,
+    git_ref: &str,
+    prefix: &str,
+) -> Result<PathBuf, ApiError> {
+    let archive_path = repository
+        .parent()
+        .map(|parent| parent.join(format!("archive-{}.tar.gz", uuid::Uuid::new_v4())))
+        .ok_or_else(|| ApiError::internal("snapshot repository has no parent directory"))?;
+    let args = snapshot_archive_args(git_ref, prefix);
+    let output = tokio::process::Command::new("git")
+        .current_dir(repository)
+        .args(args.iter().map(String::as_str))
+        .arg("-o")
+        .arg(&archive_path)
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to run git archive: {error}")))?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::not_found(format!(
+            "snapshot archive ref not found: {}",
+            stderr.trim().lines().last().unwrap_or("")
+        )));
+    }
+    Ok(archive_path)
+}
+
+/// `git archive` arguments for a snapshot tarball: gzip, GitHub's single
+/// top-level directory, then the requested tree-ish.
+fn snapshot_archive_args(git_ref: &str, prefix: &str) -> Vec<String> {
+    vec![
+        "archive".to_owned(),
+        "--format=tar.gz".to_owned(),
+        format!("--prefix={prefix}"),
+        git_ref.to_owned(),
+    ]
+}
+
+/// The forge's archive directory name: `{owner}-{repo}-{sha}`.
+fn archive_prefix(owner: &str, repo: &str, sha: &str) -> String {
+    format!("{owner}-{repo}-{sha}/")
+}
+
+/// Whether a resolved archive commit is one of the run's own snapshot
+/// commits: the snapshot store's commit (for remote checkouts the fetched
+/// commit, for local workspaces the synthetic one) or the real workspace
+/// commit the snapshot is based on, when it carries one.
+fn archive_commit_belongs_to_run(snapshot: &WorkspaceSnapshot, sha: &str) -> bool {
+    sha == snapshot.commit_sha || snapshot.head_sha.as_deref() == Some(sha)
+}
+
+/// Resolve the archive's commit so the prefix carries a sha, and so an
+/// unprovable ref never reaches `git archive` as an argument.
+async fn resolve_archive_commit(repository: &FsPath, git_ref: &str) -> Result<String, ApiError> {
+    let output = tokio::process::Command::new("git")
+        .current_dir(repository)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{git_ref}^{{commit}}"),
+        ])
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to run git rev-parse: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::not_found("snapshot archive ref not found"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Archive refs arrive in a URL path segment: allow sha(1)/sha256(256) hex and
+/// ordinary ref names, never anything that could read as a `git` option or a
+/// traversal.
+fn valid_archive_ref(git_ref: &str) -> bool {
+    !git_ref.is_empty()
+        && git_ref.len() <= 1024
+        && !git_ref.starts_with('-')
+        && git_ref.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'+' | b'-')
+        })
+        && !git_ref
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
 }
 
 /// Minimal `api/v3/repos/{owner}/{repo}` passthrough for checkout's
@@ -5602,7 +6348,7 @@ mod remote_checkout_cache_tests {
         let canonical = canonical_slug.to_owned();
         let router = axum::Router::new()
             .route(
-                "/repositories/:id",
+                "/repositories/{id}",
                 get(
                     |Path(id): Path<u64>,
                      Extension(repo_id): Extension<RepoId>,
@@ -5639,7 +6385,7 @@ mod remote_checkout_cache_tests {
                 ),
             )
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |Extension(authed): Extension<AuthedDownloads>,
                      Extension(blob): Extension<Vec<u8>>| async move {
@@ -5709,7 +6455,7 @@ mod remote_checkout_cache_tests {
                 ),
             )
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |headers: axum::http::HeaderMap,
                      Extension(authed): Extension<AuthedDownloads>,
@@ -5966,7 +6712,7 @@ mod remote_checkout_cache_tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = axum::Router::new()
             .route(
-                "/blobs/:oid",
+                "/blobs/{oid}",
                 get(
                     |headers: HeaderMap,
                      Extension(authed): Extension<Arc<AtomicUsize>>,
@@ -6201,6 +6947,382 @@ mod snapshot_sweep_tests {
         assert!(
             !dir.exists(),
             "re-armed timer discards unreferenced snapshot"
+        );
+    }
+
+    /// A kill between staging a snapshot and publishing it leaves a full bare
+    /// repository under `state/snapshots/.staging` that nothing else ever
+    /// revisits: the publish removes its own staging root on every path it can
+    /// observe. The startup sweep is the only collector, and it must spare a
+    /// tree young enough to belong to a capture running right now (a second
+    /// engine process can share the state directory).
+    #[tokio::test]
+    async fn sweep_collects_abandoned_staging_and_spares_a_live_capture() {
+        let (_temp, shared) = fixture(60).await;
+        let staging_root = shared
+            .state
+            .state_dir
+            .join("snapshots")
+            .join(SNAPSHOT_STAGING_DIR);
+        let abandoned = staging_root.join(format!("{}-{}", RunId::new(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(abandoned.join("repository.git")).unwrap();
+        std::fs::write(
+            abandoned.join("repository.git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        let live = staging_root.join(format!("{}-{}", RunId::new(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(abandoned.join(".heartbeat"), b"").unwrap();
+        std::fs::write(live.join(".heartbeat"), b"").unwrap();
+        // Age the abandoned heartbeat past the grace window. The live root is
+        // intentionally stale too: its fresh heartbeat represents a capture
+        // that is still writing into repository.git.
+        let stale = filetime::FileTime::from_unix_time(
+            chrono::Utc::now().timestamp() - SNAPSHOT_STAGING_GRACE.as_secs() as i64 - 60,
+            0,
+        );
+        filetime::set_file_mtime(abandoned.join(".heartbeat"), stale).unwrap();
+        filetime::set_file_mtime(&live, stale).unwrap();
+
+        sweep_workspace_snapshots(&shared).await;
+
+        assert!(
+            !abandoned.exists(),
+            "an abandoned staging tree is collected at startup"
+        );
+        assert!(
+            live.is_dir(),
+            "a staging tree inside the grace window may still be a live capture"
+        );
+    }
+}
+
+/// Cross-filesystem publish coverage.
+///
+/// The bug these tests pin: the snapshot was staged in the process temp
+/// directory, so publishing it was a `rename(2)` across filesystems — which
+/// the kernel refuses with `EXDEV` whenever `/tmp` is not on the state
+/// directory's device (tmpfs `/tmp` over an LVM/ext4 state volume, the common
+/// production layout). The immutable snapshot was never created, and a local
+/// submission — whose synthetic commit exists nowhere else — fell back to a
+/// checkout of a commit no forge has.
+#[cfg(test)]
+mod snapshot_staging_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Directories that may sit on another device than the state directory,
+    /// cheapest first. Linux gives `/dev/shm` for free; macOS needs a RAM disk.
+    const OTHER_DEVICE_CANDIDATES: &[&str] = &["/dev/shm", "/run/shm"];
+
+    fn device_of(path: &FsPath) -> Option<u64> {
+        std::fs::metadata(path).ok().map(|metadata| metadata.dev())
+    }
+
+    /// Whether `path` is writable and on a different device from `reference`.
+    fn is_other_device(path: &FsPath, reference: &FsPath) -> bool {
+        let (Some(path_device), Some(reference_device)) = (device_of(path), device_of(reference))
+        else {
+            return false;
+        };
+        if path_device == reference_device {
+            return false;
+        }
+        // A read-only mount is not a usable staging root.
+        let probe = path.join(format!("preloop-device-probe-{}", uuid::Uuid::new_v4()));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a rename between the two directories really is cross-device, by
+    /// asking the kernel rather than trusting the fixture.
+    async fn is_cross_device_rename(from: &FsPath, to: &FsPath) -> bool {
+        let probe = from.join(format!("preloop-rename-probe-{}", uuid::Uuid::new_v4()));
+        let target = to.join(format!("preloop-rename-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&probe).unwrap();
+        match tokio::fs::rename(&probe, &target).await {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&target);
+                false
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&probe);
+                error.kind() == std::io::ErrorKind::CrossesDevices
+            }
+        }
+    }
+
+    /// A directory on a different filesystem from the state directory,
+    /// unmounted when it goes out of scope.
+    struct OtherFilesystem {
+        path: PathBuf,
+        /// Device node of a RAM disk to detach on drop; `None` for a
+        /// borrowed mount such as `/dev/shm`.
+        ram_disk: Option<String>,
+    }
+
+    impl OtherFilesystem {
+        fn create(reference: &FsPath, scratch: &FsPath) -> Option<Self> {
+            if let Some(path) = OTHER_DEVICE_CANDIDATES
+                .iter()
+                .map(FsPath::new)
+                .find(|candidate| is_other_device(candidate, reference))
+            {
+                return Some(Self {
+                    path: path.to_path_buf(),
+                    ram_disk: None,
+                });
+            }
+            ram_disk_other_filesystem(reference, scratch)
+        }
+    }
+
+    impl Drop for OtherFilesystem {
+        fn drop(&mut self) {
+            let Some(device) = self.ram_disk.take() else {
+                return;
+            };
+            let _ = std::process::Command::new("diskutil")
+                .args(["unmount", "force"])
+                .arg(&self.path)
+                .output();
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", &device])
+                .output();
+        }
+    }
+
+    /// macOS has no second device to borrow, so the test makes one: a RAM disk
+    /// is attachable, formattable and mountable by the invoking user — both
+    /// device nodes and `diskutil mount` work without root, which is what lets
+    /// CI and a developer's machine exercise a real cross-device rename.
+    #[cfg(target_os = "macos")]
+    fn ram_disk_other_filesystem(reference: &FsPath, scratch: &FsPath) -> Option<OtherFilesystem> {
+        // 1 GiB: the process temp dir points here for the duration of one test,
+        // so sibling tests sharing the test binary must not run out of space.
+        let attached = std::process::Command::new("hdiutil")
+            .args(["attach", "-nomount", "ram://2097152"])
+            .output()
+            .ok()?;
+        if !attached.status.success() {
+            return None;
+        }
+        let device = String::from_utf8_lossy(&attached.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)?;
+        let formatted = std::process::Command::new("newfs_hfs")
+            .args(["-v", "PRELOOP-SNAPSHOT-TEST", &device])
+            .output()
+            .ok()?;
+        if !formatted.status.success() {
+            detach_ram_disk(&device);
+            return None;
+        }
+        let mount_point = scratch.join("other-filesystem");
+        std::fs::create_dir_all(&mount_point).ok()?;
+        let mounted = std::process::Command::new("diskutil")
+            .args(["mount", "-mountPoint"])
+            .arg(&mount_point)
+            .arg(device.trim_start_matches("/dev/"))
+            .output()
+            .ok()?;
+        if !mounted.status.success() || !is_other_device(&mount_point, reference) {
+            let _ = std::process::Command::new("diskutil")
+                .args(["unmount", "force"])
+                .arg(&mount_point)
+                .output();
+            detach_ram_disk(&device);
+            return None;
+        }
+        Some(OtherFilesystem {
+            path: mount_point,
+            ram_disk: Some(device),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ram_disk_other_filesystem(
+        _reference: &FsPath,
+        _scratch: &FsPath,
+    ) -> Option<OtherFilesystem> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn detach_ram_disk(device: &str) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", device])
+            .output();
+    }
+
+    fn git_ok(directory: &FsPath, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A real worktree with one commit: the snapshot path shells out to `git`
+    /// for the clone, the commit and the ref publication.
+    fn init_workspace(path: &FsPath) {
+        std::fs::create_dir_all(path).unwrap();
+        git_ok(path, &["init", "-q", "-b", "main"]);
+        git_ok(path, &["config", "user.email", "staging@test.local"]);
+        git_ok(path, &["config", "user.name", "staging tests"]);
+        std::fs::write(path.join("README.md"), "snapshot staging\n").unwrap();
+        git_ok(path, &["add", "-A"]);
+        git_ok(path, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Enough of a bare repository for a publish to be worth checking.
+    fn write_bare_repository(path: &FsPath) {
+        std::fs::create_dir_all(path.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(path.join("objects/ab")).unwrap();
+        std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            path.join("refs/heads/main"),
+            format!("{}\n", "0".repeat(40)),
+        )
+        .unwrap();
+        std::fs::write(path.join("objects/ab/cdef"), b"object").unwrap();
+    }
+
+    fn staging_dir_entries(snapshots_dir: &FsPath) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(snapshots_dir.join(SNAPSHOT_STAGING_DIR))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The publish is a `rename(2)`. A staging tree on another filesystem makes
+    /// the kernel answer `EXDEV`, and the published repository must still
+    /// appear complete, with the staging tree gone and no partial copy left
+    /// under the destination's own staging directory.
+    #[tokio::test]
+    async fn cross_filesystem_staging_still_publishes_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshots_dir = temp.path().join("state").join("snapshots");
+        std::fs::create_dir_all(snapshots_dir.join(SNAPSHOT_STAGING_DIR)).unwrap();
+        let destination = snapshots_dir.join(RunId::new().to_string());
+
+        let other = OtherFilesystem::create(&snapshots_dir, temp.path());
+        let staging_dir_guard = other
+            .as_ref()
+            .map(|other| tempfile::tempdir_in(&other.path).unwrap());
+        let staging = match &staging_dir_guard {
+            Some(staging_dir) => staging_dir.path().join("repository.git"),
+            // No second filesystem on this host: reproduce the kernel's answer
+            // for the cross-device rename the recovery exists for.
+            None => snapshots_dir
+                .join(SNAPSHOT_STAGING_DIR)
+                .join("repository.git"),
+        };
+        write_bare_repository(&staging);
+
+        let cross_device = match &other {
+            Some(other) => {
+                let cross_device = is_cross_device_rename(&other.path, &snapshots_dir).await;
+                assert!(
+                    cross_device,
+                    "the fixture must be a different device from the destination"
+                );
+                cross_device
+            }
+            None => {
+                inject_rename_failure(&destination, 1);
+                true
+            }
+        };
+        let publishes_before = cross_device_publishes();
+
+        publish_staged_repository(&staging, &destination)
+            .await
+            .expect("a staging tree on another filesystem must still publish");
+
+        assert!(
+            destination.join("HEAD").is_file(),
+            "the published repository is complete"
+        );
+        assert!(
+            destination.join("objects/ab/cdef").is_file(),
+            "the published repository carries the whole tree"
+        );
+        assert!(
+            !staging.exists(),
+            "the staging tree is gone after publishing"
+        );
+        assert_eq!(
+            staging_dir_entries(&snapshots_dir),
+            Vec::<String>::new(),
+            "no partial copy is left in the destination's staging directory"
+        );
+        if cross_device {
+            assert_eq!(
+                cross_device_publishes(),
+                publishes_before + 1,
+                "the publish took the cross-device recovery"
+            );
+        }
+    }
+
+    /// The bench that found this: staging in the process temp directory made
+    /// the publish fail with `EXDEV` on a host whose `TMPDIR` is a tmpfs, the
+    /// immutable snapshot was never created, and the run fell back to a
+    /// checkout of a commit no forge has. Staging lives under the state
+    /// directory now. This test leaves `TMPDIR` alone: changing the process
+    /// environment raced with other tests that create their own temporary
+    /// directories, which then vanished when this one was torn down. It checks
+    /// the real temp directory for legacy staging trees instead.
+    #[tokio::test]
+    async fn snapshot_publishes_without_staging_in_the_process_temp_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        let state_dir = temp.path().join("state");
+        init_workspace(&workspace);
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let run_id = RunId::new();
+        let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None, None)
+            .await
+            .expect("the snapshot must publish");
+
+        let repository = state_dir.join(&snapshot.repository);
+        assert!(
+            repository.join("HEAD").is_file(),
+            "the immutable snapshot repository is published"
+        );
+        assert_eq!(
+            staging_dir_entries(&state_dir.join("snapshots")),
+            Vec::<String>::new(),
+            "publishing leaves no staging tree behind"
+        );
+        let run_name = run_id.to_string();
+        let staged_in_temp_dir: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with("preloop-workspace-snapshot") && name.contains(&run_name)
+            })
+            .collect();
+        assert!(
+            staged_in_temp_dir.is_empty(),
+            "snapshot staging does not live in the process temp dir: {staged_in_temp_dir:?}"
         );
     }
 }
@@ -6489,6 +7611,256 @@ mod object_cache_tests {
 }
 
 #[cfg(test)]
+mod archive_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_archive_refs_are_url_safe() {
+        assert!(valid_archive_ref(
+            "de2d615edebdc27145960f78962b1b789ea07d33"
+        ));
+        assert!(valid_archive_ref("refs/heads/main"));
+        assert!(valid_archive_ref("v1.2.3-rc.1"));
+        assert!(!valid_archive_ref(""));
+        assert!(!valid_archive_ref("--output=/tmp/x"));
+        assert!(!valid_archive_ref("-x"));
+        assert!(!valid_archive_ref("refs/../etc/passwd"));
+        assert!(!valid_archive_ref("refs//main"));
+        assert!(!valid_archive_ref("refs/heads/main "));
+    }
+
+    #[test]
+    fn archive_arguments_and_prefix_match_the_forge_shape() {
+        assert_eq!(
+            archive_prefix(
+                "snapshots",
+                "7b116f3a-6973-4e4e-bcd1-213de9518ad1",
+                "abc123"
+            ),
+            "snapshots-7b116f3a-6973-4e4e-bcd1-213de9518ad1-abc123/"
+        );
+        assert_eq!(
+            snapshot_archive_args("abc123", "snapshots-run-abc123/"),
+            vec![
+                "archive".to_string(),
+                "--format=tar.gz".to_string(),
+                "--prefix=snapshots-run-abc123/".to_string(),
+                "abc123".to_string(),
+            ]
+        );
+    }
+
+    /// `actions/checkout`'s no-git path extracts GitHub's archive shape: one
+    /// top-level `{owner}-{repo}-{sha}/` directory. Build the real archive
+    /// from a real repository and check the shape the action will see.
+    #[tokio::test]
+    async fn snapshot_archive_has_the_forge_top_level_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("snapshot.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str], cwd: &FsPath| {
+            std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet", "."], &work).status.success());
+        std::fs::write(work.join("tracked.txt"), "archive me\n").unwrap();
+        assert!(git(&["add", "-A"], &work).status.success());
+        assert!(
+            git(&["commit", "--quiet", "-m", "seed"], &work)
+                .status
+                .success()
+        );
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let sha = sha.trim().to_owned();
+        assert!(
+            git(
+                &["clone", "--quiet", "--bare", ".", repo.to_str().unwrap()],
+                &work
+            )
+            .status
+            .success()
+        );
+
+        let prefix = archive_prefix("snapshots", "run-1", &sha);
+        let path = write_snapshot_archive(&repo, &sha, &prefix).await.unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..2], b"\x1f\x8b", "archive must be gzipped");
+        // `tar` sees one top-level directory holding the tree, which is the
+        // directory `actions/checkout` moves the contents out of. The raw
+        // first block is git's `pax_global_header` (commit id metadata), as in
+        // the forge's own tarballs; `tar` does not list it.
+        let listing = std::process::Command::new("tar")
+            .args(["-tzf", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        let entries: Vec<&str> = listing.lines().collect();
+        assert_eq!(
+            entries.first().copied(),
+            Some(prefix.as_str()),
+            "first listed entry must be the top-level dir: {listing}"
+        );
+        assert!(
+            entries.iter().all(|entry| entry.starts_with(&prefix)),
+            "every entry must live under {prefix}: {listing}"
+        );
+        assert!(
+            entries.contains(&format!("{prefix}tracked.txt").as_str()),
+            "the tree must be inside the prefixed directory: {listing}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A repository-scoped cache is shared by every run of the repository:
+    /// its object store holds all cached commits, and the Git endpoint hides
+    /// every run ref so a job fetches only its own commit. The archive
+    /// endpoint must serve the same set — any other cached commit, however it
+    /// is spelled, is refused exactly like a missing ref.
+    #[tokio::test]
+    async fn snapshot_archive_serves_only_the_runs_own_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let repo = dir.path().join("cache.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str], cwd: &FsPath| {
+            std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let head = |cwd: &FsPath| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert!(git(&["init", "--quiet", "."], &work).status.success());
+        std::fs::write(work.join("a.txt"), "the run's tree\n").unwrap();
+        assert!(git(&["add", "-A"], &work).status.success());
+        assert!(
+            git(&["commit", "--quiet", "-m", "run"], &work)
+                .status
+                .success()
+        );
+        let run_commit = head(&work);
+        std::fs::write(work.join("b.txt"), "another run's tree\n").unwrap();
+        assert!(git(&["add", "-A"], &work).status.success());
+        assert!(
+            git(&["commit", "--quiet", "-m", "other"], &work)
+                .status
+                .success()
+        );
+        let other_commit = head(&work);
+        assert!(
+            git(
+                &["clone", "--quiet", "--bare", ".", repo.to_str().unwrap()],
+                &work
+            )
+            .status
+            .success()
+        );
+        // The shared cache's layout: every cached run's commit is a run ref.
+        assert!(
+            git(
+                &[
+                    "--git-dir",
+                    repo.to_str().unwrap(),
+                    "update-ref",
+                    "refs/preloop/runs/other",
+                    other_commit.as_str(),
+                ],
+                dir.path()
+            )
+            .status
+            .success()
+        );
+
+        let snapshot = WorkspaceSnapshot {
+            commit_sha: run_commit.clone(),
+            head_sha: Some(run_commit.clone()),
+            ..Default::default()
+        };
+
+        let response = build_snapshot_archive(&repo, "run-1", &run_commit, &snapshot)
+            .await
+            .expect("the run's own commit archives");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = build_snapshot_archive(&repo, "run-1", &run_commit[..10], &snapshot)
+            .await
+            .expect("a short spelling of the run's commit archives");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for spelling in [other_commit.as_str(), "refs/preloop/runs/other"] {
+            let error = build_snapshot_archive(&repo, "run-1", spelling, &snapshot)
+                .await
+                .expect_err("another run's cached commit must not archive");
+            assert_eq!(error.status(), StatusCode::NOT_FOUND, "{spelling}");
+        }
+    }
+
+    /// The forge answers an archive request with a redirect to its archive
+    /// host (`codeload.github.com`); the relay's client follows it and streams
+    /// the archive, so the job needs egress only to the engine.
+    #[tokio::test]
+    async fn forge_relay_follows_the_archive_redirect() {
+        use axum::routing::get;
+
+        let archive_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let archive_base = format!("http://{}", archive_listener.local_addr().unwrap());
+        let archive =
+            axum::Router::new().route("/codeload/tarball", get(|| async { "archive-bytes" }));
+        tokio::spawn(async move { axum::serve(archive_listener, archive).await.unwrap() });
+
+        let forge_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forge_base = format!("http://{}", forge_listener.local_addr().unwrap());
+        let location = format!("{archive_base}/codeload/tarball");
+        let forge = axum::Router::new().route(
+            "/repos/owner/repo/tarball/main",
+            get(move || {
+                let location = location.clone();
+                async move { (StatusCode::FOUND, [(header::LOCATION, location)]) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(forge_listener, forge).await.unwrap() });
+
+        let request = Request::builder()
+            .uri("/api/v3/repos/owner/repo/tarball/main")
+            .body(Body::empty())
+            .unwrap();
+        let upstream = format!("{forge_base}/repos/owner/repo/tarball/main");
+        let response = forge_relay_forward(request, &upstream).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"archive-bytes");
+    }
+}
+
+#[cfg(test)]
 mod lfs_accounting_tests {
     use super::*;
     use crate::github_breaker::GithubCredentialBucket;
@@ -6549,7 +7921,7 @@ mod lfs_accounting_tests {
                         axum::routing::get(move || async move { blob_response(blob) }),
                     )
                     .route(
-                        "/*path",
+                        "/{*path}",
                         axum::routing::post(move || async move { batch_response(&batch_body) }),
                     );
                 servers.push(tokio::spawn(async move {
@@ -6578,7 +7950,7 @@ mod lfs_accounting_tests {
                 let batch_base = format!("http://{}", batch_listener.local_addr().unwrap());
                 servers.push(tokio::spawn(async move {
                     let app = axum::Router::new().route(
-                        "/*path",
+                        "/{*path}",
                         axum::routing::post(move || async move { batch_response(&batch_body) }),
                     );
                     axum::serve(batch_listener, app).await.unwrap()

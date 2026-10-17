@@ -298,7 +298,7 @@ where
             loop {
                 match try_drain_message(&mut buf) {
                     Some(Ok(text)) => ws_sink
-                        .send(Message::Text(text))
+                        .send(Message::Text(text.into()))
                         .await
                         .map_err(|e| BridgeError::Handshake(format!("ws send: {e}")))?,
                     Some(Err(e)) => return Err(e),

@@ -1516,6 +1516,58 @@ pub(crate) mod suite {
         );
     }
 
+    /// The cancel result comes from the locked transition, not an earlier read
+    /// or the number of in-flight cancellation messages.
+    pub(crate) async fn cancel_outcome_tracks_locked_transition(backend: &dyn ControlBackend) {
+        let queued = RunId::new();
+        backend
+            .submit_run(submit_run(queued, vec![submit_job(queued, "build", 1)]))
+            .await
+            .unwrap();
+        let cancelled = backend.cancel_run(queued, None).await.unwrap();
+        assert!(cancelled.run_cancelled);
+        assert_eq!(
+            cancelled.cancellations, 0,
+            "queued jobs have no live runner"
+        );
+        assert_eq!(cancelled.record.unwrap().status, ExecutionStatus::Cancelled);
+        assert!(
+            !backend
+                .cancel_run(queued, None)
+                .await
+                .unwrap()
+                .run_cancelled
+        );
+
+        let completing = RunId::new();
+        backend
+            .submit_run(submit_run(
+                completing,
+                vec![submit_job(completing, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let resolved = backend.run_record(completing).await.unwrap();
+        assert!(!resolved.status.is_terminal());
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: completing,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let after_completion = backend.cancel_run(resolved.run_id, None).await.unwrap();
+        assert!(!after_completion.run_cancelled);
+        assert_eq!(
+            after_completion.record.unwrap().conclusion.as_deref(),
+            Some("success")
+        );
+    }
+
     /// A starved run is finalized without releasing its workflow-level
     /// concurrency hold (the trait doc: `reap_sweep` step 1 performs no
     /// concurrency release). A run parked behind the group stays held.
@@ -6130,6 +6182,85 @@ pub(crate) mod suite {
         }
     }
 
+    /// Keep the lease arm of the sweep from firing at a synthetic sweep time:
+    /// the renewal instant is moved to just before `now`.
+    fn renew_just_before(inputs: &mut ReapInputs, now: std::time::SystemTime) {
+        for active in &mut inputs.active {
+            active.last_renewed_at = Some(now - std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// The reaper honours a job's `timeout-minutes` up to GitHub's maximum and
+    /// no further. GitHub's service cancels a job at five days regardless of a
+    /// longer declaration, so a stored message that asks for more must be
+    /// cancelled *at* the ceiling — otherwise a fork's workflow keeps its
+    /// leased runner for as long as it asked. The message build and the token
+    /// mint are clamped at the same value (their own tests cover those); this
+    /// one covers the reaper, which reads a stored template directly.
+    pub(crate) async fn job_timeout_is_capped_at_the_github_maximum(backend: &dyn ControlBackend) {
+        use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+        let max = MAX_JOB_TIMEOUT_SECONDS as u64;
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("cap-r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let mut job = submit_job(run_id, "build", 1);
+        // Declared an hour past the ceiling: the reaper must stop at it.
+        job.queued.message.job_timeout = Some(MAX_JOB_TIMEOUT_SECONDS + 3600);
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let inputs = backend.reap_inputs().await.unwrap();
+        let started = inputs
+            .active
+            .iter()
+            .find(|active| active.request_id == claimed.request.request_id)
+            .and_then(|active| active.started_at)
+            .expect("the claim stamps started_at");
+
+        // One second under the ceiling: the reaper must not fire early.
+        let early = started + std::time::Duration::from_secs(max - 1);
+        let mut early_inputs = inputs.clone();
+        renew_just_before(&mut early_inputs, early);
+        let outcome = backend
+            .reap_sweep(sweep_at(early, run_id, early_inputs))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.cancellations, 0,
+            "an hour-past-the-ceiling declaration must not cancel before the ceiling"
+        );
+
+        // One second past the ceiling: the declared timeout still has an hour
+        // to go, and the reaper must cancel anyway.
+        let capped = started + std::time::Duration::from_secs(max + 1);
+        let mut capped_inputs = inputs.clone();
+        renew_just_before(&mut capped_inputs, capped);
+        let outcome = backend
+            .reap_sweep(sweep_at(capped, run_id, capped_inputs))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.cancellations, 1,
+            "the reaper must cancel at GitHub's maximum, not at the declared value"
+        );
+    }
+
     /// A worker that stops renewing while its session keeps polling is hung,
     /// not disconnected: its attempt is reaped at the worker's own cadence
     /// (`HUNG_WORKER_LEASE_SECONDS`) instead of holding the slot for the full
@@ -8387,6 +8518,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn cancel_outcome_tracks_locked_transition() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::cancel_outcome_tracks_locked_transition(&backend).await;
+    }
+
+    #[tokio::test]
     async fn starved_run_keeps_workflow_hold() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -8801,6 +8940,14 @@ mod pg {
             return skip_no_postgres();
         };
         suite::timeout_then_lease_expiry_settles_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn job_timeout_is_capped_at_the_github_maximum() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::job_timeout_is_capped_at_the_github_maximum(&backend).await;
     }
 
     #[tokio::test]
@@ -10126,6 +10273,11 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn cancel_outcome_tracks_locked_transition() {
+        suite::cancel_outcome_tracks_locked_transition(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
     async fn starved_run_keeps_workflow_hold() {
         suite::starved_run_keeps_workflow_hold(&LiteBackend::in_memory().unwrap()).await;
     }
@@ -10784,6 +10936,12 @@ mod lite {
     #[tokio::test]
     async fn timeout_then_lease_expiry_settles_attempt() {
         suite::timeout_then_lease_expiry_settles_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn job_timeout_is_capped_at_the_github_maximum() {
+        suite::job_timeout_is_capped_at_the_github_maximum(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]
