@@ -1,0 +1,56 @@
+change_id = "action-download-retry-after"
+upstream_version = "v2.338.0"
+category = "nit"
+tags = ["runner", "actions", "http", "retry"]
+ai_status = "manual-delta-analysis"
+
+[description]
+what = '''
+ActionManager download loop: on HTTP 429 the runner reads the Retry-After
+response header (UrlUtil.GetRetryAfter → VssNetworkHelper.
+ConvertRetryAfterToTimeSpan, clamped 10s..10min) and prefers it over the
+random 10-30s backoff when _GITHUB_ACTION_DOWNLOAD_NO_BACKOFF is unset.
+'''
+why = '''
+Throttled action downloads (codeload/api.github.com) now respect the
+server's requested backoff instead of hammering fixed retries.
+'''
+runner_behavior = '''
+On 429 (and only 429): parse Retry-After (seconds or HTTP-date), clamp to
+[10s, 10min], sleep that instead of the random backoff. Other errors keep
+the existing retry path.
+'''
+failure_mode = '''
+Without it, heavy throttling extends download time and can exhaust retries;
+divergence only matters under real GitHub throttling (plausible in the
+gh-* campaign cells).
+'''
+
+[wire]
+request = "GET <action-download-url> → 429 + Retry-After: N"
+expected_response = "Retry after N (clamped 10s..10min); warning line printed with the backoff used"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/worker/action_preparation.rs", area = "download retry loop" },
+]
+
+[implementation]
+approach = '''
+Find the action-download retry loop (ActionManager analogue in
+action_preparation.rs or nearby). Add the 429 → Retry-After branch; clamp
+10s..600s; keep the env-var backoff kill-switch; keep the ::warning:: line
+naming the backoff seconds. Parse both delta-seconds and HTTP-date forms.
+'''
+test = "Unit: 429+Retry-After picks clamped value; 429 without header falls back to random backoff; non-429 errors unaffected."
+
+[[source_entries]]
+file = "src/Runner.Worker/ActionManager.cs"
+change_type = "file_changed"
+snippet = '''
+if (response.StatusCode == HttpStatusCode.TooManyRequests)
+{
+    var retryAfterHeader = UrlUtil.GetRetryAfter(response.Headers);
+    retryAfter = VssNetworkHelper.ConvertRetryAfterToTimeSpan(retryAfterHeader, TimeSpan.FromSeconds(10), TimeSpan.FromMinutes(10));
+}
+'''

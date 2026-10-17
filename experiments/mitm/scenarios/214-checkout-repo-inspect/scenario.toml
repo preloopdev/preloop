@@ -8,7 +8,7 @@ path = "214-checkout-repo-inspect.yml"
 [[steps]]
 kind = "wait_for_event"
 event = "job_assigned"
-timeout = 120
+timeout = 240
 
 [[steps]]
 kind = "wait_for_event"

@@ -34,7 +34,7 @@ pub mod settings;
 pub mod worker;
 
 /// Protocol compatibility version (matches actions/runner release we target).
-pub const PROTOCOL_COMPAT_VERSION: &str = "2.335.1";
+pub const PROTOCOL_COMPAT_VERSION: &str = "2.338.0";
 
 /// Crate version for display.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -55,4 +55,12 @@ pub fn os_description() -> String {
         }
     }
     format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// CLI --version string: package version plus the advertised protocol-compat
+/// release. `concat!` accepts literals only, so the release is repeated here —
+/// `cli::version_string_contains_protocol_compat` asserts it equals
+/// PROTOCOL_COMPAT_VERSION.
+pub fn cli_version() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), " (protocol-compat 2.338.0)")
 }

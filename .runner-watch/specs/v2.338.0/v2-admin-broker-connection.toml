@@ -1,0 +1,147 @@
+change_id = "v2-admin-broker-connection"
+upstream_version = "v2.338.0"
+category = "concern"
+tags = ["protocol", "broker"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner v2 admin flow discovers auth_url_v2 and BrokerUrl values.
+'''
+why = '''
+v2.329.0 introduced broker/admin paths used by newer hosted runner flows.
+'''
+runner_behavior = '''
+connectionData/location data and admin responses can advertise auth_url_v2, BrokerUrl, and UseRunnerAdminFlow.
+'''
+failure_mode = '''
+Runner can fall back today, but newer flows warn or skip broker features when absent.
+'''
+
+[feature_flag]
+name = "UseRunnerAdminFlow"
+where = "admin/connection response"
+default = false
+
+[wire]
+request = '''
+GET /_apis/connectionData and runner admin capability requests
+'''
+expected_response = "JSON containing auth_url_v2/BrokerUrl when enabled"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "connectionData payload" },
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "broker/admin flow" },
+]
+
+[implementation]
+approach = '''
+Extend connection/admin DTOs and route responses without changing legacy defaults.
+'''
+test = "connectionData/admin response includes optional v2 fields only when configured."
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+struct = "BrokerServer"
+fields = ["ConnectWebSocketAsync(CancellationToken)"]
+snippet = '''
+            return result;
+        }
+
+        private async Task<ClientWebSocket> ConnectWebSocketAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+struct = "BrokerServer"
+fields = ["DeleteSessionAsync(Guid, CancellationToken)"]
+snippet = '''
+            }
+        }
+
+        public async Task DeleteSessionAsync(Guid sessionId, CancellationToken cancellationToken)
+        {
+            CheckConnection();
+            await _brokerHttpClient.DeleteSessionAsync(sessionId, cancellationToken);
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+struct = "BrokerServer"
+fields = ["MaxDelayForWebSocketReconnect"]
+snippet = '''
+        private BrokerHttpClient _brokerHttpClient;
+
+        private static readonly TimeSpan MinDelayForWebSocketReconnect = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan MaxDelayForWebSocketReconnect = TimeSpan.FromSeconds(300);
+
+        public async Task ConnectAsync(Uri serverUri, VssCredentials credentials)
+        {
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+struct = "BrokerServer"
+fields = ["MinDelayForWebSocketReconnect"]
+snippet = '''
+        private RawConnection _connection;
+        private BrokerHttpClient _brokerHttpClient;
+
+        private static readonly TimeSpan MinDelayForWebSocketReconnect = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan MaxDelayForWebSocketReconnect = TimeSpan.FromSeconds(300);
+
+        public async Task ConnectAsync(Uri serverUri, VssCredentials credentials)
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+struct = "IBrokerServer"
+fields = ["DeleteSessionAsync(Guid, CancellationToken)"]
+snippet = '''
+        Task ConnectAsync(Uri serverUrl, VssCredentials credentials);
+
+        Task<TaskAgentSession> CreateSessionAsync(TaskAgentSession session, CancellationToken cancellationToken);
+        Task DeleteSessionAsync(Guid sessionId, CancellationToken cancellationToken);
+
+        Task<TaskAgentMessage> GetRunnerMessageAsync(Guid? sessionId, TaskAgentStatus status, string version, string os, string architecture, bool disableUpdate, CancellationToken token);
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+struct = "IBrokerServer"
+fields = ["RunLongPollWebSocketProbeAsync(CancellationToken)"]
+snippet = '''
+        Task ForceRefreshConnection(VssCredentials credentials);
+
+        // Temporary probe: holds/reconnects a websocket to the broker listener until cancelled.
+        Task<BrokerWebSocketProbeResult> RunLongPollWebSocketProbeAsync(CancellationToken cancellationToken);
+    }
+
+    public sealed class BrokerServer : RunnerService, IBrokerServer
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_removed"
+struct = "IBrokerServer"
+fields = ["DeleteSessionAsync(CancellationToken)"]
+snippet = '''
+        Task ConnectAsync(Uri serverUrl, VssCredentials credentials);
+
+        Task<TaskAgentSession> CreateSessionAsync(TaskAgentSession session, CancellationToken cancellationToken);
+        Task DeleteSessionAsync(CancellationToken cancellationToken);
+
+        Task<TaskAgentMessage> GetRunnerMessageAsync(Guid? sessionId, TaskAgentStatus status, string version, string os, string architecture, bool disableUpdate, CancellationToken token);
+
+'''

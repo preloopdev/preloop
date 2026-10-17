@@ -1,0 +1,568 @@
+change_id = "dap-debugger-endpoint"
+upstream_version = "v2.338.0"
+category = "feature"
+tags = ["debugger", "websocket"]
+ai_status = "deterministic-known-fidelity-gap"
+
+[description]
+what = '''
+Runner can expose a DAP debugger integration.
+'''
+why = '''
+v2.335.0 added debugger hooks around worker step execution.
+'''
+runner_behavior = '''
+Debugger-enabled runs use websocket/control endpoints for DAP traffic.
+'''
+failure_mode = '''
+Non-blocking unless debugging is requested.
+'''
+
+[feature_flag]
+name = ""
+where = ""
+
+[wire]
+request = '''
+WebSocket debugger endpoint when debug feature is active
+'''
+expected_response = "DAP frames proxied/stubbed according to runner expectation"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner-server", path = "crates/preloop-runner-server/src/lib.rs", area = "broker/admin flow" },
+]
+
+[implementation]
+approach = '''
+Add explicit unsupported/stub behavior first; implement full proxy when debug scenarios are captured.
+'''
+test = "Debugger route returns expected upgrade/error semantics."
+
+[[source_entries]]
+file = "src/Runner.Common/Constants.cs"
+change_type = "field_added"
+struct = "InfrastructureFailureCategories"
+fields = ["DebuggerTunnelFailure"]
+snippet = '''
+            // it can distinguish between the different ways runner infrastructure fails.
+            public static class InfrastructureFailureCategories
+            {
+                public static readonly string DebuggerTunnelFailure = "debugger_tunnel_failure";
+            }
+
+            // Node version migration related constants
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/Constants.cs"
+change_type = "protocol_keyword_added"
+fields = ["DebuggerTunnelFailure", "debugger_tunnel_failure"]
+snippet = '''
+            // it can distinguish between the different ways runner infrastructure fails.
+            public static class InfrastructureFailureCategories
+            {
+                public static readonly string DebuggerTunnelFailure = "debugger_tunnel_failure";
+            }
+
+            // Node version migration related constants
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["HandleTunnelConnectionStatusChanged(ConnectionStatus, Exception)"]
+snippet = '''
+        /// reconnects on its own, so transient drops show up as <c>Connecting</c> and
+        /// only a settled <c>Disconnected</c> means the relay is really gone.
+        /// </summary>
+        internal void HandleTunnelConnectionStatusChanged(ConnectionStatus status, Exception disconnectException)
+        {
+            try
+            {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["OnTunnelConnectionStatusChanged(object, ConnectionStatusChangedEventArgs)"]
+snippet = '''
+            Trace.Info("Dev Tunnel relay started");
+        }
+
+        private void OnTunnelConnectionStatusChanged(object sender, ConnectionStatusChangedEventArgs e)
+        {
+            HandleTunnelConnectionStatusChanged(e.Status, e.DisconnectException);
+        }
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["ReportTunnelDisconnected(Exception)"]
+snippet = '''
+        /// tunnel the debug client can never resume the job, so anything waiting on a
+        /// DAP pause would hang until the job timeout — fail fast instead.
+        /// </summary>
+        private void ReportTunnelDisconnected(Exception disconnectException)
+        {
+            if (Interlocked.Exchange(ref _tunnelFailureReported, 1) != 0)
+            {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["SanitizeConsoleText(string)"]
+snippet = '''
+        /// server-supplied text cannot inject ANSI escape sequences or terminal control codes
+        /// into the DAP console.
+        /// </summary>
+        internal static string SanitizeConsoleText(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["TunnelRelayStarted"]
+snippet = '''
+
+        // Invoked once the tunnel relay is up, so tests can simulate a relay drop
+        // that lands while startup is still in progress (unit tests only).
+        internal Action TunnelRelayStarted { get; set; }
+
+        // Synchronization for step execution
+        private TaskCompletionSource<DapCommand> _commandTcs;
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["_tunnelFailureReported"]
+snippet = '''
+
+        // 0 until an unexpected tunnel disconnect has been reported, so the job
+        // is only failed once no matter how many status changes we observe.
+        private int _tunnelFailureReported;
+
+        // Cancellation source for the connection loop, cancelled in StopAsync
+        // so AcceptTcpClientAsync unblocks cleanly without relying on listener disposal.
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "field_added"
+struct = "DapDebugger"
+fields = ["_tunnelShuttingDown"]
+snippet = '''
+
+        // Set before we intentionally tear the Dev Tunnel down so the relay
+        // disconnect that teardown produces isn't mistaken for a failure.
+        private volatile bool _tunnelShuttingDown;
+
+        // 0 until an unexpected tunnel disconnect has been reported, so the job
+        // is only failed once no matter how many status changes we observe.
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["DAP"]
+snippet = '''
+        /// <summary>
+        /// Fails the job when the debugger's tunnel drops unexpectedly. Without the
+        /// tunnel the debug client can never resume the job, so anything waiting on a
+        /// DAP pause would hang until the job timeout — fail fast instead.
+        /// </summary>
+        private void ReportTunnelDisconnected(Exception disconnectException)
+        {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["DAP"]
+snippet = '''
+        /// <summary>
+        /// Removes C0/C1 control characters (except tab, carriage return and line feed) so
+        /// server-supplied text cannot inject ANSI escape sequences or terminal control codes
+        /// into the DAP console.
+        /// </summary>
+        internal static string SanitizeConsoleText(string value)
+        {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["DebuggerTunnelException"]
+snippet = '''
+            }
+            catch (OperationCanceledException ex) when (connectCts.IsCancellationRequested)
+            {
+                throw new DebuggerTunnelException(
+                    $"Timed out after {tunnelConnectTimeoutSeconds} seconds while connecting to the debugger tunnel.",
+                    ex);
+            }
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["DebuggerTunnelException"]
+snippet = '''
+            }
+            catch (Exception ex)
+            {
+                throw new DebuggerTunnelException(
+                    $"Failed to connect to the debugger tunnel: {ex.Message}",
+                    ex);
+            }
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["DebuggerTunnelException"]
+snippet = '''
+            }
+
+            // Only watch for drops once we're actually connected. A failure during the
+            // initial connect surfaces as the DebuggerTunnelException above, so watching
+            // earlier would just report the same failure twice.
+            _tunnelRelayHost.ConnectionStatusChanged += OnTunnelConnectionStatusChanged;
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["Failed", "Message"]
+snippet = '''
+            catch (Exception ex)
+            {
+                throw new DebuggerTunnelException(
+                    $"Failed to connect to the debugger tunnel: {ex.Message}",
+                    ex);
+            }
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["Fails", "Without"]
+snippet = '''
+        }
+
+        /// <summary>
+        /// Fails the job when the debugger's tunnel drops unexpectedly. Without the
+        /// tunnel the debug client can never resume the job, so anything waiting on a
+        /// DAP pause would hang until the job timeout — fail fast instead.
+        /// </summary>
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["Message", "DebuggerConnectionResult", "TunnelDisconnected"]
+snippet = '''
+                jobContext.Global.JobTelemetry?.Add(new JobTelemetry
+                {
+                    Type = JobTelemetryType.General,
+                    Message = "DebuggerConnectionResult: TunnelDisconnected"
+                });
+            }
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["SendOutput", "SanitizeConsoleText", "MaskUserVisibleText", "debuggerConfig", "WelcomeMessage"]
+snippet = '''
+                {
+                    // The welcome message is server-supplied and never rendered verbatim:
+                    // mask secrets and strip control characters before it reaches the console.
+                    SendOutput("console", SanitizeConsoleText(MaskUserVisibleText(debuggerConfig.WelcomeMessage)));
+                    Trace.Info("Sent custom welcome message");
+                }
+                else
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["The"]
+snippet = '''
+            var detail = string.IsNullOrEmpty(disconnectException?.Message)
+                ? string.Empty
+                : $" {disconnectException.Message}";
+            var message = $"The debugger lost its connection to the tunnel and the job cannot continue.{detail}";
+            Trace.Error(message);
+
+            if (jobContext != null)
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["Timed", "tunnelConnectTimeoutSeconds"]
+snippet = '''
+            catch (OperationCanceledException ex) when (connectCts.IsCancellationRequested)
+            {
+                throw new DebuggerTunnelException(
+                    $"Timed out after {tunnelConnectTimeoutSeconds} seconds while connecting to the debugger tunnel.",
+                    ex);
+            }
+            catch (Exception ex)
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["Trace", "Info", "Debugger"]
+snippet = '''
+
+            if (terminatedDuringStartup)
+            {
+                Trace.Info("Debugger tunnel dropped during startup, skipping connection loop.");
+                return;
+            }
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["jobContext", "Global", "InfrastructureFailureCategory", "Constants", "Runner", "InfrastructureFailureCategories", "DebuggerTunnelFailure"]
+snippet = '''
+                // being flushed by a step completing.
+                if (string.IsNullOrEmpty(jobContext.Global.InfrastructureFailureCategory))
+                {
+                    jobContext.Global.InfrastructureFailureCategory = Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure;
+                }
+
+                jobContext.InfrastructureError(message, category: Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure);
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["jobContext", "InfrastructureError", "Constants", "Runner", "InfrastructureFailureCategories", "DebuggerTunnelFailure"]
+snippet = '''
+                    jobContext.Global.InfrastructureFailureCategory = Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure;
+                }
+
+                jobContext.InfrastructureError(message, category: Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure);
+                jobContext.Result = TaskResultUtil.MergeTaskResults(jobContext.Result, TaskResult.Failed);
+                if (jobContext.JobContext != null)
+                {
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["readyTcs", "TrySetException", "DebuggerTunnelException"]
+snippet = '''
+
+            // Unblock anything waiting on the debug client so the job stops waiting.
+            var readyTcs = _readyTcs;
+            if (readyTcs?.TrySetException(new DebuggerTunnelException(message)) == true)
+            {
+                // Make sure the fault is observed even when nothing is awaiting it.
+                _ = readyTcs.Task.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DapDebugger.cs"
+change_type = "protocol_keyword_added"
+fields = ["terminatedDuringStartup", "_state", "DapSessionState", "Terminated"]
+snippet = '''
+            bool terminatedDuringStartup;
+            lock (_stateLock)
+            {
+                terminatedDuringStartup = _state == DapSessionState.Terminated;
+                if (!terminatedDuringStartup)
+                {
+                    _state = DapSessionState.WaitingForConnection;
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DebuggerConfig.cs"
+change_type = "protocol_keyword_added"
+fields = []
+snippet = '''
+        /// <remarks>
+        /// Server-supplied and treated as untrusted: it is masked with the runner's
+        /// secret masker and stripped of control characters before being written to
+        /// the debugger console.
+        /// </remarks>
+        public string WelcomeMessage { get; }
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Dap/DebuggerTunnelException.cs"
+change_type = "file_added"
+fields = []
+snippet = '''
+﻿using System;
+
+namespace GitHub.Runner.Worker.Dap
+{
+    /// <summary>
+    /// Raised when the debugger's Dev Tunnel relay connection cannot be established
+    /// or is lost while the job is running.
+    /// </summary>
+    /// <remarks>
+    /// This is a dedicated type so callers can tell a broken tunnel (an infrastructure
+    /// failure the user cannot do anything about) apart from a user simply never
+    /// attaching a debug client, which surfaces as a <see cref="TimeoutException"/>.
+    /// </remarks>
+    public sealed class DebuggerTunnelException : Exception
+    {
+        public DebuggerTunnelException(string message)
+            : base(message)
+        {
+        }
+
+        public DebuggerTunnelException(string message, Exception innerException)
+            : base(message, innerException)
+        {
+        }
+    }
+}
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "field_added"
+struct = "JobExtension"
+fields = ["_brokerWebSocketProbeTask"]
+snippet = '''
+        private CancellationTokenSource _serviceConnectivityCheckToken = new();
+        private Task _serviceConnectivityCheckTask = null;
+        private CancellationTokenSource _brokerWebSocketProbeToken = new();
+        private Task<BrokerWebSocketProbeResult> _brokerWebSocketProbeTask = null;
+        private IDapDebugger _dapDebugger;
+
+        // Download all required actions.
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "field_added"
+struct = "JobExtension"
+fields = ["_brokerWebSocketProbeToken"]
+snippet = '''
+        private Task _diskSpaceCheckTask = null;
+        private CancellationTokenSource _serviceConnectivityCheckToken = new();
+        private Task _serviceConnectivityCheckTask = null;
+        private CancellationTokenSource _brokerWebSocketProbeToken = new();
+        private Task<BrokerWebSocketProbeResult> _brokerWebSocketProbeTask = null;
+        private IDapDebugger _dapDebugger;
+
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "protocol_keyword_added"
+fields = ["AddDebuggerConnectionTelemetry", "jobContext", "TunnelFailed"]
+snippet = '''
+                            // were waiting. The user can't do anything about that, so report it
+                            // as an infrastructure failure rather than a job error.
+                            Trace.Error($"DAP debugger tunnel failed: {ex.Message}");
+                            AddDebuggerConnectionTelemetry(jobContext, "TunnelFailed");
+                            context.InfrastructureError(
+                                ex.Message,
+                                category: Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure);
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "protocol_keyword_added"
+fields = ["Constants", "Runner", "InfrastructureFailureCategories", "DebuggerTunnelFailure"]
+snippet = '''
+                            AddDebuggerConnectionTelemetry(jobContext, "TunnelFailed");
+                            context.InfrastructureError(
+                                ex.Message,
+                                category: Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure);
+                            throw;
+                        }
+                        catch (Exception ex)
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "protocol_keyword_added"
+fields = ["DebuggerTunnelException"]
+snippet = '''
+                            context.Error("Job was cancelled before debugger client connected.");
+                            throw;
+                        }
+                        catch (DebuggerTunnelException ex)
+                        {
+                            // The Dev Tunnel relay could not be established, or dropped while we
+                            // were waiting. The user can't do anything about that, so report it
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "protocol_keyword_added"
+fields = ["Trace", "Error", "DAP", "Message"]
+snippet = '''
+                            // The Dev Tunnel relay could not be established, or dropped while we
+                            // were waiting. The user can't do anything about that, so report it
+                            // as an infrastructure failure rather than a job error.
+                            Trace.Error($"DAP debugger tunnel failed: {ex.Message}");
+                            AddDebuggerConnectionTelemetry(jobContext, "TunnelFailed");
+                            context.InfrastructureError(
+                                ex.Message,
+'''
+
+[[source_entries]]
+file = "src/Runner.Worker/Worker.cs"
+change_type = "file_changed"
+fields = []
+snippet = '''
+﻿using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using GitHub.DistributedTask.WebApi;
+using GitHub.Runner.Common;
+using GitHub.Runner.Common.Util;
+using GitHub.Runner.Sdk;
+using Newtonsoft.Json;
+using Pipelines = GitHub.DistributedTask.Pipelines;
+
+namespace GitHub.Runner.Worker
+{
+    [ServiceLocator(Default = typeof(Worker))]
+    public interface IWorker : IRunnerService
+    {
+        Task<int> RunAsync(string pipeIn, string pipeOut);
+    }
+
+    public sealed class Worker : RunnerService, IWorker
+    {
+        private readonly TimeSpan _workerStartTimeout = TimeSpan.FromSeconds(30);
+        private ManualResetEvent _completedCommand = new(false);
+
+        // Do not mask the values of these secrets
+        private static HashSet<String> SecretVariableMaskWhitelist = new(StringComparer.OrdinalIgnoreCase)
+        {
+            Constants.Variables.Actions.StepDebug,
+            Constants.Variables.Actions.RunnerDebug
+'''

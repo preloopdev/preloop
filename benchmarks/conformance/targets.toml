@@ -4,3 +4,7 @@
 [[targets]]
 runner_version = "2.336.0"
 exclude_prefix = ["2"]
+# v2.338.0 corpus is a reconstructed 27-scenario cell (same caveat as
+# v2.337.0, see docs/fidelity-gap.md §1a): retained for comparison replay,
+# not a green-gate target until a complete protocol-equivalent capture set
+# exists.

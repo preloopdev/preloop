@@ -1,0 +1,79 @@
+change_id = "broker-websocket-probe"
+upstream_version = "v2.338.0"
+category = "feature"
+tags = ["protocol", "broker", "websocket", "probe"]
+ai_status = "manual-delta-analysis"
+
+[description]
+what = '''
+v2.338.0 adds a temporary broker connectivity probe to the worker's job
+extension: when the job message advertises
+WellKnownDistributedTaskVariables.RunnerBrokerWebSocketProbeUrl, the runner
+spawns CheckBrokerLongPollWebSocketAsync which connects a ClientWebSocket to
+that URL (via BrokerServer.ConnectWebSocketAsync /
+RunLongPollWebSocketProbeAsync) and holds/reconnects it with exponential
+backoff (MinDelayForWebSocketReconnect 10s → MaxDelayForWebSocketReconnect
+300s) until the job finishes; the result feeds job-completion telemetry.
+RunnerWebProxy now routes ws:// through the HTTP proxy and wss:// through the
+HTTPS proxy.
+'''
+why = '''
+GitHub is instrumenting broker websocket reachability ahead of moving
+delivery off HTTP long-poll. Server opts in per job via the variables map.
+'''
+runner_behavior = '''
+If job variables contain the probe URL key: connect ws(s)://<url> with the
+job's SystemVssConnection bearer; hold until cancelled; reconnect with
+10..300s backoff; never throws; result appended to job telemetry.
+'''
+failure_mode = '''
+preloop server never advertises RunnerBrokerWebSocketProbeUrl → probe is
+inert today. Runner must still handle the key correctly if a GitHub-facing
+golden ever carries it. wss:// proxy support needed when probing through
+mitmproxy for future captures.
+'''
+
+[wire]
+request = '''
+GET wss://<broker-probe-url>   (Upgrade: websocket, Authorization: Bearer <job token>)
+Variables key: (approx) "runner.broker.websocket.probe.url" — read exact name
+from WellKnownDistributedTaskVariables.RunnerBrokerWebSocketProbeUrl upstream.
+'''
+expected_response = "101 Switching Protocols then held socket; 10s→300s reconnect backoff"
+
+[preloop_targets]
+files = [
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/worker/job_extension.rs", area = "probe spawn + telemetry on completion" },
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/client/broker.rs", area = "websocket connect + reconnect loop" },
+  { crate = "preloop-runner", path = "crates/preloop-runner/src/client/http.rs", area = "wss:// proxy selection parity" },
+]
+
+[implementation]
+approach = '''
+Gate on the exact variables key used by the official job message. Spawn a
+detached task at job start; cancel at completion; report probe result as
+telemetry. Use tokio-tungstenite (or the crate the workspace already uses
+for ws — check live_logs.rs / azdo.rs websocket code first and reuse it).
+Reconnect backoff: random 10..300s, non-fatal, never surfaces as job error.
+'''
+test = '''
+Unit: probe task starts only when variable present; cancels on job end.
+Integration: against a stub ws endpoint asserting connect+hold+reconnect.
+'''
+
+[[source_entries]]
+file = "src/Runner.Common/BrokerServer.cs"
+change_type = "field_added"
+fields = ["ConnectWebSocketAsync(CancellationToken)", "RunLongPollWebSocketProbeAsync(CancellationToken)", "MinDelayForWebSocketReconnect", "MaxDelayForWebSocketReconnect"]
+
+[[source_entries]]
+file = "src/Runner.Worker/JobExtension.cs"
+change_type = "field_added"
+fields = ["CheckBrokerLongPollWebSocketAsync(string, AgentJobRequestMessage, CancellationToken)", "_brokerWebSocketProbeTask", "_brokerWebSocketProbeToken"]
+
+[[source_entries]]
+file = "src/Runner.Sdk/RunnerWebProxy.cs"
+change_type = "file_changed"
+snippet = '''
+wss:// now selects the HTTPS proxy; ws:// selects the HTTP proxy.
+'''
