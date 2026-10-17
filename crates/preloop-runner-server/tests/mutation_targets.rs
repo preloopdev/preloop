@@ -336,7 +336,10 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
         .current_dir(root)
         .env("TMPDIR", &scratch)
         .env("PROPTEST_CASES", "8")
-        .env("RUST_TEST_THREADS", "4")
+        .env(
+            "RUST_TEST_THREADS",
+            std::env::var("RUST_TEST_THREADS").unwrap_or_else(|_| "4".to_string()),
+        )
         .env("RUSTFLAGS", "-A warnings");
     for var in SCOPED_ENV {
         cmd.env_remove(var);
