@@ -116,8 +116,17 @@ pub struct RunArgs {
     pub once: bool,
 
     /// Protocol path to use.
-    #[arg(long, default_value = "broker")]
+    #[arg(long, default_value = "broker", conflicts_with = "jitconfig")]
     pub via: ProtocolPath,
+
+    /// Base64-encoded just-in-time runner config (`encoded_jit_config`).
+    ///
+    /// Materializes `.runner`/`.credentials`/`.credentials_rsaparams` into the
+    /// runner root and runs a single job — the runner is already registered
+    /// server-side, so `configure` is not needed (and `--via` is meaningless:
+    /// the payload carries its own endpoints).
+    #[arg(long)]
+    pub jitconfig: Option<String>,
 }
 
 /// Arguments for `lint`.
@@ -196,6 +205,54 @@ mod tests {
                 assert_eq!(args.via, ProtocolPath::Broker);
             }
             _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn parse_run_jitconfig() {
+        let cli = Cli::try_parse_from(["preloop-runner", "run", "--jitconfig", "encoded-payload"])
+            .unwrap();
+        match &cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.jitconfig.as_deref(), Some("encoded-payload"));
+                assert_eq!(args.via, ProtocolPath::Broker);
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn jitconfig_rejects_explicit_protocol_override() {
+        let err = Cli::try_parse_from([
+            "preloop-runner",
+            "run",
+            "--jitconfig",
+            "encoded-payload",
+            "--via",
+            "broker",
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be used with"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn jitconfig_rejects_registration_flags() {
+        for flag in ["--token", "--url"] {
+            let result = Cli::try_parse_from([
+                "preloop-runner",
+                "run",
+                "--jitconfig",
+                "encoded-payload",
+                flag,
+                "value",
+            ]);
+            assert!(
+                result.is_err(),
+                "{flag} must not be accepted with --jitconfig"
+            );
         }
     }
 
