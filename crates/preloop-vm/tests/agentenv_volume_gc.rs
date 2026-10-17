@@ -356,6 +356,43 @@ fn provider(
         ))
 }
 
+/// A provider that collects on its own: automatic mode, no timer (the trigger a
+/// populate fires is what these tests exercise), and a grace period long enough
+/// that only the planted leftovers are old.
+fn collecting_engine(
+    executable: &Path,
+    home: &Path,
+    gc_home: &Path,
+    grace_secs: u64,
+    keep_previous: usize,
+) -> AgentEnvProvider {
+    AgentEnvProvider::new(executable)
+        .with_registry_path(home.join("machines.json"))
+        .with_volume_index_path(home.join("agentenv-runner-volumes.json"))
+        .with_ttl_secs(600)
+        .with_volume_gc(gc::GcState::new(
+            Config {
+                mode: Mode::Auto,
+                keep_previous,
+                grace: Duration::from_secs(grace_secs),
+                interval: Duration::ZERO,
+            },
+            Some(staging_path(gc_home)),
+        ))
+}
+
+/// Wait (bounded) for the fake server to drop `name`.
+async fn wait_for_volume_gone(executable: &Path, name: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while volume_names(executable).iter().any(|volume| volume == name) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{name} was never collected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A provider that runs a pass without holding the machines.
 ///
 /// That is the engine after a restart and the CLI: a provider that published a
@@ -637,6 +674,51 @@ async fn a_populate_in_flight_keeps_its_staging_volume() {
         calls_for(&executable, "start")
     );
     assert!(provider.volume_index().await.get(&published).is_some());
+}
+
+#[tokio::test]
+async fn a_populate_collects_a_superseded_volume_in_the_background() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let gc_home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
+    // A volume left by a build that is gone, with the index entry that makes it
+    // old enough to collect. It is in the index before the provider reads it.
+    let stale = "preloop-runner-999999999999";
+    plant_volume(&executable, stale);
+    fs::write(
+        home.path().join("agentenv-runner-volumes.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "volumes": { stale: { "created": gc::unix_now().saturating_sub(7200) } },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let provider = collecting_engine(&executable, home.path(), gc_home.path(), 3600, 0);
+
+    // One start publishes this engine's volume and asks for a pass. Nothing
+    // waits for that pass, so the test waits for its effect instead.
+    provider
+        .create(&spec("runner-0", bundle.path()))
+        .await
+        .unwrap();
+    provider
+        .start(&MachineName::new("runner-0").unwrap())
+        .await
+        .unwrap();
+    wait_for_volume_gone(&executable, stale).await;
+
+    let published = volume_names(&executable)
+        .into_iter()
+        .find(|volume| volume.starts_with("preloop-runner-"))
+        .expect("the start published a volume");
+    assert_ne!(published, stale);
+    assert!(
+        calls(&executable).contains(&format!("volume|delete|{stale}")),
+        "the pass deleted it through aenv: {:?}",
+        calls_for(&executable, "volume")
+    );
 }
 
 #[tokio::test]
