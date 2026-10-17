@@ -774,6 +774,16 @@ pub type LocalCompositeNestedUses = std::sync::Mutex<
 /// rather than evicted entry by entry; clearing only costs re-reads.
 pub const MAX_LOCAL_COMPOSITE_MEMO: usize = 4096;
 
+/// Remote actions a run's local composites reach, per run. A run's answer is
+/// fixed by its immutable commit, so a traversal that reached a definitive
+/// answer is remembered; see `local_composite_declared_for_run`.
+pub type LocalCompositeDeclared =
+    std::sync::Mutex<std::collections::HashMap<RunId, Arc<std::collections::BTreeSet<String>>>>;
+
+/// Maximum runs in [`LocalCompositeDeclared`]. A full memo is cleared, which
+/// only costs a re-traversal.
+pub const MAX_LOCAL_COMPOSITE_DECLARED_RUNS: usize = 1024;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -1060,6 +1070,9 @@ pub struct AppState {
     /// Memo for composite manifests read through the GitHub contents API for
     /// runs without a workspace snapshot; see [`LocalCompositeNestedUses`].
     pub local_composite_nested_uses: Arc<LocalCompositeNestedUses>,
+    /// Remote actions reached through a run's local composites, per run; see
+    /// [`LocalCompositeDeclared`].
+    pub local_composite_declared: Arc<LocalCompositeDeclared>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1754,6 +1767,9 @@ impl AppState {
             )),
             action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             local_composite_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            local_composite_declared: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             config_path,

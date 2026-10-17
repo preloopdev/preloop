@@ -627,31 +627,66 @@ impl AgentEnvProvider {
         })
     }
 
-    /// Make sure `sandbox` is running before it is snapshotted.
+    /// Resume `sandbox` if AgentENV has it paused, and report whether it did.
     ///
     /// AgentENV snapshots only running sandboxes, but `stop` pauses rather than
     /// stopping, and the orchestrator packs a golden right after stopping it. A
-    /// paused sandbox is therefore resumed first, so the snapshot captures the
-    /// machine the same way it would have while running.
-    async fn ensure_running(&self, sandbox: &str) -> Result<(), VmError> {
+    /// paused sandbox is therefore resumed before it is snapshotted, so the
+    /// snapshot captures the machine the same way it would have while running.
+    async fn resume_if_paused(&self, sandbox: &str) -> Result<bool, VmError> {
         let states = self.live_sandboxes().await?;
-        if states
+        let paused = states
             .get(sandbox)
-            .is_some_and(|state| state.as_str() != "running")
-        {
-            self.checked(
-                "resume",
-                &[
-                    "resume".into(),
-                    sandbox.to_owned(),
-                    "--timeout".into(),
-                    self.ttl_secs.to_string(),
-                ],
-            )
-            .await?;
-            self.await_guest(sandbox).await?;
+            .is_some_and(|state| state.as_str() != "running");
+        if !paused {
+            return Ok(false);
         }
-        Ok(())
+        self.checked(
+            "resume",
+            &[
+                "resume".into(),
+                sandbox.to_owned(),
+                "--timeout".into(),
+                self.ttl_secs.to_string(),
+            ],
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Take a snapshot of `sandbox` with `args`. AgentENV takes snapshots only
+    /// of running sandboxes, so a paused one is resumed first.
+    ///
+    /// A sandbox resumed for the snapshot is paused again afterwards, on success
+    /// and on error alike: the orchestrator recorded it as stopped, and a
+    /// running sandbox with no keepalive would be deleted by its TTL. A failed
+    /// pause is logged and does not replace the snapshot's own outcome.
+    async fn snapshot_running(
+        &self,
+        sandbox: &str,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<(), VmError> {
+        let resumed = self.resume_if_paused(sandbox).await?;
+        let outcome: Result<(), VmError> = async {
+            if resumed {
+                self.await_guest(sandbox).await?;
+            }
+            self.checked(operation, args).await.map(|_| ())
+        }
+        .await;
+        if resumed
+            && let Err(error) = self
+                .checked("stop", &["pause".into(), sandbox.to_owned()])
+                .await
+        {
+            warn!(
+                sandbox,
+                %error,
+                "could not pause the sandbox again after its snapshot; it stays running until its TTL expires"
+            );
+        }
+        outcome
     }
 
     /// Re-arm the sandbox TTL for as long as the machine is running.
@@ -1122,8 +1157,8 @@ impl VmProvider for AgentEnvProvider {
                             golden.as_str(),
                             &uuid::Uuid::new_v4().simple().to_string()[..8]
                         );
-                        self.ensure_running(&golden_sandbox).await?;
-                        self.checked(
+                        self.snapshot_running(
+                            &golden_sandbox,
                             "snapshot",
                             &[
                                 "snapshot".into(),
@@ -1561,13 +1596,13 @@ impl VmProvider for AgentEnvProvider {
             name.as_str(),
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
-        self.ensure_running(&sandbox).await?;
-        self.checked(
+        self.snapshot_running(
+            &sandbox,
             "pack",
             &[
                 "snapshot".into(),
                 "create".into(),
-                sandbox,
+                sandbox.clone(),
                 "--name".into(),
                 snapshot.clone(),
             ],

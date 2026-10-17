@@ -81,6 +81,10 @@ case "${1-}" in
     fi
     ;;
   snapshot)
+    if [ -f "$0.fail-snapshot" ]; then
+      printf 'snapshot refused\n' >&2
+      exit 1
+    fi
     printf 'Created snapshot snap-9999\n'
     ;;
   exec)
@@ -896,6 +900,129 @@ async fn pack_resumes_a_paused_machine_before_snapshotting() {
     assert_eq!(ordered[0], "resume|sb-0001|--timeout|600", "{ordered:?}");
     assert!(
         ordered[1].starts_with("snapshot|create|sb-0001|--name|golden-pack-pack-"),
+        "{ordered:?}"
+    );
+}
+
+/// The lifecycle calls the fake recorded, in order: pauses, resumes, snapshots.
+fn lifecycle_calls(executable: &Path) -> Vec<String> {
+    calls(executable)
+        .into_iter()
+        .filter(|call| {
+            ["pause|", "resume|", "snapshot|"]
+                .iter()
+                .any(|verb| call.starts_with(verb))
+        })
+        .collect()
+}
+
+/// Packing a paused golden resumes it for the snapshot and parks it again
+/// afterwards, so it is paused as the orchestrator recorded it.
+#[tokio::test]
+async fn pack_pauses_the_sandbox_again_after_snapshotting_it() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("golden-repause").unwrap();
+    provider
+        .create(&spec("golden-repause", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+    provider.stop(&name).await.unwrap();
+    set_state(&executable, "paused");
+
+    let output = home.path().join("golden.smolmachine.json");
+    provider.pack(&name, &output).await.unwrap();
+
+    let ordered = lifecycle_calls(&executable);
+    let [.., resume, snapshot, pause] = ordered.as_slice() else {
+        panic!("expected resume, snapshot, pause: {ordered:?}");
+    };
+    assert_eq!(
+        resume.as_str(),
+        "resume|sb-0001|--timeout|600",
+        "{ordered:?}"
+    );
+    assert!(
+        snapshot.starts_with("snapshot|create|sb-0001|--name|golden-repause-pack-"),
+        "{ordered:?}"
+    );
+    assert_eq!(pause.as_str(), "pause|sb-0001", "{ordered:?}");
+}
+
+/// A refused snapshot still parks the sandbox it resumed: the pause runs on the
+/// error path too, and the caller sees the snapshot's refusal.
+#[tokio::test]
+async fn pack_pauses_the_sandbox_again_when_the_snapshot_fails() {
+    let (_directory, executable) = fake_aenv();
+    std::fs::write(format!("{}.fail-snapshot", executable.display()), "").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("golden-refused").unwrap();
+    provider
+        .create(&spec("golden-refused", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+    provider.stop(&name).await.unwrap();
+    set_state(&executable, "paused");
+
+    let output = home.path().join("golden.smolmachine.json");
+    assert!(
+        provider.pack(&name, &output).await.is_err(),
+        "the refused snapshot must surface as an error"
+    );
+
+    let ordered = lifecycle_calls(&executable);
+    let [.., resume, snapshot, pause] = ordered.as_slice() else {
+        panic!("expected resume, snapshot, pause: {ordered:?}");
+    };
+    assert_eq!(
+        resume.as_str(),
+        "resume|sb-0001|--timeout|600",
+        "{ordered:?}"
+    );
+    assert!(
+        snapshot.starts_with("snapshot|create|sb-0001|--name|golden-refused-pack-"),
+        "{ordered:?}"
+    );
+    assert_eq!(pause.as_str(), "pause|sb-0001", "{ordered:?}");
+}
+
+/// Forking from a paused golden resumes it to snapshot it, then parks it again.
+#[tokio::test]
+async fn fork_pauses_the_golden_again_after_snapshotting_it() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let golden = MachineName::new("golden-fork-repause").unwrap();
+    let clone = MachineName::new("clone-fork-repause").unwrap();
+    provider
+        .create(&spec("golden-fork-repause", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&golden).await.unwrap();
+    provider.stop(&golden).await.unwrap();
+    set_state(&executable, "paused");
+
+    provider.fork(&golden, &clone).await.unwrap();
+
+    let ordered = lifecycle_calls(&executable);
+    let snapshot_at = ordered
+        .iter()
+        .position(|call| {
+            call.starts_with("snapshot|create|sb-0001|--name|golden-fork-repause-snap-")
+        })
+        .unwrap_or_else(|| panic!("no golden snapshot: {ordered:?}"));
+    assert_eq!(
+        ordered[snapshot_at - 1].as_str(),
+        "resume|sb-0001|--timeout|600",
+        "{ordered:?}"
+    );
+    assert_eq!(
+        ordered.get(snapshot_at + 1).map(String::as_str),
+        Some("pause|sb-0001"),
         "{ordered:?}"
     );
 }

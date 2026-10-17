@@ -1580,10 +1580,9 @@ struct ForgeManifests<'a> {
     owner: String,
     repo: String,
     commit: String,
-    /// The `contents: read` credential, minted on first use and kept for the
-    /// rest of the traversal. `Some(None)` records a failed mint, so the
-    /// failure is logged once and fails closed.
-    credential: Option<Option<(String, crate::github_breaker::GithubCredentialBucket)>>,
+    /// The `contents: read` credential, looked up on first use and kept for the
+    /// rest of the traversal.
+    credential: Option<ContentsCredential>,
 }
 
 impl ForgeManifests<'_> {
@@ -1591,8 +1590,12 @@ impl ForgeManifests<'_> {
     /// the file it names, and reports a link to a directory as a `symlink`
     /// object carrying its target.
     async fn probe(&mut self, path: &str) -> Probe {
-        let Some((token, bucket)) = self.credential().await else {
-            return Probe::Transient;
+        let (token, bucket) = match self.credential().await {
+            ContentsCredential::Token(token, bucket) => (token, bucket),
+            // No App covers the repository, so nothing in it can be read. That
+            // is a definitive answer: the path is absent.
+            ContentsCredential::NotInstalled => return Probe::Missing,
+            ContentsCredential::Transient => return Probe::Transient,
         };
         let api_base = self.shared.state.github_urls.api_url.trim_end_matches('/');
         let segments: Vec<String> = path.split('/').map(percent_encode_path_segment).collect();
@@ -1640,15 +1643,16 @@ impl ForgeManifests<'_> {
         }
     }
 
-    /// The run repository's contents-read credential, minted on first use.
-    async fn credential(
-        &mut self,
-    ) -> Option<(String, crate::github_breaker::GithubCredentialBucket)> {
+    /// The run repository's contents-read credential, looked up on first use and
+    /// kept for the rest of the traversal.
+    async fn credential(&mut self) -> ContentsCredential {
         if self.credential.is_none() {
             let repository = format!("{}/{}", self.owner, self.repo);
             self.credential = Some(contents_read_credential(self.shared, &repository).await);
         }
-        self.credential.clone().flatten()
+        self.credential
+            .clone()
+            .unwrap_or(ContentsCredential::Transient)
     }
 }
 
@@ -1673,21 +1677,40 @@ fn forge_node(body: &serde_json::Value) -> TreeNode {
     }
 }
 
+/// What a `contents: read` credential lookup found for a repository.
+#[derive(Clone)]
+enum ContentsCredential {
+    /// An installation token scoped to the repository, and its rate-limit bucket.
+    Token(String, crate::github_breaker::GithubCredentialBucket),
+    /// No registered App is installed on the repository. That is a definitive
+    /// answer, so the empty traversal it leads to may be remembered for the run.
+    NotInstalled,
+    /// The lookup or the mint failed, so coverage is unknown. Not remembered.
+    Transient,
+}
+
 /// The credential that reads `repository`'s contents: a `contents: read`
 /// installation token scoped to that repository, minted from the GitHub App
 /// installed on its owner, with the installation as its rate-limit bucket.
-/// `None` when no App covers the repository or the mint fails, so the caller
-/// fails closed. Unlike action downloads there is no static-PAT fallback.
-async fn contents_read_credential(
-    shared: &SharedState,
-    repository: &str,
-) -> Option<(String, crate::github_breaker::GithubCredentialBucket)> {
-    let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await else {
-        warn!(
-            repository,
-            "no GitHub App installation covers this repository; its local composite manifests cannot be read, so their nested actions stay denied"
-        );
-        return None;
+/// Unlike action downloads there is no static-PAT fallback.
+async fn contents_read_credential(shared: &SharedState, repository: &str) -> ContentsCredential {
+    let app = match crate::github_app::candidate_apps_for_repo_inner(shared, repository).await {
+        Ok(mut candidates) if !candidates.is_empty() => candidates.swap_remove(0),
+        Ok(_) | Err(crate::github_app::AppLookupError::NotInstalled) => {
+            warn!(
+                repository,
+                "no GitHub App installation covers this repository; its local composite manifests cannot be read, so their nested actions stay denied"
+            );
+            return ContentsCredential::NotInstalled;
+        }
+        Err(crate::github_app::AppLookupError::Transient(error)) => {
+            warn!(
+                repository,
+                %error,
+                "could not tell whether a GitHub App covers this repository; its local composite manifests cannot be read, so their nested actions stay denied"
+            );
+            return ContentsCredential::Transient;
+        }
     };
     let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
     let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
@@ -1706,21 +1729,21 @@ async fn contents_read_credential(
                 %error,
                 "could not mint a contents-read installation token; its local composite manifests cannot be read, so their nested actions stay denied"
             );
-            return None;
+            return ContentsCredential::Transient;
         }
     };
     // The installation is the rate-limit identity, so never invent one.
     match crate::github_app::installation_for_repo(&app, repository).await {
-        Ok(installation) if installation != 0 => Some((
+        Ok(installation) if installation != 0 => ContentsCredential::Token(
             token,
             crate::github_breaker::GithubCredentialBucket::Installation(installation),
-        )),
+        ),
         _ => {
             warn!(
                 repository,
                 "could not resolve the installation for this repository; its local composite manifests cannot be read, so their nested actions stay denied"
             );
-            None
+            ContentsCredential::Transient
         }
     }
 }
