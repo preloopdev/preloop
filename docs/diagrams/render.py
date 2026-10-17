@@ -151,15 +151,14 @@ def main():
         print("rendered", jp.name)
     # rebuild index.html embedding every svg
     parts = ['<!DOCTYPE html>\n<html lang="en"><head><meta charset="UTF-8">\n'
+             '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
              '<title>Preloop — Architecture Diagrams</title>\n<style>\n'
-             '*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%}\n'
-             'body{font-family:system-ui,sans-serif;background:#fafafa;display:grid;\n'
-             'grid-template-columns:280px 1fr;height:100vh;overflow:hidden}\n'
-             'nav{background:#1e1e1e;color:#e5e5e5;padding:24px 16px;overflow-y:auto}\n'
-             'nav h1{font\n\n']
-    old = (root / "index.html").read_text()
-    head_end = old.find('<main id="host">')
-    parts = [old[:head_end] if head_end > 0 else parts[0]]
+             '*{box-sizing:border-box}html,body{min-height:100%;margin:0}\n'
+             'body{font-family:system-ui,sans-serif;background:#fafafa;padding:1rem}\n'
+             '#host{max-width:1600px;margin:0 auto;display:grid;grid-template-columns:1fr;gap:1.5rem}\n'
+             '.dia{width:100%;overflow:auto;background:#fff;border:1px solid #ddd}\n'
+             '.dia svg{display:block;width:100%;height:auto}\n'
+             '</style></head><body>\n']
     parts.append('<main id="host">\n')
     for jp in sorted(root.glob("*.json")):
         svg = jp.with_suffix(".svg").read_text().rstrip()

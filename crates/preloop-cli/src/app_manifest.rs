@@ -202,17 +202,23 @@ struct InstalledQuery {
     installation_id: Option<u64>,
 }
 
-/// Run the browser flow to completion.
+/// Run the browser flow and persist the converted credentials immediately.
 ///
-/// Returns once GitHub has converted the manifest; the installation step is
-/// best-effort and bounded by [`INSTALL_TIMEOUT`].
-pub(crate) async fn register(
+/// The callback runs as soon as GitHub's conversion response arrives, before
+/// waiting for the optional installation redirect. GitHub returns the private
+/// key only once, so waiting for installation before saving it would let a
+/// timeout or Ctrl-C lose the key.
+pub(crate) async fn register_with_persist<F, T>(
     name: &str,
     org: Option<&str>,
     port: u16,
     public_url: Option<&str>,
     open_browser: bool,
-) -> Result<Registration> {
+    persist: F,
+) -> Result<(Registration, T)>
+where
+    F: FnOnce(&AppCredentials) -> Result<T>,
+{
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
         .with_context(|| format!("binding 127.0.0.1:{port} for the GitHub redirect"))?;
@@ -229,11 +235,12 @@ pub(crate) async fn register(
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://api.github.com".to_owned());
-    register_on(listener, name, org, public_url, &api_base).await
+    register_on_with_persist(listener, name, org, public_url, &api_base, persist).await
 }
 
-/// [`register`] against an already-bound listener, so a test can learn the
-/// address before the flow starts.
+/// [`register_with_persist`] against an already-bound listener, so a test can
+/// learn the address before the flow starts.
+#[cfg(test)]
 async fn register_on(
     listener: tokio::net::TcpListener,
     name: &str,
@@ -241,6 +248,23 @@ async fn register_on(
     public_url: Option<&str>,
     api_base: &str,
 ) -> Result<Registration> {
+    let (registration, ()) =
+        register_on_with_persist(listener, name, org, public_url, api_base, |_| Ok(())).await?;
+    Ok(registration)
+}
+
+/// [`register_on`] with immediate persistence of the converted credentials.
+async fn register_on_with_persist<F, T>(
+    listener: tokio::net::TcpListener,
+    name: &str,
+    org: Option<&str>,
+    public_url: Option<&str>,
+    api_base: &str,
+    persist: F,
+) -> Result<(Registration, T)>
+where
+    F: FnOnce(&AppCredentials) -> Result<T>,
+{
     let local = listener
         .local_addr()
         .context("reading the local listener address")?;
@@ -282,6 +306,15 @@ async fn register_on(
             BROWSER_TIMEOUT.as_secs()
         ),
     };
+    let persisted = match persist(&credentials) {
+        Ok(value) => value,
+        Err(error) => {
+            shutdown.cancel();
+            let _ = server.await;
+            return Err(error)
+                .context("persisting GitHub App credentials immediately after conversion");
+        }
+    };
 
     let installation_id = match tokio::time::timeout(INSTALL_TIMEOUT, installed_rx).await {
         Ok(Ok(id)) => Some(id),
@@ -289,10 +322,13 @@ async fn register_on(
     };
     shutdown.cancel();
     let _ = server.await;
-    Ok(Registration {
-        credentials,
-        installation_id,
-    })
+    Ok((
+        Registration {
+            credentials,
+            installation_id,
+        },
+        persisted,
+    ))
 }
 
 /// The form page: GitHub only accepts a manifest as a form POST, so this is
@@ -523,7 +559,7 @@ mod tests {
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let router = Router::new().route(
-            "/app-manifests/:code/conversions",
+            "/app-manifests/{code}/conversions",
             axum::routing::post(|axum::extract::Path(code): axum::extract::Path<String>| async move {
                 assert_eq!(code, "conversion-code", "the code from GitHub is forwarded verbatim");
                 axum::Json(serde_json::json!({
@@ -648,7 +684,7 @@ mod tests {
         );
         tokio::spawn(async move {
             let router = Router::new().route(
-                "/app-manifests/:code/conversions",
+                "/app-manifests/{code}/conversions",
                 axum::routing::post(|| async {
                     (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "code expired")
                 }),

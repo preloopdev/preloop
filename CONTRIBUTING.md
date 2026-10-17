@@ -104,6 +104,8 @@ just clippy       # cargo clippy --workspace --all-targets -- -D warnings
 just test-ci      # fmt-check + clippy + test (the full CI gate)
 ```
 
+Optional: tool versions are pinned in `mise.toml` (zig, cargo-zigbuild, ast-grep, just, cargo-deny). Run `mise install`, then `mise exec -- just <recipe>`. Rust still comes from rustup and `rust-toolchain.toml`. Without mise, the recipes use whatever is on your PATH.
+
 ## E2E testing
 
 For local HTTP E2E, configure the official runner with

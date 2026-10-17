@@ -387,7 +387,7 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            preloop_runner_server::credential_store::load_engine_token_from_env(&preloop_home())
+            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
                 .ok()
                 .flatten()
         })
@@ -401,7 +401,7 @@ pub(crate) fn api_token() -> Option<String> {
             if home == cwd_default {
                 return None;
             }
-            preloop_runner_server::credential_store::load_engine_token_from_env(&cwd_default)
+            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
                 .ok()
                 .flatten()
         })
@@ -633,6 +633,16 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
 
 #[cfg(test)]
 pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes every test that reads or writes process-global environment
+/// variables (`PRELOOP_HOME`, `PRELOOP_CONFIG`, `PRELOOP_CREDENTIAL_STORE`,
+/// `PRELOOP_TOKEN`, `HOME`, …). Process env is per-process state, so parallel
+/// test threads would otherwise race each other's `set_var`/`remove_var`
+/// pairs and observe each other's transient values across modules. Sync
+/// tests take it with [`tokio::sync::Mutex::blocking_lock`]; async tests with
+/// `lock().await`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A fake `smolvm` on PATH that records the sandbox environment it was given
 /// and answers the debug-session byte-count probe. Serialized with
@@ -926,9 +936,16 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     payload: Option<PathBuf>,
 
-    /// Base ref for pull_request or merge_group events.
+    /// Pull-request base ref for merge construction and hosted bundle
+    /// prerequisites.
     #[arg(long)]
     base: Option<String>,
+
+    /// Commit message for the real submit-time commit created by `--push`
+    /// when the working tree is dirty. Without this flag, `$EDITOR` is
+    /// prefilled; non-interactive runs use a generated message.
+    #[arg(short = 'm', long = "message")]
+    message: Option<String>,
     /// Open a live debug session when a job fails. Without this flag, failed
     /// AgentENV jobs are cleaned up normally. SmolVM retains its historical
     /// terminal-attached default for compatibility.
@@ -988,6 +1005,14 @@ struct RunArgs {
         action = clap::ArgAction::Set
     )]
     pr_draft: bool,
+
+    /// Test the branch alone instead of the merge of the pull request's
+    /// current base tip into it. Only affects `--event pull_request` runs
+    /// against a local engine: by default those run on the merge (the base
+    /// tip is fetched from origin), like GitHub's `refs/pull/<n>/merge`.
+    /// Use this when the base branch cannot be fetched.
+    #[arg(long)]
+    no_merge: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1508,7 +1533,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
         );
     }
 
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_dir);
+    let store = preloop_runner_server::credential_store::engine_store(&preloop_dir)?;
     let token = prepare_engine_token(
         &preloop_dir,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
@@ -1521,6 +1546,12 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     cmd.arg("engine");
     cmd.env("PRELOOP_SYSTEM_TOKEN", token);
     cmd.env("PRELOOP_HOME", &preloop_dir);
+    // Lets the engine record in serve.lock that a preloop command started it,
+    // so a second `preloop serve` names the right way to stop it.
+    cmd.env(
+        preloop_runner_server::bootstrap::ENGINE_ORIGIN_ENV,
+        preloop_runner_server::bootstrap::EngineOrigin::Background.as_str(),
+    );
     if std::env::var_os("RUST_LOG").is_none() {
         cmd.env("RUST_LOG", "info,preloop=debug");
     }
@@ -1614,7 +1645,7 @@ fn prepare_engine_token(
     )
 }
 
-/// Move any inline GitHub credential in `config` into the OS credential
+/// Move any inline GitHub credential in `config` into the selected credential
 /// store, returning whether anything moved.
 ///
 /// Only the `legacy_*` fields are inspected, and those are populated purely
@@ -1802,7 +1833,11 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
     let mut file_config = preloop_runner_server::config::load_config()?;
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
+    let config_path = preloop_runner_server::config::config_path();
+    let store = preloop_runner_server::credential_store::selected_store_for_config(
+        &config_path,
+        file_config.credential_store.as_deref(),
+    )?;
     // Read before migrating: migration moves the inline values out of
     // `config.github`, and the freshly stored ones are not re-resolved here.
     let from_file = github_auth::StoredAuth {
@@ -1813,9 +1848,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     };
     if migrate_legacy_github_credentials(&mut file_config, store.as_ref())? {
         preloop_runner_server::config::write_config(&file_config)?;
-        eprintln!(
-            "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
-        );
+        eprintln!("[preloop] migrated legacy GitHub credentials to the credential store");
     }
     auth.fill_gaps(from_file);
 
@@ -1847,7 +1880,7 @@ async fn cmd_engine(
 
     // Keep AppState's resolver on the same engine home as this CLI.
     unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-    let store = preloop_runner_server::credential_store::store_from_env(&home);
+    let store = preloop_runner_server::credential_store::engine_store(&home)?;
     let token = prepare_engine_token(
         &home,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
@@ -2005,45 +2038,85 @@ async fn cmd_engine(
         result = wait_for_engine_socket(&socket, listen) => result?,
     }
 
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match pool_config {
-        Ok(config) => {
-            if !pool_enabled {
-                if config.use_fork {
-                    tracing::info!(
-                        "warm runner pool disabled; forking one VM per queued job from the golden"
-                    );
-                } else {
-                    tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
-                }
-            }
-            let pool_shutdown = shutdown.clone();
-            // Supervisor-side, once, before any VM boots: systemd's
-            // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
-            // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
-            // get no cpu/memory/pids limit files. This performs the same
-            // vacate-then-enable dance `smolvm serve` does. It is the only
-            // place Preloop writes to the cgroup hierarchy — the CLI paths
-            // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
-            // root read-only and never mutate it.
-            preloop_vm::init_vm_cgroup_delegation();
-            let backend = vm_backend()?;
-            tracing::info!(backend = backend.as_str(), "VM substrate selected");
-            Some(tokio::spawn(async move {
-                RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-                    .run(pool_shutdown)
-                    .await
-            }))
-        }
-        Err(_) => None,
-    };
-
-    // Every way out of this process — the normal shutdown below, a slot
-    // failure that ends the pool, an error return — must not leave VMs
-    // running: see `VmTeardownOnExit`.
+    // Every way out of this process — the normal shutdown below, a pool that
+    // never recovers, an error return like a failed `vm_backend()` — must not
+    // leave VMs running: see `VmTeardownOnExit`. Armed before the first pool
+    // spawn so even those early returns run the exit scan.
     let _vm_teardown = VmTeardownOnExit;
 
-    let stop = wait_for_stop(&mut server, &mut pool, engine_shutdown_signal()).await;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let pool_config = pool_config.ok();
+    let mut backend = None;
+    if let Some(config) = &pool_config {
+        if !pool_enabled {
+            if config.use_fork {
+                tracing::info!(
+                    "warm runner pool disabled; forking one VM per queued job from the golden"
+                );
+            } else {
+                tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
+            }
+        }
+        // Supervisor-side, once, before any VM boots: systemd's
+        // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+        // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+        // get no cpu/memory/pids limit files. This performs the same
+        // vacate-then-enable dance `smolvm serve` does. It is the only
+        // place Preloop writes to the cgroup hierarchy — the CLI paths
+        // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+        // root read-only and never mutate it.
+        preloop_vm::init_vm_cgroup_delegation();
+        let selected = vm_backend()?;
+        tracing::info!(backend = selected.as_str(), "VM substrate selected");
+        backend = Some(selected);
+    }
+
+    let spawn_pool = |config: &RunnerPoolConfig,
+                      pool_shutdown: tokio_util::sync::CancellationToken,
+                      backend: VmBackend| {
+        let config = config.clone();
+        tokio::spawn(async move {
+            RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
+                .run(pool_shutdown)
+                .await
+        })
+    };
+    // Each generation gets a fresh child token: `RunnerPool::run` cancels the
+    // token it is handed when a slot ends so its siblings drain, and reusing
+    // the same token would hand the replacement pool an already-fired
+    // cancellation that makes it exit `Ok` — and stop the engine — instantly.
+    let mut pool = pool_config.as_ref().map(|config| {
+        spawn_pool(
+            config,
+            shutdown.child_token(),
+            backend.expect("the backend is resolved when a pool config exists"),
+        )
+    });
+
+    // A pool task that returns an error ends only the pool, not the engine:
+    // `RunnerPool::run` ran its teardown on the way out, so nothing is left
+    // running, and the server must keep answering clients (including
+    // `preloop status`, which is how this failure is diagnosed). The pool is
+    // rebuilt on an exponential backoff; a run that reached steady state
+    // resets the backoff so a one-off failure retries quickly.
+    let mut signal = Box::pin(engine_shutdown_signal());
+    let stop = supervise_pool(
+        &mut server,
+        &mut pool,
+        signal.as_mut(),
+        |restart| {
+            tracing::error!(%restart, "runner pool exited; rebuilding it after a backoff");
+            pool_status.record_provision_failure();
+            !pool_preparing.load(std::sync::atomic::Ordering::Acquire)
+        },
+        || {
+            pool_config
+                .as_ref()
+                .zip(backend)
+                .map(|(config, backend)| spawn_pool(config, shutdown.child_token(), backend))
+        },
+    )
+    .await;
     let result = match stop {
         Stop::Server(result) | Stop::Pool(result) => Some(result),
         Stop::Signal => None,
@@ -2059,8 +2132,19 @@ async fn cmd_engine(
     }
 }
 
+/// First wait before rebuilding a pool whose task returned an error.
+const POOL_RESTART_MIN: Duration = Duration::from_secs(1);
+/// Longest wait between pool rebuilds; each consecutive failure doubles the
+/// previous wait.
+const POOL_RESTART_MAX: Duration = Duration::from_secs(300);
+/// A pool that finished preparing and then ran this long reached steady
+/// state; a later failure restarts from [`POOL_RESTART_MIN`] instead of
+/// inheriting a stale maximum.
+const POOL_STEADY_AFTER: Duration = Duration::from_secs(60);
+
 /// Why the engine is stopping; each result is handled *after* the pool has
 /// settled, never by an early return past its teardown.
+#[derive(Debug)]
 enum Stop {
     Server(anyhow::Result<()>),
     Pool(anyhow::Result<()>),
@@ -2075,13 +2159,17 @@ fn flatten_task_result<E: Into<anyhow::Error>>(
 
 /// Wait for the first reason the engine must stop.
 ///
+/// `signal` is borrowed, not consumed: the caller loops over this function
+/// when it restarts a failed pool, and the pending signal future must
+/// survive between iterations.
+///
 /// When the pool task is the one that ended the race, its handle is consumed
 /// out of `pool`: a finished `JoinHandle` panics if it is polled again, and
 /// the shutdown sequence that follows would otherwise wait on it.
 async fn wait_for_stop<S, P>(
     server: &mut tokio::task::JoinHandle<Result<(), S>>,
     pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
-    signal: impl Future<Output = ()>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
 ) -> Stop
 where
     S: Into<anyhow::Error>,
@@ -2104,6 +2192,59 @@ where
         *pool = None;
     }
     stop
+}
+
+/// Run the server/pool race until the engine must stop, rebuilding a failed
+/// pool instead of ending the process.
+///
+/// A `RunnerPool::run` that returns an error has already torn every machine
+/// down, so the failure is survivable: `report` sees it (logging, status
+/// counters) and answers whether the dead pool had finished preparing —
+/// only a pool that reached steady state resets the backoff, because a slow
+/// persistent failure (a multi-GB unpack on a full disk) must keep doubling
+/// rather than hot-retry every second. `respawn` builds the next
+/// generation's handle; each generation must carry a fresh child token
+/// because `RunnerPool::run` cancels the token it is handed when a slot
+/// ends.
+///
+/// While the backoff sleeps the server and the shutdown signal stay in the
+/// race — a dead HTTP side stops the engine now instead of after the sleep
+/// spawning a pool for a dead server. `Stop::Server`, `Stop::Pool(Ok(..))`,
+/// and `Stop::Signal` end the loop untouched.
+async fn supervise_pool<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
+    mut report: impl FnMut(&anyhow::Error) -> bool,
+    mut respawn: impl FnMut() -> Option<tokio::task::JoinHandle<Result<(), P>>>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let mut restart_backoff = POOL_RESTART_MIN;
+    let mut signal = signal;
+    loop {
+        let pool_started = std::time::Instant::now();
+        match wait_for_stop(server, pool, signal.as_mut()).await {
+            Stop::Pool(Err(error)) => {
+                let reached_steady = report(&error) && pool_started.elapsed() >= POOL_STEADY_AFTER;
+                if reached_steady {
+                    restart_backoff = POOL_RESTART_MIN;
+                }
+                tokio::select! {
+                    result = &mut *server => {
+                        return Stop::Server(flatten_task_result(result));
+                    }
+                    _ = signal.as_mut() => return Stop::Signal,
+                    _ = tokio::time::sleep(restart_backoff) => {}
+                }
+                restart_backoff = restart_backoff.saturating_mul(2).min(POOL_RESTART_MAX);
+                *pool = respawn();
+            }
+            stop => return stop,
+        }
+    }
 }
 
 /// Give the pool `grace` to reach its own teardown after the shutdown token
@@ -2851,7 +2992,15 @@ fn usable_diff_base(base: &str) -> bool {
 
 /// Remotes configured for this repository, in git's order.
 fn git_remotes() -> Vec<String> {
-    std::process::Command::new("git")
+    git_remotes_in(None)
+}
+
+fn git_remotes_in(repository: Option<&std::path::Path>) -> Vec<String> {
+    let mut command = std::process::Command::new("git");
+    if let Some(repository) = repository {
+        command.arg("-C").arg(repository);
+    }
+    command
         .arg("remote")
         .output()
         .ok()
@@ -3008,10 +3157,9 @@ fn strip_branch_prefix(raw: &str) -> &str {
 
 /// Branch a `pull_request` run should be filtered against.
 ///
-/// GitHub applies `on.pull_request.branches` to the PR's *target* branch, not
-/// the head branch. Without this a local PR run filters on the checked-out
-/// branch and a workflow gated to `branches: [main]` never matches. Only
-/// derived when the payload does not already carry a base ref.
+/// GitHub applies `on.pull_request.branches` to the PR's target branch. When
+/// no target is supplied, use the remote's advertised default branch rather
+/// than the checked-out branch's tracking ref.
 fn default_local_filter_branch(
     event: &str,
     base: Option<&str>,
@@ -3028,18 +3176,80 @@ fn default_local_filter_branch(
     {
         return None;
     }
-    // An explicit `--base` is the user's stated PR target and names the branch
-    // filters apply to whether or not the ref exists locally — shallow clones
-    // and un-fetched bases are normal. Only the fallback needs a real ref,
-    // because it has nothing else to go on.
-    let base = match base {
-        Some(base) => base.to_owned(),
-        None => resolve_local_diff_base(None)?,
-    };
-    // Filters are written against branch names (`main`), not remote-qualified
-    // refs (`origin/main`), but branches can contain slashes (`feature/auth`).
+    let base = base.map(str::to_owned).or_else(local_default_branch)?;
     let name = strip_branch_prefix(&base).to_owned();
     (!name.is_empty()).then_some(name)
+}
+
+/// The base branch whose tip rides in a hosted dirty-submit bundle. The server
+/// builds the test merge against `pull_request_base_branch`, which reads the
+/// payload's `pull_request.base.ref` first, then `--base`, then the derived
+/// filter branch; the bundle must carry the tip of that same branch or the
+/// engine has nothing to merge against.
+fn submit_base_branch(
+    payload: &serde_json::Value,
+    base_arg: Option<&str>,
+    derived_filter_branch: Option<&str>,
+) -> Option<String> {
+    payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .and_then(serde_json::Value::as_str)
+        .or(base_arg)
+        .or(derived_filter_branch)
+        .map(|raw| strip_branch_prefix(raw).to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+fn local_default_branch() -> Option<String> {
+    local_default_branch_in(std::path::Path::new("."))
+}
+
+fn local_default_branch_in(repository: &std::path::Path) -> Option<String> {
+    for remote in git_remotes_in(Some(repository)) {
+        let local = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args([
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ])
+            .output();
+        if let Ok(output) = local
+            && output.status.success()
+        {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !branch.is_empty() {
+                return Some(branch);
+            }
+        }
+
+        let advertised = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["ls-remote", "--symref", &remote, "HEAD"])
+            .output();
+        let Ok(output) = advertised else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let branch = output.lines().find_map(|line| {
+            let (reference, name) = line.split_once('\t')?;
+            (name == "HEAD")
+                .then(|| reference.strip_prefix("ref: refs/heads/"))
+                .flatten()
+        });
+        if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+            return Some(format!("{remote}/{branch}"));
+        }
+    }
+    None
 }
 
 fn collect_local_reusable_workflows(
@@ -3123,16 +3333,36 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     .await?;
 
     let push_requested = args.push || args.create_pr;
-    // A dirty working tree is allowed with --push: CI runs on the server's
-    // snapshot of the uncommitted state, and after it passes the CLI
-    // materializes a commit whose tree is exactly what CI tested (see
-    // `decide_dirty_push_opts`). A clean tree pins the push to HEAD directly.
+    // Dirty push submissions are committed before they leave this process.
+    // The commit is created in a private index, so the user's index, refs, and
+    // working tree remain untouched while the engine receives a real C.
     let dirty = if push_requested {
         git_porcelain().context("failed to check the working tree for --push")?
     } else {
         Vec::new()
     };
     let dirty_push = push_requested && !dirty.is_empty();
+    let submit_commit = if dirty_push {
+        // A hosted pull-request merge is built against the base branch, so the
+        // base tip rides in the bundle; every other event tests C alone.
+        let base_branch = (event == "pull_request" && !args.no_merge)
+            .then(|| {
+                submit_base_branch(
+                    &payload,
+                    args.base.as_deref(),
+                    derived_filter_branch.as_deref(),
+                )
+            })
+            .flatten();
+        Some(create_submit_commit(
+            args.message.as_deref(),
+            &dirty,
+            &detect_git_ref(),
+            base_branch.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let tested_head = if push_requested && !dirty_push {
         Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
     } else {
@@ -3166,6 +3396,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // list the server was just handed.
         changed_paths_known: derived_changed_paths.is_some(),
         filter_branch: derived_filter_branch,
+        // A local `pull_request` run tests the merge of the current base tip
+        // into the head by default (like GitHub's `refs/pull/<n>/merge`);
+        // `--no-merge` is the explicit escape back to testing the branch
+        // alone.
+        no_merge: args.no_merge,
         // `--debug` keeps the failed runner waiting for a verdict;
         // `--preserve-on-failure` only keeps a completed failed VM for shell.
         preserve_on_failure,
@@ -3175,32 +3410,55 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
     if push_requested {
-        // The base commit: for a clean tree this IS the tested commit; for a
-        // dirty tree it is the parent of the materialized CI-verified commit.
-        submission.sha = git_rev_parse("HEAD")?;
-        // The server names the requester in the PR body it opens.
+        // C is the exact commit CI will test. Clean submissions keep HEAD;
+        // dirty submissions carry C and its tree in the hosted bundle.
+        submission.sha = submit_commit
+            .as_ref()
+            .map(|commit| commit.sha.clone())
+            .unwrap_or(git_rev_parse("HEAD")?);
         if let Some(name) = git_config_user_name() {
             submission.actor = name;
         }
         submission.push = Some(preloop_gha_protocol::PushRequest {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
-            // The server verifies the branch head for a dirty-tree push (the
-            // materialized commit) instead of the base sha.
-            dirty: dirty_push,
+            dirty: false,
         });
-        if let Some((_, head_tree)) = tested_head {
-            submission.push_tree = Some(head_tree);
+        submission.push_tree = submit_commit
+            .as_ref()
+            .map(|commit| commit.tree.clone())
+            .or_else(|| tested_head.map(|(_, head_tree)| head_tree));
+        if let Some(commit) = submit_commit.as_ref()
+            && event == "pull_request"
+            && let Some(head) = submission
+                .payload
+                .get_mut("pull_request")
+                .and_then(|pr| pr.get_mut("head"))
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            head.insert("sha".to_owned(), serde_json::json!(commit.sha));
         }
     }
 
     let client = build_client();
     let url = server_url();
+    if let Some(commit) = submit_commit.as_ref() {
+        // The bundle is single-use scratch: remove it whether or not the upload
+        // succeeded, so a refused or failed upload (413, network error) cannot
+        // strand up to 512 MiB in the temp directory.
+        let uploaded = upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await;
+        let _ = std::fs::remove_file(&commit.bundle_path);
+        submission.git_bundle_id = Some(uploaded?);
+    }
     // Secrets redact on plain serialization; sending them is opt-in.
     let mut request = client
         .post(format!("{url}/api/v1/runs"))
         .json(&submission.to_request_json()?);
-    if should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err()) {
+    // A bundled submission carries its own workspace; a workspace header would
+    // point the engine at the live checkout instead of the commit under test.
+    if submit_commit.is_none()
+        && should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err())
+    {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -3477,11 +3735,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // Push-back runs on any conclusion: a draft PR with red checks is
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
+        let tree_unchanged = submit_commit.as_ref().is_none_or(submit_tree_unchanged);
+        // Only a push that actually succeeded may offer to move the branch: a
+        // declined or failed push has published nothing to move to.
+        let mut pushed = false;
         let push_error = if push_requested {
-            if dirty_push {
-                // The PR decision happens after CI for a dirty tree: the
-                // user saw the result and chooses y/N/d now (or a label /
-                // explicit flag decides in non-interactive runs).
+            if dirty_push && !tree_unchanged {
+                eprintln!(
+                    "not pushing submit commit: the working tree changed since submission; \
+                     re-submit to test the new tree"
+                );
+                Some(anyhow::anyhow!("working tree changed since submit"))
+            } else if dirty_push {
                 match decide_dirty_push_opts(
                     &dirty,
                     args.push,
@@ -3489,15 +3754,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     args.pr_draft,
                     status == ExecutionStatus::Success,
                 )? {
-                    Some(opts) => push::push_run(
-                        &client,
-                        &url,
-                        api_token(),
-                        &accepted.run_id.to_string(),
-                        Some(opts),
-                    )
-                    .await
-                    .err(),
+                    Some(opts) => {
+                        let result = push::push_run(
+                            &client,
+                            &url,
+                            api_token(),
+                            &accepted.run_id.to_string(),
+                            Some(opts),
+                        )
+                        .await;
+                        pushed = result.is_ok();
+                        result.err()
+                    }
                     None => {
                         eprintln!(
                             "not pushing (declined) — CI result was informational. \
@@ -3508,19 +3776,28 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                push::push_run(
+                let result = push::push_run(
                     &client,
                     &url,
                     api_token(),
                     &accepted.run_id.to_string(),
                     None,
                 )
-                .await
-                .err()
+                .await;
+                pushed = result.is_ok();
+                result.err()
             }
         } else {
             None
         };
+        if pushed
+            && dirty_push
+            && tree_unchanged
+            && status == ExecutionStatus::Success
+            && let Some(commit) = submit_commit.as_ref()
+        {
+            offer_branch_move(&commit.sha)?;
+        }
         if let Some(error) = &push_error {
             eprintln!(
                 "push failed: {error:#}\n\
@@ -3736,6 +4013,331 @@ fn git_porcelain() -> anyhow::Result<Vec<String>> {
         .lines()
         .map(str::to_owned)
         .collect())
+}
+#[derive(Debug)]
+struct SubmitCommit {
+    sha: String,
+    tree: String,
+    bundle_path: PathBuf,
+}
+
+/// A number unique to this process and call, so concurrent submissions in one
+/// process never share an index, message, bundle file or ref namespace.
+fn next_scratch_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A scratch file path in the temp directory, unique to this process and call.
+fn submit_scratch(label: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "preloop-{label}-{}-{}.{extension}",
+        std::process::id(),
+        next_scratch_id()
+    ))
+}
+
+/// `git -C <repo> <args>` with extra environment; returns trimmed stdout.
+fn git_in(
+    repo: &std::path::Path,
+    envs: &[(&str, &std::ffi::OsStr)],
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .envs(envs.iter().copied())
+        .args(args)
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The tree the working tree would commit: tracked changes plus untracked,
+/// non-ignored files, computed in a private index so the user's real index
+/// never moves. The index starts from HEAD, not empty: git keeps tracking a
+/// file that an ignore rule now matches only when the index already lists it,
+/// so an empty index would silently delete such a file from the submit.
+fn worktree_tree_in(repo: &std::path::Path) -> anyhow::Result<String> {
+    let index = submit_scratch("index", "tmp");
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    let tree = git_in(repo, &env, &["read-tree", "HEAD"])
+        .and_then(|_| git_in(repo, &env, &["add", "-A"]))
+        .and_then(|_| git_in(repo, &env, &["write-tree"]));
+    let _ = std::fs::remove_file(&index);
+    tree
+}
+
+/// The commit a hosted pull-request merge is built against: the freshest known
+/// tip of `origin/<base>`. A stale local branch of the same name is used only
+/// when there is no remote-tracking ref at all.
+fn resolve_base_tip_in(repo: &std::path::Path, base: &str) -> anyhow::Result<String> {
+    let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+    // The merge should test the base as it is now. Offline, fall back to the
+    // last fetched tip, and say so rather than testing it silently.
+    if git_in(repo, &[], &["fetch", "--quiet", "origin", base]).is_err() {
+        eprintln!("warning: could not fetch origin/{base}; merging against the last fetched tip");
+    }
+    for candidate in [
+        format!("refs/remotes/origin/{base}^{{commit}}"),
+        format!("refs/heads/{base}^{{commit}}"),
+    ] {
+        if let Ok(sha) = git_in(repo, &[], &["rev-parse", "--verify", "-q", &candidate]) {
+            return Ok(sha);
+        }
+    }
+    anyhow::bail!(
+        "base branch `{base}` was not found on `origin` or locally; fetch it, pass --base, \
+         or use --no-merge"
+    )
+}
+
+/// Create the immutable commit uploaded for a dirty hosted submit. Git
+/// `commit-tree` bypasses commit-msg hooks by design; only a private index is
+/// used, so the user's staging area and branch pointer never move. The editor
+/// opens only for a person at a terminal: a pipe or CI run must never hang on it.
+fn create_submit_commit(
+    explicit_message: Option<&str>,
+    dirty: &[String],
+    git_ref: &str,
+    base_branch: Option<&str>,
+) -> anyhow::Result<SubmitCommit> {
+    let editor = submit_editor(
+        std::env::var("EDITOR").ok(),
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    );
+    create_submit_commit_in(
+        std::path::Path::new("."),
+        explicit_message,
+        editor.as_deref(),
+        dirty,
+        git_ref,
+        base_branch,
+    )
+}
+
+/// The editor to compose the submit message in: `$EDITOR` when one is set and
+/// a person is at the terminal, never otherwise.
+fn submit_editor(editor_env: Option<String>, interactive: bool) -> Option<String> {
+    editor_env
+        .filter(|editor| !editor.trim().is_empty())
+        .filter(|_| interactive)
+}
+
+fn create_submit_commit_in(
+    repo: &std::path::Path,
+    explicit_message: Option<&str>,
+    editor: Option<&str>,
+    dirty: &[String],
+    git_ref: &str,
+    base_branch: Option<&str>,
+) -> anyhow::Result<SubmitCommit> {
+    let parent = git_in(repo, &[], &["rev-parse", "HEAD"])?;
+    let tree = worktree_tree_in(repo)?;
+    let branch = git_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(git_ref)
+        .to_owned();
+    let mut message = explicit_message
+        .map(str::to_owned)
+        .unwrap_or_else(|| generated_submit_message(&branch, dirty));
+    if explicit_message.is_none()
+        && let Some(editor) = editor
+    {
+        message = edit_submit_message(editor, &message)?;
+    }
+    if !message.contains("Preloop-Tested-Tree:") {
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+        message.push_str(&format!("\nPreloop-Tested-Tree: {tree}\n"));
+    }
+    let identity = |key: &str| {
+        git_in(repo, &[], &["config", key])
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    let name = identity("user.name")
+        .ok_or_else(|| anyhow::anyhow!("git user.name is required for a dirty submit"))?;
+    let email = identity("user.email")
+        .ok_or_else(|| anyhow::anyhow!("git user.email is required for a dirty submit"))?;
+    let author = [
+        ("GIT_AUTHOR_NAME", std::ffi::OsStr::new(&name)),
+        ("GIT_AUTHOR_EMAIL", std::ffi::OsStr::new(&email)),
+        ("GIT_COMMITTER_NAME", std::ffi::OsStr::new(&name)),
+        ("GIT_COMMITTER_EMAIL", std::ffi::OsStr::new(&email)),
+    ];
+    let sha = git_in(
+        repo,
+        &author,
+        &["commit-tree", &tree, "-p", &parent, "-m", &message],
+    )?;
+
+    // Bundle exactly what the engine needs and nothing else: the submitted
+    // commit and, for a pull-request merge, the base tip. `--all` would ship
+    // every branch, stash and remote-tracking ref in the repository.
+    let namespace = format!(
+        "refs/preloop/submit/{}-{}",
+        std::process::id(),
+        next_scratch_id()
+    );
+    let mut refs = vec![format!("{namespace}/head")];
+    let bundle_path = submit_scratch("submit", "bundle");
+    let bundled = (|| -> anyhow::Result<()> {
+        git_in(repo, &[], &["update-ref", &refs[0], &sha])?;
+        if let Some(base) = base_branch {
+            let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+            let tip = resolve_base_tip_in(repo, base)?;
+            let base_ref = format!("{namespace}/base/{base}");
+            git_in(repo, &[], &["update-ref", &base_ref, &tip])?;
+            refs.push(base_ref);
+        }
+        let bundle_arg = bundle_path.to_string_lossy();
+        let mut args = vec!["bundle", "create", bundle_arg.as_ref()];
+        args.extend(refs.iter().map(String::as_str));
+        git_in(repo, &[], &args)?;
+        Ok(())
+    })();
+    // The refs only name the bundle's contents; the repository keeps none.
+    for name in &refs {
+        let _ = git_in(repo, &[], &["update-ref", "-d", name]);
+    }
+    if let Err(error) = bundled {
+        let _ = std::fs::remove_file(&bundle_path);
+        return Err(error);
+    }
+    Ok(SubmitCommit {
+        sha,
+        tree,
+        bundle_path,
+    })
+}
+
+/// Let the user edit the commit message the way `git commit` does: the command
+/// goes through a shell so `EDITOR="code --wait"` works.
+fn edit_submit_message(editor: &str, initial: &str) -> anyhow::Result<String> {
+    let path = submit_scratch("message", "txt");
+    std::fs::write(&path, initial).context("write prefilled submit message")?;
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "preloop"])
+        .arg(&path)
+        .status()
+        .context("run $EDITOR for submit commit");
+    let edited = match status {
+        Ok(status) if status.success() => {
+            std::fs::read_to_string(&path).context("read submit message")
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "$EDITOR failed while composing the submit commit"
+        )),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(&path);
+    edited
+}
+
+fn generated_submit_message(branch: &str, dirty: &[String]) -> String {
+    let mut dirs = dirty
+        .iter()
+        .filter_map(|line| line.get(3..))
+        .filter_map(|path| path.split('/').next())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.dedup();
+    format!(
+        "wip({branch}): {} files in {}",
+        dirty.len(),
+        if dirs.is_empty() {
+            ".".to_owned()
+        } else {
+            dirs.join(", ")
+        }
+    )
+}
+
+fn run_git_status<const N: usize>(args: [&str; N]) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .context("run git command")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn upload_git_bundle(
+    client: &reqwest::Client,
+    url: &str,
+    path: &std::path::Path,
+    token: Option<String>,
+) -> anyhow::Result<String> {
+    let body = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read git bundle {}", path.display()))?;
+    let mut request = client
+        .post(format!("{url}/api/v1/bundles"))
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.context("upload git bundle")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("bundle upload returned {status}: {body}");
+    }
+    let body: serde_json::Value = response.json().await.context("decode bundle upload")?;
+    body["bundle_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("bundle upload response omitted bundle_id"))
+}
+/// Whether the working tree still holds exactly the submitted tree on top of
+/// the submitted parent. Compared by tree hash: `git status --porcelain` lists
+/// the same line for a file edited again after CI started, so it cannot tell.
+fn submit_tree_unchanged(commit: &SubmitCommit) -> bool {
+    submit_tree_unchanged_in(std::path::Path::new("."), commit)
+}
+
+fn submit_tree_unchanged_in(repo: &std::path::Path, commit: &SubmitCommit) -> bool {
+    let parent = git_in(repo, &[], &["rev-parse", &format!("{}^", commit.sha)]).ok();
+    let head = git_in(repo, &[], &["rev-parse", "HEAD"]).ok();
+    parent.is_some()
+        && parent == head
+        && worktree_tree_in(repo).ok().as_deref() == Some(commit.tree.as_str())
+}
+
+/// Moving the checked-out branch to C changes the user's worktree, so it is
+/// offered only after an explicit answer and only when the tree still matches
+/// the tree submitted for CI.
+fn offer_branch_move(commit: &str) -> anyhow::Result<()> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    eprint!("CI-tested commit {commit} is pushed. Move this branch to it? [y/N] ");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading branch-move answer")?;
+    if input.trim().eq_ignore_ascii_case("y") {
+        run_git_status(["reset", "--mixed", commit])?;
+        eprintln!("moved the current branch to {commit}");
+    }
+    Ok(())
 }
 
 /// Decide, after CI on a dirty tree, whether to materialize the tested tree,
@@ -5050,7 +5652,12 @@ mod tests {
             Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
         }));
 
-        let stop = wait_for_stop(&mut server, &mut pool, std::future::pending()).await;
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::pending()),
+        )
+        .await;
         let Stop::Pool(Err(error)) = stop else {
             panic!("the pool's failure must be reported as the stop reason");
         };
@@ -5091,7 +5698,12 @@ mod tests {
         let mut pool: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
             Some(tokio::spawn(std::future::pending()));
 
-        let stop = wait_for_stop(&mut server, &mut pool, std::future::ready(())).await;
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::ready(())),
+        )
+        .await;
 
         assert!(matches!(stop, Stop::Signal));
         assert!(
@@ -5102,12 +5714,95 @@ mod tests {
         server.abort();
     }
 
-    /// Serializes tests that mutate process-global env vars read by
-    /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
-    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
-    /// race each other's set_var/remove_var pairs.
-    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// A pool generation that fails after cancelling its own shutdown token
+    /// — exactly what `RunnerPool::run` does on a slot failure — must not
+    /// poison the replacement: the respawned generation gets a fresh child
+    /// token that is not already cancelled. This is the regression the
+    /// supervise loop exists for; without child tokens the engine would
+    /// observe an instant `Ok` exit and shut down.
+    #[tokio::test]
+    async fn restarted_pool_gets_an_uncancelled_shutdown_token() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut server = never_ending_server();
+
+        let generation_token = shutdown.child_token();
+        let first_token = generation_token.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            first_token.cancel();
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_respawn = seen.clone();
+        let parent = shutdown.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || {
+                    let token = parent.child_token();
+                    seen_respawn.lock().unwrap().push(token.clone());
+                    Some(tokio::spawn(async move {
+                        token.cancelled().await;
+                        Ok(())
+                    }))
+                },
+            )
+            .await
+        })
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the replacement pool must run until cancellation, not exit instantly"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one generation was respawned");
+        assert!(
+            !seen[0].is_cancelled(),
+            "the respawned pool's token must not inherit generation one's cancellation"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a pool's own cancellation must never reach the engine token"
+        );
+    }
+
+    /// If the HTTP server dies during the restart backoff the engine stops
+    /// immediately instead of sleeping to the ceiling and spawning a pool
+    /// for a dead server.
+    #[tokio::test]
+    async fn server_death_during_pool_backoff_stops_the_engine() {
+        let mut server = tokio::spawn(async { anyhow::bail!("listener died") });
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("golden unpack failed"))
+        }));
+
+        let stop = tokio::time::timeout(
+            Duration::from_millis(POOL_RESTART_MIN.as_millis() as u64 + 300),
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || None,
+            ),
+        )
+        .await
+        .expect("a dead server must stop the engine inside the backoff window");
+
+        let Stop::Server(Err(error)) = stop else {
+            panic!("server failure must be the stop reason, got {stop:?}");
+        };
+        assert_eq!(error.to_string(), "listener died");
+        // Whether the pool arm or the server arm won the first race is
+        // nondeterministic; the assertion that matters is above: the stop
+        // reason is the server error, inside the backoff window.
+    }
+
+    // Env-var serialization for these tests lives in the crate-wide
+    // [`crate::TEST_ENV_LOCK`].
 
     mod github_credential_migration {
         use super::super::migrate_legacy_github_credentials;
@@ -5410,7 +6105,7 @@ mod tests {
 
     #[test]
     fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("1", 1),
             (" 8 ", 8),
@@ -5432,7 +6127,7 @@ mod tests {
 
     #[test]
     fn runner_storage_gib_ignores_invalid_or_zero_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("80", 80),
             (" 96 ", 96),
@@ -5524,7 +6219,7 @@ mod tests {
     /// `PRELOOP_RUNNER_BASE_IMAGE` still overrides it.
     #[test]
     fn the_pool_reads_the_golden_init_recorded() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut config = preloop_runner_server::config::ConfigFile::default();
@@ -5592,7 +6287,7 @@ mod tests {
     /// it forever and idle runners would be replaced forever.
     #[test]
     fn only_the_official_golden_keeps_environment_replacement() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
         // the construction reaches the base-image decision.
@@ -5690,7 +6385,7 @@ mod tests {
 
     #[test]
     fn packed_artifact_cache_key_tracks_base_image_digest() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -5860,6 +6555,84 @@ mod tests {
         assert!(
             default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn local_default_branch_uses_advertised_head_when_local_head_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("origin.git");
+        let seed = temp.path().join("seed");
+        let workspace = temp.path().join("workspace");
+        let run_git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git runs in local default-branch fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=main",
+                seed.to_str().unwrap(),
+            ],
+        );
+        run_git(&seed, &["config", "user.name", "Preloop Test"]);
+        run_git(&seed, &["config", "user.email", "test@example.test"]);
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        let remote_url = remote.to_str().unwrap();
+        run_git(&seed, &["remote", "add", "origin", remote_url]);
+        run_git(&seed, &["push", "--quiet", "origin", "main"]);
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=feature",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git(&workspace, &["remote", "add", "origin", remote_url]);
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/main")
+        );
+
+        run_git(
+            &workspace,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/local-default",
+            ],
+        );
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/local-default"),
+            "an existing local remote-HEAD symbolic ref remains preferred"
         );
     }
 
@@ -6243,6 +7016,7 @@ mod tests {
     #[tokio::test]
     async fn shell_spawn_carries_the_sandbox_environment() {
         let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let (directory, executable) = crate::fake_smolvm_on_path();
         let previous_path = std::env::var_os("PATH");
         let previous_home = std::env::var_os("PRELOOP_HOME");
@@ -6441,6 +7215,334 @@ mod tests {
         assert!(hook_decided(), "should be decided after declining");
     }
 
+    /// A throwaway repository on `main` with a fixed identity, one tracked
+    /// file `src.txt`, and a tracked `dist/app.js`.
+    fn submit_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("work");
+        std::fs::create_dir_all(repo.join("dist")).unwrap();
+        git_in(&repo, &[], &["init", "-q", "-b", "main"]).unwrap();
+        git_in(&repo, &[], &["config", "user.name", "Submit Test"]).unwrap();
+        git_in(&repo, &[], &["config", "user.email", "submit@example.test"]).unwrap();
+        git_in(&repo, &[], &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "original\n").unwrap();
+        std::fs::write(repo.join("dist/app.js"), "built\n").unwrap();
+        git_in(&repo, &[], &["add", "-A"]).unwrap();
+        git_in(&repo, &[], &["commit", "-q", "-m", "init"]).unwrap();
+        (tmp, repo)
+    }
+
+    /// `submit_repo` plus a bare `origin` that already holds `main`.
+    fn submit_repo_with_origin() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, repo) = submit_repo();
+        let origin = tmp.path().join("origin.git");
+        git_in(
+            &repo,
+            &[],
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "--initial-branch=main",
+                origin.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git_in(
+            &repo,
+            &[],
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
+        git_in(&repo, &[], &["push", "-q", "origin", "main"]).unwrap();
+        (tmp, repo, origin)
+    }
+
+    #[test]
+    fn submit_tree_keeps_a_tracked_file_an_ignore_rule_now_matches() {
+        let (_tmp, repo) = submit_repo();
+        // The dirty change ignores `dist/`, which HEAD still tracks: the
+        // developer still has `dist/app.js`, so the submit must too.
+        std::fs::write(repo.join(".gitignore"), "dist/\n*.log\n").unwrap();
+        std::fs::write(repo.join("build.log"), "untracked and ignored\n").unwrap();
+        std::fs::write(repo.join("notes.txt"), "untracked and not ignored\n").unwrap();
+
+        let tree = worktree_tree_in(&repo).unwrap();
+        let files = git_in(&repo, &[], &["ls-tree", "-r", "--name-only", &tree]).unwrap();
+        let files: Vec<&str> = files.lines().collect();
+
+        assert!(
+            files.contains(&"dist/app.js"),
+            "a tracked file must not vanish because an ignore rule now matches it: {files:?}"
+        );
+        assert!(files.contains(&".gitignore") && files.contains(&"notes.txt"));
+        assert!(
+            !files.contains(&"build.log"),
+            "an untracked, ignored file stays out of the submit: {files:?}"
+        );
+        assert_eq!(
+            git_in(&repo, &[], &["diff", "--cached", "--name-only"]).unwrap(),
+            "",
+            "the user's own index must never be touched"
+        );
+    }
+
+    #[test]
+    fn submit_tree_unchanged_sees_an_edit_that_leaves_git_status_identical() {
+        let (_tmp, repo) = submit_repo();
+        std::fs::write(repo.join("src.txt"), "first edit\n").unwrap();
+        let dirty = vec![" M src.txt".to_owned()];
+        let commit =
+            create_submit_commit_in(&repo, Some("wip"), None, &dirty, "refs/heads/feat/x", None)
+                .unwrap();
+        assert!(submit_tree_unchanged_in(&repo, &commit));
+
+        let status = git_in(&repo, &[], &["status", "--porcelain"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "second edit\n").unwrap();
+        assert_eq!(
+            git_in(&repo, &[], &["status", "--porcelain"]).unwrap(),
+            status,
+            "the premise: git status cannot tell these two states apart"
+        );
+        assert!(
+            !submit_tree_unchanged_in(&repo, &commit),
+            "a file edited again after submission must not count as unchanged"
+        );
+
+        // Putting the content back restores the match; moving HEAD never does.
+        std::fs::write(repo.join("src.txt"), "first edit\n").unwrap();
+        assert!(submit_tree_unchanged_in(&repo, &commit));
+        git_in(&repo, &[], &["commit", "-q", "-a", "-m", "move head"]).unwrap();
+        assert!(!submit_tree_unchanged_in(&repo, &commit));
+    }
+
+    #[test]
+    fn submit_bundle_uploads_only_the_submit_commit_and_base_tip() {
+        let (_tmp, repo, _origin) = submit_repo_with_origin();
+        // Things that must never leave the machine.
+        git_in(&repo, &[], &["branch", "private-branch"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "stashed work\n").unwrap();
+        git_in(&repo, &[], &["stash", "push", "-q"]).unwrap();
+        git_in(&repo, &[], &["checkout", "-q", "-b", "feat/x"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "dirty\n").unwrap();
+
+        let commit = create_submit_commit_in(
+            &repo,
+            Some("wip"),
+            None,
+            &[" M src.txt".to_owned()],
+            "refs/heads/feat/x",
+            Some("main"),
+        )
+        .unwrap();
+
+        let listing = git_in(
+            &repo,
+            &[],
+            &["bundle", "list-heads", commit.bundle_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let refs: Vec<(&str, &str)> = listing
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .collect();
+        let base = git_in(&repo, &[], &["rev-parse", "refs/remotes/origin/main"]).unwrap();
+        assert_eq!(refs.len(), 2, "exactly the head and the base: {refs:?}");
+        assert!(
+            refs.iter()
+                .any(|(sha, name)| *sha == commit.sha && name.ends_with("/head")),
+            "the submitted commit travels: {refs:?}"
+        );
+        assert!(
+            refs.iter()
+                .any(|(sha, name)| *sha == base && name.ends_with("/base/main")),
+            "the base tip travels under its branch name: {refs:?}"
+        );
+        // The bundle must not drag the stash or the private branch along as
+        // objects either: nothing it holds is reachable from those refs.
+        let stash = git_in(&repo, &[], &["rev-parse", "refs/stash"]).unwrap();
+        let private = git_in(&repo, &[], &["rev-parse", "refs/heads/private-branch"]).unwrap();
+        assert_ne!(stash, commit.sha);
+        assert_ne!(private, commit.sha);
+        let unpack = tempfile::tempdir().unwrap();
+        git_in(unpack.path(), &[], &["init", "-q", "--bare", "."]).unwrap();
+        git_in(
+            unpack.path(),
+            &[],
+            &[
+                "fetch",
+                "-q",
+                commit.bundle_path.to_str().unwrap(),
+                "+refs/preloop/*:refs/preloop/*",
+            ],
+        )
+        .unwrap();
+        assert!(
+            git_in(unpack.path(), &[], &["cat-file", "-e", &stash]).is_err(),
+            "the stash commit's objects must not be in the bundle"
+        );
+        // The repository keeps none of the bookkeeping refs.
+        assert_eq!(
+            git_in(&repo, &[], &["for-each-ref", "refs/preloop"]).unwrap(),
+            ""
+        );
+        let _ = std::fs::remove_file(&commit.bundle_path);
+    }
+
+    #[test]
+    fn submit_base_tip_prefers_the_fetched_remote_branch_over_a_stale_local_one() {
+        let (tmp, repo, origin) = submit_repo_with_origin();
+        let stale_local = git_in(&repo, &[], &["rev-parse", "refs/heads/main"]).unwrap();
+
+        // Someone else advances `main` on origin; this checkout's local `main`
+        // and remote-tracking `origin/main` both still point at the old tip.
+        let other = tmp.path().join("other");
+        git_in(
+            tmp.path(),
+            &[],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git_in(&other, &[], &["config", "user.name", "Other"]).unwrap();
+        git_in(&other, &[], &["config", "user.email", "other@example.test"]).unwrap();
+        git_in(&other, &[], &["config", "commit.gpgsign", "false"]).unwrap();
+        git_in(
+            &other,
+            &[],
+            &["commit", "-q", "--allow-empty", "-m", "base moved"],
+        )
+        .unwrap();
+        git_in(&other, &[], &["push", "-q", "origin", "main"]).unwrap();
+        let moved = git_in(&other, &[], &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            resolve_base_tip_in(&repo, "main").unwrap(),
+            moved,
+            "the merge must be built against the base as it is now"
+        );
+        assert_eq!(
+            git_in(&repo, &[], &["rev-parse", "refs/heads/main"]).unwrap(),
+            stale_local,
+            "fetching the base must not move the user's local branch"
+        );
+
+        // Offline: the last fetched tip still wins over the stale local branch.
+        git_in(
+            &other,
+            &[],
+            &["commit", "-q", "--allow-empty", "-m", "moved again"],
+        )
+        .unwrap();
+        git_in(&other, &[], &["push", "-q", "origin", "main"]).unwrap();
+        git_in(
+            &repo,
+            &[],
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        )
+        .unwrap();
+        assert_eq!(resolve_base_tip_in(&repo, "main").unwrap(), moved);
+
+        let error = resolve_base_tip_in(&repo, "no-such-branch").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no-such-branch"),
+            "an unresolvable base fails loudly: {error:#}"
+        );
+    }
+
+    #[test]
+    fn submit_bundle_base_follows_the_branch_the_server_merges_against() {
+        let payload = serde_json::json!({"pull_request": {"base": {"ref": "release"}}});
+        // The payload wins even though `default_local_filter_branch` yields
+        // nothing for it: the server merges against `release`, so that is the
+        // tip the bundle must carry.
+        assert_eq!(
+            submit_base_branch(&payload, Some("main"), None).as_deref(),
+            Some("release")
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(
+            submit_base_branch(&empty, Some("refs/heads/dev"), Some("main")).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            submit_base_branch(&empty, None, Some("main")).as_deref(),
+            Some("main")
+        );
+        assert_eq!(submit_base_branch(&empty, None, None), None);
+    }
+
+    #[test]
+    fn submit_editor_opens_only_for_a_person_at_a_terminal() {
+        assert_eq!(
+            submit_editor(Some("vim".into()), true).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            submit_editor(Some("vim".into()), false),
+            None,
+            "a pipe or CI run must never hang on an editor"
+        );
+        assert_eq!(submit_editor(Some("  ".into()), true), None);
+        assert_eq!(submit_editor(None, true), None);
+    }
+
+    #[test]
+    fn submit_message_comes_from_the_editor_when_one_runs() {
+        let (tmp, repo) = submit_repo();
+        std::fs::write(repo.join("src.txt"), "dirty\n").unwrap();
+        let editor = tmp.path().join("editor.sh");
+        std::fs::write(&editor, "#!/bin/sh\nprintf 'edited subject\\n' > \"$1\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirty = [" M src.txt".to_owned()];
+
+        let edited = create_submit_commit_in(
+            &repo,
+            None,
+            Some(editor.to_str().unwrap()),
+            &dirty,
+            "refs/heads/feat/x",
+            None,
+        )
+        .unwrap();
+        let message = git_in(&repo, &[], &["log", "-1", "--format=%B", &edited.sha]).unwrap();
+        assert!(message.starts_with("edited subject"), "{message}");
+        assert!(message.contains(&format!("Preloop-Tested-Tree: {}", edited.tree)));
+
+        // Without an editor the generated message is used.
+        let generated =
+            create_submit_commit_in(&repo, None, None, &dirty, "refs/heads/feat/x", None).unwrap();
+        let message = git_in(&repo, &[], &["log", "-1", "--format=%B", &generated.sha]).unwrap();
+        assert!(
+            message.starts_with("wip(feat/x): 1 files in src.txt"),
+            "{message}"
+        );
+
+        // A failing editor aborts the submit instead of committing a stale message.
+        let failing = create_submit_commit_in(
+            &repo,
+            None,
+            Some("false"),
+            &dirty,
+            "refs/heads/feat/x",
+            None,
+        );
+        assert!(failing.is_err());
+        for commit in [&edited, &generated] {
+            let _ = std::fs::remove_file(&commit.bundle_path);
+        }
+    }
+
     #[test]
     fn cancel_parses() {
         let cli = parse(&["cancel"]).unwrap();
@@ -6548,8 +7650,7 @@ mod tests {
     /// the probe must still arrive without an `Authorization` header.
     #[tokio::test]
     async fn health_probe_sends_no_authorization_header() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _env_guard = ENV_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let saw_authorization = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_authorization_clone = std::sync::Arc::clone(&saw_authorization);
         let app = axum::Router::new().route(

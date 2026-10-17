@@ -693,7 +693,7 @@ jobs:
 }
 
 #[tokio::test]
-async fn github_check_run_rerequest_resubmits_the_owning_run() {
+async fn github_check_run_rerequest_reruns_the_owning_run_in_place() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -777,13 +777,21 @@ async fn github_check_run_rerequest_resubmits_the_owning_run() {
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
     let inner = state.test_tx().await;
-    assert_eq!(inner.runs.len(), 2);
+    assert_eq!(
+        inner.runs.len(),
+        1,
+        "a rerequest re-runs the owning run in place"
+    );
     let rerun = inner
         .runs
-        .values()
-        .find(|run| run.run_id != original_run_id)
-        .expect("rerequest should create a new run");
-    assert_eq!(rerun.status, ExecutionStatus::Queued);
+        .get(&original_run_id)
+        .expect("the owning run must survive the rerequest");
+    assert_eq!(rerun.run_attempt, 2, "the rerequest starts attempt 2");
+    assert!(
+        !rerun.status.is_terminal(),
+        "the re-run reopened the run: {:?}",
+        rerun.status
+    );
     assert_eq!(
         rerun.job_check_run_ids.get(&JobId("build".to_owned())),
         Some(&original_check_run_id),
@@ -1121,6 +1129,7 @@ jobs:
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
     let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+    add_fixture_origin(temp.path(), &ws_dir);
     git(&["commit", "--allow-empty", "-m", "head commit"]);
     let head_sha = git(&["rev-parse", "HEAD"]);
 
@@ -1192,12 +1201,302 @@ jobs:
     assert_eq!(run_record.submission.event, "pull_request");
     assert_eq!(run_record.submission.git_ref, "refs/pull/42/head");
     assert_eq!(run_record.job_check_run_ids.len(), 1);
-    // A pull_request payload has no `after`; the head sha must still reach
-    // the job. Falling through to all-zeros makes every checkout ask the
-    // server for `0000…` and fail as "not our ref".
+    // A pull_request payload has no `after`; preserve its head SHA for status
+    // checks even though a local snapshot may use a synthetic checkout SHA.
     assert_eq!(
-        run_record.head_sha, head_sha,
-        "pull_request head sha must drive github.sha"
+        run_record.submission.status_check_sha.as_deref(),
+        Some(head_sha.as_str()),
+        "pull_request head sha must drive check reporting",
+    );
+    assert_eq!(
+        run_record.github["sha"],
+        serde_json::json!(run_record.head_sha),
+        "github.sha must identify the checked-out snapshot",
+    );
+}
+
+/// The repository the publish-echo tests drive. `main` is the base the fixture
+/// commits; the head is one more commit that push-back publishes. The engine's
+/// checkout is the local workspace, and `origin` is the remote a `pull_request`
+/// merge is built against.
+struct PublishEchoFixture {
+    _temp: tempfile::TempDir,
+    _token_guard: crate::state::TestEnvVar,
+    _api_guard: crate::state::TestEnvVar,
+    state: AppState,
+    app: Router,
+    workflow: &'static str,
+    base_sha: String,
+    head_sha: String,
+}
+
+impl PublishEchoFixture {
+    async fn new(workflow: &'static str) -> Self {
+        // No GitHub API may be reached: an unreachable one opens the breaker,
+        // and the webhook drain then defers every delivery, so a missing run
+        // could not be told apart from a skipped one.
+        let token_guard = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+        let api_guard = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("workspace");
+        tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+            .await
+            .unwrap();
+        tokio::fs::write(ws_dir.join(".github/workflows/test.yml"), workflow)
+            .await
+            .unwrap();
+        let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+        add_fixture_origin(temp.path(), &ws_dir);
+        let git = |args: &[&str]| -> String {
+            let output = Command::new("git")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(args)
+                .current_dir(&ws_dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["commit", "--allow-empty", "-m", "head commit"]);
+        let head_sha = git(&["rev-parse", "HEAD"]);
+
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.webhook_secret = Some("super-secret".to_owned());
+        state.local_workspace = Some(ws_dir);
+        let app = app(state.clone(), CancellationToken::new());
+        Self {
+            _temp: temp,
+            _token_guard: token_guard,
+            _api_guard: api_guard,
+            state,
+            app,
+            workflow,
+            base_sha,
+            head_sha,
+        }
+    }
+
+    /// Submit the run push-back published for the head, then conclude it.
+    async fn publish(&self, body: serde_json::Value) -> preloop_gha_protocol::RunId {
+        let accepted = request_json(&self.app, Method::POST, "/api/v1/runs", body).await;
+        let run_id = accepted["run_id"]
+            .as_str()
+            .unwrap()
+            .parse::<preloop_gha_protocol::RunId>()
+            .unwrap();
+        self.state
+            .test_db_mutate(|tx| {
+                tx.set_run_status(run_id, "completed", Some("success"))
+                    .unwrap();
+            })
+            .await;
+        run_id
+    }
+
+    /// Deliver one signed GitHub webhook and drain the queue it lands in.
+    async fn deliver(&self, event: &str, delivery_id: &str, payload: serde_json::Value) {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let body = serde_json::to_vec(&payload).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"super-secret").unwrap();
+        mac.update(&body);
+        let signature = format!(
+            "sha256={}",
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let response = self
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/github/webhooks")
+                    .header("x-github-event", event)
+                    .header("x-github-delivery", delivery_id)
+                    .header("x-hub-signature-256", signature)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let shared = Arc::new(SharedState {
+            state: self.state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        crate::github::drain_webhook_queue(&shared).await.unwrap();
+        // A delivery the drain left queued would look like a skipped echo, so
+        // every delivery must reach `done`.
+        let (status, attempts, last_error) = self
+            .state
+            .test_db_mutate(|tx| {
+                tx.0.query_row(
+                    "SELECT state, attempts, last_error FROM webhook_deliveries \
+                     WHERE delivery_id = ?1",
+                    [delivery_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            })
+            .await;
+        assert_eq!(
+            status, "done",
+            "delivery `{delivery_id}` was not processed after {attempts} attempt(s): {last_error:?}"
+        );
+    }
+
+    /// The `pull_request` `opened` payload GitHub sends for the PR on the head.
+    fn pull_request_opened(&self) -> serde_json::Value {
+        serde_json::json!({
+            "action": "opened",
+            "number": 42,
+            "pull_request": {
+                "head": { "ref": "feature-branch", "sha": self.head_sha },
+                "base": { "ref": "main", "sha": self.base_sha },
+            },
+            "repository": { "full_name": "owner/repo", "default_branch": "main" },
+        })
+    }
+
+    /// The events of every run other than `published`, sorted.
+    async fn runs_besides(&self, published: preloop_gha_protocol::RunId) -> Vec<String> {
+        let inner = self.state.test_tx().await;
+        let mut events: Vec<String> = inner
+            .runs
+            .values()
+            .filter(|run| run.run_id != published)
+            .map(|run| run.submission.event.clone())
+            .collect();
+        events.sort();
+        events
+    }
+}
+
+/// Push-back deduplicates only what a publish already tested. A `pull_request`
+/// run that checked out the base merged into the head is the PR's merge test,
+/// so the `pull_request` echo of that publish repeats it and is skipped. The
+/// `pull_request_target` run executes the BASE branch's workflow, which the
+/// publish never exercised, so it must still run.
+#[tokio::test]
+async fn publish_echo_dedup_skips_pull_request_but_not_pull_request_target() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let fixture = PublishEchoFixture::new(
+        "on:\n  push:\n  pull_request:\n  pull_request_target:\njobs:\n  build:\n    \
+         runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .await;
+
+    // The merge run push-back published for this head.
+    let published = fixture
+        .publish(serde_json::json!({
+            "workflow_yaml": fixture.workflow,
+            "event": "pull_request",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feature-branch",
+            "sha": fixture.head_sha,
+            "workflow_path": ".github/workflows/test.yml",
+            "payload": {
+                "action": "opened",
+                "number": 42,
+                "pull_request": {
+                    "number": 42,
+                    "base": { "ref": "main", "sha": fixture.base_sha },
+                    "head": { "ref": "feature-branch", "sha": fixture.head_sha },
+                },
+            },
+            "push": {"create_pr": false, "draft_pr": false, "dirty": false},
+            "push_tree": "b".repeat(40),
+        }))
+        .await;
+
+    // GitHub opens the PR for the published head.
+    fixture
+        .deliver(
+            "pull_request",
+            "echo-scoping",
+            fixture.pull_request_opened(),
+        )
+        .await;
+    assert_eq!(
+        fixture.runs_besides(published).await,
+        ["pull_request_target"],
+        "the `pull_request` echo is deduplicated, the base-side `pull_request_target` run is not"
+    );
+}
+
+/// A publish of the branch alone (a `push` run) tested the head without the
+/// base merged in. The `push` echo of that publish is still deduplicated, but
+/// the `pull_request` the PR emits for the same head is the merge test no run
+/// has performed, so it must run.
+#[tokio::test]
+async fn publish_echo_dedup_leaves_the_pull_request_merge_test_after_a_branch_publish() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // Only `push` and `pull_request` triggers: a delivery's `pull_request_target`
+    // projection would take the one run its workflow file may have per delivery
+    // (`runs_delivery`), and the `pull_request` run under test would replay it.
+    let fixture = PublishEchoFixture::new(
+        "on:\n  push:\n  pull_request:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+    )
+    .await;
+
+    // The branch push-back published for this head.
+    let published = fixture
+        .publish(serde_json::json!({
+            "workflow_yaml": fixture.workflow,
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feature-branch",
+            "sha": fixture.head_sha,
+            "workflow_path": ".github/workflows/test.yml",
+            "push": {"create_pr": false, "draft_pr": false, "dirty": false},
+            "push_tree": "b".repeat(40),
+        }))
+        .await;
+
+    // Landing the branch makes GitHub echo the push of the tested commit.
+    fixture
+        .deliver(
+            "push",
+            "echo-push",
+            serde_json::json!({
+                "ref": "refs/heads/feature-branch",
+                "before": "0".repeat(40),
+                "after": fixture.head_sha,
+                "repository": { "full_name": "owner/repo", "default_branch": "main" },
+                "commits": [{
+                    "id": fixture.head_sha,
+                    "added": [],
+                    "modified": [],
+                    "removed": [],
+                }],
+            }),
+        )
+        .await;
+    assert!(
+        fixture.runs_besides(published).await.is_empty(),
+        "the push echo of a commit that was already tested and published is skipped"
+    );
+
+    // The PR opens on the same head: its merge test has not run yet.
+    fixture
+        .deliver("pull_request", "echo-merge", fixture.pull_request_opened())
+        .await;
+    assert_eq!(
+        fixture.runs_besides(published).await,
+        ["pull_request"],
+        "the `pull_request` echo runs the merge test that a branch publish never performed"
     );
 }
 
@@ -1227,6 +1526,7 @@ jobs:
         .unwrap();
 
     let head_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+    add_fixture_origin(temp.path(), &ws_dir);
     // The adapter also emits a pull_request_target event (base trust tier);
     // it needs a base SHA or it aborts the batch before our pull_request
     // event is processed.
@@ -1347,7 +1647,7 @@ async fn github_app_manifest_registration_flow() {
 
     // Setup a local mock GitHub API server for manifest conversion
     let mock_app = Router::new().route(
-            "/app-manifests/:code/conversions",
+            "/app-manifests/{code}/conversions",
             post(|Path(code): Path<String>| async move {
                 assert_eq!(code, "mock_code_123");
                 Json(json!({
@@ -1816,17 +2116,15 @@ fn label_matching_empty_job_matches_all() {
 // real queue/promotion state is driven through the explicitly gated test
 // completion API and compared with the documented outcome.
 // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
-
 /// Production path: build fails → test with default condition is skipped.
 /// Verifies the server's promote_ready_jobs correctly propagates failure.
-
 // Oracle: GitHub `needs` and status-function contracts, with worker-side
 // condition semantics pinned to actions/runner v2.335.1. These tests are
 // production-path checks: YAML is parsed and expanded by Preloop, then the
 // real queue/promotion state is driven through the explicitly gated test
 // completion API and compared with the documented outcome.
 // ─── DAG scheduling regression tests (spec §1) ─────────────────────────
-
+///
 /// Production path: build fails → test with default condition is skipped.
 /// Verifies the server's promote_ready_jobs correctly propagates failure.
 #[tokio::test]
@@ -2317,6 +2615,86 @@ async fn archived_run_keeps_run_tier_secrets_for_rerun() {
     assert_eq!(var["isSecret"].as_bool(), Some(true));
 }
 
+/// A partial re-run of a fully archived run is refused with `409`: the live
+/// scheduler rows (`job_specs`/`job_messages`/`job_needs`) are gone, so only a
+/// full re-run — resubmit as a new run — is possible. `all` keeps that
+/// fallback; the refusal names the archive.
+#[tokio::test]
+async fn archived_run_partial_rerun_is_409_and_all_resubmits() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    complete_via_api(&app, accepted["run_id"].as_str().unwrap(), "build").await;
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(run_id, old).unwrap();
+        })
+        .await;
+    assert!(
+        state.test_archive_finished_runs_once().await >= 1,
+        "the settled run must archive"
+    );
+
+    for body in [
+        json!({"mode": "failed"}),
+        json!({"mode": "job", "job_id": "build"}),
+    ] {
+        let (status, response) = try_req(
+            &app,
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/rerun"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "partial mode {body} must 409: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("archived"),
+            "the 409 must name the archive: {response}"
+        );
+    }
+
+    // `all` keeps the pre-rerun fallback: the recorded submission resubmits
+    // as a fresh run (new id, attempt 1).
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/rerun"),
+        json!({"mode": "all"}),
+    )
+    .await;
+    let new_run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    assert_ne!(new_run_id, run_id, "an archived full re-run is a new run");
+    let record = state
+        .test_tx()
+        .await
+        .runs
+        .get(&new_run_id)
+        .cloned()
+        .expect("the resubmitted run exists");
+    assert_eq!(record.run_attempt, 1);
+}
+
 /// A reusable-workflow callee that declares no `secrets:` receives none of
 /// the caller's secrets — only `secrets: inherit` or an explicit map does.
 #[tokio::test]
@@ -2465,7 +2843,7 @@ async fn job_level_env_secret_is_filled_into_environment_variables() {
 }
 
 /// Extract the queued job message for a run, wherever it currently sits.
-
+///
 /// `preloop setup github --via pat` stores the credential as `github.pat` and
 /// configures no App. That PAT must reach jobs as their `GITHUB_TOKEN`:
 /// previously only `PRELOOP_GITHUB_TOKEN` was consulted, so setup reported

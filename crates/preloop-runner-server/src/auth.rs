@@ -16,6 +16,23 @@ pub async fn require_protocol_bearer(
         ))
     }
 }
+/// Require the system credential or a Results job runtime token.
+///
+/// This is narrower than [`require_protocol_bearer`]: action-resolution
+/// endpoints must not admit runner-listen, registration, debug-worker, blob,
+/// or other locally signed JWT classes as bearer credentials.
+pub async fn require_results_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer = bearer_token(&request)
+        .ok_or_else(|| ApiError::unauthorized("system or job runtime token required"))?;
+    let identity = results_identity(&shared.state, bearer)
+        .map_err(|_| ApiError::unauthorized("system or job runtime token required"))?;
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
+}
 /// Require that a protocol reporting request is authenticated by the system
 /// credential or by the runtime token minted for the exact job request.
 ///
@@ -69,6 +86,33 @@ pub fn authorize_reporting_request(
             "job runtime token does not own the reporting target",
         ))
     }
+}
+
+/// [`authorize_reporting_request`] plus the liveness rule: the caller must own
+/// the target *and* the attempt must still be live.
+///
+/// A settled attempt's runtime credential is spent — the rule the Results
+/// writes ([`require_live_results_job`]), the cache and artifact writes, and
+/// the live-log ingest all apply — so it must not keep mutating the run's
+/// records (timeline records, logs, console logs) after the attempt has
+/// settled. The credential is handed to workflow code and outlives the
+/// attempt, so without this a finished job could rewrite its own step records
+/// and annotations for the rest of the token's lifetime. Reads stay available,
+/// and the system identity bypasses exactly as it does everywhere else.
+pub async fn authorize_live_reporting_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    authorize_reporting_request(state, headers, request)?;
+    if system_bearer_authorized(state, headers) {
+        return Ok(());
+    }
+    let Some(record) = request else {
+        // Unresolvable targets were refused above for a non-system caller.
+        return Ok(());
+    };
+    require_live_job(state, record.agent_job_id).await
 }
 
 pub async fn require_results_bearer(
@@ -902,6 +946,34 @@ fn is_worker_debug_route(method: &axum::http::Method, path: &str) -> bool {
     method == Method::GET && debug_session_member(path, crate::routes::DEBUG_SESSION_VERDICT_SUFFIX)
 }
 
+/// The two read-only repository shapes a job's checkout issues against
+/// `/api/v3` when it cannot run Git: the default-branch lookup
+/// (`/repos/{o}/{r}`) and the archive download (`/repos/{o}/{r}/tarball/{ref}`,
+/// ref may contain `/`). Both handlers pin the caller to a job runtime token
+/// (`authorize_forge_relay` / snapshot token), so the socket surface can carry
+/// them without exposing the runner-management API — every other `/api/v3/*`
+/// shape stays refused.
+fn job_scoped_repo_read(method: &axum::http::Method, path: &str) -> bool {
+    if *method != axum::http::Method::GET {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/api/v3/repos/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let (Some(owner), Some(repo)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() {
+        return false;
+    }
+    match segments.next() {
+        None => true,
+        Some("tarball") => segments.next().is_some(),
+        Some(_) => false,
+    }
+}
+
 fn debug_session_member(path: &str, suffix: &str) -> bool {
     path.strip_prefix(crate::routes::DEBUG_SESSIONS_PATH)
         .and_then(|rest| rest.strip_prefix('/'))
@@ -936,7 +1008,8 @@ pub async fn runner_surface_only(mut request: Request, next: Next) -> Result<Res
         // the runner's own registration: its handler requires the system
         // credential on this surface even when TCP registration is explicitly
         // permissive, so workflow code cannot use the carve-out to mint anything.
-        || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration")
+        || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration"
+            && !job_scoped_repo_read(request.method(), path))
         || (path.starts_with("/api/v1/")
             && !path.starts_with("/api/v1/actions/")
             && !worker_debug_route);
@@ -1162,4 +1235,53 @@ pub fn job_runtime_claims_from_headers(
 pub struct JobRuntimeClaims {
     pub plan_id: String,
     pub job_id: uuid::Uuid,
+}
+
+#[cfg(test)]
+mod job_scoped_repo_read_tests {
+    use super::*;
+
+    #[test]
+    fn job_scoped_repo_read_allows_only_the_checkout_shapes() {
+        // The two shapes a redirected checkout issues.
+        assert!(job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/valkey-io/valkey"
+        ));
+        assert!(job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/snapshots/7b116f3a-6973-4e4e-bcd1-213de9518ad1/tarball/de2d615e"
+        ));
+        assert!(job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o/r/tarball/refs/heads/main"
+        ));
+        // Anything else under /api/v3 stays off the socket surface: the
+        // runner-management endpoints mint credentials.
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/actions/runners/registration-token"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos//r"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o/r/tarball"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o/r/actions/runners/registration-token"
+        ));
+        // Reads only: nothing may be created or mutated through the socket.
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::POST,
+            "/api/v3/repos/o/r/tarball/main"
+        ));
+    }
 }

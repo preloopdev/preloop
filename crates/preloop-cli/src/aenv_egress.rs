@@ -478,6 +478,7 @@ mod tests {
     }
 
     fn with_egress_env(vars: &[(&str, &str)], test: impl FnOnce()) {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let previous: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(key, _)| (key.to_string(), std::env::var(key).ok()))

@@ -41,6 +41,11 @@ tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
 tokio-tungstenite.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+webpki-roots = "0.26"
+percent-encoding = "2"
 tracing-subscriber.workspace = true
 uuid.workspace = true
 command-group.workspace = true
@@ -58,7 +63,7 @@ zip.workspace = true
 # the tree via command-group. Unix-only — `nix` does not build on Windows,
 # where the `cfg(not(unix))` paths in `process.rs` apply instead.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true

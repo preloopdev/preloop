@@ -26,10 +26,10 @@ jobs:
       matrix:
         include:
           - triple: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             zig: true
           - triple: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             zig: true
           - triple: aarch64-apple-darwin
             os: macos-14
@@ -39,14 +39,14 @@ jobs:
       contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           targets: ${{ matrix.triple }}
 
       - name: Set up Zig cross toolchain
@@ -57,7 +57,7 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.zig
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-zigbuild@0.23.0
 
@@ -83,7 +83,7 @@ jobs:
             > "dist/preloop-runner-$TRIPLE.sha256"
 
       - name: Generate SBOM (CycloneDX)
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-cyclonedx
 
@@ -109,7 +109,7 @@ jobs:
 
       - name: Retain runner bundle for non-release builds
         if: github.event_name != 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: preloop-runner-${{ matrix.triple }}
           path: dist/
@@ -117,21 +117,21 @@ jobs:
 
   runner-image:
     name: Publish runner container image
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: build-runner
     permissions:
       contents: read
       packages: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
       - name: Set up Zig cross toolchain
@@ -140,7 +140,7 @@ jobs:
           version: 0.14.1
 
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-zigbuild@0.23.0
 

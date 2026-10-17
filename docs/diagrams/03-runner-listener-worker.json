@@ -20,7 +20,7 @@
   "id": "subtitle",
   "x": 420,
   "y": 60,
-  "text": "Faithful to actions/runner v2.337.0 \u2014 two-process isolation over stdin NDJSON",
+  "text": "Compared against actions/runner v2.336.0 \u2014 two-process isolation over stdin NDJSON",
   "fontSize": 15,
   "strokeColor": "#757575"
  },

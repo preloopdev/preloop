@@ -28,7 +28,7 @@ edition = "2024"
 # deployed binary's provenance unreadable (a host reporting CLI 0.32.7 was
 # running post-0.32.7 code, while `service.version` showed the server's
 # unrelated 0.2.0). Both now inherit this single number.
-version = "0.34.0"
+version = "0.34.4"
 license = "MIT"
 repository = "https://github.com/preloopdev/preloop"
 homepage = "https://github.com/preloopdev/preloop"
@@ -44,12 +44,12 @@ missing_docs = "warn"
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-axum = { version = "0.7", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 hyper = "1.0"
 hyper-util = { version = "0.1", features = ["full"] }
-rcgen = "0.13"
-base64 = "0.22"
+rcgen = "0.14"
+base64 = "0.23"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
@@ -58,14 +58,14 @@ indexmap = { version = "2.2", features = ["serde"] }
 proptest = "1.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form", "query", "blocking"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
-rand = "0.8"
+rand = "0.10"
 # `preserve_order` keeps `Value::Object` in document order instead of sorting
 # keys. GitHub renders a matrix job name by walking the matrix mapping as
 # written (`JobNameBuilder`), so a `fromJSON` matrix declaring `os` before
 # `arch` must name the job `build (ubuntu-latest, x64)`. Sorted keys silently
 # reorder every dynamic-matrix job id.
 serde_json = { version = "1.0", features = ["preserve_order"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-postgres = "0.7"
 refinery = { version = "0.10.0", default-features = false, features = ["rusqlite", "tokio-postgres"] }
 postgres_rustls = "0.1"
@@ -80,41 +80,41 @@ tempfile = "3.10"
 libc = "0.2"
 hex = "0.4"
 parking_lot = "0.12"
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "io-std", "process"] }
 tokio-util = "0.7"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
-tokio-tungstenite = { version = "0.23", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.33"
-opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_custom_reader"] }
+tracing-opentelemetry = "0.34"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "rt-tokio", "experimental_metrics_custom_reader"] }
 # OTLP/HTTP only — never the tonic/gRPC stack (plan §435-437, §1289). Reuses
 # the workspace reqwest (now 0.13, same line the SDK targets) through
 # `opentelemetry_http::HttpClient`, so there is exactly one HTTP client.
 # `reqwest-blocking-client` lets the SDK's plain-thread batch/periodic
 # processors export (an async client never completes off-runtime).
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "metrics", "logs", "reqwest-blocking-client"] }
-opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest"] }
-opentelemetry-appender-tracing = "0.32"
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace", "metrics", "logs", "reqwest-blocking-client"] }
+opentelemetry-http = { version = "0.33", default-features = false, features = ["reqwest"] }
+opentelemetry-appender-tracing = "0.33"
+opentelemetry-semantic-conventions = "0.33"
 uuid = { version = "1.8", features = ["v4", "serde"] }
-aes = "0.8"
-cbc = { version = "0.1", features = ["block-padding"] }
-cipher = { version = "0.4", features = ["block-padding", "alloc"] }
-rsa = "0.9"
+aes = "0.9"
+cbc = { version = "0.2", features = ["block-padding"] }
+cipher = { version = "0.5", features = ["block-padding", "alloc"] }
+rsa = { version = "0.9", features = ["getrandom"] }
 walkdir = "2.5"
-toml = "0.8"
+toml = "1.0"
 regex = "1.10"
-x509-parser = { version = "0.16", features = ["verify"] }
-similar = "2.5"
-cron = "0.12"
+x509-parser = { version = "0.18", features = ["verify"] }
+similar = "3.0"
+cron = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-utoipa = { version = "5", features = ["uuid", "chrono"] }
-cap-std = "3.4"
+utoipa = { version = "6", features = ["uuid", "chrono"] }
+cap-std = "4.0"
 keyring = "4.2"
 
 command-group = { version = "5", features = ["with-tokio"] }
@@ -122,7 +122,7 @@ flate2 = "1"
 tar = "0.4"
 glob = "0.3"
 hostname = "0.4"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 self-replace = "1.5"
 semver = "1.0"
 

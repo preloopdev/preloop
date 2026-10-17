@@ -32,11 +32,11 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "6"
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           lfs: false
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           # Fresh microVMs start with an empty RUSTUP_HOME, so dtolnay would
           # reinstall the toolchain on every run. Restore it from cache;
@@ -45,9 +45,9 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           components: rustfmt,clippy
       - name: Select Rust toolchain binaries
         run: |
@@ -108,7 +108,7 @@ jobs:
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           lfs: false
@@ -140,7 +140,7 @@ jobs:
               exit 1
             fi
           done
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           # Fresh microVMs start with an empty RUSTUP_HOME, so dtolnay would
           # reinstall the toolchain on every run. Restore it from cache;
@@ -149,9 +149,9 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
           components: rustfmt,clippy
       - name: Select Rust toolchain binaries
         run: |
@@ -221,7 +221,7 @@ jobs:
           # lose its output — including the failing test names — and the run
           # becomes undiagnosable. The summary step below re-prints just the
           # verdict, which always fits.
-          cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4 2>&1 \
+          cargo nextest run --locked --no-fail-fast --workspace --partition hash:${{ matrix.shard }}/4 2>&1 \
             | tee "$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
         env:
           RUSTFLAGS: "-A warnings"
@@ -241,6 +241,8 @@ jobs:
           else
             echo "no shard log captured at $log"
           fi
+          echo "--- guest disk (temp full? look for a small/100% tmpfs) ---"
+          df -h 2>/dev/null | head -8 || true
           echo "--- guest kernel (OOM?) ---"
           sudo dmesg 2>/dev/null | tail -15 || echo "(no dmesg)"
           echo "--- guest memory ---"
@@ -281,10 +283,10 @@ jobs:
     timeout-minutes: 30
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           # Fresh microVMs start with an empty RUSTUP_HOME, so dtolnay would
           # reinstall the toolchain on every run. Restore it from cache;
@@ -293,9 +295,9 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
       - name: Select Rust toolchain binaries
         run: |
           toolchain_bin="$(dirname "$(rustup which rustc)")"
@@ -392,7 +394,7 @@ jobs:
 
       - name: Upload proptest regressions
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: proptest-regressions-fast
           path: |
@@ -405,10 +407,10 @@ jobs:
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           # Fresh microVMs start with an empty RUSTUP_HOME, so dtolnay would
           # reinstall the toolchain on every run. Restore it from cache;
@@ -417,9 +419,9 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.97"
+          toolchain: "1.99"
       - name: Select Rust toolchain binaries
         run: |
           toolchain_bin="$(dirname "$(rustup which rustc)")"
@@ -517,7 +519,7 @@ jobs:
 
       - name: Upload proptest regressions
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: proptest-regressions-intensive
           path: |

@@ -547,6 +547,9 @@ pub(crate) struct CompleteOutcome {
 /// Result of `cancel_run` / `cancel_job`.
 #[derive(Debug)]
 pub(crate) struct CancelOutcome {
+    /// This `cancel_run` call transitioned a live run to cancelled under its lock.
+    /// False for an already-terminal run and for `cancel_job`.
+    pub(crate) run_cancelled: bool,
     /// Cancellation messages queued for in-progress jobs.
     pub(crate) cancellations: usize,
     /// Run status after cancellation (for `cancel_run`).
@@ -1045,7 +1048,7 @@ pub(crate) struct RunQueueClaimability {
     /// The run's jobs in the ready queue (`queue_state = ready`).
     pub(crate) queued: usize,
     /// Registered runners whose capabilities
-    /// (`crate::runtime_scheduling::job_matches_runner_capabilities`) match at
+    /// (`crate::runtime_scheduling::job_matches_runner`) match at
     /// least one of those ready jobs. 0 when `queued` is 0.
     pub(crate) claimable: usize,
 }

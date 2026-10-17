@@ -1,0 +1,3 @@
+# Never publish private engineering plans, reviews, or investigations.
+internal/
+**/internal/**

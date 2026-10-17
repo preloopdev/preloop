@@ -4307,3 +4307,202 @@ jobs:
         std::collections::BTreeSet::from(["REAL".to_owned()])
     );
 }
+
+#[test]
+fn same_repository_refs_are_recognized_by_their_prefix() {
+    assert!(is_local_workflow_ref("./.github/workflows/build.yml"));
+    assert!(is_local_workflow_ref("$/.github/workflows/build.yml"));
+    assert!(!is_local_workflow_ref(
+        "owner/repo/.github/workflows/build.yml@v1"
+    ));
+    assert!(!is_local_workflow_ref("$"));
+    assert!(!is_local_workflow_ref("$build.yml"));
+}
+
+#[test]
+fn same_repository_calls_name_no_workflow_repository() {
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/setup
+"#;
+    for uses in [
+        "./.github/workflows/build.yml",
+        "$/.github/workflows/build.yml",
+    ] {
+        let caller =
+            parse_workflow(&format!("on: push\njobs:\n  call:\n    uses: {uses}\n")).unwrap();
+        let reusable =
+            BTreeMap::from([(".github/workflows/build.yml".to_owned(), called.to_owned())]);
+
+        let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        assert_eq!(expanded.jobs[0].workflow_repository, None, "{uses}");
+        assert_eq!(
+            expanded.reusable_calls["call"].workflow_repository, None,
+            "{uses}"
+        );
+
+        // Materializing the callee keeps the identity: its jobs run in the
+        // submitted repository, not in a repository named `./.github` or `$/.github`.
+        let materialized = expand_reusable_call(
+            &parse_workflow(called).unwrap(),
+            &expanded.jobs[0],
+            &reusable,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(materialized.jobs[0].id.0, "call/build");
+        assert_eq!(materialized.jobs[0].workflow_repository, None, "{uses}");
+    }
+}
+
+#[test]
+fn same_repository_call_in_a_remote_callee_resolves_in_its_repository() {
+    let remote = "octo/shared/.github/workflows/outer.yml@v1";
+    let pinned = "0123456789abcdef0123456789abcdef01234567";
+    let nested_key = format!("octo/shared/.github/workflows/inner.yml@{pinned}");
+    let outer = r#"
+on:
+  workflow_call:
+jobs:
+  nested:
+    uses: $/.github/workflows/inner.yml
+"#;
+    let inner = r#"
+on:
+  workflow_call:
+jobs:
+  leaf:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#;
+    let caller =
+        parse_workflow(&format!("on: push\njobs:\n  call:\n    uses: {remote}\n")).unwrap();
+    let shas = BTreeMap::from([
+        (remote.to_owned(), pinned.to_owned()),
+        (nested_key.clone(), pinned.to_owned()),
+    ]);
+    // The submitted tree has its own `inner.yml`; the remote callee must never
+    // select it for its `$/` call.
+    let mut reusable = BTreeMap::from([
+        (remote.to_owned(), outer.to_owned()),
+        (
+            ".github/workflows/inner.yml".to_owned(),
+            inner.replace("echo inner", "echo caller"),
+        ),
+        (nested_key.clone(), inner.to_owned()),
+    ]);
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    let outer_workflow = parse_workflow(outer).unwrap();
+    let callee =
+        expand_reusable_call(&outer_workflow, &expanded.jobs[0], &reusable, &shas).unwrap();
+    let nested = callee
+        .jobs
+        .iter()
+        .find(|job| job.id.0 == "call/nested")
+        .expect("nested call placeholder");
+    let call = nested.reusable_call.as_ref().expect("reusable call");
+    assert_eq!(call.uses, nested_key);
+    assert_eq!(call.workflow_repository.as_deref(), Some("octo/shared"));
+    assert_eq!(call.workflow_sha.as_deref(), Some(pinned));
+
+    // Without the callee's own copy the nested call is missing; it is not
+    // satisfied by the submitted tree's file.
+    reusable.remove(&nested_key);
+    match expand_reusable_call(&outer_workflow, &expanded.jobs[0], &reusable, &shas) {
+        Err(ParserError::MissingReusableWorkflow { path }) => assert_eq!(path, nested_key),
+        other => panic!("expected MissingReusableWorkflow, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_repository_refs_stay_inside_the_callee_repository() {
+    let origin = "octo/shared/.github/workflows/outer.yml@v1";
+    assert_eq!(
+        scope_same_repository_ref("$/.github/workflows/inner.yml", origin, "abc123").as_deref(),
+        Some("octo/shared/.github/workflows/inner.yml@abc123")
+    );
+    assert_eq!(
+        scope_same_repository_ref("./.github/workflows/inner.yml", origin, "abc123").as_deref(),
+        Some("octo/shared/.github/workflows/inner.yml@abc123")
+    );
+    assert_eq!(
+        scope_same_repository_ref("$/.github/workflows/../../secrets.yml", origin, "abc123"),
+        None
+    );
+    assert_eq!(
+        scope_same_repository_ref("octo/other/.github/workflows/x.yml@v1", origin, "abc123"),
+        None
+    );
+    assert_eq!(
+        scope_same_repository_ref("$/.github/workflows/inner.yml", "not-a-remote-key", "abc"),
+        None
+    );
+}
+
+#[test]
+fn plain_paths_refuse_every_spelling_a_url_parser_could_reinterpret() {
+    for path in [
+        "build.yml",
+        ".github/workflows/build.yml",
+        "v1.2.3",
+        "release/2026-10",
+        "my.workflow-1_x.yml",
+    ] {
+        assert!(is_plain_path(path), "`{path}` is plain");
+    }
+    for path in [
+        "", "/abs", "a//b", "a/", "..", "a/../b", "./a", "a/./b", "a\\b", "a%2e%2e", "a?b", "a#b",
+        "a b", "a\tb", "a\nb", "a+b",
+    ] {
+        assert!(!is_plain_path(path), "{path:?} must be refused");
+    }
+    assert!(is_plain_segment("octo-org"));
+    assert!(!is_plain_segment("a/b"));
+    assert!(!is_plain_segment(".."));
+}
+
+#[test]
+fn same_repository_paths_must_be_reusable_workflow_paths() {
+    assert_eq!(
+        same_repository_path("$/.github/workflows/build.yml"),
+        Some(".github/workflows/build.yml")
+    );
+    assert_eq!(
+        same_repository_path("./.github/workflows/build.yml"),
+        Some(".github/workflows/build.yml")
+    );
+    for uses in [
+        "$/../../../../repos/other/private/contents/.github/workflows/x.yml",
+        "$/.github/workflows/../../x.yml",
+        "$//.github/workflows/x.yml",
+        "$/.github/workflows/x.yml/",
+        "$/x.yml",
+        "$/.github/workflows/a b.yml",
+        "$/",
+        "octo/demo/.github/workflows/build.yml@v1",
+    ] {
+        assert_eq!(same_repository_path(uses), None, "`{uses}`");
+    }
+}
+
+#[test]
+fn same_repository_refs_must_name_a_workflow_file_under_github_workflows() {
+    assert_eq!(
+        same_repository_path("$/.github/workflows/ci.yml"),
+        Some(".github/workflows/ci.yml")
+    );
+    for uses in [
+        "$/../../../repos/other/private/contents/.github/workflows/x.yml",
+        "./../x.yml",
+        "$/src/x.yml",
+    ] {
+        assert_eq!(same_repository_path(uses), None, "`{uses}` must be refused");
+    }
+}

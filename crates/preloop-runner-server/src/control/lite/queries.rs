@@ -5,7 +5,7 @@
 use super::codec::{self, now_us};
 use super::{LiteBackend, db};
 use crate::control::types::*;
-use crate::models::{JobDetail, PushState, PushStatus};
+use crate::models::{JobDetail, PublishedRun, PushState, PushStatus};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use rusqlite::{OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -516,33 +516,41 @@ impl LiteBackend {
         })
     }
 
-    /// The concluded run whose push already published `sha` for
+    /// Every concluded run whose push already published `sha` for
     /// `workflow_path` on `repository` (matched on the submitted sha or the
-    /// push's `effective_sha`). Archive keeps such runs live for the echo
-    /// window, so only live runs are searched.
-    pub(crate) async fn published_run(
+    /// push's `effective_sha`), oldest first. `tested_merge` is whether the
+    /// run's workspace snapshot records a self-built merge. Archive keeps such
+    /// runs live for the echo window, so only live runs are searched.
+    pub(crate) async fn published_runs(
         &self,
         repository: &str,
         sha: &str,
         workflow_path: &str,
-    ) -> Result<Option<RunId>, ControlError> {
+    ) -> Result<Vec<PublishedRun>, ControlError> {
         self.read(|tx| {
-            tx.prepare_cached(
-                "SELECT r.run_id FROM runs r \
-                 JOIN run_push_states p ON p.run_id = r.run_id \
-                 JOIN run_submissions s ON s.run_id = r.run_id \
-                 WHERE r.conclusion IS NOT NULL AND r.repository = ?1 \
-                   AND s.submission ->> '$.workflow_path' = ?3 \
-                   AND (s.submission ->> '$.sha' = ?2 OR p.effective_sha = ?2) \
-                 ORDER BY r.run_id LIMIT 1",
-            )
-            .map_err(db)?
-            .query_row(params![repository, sha, workflow_path], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()
-            .map(|run| run.map(|run| codec::run_id(&run)))
-            .map_err(db)
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT r.run_id, s.submission ->> '$.event', \
+                     s.workspace_snapshot ->> '$.merge' IS NOT NULL \
+                     FROM runs r \
+                     JOIN run_push_states p ON p.run_id = r.run_id \
+                     JOIN run_submissions s ON s.run_id = r.run_id \
+                     WHERE r.conclusion IS NOT NULL AND r.repository = ?1 \
+                       AND s.submission ->> '$.workflow_path' = ?3 \
+                       AND (s.submission ->> '$.sha' = ?2 OR p.effective_sha = ?2) \
+                     ORDER BY r.run_id",
+                )
+                .map_err(db)?;
+            let runs = statement
+                .query_map(params![repository, sha, workflow_path], |row| {
+                    Ok(PublishedRun {
+                        run_id: codec::run_id(&row.get::<_, String>(0)?),
+                        event: row.get(1)?,
+                        tested_merge: row.get(2)?,
+                    })
+                })
+                .map_err(db)?;
+            runs.collect::<Result<Vec<_>, _>>().map_err(db)
         })
     }
 
