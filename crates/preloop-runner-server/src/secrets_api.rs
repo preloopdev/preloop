@@ -197,7 +197,8 @@ pub async fn set_secret(
     // `set` here would be overridden at the next startup when the credential
     // re-applies over config.toml — reject with guidance instead of silently
     // reverting.
-    let credential = crate::config::load_credential_secrets()
+    let credentials_dir = shared.state.credentials_dir.as_deref();
+    let credential = crate::config::load_credential_secrets(credentials_dir)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     if credential_scope_conflict(
         &credential,
@@ -249,7 +250,7 @@ pub async fn set_secret(
         }
         (None, Some(_)) => unreachable!("env without repo rejected above"),
     }
-    if !crate::config::store_memory(&config)
+    if !crate::config::store_memory(&config, shared.state.secrets_store_env.as_deref())
         .map_err(|error| ApiError::internal(format!("{error:#}")))?
     {
         crate::config::write_config_to(&shared.state.config_path, &config)
@@ -308,7 +309,8 @@ pub async fn delete_secret(
     // Same immutable-scope rule as `set_secret`: credential-backed entries
     // re-apply at startup, so a config-file removal would either 404 or
     // silently reappear. The credential file is the only supported edit path.
-    let credential = crate::config::load_credential_secrets()
+    let credentials_dir = shared.state.credentials_dir.as_deref();
+    let credential = crate::config::load_credential_secrets(credentials_dir)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     if credential_scope_conflict(
         &credential,
@@ -327,7 +329,7 @@ pub async fn delete_secret(
     let _mutation = shared.state.secret_mutation.lock().await;
     let config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    let memory = crate::config::store_memory(&config)
+    let memory = crate::config::store_memory(&config, shared.state.secrets_store_env.as_deref())
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
 
     if memory {

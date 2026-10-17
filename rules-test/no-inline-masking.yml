@@ -1,0 +1,16 @@
+id: no-inline-masking
+valid:
+  # The shared masker itself is exempt by the rule's function-name carve-out.
+  - |
+    fn mask_secrets(text: &str, secret: &str) -> String {
+        text.replace(secret, "****")
+    }
+  - |
+    fn f(text: &str) -> String {
+        mask_secrets(text, "secret")
+    }
+invalid:
+  - |
+    fn f(text: &str, secret: &str) -> String {
+        text.replace(secret, "****")
+    }

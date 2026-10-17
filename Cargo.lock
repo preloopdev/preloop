@@ -2543,7 +2543,6 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
- "libc",
  "nix 0.31.3",
  "preloop-gha-parser",
  "preloop-gha-protocol",
@@ -2912,7 +2911,6 @@ name = "preloop-vm"
 version = "0.21.0"
 dependencies = [
  "async-trait",
- "parking_lot",
  "preloop-gha-protocol",
  "preloop-observability",
  "serde",

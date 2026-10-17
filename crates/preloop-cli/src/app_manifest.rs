@@ -27,9 +27,12 @@ use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
 use serde::Deserialize;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
+
+use crate::output::Out;
 
 /// Default permissions of the generated App.
 ///
@@ -142,6 +145,7 @@ pub(crate) fn manifest(
     name: &str,
     redirect_url: &str,
     public_url: Option<&str>,
+    default_events: Option<&str>,
 ) -> serde_json::Value {
     let permissions: serde_json::Map<String, serde_json::Value> = DEFAULT_PERMISSIONS
         .iter()
@@ -161,8 +165,8 @@ pub(crate) fn manifest(
             "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
             "active": true,
         });
-        manifest["default_events"] =
-            serde_json::json!(preloop_runner_server::github::manifest_default_events());
+        let events = preloop_runner_server::github::manifest_default_events(default_events);
+        manifest["default_events"] = serde_json::json!(events);
     }
     // With no public URL there is no webhook at all: GitHub validates hook URL
     // reachability even for inactive hooks and rejects loopback addresses.
@@ -181,6 +185,9 @@ struct Flow {
     public_url: Option<String>,
     redirect_url: String,
     api_base: String,
+    /// Resolved `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` override for the App's
+    /// creation-time event subscriptions.
+    default_events: Option<String>,
     /// Install URL, published by the callback for the `/installed` page.
     install_url: Mutex<Option<String>>,
     /// Fires once, with the converted credentials.
@@ -202,6 +209,17 @@ struct InstalledQuery {
     installation_id: Option<u64>,
 }
 
+/// The GitHub App registration request: the App to create (name, install org,
+/// webhook base URL, default events) and the GitHub API endpoint to create it
+/// against.
+struct RegistrationRequest<'a> {
+    name: &'a str,
+    org: Option<&'a str>,
+    public_url: Option<&'a str>,
+    api_base: &'a str,
+    default_events: Option<&'a str>,
+}
+
 /// Run the browser flow and persist the converted credentials immediately.
 ///
 /// The callback runs as soon as GitHub's conversion response arrives, before
@@ -209,6 +227,7 @@ struct InstalledQuery {
 /// key only once, so waiting for installation before saving it would let a
 /// timeout or Ctrl-C lose the key.
 pub(crate) async fn register_with_persist<F, T>(
+    out: &mut Out,
     name: &str,
     org: Option<&str>,
     port: u16,
@@ -217,7 +236,7 @@ pub(crate) async fn register_with_persist<F, T>(
     persist: F,
 ) -> Result<(Registration, T)>
 where
-    F: FnOnce(&AppCredentials) -> Result<T>,
+    F: FnOnce(&AppCredentials, &mut Out) -> Result<T>,
 {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
@@ -226,16 +245,27 @@ where
         .local_addr()
         .context("reading the local listener address")?;
     let base = format!("http://127.0.0.1:{}", local.port());
-    println!("Open this URL to create the GitHub App:\n  {base}");
+    writeln!(out, "Open this URL to create the GitHub App:\n  {base}")?;
     if open_browser && open_in_browser(&base).is_err() {
-        println!("(could not open a browser automatically — open the URL above)");
+        writeln!(
+            out,
+            "(could not open a browser automatically — open the URL above)"
+        )?;
     }
-    println!("Waiting for GitHub to redirect back…");
+    writeln!(out, "Waiting for GitHub to redirect back…")?;
     let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://api.github.com".to_owned());
-    register_on_with_persist(listener, name, org, public_url, &api_base, persist).await
+    let default_events = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS").ok();
+    let request = RegistrationRequest {
+        name,
+        org,
+        public_url,
+        api_base: &api_base,
+        default_events: default_events.as_deref(),
+    };
+    register_on_with_persist(listener, out, &request, persist).await
 }
 
 /// [`register_with_persist`] against an already-bound listener, so a test can
@@ -243,27 +273,34 @@ where
 #[cfg(test)]
 async fn register_on(
     listener: tokio::net::TcpListener,
+    out: &mut Out,
     name: &str,
     org: Option<&str>,
     public_url: Option<&str>,
     api_base: &str,
+    default_events: Option<&str>,
 ) -> Result<Registration> {
+    let request = RegistrationRequest {
+        name,
+        org,
+        public_url,
+        api_base,
+        default_events,
+    };
     let (registration, ()) =
-        register_on_with_persist(listener, name, org, public_url, api_base, |_| Ok(())).await?;
+        register_on_with_persist(listener, out, &request, |_, _| Ok(())).await?;
     Ok(registration)
 }
 
 /// [`register_on`] with immediate persistence of the converted credentials.
 async fn register_on_with_persist<F, T>(
     listener: tokio::net::TcpListener,
-    name: &str,
-    org: Option<&str>,
-    public_url: Option<&str>,
-    api_base: &str,
+    out: &mut Out,
+    request: &RegistrationRequest<'_>,
     persist: F,
 ) -> Result<(Registration, T)>
 where
-    F: FnOnce(&AppCredentials) -> Result<T>,
+    F: FnOnce(&AppCredentials, &mut Out) -> Result<T>,
 {
     let local = listener
         .local_addr()
@@ -273,15 +310,16 @@ where
     let (installed_tx, installed_rx) = oneshot::channel();
     let flow = Arc::new(Flow {
         state: nonce(),
-        name: name.to_owned(),
-        public_url: public_url.map(str::to_owned),
+        name: request.name.to_owned(),
+        public_url: request.public_url.map(str::to_owned),
         redirect_url: format!("{base}/callback"),
-        api_base: api_base.to_owned(),
+        api_base: request.api_base.to_owned(),
+        default_events: request.default_events.map(str::to_owned),
         install_url: Mutex::new(None),
         credentials_tx: Mutex::new(Some(credentials_tx)),
         installed_tx: Mutex::new(Some(installed_tx)),
     });
-    let org = org.map(str::to_owned);
+    let org = request.org.map(str::to_owned);
     let router = Router::new()
         .route("/", get(page_form))
         .route("/callback", get(page_callback))
@@ -306,7 +344,7 @@ where
             BROWSER_TIMEOUT.as_secs()
         ),
     };
-    let persisted = match persist(&credentials) {
+    let persisted = match persist(&credentials, out) {
         Ok(value) => value,
         Err(error) => {
             shutdown.cancel();
@@ -334,7 +372,12 @@ where
 /// The form page: GitHub only accepts a manifest as a form POST, so this is
 /// a self-submitting form rather than a link.
 async fn page_form(State((flow, org)): State<(Arc<Flow>, Option<String>)>) -> impl IntoResponse {
-    let manifest = manifest(&flow.name, &flow.redirect_url, flow.public_url.as_deref());
+    let manifest = manifest(
+        &flow.name,
+        &flow.redirect_url,
+        flow.public_url.as_deref(),
+        flow.default_events.as_deref(),
+    );
     let action = creation_url(org.as_deref(), &flow.state);
     let scope = match &org {
         Some(org) => format!("the <strong>{}</strong> organization", escape(org)),
@@ -585,10 +628,10 @@ mod tests {
             .await
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, None, &api).await },
-            );
+        let flow = tokio::spawn(async move {
+            let mut out = crate::output::Out::capturing();
+            register_on(listener, &mut out, "preloop-local", None, None, &api, None).await
+        });
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -691,10 +734,10 @@ mod tests {
             );
             axum::serve(api_listener, router).await
         });
-        let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, None, &api).await },
-            );
+        let flow = tokio::spawn(async move {
+            let mut out = crate::output::Out::capturing();
+            register_on(listener, &mut out, "preloop-local", None, None, &api, None).await
+        });
 
         let client = reqwest::Client::new();
         let form = client
@@ -727,7 +770,7 @@ mod tests {
 
     #[test]
     fn manifest_disables_webhooks_without_a_public_url() {
-        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None);
+        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None, None);
         assert!(
             manifest.get("hook_attributes").is_none(),
             "GitHub rejects hook URLs it cannot reach over the public \
@@ -749,6 +792,7 @@ mod tests {
             "preloop",
             "http://127.0.0.1:4000/callback",
             Some("https://ci.example.com/"),
+            None,
         );
         assert_eq!(
             manifest["hook_attributes"]["url"],

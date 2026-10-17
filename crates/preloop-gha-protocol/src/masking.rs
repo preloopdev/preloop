@@ -428,8 +428,8 @@ fn is_secret_prefix(remaining: &str, secrets: &[String]) -> bool {
 /// This function and [`expose_values`] are the only sanctioned boundary where a
 /// whole collection of secrets becomes plaintext. Callers must resolve once and
 /// then iterate the returned collection; re-exposing per element inside a loop
-/// or iterator closure scatters plaintext across the codebase and defeats the
-/// audit rule `rules/no-expose-in-loop.yml`.
+/// or iterator closure scatters plaintext across the codebase and makes the
+/// audit trail unscannable — no structural rule can see it.
 pub fn expose_all(secrets: &crate::SecretMap) -> std::collections::BTreeMap<String, String> {
     secrets
         .iter()

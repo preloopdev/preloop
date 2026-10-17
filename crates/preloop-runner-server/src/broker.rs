@@ -127,31 +127,6 @@ pub fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStat
     }
 }
 
-pub fn broker_run_service_url(runner_id: i64) -> String {
-    format!("{}/broker/{runner_id}/", runner_base_url())
-}
-
-/// Runner-facing base URL: the origin embedded in connectionData, broker
-/// endpoint data, Twirp signed URLs, and job-message variables. Defaults to
-/// `PRELOOP_RUNNER_URL`, falling back to `PRELOOP_PUBLIC_URL` for standalone
-/// `preloop-runner-server` deployments. `preloop serve` pins this to the loopback
-/// listen origin so in-VM runners and their jobs reach the host exclusively
-/// via the mounted control socket and in-guest loopback bridge, never the
-/// public tunnel.
-pub fn runner_base_url() -> String {
-    std::env::var("PRELOOP_RUNNER_URL")
-        .unwrap_or_else(|_| public_base_url())
-        .trim_end_matches('/')
-        .to_owned()
-}
-
-pub fn public_base_url() -> String {
-    std::env::var("PRELOOP_PUBLIC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
-        .trim_end_matches('/')
-        .to_owned()
-}
-
 pub fn format_reusable_workflow_ref(
     repository: &str,
     workflow_ref: &str,
@@ -179,29 +154,14 @@ pub fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
     Ok(issuer)
 }
 
-/// Return the effective OIDC issuer URL, falling back to
-/// `{public_base_url}/oidc` when not explicitly configured.
-pub fn oidc_issuer_url(inner: &InnerState) -> String {
-    if inner.oidc_issuer.is_empty() {
-        format!("{}/oidc", runner_base_url())
+/// Return the effective OIDC issuer URL from an explicitly configured value,
+/// falling back to `{runner_base}/oidc` when not configured.
+pub fn oidc_issuer_url(configured: &str, runner_base: &str) -> String {
+    if configured.is_empty() {
+        format!("{runner_base}/oidc")
     } else {
-        inner.oidc_issuer.clone()
+        configured.to_owned()
     }
-}
-
-pub fn websocket_base_url() -> String {
-    let base = runner_base_url();
-    if let Some(rest) = base.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        base
-    }
-}
-
-pub fn runner_server_url() -> String {
-    format!("{}/runner/server", runner_base_url())
 }
 
 /// Return server-enforced runner settings.
@@ -213,13 +173,16 @@ pub async fn runner_settings() -> Json<azdo::RunnerServerSettings> {
     Json(azdo::RunnerServerSettings::default())
 }
 
-pub fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
+pub fn broker_job_ref(
+    request: &TaskAgentJobRequestRecord,
+    run_service_url: &str,
+) -> serde_json::Value {
     json!({
         "messageId": request.request_id,
         "messageType": "RunnerJobRequest",
         "body": serde_json::to_string(&json!({
             "runner_request_id": request.agent_job_id.to_string(),
-            "run_service_url": broker_run_service_url(runner_id),
+            "run_service_url": run_service_url,
             "billing_owner_id": "local",
             "should_acknowledge": true
         })).unwrap()
@@ -228,7 +191,7 @@ pub fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> se
 
 pub fn broker_job_ref_root(
     request: &TaskAgentJobRequestRecord,
-    runner_id: i64,
+    run_service_url: &str,
 ) -> serde_json::Value {
     // messageId must be unique across job + cancel messages on a session.
     // Using request_id alone collides with cancel messages that also allocate
@@ -238,7 +201,7 @@ pub fn broker_job_ref_root(
         "messageType": "RunnerJobRequest",
         "body": serde_json::to_string(&json!({
             "runner_request_id": request.agent_job_id.to_string(),
-            "run_service_url": broker_run_service_url(runner_id),
+            "run_service_url": run_service_url,
             "billing_owner_id": "local",
             "should_acknowledge": true
         })).unwrap()
@@ -296,7 +259,7 @@ pub async fn next_message_broker_ref(
         .unwrap_or(50)
         // A client-chosen window longer than the liveness floor parks a
         // healthy runner past its own reaping.
-        .min(crate::state::max_poll_window_secs());
+        .min(shared.state.max_poll_window_secs);
     let runner_busy = params
         .get("status")
         .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
@@ -358,7 +321,11 @@ pub async fn next_message_broker_ref(
             crate::control::types::PollOutcome::ActiveRequest { request, runner_id }
                 if !runner_busy =>
             {
-                return Ok(Json(broker_job_ref(&request, runner_id)).into_response());
+                return Ok(Json(broker_job_ref(
+                    &request,
+                    &shared.state.broker_run_service_url(runner_id),
+                ))
+                .into_response());
             }
             crate::control::types::PollOutcome::Claimed(claimed) => {
                 let crate::control::types::ClaimedJob {
@@ -383,7 +350,11 @@ pub async fn next_message_broker_ref(
                     })
                     .await;
 
-                return Ok(Json(broker_job_ref(&request, runner_id)).into_response());
+                return Ok(Json(broker_job_ref(
+                    &request,
+                    &shared.state.broker_run_service_url(runner_id),
+                ))
+                .into_response());
             }
             // ActiveRequest while busy, or Empty: nothing to deliver — wait.
             _ => {}
@@ -714,7 +685,7 @@ pub async fn next_message_broker_ref_root(
         .unwrap_or(50)
         // A client-chosen window longer than the liveness floor parks a
         // healthy runner past its own reaping.
-        .min(crate::state::max_poll_window_secs());
+        .min(shared.state.max_poll_window_secs);
     // The runner may report completion before its worker process has fully
     // exited. GitHub keeps polling with status=Busy during that drain window;
     // never dispatch a successor until the runner reports Online again.
@@ -767,7 +738,10 @@ pub async fn next_message_broker_ref_root(
                 } = *claimed;
                 *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 record_claim_queue_wait(&shared, &Some(queued));
-                Some(broker_job_ref_root(&request, runner_id))
+                Some(broker_job_ref_root(
+                    &request,
+                    &shared.state.broker_run_service_url(runner_id),
+                ))
             }
             crate::control::types::PollOutcome::Empty => {
                 drained = true;
@@ -1056,7 +1030,12 @@ pub async fn broker_acquire_job(
             // verified (fresh cache, or re-introspected here: the job may have
             // queued past the cache TTL); unverifiable authority stays
             // withheld and the job keeps an empty token surface.
-            match crate::runs::verified_pat_scopes(&pat).await {
+            match crate::runs::verified_pat_scopes(
+                shared.state.github_api_request_base.as_deref(),
+                &pat,
+            )
+            .await
+            {
                 Some(scopes) => {
                     message.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),
@@ -1099,7 +1078,7 @@ pub async fn broker_acquire_job(
         );
     }
     message.message_type = Some(azdo::message_type::RUNNER_JOB_REQUEST.to_owned());
-    let run_service_url = broker_run_service_url(runner_id);
+    let run_service_url = shared.state.broker_run_service_url(runner_id);
     for endpoint in &mut message.resources.endpoints {
         if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
             endpoint.url = Some(run_service_url.clone());
@@ -1113,26 +1092,33 @@ pub async fn broker_acquire_job(
             );
             endpoint.data.insert(
                 "ResultsServiceUrl".to_owned(),
-                format!("{}/", runner_base_url()),
+                format!("{}/", shared.state.runner_base_url()),
             );
-            endpoint
-                .data
-                .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+            endpoint.data.insert(
+                "PipelinesServiceUrl".to_owned(),
+                shared.state.runner_server_url(),
+            );
             endpoint.data.insert(
                 "CacheServerUrl".to_owned(),
-                format!("{}/", runner_base_url()),
+                format!("{}/", shared.state.runner_base_url()),
             );
             endpoint.data.insert(
                 "FeedStreamUrl".to_owned(),
-                format!("{}/ws/live-logs/{}", websocket_base_url(), message.job_id),
+                format!(
+                    "{}/ws/live-logs/{}",
+                    shared.state.websocket_base_url(),
+                    message.job_id
+                ),
             );
             endpoint.data.insert(
                 "ConnectivityChecks".to_owned(),
-                serde_json::json!([format!("{}/check", runner_base_url())]).to_string(),
+                serde_json::json!([format!("{}/check", shared.state.runner_base_url())])
+                    .to_string(),
             );
             endpoint.data.insert(
                 "ConnectivityAndDNSChecks".to_owned(),
-                serde_json::json!([format!("{}/check", runner_base_url())]).to_string(),
+                serde_json::json!([format!("{}/check", shared.state.runner_base_url())])
+                    .to_string(),
             );
             endpoint.data.insert("ServerId".to_owned(), String::new());
             endpoint.data.insert("ServerName".to_owned(), String::new());
@@ -1146,7 +1132,7 @@ pub async fn broker_acquire_job(
                     "GenerateIdTokenUrl".to_owned(),
                     format!(
                         "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
-                        runner_base_url(),
+                        shared.state.runner_base_url(),
                         message.plan.plan_id,
                         message.job_id
                     ),
@@ -1527,6 +1513,7 @@ pub async fn mint_dispatch_github_token(
     }
     let ceiling_clamped = !ceiling.clamped.is_empty();
     let minted = match crate::github_app::get_or_mint_token_declared(
+        &shared.state.github_api_base(),
         &app,
         &request.repository,
         &ceiling.permissions,
@@ -1753,7 +1740,9 @@ mod tests {
         use tower::ServiceExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = crate::app(state, CancellationToken::new());
 
         for path in [
@@ -1787,7 +1776,9 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let mut shared = SharedState {
             state,
             shutdown: CancellationToken::new(),

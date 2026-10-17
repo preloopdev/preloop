@@ -1,0 +1,40 @@
+id: no-tls-verification-opt-out
+valid:
+  # Explicit false re-enables verification; must not match.
+  - |
+    fn f() {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(false)
+            .build();
+    }
+  - |
+    fn f(builder: SslConnectorBuilder) {
+        builder.set_verify(SslVerifyMode::PEER);
+    }
+  - |
+    fn f(client: reqwest::Client) {
+        client.timeout(Duration::from_secs(5));
+    }
+invalid:
+  - |
+    fn f() {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build();
+    }
+  - |
+    fn f(connector: TlsConnector) {
+        connector.danger_accept_invalid_hostnames(true);
+    }
+  - |
+    fn f(builder: TlsConnectorBuilder) {
+        builder.danger_accept_untrusted_certs(true);
+    }
+  - |
+    fn f(builder: SslConnectorBuilder) {
+        builder.set_verify(SslVerifyMode::NONE);
+    }
+  - |
+    fn f(connector: SslConnector) {
+        connector.set_verify(openssl::ssl::SslVerifyMode::NONE);
+    }

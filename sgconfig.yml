@@ -1,2 +1,7 @@
 ruleDirs:
   - rules
+# Rule fixtures live outside ruleDirs so they are never loaded as rules.
+# `ast-grep test` picks them up from here; `ast-grep scan` parses them as
+# plain YAML and no YAML-language rules exist, so they cannot produce hits.
+testConfigs:
+  - testDir: rules-test

@@ -351,11 +351,11 @@ pub fn expire_pat_scope_cache() {
 /// and fail every GitHub fetch the submit-time checkout routing assumed it
 /// could make. `None` when the scopes cannot be established (the PAT stays
 /// withheld, as before).
-pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
+pub async fn verified_pat_scopes(api_base: Option<&str>, pat: &str) -> Option<Vec<String>> {
     if let Some(scopes) = cached_pat_scopes(pat) {
         return Some(scopes);
     }
-    match pat_oauth_scopes(pat).await {
+    match pat_oauth_scopes(api_base, pat).await {
         PatScopeOutcome::Known(scopes) => Some(scopes),
         PatScopeOutcome::Unverifiable { reason } => {
             tracing::warn!(%reason, "withholding PAT at dispatch: scopes unverifiable");
@@ -379,8 +379,8 @@ pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
 /// Failures are logged, never fatal: a server that cannot reach the GitHub API
 /// still serves, and the run path withholds the credential instead of
 /// embedding one whose bounds nobody established.
-pub async fn warm_pat_scope_cache(pat: &str) {
-    match pat_oauth_scopes(pat).await {
+pub async fn warm_pat_scope_cache(api_base: Option<&str>, pat: &str) {
+    match pat_oauth_scopes(api_base, pat).await {
         PatScopeOutcome::Known(scopes) => {
             tracing::info!(
                 scope_count = scopes.len(),
@@ -484,7 +484,7 @@ enum PatScopeOutcome {
 /// for fine-grained PATs, so absence means the token's bounds are unknown
 /// rather than narrow. Results are cached per PAT (SHA-256 of the token) for
 /// [`PAT_SCOPE_CACHE_TTL`].
-async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
+async fn pat_oauth_scopes(api_base: Option<&str>, pat: &str) -> PatScopeOutcome {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
     if let Ok(cache) = PAT_SCOPE_CACHE.lock()
@@ -494,23 +494,26 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
         return PatScopeOutcome::Known(scopes.clone());
     }
     // Test-support builds stay off the network unless a test pointed the
-    // GitHub API at its own stub: `cargo test` shares one process environment
-    // across the whole binary, so a PAT set by a neighbouring test (or
-    // injected into the job VM) would otherwise turn an unrelated submit into
-    // a live 401 and a `403 refusing to embed an invalid PAT`. Unverifiable
-    // scopes are already a handled outcome — the PAT is withheld and the run
-    // proceeds on the job-scoped runtime token — so tests that need a verdict
-    // set `PRELOOP_GITHUB_API_URL` at their own stub, which this guard leaves
-    // alone.
+    // GitHub API at its own stub (an explicit `StartupConfig::github_api_url`,
+    // which lands here as `api_base`): a PAT set for one test would otherwise
+    // turn an unrelated submit into a live 401 and a `403 refusing to embed an
+    // invalid PAT`. Unverifiable scopes are already a handled outcome — the
+    // PAT is withheld and the run proceeds on the job-scoped runtime token.
     #[cfg(any(test, feature = "test-support"))]
-    if std::env::var_os("PRELOOP_GITHUB_API_URL").is_none() {
+    if api_base.is_none() {
         return PatScopeOutcome::Unverifiable {
             reason: "test-support: PAT scope introspection is disabled for the default GitHub API \
-                     base; point PRELOOP_GITHUB_API_URL at a stub to exercise it"
+                     base; point StartupConfig::github_api_url at a stub to exercise it"
                 .to_owned(),
         };
     }
-    let url = format!("{}/", crate::github::github_api_base());
+    let url = format!(
+        "{}/",
+        api_base
+            .map(|base| base.trim_end_matches('/'))
+            .filter(|base| !base.is_empty())
+            .unwrap_or("https://api.github.com")
+    );
     let response = match crate::shared_http::CLIENT
         .get(&url)
         .header("Authorization", format!("Bearer {pat}"))
@@ -1597,7 +1600,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // the PAT's classic OAuth scopes and refuse the run on mismatch;
         // an invalid PAT is refused outright, and a PAT whose bounds
         // cannot be verified is withheld rather than embedded at acquire.
-        match pat_oauth_scopes(&pat).await {
+        match pat_oauth_scopes(shared.state.github_api_request_base.as_deref(), &pat).await {
             PatScopeOutcome::Known(scopes) => {
                 enforce_pat_permissions(&jobs, &submission, &scopes)?;
                 tracing::warn!(
@@ -1687,7 +1690,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // Messages, token material and OIDC contexts for the whole matrix are
     // built without any lock — the durable insert happens in one
     // `submit_run` transaction below.
-    let base_url = runner_base_url();
+    let base_url = shared.state.runner_base_url();
     let normalized_github = preloop_gha_parser::job_builder::normalize_github_context(&github);
     // Every value this run's jobs can see (run > repo > global), for the
     // masker cache only; the builder below takes names.
@@ -4003,7 +4006,7 @@ pub(crate) async fn rerun_run_with_mode(
                     serde_json::Value::String(actor.to_owned()),
                 );
             }
-            let base_url = runner_base_url();
+            let base_url = shared.state.runner_base_url();
             // The rerun rebuilds templates for the same workflow snapshot —
             // expansion is deterministic over the stored submission's
             // inputs/event, so JobPlans match the submit's expansion.
@@ -4570,7 +4573,6 @@ fn live_run_events(
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)] // SAFETY: env writes confined to serialized tests.
 mod tests {
     use super::*;
     use futures::FutureExt;
@@ -4582,7 +4584,9 @@ mod tests {
     #[tokio::test]
     async fn needs_gated_unsatisfiable_labels_skip_on_if_false() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state.pool_status.set_labels(vec![
             "self-hosted".to_owned(),
             "Linux".to_owned(),
@@ -4659,7 +4663,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_webhook_replay_does_not_consume_run_number() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let shared = state.shared();
         let submission = preloop_gha_protocol::WorkflowSubmission {
             workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
@@ -5049,7 +5055,7 @@ mod tests {
         // synthetic head commit that the merge builder consumes.
         std::fs::write(workspace.join("file.txt"), "two (uncommitted)\n").unwrap();
 
-        let mut state = AppState::new(state_dir.clone()).await.unwrap();
+        let mut state = AppState::new_for_tests(state_dir.clone()).await.unwrap();
         state.local_workspace = Some(workspace.clone());
         let shared = std::sync::Arc::new(SharedState {
             state: state.clone(),
@@ -5164,18 +5170,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-        // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-        // The guard restores the previous value when the test ends, so a
-        // leaked stub base cannot poison later tests.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         std::fs::write(&config_path, "[github]\npat = \"ghp_config_pat_value\"\n").unwrap();
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        let mut state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path)
             .await
             .unwrap();
+        // The stub is the request-path GitHub API for this state.
+        state.github_api_request_base = Some(api_base);
         let app = crate::app(state, CancellationToken::new());
 
         let response = app
@@ -5211,8 +5214,6 @@ mod tests {
             Some("Bearer ghp_config_pat_value"),
             "remote reusable-workflow resolution must send the config-backed PAT"
         );
-
-        unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
     }
 
     /// Submit a run through the public API against a config-file registry.
@@ -5224,7 +5225,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         std::fs::write(&config_path, config_toml).unwrap();
-        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        let state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path)
             .await
             .unwrap();
         let app = crate::app(state, CancellationToken::new());
@@ -5310,7 +5311,8 @@ mod tests {
             "[environments]\n\"owner/repo\" = [\"production\"]\n",
         )
         .unwrap();
-        let result = AppState::new_with_config(temp.path().to_path_buf(), config_path).await;
+        let result =
+            AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path).await;
         assert!(
             result.is_err(),
             "a non-empty [environments] table must fail the config load"
@@ -5344,7 +5346,9 @@ mod tests {
         temp: &std::path::Path,
         mode: crate::config::ProtectionMode,
     ) -> std::sync::Arc<crate::SharedState> {
-        let mut state = crate::AppState::new(temp.to_path_buf()).await.unwrap();
+        let mut state = crate::AppState::new_for_tests(temp.to_path_buf())
+            .await
+            .unwrap();
         state.execution_protection = crate::config::ExecutionProtectionConfig {
             mode,
             event_rules: vec![crate::config::EventRule {
@@ -5421,7 +5425,7 @@ mod tests {
     #[tokio::test]
     async fn submit_run_inner_logs_but_does_not_block_default_prt_rule() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
+        let mut state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         state.execution_protection = crate::config::ExecutionProtectionConfig::default();
@@ -5475,7 +5479,7 @@ mod tests {
             }
         }
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
+        let mut state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         state.max_jobs_per_run = 2;
@@ -5546,7 +5550,7 @@ mod tests {
             }
         }
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
+        let mut state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         state.max_jobs_per_run = 300;
@@ -5586,7 +5590,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_delivery_bypasses_max_jobs_per_run() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
+        let mut state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         state.max_jobs_per_run = 2;
@@ -5628,7 +5632,7 @@ mod tests {
     #[tokio::test]
     async fn run_whose_only_job_is_gated_off_finishes_at_submit() {
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
+        let state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         let shared = state.shared();
@@ -5685,7 +5689,7 @@ mod tests {
         use tower::ServiceExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
+        let state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         let shared = state.shared();
@@ -5757,7 +5761,7 @@ mod tests {
     #[tokio::test]
     async fn workless_run_takes_no_workflow_concurrency_and_leaves_none_held() {
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
+        let state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         let shared = state.shared();

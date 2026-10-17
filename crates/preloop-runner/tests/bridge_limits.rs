@@ -1,7 +1,7 @@
 //! Regression tests: the control bridge must bound concurrent
 //! connections and reap truly-idle splices.
 //!
-//! Exercised through the public `spawn_from_env` entry point with
+//! Exercised through the public `spawn_from_env_lookup` entry point with
 //! `PRELOOP_BRIDGE_MAX_CONNECTIONS` / `PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS`
 //! overrides. Without the bounds the excess-connection scenario parks the
 //! third connection instead of closing it, and the idle scenario never
@@ -17,14 +17,9 @@ use tokio::net::{TcpListener, TcpStream};
 // ignores them fails the scenarios below at runtime.
 const BRIDGE_MAX_CONNECTIONS_ENV: &str = "PRELOOP_BRIDGE_MAX_CONNECTIONS";
 const BRIDGE_IDLE_TIMEOUT_SECS_ENV: &str = "PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS";
-/// Env overrides are process-global and integration tests in one binary share
-/// a process: serialize scenarios that mutate them. Async mutex: the guard
-/// is held across awaits by design.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// `spawn_from_env` against an env map — edition 2024 makes `set_var` unsafe
-/// and the crate forbids `unsafe`, so tests hand the bridge its variables
-/// instead of exporting them.
+/// `spawn_from_env_lookup` against an explicit env map: tests hand the bridge
+/// its variables instead of exporting them, so no process env is touched.
 async fn spawn_bridge_with(vars: &[(&str, String)]) -> control_bridge::ControlBridge {
     let map: BTreeMap<&str, String> = vars.iter().cloned().collect();
     control_bridge::spawn_from_env_lookup(
@@ -56,7 +51,6 @@ async fn park_upstream(listener: TcpListener) {
 
 #[tokio::test]
 async fn bridge_enforces_connection_cap_and_idle_timeout() {
-    let _env = ENV_LOCK.lock().await;
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
     tokio::spawn(park_upstream(upstream));
@@ -128,7 +122,6 @@ async fn bridge_enforces_connection_cap_and_idle_timeout() {
 /// drops a reply already on its way back.
 #[tokio::test]
 async fn bridge_half_close_preserves_response() {
-    let _env = ENV_LOCK.lock().await;
     // Upstream reads the request to EOF, then answers.
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
@@ -172,7 +165,6 @@ async fn bridge_half_close_preserves_response() {
 /// reverse channel never kills an active forward one.
 #[tokio::test]
 async fn bridge_one_way_traffic_survives_idle_timeout() {
-    let _env = ENV_LOCK.lock().await;
     // Upstream drains request bytes and never answers.
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();

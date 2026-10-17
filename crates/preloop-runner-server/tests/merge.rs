@@ -138,7 +138,9 @@ impl MergeFixture {
 
     async fn app(&self) -> (AppState, Router) {
         std::fs::create_dir_all(&self.state_dir).unwrap();
-        let mut state = AppState::new(self.state_dir.clone()).await.unwrap();
+        let mut state = AppState::new_for_tests(self.state_dir.clone())
+            .await
+            .unwrap();
         state.local_workspace = Some(self.workspace.clone());
         let app = app(state.clone(), CancellationToken::new());
         (state, app)
@@ -742,7 +744,9 @@ async fn push_after_local_pr_merge_records_head_tree_not_merge_tree() {
 async fn prebuilt_merge_is_built_served_and_validated() {
     let fixture = MergeFixture::clean();
     std::fs::create_dir_all(&fixture.state_dir).unwrap();
-    let mut state = AppState::new(fixture.state_dir.clone()).await.unwrap();
+    let mut state = AppState::new_for_tests(fixture.state_dir.clone())
+        .await
+        .unwrap();
     state.local_workspace = Some(fixture.workspace.clone());
     let shared = state.shared();
 
@@ -900,7 +904,9 @@ async fn fetch_inputs_rejects_a_non_object_id_head() {
 async fn webhook_merge_source_prepares_a_reusable_mirror() {
     let fixture = MergeFixture::clean();
     std::fs::create_dir_all(&fixture.state_dir).unwrap();
-    let state = AppState::new(fixture.state_dir.clone()).await.unwrap();
+    let state = AppState::new_for_tests(fixture.state_dir.clone())
+        .await
+        .unwrap();
     let shared = state.shared();
     let source = webhook_merge_source(&shared, "owner/repo").await.unwrap();
     assert!(source.mirror.starts_with(&fixture.state_dir));

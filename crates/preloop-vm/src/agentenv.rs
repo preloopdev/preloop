@@ -153,8 +153,10 @@ const PACK_PROVIDER: &str = "agentenv";
 /// server-assigned id, so the only way for those commands to reach a paused
 /// job's guest is the registry the engine persisted. Returns `None` when there
 /// is no registry, no such machine, or the machine was never started.
-pub fn recorded_sandbox(machine: &str) -> Option<String> {
-    let path = crate::effective_preloop_home()?.join("agentenv-machines.json");
+pub fn recorded_sandbox(paths: &crate::VmPathConfig, machine: &str) -> Option<String> {
+    let path = paths
+        .effective_preloop_home()?
+        .join("agentenv-machines.json");
     let registry: Registry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     registry.machines.get(machine)?.sandbox.clone()
 }
@@ -189,12 +191,6 @@ pub struct AgentEnvProvider {
     fork_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
-impl Default for AgentEnvProvider {
-    fn default() -> Self {
-        Self::from_environment()
-    }
-}
-
 impl AgentEnvProvider {
     /// Construct a provider using an explicit `aenv` executable.
     pub fn new(binary: impl Into<PathBuf>) -> Self {
@@ -209,13 +205,15 @@ impl AgentEnvProvider {
         }
     }
 
-    /// Construct a provider from the process environment.
+    /// The startup-boundary constructor: resolve `PRELOOP_AENV_BINARY` and
+    /// `PRELOOP_AENV_TTL_SECS` from the process environment once, then carry
+    /// them (and `paths`) as typed state.
     ///
     /// `PRELOOP_AENV_BINARY` overrides the executable and
     /// `PRELOOP_AENV_TTL_SECS` the sandbox TTL; the registry is persisted under
-    /// the effective preloop home so a restarted engine can still enumerate and
-    /// tear down the machines it created.
-    pub fn from_environment() -> Self {
+    /// `paths`' effective preloop home so a restarted engine can still
+    /// enumerate and tear down the machines it created.
+    pub fn from_environment(paths: crate::VmPathConfig) -> Self {
         let mut provider = Self::new(binary());
         if let Some(ttl) = std::env::var(TTL_ENV)
             .ok()
@@ -224,7 +222,7 @@ impl AgentEnvProvider {
         {
             provider.ttl_secs = ttl;
         }
-        if let Some(home) = crate::effective_preloop_home() {
+        if let Some(home) = paths.effective_preloop_home() {
             provider = provider.with_registry_path(home.join("agentenv-machines.json"));
         }
         provider
@@ -1309,16 +1307,7 @@ impl VmProvider for AgentEnvProvider {
                 ));
             }
             let value = match source {
-                SecretSource::HostEnv(host) => {
-                    if !crate::is_env_identifier(host) {
-                        return Err(VmError::InvalidSpec(
-                            "secret environment names must be non-empty ASCII identifiers".into(),
-                        ));
-                    }
-                    std::env::var(host).map_err(|_| {
-                        VmError::InvalidSpec(format!("host environment variable {host} is unset"))
-                    })?
-                }
+                SecretSource::Value(secret) => secret.expose().to_owned(),
                 SecretSource::HostFile(path) => {
                     if !path.is_absolute() {
                         return Err(VmError::InvalidSpec(

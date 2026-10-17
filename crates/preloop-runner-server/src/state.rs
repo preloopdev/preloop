@@ -679,13 +679,12 @@ pub enum RegistrationPolicy {
 }
 
 impl RegistrationPolicy {
-    /// Parse the `PRELOOP_REGISTRATION_POLICY` environment variable.
+    /// Parse `value` (the resolved `PRELOOP_REGISTRATION_POLICY` value).
     ///
     /// Unknown or missing values fall back to [`RegistrationPolicy::Strict`]:
     /// a typo must fail closed, never open.
-    pub fn from_env() -> Self {
-        match std::env::var("PRELOOP_REGISTRATION_POLICY")
-            .ok()
+    pub fn parse(value: Option<&str>) -> Self {
+        match value
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
@@ -709,8 +708,6 @@ pub struct GitHubUrls {
 }
 
 /// (owner, repo, ref) → resolution outcome with the instant it was recorded.
-///
-/// See [`GITHUB_ENV_LOCK`] for why the tests around this are serialized.
 ///
 /// `None` is a cached *failure*. Without it an offline or rate-limited server
 /// re-attempts every unresolvable ref on every job dispatch and pays the full
@@ -770,73 +767,6 @@ pub(crate) type RepoMetaCache = std::sync::Mutex<
         ((Option<u64>, Option<bool>), std::time::Instant),
     >,
 >;
-
-/// Serializes tests that mutate the process-global GitHub URL environment
-/// variables.
-///
-/// `std::env` is process-wide while `cargo test` runs the suite on a thread
-/// pool, so two tests that point `PRELOOP_GITHUB_API_URL` at their own mock
-/// server observe each other's value. Each such test passes in isolation and
-/// they fail reliably whenever they are co-scheduled, which is what happens
-/// when a developer filters the suite down to a handful of names.
-#[cfg(any(test, feature = "test-support"))]
-pub static GITHUB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Restores one process-global environment variable when a test exits,
-/// including during panic unwinding.
-#[cfg(any(test, feature = "test-support"))]
-pub struct TestEnvVar {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-// SAFETY: edition 2024 makes process-env mutation `unsafe`; every caller
-// serializes on `GITHUB_ENV_LOCK`, so no thread observes a torn env. The
-// workspace `deny` blocks unsafe elsewhere; this helper exists precisely so
-// tests keep a safe-looking API.
-#[allow(unsafe_code)]
-impl TestEnvVar {
-    pub fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os(key);
-        // SAFETY: serialized by `GITHUB_ENV_LOCK` at every callsite.
-        unsafe { std::env::set_var(key, value) };
-        Self { key, previous }
-    }
-
-    /// Clear a variable for the duration of a test.
-    ///
-    /// The counterpart to [`TestEnvVar::set`] for tests whose contract is the
-    /// *absence* of a value — a configured `PRELOOP_GITHUB_TOKEN` flips the
-    /// check-run path from its mock to a live GitHub call, so a test asserting
-    /// the mock path has to guarantee no token is visible. Restores on drop,
-    /// so a panicking test cannot leak the cleared state onto the rest of the
-    /// suite.
-    pub fn unset(key: &'static str) -> Self {
-        let previous = std::env::var_os(key);
-        // SAFETY: serialized by `GITHUB_ENV_LOCK` at every callsite.
-        unsafe { std::env::remove_var(key) };
-        Self { key, previous }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-// SAFETY: restores a process env var under the same `GITHUB_ENV_LOCK`
-// serialization as `set`/`unset`; see the impl above.
-#[allow(unsafe_code)]
-impl Drop for TestEnvVar {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(previous) = self.previous.take() {
-                // SAFETY: serialized by `GITHUB_ENV_LOCK`.
-                std::env::set_var(self.key, previous);
-            } else {
-                // SAFETY: serialized by `GITHUB_ENV_LOCK`.
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1109,6 +1039,85 @@ pub struct AppState {
     /// trusted to be pool-originated, which is what authorizes stamping a
     /// job → runner assignment a rogue machine-side process cannot mint.
     pub pending_registrations: Arc<std::sync::RwLock<BTreeMap<String, std::time::SystemTime>>>,
+    /// Public (GitHub-facing) base URL, resolved at startup
+    /// (`PRELOOP_PUBLIC_URL` / explicit). `None` means not configured: the
+    /// format-time default (`http://127.0.0.1:9090`) applies in
+    /// [`Self::public_base_url`], while [`Self::run_details_url`] stays
+    /// `None` so check runs carry no details link (baseline behavior).
+    pub public_url: Option<String>,
+    /// Runner-facing base URL (`PRELOOP_RUNNER_URL` / explicit); `None` falls
+    /// back to [`Self::public_url`], then the default — the baseline
+    /// `broker::runner_base_url` precedence.
+    pub runner_url: Option<String>,
+    /// REST root for this engine's outbound GitHub requests, resolved at
+    /// startup (`PRELOOP_GITHUB_API_URL` / explicit; default
+    /// `https://api.github.com`). Deliberately *not* layered over the config
+    /// file's `github.api_url`: the request paths behind this value ignored
+    /// that key at baseline and keep doing so (the config key stays scoped to
+    /// [`Self::github_urls`], as before). `None` = unconfigured.
+    pub github_api_request_base: Option<String>,
+    /// Upper bound on a runner long-poll `waitSeconds`, resolved at startup
+    /// (`PRELOOP_MAX_POLL_WINDOW_SECS`, default 60).
+    pub max_poll_window_secs: u64,
+    /// OAuth token TTL in seconds, resolved at startup
+    /// (`PRELOOP_TOKEN_TTL_SECS`, default 2999).
+    pub token_ttl_secs: u64,
+    /// Webhook delivery workers, resolved at startup
+    /// (`PRELOOP_WEBHOOK_WORKERS`, default 8).
+    pub webhook_workers: usize,
+    /// Workflow filenames the engine never runs, resolved at startup
+    /// (`PRELOOP_GITHUB_SKIP_WORKFLOWS`).
+    pub github_owned_workflows: BTreeSet<String>,
+    /// Events a new GitHub App manifest subscribes to, resolved at startup
+    /// (`PRELOOP_GITHUB_APP_DEFAULT_EVENTS`, default
+    /// `push,pull_request,check_run`).
+    pub manifest_default_events: Vec<String>,
+    /// Webhook delivery-watchdog tuning, resolved at startup.
+    pub webhook_watchdog: WebhookWatchdogConfig,
+    /// In-place re-run hold for the history archiver, resolved at startup
+    /// from the `PRELOOP_RERUN_WINDOW_DAYS` override (default 30 days;
+    /// `0` disables the hold): how long a completed run with at least one
+    /// failed/cancelled/timed-out job stays in the live tables so `rerun_run`
+    /// can reset it in place. `None` = hold disabled (including for an
+    /// unparseable value, warned at startup).
+    pub rerun_window_hold: Option<std::time::Duration>,
+    /// Resolved `PRELOOP_SECRETS_STORE` override layered over the config
+    /// file's `secrets_store` by the live secrets API (it re-reads the file
+    /// per request, so the override travels with the state).
+    pub secrets_store_env: Option<String>,
+    /// Resolved systemd `LoadCredential=` directory (`CREDENTIALS_DIRECTORY`)
+    /// for the secrets API's per-request credential overlay.
+    pub credentials_dir: Option<PathBuf>,
+}
+
+/// Webhook delivery-watchdog tuning (all resolved at startup from the
+/// `PRELOOP_WEBHOOK_WATCHDOG*` variables / [`crate::config::StartupConfig`];
+/// defaults match the historical env-driven values).
+#[derive(Debug, Clone, Copy)]
+pub struct WebhookWatchdogConfig {
+    /// `PRELOOP_WEBHOOK_WATCHDOG` (`off|0|false|disabled` disables).
+    pub enabled: bool,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS` (default 300, floored at 10
+    /// where the poll loop consumes it).
+    pub interval_secs: u64,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS` (default 120).
+    pub grace_secs: u64,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS` (default 5).
+    pub max_attempts: u32,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES` (default 5).
+    pub max_pages: usize,
+}
+
+impl Default for WebhookWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            grace_secs: 120,
+            max_attempts: 5,
+            max_pages: 5,
+        }
+    }
 }
 
 /// The runtime secret store: a global tier injected everywhere plus
@@ -1294,50 +1303,36 @@ fn bounded_reason_detail(detail: &str) -> String {
 }
 
 impl AppState {
-    pub async fn new(state_dir: PathBuf) -> anyhow::Result<Self> {
-        let config_path = crate::config::config_path();
-        Self::new_with_config(state_dir, config_path).await
-    }
-
-    /// [`AppState::new`] against an explicit config file.
+    /// Build engine state from a fully-resolved [`crate::config::StartupConfig`].
     ///
-    /// The path is resolved once, here, and then stored: every later read and
-    /// write goes through the stored value rather than re-reading
-    /// `PRELOOP_CONFIG`. That keeps one engine pinned to one file for its
-    /// whole life, and lets tests point at a temp file without mutating
-    /// process-wide environment state that other tests race against.
-    pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_with_store(state_dir, config_path, None).await
-    }
-
-    /// [`AppState::new_with_config`] against an explicit store URL.
-    ///
-    /// `store_url` takes precedence over the `PRELOOP_STORE_URL` environment
-    /// variable; `None` falls back to the environment, then to SQLite at
-    /// `<state_dir>/preloop.db`. Test builds skip the environment read: one
-    /// process env shared across parallel tests cannot select a store
-    /// deterministically.
-    pub async fn new_with_store(
+    /// The only constructor, and the engine's typed-config boundary: it
+    /// reads no process environment. Every value comes from `startup`
+    /// (explicit or env, resolved once at process startup by
+    /// [`crate::config::StartupConfig::from_env`]) layered over the config
+    /// file at `startup.config_path`, then the built-in defaults. Tests build
+    /// [`crate::config::StartupConfig::for_tests`] (optionally overriding
+    /// fields) and stay hermetic without touching global state.
+    pub async fn new(
         state_dir: PathBuf,
-        config_path: PathBuf,
-        store_url: Option<&str>,
+        startup: crate::config::StartupConfig,
     ) -> anyhow::Result<Self> {
-        // Test binaries share one process env: a sibling test mutating
-        // `PRELOOP_STORE_URL` must not silently retarget a state built for a
-        // temp dir, so in test builds `None` means the state-dir default.
-        // (`Backend::open` keeps the production env fallback; the
-        // `PRELOOP_STORE_URL` selection contract is covered through
-        // `test_open_backend`.)
+        let config_path = startup.config_path.clone();
+        // Test builds must never let an ambient `PRELOOP_STORE_URL` retarget
+        // a state built for a temp dir (a sibling test's variable could point
+        // at a deleted or foreign database), so `None` pins the state-dir
+        // default here. Production keeps `Backend::open`'s env fallback; the
+        // selection contract is covered by `tests/store_env.rs`.
         #[cfg(any(test, feature = "test-support"))]
-        let store_url = Some(store_url.map_or_else(
-            || format!("sqlite://{}", state_dir.join("preloop.db").display()),
-            str::to_owned,
-        ));
-        // Back to `Option<&str>` so the production call site below is
-        // identical in every build — and `as_deref` never appears where the
-        // parameter is already `Option<&str>` (clippy::needless-option-as-deref).
+        let store_url = Some(
+            startup
+                .store_url
+                .clone()
+                .unwrap_or_else(|| format!("sqlite://{}", state_dir.join("preloop.db").display())),
+        );
         #[cfg(any(test, feature = "test-support"))]
         let store_url = store_url.as_deref();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let store_url = startup.store_url.as_deref();
         let mut cache = CacheStore::new(state_dir.join("cache")).await?;
         let artifacts = ArtifactStore::new(state_dir.join("artifacts")).await?;
         let (events, _) = broadcast::channel(1024);
@@ -1345,46 +1340,39 @@ impl AppState {
         let keypair_handle = tokio::task::spawn_blocking(AgentRsaKeypair::generate);
         let oidc_handle =
             tokio::task::spawn_blocking(move || load_or_generate_oidc_keypair(&oidc_state_dir));
-        #[cfg(not(any(test, feature = "test-support")))]
-        let hmac_handle = {
-            let hmac_state_dir = state_dir.clone();
-            tokio::task::spawn_blocking(move || load_or_generate_hmac_key(&hmac_state_dir))
-        };
-        #[cfg(not(any(test, feature = "test-support")))]
-        let (keypair_result, oidc_result, hmac_result) =
-            tokio::join!(keypair_handle, oidc_handle, hmac_handle);
-        #[cfg(any(test, feature = "test-support"))]
+        // Explicit key material (a test pin or a parsed `PRELOOP_HMAC_KEY`)
+        // skips the key file entirely; otherwise the per-state key file is
+        // loaded or created.
+        let hmac_handle =
+            (startup.local_jwt_key.is_none() && startup.hmac_key.is_none()).then(|| {
+                let hmac_state_dir = state_dir.clone();
+                tokio::task::spawn_blocking(move || load_or_generate_hmac_key(&hmac_state_dir))
+            });
         let (keypair_result, oidc_result) = tokio::join!(keypair_handle, oidc_handle);
         let keypair = keypair_result??;
         let oidc_keypair = oidc_result??;
-        let token_dir = crate::credential_store::engine_token_dir(&state_dir);
-        let configured_token = env::var("PRELOOP_SYSTEM_TOKEN").ok();
-        #[cfg(any(test, feature = "test-support"))]
-        let system_token = {
-            let configured_token =
-                configured_token.or_else(|| Some(DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned()));
-            let store = crate::credential_store::MemoryCredentialStore::default();
-            crate::credential_store::resolve_engine_token_with_store(
-                &token_dir,
-                configured_token,
-                &store,
-            )?
+        let local_jwt_key = match (&startup.local_jwt_key, &startup.hmac_key) {
+            (Some(key), _) => key.clone(),
+            (None, Some(raw)) => parse_hmac_key(raw)?,
+            (None, None) => {
+                hmac_handle
+                    .expect("the key-file task is spawned when no key material is configured")
+                    .await??
+            }
         };
-        #[cfg(not(any(test, feature = "test-support")))]
-        let system_token = {
-            let configured_store = crate::config::credential_store_setting(&config_path)?;
-            let store =
-                crate::credential_store::selected_store(&token_dir, configured_store.as_deref())?;
-            crate::credential_store::resolve_engine_token_with_store(
-                &token_dir,
-                configured_token,
-                store.as_ref(),
-            )?
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
-        #[cfg(not(any(test, feature = "test-support")))]
-        let local_jwt_key = hmac_result??;
+        let token_dir =
+            crate::credential_store::engine_token_dir(&state_dir, startup.engine_home.as_deref());
+        let configured_store = crate::config::credential_store_setting(&config_path)?;
+        let store = crate::credential_store::selected_store(
+            &token_dir,
+            startup.credential_store.as_deref(),
+            configured_store.as_deref(),
+        )?;
+        let system_token = crate::credential_store::resolve_engine_token_with_store(
+            &token_dir,
+            startup.system_token.clone(),
+            store.as_ref(),
+        )?;
         let registry_path = state_dir.join("artifact_v2_registry.json");
         let (registry, next_id) = if registry_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&registry_path) {
@@ -1410,7 +1398,10 @@ impl AppState {
         } else {
             (BTreeMap::new(), 0)
         };
-        let mut config = crate::config::load_config_from(&config_path)?;
+        let mut config = crate::config::load_config_from_with(
+            &config_path,
+            startup.credential_store.as_deref(),
+        )?;
         let inner = InnerState {
             agent_keypair: Some(keypair),
             artifact_v2_registry: registry,
@@ -1418,110 +1409,123 @@ impl AppState {
             oidc_keypair: Some(oidc_keypair),
             session_last_seen: BTreeMap::new(),
             runner_liveness_timeout: std::time::Duration::from_secs(
-                env::var("PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|raw| raw.trim().parse().ok())
+                startup
+                    .runner_liveness_timeout_secs
                     .unwrap_or(1800)
                     // Floor: the liveness sweep must never outrun a
                     // legitimate in-flight long-poll. A runner parked for
                     // the full client window sends no traffic; a timeout
                     // below ~3x the max poll window can reap a healthy,
                     // still-polling runner.
-                    .max(3 * max_poll_window_secs()),
+                    .max(3 * resolve_max_poll_window_secs(startup.max_poll_window_secs)),
             ),
             ..Default::default()
         };
 
-        let local_workspace = std::env::var("PRELOOP_LOCAL_WORKSPACE")
-            .ok()
-            .map(PathBuf::from);
-        let runner_version_deprecated = std::env::var("PRELOOP_RUNNER_VERSION_DEPRECATED")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false);
+        let local_workspace = startup.local_workspace.clone();
+        let runner_version_deprecated = startup.runner_version_deprecated.unwrap_or(false);
         // systemd credentials (`LoadCredential=preloop-secrets:…`, encrypted
         // at rest, decrypted into a memfd by systemd) override the config
         // file's stored secrets per name. The file may hold nothing at all
         // in `secrets_store = "memory"` mode; the credential is then the
         // durable base set.
-        let credential = crate::config::load_credential_secrets()?;
+        let credential =
+            crate::config::load_credential_secrets(startup.credentials_dir.as_deref())?;
         crate::config::merge_secret_stores(&mut config, credential);
-        let checkout_cache = crate::config::checkout_cache_config(&config)?;
+        let checkout_cache = crate::config::checkout_cache_config(
+            &config,
+            &crate::config::CheckoutCacheEnv {
+                mode: startup.checkout_cache_mode.clone(),
+                run_retention_seconds: startup.checkout_cache_run_retention_seconds.clone(),
+                repository_retention_seconds: startup
+                    .checkout_cache_repository_retention_seconds
+                    .clone(),
+                max_bytes: startup.checkout_cache_max_bytes.clone(),
+            },
+        )?;
         // Actions-cache quota: operator-overridable, 10 GiB default.
         // Enforced at startup too, so entries committed under a larger quota
         // are evicted LRU-first on the next boot.
-        let cache_quota_bytes = crate::config::cache_config(&config)?.total_quota_bytes;
+        let cache_quota_bytes =
+            crate::config::cache_config(&config, startup.cache_total_quota_bytes.as_deref())?
+                .total_quota_bytes;
         cache.set_quota_bytes(cache_quota_bytes);
         cache.enforce_quota().await?;
         // In-flight chunked uploads never survive a restart (`pending_caches`
         // is in-memory only), so staging files left by a crashed server are
         // debris, not resumable uploads.
         let _ = tokio::fs::remove_dir_all(state_dir.join("cache-staging")).await;
-        let retention_days = crate::config::retention_days(&config)?;
-        let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
-        let diag_staging_max_age_seconds =
-            crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_apps = crate::github_app::load_from(&config)?;
+        let retention_days =
+            crate::config::retention_days(&config, startup.retention_days.as_deref())?;
+        let max_jobs_per_run =
+            crate::config::max_jobs_per_run(&config, startup.max_jobs_per_run.as_deref())?;
+        let diag_staging_max_age_seconds = crate::config::diag_staging_max_age_hours(
+            &config,
+            startup.diag_staging_max_age_hours.as_deref(),
+        )?
+        .saturating_mul(3600);
+        // The archiver reads this every 5s, so the variable is resolved once
+        // here; an unparseable value warns and disables the hold (fail
+        // closed), matching `rerun_window_days`'s caller contract.
+        let rerun_hold_days =
+            crate::config::rerun_window_days(startup.rerun_window_days.as_deref());
+        let rerun_window_hold = match rerun_hold_days {
+            Ok(0) => None,
+            Ok(days) => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "invalid PRELOOP_RERUN_WINDOW_DAYS; disabling the in-place rerun hold"
+                );
+                None
+            }
+        };
+        let github_apps = crate::github_app::load_from(&config, &startup)?;
         let github_app = github_apps
             .as_ref()
             .map(|registry| registry.default_app().clone());
-        // Env wins over the config file, matching every other credential
-        // here. An empty value in either source counts as unset: a blank
-        // export must not disable signature verification silently.
-        let webhook_secret = crate::config::webhook_secret_from_env_or_config(&config);
-        // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
-        // override. An empty value in either source counts as unset.
-        let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
-            .ok()
-            .filter(|pat| !pat.is_empty())
+        // The startup override wins over the config file, matching every
+        // other credential here. An empty value in either source counts as
+        // unset: a blank export must not disable signature verification
+        // silently.
+        let webhook_secret = startup
+            .webhook_secret
+            .clone()
+            .filter(|secret| !secret.is_empty())
+            .or_else(|| {
+                config
+                    .github
+                    .webhook_secret()
+                    .filter(|secret| !secret.is_empty())
+                    .map(str::to_owned)
+            });
+        // The startup override wins over the config file, matching every
+        // other `PRELOOP_GITHUB_*` override. An empty value in either source
+        // counts as unset.
+        let github_pat = startup
+            .github_token
+            .clone()
+            .filter(|pat| !pat.expose().is_empty())
             .or_else(|| {
                 config
                     .github
                     .pat()
                     .filter(|pat| !pat.is_empty())
-                    .map(str::to_owned)
-            })
-            .map(preloop_gha_protocol::SecretString::new);
-        // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
-        // override; an empty value in either source counts as unset.
+                    .map(preloop_gha_protocol::SecretString::new)
+            });
+        // The startup override wins over the config file, matching every
+        // other `PRELOOP_GITHUB_*` override; an empty value in either source
+        // counts as unset. Values are stored verbatim (baseline behavior);
+        // the URL helpers trim trailing `/` when they format.
         let github_urls = GitHubUrls {
-            server_url: env::var("PRELOOP_GITHUB_SERVER_URL")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    config
-                        .github
-                        .server_url
-                        .clone()
-                        .filter(|value| !value.is_empty())
-                })
+            server_url: non_empty(startup.github_server_url.as_deref())
+                .or_else(|| non_empty(config.github.server_url.as_deref()))
                 .unwrap_or_else(|| "https://github.com".to_owned()),
-            api_url: env::var("PRELOOP_GITHUB_API_URL")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    config
-                        .github
-                        .api_url
-                        .clone()
-                        .filter(|value| !value.is_empty())
-                })
+            api_url: non_empty(startup.github_api_url.as_deref())
+                .or_else(|| non_empty(config.github.api_url.as_deref()))
                 .unwrap_or_else(|| "https://api.github.com".to_owned()),
-            graphql_url: env::var("PRELOOP_GITHUB_GRAPHQL_URL")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    config
-                        .github
-                        .graphql_url
-                        .clone()
-                        .filter(|value| !value.is_empty())
-                })
+            graphql_url: non_empty(startup.github_graphql_url.as_deref())
+                .or_else(|| non_empty(config.github.graphql_url.as_deref()))
                 .unwrap_or_else(|| "https://api.github.com/graphql".to_owned()),
         };
         let secrets = Arc::new(parking_lot::RwLock::new(SecretStore {
@@ -1535,52 +1539,16 @@ impl AppState {
                 state_dir.join("run-secrets"),
                 crate::store::Envelope::new(&local_jwt_key),
             ));
-        // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
-        // override. An empty value in either source counts as unset.
+        // The startup override wins over the config file, matching every
+        // other `PRELOOP_GITHUB_*` override. An empty value in either source
+        // counts as unset.
         let mut pr_config = config.github.pr.clone();
-        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_AUTO")
-            && !value.trim().is_empty()
-        {
-            pr_config.auto = match value.trim().to_ascii_lowercase().as_str() {
-                "feature" => crate::config::PrAuto::Feature,
-                "never" => crate::config::PrAuto::Never,
-                other => {
-                    tracing::warn!(
-                        value = other,
-                        "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|never"
-                    );
-                    pr_config.auto
-                }
-            };
-        }
-        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_DRAFT")
-            && !value.trim().is_empty()
-        {
-            // A typo (`ture`) must not silently flip the configured
-            // draft policy: unknown values keep the configured default
-            // and warn, mirroring PRELOOP_GITHUB_PR_AUTO.
-            pr_config.draft = match value.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" => true,
-                "0" | "false" | "no" => false,
-                other => {
-                    tracing::warn!(
-                        value = other,
-                        "unknown PRELOOP_GITHUB_PR_DRAFT; expected 1|true|yes|0|false|no"
-                    );
-                    pr_config.draft
-                }
-            };
-        }
-        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_EXCLUDE")
-            && !value.trim().is_empty()
-        {
-            pr_config.exclude = value
-                .split(',')
-                .map(str::trim)
-                .filter(|pattern| !pattern.is_empty())
-                .map(str::to_owned)
-                .collect();
-        }
+        apply_pr_overrides(
+            &mut pr_config,
+            startup.github_pr_auto.as_deref(),
+            startup.github_pr_draft.as_deref(),
+            startup.github_pr_exclude.as_deref(),
+        );
         // The sole database authority. SQLite uses `<state_dir>/preloop.db`;
         // PostgreSQL uses the configured database's `control` schema.
         let backend = Arc::new(
@@ -1661,16 +1629,25 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
+            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::new(
+                crate::github_breaker::BreakerConfig::from_overrides(
+                    startup.github_breaker_enabled,
+                    startup.github_breaker_threshold,
+                ),
+            )),
             github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             fresh_merge_poll: crate::github::FreshMergePoll::default(),
             fresh_merge_poll_slots: Arc::new(tokio::sync::Semaphore::new(
-                crate::github::fresh_merge_poll_capacity(),
+                crate::github::fresh_merge_poll_capacity(resolve_webhook_workers(
+                    startup.webhook_workers,
+                )),
             )),
             fresh_merge_probe_permits: Arc::new(tokio::sync::Semaphore::new(
-                crate::github::fresh_merge_poll_capacity(),
+                crate::github::fresh_merge_poll_capacity(resolve_webhook_workers(
+                    startup.webhook_workers,
+                )),
             )),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
@@ -1692,10 +1669,7 @@ impl AppState {
             webhook_secret,
             local_workspace,
             checkout_cache,
-            snapshot_retention_seconds: env::var("PRELOOP_SNAPSHOT_RETENTION_SECONDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30 * 60),
+            snapshot_retention_seconds: startup.snapshot_retention_seconds.unwrap_or(30 * 60),
             retention_days,
             max_jobs_per_run,
             diag_staging_max_age_seconds,
@@ -1705,7 +1679,7 @@ impl AppState {
             state_dir,
             log_segments,
             system_token,
-            registration_policy: RegistrationPolicy::from_env(),
+            registration_policy: RegistrationPolicy::parse(startup.registration_policy.as_deref()),
             local_jwt_key,
             runner_version_deprecated,
             scheduler: None,
@@ -1735,7 +1709,73 @@ impl AppState {
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            public_url: non_empty(startup.public_url.as_deref()),
+            runner_url: non_empty(startup.runner_url.as_deref()),
+            github_api_request_base: base_url_value(startup.github_api_url.as_deref()),
+            max_poll_window_secs: resolve_max_poll_window_secs(startup.max_poll_window_secs),
+            token_ttl_secs: startup.token_ttl_secs.unwrap_or(2999),
+            webhook_workers: resolve_webhook_workers(startup.webhook_workers),
+            github_owned_workflows: parse_workflow_list(startup.github_skip_workflows.as_deref()),
+            manifest_default_events: crate::github::manifest_default_events(
+                startup.github_app_default_events.as_deref(),
+            ),
+            webhook_watchdog: WebhookWatchdogConfig {
+                enabled: startup.webhook_watchdog_enabled.unwrap_or(true),
+                interval_secs: startup.webhook_watchdog_interval_secs.unwrap_or(300),
+                grace_secs: startup.webhook_watchdog_grace_secs.unwrap_or(120),
+                max_attempts: startup.webhook_watchdog_max_attempts.unwrap_or(5),
+                max_pages: startup.webhook_watchdog_max_pages.unwrap_or(5),
+            },
+            secrets_store_env: startup.secrets_store.clone(),
+            credentials_dir: startup.credentials_dir.clone(),
+            rerun_window_hold,
         })
+    }
+
+    /// Test-support constructor: [`AppState::new`] with
+    /// [`crate::config::StartupConfig::for_tests`] — pinned test config path,
+    /// fixed system token and JWT key, no environment-derived values. Tests
+    /// that need a non-default startup value either extend the config
+    /// (`AppState::new(dir, StartupConfig { github_api_url: Some(stub),
+    /// ..StartupConfig::for_tests() })`) or set the resulting `AppState`
+    /// fields directly before cloning the state into the router.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn new_for_tests(state_dir: PathBuf) -> anyhow::Result<Self> {
+        Self::new(state_dir, crate::config::StartupConfig::for_tests()).await
+    }
+
+    /// [`Self::new_for_tests`] against an explicit config file path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn new_for_tests_with_config(
+        state_dir: PathBuf,
+        config_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            state_dir,
+            crate::config::StartupConfig {
+                config_path,
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::new_for_tests_with_config`] against an explicit store URL.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn new_for_tests_with_store(
+        state_dir: PathBuf,
+        config_path: PathBuf,
+        store_url: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            state_dir,
+            crate::config::StartupConfig {
+                config_path,
+                store_url: store_url.map(str::to_owned),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
     }
 
     /// Emit an event the backend never persisted — write it to the event
@@ -1915,13 +1955,77 @@ impl AppState {
     /// protocol boundary; the single `expose` below is the whole reason the
     /// field is wrapped everywhere else.
     pub fn static_github_pat(&self) -> Option<String> {
-        // Deliberately `let ... else` rather than `Option::map`: the audit rule
-        // `no-expose-in-loop` flags any `.expose()` inside a closure, and a
-        // `match` here trips clippy::manual_map. This form satisfies both.
+        // Deliberately `let ... else` rather than `Option::map`, whose closure
+        // would hide the `.expose()`, and not a `match`, which trips
+        // clippy::manual_map. No structural rule can see `.expose()` inside a
+        // closure or loop, so exposure is structured by construction instead:
+        // a whole collection is resolved once through
+        // `preloop_gha_protocol::masking::expose_all`/`expose_values`, never
+        // re-exposed per element. This single value keeps its one `.expose()`
+        // in straight-line code.
         let Some(pat) = &self.github_pat else {
             return None;
         };
         Some(pat.expose().to_owned())
+    }
+
+    /// Public (GitHub-facing) base URL, trailing `/` stripped;
+    /// `http://127.0.0.1:9090` when none is configured. Baseline
+    /// `broker::public_base_url`.
+    pub fn public_base_url(&self) -> String {
+        base_url_value(self.public_url.as_deref())
+            .unwrap_or_else(|| "http://127.0.0.1:9090".to_owned())
+    }
+
+    /// Runner-facing base URL (connectionData, broker endpoints, Twirp
+    /// signed URLs, job-message variables), trailing `/` stripped:
+    /// `PRELOOP_RUNNER_URL`-equivalent first, then the public URL, then the
+    /// default. Baseline `broker::runner_base_url`.
+    pub fn runner_base_url(&self) -> String {
+        base_url_value(self.runner_url.as_deref())
+            .or_else(|| base_url_value(self.public_url.as_deref()))
+            .unwrap_or_else(|| "http://127.0.0.1:9090".to_owned())
+    }
+
+    /// WebSocket root: [`Self::runner_base_url`] with the scheme flipped to
+    /// `ws`/`wss`. Baseline `broker::websocket_base_url`.
+    pub fn websocket_base_url(&self) -> String {
+        let base = self.runner_base_url();
+        if let Some(rest) = base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            base
+        }
+    }
+
+    /// The runner-server endpoint (`{runner_base_url}/runner/server`).
+    /// Baseline `broker::runner_server_url`.
+    pub fn runner_server_url(&self) -> String {
+        format!("{}/runner/server", self.runner_base_url())
+    }
+
+    /// Per-runner broker run-service endpoint.
+    /// Baseline `broker::broker_run_service_url`.
+    pub fn broker_run_service_url(&self, runner_id: i64) -> String {
+        format!("{}/broker/{runner_id}/", self.runner_base_url())
+    }
+
+    /// Run details link for check-run payloads. `None` when no public URL is
+    /// configured (baseline `github::run_details_url` semantics: the link is
+    /// only attached when the operator configured one).
+    pub fn run_details_url(&self, run_id: RunId) -> Option<String> {
+        base_url_value(self.public_url.as_deref()).map(|base| format!("{base}/runs/{run_id}"))
+    }
+
+    /// REST root for outbound GitHub requests (`https://api.github.com` when
+    /// unconfigured), trailing `/` stripped. Baseline `github::github_api_base`:
+    /// the config file's `github.api_url` deliberately does not apply here.
+    pub fn github_api_base(&self) -> String {
+        self.github_api_request_base
+            .clone()
+            .unwrap_or_else(|| "https://api.github.com".to_owned())
     }
 }
 /// Canonical bytes covered by an action ticket signature.
@@ -2081,19 +2185,13 @@ pub fn parse_hmac_key(value: &str) -> anyhow::Result<Vec<u8>> {
     );
     Ok(key)
 }
-
-#[cfg(not(any(test, feature = "test-support")))]
 /// Load or generate a 32-byte HMAC key for local JWT signing.
 ///
-/// `PRELOOP_HMAC_KEY` (the shared cluster key) wins; otherwise the key is
-/// persisted to `<state_dir>/hmac-key.bin`, which is correct only for a
-/// single node.
+/// The caller resolves `PRELOOP_HMAC_KEY` (the shared cluster key) through
+/// [`crate::config::StartupConfig::hmac_key`] and passes it to
+/// [`AppState::new`] instead; this loads or generates the key persisted to
+/// `<state_dir>/hmac-key.bin`, which is correct only for a single node.
 pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    if let Ok(value) = std::env::var(HMAC_KEY_ENV)
-        && !value.trim().is_empty()
-    {
-        return parse_hmac_key(&value);
-    }
     let key_path = state_dir.join("hmac-key.bin");
     if key_path.exists() {
         let key = std::fs::read(&key_path).map_err(|error| {
@@ -2282,7 +2380,9 @@ mod tests {
     #[tokio::test]
     async fn action_ticket_does_not_cross_validate_across_newline_splits() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let expires_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2330,7 +2430,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_token_outlives_the_six_hour_job_limit() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job = uuid::Uuid::new_v4();
         let token = state.mint_runtime_token("plan-a", &job);
         let claims = state
@@ -2358,7 +2460,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_token_grows_with_a_declared_longer_job_timeout() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job = uuid::Uuid::new_v4();
         let declared = 20 * 60 * 60;
         let lifetime = runtime_token_lifetime(Some(declared));
@@ -2410,7 +2514,9 @@ mod tests {
         assert_eq!(runtime_token_lifetime(Some(i64::MAX)), ceiling);
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job = uuid::Uuid::new_v4();
         let token = state.mint_runtime_token_for_job("plan-fork", &job, Some(i64::MAX));
         let claims = state
@@ -2540,16 +2646,108 @@ mod cluster_key_tests {
     }
 }
 
-/// Upper bound on a runner long-poll `waitSeconds` (seconds).
-/// `PRELOOP_MAX_POLL_WINDOW_SECS` overrides; the default keeps polls short
+/// Upper bound on a runner long-poll `waitSeconds` (seconds): the resolved
+/// `PRELOOP_MAX_POLL_WINDOW_SECS` value, with the default keeping polls short
 /// enough that a healthy runner always beats the liveness sweep (which is
 /// floored at `3 *` this value — see `runner_liveness_timeout` seeding).
-pub(crate) fn max_poll_window_secs() -> u64 {
-    env::var("PRELOOP_MAX_POLL_WINDOW_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(60)
+/// `None` and `0` both fall back to the default, matching the historical
+/// parse.
+pub(crate) fn resolve_max_poll_window_secs(value: Option<u64>) -> u64 {
+    value.filter(|value| *value > 0).unwrap_or(60)
+}
+
+/// Concurrent webhook deliveries processed per node: the resolved
+/// `PRELOOP_WEBHOOK_WORKERS` value, default 8, floored at 1.
+fn resolve_webhook_workers(value: Option<usize>) -> usize {
+    value.unwrap_or(8).max(1)
+}
+
+/// A configured base URL with trailing `/` stripped, `None` when the source
+/// value is absent or empty (an exported-but-blank variable behaves like an
+/// unset one, matching every historical override filter).
+fn base_url_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// A configured value with empty strings treated as unset (an
+/// exported-but-blank override behaves like an absent one), stored verbatim.
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value.filter(|value| !value.is_empty()).map(str::to_owned)
+}
+
+/// Split a comma-separated workflow-file list (the resolved
+/// `PRELOOP_GITHUB_SKIP_WORKFLOWS` value) into normalized entries; `None` and
+/// blank values yield the empty set.
+pub fn parse_workflow_list(value: Option<&str>) -> BTreeSet<String> {
+    value
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.trim_start_matches("./").to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Layer the resolved `PRELOOP_GITHUB_PR_*` overrides over the config file's
+/// `[github.pr]` policy. Blank override values count as unset; unknown values
+/// keep the configured policy and warn (a typo must not silently flip the
+/// policy). This is the pure form of the env overrides `AppState::new` used to
+/// read directly; precedence is unchanged.
+pub(crate) fn apply_pr_overrides(
+    pr_config: &mut crate::config::PrConfig,
+    auto: Option<&str>,
+    draft: Option<&str>,
+    exclude: Option<&str>,
+) {
+    if let Some(value) = auto
+        && !value.trim().is_empty()
+    {
+        pr_config.auto = match value.trim().to_ascii_lowercase().as_str() {
+            "feature" => crate::config::PrAuto::Feature,
+            "never" => crate::config::PrAuto::Never,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|never"
+                );
+                pr_config.auto
+            }
+        };
+    }
+    if let Some(value) = draft
+        && !value.trim().is_empty()
+    {
+        // A typo (`ture`) must not silently flip the configured
+        // draft policy: unknown values keep the configured default
+        // and warn, mirroring PRELOOP_GITHUB_PR_AUTO.
+        pr_config.draft = match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown PRELOOP_GITHUB_PR_DRAFT; expected 1|true|yes|0|false|no"
+                );
+                pr_config.draft
+            }
+        };
+    }
+    if let Some(value) = exclude
+        && !value.trim().is_empty()
+    {
+        pr_config.exclude = value
+            .split(',')
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
 }
 
 /// Wake long-polling runners: at most `ready` of them for newly claimable

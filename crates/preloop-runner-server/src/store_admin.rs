@@ -36,10 +36,17 @@ pub enum StoreTarget {
 impl StoreTarget {
     /// Resolve an explicit `--store`, else `PRELOOP_STORE_URL`, else SQLite at
     /// `<state_dir>/preloop.db` — the same precedence `preloop serve` uses.
-    pub fn resolve(store: Option<&str>, state_dir: &Path) -> anyhow::Result<StoreTarget> {
+    /// Both layers are explicit inputs (`store_url_env` is the resolved
+    /// `PRELOOP_STORE_URL` value), so precedence is testable without process
+    /// env.
+    pub fn resolve(
+        store: Option<&str>,
+        store_url_env: Option<&str>,
+        state_dir: &Path,
+    ) -> anyhow::Result<StoreTarget> {
         let raw = match store {
             Some(value) if !value.trim().is_empty() => value.to_owned(),
-            _ => std::env::var(STORE_URL_ENV).unwrap_or_default(),
+            _ => store_url_env.unwrap_or_default().to_owned(),
         };
         match parse_store_url(&raw)? {
             StoreUrl::Sqlite(path) => {
@@ -198,9 +205,9 @@ pub async fn status(target: StoreTarget) -> anyhow::Result<StoreStatus> {
 /// attack one level up. `preloop server install` no longer takes that path —
 /// it runs the preparation as the service account itself, so root never
 /// creates, writes or chmods anything inside the service-owned tree.
-pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
-    let raw = std::env::var(STORE_URL_ENV).unwrap_or_default();
-    let StoreUrl::Sqlite(path) = parse_store_url(&raw)? else {
+pub fn prepare_brand_new_local(state_dir: &Path, store_url: Option<&str>) -> anyhow::Result<bool> {
+    let raw = store_url.unwrap_or_default();
+    let StoreUrl::Sqlite(path) = parse_store_url(raw)? else {
         return Ok(false);
     };
     let path = if path.as_os_str().is_empty() {
@@ -263,13 +270,9 @@ pub fn prepare_brand_new_local(state_dir: &Path) -> anyhow::Result<bool> {
 /// (euid 0) is held to an exclusive tree: the create, the write and the
 /// chmod below must not land anywhere another account can steer them with a
 /// symlink or a directory it can rewrite.
-// SAFETY: `geteuid` takes no arguments and only reads the process's
-// effective uid; there is no other way to ask "am I privileged?" and the
-// answer only selects a stricter check.
-#[allow(unsafe_code)]
 fn prepare_parent_directory(parent: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
-    if unsafe { libc::geteuid() } == 0 {
+    if nix::unistd::geteuid().is_root() {
         return guarded_create_directory(parent);
     }
     std::fs::create_dir_all(parent)?;
@@ -279,12 +282,9 @@ fn prepare_parent_directory(parent: &Path) -> anyhow::Result<()> {
 /// [`prepare_parent_directory`] for a privileged caller: refuse an existing
 /// directory that is not exclusively this account's own, create it, then
 /// check what exists now (`create_dir_all` follows a symlink).
-// SAFETY: `geteuid` as in [`prepare_parent_directory`].
-#[allow(unsafe_code)]
 #[cfg(unix)]
 fn guarded_create_directory(parent: &Path) -> anyhow::Result<()> {
-    // `uid_t` is `u32` on every unix target this crate builds for.
-    let uid = unsafe { libc::geteuid() };
+    let uid = nix::unistd::geteuid().as_raw();
     match std::fs::symlink_metadata(parent) {
         Ok(_) => exclusive_directory(parent, uid)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

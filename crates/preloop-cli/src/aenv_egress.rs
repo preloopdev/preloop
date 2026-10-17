@@ -211,6 +211,34 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
+/// The inputs [`ensure_engine_egress`] resolves from process state, read
+/// once at the `serve` startup boundary. Reconciliation itself is pure over
+/// these values and never reads the process environment.
+pub(crate) struct EgressInputs {
+    /// Effective [`MANAGE_ENV`] mode: `on`, `dry-run`, or an opt-out
+    /// spelling. An unset variable behaves `on`.
+    pub(crate) mode: String,
+    /// [`ENGINE_IP_ENV`] override, for when the engine address cannot be
+    /// read off the runner URL.
+    pub(crate) engine_ip: Option<String>,
+    /// The AgentENV node config to reconcile ([`CONFIG_ENV`]).
+    pub(crate) config_path: PathBuf,
+}
+
+impl EgressInputs {
+    /// Startup boundary: read the three inputs from the process environment.
+    pub(crate) fn from_env() -> Self {
+        Self {
+            mode: std::env::var(MANAGE_ENV)
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "on".to_owned()),
+            engine_ip: std::env::var(ENGINE_IP_ENV).ok(),
+            config_path: config_path(),
+        }
+    }
+}
+
 /// Run `program` with `sudo -n` (never interactive: either the operator
 /// granted NOPASSWD for it or the engine must fail loudly, not hang).
 fn sudo(program: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
@@ -244,11 +272,8 @@ fn service_active() -> bool {
 /// Ensure the engine at `server_url` is reachable from AgentENV sandboxes:
 /// surgical node deny-list exception plus ordered host firewall rules.
 /// See the module docs for the two gates this reconciles.
-pub(crate) fn ensure_engine_egress(server_url: &str) -> anyhow::Result<()> {
-    let mode = std::env::var(MANAGE_ENV)
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "on".to_owned());
+pub(crate) fn ensure_engine_egress(server_url: &str, inputs: &EgressInputs) -> anyhow::Result<()> {
+    let mode = inputs.mode.trim().to_ascii_lowercase();
     if matches!(mode.as_str(), "0" | "false" | "no" | "off") {
         tracing::warn!(
             "{MANAGE_ENV} is {mode}: skipping AgentENV egress reconciliation; \
@@ -259,7 +284,7 @@ pub(crate) fn ensure_engine_egress(server_url: &str) -> anyhow::Result<()> {
     }
     let dry_run = mode == "dry-run";
 
-    let engine: Ipv4Addr = match std::env::var(ENGINE_IP_ENV).ok() {
+    let engine: Ipv4Addr = match inputs.engine_ip.as_deref() {
         Some(value) => value
             .trim()
             .parse()
@@ -290,8 +315,8 @@ pub(crate) fn ensure_engine_egress(server_url: &str) -> anyhow::Result<()> {
             format!("runner URL `{server_url}` has no explicit port for the firewall exception")
         })?;
 
-    let path = config_path();
-    let current = std::fs::read_to_string(&path)
+    let path = &inputs.config_path;
+    let current = std::fs::read_to_string(path)
         .with_context(|| format!("reading AgentENV node config {}", path.display()))?;
     let pools = sandbox_pools(&current);
 
@@ -303,7 +328,7 @@ pub(crate) fn ensure_engine_egress(server_url: &str) -> anyhow::Result<()> {
             tracing::info!("egress dry-run: node deny-list would be rewritten");
         } else {
             tracing::warn!(%engine, "engine address is node-denied; rewriting the deny-list complement");
-            write_config_atomically(&path, &rewritten)?;
+            write_config_atomically(path, &rewritten)?;
             restart_aenv()?;
         }
     }
@@ -477,28 +502,6 @@ mod tests {
         );
     }
 
-    fn with_egress_env(vars: &[(&str, &str)], test: impl FnOnce()) {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
-        let previous: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(key, _)| (key.to_string(), std::env::var(key).ok()))
-            .collect();
-        for (key, value) in vars {
-            // SAFETY: single-threaded test manipulation, restored below.
-            unsafe { std::env::set_var(key, value) };
-        }
-        test();
-        for (key, value) in previous {
-            // SAFETY: restoring what the setup above changed.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(&key, value),
-                    None => std::env::remove_var(&key),
-                }
-            }
-        }
-    }
-
     #[test]
     fn dry_run_reconciles_nothing_but_validates_everything() {
         let dir = tempfile::tempdir().unwrap();
@@ -509,29 +512,18 @@ mod tests {
         )
         .unwrap();
         let before = std::fs::read_to_string(&config).unwrap();
-        with_egress_env(
-            &[
-                (MANAGE_ENV, "dry-run"),
-                (CONFIG_ENV, config.to_str().expect("fixture path is UTF-8")),
-            ],
-            || {
-                ensure_engine_egress("http://192.168.8.174:9491").expect("dry run succeeds");
-            },
-        );
+        let inputs = EgressInputs {
+            mode: "dry-run".to_owned(),
+            engine_ip: None,
+            config_path: config.clone(),
+        };
+        ensure_engine_egress("http://192.168.8.174:9491", &inputs).expect("dry run succeeds");
         // Dry run changes nothing on disk...
         assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
         // ...while a loopback URL without an override is rejected, not probed.
-        with_egress_env(
-            &[
-                (MANAGE_ENV, "dry-run"),
-                (CONFIG_ENV, config.to_str().expect("fixture path is UTF-8")),
-            ],
-            || {
-                // 127.0.0.1 parses as an IP, so it is accepted as an address
-                // here (the loopback *policy* decision lives in pool config);
-                // a hostname without an override is what must fail.
-                assert!(ensure_engine_egress("http://engine.local:9491").is_err());
-            },
-        );
+        // 127.0.0.1 parses as an IP, so it is accepted as an address
+        // here (the loopback *policy* decision lives in pool config);
+        // a hostname without an override is what must fail.
+        assert!(ensure_engine_egress("http://engine.local:9491", &inputs).is_err());
     }
 }

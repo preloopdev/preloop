@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "preloop-loadtest"
 path = "src/main.rs"

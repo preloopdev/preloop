@@ -9,8 +9,8 @@
 //! halves of the fix: eviction (or non-registration) invalidates the token,
 //! and the reaper removes expired/aged staging directories.
 //!
-//! The config test mutates process env and serializes via GITHUB_ENV_LOCK,
-//! the same discipline as the other test crates.
+//! Reaping and config tests take explicit inputs; nothing here mutates the
+//! process environment.
 
 mod common;
 
@@ -63,7 +63,9 @@ fn token_of_url(url: &str) -> &str {
 #[tokio::test]
 async fn diag_evicted_upload_token_put_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let plan_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
@@ -153,7 +155,9 @@ async fn diag_evicted_upload_token_put_is_rejected() {
 #[tokio::test]
 async fn diag_reaper_removes_expired_token_staging_dirs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -284,14 +288,13 @@ async fn diag_disk_sweep_removes_only_aged_staging_dirs() {
     assert!(new_dir.exists(), "fresh staging dir is kept");
 }
 
-/// The new config key parses with a 24h default and honors the env override.
+/// The new config key parses with a 24h default and honors the override
+/// (the resolved `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` value).
 #[tokio::test]
 async fn diag_staging_max_age_config_defaults_and_env_override() {
-    let _env = GITHUB_ENV_LOCK.lock().await;
     let config = ConfigFile::default();
     assert_eq!(config.diag_staging_max_age_hours, 24);
-    assert_eq!(diag_staging_max_age_hours(&config).unwrap(), 24);
+    assert_eq!(diag_staging_max_age_hours(&config, None).unwrap(), 24);
 
-    let _var = TestEnvVar::set(DIAG_STAGING_MAX_AGE_HOURS_ENV, "48");
-    assert_eq!(diag_staging_max_age_hours(&config).unwrap(), 48);
+    assert_eq!(diag_staging_max_age_hours(&config, Some("48")).unwrap(), 48);
 }

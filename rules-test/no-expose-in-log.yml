@@ -1,0 +1,52 @@
+id: no-expose-in-log
+valid:
+  # Exposed outside the log call; the log carries only safe metadata.
+  - |
+    fn f(secret: &SecretString) {
+        let value = secret.expose();
+        info!(len = value.len(), "resolved secret");
+    }
+  - |
+    fn f() {
+        info!(kind = "blob", size = 3u64, "blob single-shot upload");
+    }
+  # Non-log macros are out of scope even when they wrap .expose().
+  - |
+    fn f(secret: &SecretString) {
+        assert_eq!(secret.expose(), "expected");
+    }
+  - |
+    fn f(secret: &SecretString) {
+        let rendered = format!("{}", secret.expose());
+        sink(rendered);
+    }
+  # A message string mentioning expose without the call shape stays clean.
+  - |
+    fn f() {
+        debug!("remember to keep SecretString opaque in logs");
+    }
+invalid:
+  # %-display assigned field, first position.
+  - |
+    fn f(secret: &SecretString) {
+        info!(token = %secret.expose(), "minted");
+    }
+  # Qualified macro, message-argument position.
+  - |
+    fn f(secret: &SecretString) {
+        tracing::debug!("env value: {}", secret.expose());
+    }
+  # Chained call in a ?-debug field.
+  - |
+    fn f(secret: &SecretString) {
+        warn!(len = ?secret.expose().to_owned(), "hint");
+    }
+  # Nested field access at trace level.
+  - |
+    fn f(holder: &Holder) {
+        trace!(x = holder.token.expose(), "nested");
+    }
+  - |
+    fn f(creds: &Creds) {
+        error!("key: {}", creds.api_key.expose());
+    }

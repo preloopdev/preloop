@@ -25,7 +25,9 @@ async fn get_deprecation(app: &Router, uri: &str, token: Option<&str>) -> (Statu
 
 async fn test_app() -> (Router, String) {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let token = state.system_token.clone();
     let shutdown = CancellationToken::new();
     (app(state, shutdown), token)

@@ -321,7 +321,7 @@ pub async fn blob_put(
             _ => MAX_ASSEMBLED_BYTES,
         };
         if cl > cap {
-            warn!(kind, token, cl, cap, "blob content-length exceeds cap");
+            warn!(kind, cl, cap, "blob content-length exceeds cap");
             return StatusCode::PAYLOAD_TOO_LARGE;
         }
     }
@@ -368,7 +368,7 @@ pub async fn blob_put(
                 },
                 Err(AssemblyError::Budget) => {
                     let _ = tokio::fs::remove_file(&tmp_path).await;
-                    warn!(kind, token, "blob block exceeds the per-block cap");
+                    warn!(kind, "blob block exceeds the per-block cap");
                     StatusCode::PAYLOAD_TOO_LARGE
                 }
                 Err(AssemblyError::Io(e)) => {
@@ -383,7 +383,7 @@ pub async fn blob_put(
             let body = match axum::body::to_bytes(body, 1024 * 1024).await {
                 Ok(b) => b,
                 Err(_) => {
-                    warn!(kind, token, "blocklist body exceeds 1 MiB");
+                    warn!(kind, "blocklist body exceeds 1 MiB");
                     return StatusCode::PAYLOAD_TOO_LARGE;
                 }
             };
@@ -392,7 +392,6 @@ pub async fn blob_put(
             if block_ids.len() > MAX_BLOCKLIST_BLOCKS {
                 warn!(
                     kind,
-                    token,
                     blocks = block_ids.len(),
                     "blocklist exceeds the block-id budget"
                 );
@@ -414,15 +413,12 @@ pub async fn blob_put(
                     Ok(md) => {
                         total = total.saturating_add(md.len());
                         if total > MAX_ASSEMBLED_BYTES as u64 {
-                            warn!(
-                                kind,
-                                token, total, "blocklist exceeds the total assembly budget"
-                            );
+                            warn!(kind, total, "blocklist exceeds the total assembly budget");
                             return StatusCode::PAYLOAD_TOO_LARGE;
                         }
                     }
                     Err(e) => {
-                        warn!(kind, token, "failed to stat block {safe_id}: {e}");
+                        warn!(kind, "failed to stat block {safe_id}: {e}");
                         return StatusCode::INTERNAL_SERVER_ERROR;
                     }
                 }
@@ -441,7 +437,6 @@ pub async fn blob_put(
                         let _ = tokio::fs::remove_dir_all(&blocks_dir).await;
                         info!(
                             kind,
-                            token,
                             size,
                             blocks = block_ids.len(),
                             "blob assembled from blocks"
@@ -450,18 +445,18 @@ pub async fn blob_put(
                     }
                     Err(e) => {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
-                        warn!(kind, token, "failed to commit assembled blob: {e}");
+                        warn!(kind, "failed to commit assembled blob: {e}");
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
                 },
                 Err(AssemblyError::Budget) => {
                     let _ = tokio::fs::remove_file(&tmp_path).await;
-                    warn!(kind, token, "assembly budget exceeded during copy");
+                    warn!(kind, "assembly budget exceeded during copy");
                     StatusCode::PAYLOAD_TOO_LARGE
                 }
                 Err(AssemblyError::Io(e)) => {
                     let _ = tokio::fs::remove_file(&tmp_path).await;
-                    warn!(kind, token, "failed to write assembled blob: {e}");
+                    warn!(kind, "failed to write assembled blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             };
@@ -483,23 +478,23 @@ pub async fn blob_put(
             match stream_body_to_file(body, &tmp_path, MAX_ASSEMBLED_BYTES).await {
                 Ok(size) => match tokio::fs::rename(&tmp_path, &data_path).await {
                     Ok(()) => {
-                        info!(kind, token, size, "blob single-shot upload");
+                        info!(kind, size, "blob single-shot upload");
                         StatusCode::CREATED
                     }
                     Err(e) => {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
-                        warn!(kind, token, "failed to commit single-shot blob: {e}");
+                        warn!(kind, "failed to commit single-shot blob: {e}");
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
                 },
                 Err(AssemblyError::Budget) => {
                     let _ = tokio::fs::remove_file(&tmp_path).await;
-                    warn!(kind, token, "single-shot blob exceeds the assembly budget");
+                    warn!(kind, "single-shot blob exceeds the assembly budget");
                     StatusCode::PAYLOAD_TOO_LARGE
                 }
                 Err(AssemblyError::Io(e)) => {
                     let _ = tokio::fs::remove_file(&tmp_path).await;
-                    warn!(kind, token, "failed to write single-shot blob: {e}");
+                    warn!(kind, "failed to write single-shot blob: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }

@@ -2206,7 +2206,7 @@ fn build_jobs<F>(
 where
     F: Fn(&preloop_gha_protocol::JobPlan) -> preloop_gha_expressions::Context,
 {
-    let base_url = crate::broker::runner_base_url();
+    let base_url = shared.state.runner_base_url();
     let normalized_github =
         preloop_gha_parser::job_builder::normalize_github_context(&ctx.github_json);
     let mut built = Vec::with_capacity(plans.len());
@@ -2456,7 +2456,7 @@ jobs:
     #[tokio::test]
     async fn matrix_expansion_uses_deferred_node_scoped_inputs() {
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().to_path_buf())
+        let state = crate::AppState::new_for_tests(temp.path().to_path_buf())
             .await
             .unwrap();
         let shared = state.shared();

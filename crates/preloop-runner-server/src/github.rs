@@ -33,20 +33,6 @@ use preloop_gha_protocol::{
 /// generic forges-only behavior unchanged.
 pub const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
 
-pub fn configured_github_owned_workflows() -> BTreeSet<String> {
-    std::env::var(GITHUB_OWNED_WORKFLOWS_ENV)
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(|entry| entry.trim_start_matches("./").to_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 pub fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<String>) -> bool {
     let path = format!(".github/workflows/{filename}");
     configured
@@ -156,16 +142,6 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
-/// GitHub REST root, overridable for GHES and for tests that point the server
-/// at a stub API.
-pub fn github_api_base() -> String {
-    std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .map(|base| base.trim_end_matches('/').to_owned())
-        .filter(|base| !base.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
-}
-
 fn record_check_reporting(shared: &Arc<SharedState>, success: bool) {
     let mut snapshot = shared.state.status_snapshot.write();
     if success {
@@ -189,7 +165,14 @@ async fn resolve_repo_token(
         // being read; a single retry keeps a transient rejection from
         // stranding the report.
         for attempt in 0..2 {
-            match crate::github_app::get_or_mint_token(app_creds, repo, permissions).await {
+            match crate::github_app::get_or_mint_token(
+                &shared.state.github_api_base(),
+                app_creds,
+                repo,
+                permissions,
+            )
+            .await
+            {
                 Ok(token) => return Some(token),
                 Err(error) if attempt == 0 => {
                     tracing::warn!(
@@ -229,7 +212,7 @@ async fn send_github_check_request(
     body: &Value,
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
-    let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
+    let url = format!("{}/repos/{}/{}", shared.state.github_api_base(), repo, path);
     let res = crate::github_breaker::send_observed_labeled(
         &shared.state.github_breakers,
         bucket,
@@ -283,12 +266,6 @@ async fn send_github_check_request(
     record_check_reporting(shared, true);
     let val = res.json().await.unwrap_or(Value::Null);
     Ok(val)
-}
-
-pub fn run_details_url(run_id: RunId) -> Option<String> {
-    std::env::var("PRELOOP_PUBLIC_URL")
-        .ok()
-        .map(|base| format!("{}/runs/{run_id}", base.trim_end_matches('/')))
 }
 
 /// Report a queued check run to GitHub or simulate it locally.
@@ -664,10 +641,15 @@ impl CheckRunSender {
 /// installation id.
 async fn resolve_check_run_rate_key(shared: &Arc<SharedState>, repo: &str) -> CheckRunRateKey {
     match crate::github_app::select_app_for_repo(shared, repo).await {
-        Some(app) => match crate::github_app::installation_for_repo(&app, repo).await {
-            Ok(installation) if installation != 0 => CheckRunRateKey::Installation(installation),
-            _ => CheckRunRateKey::Pat,
-        },
+        Some(app) => {
+            let api_base = shared.state.github_api_base();
+            match crate::github_app::installation_for_repo(&api_base, &app, repo).await {
+                Ok(installation) if installation != 0 => {
+                    CheckRunRateKey::Installation(installation)
+                }
+                _ => CheckRunRateKey::Pat,
+            }
+        }
         None => CheckRunRateKey::Pat,
     }
 }
@@ -895,7 +877,7 @@ async fn send_queued_check_run(
             } else {
                 serde_json::json!({"name":name,"head_sha":sha,"status":"queued","output":{"title":name,"summary":format!("Waiting for a preloop runner.\n\njob_id: `{}`",update.job_id.0)}})
             };
-            if let Some(url) = run_details_url(update.run_id) {
+            if let Some(url) = shared.state.run_details_url(update.run_id) {
                 body["details_url"] = Value::String(url);
             }
             send_check_run_body(
@@ -992,7 +974,7 @@ async fn send_queued_check_run(
                     if let Some(started_at) = started_at {
                         body["started_at"] = Value::String(started_at.to_rfc3339());
                     }
-                    if let Some(url) = run_details_url(update.run_id) {
+                    if let Some(url) = shared.state.run_details_url(update.run_id) {
                         body["details_url"] = Value::String(url);
                     }
                 } else if id.is_none() {
@@ -1532,7 +1514,7 @@ async fn post_deployment_status(
 ) -> anyhow::Result<()> {
     let mut body = serde_json::json!({
         "state": state,
-        "log_url": run_details_url(run_id).unwrap_or_default(),
+        "log_url": shared.state.run_details_url(run_id).unwrap_or_default(),
     });
     if let Some(url) = environment_url {
         body["environment_url"] = serde_json::json!(url);
@@ -1835,7 +1817,7 @@ pub async fn fetch_workflows(
     repo: &str,
     git_ref: &str,
 ) -> anyhow::Result<BTreeMap<String, String>> {
-    let api_base = github_api_base();
+    let api_base = shared.state.github_api_base();
     fetch_workflows_at(shared, repo, git_ref, &api_base).await
 }
 
@@ -1998,7 +1980,9 @@ pub async fn fetch_workflows_at(
                         .await?;
                 // The installation id is the rate-limit identity; never
                 // invent one (same convention as check runs).
-                let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                let bucket = match crate::github_app::installation_for_repo(api_base, &app, repo)
+                    .await
+                {
                     Ok(installation) if installation != 0 => {
                         crate::github_breaker::GithubCredentialBucket::Installation(installation)
                     }
@@ -2143,7 +2127,7 @@ pub async fn resolve_ref_sha(
         }
         return Ok(None);
     }
-    let api_base = github_api_base();
+    let api_base = shared.state.github_api_base();
     let Some((token, bucket)) = contents_read_token(shared, repository, &api_base).await? else {
         return Ok(None);
     };
@@ -2188,18 +2172,20 @@ async fn contents_read_token(
                 .await?;
         // The installation id is the rate-limit identity; never invent one
         // (same convention as check runs).
-        let bucket = match crate::github_app::installation_for_repo(&app, repository).await {
-            Ok(installation) if installation != 0 => {
-                crate::github_breaker::GithubCredentialBucket::Installation(installation)
-            }
-            _ => crate::github_breaker::GithubCredentialBucket::Pat,
-        };
+        let bucket =
+            match crate::github_app::installation_for_repo(api_base, &app, repository).await {
+                Ok(installation) if installation != 0 => {
+                    crate::github_breaker::GithubCredentialBucket::Installation(installation)
+                }
+                _ => crate::github_breaker::GithubCredentialBucket::Pat,
+            };
         return Ok(Some((token, bucket)));
     }
-    // The env PAT here mirrors the pre-existing credential ladder; the
-    // bucket is the PAT's either way.
-    Ok(std::env::var("PRELOOP_GITHUB_TOKEN")
-        .ok()
+    // The static PAT mirrors the pre-existing credential ladder; the bucket
+    // is the PAT's either way.
+    Ok(shared
+        .state
+        .static_github_pat()
         .map(|token| (token, crate::github_breaker::GithubCredentialBucket::Pat)))
 }
 
@@ -2240,7 +2226,7 @@ async fn fetch_branch_protected(
     repository: &str,
     branch: &str,
 ) -> anyhow::Result<bool> {
-    let api_base = github_api_base();
+    let api_base = shared.state.github_api_base();
     let Some((token, bucket)) = contents_read_token(shared, repository, &api_base).await? else {
         return Ok(false);
     };
@@ -2375,7 +2361,8 @@ pub async fn resolve_pr_changed_files_at(
             let permissions = BTreeMap::from([("pull_requests".to_owned(), "read".to_owned())]);
             let token =
                 crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?;
-            let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+            let bucket = match crate::github_app::installation_for_repo(api_base, &app, repo).await
+            {
                 Ok(installation) if installation != 0 => {
                     crate::github_breaker::GithubCredentialBucket::Installation(installation)
                 }
@@ -2384,7 +2371,7 @@ pub async fn resolve_pr_changed_files_at(
             (Some(token), bucket)
         }
         None => (
-            std::env::var("PRELOOP_GITHUB_TOKEN").ok(),
+            shared.state.static_github_pat(),
             crate::github_breaker::GithubCredentialBucket::Pat,
         ),
     };
@@ -2670,7 +2657,7 @@ enum MergeProbe {
 /// parent matches the API's current base and whose second parent is the payload
 /// head.
 async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget) -> MergeProbe {
-    let api_base = github_api_base();
+    let api_base = shared.state.github_api_base();
     let (token, bucket) = match crate::github_app::select_app_for_repo(shared, &target.repo).await {
         Some(app) => {
             let permissions = BTreeMap::from([
@@ -2688,15 +2675,20 @@ async fn probe_fresh_merge(shared: &Arc<SharedState>, target: &FreshMergeTarget)
                 Ok(token) => {
                     // The installation id is the rate-limit identity; never
                     // invent one (same convention as check runs).
-                    let bucket =
-                        match crate::github_app::installation_for_repo(&app, &target.repo).await {
-                            Ok(installation) if installation != 0 => {
-                                crate::github_breaker::GithubCredentialBucket::Installation(
-                                    installation,
-                                )
-                            }
-                            _ => crate::github_breaker::GithubCredentialBucket::Pat,
-                        };
+                    let bucket = match crate::github_app::installation_for_repo(
+                        &api_base,
+                        &app,
+                        &target.repo,
+                    )
+                    .await
+                    {
+                        Ok(installation) if installation != 0 => {
+                            crate::github_breaker::GithubCredentialBucket::Installation(
+                                installation,
+                            )
+                        }
+                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                    };
                     (Some(token), bucket)
                 }
                 Err(error) => {
@@ -3169,7 +3161,11 @@ async fn pr_head_commit_skips_ci(
             match crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await
             {
                 Ok(token) => {
-                    let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                    let bucket = match crate::github_app::installation_for_repo(
+                        api_base, &app, repo,
+                    )
+                    .await
+                    {
                         Ok(installation) if installation != 0 => {
                             crate::github_breaker::GithubCredentialBucket::Installation(
                                 installation,
@@ -3189,7 +3185,7 @@ async fn pr_head_commit_skips_ci(
             }
         }
         None => (
-            std::env::var("PRELOOP_GITHUB_TOKEN").ok(),
+            shared.state.static_github_pat(),
             crate::github_breaker::GithubCredentialBucket::Pat,
         ),
     };
@@ -3418,7 +3414,14 @@ pub async fn handle_github_webhook(
             .as_ref()
             .and_then(|apps| apps.app_by_id(app_id))
         {
-            Some(app) => crate::github_app::app_covers_repository(app, &claimed).await,
+            Some(app) => {
+                crate::github_app::app_covers_repository(
+                    &shared.state.github_api_base(),
+                    app,
+                    &claimed,
+                )
+                .await
+            }
             // The payload's secret matched a registered App's secret, so
             // its id must resolve. Fail closed rather than skip binding.
             None => false,
@@ -4035,32 +4038,19 @@ pub async fn run_webhook_queue_worker(
     }
 }
 
-/// Concurrent webhook deliveries processed per node
-/// (`PRELOOP_WEBHOOK_WORKERS`, default 8). Deliveries are independent:
-/// cross-delivery ordering is decided by GitHub event timestamps
-/// (`concurrency::EventOrder`), not by processing order, and other nodes
-/// already drain the same queue in parallel.
-fn webhook_workers() -> usize {
-    std::env::var("PRELOOP_WEBHOOK_WORKERS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(8)
-        .max(1)
-}
-
 /// Deliveries that may wait on GitHub's test merge at once, and merge-state
 /// probes that may be in flight at once, per node: a quarter of the webhook
 /// workers, and at least one. A waiting delivery holds its worker for up to the
 /// whole poll budget, so most workers stay free for every other delivery; the
 /// rest build the engine's own merge without waiting.
-pub fn fresh_merge_poll_capacity() -> usize {
-    (webhook_workers() / 4).max(1)
+pub fn fresh_merge_poll_capacity(webhook_workers: usize) -> usize {
+    (webhook_workers / 4).max(1)
 }
 
 /// Drain pending webhook deliveries (oldest received first) with
-/// [`webhook_workers`] concurrent claim loops.
+/// `AppState::webhook_workers` concurrent claim loops.
 pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
-    let loops = (0..webhook_workers()).map(|_| drain_webhook_queue_loop(shared));
+    let loops = (0..shared.state.webhook_workers).map(|_| drain_webhook_queue_loop(shared));
     let mut total = 0;
     for result in futures::future::join_all(loops).await {
         total += result?;
@@ -4144,7 +4134,8 @@ async fn webhook_delivery_bucket(
     let Some(app) = crate::github_app::select_app_for_repo(shared, &repo).await else {
         return GithubCredentialBucket::Pat;
     };
-    match crate::github_app::installation_for_repo(&app, &repo).await {
+    let api_base = shared.state.github_api_base();
+    match crate::github_app::installation_for_repo(&api_base, &app, &repo).await {
         Ok(installation) if installation != 0 => GithubCredentialBucket::Installation(installation),
         _ => GithubCredentialBucket::Pat,
     }
@@ -4673,8 +4664,7 @@ async fn process_delivery_payload_with_lease(
         delivery.event.as_str(),
         "pull_request" | "pull_request_target"
     ) {
-        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        let api_base = shared.state.github_api_base();
         if pr_head_commit_skips_ci(shared, &repo_full_name, &payload_val, &api_base).await {
             info!("[skip ci] on internal pull-request head commit — suppressing delivery");
             return WebhookOutcome::Success;
@@ -4693,8 +4683,7 @@ async fn process_delivery_payload_with_lease(
                     .and_then(|pr| pr.get("number"))
             })
             .and_then(|value| value.as_u64());
-        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_owned());
+        let api_base = shared.state.github_api_base();
         let fetched = match pr_number {
             Some(number) => {
                 match resolve_pr_changed_files_at(shared, &repo_full_name, number, &api_base).await
@@ -4721,7 +4710,7 @@ async fn process_delivery_payload_with_lease(
         (changed_paths_from_payload(&payload_val), true)
     };
 
-    let github_owned_workflows = configured_github_owned_workflows();
+    let github_owned_workflows = shared.state.github_owned_workflows.clone();
     let mut unmatched_workflows: Vec<String> = Vec::new();
     let mut triggered_count = 0usize;
     let mut permanent_failures: Vec<WebhookFailure> = Vec::new();
@@ -5214,10 +5203,11 @@ async fn process_delivery_payload_with_lease(
 /// cannot change an App's event subscriptions through its API after creation,
 /// so operators who need additional triggers must add them manually in the
 /// App settings UI. Operators who want a different creation-time set can
-/// override it with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated).
-pub fn manifest_default_events() -> Vec<String> {
-    if let Some(raw) = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS")
-        .ok()
+/// override it with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated);
+/// the resolved value is passed in explicitly (`AppState::new` layers it over
+/// the [`crate::config::StartupConfig`] resolution).
+pub fn manifest_default_events(override_value: Option<&str>) -> Vec<String> {
+    if let Some(raw) = override_value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     {
@@ -5448,7 +5438,8 @@ pub async fn github_register(
         manifest_json["hook_attributes"] = serde_json::json!({
                 "url": format!("{}/api/v1/github/webhooks", base_url)
         });
-        manifest_json["default_events"] = serde_json::json!(manifest_default_events());
+        manifest_json["default_events"] =
+            serde_json::json!(shared.state.manifest_default_events.clone());
     }
 
     let expires_at = unix_now_secs() + APP_MANIFEST_STATE_TTL_SECS;
@@ -5569,7 +5560,8 @@ pub async fn github_callback(
         ));
     };
 
-    let credentials = match exchange_manifest_code(code).await {
+    let api_base = shared.state.github_api_base();
+    let credentials = match exchange_manifest_code(code, &api_base).await {
         Ok(credentials) => credentials,
         Err(status) => {
             warn!("GitHub App manifest code exchange failed");
@@ -5602,10 +5594,11 @@ pub async fn github_callback(
 
 /// Exchange the one-time manifest `code` for the App's credentials. The code is
 /// caller-supplied, so it is encoded as a single path segment.
-async fn exchange_manifest_code(code: &str) -> Result<AppManifestConversion, StatusCode> {
+async fn exchange_manifest_code(
+    code: &str,
+    api_base: &str,
+) -> Result<AppManifestConversion, StatusCode> {
     let client = crate::shared_http::CLIENT.clone();
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_owned());
     let url = format!(
         "{}/app-manifests/{}/conversions",
         api_base,
@@ -5709,7 +5702,6 @@ fn app_credentials_page(credentials: &AppManifestConversion) -> String {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)] // SAFETY: env writes confined to serialized tests.
 mod tests {
     use super::*;
     use crate::AppState;
@@ -5812,454 +5804,29 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_default_events_use_minimal_ci_defaults() {
-        // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
-        // process-global and other tests build apps concurrently; the
-        // fallback must be asserted with the override absent.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
-        let defaults = manifest_default_events();
+        let defaults = manifest_default_events(None);
         assert_eq!(defaults, vec!["push", "pull_request", "check_run"]);
     }
 
     #[tokio::test]
     async fn manifest_default_events_override_is_used_when_set() {
-        // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
-        // process-global and other tests build apps concurrently.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        unsafe { std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "push, pull_request") };
-        let events = manifest_default_events();
+        let events = manifest_default_events(Some("push, pull_request"));
         assert_eq!(events, vec!["push".to_owned(), "pull_request".to_owned()]);
-        unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
 
         // A blank override falls back to the minimal default.
-        unsafe { std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ") };
         assert_eq!(
-            manifest_default_events(),
+            manifest_default_events(Some("  ")),
             vec!["push", "pull_request", "check_run"]
         );
-        unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
     }
 
-    /// App-manifest registration: the feature flag, the cookie-bound `state`, the
-    /// one-time handoff page, and the conversion request sent upstream.
-    mod manifest_registration {
-        use super::*;
-
-        const FLAG: &str = "PRELOOP_ENABLE_APP_REGISTRATION";
-
-        /// GitHub's manifest-conversion response for an App owned by `owner`.
-        fn conversion_response(owner: &str, webhook_secret: &str) -> Value {
-            serde_json::json!({
-                "id": 987654,
-                "slug": "preloop-local-app",
-                "owner": { "login": owner },
-                "pem": "-----BEGIN RSA PRIVATE KEY-----\nMOCK-KEY\n-----END RSA PRIVATE KEY-----",
-                "webhook_secret": webhook_secret,
-            })
-        }
-
-        /// A stub GitHub, the production router, and the environment guards that keep
-        /// both in place for one test. Fields drop in declaration order, so the
-        /// environment is restored before the lock is released.
-        struct Harness {
-            app: axum::Router,
-            state: AppState,
-            requests: StubRequests,
-            _vars: Vec<crate::state::TestEnvVar>,
-            _env: tokio::sync::MutexGuard<'static, ()>,
-            _temp: tempfile::TempDir,
-        }
-
-        async fn harness(response: Value, registration: Option<&str>) -> Harness {
-            harness_at(response, 201, registration).await
-        }
-
-        /// [`harness`] with control over the conversion endpoint's status.
-        async fn harness_at(
-            response: Value,
-            upstream_status: u16,
-            registration: Option<&str>,
-        ) -> Harness {
-            let env = crate::state::GITHUB_ENV_LOCK.lock().await;
-            let (api, requests) =
-                start_github_stub(move |_, _, _| (upstream_status, vec![], response.clone())).await;
-            let flag = match registration {
-                Some(value) => crate::state::TestEnvVar::set(FLAG, value),
-                None => crate::state::TestEnvVar::unset(FLAG),
-            };
-            let vars = vec![
-                crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api),
-                flag,
-            ];
-            let temp = tempfile::tempdir().unwrap();
-            let state = AppState::new(temp.path().join("state")).await.unwrap();
-            let app = crate::routes::app(state.clone(), CancellationToken::new());
-            Harness {
-                app,
-                state,
-                requests,
-                _vars: vars,
-                _env: env,
-                _temp: temp,
-            }
-        }
-
-        /// One GET through the production router, with an optional `Cookie` and `Host`.
-        async fn get(
-            app: &axum::Router,
-            uri: &str,
-            cookie: Option<&str>,
-            host: Option<&str>,
-        ) -> axum::response::Response {
-            let mut request = Request::builder().method(Method::GET).uri(uri);
-            if let Some(cookie) = cookie {
-                request = request.header("cookie", cookie);
-            }
-            if let Some(host) = host {
-                request = request.header("host", host);
-            }
-            app.clone()
-                .oneshot(request.body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-        }
-
-        async fn text(response: axum::response::Response) -> String {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            String::from_utf8(bytes.to_vec()).unwrap()
-        }
-
-        fn set_cookie_of(response: &axum::response::Response) -> String {
-            let value = &response.headers()["set-cookie"];
-            value.to_str().unwrap().to_owned()
-        }
-
-        /// The `Cookie` header and the `state` token of a binding this engine would
-        /// issue under `nonce`, valid for ten minutes.
-        fn binding(key: &[u8], nonce: &str) -> (String, String) {
-            let token = app_manifest_state_token(key, nonce, unix_now_secs() + 600);
-            (format!("preloop_app_manifest_state={token}"), token)
-        }
-
-        fn upstream(requests: &StubRequests) -> Vec<(String, String, Value)> {
-            requests.lock().iter().cloned().collect()
-        }
-
-        #[tokio::test]
-        async fn flag_accepts_only_the_documented_on_values() {
-            let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-            for value in ["1", "true", "TRUE", " on ", "On"] {
-                let _flag = crate::state::TestEnvVar::set(FLAG, value);
-                assert!(
-                    app_registration_enabled(),
-                    "{value:?} should enable registration"
-                );
-            }
-            for value in ["", "0", "false", "off", "yes"] {
-                let _flag = crate::state::TestEnvVar::set(FLAG, value);
-                assert!(
-                    !app_registration_enabled(),
-                    "{value:?} should not enable registration"
-                );
-            }
-            let _unset = crate::state::TestEnvVar::unset(FLAG);
-            assert!(!app_registration_enabled());
-        }
-
-        #[tokio::test]
-        async fn routes_are_not_found_while_registration_is_disabled() {
-            let h = harness(conversion_response("acme", "s"), None).await;
-
-            let register = get(&h.app, "/api/v1/github/register", None, None).await;
-            assert_eq!(register.status(), StatusCode::NOT_FOUND);
-            assert!(register.headers().get("set-cookie").is_none());
-
-            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-disabled");
-            let uri = format!("/api/v1/github/callback?code=c1&state={token}");
-            let callback = get(&h.app, &uri, Some(cookie.as_str()), None).await;
-            assert_eq!(callback.status(), StatusCode::NOT_FOUND);
-            // A query that cannot parse must still see the disabled route's
-            // 404, not an extractor rejection.
-            let malformed = get(
-                &h.app,
-                "/api/v1/github/callback?code=c1&code=c2&state=x",
-                None,
-                None,
-            )
-            .await;
-            assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
-            assert!(
-                upstream(&h.requests).is_empty(),
-                "a disabled route must not reach GitHub"
-            );
-        }
-
-        #[tokio::test]
-        async fn callback_without_a_matching_state_never_reaches_github() {
-            let h = harness(conversion_response("acme", "s"), Some("1")).await;
-            let key = &h.state.local_jwt_key;
-            let (cookie, token) = binding(key, "nonce-good");
-            let (_, other) = binding(key, "nonce-other");
-            let expiry = unix_now_secs() + 600;
-            let forged = app_manifest_state_token(b"not-this-engine", "nonce-good", expiry);
-            let refused: [(String, Option<String>); 6] = [
-                ("/api/v1/github/callback?code=c1".to_owned(), None),
-                (
-                    format!("/api/v1/github/callback?code=c1&state={token}"),
-                    None,
-                ),
-                (
-                    "/api/v1/github/callback?code=c1".to_owned(),
-                    Some(cookie.clone()),
-                ),
-                (
-                    format!("/api/v1/github/callback?code=c1&state={other}"),
-                    Some(cookie.clone()),
-                ),
-                (
-                    format!("/api/v1/github/callback?code=c1&state={forged}"),
-                    Some(format!("preloop_app_manifest_state={forged}")),
-                ),
-                (
-                    format!("/api/v1/github/callback?code=c1&state={token}"),
-                    Some(format!("{cookie}; {cookie}")),
-                ),
-            ];
-            for (uri, cookie_header) in &refused {
-                let response = get(&h.app, uri, cookie_header.as_deref(), None).await;
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
-            }
-            assert!(
-                upstream(&h.requests).is_empty(),
-                "no refused callback may reach GitHub"
-            );
-        }
-
-        #[tokio::test]
-        async fn expired_state_is_refused_even_when_signed_and_echoed() {
-            let h = harness(conversion_response("acme", "s"), Some("1")).await;
-            let expired = app_manifest_state_token(
-                &h.state.local_jwt_key,
-                "nonce-old",
-                unix_now_secs().saturating_sub(1),
-            );
-            let cookie = format!("preloop_app_manifest_state={expired}");
-            let uri = format!("/api/v1/github/callback?code=c1&state={expired}");
-            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert!(
-                upstream(&h.requests).is_empty(),
-                "an expired state must not reach GitHub"
-            );
-        }
-
-        /// A malformed query gets the generic refusal — never an extractor
-        /// rejection — and never reaches GitHub.
-        #[tokio::test]
-        async fn malformed_query_gets_the_generic_refusal() {
-            let h = harness(conversion_response("acme", "s"), Some("1")).await;
-            let response = get(
-                &h.app,
-                "/api/v1/github/callback?code=c1&code=c2&state=x",
-                None,
-                None,
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(
-                response.headers()["cache-control"].to_str().unwrap(),
-                "no-store"
-            );
-            assert!(text(response).await.contains("Registration not accepted"));
-            assert!(
-                upstream(&h.requests).is_empty(),
-                "a malformed query must not reach GitHub"
-            );
-        }
-
-        /// A failed code exchange answers with the protected page: the browser
-        /// URL still carries the one-time code, so the response is never
-        /// cacheable and never leaks through `Referer`.
-        #[tokio::test]
-        async fn exchange_failure_renders_a_protected_page() {
-            let h = harness_at(conversion_response("acme", "s"), 500, Some("1")).await;
-            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-exchange");
-            let uri = format!("/api/v1/github/callback?code=the-code&state={token}");
-            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
-            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(
-                response.headers()["cache-control"].to_str().unwrap(),
-                "no-store"
-            );
-            assert_eq!(
-                response.headers()["referrer-policy"].to_str().unwrap(),
-                "no-referrer"
-            );
-            let page = text(response).await;
-            assert!(page.contains("Registration could not be completed"));
-            assert_eq!(
-                upstream(&h.requests).len(),
-                1,
-                "the bound exchange is attempted exactly once"
-            );
-        }
-
-        #[tokio::test]
-        async fn round_trip_hands_off_a_cli_command_and_clears_the_binding() {
-            let response = conversion_response("acme-admin", "mock-webhook-secret-xyz");
-            let h = harness(response, Some("1")).await;
-
-            // Loopback hosts are plain HTTP, so their cookie is not `Secure`.
-            let local = get(&h.app, "/api/v1/github/register", None, None).await;
-            assert!(!set_cookie_of(&local).contains("Secure"));
-
-            // Over HTTPS the cookie is HttpOnly, Lax, scoped to the GitHub routes, and
-            // lives for an hour.
-            let register = get(
-                &h.app,
-                "/api/v1/github/register",
-                None,
-                Some("preloop.example.com"),
-            )
-            .await;
-            assert_eq!(register.status(), StatusCode::OK);
-            assert_eq!(
-                register.headers()["cache-control"].to_str().unwrap(),
-                "no-store"
-            );
-            let set_cookie = set_cookie_of(&register);
-            for attribute in [
-                "HttpOnly",
-                "SameSite=Lax",
-                "Path=/api/v1/github",
-                "Max-Age=3600",
-                "Secure",
-            ] {
-                assert!(
-                    set_cookie.contains(attribute),
-                    "missing {attribute}: {set_cookie}"
-                );
-            }
-            let cookie = set_cookie.split(';').next().unwrap().to_owned();
-            let token = cookie
-                .strip_prefix("preloop_app_manifest_state=")
-                .unwrap()
-                .to_owned();
-            let page = text(register).await;
-            assert!(
-                page.contains(&format!(
-                    "https://github.com/settings/apps/new?state={token}"
-                )),
-                "the form must send the token the cookie carries"
-            );
-
-            // GitHub redirects the same browser back, echoing the state.
-            let uri = format!("/api/v1/github/callback?code=the-code&state={token}");
-            let callback = get(
-                &h.app,
-                &uri,
-                Some(cookie.as_str()),
-                Some("preloop.example.com"),
-            )
-            .await;
-            assert_eq!(callback.status(), StatusCode::OK);
-            assert_eq!(
-                callback.headers()["cache-control"].to_str().unwrap(),
-                "no-store"
-            );
-            assert_eq!(
-                callback.headers()["referrer-policy"].to_str().unwrap(),
-                "no-referrer"
-            );
-            assert!(
-                set_cookie_of(&callback).contains("Max-Age=0"),
-                "the binding is cleared"
-            );
-            let page = text(callback).await;
-            assert!(page.contains("GitHub App Registered Successfully!"));
-            assert!(page.contains("987654"));
-            assert!(
-                page.contains("acme-admin"),
-                "the owner is shown for confirmation"
-            );
-            assert!(
-                page.contains("--webhook-secret &#39;mock-webhook-secret-xyz&#39;"),
-                "the handoff must pass the secret on the CLI"
-            );
-            assert!(!page.contains("export PRELOOP_WEBHOOK_SECRET"));
-
-            let calls = upstream(&h.requests);
-            assert_eq!(
-                calls.len(),
-                1,
-                "one registration makes one conversion request"
-            );
-            assert_eq!(calls[0].0, "POST");
-            assert_eq!(calls[0].1, "/app-manifests/the-code/conversions");
-        }
-
-        #[tokio::test]
-        async fn code_stays_one_percent_encoded_upstream() {
-            let h = harness(conversion_response("acme", "s"), Some("1")).await;
-            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-code");
-            // The code decodes to `a/b?c&d`; none of those characters may split the path.
-            let uri = format!("/api/v1/github/callback?code=a%2Fb%3Fc%26d&state={token}");
-            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let calls = upstream(&h.requests);
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].1, "/app-manifests/a%2Fb%3Fc%26d/conversions");
-        }
-
-        #[tokio::test]
-        async fn handoff_page_escapes_every_value_github_supplies() {
-            let hostile = serde_json::json!({
-                "id": 42,
-                "slug": "<img src=x>",
-                "owner": { "login": "<b>acme</b>" },
-                "pem": "<script>alert(1)</script>",
-                "webhook_secret": "s3cr'et<i>",
-            });
-            let h = harness(hostile, Some("1")).await;
-            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-escape");
-            let uri = format!("/api/v1/github/callback?code=c1&state={token}");
-            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let page = text(response).await;
-            for raw in ["<script>", "<img", "<b>acme", "<i>"] {
-                assert!(!page.contains(raw), "{raw} reached the page unescaped");
-            }
-            assert!(page.contains("&lt;b&gt;acme&lt;/b&gt;"));
-            assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-            assert!(page.contains("s3cr&#39;et&lt;i&gt;"));
-            // The slug only reaches the install link percent-encoded.
-            assert!(page.contains("%3Cimg%20src%3Dx%3E"));
-        }
-
-        #[test]
-        fn state_token_is_bound_to_nonce_expiry_and_key() {
-            let key: &[u8] = b"engine-local-jwt-key";
-            let now: u64 = 1_800_000_000;
-            let token = app_manifest_state_token(key, "nonce", now + 600);
-            assert!(app_manifest_state_is_valid(key, &token, now));
-            // The nonce, the expiry, and the engine key are all covered by the signature.
-            assert!(!app_manifest_state_is_valid(
-                key,
-                &token.replacen("nonce", "other", 1),
-                now
-            ));
-            let longer = (now + 6_000).to_string();
-            let extended = token.replacen(&(now + 600).to_string(), &longer, 1);
-            assert!(!app_manifest_state_is_valid(key, &extended, now));
-            assert!(!app_manifest_state_is_valid(
-                b"another-engine-key",
-                &token,
-                now
-            ));
-            // Expired from the expiry second onward.
-            assert!(!app_manifest_state_is_valid(key, &token, now + 600));
+    /// Startup config for stubbed-GitHub tests: request-path calls go to
+    /// `api_base` under the static `pat` (or no PAT when `None`).
+    fn stub_startup(api_base: Option<&str>, pat: Option<&str>) -> crate::config::StartupConfig {
+        crate::config::StartupConfig {
+            github_api_url: api_base.map(str::to_owned),
+            github_token: pat.map(preloop_gha_protocol::SecretString::new),
+            ..crate::config::StartupConfig::for_tests()
         }
     }
 
@@ -6281,7 +5848,6 @@ mod tests {
         let signature = sign(&bytes, "super-secret");
         (bytes, signature)
     }
-
     /// In-process server fixture mirroring the crate's `WebhookDedupFixture`:
     /// a local workspace (with one push-triggered workflow by default), a
     /// webhook secret, and the signed push payload.
@@ -6295,7 +5861,7 @@ mod tests {
 
     impl WebhookFixture {
         /// Standard fixture: the workspace holds one push-triggered workflow.
-        async fn new(temp: &tempfile::TempDir) -> Self {
+        async fn new(temp: &tempfile::TempDir, startup: crate::config::StartupConfig) -> Self {
             let ws_dir = temp.path().join("ws");
             std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
             std::fs::write(
@@ -6303,16 +5869,20 @@ mod tests {
                 "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
             )
             .unwrap();
-            Self::with_workspace(temp, ws_dir).await
+            Self::with_workspace(temp, ws_dir, startup).await
         }
 
-        async fn with_workspace(temp: &tempfile::TempDir, ws_dir: std::path::PathBuf) -> Self {
+        async fn with_workspace(
+            temp: &tempfile::TempDir,
+            ws_dir: std::path::PathBuf,
+            startup: crate::config::StartupConfig,
+        ) -> Self {
             let event_sha = if ws_dir.join(".github/workflows").is_dir() {
                 commit_workspace(&ws_dir)
             } else {
                 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned()
             };
-            let mut state = AppState::new(temp.path().join("state").to_path_buf())
+            let mut state = AppState::new(temp.path().join("state").to_path_buf(), startup)
                 .await
                 .unwrap();
             state.webhook_secret = Some("super-secret".to_owned());
@@ -6530,9 +6100,6 @@ mod tests {
     /// merge, and the stale sha must never be consulted.
     #[tokio::test]
     async fn stale_payload_merge_sha_is_replaced_with_the_live_test_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -6564,9 +6131,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
         assert_eq!(
             fixture
@@ -6603,9 +6170,6 @@ mod tests {
     /// both polled through, not treated as final.
     #[tokio::test]
     async fn mergeability_unknown_is_polled_until_the_test_merge_is_ready() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -6656,9 +6220,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
@@ -6689,9 +6253,6 @@ mod tests {
     /// pull_request_target projection still runs on the base.
     #[tokio::test]
     async fn conflicted_pull_request_creates_no_pr_runs_but_still_runs_target() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -6724,9 +6285,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
         assert_eq!(
             fixture
@@ -6767,9 +6328,6 @@ mod tests {
     /// it. Never the bare head ref, and never the newer head's tree.
     #[tokio::test]
     async fn head_race_builds_and_runs_the_engines_own_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -6809,9 +6367,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
@@ -6870,9 +6428,6 @@ mod tests {
     /// never the bare head ref.
     #[tokio::test]
     async fn api_failure_within_the_budget_builds_and_runs_the_engines_own_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -6893,9 +6448,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         // A persistent 5xx would trip the shared breaker; this test is about
         // the resolver's own fallback, so keep the breaker out of the way.
         fixture.state.github_breakers =
@@ -6962,9 +6517,6 @@ mod tests {
     /// delivery polls through the budget and the engine builds its own merge.
     #[tokio::test]
     async fn a_merge_commit_from_another_head_is_never_used() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -6998,9 +6550,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_millis(100),
             poll_interval: Duration::from_millis(20),
@@ -7040,9 +6592,6 @@ mod tests {
     /// exact head against the target branch's current tip in the engine.
     #[tokio::test]
     async fn a_merge_against_an_older_base_is_rejected_and_rebuilt() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7076,9 +6625,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
@@ -7150,9 +6699,6 @@ mod tests {
     /// not discarded for a head race that no longer concerns this delivery.
     #[tokio::test]
     async fn head_race_keeps_this_heads_merge_when_the_pointer_still_names_it() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7184,9 +6730,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
         assert_eq!(
             fixture
@@ -7220,9 +6766,6 @@ mod tests {
     /// the delivery runs on the engine's own merge of the current base tip.
     #[tokio::test]
     async fn budget_expiry_builds_and_runs_the_engines_own_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7256,9 +6799,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_secs(5),
             poll_interval: Duration::from_millis(20),
@@ -7320,9 +6863,6 @@ mod tests {
     /// pull_request_target still runs on the base.
     #[tokio::test]
     async fn engine_merge_conflict_skips_pull_request_runs() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7369,9 +6909,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_millis(60),
             poll_interval: Duration::from_millis(20),
@@ -7420,9 +6960,6 @@ mod tests {
     /// dead-letters the delivery instead of retrying it into the same wall.
     #[tokio::test]
     async fn unfetchable_base_branch_dead_letters_the_delivery() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7450,9 +6987,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_millis(60),
             poll_interval: Duration::from_millis(20),
@@ -7500,9 +7037,6 @@ mod tests {
     /// same fresh resolution.
     #[tokio::test]
     async fn pull_request_review_uses_the_live_test_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7534,9 +7068,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let payload = serde_json::to_vec(&serde_json::json!({
             "action": "submitted",
             "pull_request": {
@@ -7577,9 +7111,7 @@ mod tests {
     /// stands — the historical behavior stays available for non-GitHub use.
     #[tokio::test]
     async fn pull_request_delivery_without_github_credentials_keeps_the_payload_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-        let _no_api = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+        let startup = stub_startup(None, None);
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
@@ -7588,7 +7120,7 @@ mod tests {
         );
         let (head, stale_merge, _current_merge, current_base) = build_pull_request_graph(&ws_dir);
 
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let payload = stale_pull_request_payload(&head, &stale_merge, &current_base);
         assert_eq!(
             fixture
@@ -7610,9 +7142,6 @@ mod tests {
     /// merge nothing will run.
     #[tokio::test]
     async fn disabled_fork_workflows_skip_the_merge_state_poll() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7637,9 +7166,9 @@ mod tests {
             )
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         fixture.state.fork_policy.run_fork_workflows = false;
         // A regression would poll to this budget before failing; keep the
         // failure fast.
@@ -7752,9 +7281,6 @@ mod tests {
     /// must too, not the head's older one.
     #[tokio::test]
     async fn self_built_merge_runs_the_workflow_revision_at_the_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
         let head = build_base_advanced_workflow_graph(&ws_dir);
@@ -7780,9 +7306,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget: Duration::from_millis(300),
             poll_interval: Duration::from_millis(20),
@@ -7821,11 +7347,11 @@ mod tests {
     /// from the pull request head instead, so the delivery is not lost.
     #[tokio::test]
     async fn unreadable_merge_mirror_falls_back_to_the_head_workflows() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let startup = stub_startup(None, None);
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
         let head = build_base_advanced_workflow_graph(&ws_dir);
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
             shutdown: CancellationToken::new(),
@@ -7867,8 +7393,17 @@ mod tests {
 
     /// Engine state for driving [`poll_fresh_merge`] directly: a poll schedule
     /// and the environment's stubbed API, with no repository or merge needed.
-    async fn poll_only_shared(temp: &tempfile::TempDir, budget: Duration) -> Arc<SharedState> {
-        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    async fn poll_only_shared(
+        temp: &tempfile::TempDir,
+        budget: Duration,
+        api_base: &str,
+    ) -> Arc<SharedState> {
+        let mut state = AppState::new(
+            temp.path().join("state"),
+            stub_startup(Some(api_base), Some("test-token")),
+        )
+        .await
+        .unwrap();
         state.fresh_merge_poll = FreshMergePoll {
             budget,
             poll_interval: Duration::from_millis(20),
@@ -7901,9 +7436,6 @@ mod tests {
     /// it builds the engine's own merge at once, and the held slots stay held.
     #[tokio::test]
     async fn saturated_poll_slots_build_the_merge_without_waiting_for_the_budget() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = pr_workspace(
             &temp,
@@ -7936,9 +7468,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone(), startup).await;
         let budget = Duration::from_secs(10);
         fixture.state.fresh_merge_poll = FreshMergePoll {
             budget,
@@ -7991,9 +7523,6 @@ mod tests {
     /// A poll that resolves to GitHub's merge gives its slot back.
     #[tokio::test]
     async fn poll_slot_is_released_once_github_offers_the_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let (head, base, merge) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
         let commits_path = format!("/repos/owner/repo/commits/{merge}");
@@ -8034,9 +7563,8 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
+        let shared = poll_only_shared(&temp, Duration::from_secs(5), &api).await;
         let slots = shared.state.fresh_merge_poll_slots.clone();
         let total = slots.available_permits();
         match poll_fresh_merge(&shared, &poll_target(&head)).await {
@@ -8054,9 +7582,6 @@ mod tests {
     /// A poll whose probe turns fatal after waiting gives its slot back.
     #[tokio::test]
     async fn poll_slot_is_released_when_the_probe_turns_fatal() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let head = "a".repeat(40);
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8081,9 +7606,8 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
+        let shared = poll_only_shared(&temp, Duration::from_secs(5), &api).await;
         let slots = shared.state.fresh_merge_poll_slots.clone();
         let total = slots.available_permits();
         assert!(
@@ -8103,9 +7627,6 @@ mod tests {
     /// A poll that runs out of budget gives its slot back too.
     #[tokio::test]
     async fn poll_slot_is_released_when_the_budget_runs_out() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let head = "a".repeat(40);
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8118,11 +7639,8 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        // Leave wall time for the stub request when nextest is CPU-contended;
-        // the 20ms poll interval still exercises the retry budget.
-        let shared = poll_only_shared(&temp, Duration::from_secs(5)).await;
+        let shared = poll_only_shared(&temp, Duration::from_secs(1), &api).await;
         let slots = shared.state.fresh_merge_poll_slots.clone();
         let total = slots.available_permits();
         assert!(
@@ -8145,9 +7663,6 @@ mod tests {
     /// lease is lost) drops the slot it holds.
     #[tokio::test]
     async fn poll_slot_is_released_when_the_waiting_delivery_is_cancelled() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let head = "a".repeat(40);
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8170,9 +7685,8 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let shared = poll_only_shared(&temp, Duration::from_secs(30)).await;
+        let shared = poll_only_shared(&temp, Duration::from_secs(30), &api).await;
         let slots = shared.state.fresh_merge_poll_slots.clone();
         let total = slots.available_permits();
         let target = poll_target(&head);
@@ -8209,9 +7723,6 @@ mod tests {
     /// stub answers slowly so probes overlap, and it counts how many run at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn merge_state_probes_in_flight_stay_within_the_probe_capacity() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8236,13 +7747,12 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
-        let shared = poll_only_shared(&temp, Duration::from_millis(600)).await;
+        let shared = poll_only_shared(&temp, Duration::from_millis(600), &api).await;
         let permits = shared.state.fresh_merge_probe_permits.clone();
         let total = permits.available_permits();
         let head = "a".repeat(40);
-        let polls: Vec<_> = (0..fresh_merge_poll_capacity() * 4)
+        let polls: Vec<_> = (0..fresh_merge_poll_capacity(shared.state.webhook_workers) * 4)
             .map(|_| {
                 let shared = shared.clone();
                 let target = poll_target(&head);
@@ -8256,7 +7766,7 @@ mod tests {
         let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(peak >= 1, "the polls must reach GitHub");
         assert!(
-            peak <= fresh_merge_poll_capacity(),
+            peak <= fresh_merge_poll_capacity(shared.state.webhook_workers),
             "{peak} merge-state probes were in flight at once"
         );
         assert_eq!(
@@ -8271,9 +7781,6 @@ mod tests {
     /// and builds its own merge.
     #[tokio::test]
     async fn saturated_probe_permits_skip_the_probe_and_build_the_merge() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-
         let temp = tempfile::tempdir().unwrap();
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let polls_for_stub = polls.clone();
@@ -8294,10 +7801,9 @@ mod tests {
             (404, vec![], serde_json::json!({ "message": "not found" }))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
 
         let budget = Duration::from_secs(10);
-        let shared = poll_only_shared(&temp, budget).await;
+        let shared = poll_only_shared(&temp, budget, &api).await;
         let permits = shared.state.fresh_merge_probe_permits.clone();
         let total = permits.available_permits();
         let held: Vec<_> = (0..total)
@@ -8335,12 +7841,13 @@ mod tests {
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone())
-            .await
-            // One 40ms tier: the retry is still a real scheduled retry (the row
-            // is not claimable while its backoff is pending), but the test does
-            // not sleep through the production ladder.
-            .with_retry_backoff(vec![Duration::from_millis(40)]);
+        let fixture =
+            WebhookFixture::with_workspace(&temp, ws_dir.clone(), stub_startup(None, None))
+                .await
+                // One 40ms tier: the retry is still a real scheduled retry (the row
+                // is not claimable while its backoff is pending), but the test does
+                // not sleep through the production ladder.
+                .with_retry_backoff(vec![Duration::from_millis(40)]);
 
         // Hide workspace temporarily so workflow fetching fails transiently.
         let hidden_ws = temp.path().join("hidden_ws");
@@ -8420,15 +7927,15 @@ mod tests {
 
     /// Register a test App whose installation on `owner` is
     /// `installation_id`, stubbing the ownership verification the selection
-    /// ladder makes. Returns the env guard holding `PRELOOP_GITHUB_API_URL`
-    /// and a cloned `AppState` carrying the registry — `github_app`/`github_apps`
+    /// ladder makes. Returns a cloned `AppState` carrying the registry and
+    /// pointing request-path calls at the stub — `github_app`/`github_apps`
     /// are plain fields, so the returned state is the one the delivery
     /// processing must run against.
     async fn configure_app_installation(
         state: &AppState,
         installation_id: u64,
         owner: &'static str,
-    ) -> (crate::state::TestEnvVar, AppState) {
+    ) -> AppState {
         let (api, _requests) = start_github_stub(move |method, path, _body| {
             if method == "GET" && path == format!("/app/installations/{installation_id}") {
                 return (
@@ -8440,7 +7947,6 @@ mod tests {
             (404, vec![], serde_json::json!({"message": "not found"}))
         })
         .await;
-        let api_env = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
         let mut app = crate::github_app::GitHubAppCredentials::for_tests(
             "474",
             rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
@@ -8448,12 +7954,13 @@ mod tests {
         );
         app.installation_id = Some(installation_id);
         let mut state = state.clone();
+        state.github_api_request_base = Some(api);
         state.github_app = Some(app.clone());
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![app],
             default_index: 0,
         });
-        (api_env, state)
+        state
     }
 
     /// A fixture whose workspace is hidden, so workflow evaluation fails
@@ -8466,7 +7973,12 @@ mod tests {
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(temp, ws_dir.clone()).await;
+        let fixture = WebhookFixture::with_workspace(
+            temp,
+            ws_dir.clone(),
+            crate::config::StartupConfig::for_tests(),
+        )
+        .await;
         std::fs::rename(&ws_dir, temp.path().join("hidden_ws")).unwrap();
         fixture
     }
@@ -8517,7 +8029,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_queue_stops_claiming_while_github_is_unavailable() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
         assert_eq!(
             fixture.post("delivery-outage-gate", Some("push")).await,
             StatusCode::ACCEPTED
@@ -8625,12 +8137,11 @@ mod tests {
     /// selects, which the payload's `installation.id` happens to name here.
     #[tokio::test]
     async fn throttled_own_installation_parks_transient_failures() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let fixture = hidden_workspace_fixture(&temp).await;
         // The repo's real credential is this App's installation 9: selection,
         // not the payload's `installation.id`, decides the bucket.
-        let (_api, app_state) = configure_app_installation(&fixture.state, 9, "owner").await;
+        let app_state = configure_app_installation(&fixture.state, 9, "owner").await;
         fixture
             .state
             .github_breakers
@@ -8677,7 +8188,6 @@ mod tests {
     /// while installation 9's budget sits unused.
     #[tokio::test]
     async fn throttled_pat_parks_delivery_naming_a_foreign_installation() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let fixture = hidden_workspace_fixture(&temp).await;
         fixture
@@ -8750,9 +8260,11 @@ mod tests {
     /// the installation id the payload happens to name.
     #[tokio::test]
     async fn webhook_delivery_bucket_follows_the_selected_credential() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let startup = stub_startup(None, None);
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = Arc::new(SharedState {
             state,
             shutdown: CancellationToken::new(),
@@ -8789,7 +8301,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_unresolvable_sha_is_redelivered() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
 
         let payload = serde_json::json!({
             "ref": "refs/heads/main",
@@ -8846,7 +8358,7 @@ mod tests {
             )
             .unwrap();
         }
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, stub_startup(None, None)).await;
         let payload = serde_json::to_vec(&serde_json::json!({
             "ref": "main",
             "workflow": ".github/workflows/selected.yml",
@@ -8907,7 +8419,7 @@ jobs:
 "#,
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, stub_startup(None, None)).await;
         let payload = serde_json::to_vec(&serde_json::json!({
             "ref": "main",
             "workflow": ".github/workflows/dispatch.yml",
@@ -8962,7 +8474,7 @@ jobs:
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo valid\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, stub_startup(None, None)).await;
 
         assert_eq!(
             fixture.post("delivery-malformed", Some("push")).await,
@@ -9001,7 +8513,7 @@ jobs:
     async fn malformed_pull_request_workflow_reports_head_sha() {
         // See `malformed_pull_request_workflow_failure_is_deduplicated`: the
         // PR-files lookup must not hit another test's GitHub stub.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let startup = stub_startup(None, None);
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
@@ -9010,7 +8522,7 @@ jobs:
             "on: [push\njobs:\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let base_sha = git_output(&fixture.workspace, &["rev-parse", "HEAD"]);
         let payload = serde_json::json!({
             "action": "opened",
@@ -9058,10 +8570,9 @@ jobs:
 
     #[tokio::test]
     async fn malformed_pull_request_workflow_failure_is_deduplicated() {
-        // `PRELOOP_GITHUB_API_URL` is process-global; this scenario expects no
-        // stub to answer the PR-files lookup, so it must not race a test that
-        // installs one.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        // This state configures no GitHub API: the PR-files lookup has no
+        // stub to answer it, which is the scenario under test.
+        let startup = stub_startup(None, None);
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
@@ -9070,7 +8581,7 @@ jobs:
             "on: [push\njobs:\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
         let commit_sha = git_output(&fixture.workspace, &["rev-parse", "HEAD"]);
         let payload = serde_json::json!({
             "action": "opened",
@@ -9131,7 +8642,7 @@ jobs:
             "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, stub_startup(None, None)).await;
 
         assert_eq!(
             fixture.post("delivery-no-match", Some("push")).await,
@@ -9159,8 +8670,10 @@ jobs:
     /// Preloop owns the ordinary CI workflows in the same repository.
     #[tokio::test]
     async fn webhook_skips_github_owned_workflows() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        unsafe { std::env::set_var(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml") };
+        let startup = crate::config::StartupConfig {
+            github_skip_workflows: Some("release.yml".to_owned()),
+            ..stub_startup(None, None)
+        };
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
@@ -9170,7 +8683,7 @@ jobs:
             "on: push\njobs:\n  release:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo release\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
 
         assert_eq!(
             fixture.post("delivery-github-owned", Some("push")).await,
@@ -9192,8 +8705,6 @@ jobs:
         );
         let inner = fixture.state.test_tx().await;
         assert!(inner.runs.is_empty());
-
-        unsafe { std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV) };
     }
 
     /// Crash recovery: processing that died mid-flight has its expired lease
@@ -9201,7 +8712,7 @@ jobs:
     #[tokio::test]
     async fn webhook_cancelled_processing_releases_reservation() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
 
         let record = WebhookDeliveryRecord {
             delivery_id: "delivery-cancel".to_owned(),
@@ -9249,7 +8760,7 @@ jobs:
     #[tokio::test]
     async fn webhook_replay_reuses_existing_run() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
 
         assert_eq!(
             fixture.post("delivery-replay", Some("push")).await,
@@ -9313,7 +8824,7 @@ jobs:
     #[tokio::test]
     async fn failed_webhook_delivery_can_be_reopened_for_redelivery() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
         let delivery = WebhookDeliveryRecord {
             delivery_id: "delivery-redelivery".to_owned(),
             event: "push".to_owned(),
@@ -9400,7 +8911,7 @@ jobs:
     #[tokio::test]
     async fn corrupt_webhook_payload_is_dead_lettered_without_wedging_queue() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
         let corrupt = WebhookDeliveryRecord {
             delivery_id: "delivery-corrupt".to_owned(),
             event: "push".to_owned(),
@@ -9488,7 +8999,7 @@ jobs:
     #[tokio::test]
     async fn webhook_processing_lease_can_be_renewed() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
         let delivery = WebhookDeliveryRecord {
             delivery_id: "delivery-lease".to_owned(),
             event: "push".to_owned(),
@@ -9556,7 +9067,7 @@ jobs:
     #[tokio::test]
     async fn expired_webhook_lease_rejects_all_mutations() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
         let delivery = WebhookDeliveryRecord {
             delivery_id: "delivery-expired-lease".to_owned(),
             event: "push".to_owned(),
@@ -9630,7 +9141,7 @@ jobs:
     #[tokio::test]
     async fn webhook_terminal_rows_are_pruned_after_retention() {
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, stub_startup(None, None)).await;
         let now = crate::store::now_us();
         for (delivery_id, received_at_us) in
             [("delivery-old", now - 2_000_000), ("delivery-fresh", now)]
@@ -9686,7 +9197,9 @@ jobs:
     /// denied: the rerequest must not resubmit.
     async fn rerequest_fixture() -> (tempfile::TempDir, std::sync::Arc<crate::SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state.execution_protection = crate::config::ExecutionProtectionConfig {
             mode: crate::config::ProtectionMode::Enforce,
             event_rules: vec![],
@@ -9991,7 +9504,9 @@ jobs:
     #[tokio::test]
     async fn check_suite_rerequest_ignores_a_foreign_app_suite() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![crate::github_app::GitHubAppCredentials::for_tests(
                 "424",
@@ -10027,9 +9542,12 @@ jobs:
     async fn mint_fixture(
         reports_check_runs: bool,
         status_check_sha: Option<&str>,
+        startup: crate::config::StartupConfig,
     ) -> (tempfile::TempDir, std::sync::Arc<crate::SharedState>, RunId) {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = state.shared();
         let submission = WorkflowSubmission {
             workflow_yaml:
@@ -10055,7 +9573,7 @@ jobs:
 
     #[tokio::test]
     async fn materialized_job_mints_check_run_when_intake_reported() {
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let (_temp, shared, run_id) = mint_fixture(true, None, stub_startup(None, None)).await;
         let job = JobId("build".to_owned());
 
         // Handlers never mint inline any more: there is no GitHub call and no
@@ -10095,7 +9613,7 @@ jobs:
 
     #[tokio::test]
     async fn materialized_job_gets_no_check_run_when_intake_never_reported() {
-        let (_temp, shared, run_id) = mint_fixture(false, None).await;
+        let (_temp, shared, run_id) = mint_fixture(false, None, stub_startup(None, None)).await;
 
         let leg = JobId("build (linux)".to_owned());
         assert_eq!(
@@ -10109,7 +9627,7 @@ jobs:
 
     #[tokio::test]
     async fn terminal_report_mints_missing_check_run_for_late_job() {
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let (_temp, shared, run_id) = mint_fixture(true, None, stub_startup(None, None)).await;
         let job = JobId("build".to_owned());
 
         // A matrix leg that skips at promotion never dispatches; the only
@@ -10257,15 +9775,13 @@ jobs:
     /// coalesces to ONE Checks API write carrying the final state.
     #[tokio::test]
     async fn sender_coalesces_versions_into_one_final_request() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api, requests) = start_github_stub(|method, _path, _body| match method {
             "GET" => (200, vec![], serde_json::json!({"check_runs": []})),
             _ => (201, vec![], serde_json::json!({"id": 4242})),
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let startup = stub_startup(Some(&api), Some("test-token"));
+        let (_temp, shared, run_id) = mint_fixture(true, None, startup).await;
         let job = JobId("build".to_owned());
         for (version, status) in [(1, "queued"), (2, "in_progress"), (3, "success")] {
             seed_check_run_update(&shared, run_id, &job, version, status, None).await;
@@ -10293,7 +9809,6 @@ jobs:
     /// the next attempt succeeds.
     #[tokio::test]
     async fn sender_retries_after_retry_after_then_succeeds() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_stub = attempts.clone();
         let (api, requests) = start_github_stub(move |method, _path, _body| {
@@ -10311,9 +9826,8 @@ jobs:
             }
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let startup = stub_startup(Some(&api), Some("test-token"));
+        let (_temp, shared, run_id) = mint_fixture(true, None, startup).await;
         let job = JobId("build".to_owned());
         seed_check_run_update(&shared, run_id, &job, 1, "queued", None).await;
 
@@ -10354,7 +9868,6 @@ jobs:
     #[tokio::test]
     async fn pat_throttle_on_actions_parks_check_run_sender() {
         use crate::github_breaker::{GithubCredentialBucket, GithubSubsystem};
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let reset = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -10368,9 +9881,8 @@ jobs:
             )
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "pat-for-test");
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let startup = stub_startup(Some(&api), Some("pat-for-test"));
+        let (_temp, shared, run_id) = mint_fixture(true, None, startup).await;
 
         // Trip the PAT bucket the way an action-tarball 429 would: the 429
         // response itself is returned, and the bucket opens at once.
@@ -10422,7 +9934,6 @@ jobs:
     /// it never POSTs a duplicate.
     #[tokio::test]
     async fn sender_reconciles_instead_of_second_post() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         // The row's own check is listed after a same-named check another
         // workflow created on the same commit; only the `external_id` match
         // may be adopted. The id is filled in once the fixture exists.
@@ -10453,9 +9964,8 @@ jobs:
             (200, vec![], serde_json::json!({"id": 7001}))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let startup = stub_startup(Some(&api), Some("test-token"));
+        let (_temp, shared, run_id) = mint_fixture(true, None, startup.clone()).await;
         let job = JobId("build".to_owned());
         *own_external_id.lock() = format!("{run_id}:{}", job.0);
 
@@ -10478,7 +9988,7 @@ jobs:
         );
 
         // A persisted job mapping alone (no GitHub lookup) also PATCHes.
-        let (_temp2, shared2, run_id2) = mint_fixture(true, None).await;
+        let (_temp2, shared2, run_id2) = mint_fixture(true, None, startup).await;
         shared2
             .state
             .backend
@@ -10512,7 +10022,6 @@ jobs:
     /// installation's check run succeeds in the same batch.
     #[tokio::test]
     async fn throttled_installation_does_not_block_another() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api, requests) = start_github_stub(|method, path, _body| {
             if path.contains("/access_tokens") {
                 let token = if path.contains("/101/") {
@@ -10560,8 +10069,7 @@ jobs:
             (201, vec![], serde_json::json!({"id": 900}))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
         let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let mut app_a = crate::github_app::GitHubAppCredentials::for_tests(
@@ -10577,7 +10085,9 @@ jobs:
         );
         app_b.installation_id = Some(202);
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![app_a.clone(), app_b],
             default_index: 0,
@@ -10676,7 +10186,6 @@ jobs:
     /// state from the payload; permanent errors drop the row.
     #[tokio::test]
     async fn sender_delivers_vanished_run_and_drops_permanent_failures() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let statuses = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u16>::new()));
         let statuses_for_stub = statuses.clone();
         let (api, requests) = start_github_stub(move |method, _path, _body| {
@@ -10687,10 +10196,11 @@ jobs:
             (status, vec![], serde_json::json!({"id": 555}))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let startup = stub_startup(Some(&api), Some("test-token"));
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = state.shared();
         let job = JobId("build".to_owned());
 
@@ -10723,11 +10233,9 @@ jobs:
     /// GitHub Checks API call; the durable queue carries the reports instead.
     #[tokio::test]
     async fn webhook_fanout_makes_zero_inline_check_calls() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api, requests) =
             start_github_stub(|_method, _path, _body| (200, vec![], serde_json::json!({}))).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+        let startup = stub_startup(Some(&api), Some("test-token"));
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
@@ -10739,7 +10247,7 @@ jobs:
             ));
         }
         std::fs::write(ws_dir.join(".github/workflows/build.yml"), workflow).unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, startup).await;
 
         assert_eq!(
             fixture.post("delivery-check-fanout", Some("push")).await,
@@ -10780,7 +10288,6 @@ jobs:
 
     #[tokio::test]
     async fn terminal_check_retries_not_found_after_creation() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let creates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mock_app = axum::Router::new()
@@ -10826,14 +10333,15 @@ jobs:
         });
 
         // The PAT and API base are part of `AppState` construction
-        // (`state.github_pat` snapshots `PRELOOP_GITHUB_TOKEN` — env wins,
-        // then the config file), so they must be set before `mint_fixture`.
-        let _api_url = crate::state::TestEnvVar::set(
-            "PRELOOP_GITHUB_API_URL",
-            format!("http://127.0.0.1:{port}"),
-        );
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "check-retry-token");
-        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        // (`state.github_pat` is resolved at startup — env wins, then the
+        // config file), so they ride the fixture's startup config.
+        let api_base = format!("http://127.0.0.1:{port}");
+        let (_temp, shared, run_id) = mint_fixture(
+            true,
+            None,
+            stub_startup(Some(&api_base), Some("check-retry-token")),
+        )
+        .await;
         let job_id = JobId("build".to_owned());
         shared
             .state
@@ -10846,12 +10354,6 @@ jobs:
             })
             .await
             .unwrap();
-        let _api_url = crate::state::TestEnvVar::set(
-            "PRELOOP_GITHUB_API_URL",
-            format!("http://127.0.0.1:{port}"),
-        );
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "check-retry-token");
-
         report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Skipped).await;
         // The projector queues the update in the background; drain the
         // sender until the PATCH is retried past its first 404.
@@ -10957,13 +10459,12 @@ jobs:
             .route("/repos/owner/mismatch/branches/{branch}", mismatch_stub);
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
-        let _token =
-            crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "branch-protection-token");
+        let startup = stub_startup(Some(&api_base), Some("branch-protection-token"));
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = state.shared();
 
         assert!(resolve_ref_protected(&shared, "owner/repo", "refs/heads/main").await);
@@ -11091,7 +10592,8 @@ jobs:
         )
         .unwrap();
         // The fixture commits the workspace: that is the older commit.
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let fixture =
+            WebhookFixture::with_workspace(&temp, ws_dir.clone(), stub_startup(None, None)).await;
         let older = git_output(&ws_dir, &["rev-parse", "HEAD"]);
         std::fs::write(ws_dir.join("change.txt"), "newer").unwrap();
         git_output(&ws_dir, &["add", "-A"]);
@@ -11174,7 +10676,7 @@ jobs:
              steps:\n      - run: echo deploy\n",
         )
         .unwrap();
-        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir, stub_startup(None, None)).await;
 
         let comment = |id: u64, created_at: &str| {
             serde_json::to_vec(&serde_json::json!({
@@ -11230,7 +10732,8 @@ jobs:
             "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
         )
         .unwrap();
-        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let mut fixture =
+            WebhookFixture::with_workspace(&temp, ws_dir.clone(), stub_startup(None, None)).await;
         // Workflow fetching reads the event's ref out of the local clone;
         // materialize the PR ref GitHub would have resolved.
         assert!(
@@ -11402,14 +10905,12 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         // Restored when the guards drop (including on panic): a leaked stub
         // base or token breaks every later env-sensitive test in the binary.
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let startup = stub_startup(Some(&api_base), Some("ghp_test_token"));
 
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, startup).await;
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
             shutdown: CancellationToken::new(),
@@ -11649,12 +11150,10 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _pat = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let startup = stub_startup(Some(&api_base), None);
 
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, startup).await;
         let mut state = fixture.state.clone();
         // Two Apps: the single-App fallback (a lone App is still the only App
         // minting can try) deliberately does not apply.
@@ -11781,12 +11280,10 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let startup = stub_startup(Some(&api_base), Some("ghp_test_token"));
 
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, startup).await;
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
             shutdown: CancellationToken::new(),
@@ -11957,14 +11454,12 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         // Restored when the guards drop (including on panic): a leaked stub
         // base or token breaks every later env-sensitive test in the binary.
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let startup = stub_startup(Some(&api_base), Some("ghp_test_token"));
 
         let temp = tempfile::tempdir().unwrap();
-        let fixture = WebhookFixture::new(&temp).await;
+        let fixture = WebhookFixture::new(&temp, startup).await;
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
             shutdown: CancellationToken::new(),
@@ -12059,7 +11554,6 @@ jobs:
     /// and `contents:read`.
     #[tokio::test]
     async fn environment_token_requests_checks_write() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api, requests) = start_github_stub(|method, path, _body| {
             if method == "GET" && path == "/app/installations/101" {
                 return (
@@ -12078,12 +11572,13 @@ jobs:
             (404, vec![], serde_json::json!({"message": "not found"}))
         })
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+        let startup = stub_startup(Some(&api), None);
         // No PAT: the App path must mint.
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "");
 
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let mut app = crate::github_app::GitHubAppCredentials::for_tests(
             "424",
             rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
@@ -12133,11 +11628,12 @@ jobs:
     /// an empty bearer.
     #[tokio::test]
     async fn repo_token_falls_back_to_config_pat() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "");
+        let startup = stub_startup(None, None);
 
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf(), startup.clone())
+            .await
+            .unwrap();
         state.github_pat = Some(preloop_gha_protocol::SecretString::new(
             "config_pat".to_owned(),
         ));
@@ -12152,7 +11648,9 @@ jobs:
         );
 
         let temp2 = tempfile::tempdir().unwrap();
-        let bare = AppState::new(temp2.path().to_path_buf()).await.unwrap();
+        let bare = AppState::new(temp2.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = bare.shared();
         assert_eq!(
             resolve_environment_token(&shared, "owner/repo").await,
@@ -12169,7 +11667,8 @@ jobs:
         temp: &tempfile::TempDir,
         api_base: &str,
     ) -> (WebhookFixture, std::sync::Arc<SharedState>, RunId, JobId) {
-        let fixture = WebhookFixture::new(temp).await;
+        let fixture =
+            WebhookFixture::new(temp, stub_startup(Some(api_base), Some("ghp_test_token"))).await;
         let shared = fixture.state.shared();
         fixture.state.environment_resolver.set_github_configured();
         fixture
@@ -12306,10 +11805,6 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-
         let temp = tempfile::tempdir().unwrap();
         let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
         // The run reports check runs, but the check-run creation task has not
@@ -12435,10 +11930,6 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-
         let temp = tempfile::tempdir().unwrap();
         let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
 
@@ -12532,12 +12023,12 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let startup = stub_startup(Some(&api_base), Some("ghp_test_token"));
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = state.shared();
 
         let run_id = RunId::new();
@@ -12635,12 +12126,12 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let startup = stub_startup(Some(&api_base), Some("ghp_test_token"));
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new(temp.path().to_path_buf(), startup)
+            .await
+            .unwrap();
         let shared = state.shared();
 
         let run_id = RunId::new();
@@ -12748,10 +12239,6 @@ jobs:
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-
         let temp = tempfile::tempdir().unwrap();
         let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
         // No announce ran and no deployment is stamped: the rejection lands
@@ -12847,10 +12334,6 @@ jobs:
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
-
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
         let temp = tempfile::tempdir().unwrap();
         let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;
@@ -12962,10 +12445,6 @@ jobs:
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
-
-        let _env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
         let temp = tempfile::tempdir().unwrap();
         let (fixture, shared, run_id, job_id) = held_environment_fixture(&temp, &api_base).await;

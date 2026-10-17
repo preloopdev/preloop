@@ -180,7 +180,7 @@ fn install(args: InstallArgs) -> Result<()> {
     if !args.user && !args.dry_run {
         require_root()?;
     }
-    let home = resolve_home(args.home.as_deref(), args.user)?;
+    let home = resolve_home(args.home.as_deref(), &crate::preloop_home(), args.user)?;
     let exe = std::env::current_exe().context("resolve current executable path")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     if exe.to_string_lossy().contains("/target/") {
@@ -311,7 +311,7 @@ fn uninstall(args: UninstallArgs) -> Result<()> {
     if !args.user && !args.dry_run {
         require_root()?;
     }
-    let home = resolve_home(args.home.as_deref(), args.user)?;
+    let home = resolve_home(args.home.as_deref(), &crate::preloop_home(), args.user)?;
 
     #[cfg(target_os = "linux")]
     uninstall_systemd(&args, &home)?;
@@ -1411,7 +1411,8 @@ fn install_launchd(
     env_lines: &[String],
 ) -> Result<()> {
     let dry = args.dry_run;
-    let (plist_path, domain) = launchd_target(args.user);
+    let user_home = std::env::var_os("HOME");
+    let (plist_path, domain) = launchd_target(args.user, user_home.as_deref().map(Path::new));
     let plist = render_launchd_plist(exe, home, env_lines)?;
 
     if dry {
@@ -1507,7 +1508,8 @@ fn webhook_hint(public_url: Option<&str>) -> String {
 fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
     let _ = home;
     let dry = args.dry_run;
-    let (plist_path, domain) = launchd_target(args.user);
+    let user_home = std::env::var_os("HOME");
+    let (plist_path, domain) = launchd_target(args.user, user_home.as_deref().map(Path::new));
     let bootout = format!("{domain}/{LAUNCHD_LABEL}");
     run_ok(
         "launchctl",
@@ -1527,16 +1529,18 @@ fn uninstall_launchd(args: &UninstallArgs, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Plist path and launchctl domain for the requested scope.
+/// Plist path and launchctl domain for the requested scope. `user_home` is
+/// the invoking user's home directory, resolved once at the command entry —
+/// nothing here reads process state.
 #[cfg(any(target_os = "macos", test))]
-fn launchd_target(user: bool) -> (PathBuf, String) {
+fn launchd_target(user: bool, user_home: Option<&Path>) -> (PathBuf, String) {
     if user {
-        let home = std::env::var_os("HOME")
+        let home = user_home
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         (
             home.join("Library/LaunchAgents/dev.preloop.server.plist"),
-            format!("gui/{}", unsafe { libc::getuid() }),
+            format!("gui/{}", nix::unistd::getuid().as_raw()),
         )
     } else {
         (PathBuf::from(LAUNCHD_PLIST), "system".to_owned())
@@ -1666,9 +1670,13 @@ fn env_line(key: &str, value: &str) -> Result<String> {
     Ok(format!("{key}={escaped}"))
 }
 
-fn resolve_home(home: Option<&Path>, user: bool) -> Result<PathBuf> {
+/// The service's state home: `--home` when given, else the scope's default.
+/// `engine_home` is the already-resolved engine home (the CLI's
+/// `preloop_home()`); a user install defaults to it so the service and the
+/// invoker share one state tree.
+fn resolve_home(home: Option<&Path>, engine_home: &Path, user: bool) -> Result<PathBuf> {
     let default = if user {
-        crate::preloop_home()
+        engine_home.to_path_buf()
     } else {
         PathBuf::from(DEFAULT_HOME)
     };
@@ -1681,7 +1689,7 @@ fn resolve_home(home: Option<&Path>, user: bool) -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn require_root() -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !nix::unistd::geteuid().is_root() {
         bail!("server install/uninstall must run as root (sudo preloop server install)")
     }
     Ok(())
@@ -2338,11 +2346,8 @@ WantedBy=multi-user.target
 
     #[test]
     fn user_home_defaults_to_preloop_home() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let unique = std::env::temp_dir().join("preloop-home-test");
-        unsafe { std::env::set_var("PRELOOP_HOME", &unique) };
-        let home = resolve_home(None, true).unwrap();
-        unsafe { std::env::remove_var("PRELOOP_HOME") };
+        let home = resolve_home(None, &unique, true).unwrap();
         assert_eq!(home, unique);
     }
 
@@ -2452,14 +2457,11 @@ WantedBy=multi-user.target
 
     #[test]
     fn user_launchd_target_is_gui_domain_in_home() {
-        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let unique = std::env::temp_dir().join("preloop-home-test");
-        unsafe { std::env::set_var("HOME", &unique) };
-        let (path, domain) = launchd_target(true);
-        unsafe { std::env::remove_var("HOME") };
+        let (path, domain) = launchd_target(true, Some(unique.as_path()));
         assert!(path.ends_with("Library/LaunchAgents/dev.preloop.server.plist"));
         assert!(domain.starts_with("gui/"));
-        let (system_path, system_domain) = launchd_target(false);
+        let (system_path, system_domain) = launchd_target(false, None);
         assert_eq!(system_path, PathBuf::from(LAUNCHD_PLIST));
         assert_eq!(system_domain, "system");
     }
@@ -2538,8 +2540,12 @@ WantedBy=multi-user.target
 
     #[test]
     fn resolve_home_requires_absolute() {
-        assert!(resolve_home(None, false).unwrap().is_absolute());
-        assert!(resolve_home(Some(Path::new("relative")), false).is_err());
+        assert!(
+            resolve_home(None, Path::new("/engine"), false)
+                .unwrap()
+                .is_absolute()
+        );
+        assert!(resolve_home(Some(Path::new("relative")), Path::new("/engine"), false).is_err());
     }
 
     #[test]

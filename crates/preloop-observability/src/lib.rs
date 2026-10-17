@@ -213,23 +213,30 @@ impl ObservabilityConfig {
     /// `Debug` and error paths never expose `OTEL_EXPORTER_OTLP_HEADERS` values
     /// or credential-bearing endpoint components (userinfo/query).
     pub fn from_env() -> Self {
-        let log_format = std::env::var("PRELOOP_LOG_FORMAT")
-            .ok()
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Parse the same variables through an explicit environment reader.
+    ///
+    /// This holds the whole value-resolution surface; [`Self::from_env`] is
+    /// just the process-env wrapper. Tests (and any caller that resolves env
+    /// another way) supply explicit values here and never touch the process
+    /// environment.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let log_format = lookup("PRELOOP_LOG_FORMAT")
             .and_then(|v| LogFormat::parse(&v))
             .unwrap_or(LogFormat::Auto);
 
         // CLI defaults to `info` when unset; the standalone server historically
         // used `EnvFilter::from_default_env()` with no fallback (silent when
         // unset). We unify on `info`.
-        let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        let rust_log = lookup("RUST_LOG").unwrap_or_else(|| "info".to_string());
 
-        let service_name =
-            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "preloop".to_string());
+        let service_name = lookup("OTEL_SERVICE_NAME").unwrap_or_else(|| "preloop".to_string());
 
         // Presence — not value — enables export. This is a deliberate
         // deviation from the OTel spec default `http://localhost:4318`.
-        let generic = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .ok()
+        let generic = lookup("OTEL_EXPORTER_OTLP_ENDPOINT")
             .filter(|v| {
                 let v = v.trim();
                 !v.is_empty() && !v.eq_ignore_ascii_case("none")
@@ -240,8 +247,8 @@ impl ObservabilityConfig {
         // base needs the /v1/<signal> suffix. Appending the suffix to a
         // signal-specific URL would produce `/v1/traces/v1/traces`, and
         // sending every signal to one signal-specific URL misroutes the rest.
-        let resolve = |var: &str, suffix: &str| match std::env::var(var) {
-            Ok(value) => {
+        let resolve = |var: &str, suffix: &str| match lookup(var) {
+            Some(value) => {
                 let value = value.trim();
                 if value.eq_ignore_ascii_case("none") {
                     // An explicit per-signal disable must not fall back to
@@ -253,18 +260,15 @@ impl ObservabilityConfig {
                     Some(value.trim_end_matches('/').to_string())
                 }
             }
-            Err(_) => generic.as_ref().map(|g| with_signal_suffix(g, suffix)),
+            None => generic.as_ref().map(|g| with_signal_suffix(g, suffix)),
         };
         let otel_logs_endpoint = resolve("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "/v1/logs");
         let otel_traces_endpoint = resolve("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
         let otel_metrics_endpoint = resolve("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "/v1/metrics");
 
-        let generic_headers = std::env::var("OTEL_EXPORTER_OTLP_HEADERS")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
+        let generic_headers = lookup("OTEL_EXPORTER_OTLP_HEADERS").filter(|v| !v.trim().is_empty());
         let resolve_headers = |var: &str| {
-            std::env::var(var)
-                .ok()
+            lookup(var)
                 .filter(|v| !v.trim().is_empty())
                 .or_else(|| generic_headers.clone())
         };
@@ -1048,22 +1052,18 @@ impl fmt::Debug for ObservabilityRuntime {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-// SAFETY: edition 2024 makes env mutation unsafe; tests are serialized by
-// the harness only within a module, so each test below manages its own
-// variables and restores them — the allow is confined to this module.
-#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
-    /// `ObservabilityConfig::from_env` reads process-global `OTEL_*`
-    /// variables, and several tests mutate them. Cargo runs unit tests on
-    /// many threads inside one process, so these tests race on the
-    /// environment and fail intermittently unless serialized.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Guard that serializes the env-mutating tests.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Explicit environment reader over `pairs` — absent names read as
+    /// unset. Tests never touch the process environment.
+    fn config_from(pairs: &[(&str, &str)]) -> ObservabilityConfig {
+        ObservabilityConfig::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
     }
 
     #[test]
@@ -1078,26 +1078,9 @@ mod tests {
 
     #[test]
     fn absent_endpoint_means_disabled_not_localhost() {
-        let _guard = env_guard();
-        // Ensure no ambient OTEL vars leak into the test.
-        for k in [
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        // Also headers, so `has_otel_headers` is false.
-        for k in [
-            "OTEL_EXPORTER_OTLP_HEADERS",
-            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
-            "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
-            "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        let cfg = ObservabilityConfig::from_env();
+        // Empty reader: no endpoints and no headers, so `has_otel_headers`
+        // is false too.
+        let cfg = config_from(&[]);
         assert!(
             !cfg.otlp_enabled,
             "absent endpoint must be disabled, not localhost:4318"
@@ -1112,49 +1095,25 @@ mod tests {
 
     #[test]
     fn none_disables_signal() {
-        let _guard = env_guard();
-        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "none") };
-        let cfg = ObservabilityConfig::from_env();
+        let cfg = config_from(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "none")]);
         assert!(!cfg.otlp_enabled, "`none` must disable export");
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
     fn generic_none_is_case_insensitive() {
-        let _guard = env_guard();
-        for k in [
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "NONE") };
-        let cfg = ObservabilityConfig::from_env();
+        let cfg = config_from(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "NONE")]);
         assert!(
             !cfg.otlp_enabled,
             "`NONE` must disable export case-insensitively"
         );
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
     fn signal_specific_endpoint_is_used_as_is() {
-        let _guard = env_guard();
-        for k in [
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe {
-            std::env::set_var(
-                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                "http://collector:4318/v1/traces",
-            )
-        };
-        let cfg = ObservabilityConfig::from_env();
+        let cfg = config_from(&[(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "http://collector:4318/v1/traces",
+        )]);
         let targets = cfg.export_targets();
         assert!(cfg.otlp_enabled);
         // The signal-specific URL must be used verbatim — appending the
@@ -1166,21 +1125,11 @@ mod tests {
         // And it must not hijack the other signals.
         assert!(targets.logs.is_none());
         assert!(targets.metrics.is_none());
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") };
     }
 
     #[test]
     fn generic_endpoint_gets_the_signal_suffix() {
-        let _guard = env_guard();
-        for k in [
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318") };
-        let cfg = ObservabilityConfig::from_env();
+        let cfg = config_from(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")]);
         let targets = cfg.export_targets();
         assert_eq!(
             targets.logs.as_ref().unwrap().url,
@@ -1194,26 +1143,14 @@ mod tests {
             targets.metrics.as_ref().unwrap().url,
             "http://collector:4318/v1/metrics"
         );
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
     fn generic_endpoint_query_string_keeps_suffix_before_query() {
-        let _guard = env_guard();
-        for k in [
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe {
-            std::env::set_var(
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "https://collector/acme?tenant=x",
-            )
-        };
-        let cfg = ObservabilityConfig::from_env();
+        let cfg = config_from(&[(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "https://collector/acme?tenant=x",
+        )]);
         let targets = cfg.export_targets();
         // The signal path must precede the query string, not become part of it.
         assert_eq!(
@@ -1224,24 +1161,15 @@ mod tests {
             targets.logs.as_ref().unwrap().url,
             "https://collector/acme/v1/logs?tenant=x"
         );
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
     fn signal_specific_none_disables_only_that_signal() {
-        let _guard = env_guard();
-        for k in [
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318") };
-        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "none") };
-
-        let targets = ObservabilityConfig::from_env().export_targets();
+        let targets = config_from(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+            ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "none"),
+        ])
+        .export_targets();
         assert!(targets.traces.is_none());
         assert_eq!(
             targets.logs.as_ref().unwrap().url,
@@ -1251,13 +1179,6 @@ mod tests {
             targets.metrics.as_ref().unwrap().url,
             "http://collector:4318/v1/metrics"
         );
-
-        for k in [
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
     }
 
     #[test]
@@ -1362,27 +1283,16 @@ mod tests {
 
     #[test]
     fn debug_redacts_headers_and_endpoint_userinfo() {
-        let _guard = env_guard();
-        unsafe {
-            std::env::set_var(
+        let cfg = config_from(&[
+            (
                 "OTEL_EXPORTER_OTLP_ENDPOINT",
                 "https://user:secret@example.com:4318/v1/traces?token=abc",
-            )
-        };
-        for k in [
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        unsafe {
-            std::env::set_var(
+            ),
+            (
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 "Authorization=Bearer secret123",
-            )
-        };
-        let cfg = ObservabilityConfig::from_env();
+            ),
+        ]);
         let dbg = format!("{cfg:?}");
         assert!(
             !dbg.contains("secret"),
@@ -1408,8 +1318,6 @@ mod tests {
             !targets_dbg.contains("Authorization=Bearer"),
             "Debug must not contain raw header pairs: {targets_dbg}"
         );
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
-        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS") };
     }
 
     #[test]
@@ -1422,12 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_bounded() {
-        // Env is only read during `from_config`; the guard must not be held
-        // across the await below (it is a non-async `std` guard).
-        let (obs, rt) = {
-            let _guard = env_guard();
-            Observability::from_config(ObservabilityConfig::from_env())
-        };
+        let (obs, rt) = Observability::from_config(ObservabilityConfig::from_lookup(|_| None));
         // Must not hang even though there are no exporters.
         tokio::time::timeout(Duration::from_secs(3), rt.shutdown())
             .await

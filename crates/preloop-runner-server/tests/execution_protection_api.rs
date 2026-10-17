@@ -14,7 +14,7 @@ struct Fixture {
 async fn fixture() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path.clone())
+    let state = AppState::new_for_tests_with_config(temp.path().to_path_buf(), config_path.clone())
         .await
         .unwrap();
     let app = app(state, CancellationToken::new());
@@ -206,7 +206,7 @@ async fn created_rules_persist_to_the_config_file() {
 
     // A fresh engine pointed at the same file (the restart equivalent)
     // picks the rule up.
-    let rebooted = AppState::new_with_config(
+    let rebooted = AppState::new_for_tests_with_config(
         fixture._temp.path().to_path_buf(),
         fixture.config_path.clone(),
     )
