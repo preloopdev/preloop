@@ -60,10 +60,8 @@ A pool slot retries transient fork failures twice. If teardown still cannot conf
 | Action reference resolution | Negative results cache for 60 seconds; positive results for 300 seconds. |
 | Background reaper | Runs every 10 seconds for the process lifetime. |
 | Runner HTTP POST/PUT | Three attempts with 2- and 4-second delays for transport, 429, and 5xx failures. |
-
-A GitHub transport read (`GET`/`HEAD`) uses the read-only retry policy in builds containing PR #501: up to three attempts with 100 ms and 200 ms delays. Writes and HTTP application errors are not replayed.
-
-PR-dependent: PR #453 retries throttled action downloads at most twice. A usable `Retry-After` is honored within a 10-second to 10-minute range; without one, the delay is randomized between 10 and 30 seconds.
+| Server-side GitHub call during push-back | Not retried by the control plane. A transport or 5xx failure is reported as a gateway error and the push-back is recorded as blocked with the upstream message; any other failure is a client error. Retry the publish from the CLI. |
+| Throttled action download (`429`) | Fails that download and trips the shared GitHub breaker at once. While the breaker is open, the next download fails fast with `503` instead of spending another request on the throttled route. |
 
 ## Runner retry behavior
 

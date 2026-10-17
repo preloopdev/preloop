@@ -79,6 +79,7 @@ The default state home contains:
 | `state/preloop.db`, `-wal`, `-shm` | SQLite control data and live WAL sidecars. |
 | `credentials/` | File-backed App keys, PATs, webhook secrets, and system token; directory `0700`, files `0600`. |
 | `config.toml` | Nonsecret references and, when configured, sealed secret data; mode `0600`. |
+| `secrets.key` | Legacy config-secrets key, written only while the credential store cannot be reached and migrated into it once it can. A file that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>`, never deleted. |
 | `state/hmac-key.bin` | Cluster/runtime JWT and run-secret sealing key; `PRELOOP_HMAC_KEY` can supply it externally. |
 | `state/blobs/`, `state/cache/`, `state/artifacts/` | Artifacts, caches, diagnostics, and blob data. |
 | `state/run-secrets/`, `state/live-logs/` | Sealed per-run secrets and log segments. |
@@ -90,6 +91,4 @@ For SQLite, stop the engine or use a consistent database backup; retain the data
 
 Keep the state directory on one filesystem. Snapshot, blob, and cache publication uses atomic renames; splitting the directory across devices causes `EXDEV` failures. The HMAC key must remain stable across restarts and nodes or stored secrets and state fingerprints cannot be read.
 
-<Note>
-PR-dependent: PR #478 adds Postgres `LISTEN/NOTIFY` wakeups for webhook workers; durable queue state and migrations remain shared through Postgres. PR #591 adds a migration that makes webhook replay identity include the event, so apply that migration before relying on separate `pull_request` and `pull_request_target` replays.
-</Note>
+On Postgres, a dedicated wake listener receives `preloop_webhooks` notifications, so every node's webhook worker wakes when another node makes a delivery claimable. Notifications are only a latency gain: workers re-read the queue at least every five seconds, and durable queue state and migrations remain shared through Postgres. SQLite is single-node and wakes only its own worker. Live logs, debug sessions, and file-backed cache and artifact reservations remain node-local, so a shared store alone is not a complete active-active deployment.

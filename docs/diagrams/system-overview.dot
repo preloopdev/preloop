@@ -19,12 +19,12 @@ digraph system_overview {
     { rank=same; workflow; coord; }
   }
 
-  subgraph cluster_sandbox {
-    label="Sandbox service"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
-    sandbox [label="Sandboxes API\nAcquire, Renew, Release, Exec\nConnect JSON over HTTP", fillcolor="#fef3c7"];
-    provider [label="Provider agent\nPoll CreateWork/ExecWork\nReport and reconcile", fillcolor="#fef3c7"];
-    vm [label="SmolVM microVM\nlibkrun + guest agent\nisolated job runner", fillcolor="#fef3c7"];
-    { rank=same; sandbox; provider; vm; }
+  subgraph cluster_pool {
+    label="MicroVM pool"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    pool [label="Runner pool (preloop-orchestrator)\non-demand forks or warm slots\ngolden cache, host memory cap", fillcolor="#fef3c7"];
+    provider [label="VmProvider (preloop-vm)\nSmolVM default; AgentENV opt-in\nPRELOOP_VM_BACKEND", fillcolor="#fef3c7"];
+    vm [label="microVM per job\nCoW fork of the golden\nguest preloop-runner", fillcolor="#fef3c7"];
+    { rank=same; pool; provider; vm; }
   }
 
   subgraph cluster_storage {
@@ -41,9 +41,9 @@ digraph system_overview {
   server -> workflow [label="parse and expand"];
   server -> coord [label="submit, schedule"];
   coord -> db [label="one command / txn"];
-  server -> sandbox [label="runner pool acquire"];
-  sandbox -> provider [label="work queue"];
-  provider -> vm [label="driver create / exec"];
-  vm -> provider [label="exit and output", constraint=false];
+  server -> pool [label="queued jobs"];
+  pool -> provider [label="fork per job"];
+  provider -> vm [label="libkrun / KVM"];
+  vm -> server [label="register, logs, results", constraint=false];
   db -> checks [label="outbox projection"];
 }

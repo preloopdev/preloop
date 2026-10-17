@@ -1,6 +1,6 @@
 ---
 title: Environment variables
-description: Environment variables read by the Preloop control plane, CLI, and sandbox service.
+description: Environment variables read by the Preloop control plane and CLI.
 ---
 
 Set these variables before starting `preloop serve` or invoking a CLI command. A command-line flag wins over its environment variable. Where a variable mirrors a `config.toml` key, the variable wins over the file; an empty value is usually treated as unset. Invalid values either use the documented fallback or stop startup, as noted below.
@@ -27,7 +27,7 @@ Runner-only variables such as `PRELOOP_BRIDGE_*` and `PRELOOP_DISABLE_ACTIONS_PR
 | `PRELOOP_SECRETS_STORE` | `file` | Workflow-secret backend: `file` or `memory`. |
 | `PRELOOP_HMAC_KEY` | `$PRELOOP_HOME/state/hmac-key.bin`, generated when absent | 32-byte cluster key. The variable accepts exactly 64 hexadecimal characters. |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | `false` | Require job-assignment metadata before dispatching. Boolean values are `1`, `true`, `yes`, `on`, `0`, `false`, `no`, or `off`. |
-| `PRELOOP_REGISTRATION_POLICY` | `strict` | Runner-registration policy: `permissive` allows unregistered runners; any other value selects `strict`. |
+| `PRELOOP_REGISTRATION_POLICY` | `strict` | Runner-registration policy: `permissive` allows unregistered runners and is accepted only on a loopback listen address; any other value selects `strict`. |
 | `PRELOOP_TOKEN_TTL_SECS` | `2999` | Lifetime in seconds for short-lived OAuth assertions. Invalid or unset values use `2999`. |
 | `PRELOOP_LOCAL_WORKSPACE` | Unset | Load workflows from a specified local checkout path. |
 
@@ -56,7 +56,7 @@ The generated pre-push hook reads these variables:
 | `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Discovered from the App, or unset | Numeric installation ID; skips installation discovery. |
 | `PRELOOP_GITHUB_APP_MINT_FAILURE` | `local` | What happens when App token minting fails: `local` leaves the job without an App token, `error` rejects the run, and `pat` uses `PRELOOP_GITHUB_TOKEN`. |
 | `PRELOOP_GITHUB_APPS_JSON` | The `[github.apps]` list, or empty | JSON array of additional App configurations. Invalid JSON stops startup. |
-| `PRELOOP_WEBHOOK_SECRET` | Configured webhook secret, or unset | Secret used to verify `X-Hub-Signature-256`. |
+| `PRELOOP_WEBHOOK_SECRET` | Configured webhook secret, or unset | Verifies `X-Hub-Signature-256` for the default App, and a payload it signs is bound to that App's installation coverage. Other Apps carry their own secret, set with `preloop setup github --via app --webhook-secret`. |
 | `PRELOOP_GITHUB_SERVER_URL` | `https://github.com` | GitHub server URL exposed to workflows. Point it at a GHES host when required. |
 | `PRELOOP_GITHUB_API_URL` | `https://api.github.com` | GitHub REST API base URL. |
 | `PRELOOP_GITHUB_GRAPHQL_URL` | `https://api.github.com/graphql` | GitHub GraphQL endpoint. |
@@ -68,10 +68,8 @@ The generated pre-push hook reads these variables:
 | `PRELOOP_GITHUB_PR_AUTO` | `feature` | Automatic PR policy: `feature` or `never`. |
 | `PRELOOP_GITHUB_PR_DRAFT` | `true` | Whether automatically created pull requests start as drafts. Boolean values are `1`, `true`, `yes`, `0`, `false`, or `no`, case-insensitive. |
 | `PRELOOP_GITHUB_PR_EXCLUDE` | Empty | Comma-separated gitignore-style branch patterns excluded from automatic PR creation. |
-| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | `push,pull_request,check_run,workflow_job` | Comma-separated events requested by the default App manifest. An empty value restores this default. |
-| `PRELOOP_GITHUB_RUNNER_ADMIN` | `false` | When creating an App, request repository `Administration: write` for GitHub runner administration. It does not change an existing App's permissions. |
-
-`PRELOOP_GITHUB_RUNNER_ADMIN` is available when using the App manifest flow. Organization-wide runner administration also needs the corresponding organization permission.
+| `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | `push,pull_request,check_run` | Comma-separated events requested by the default App manifest. An empty value restores this default. |
+| `PRELOOP_ENABLE_APP_REGISTRATION` | Off | `1`, `true`, or `on` serves the App-manifest pages at `/api/v1/github/register` and `/api/v1/github/callback`. Both routes return `404` otherwise. Register Apps with `preloop setup github --via app` and leave this off; enable it only for a browser-driven registration on a remote engine, then unset it. |
 
 ## Retention, limits, and caches
 
@@ -143,34 +141,28 @@ The official packed golden defaults are digest-pinned per architecture. The curr
 - `aarch64`: `ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414`
 - `x86_64`: `ghcr.io/preloopdev/preloop-x86_64-smolvm-golden@sha256:5757a8319aba0604672e62425559f207cc9f21e9380be01e8e80227eaec21914`
 
-## Sandbox service
+## VM backend
 
-The sandbox service is the control plane's VM lifecycle boundary. Its defaults are loopback-only; set both tokens before binding it to a non-loopback address.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PRELOOP_SANDBOX_URL` | `http://127.0.0.1:9191` | Sandbox API URL used by `preloop sandbox`. |
-| `PRELOOP_SANDBOX_TOKEN` | Unset | Client bearer token. Optional for loopback; required for a non-loopback API. |
-| `PRELOOP_SANDBOX_PROVIDER_TOKEN` | Unset | Provider bearer token. Optional for loopback; required for a non-loopback API. |
-| `PRELOOP_SANDBOX_LISTEN` | `127.0.0.1:9191` | Embedded sandbox API address. Set `off` to keep the in-process service without a TCP API. |
-| `PRELOOP_SANDBOX_STORE_URL` | `$PRELOOP_HOME/state/sandbox.db` | Sandbox service store URL. |
-| `PRELOOP_SANDBOX_DRIVERS` | `smolvm` | Comma-separated host drivers. Unknown names fail service startup. |
-| `PRELOOP_SANDBOX_SMOLVM_SLOTS` | `0` | Concurrent SmolVM slot cap. `0` means unbounded. |
-| `PRELOOP_SANDBOX_POOL_DRIVER` | First host driver, or `smolvm` | Driver used for the local runner pool. |
-
-## Actions policy
-
-The actions policy controls the `uses:` references a run may execute. These settings are available in the actions-policy configuration:
+The engine boots each job in a microVM through one provider. SmolVM is the default everywhere; AgentENV is opt-in.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PRELOOP_ACTIONS_POLICY_REQUIRE_SHA_PINNING` | `false` | Require action references to use a full commit SHA. |
-| `PRELOOP_ACTIONS_POLICY_REQUIRE_LOCKFILE` | `false` | Require a repository `actions.lock` file. |
-| `PRELOOP_ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY` | `true` | Verify that a full-SHA action commit is reachable from the referenced repository. |
-
-Each accepts `1`, `true`, or `yes` for true and `0`, `false`, or `no` for false, case-insensitively. Blank values are unset; an invalid value fails server startup. The `allowed_actions` list has no environment override.
+| `PRELOOP_VM_BACKEND` | `smolvm` | `smolvm` or `agentenv` (`aenv` is accepted as an alias). An unrecognized value stops startup rather than falling back. AgentENV needs Linux ≥ 6.8 with `/dev/kvm` and `aenv` on `PATH`. |
 
 <AccordionGroup>
+  <Accordion title="AgentENV backend variables">
+    These apply when `PRELOOP_VM_BACKEND=agentenv`, which drives the `aenv` CLI.
+
+    | Variable | Default | Purpose |
+    |---|---|---|
+    | `PRELOOP_AENV_BINARY` | `aenv` on `PATH` | Path to the `aenv` executable. |
+    | `PRELOOP_AENV_TTL_SECS` | `3600` | Sandbox TTL the provider requests and re-arms. Values below `60` are ignored. |
+    | `PRELOOP_AENV_MANAGE_EGRESS` | `on` | `0`, `false`, `no`, or `off` skips the engine-egress reconciliation with a warning; `dry-run` logs the planned actions and changes nothing. |
+    | `PRELOOP_AENV_ENGINE_IP` | Read from the runner URL | Engine IPv4 address, when the runner URL does not name one and the guest must still reach the engine. |
+    | `PRELOOP_AENV_CONFIG` | `/var/lib/aenv/config/config.toml` | AgentENV node configuration the egress reconciliation reads. |
+
+    AgentENV sandboxes cannot reach a private engine until the node deny-list and host firewall admit exactly the engine's address and port. The engine reconciles both itself and needs passwordless `sudo` for `iptables` and `systemctl`; set `PRELOOP_AENV_MANAGE_EGRESS=0` to keep the defaults and open them by hand.
+  </Accordion>
   <Accordion title="Update and golden-build variables">
     These are mainly for operators building images or running self-updates.
 

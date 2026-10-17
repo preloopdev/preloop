@@ -7,7 +7,7 @@
 //! each test assert both what was asked and what the provider concluded.
 //!
 //! Every command string asserted here was verified against AgentENV 0.2.0 on a
-//! Linux/KVM host (see `docs/vm-substrates.md`).
+//! Linux/KVM host (see `docs/control-plane/architecture/sandboxes.mdx`).
 
 #![cfg(unix)]
 

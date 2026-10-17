@@ -17,7 +17,7 @@ Do not publish the whole listener. In particular, protect:
 
 - `/api/v1/*` native management routes and run logs;
 - `/api/v3/actions/runner-registration` and registration-token routes;
-- `/api/v1/github/register` and `/api/v1/github/callback` after App setup—the callback displays a private key and webhook secret;
+- `/api/v1/github/register` and `/api/v1/github/callback` while App registration is in progress—the callback displays a private key and webhook secret, and both routes return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`;
 - runner protocol, broker, artifact, cache, OIDC, and signed blob URLs.
 
 Native management routes use the system bearer, but the namespace is not uniform: webhooks use `X-Hub-Signature-256`, signed download URLs carry their own credential, and runner protocol routes use job or runner tokens. Do not rely on one blanket `/api/v1` rule in a proxy.
@@ -121,6 +121,8 @@ Names are `UPPER_SNAKE`. Repository scopes use `owner/repo`; environment names u
 
 The config file is mode `0600`; file credentials live in a `0700` credentials directory with `0600` entries. `secrets_store = "memory"` keeps secret mutations only in engine memory and loses them at restart. `credential_store = "file"` is the default; `credential_store = "os"` uses the operating-system store. `PRELOOP_CREDENTIAL_STORE` can additionally select the nonpersistent `memory` backend for test-like deployments.
 
+Stored secrets (`[secrets]` in `config.toml`) are sealed with a key that lives in the same credential store. If that key cannot be read—for example while the macOS login keychain is locked—startup fails and names what to unlock. Preloop never generates a replacement key over sealed secrets, because a new key cannot open them. A `secrets.key` file beside the config that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>` rather than deleted.
+
 For systemd, use an encrypted credential rather than plaintext secrets:
 
 ```sh
@@ -130,10 +132,8 @@ sudo preloop server install --systemd-credential /etc/preloop-secrets.enc
 
 The credential overlays global, repository, and environment secret maps at startup. To remove a value permanently, edit and re-encrypt the credential; a running `preloop secret rm` cannot remove a value supplied by that credential.
 
-<Note>
-PR-dependent: PR #641 adds an operator `[actions_policy]` with `require_sha_pinning = false`, `require_lockfile = false`, `verify_commit_reachability = true`, and `allowed_actions = []`. Its boolean environment overrides are `PRELOOP_ACTIONS_POLICY_REQUIRE_SHA_PINNING`, `PRELOOP_ACTIONS_POLICY_REQUIRE_LOCKFILE`, and `PRELOOP_ACTIONS_POLICY_VERIFY_COMMIT_REACHABILITY`. Policy failures return `403`; malformed lockfiles return `422`, and an oversized lockfile returns `413`.
-</Note>
+Webhook signatures use per-App secrets. `PRELOOP_WEBHOOK_SECRET` verifies `X-Hub-Signature-256` for the default App; a payload it signs is bound to that App's installation coverage. Set another App's secret against that App's id instead:
 
-<Note>
-PR-dependent: PR #620 authorizes remote actions nested inside local composite actions from the immutable snapshot or the run repository's commit. Unreadable manifests and unrelated actions remain denied.
-</Note>
+```sh
+preloop setup github --via app --app-id 123456 --pem-file ./app.pem --webhook-secret '<webhook-secret>'
+```

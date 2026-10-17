@@ -55,6 +55,7 @@ These are current behaviors users can encounter on public/main. They are separat
 |---|---|
 | Runner binary updates | `preloop-runner` acknowledges refresh messages and can refresh settings, but it does not replace its own binary. Update the installed Preloop runner with the product release. |
 | Background-step controls | Background steps and result aggregation are supported; explicit background cancel-control steps are not complete. Workflows using those controls can diverge from the official runner. |
+| Remote actions inside local composites | The control plane admits a remote action only when the run's workflow or an admitted remote composite declares it. A remote `uses:` referenced solely from inside a local composite action is refused with `403`; declare it in the workflow as well. |
 | Action-download telemetry | Action downloads report basic information such as archive size; the structured upstream telemetry payload is not emitted. |
 | Hosted service topology | The control plane exposes 30 runner-facing service definitions, not the complete GitHub/Azure hosted location catalog. Actions that require an unimplemented hosted service can fail. |
 | macOS and Windows jobs | The built-in pool provides Linux guests. A job requiring a matching macOS or Windows runner needs an external runner registered with the corresponding labels. |

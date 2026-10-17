@@ -13,6 +13,8 @@ Delivery states are `received`, `processing`, `done`, and `failed`. Workers hold
 
 Terminal rows are retained for 30 days and pruned every five minutes in batches of 256. This keeps recent delivery IDs available for idempotency and gives operators a local replay window well beyond GitHub's delivery history.
 
+Workers are woken, not only polled. A delivery that one node makes claimable—an enqueue, or an operator replay—wakes that node's worker at once. On Postgres the node also sends one `preloop_webhooks` notification after the commit, coalesced over 15 ms, so every other node's worker wakes too. A lost notification costs only latency: each worker re-reads the queue at least every five seconds. SQLite is single-node and wakes only its own worker.
+
 ## Recovery layers
 
 ### 1. Delivery watchdog
@@ -31,7 +33,7 @@ It joins GitHub's delivery GUIDs with the local queue and requests a redelivery 
 
 The first poll adopts a grace-boundary watermark before reading history. Poll failures do not advance it, and a page limit stores its continuation cursor. Open repair records are retried independently of the watermark. A repair is claimed before the GitHub request, so overlapping watchdogs cannot charge or request the same GUID twice.
 
-Per-GUID repair delays are 0, 5 minutes, 15 minutes, 1 hour, then 6 hours repeatedly. The default cap is five attempts; capped rows stay visible as unresolved findings. The watchdog skips redelivery while the store is unhealthy, while the App breaker is open, or when no App is configured.
+Per-GUID repair delays are 0, 5 minutes, 15 minutes, 1 hour, then 6 hours repeatedly. The default cap is five attempts; capped rows stay visible as unresolved findings. Each App's history is polled while that App's breaker is closed, but a pass that skips any App is not a successful poll: the stale signal keeps aging until every App's history has been read again, because the skipped App's deliveries are unwatched. The watchdog also skips redelivery while the store is unhealthy or when no App is configured.
 
 ### 2. GitHub circuit breaker
 
@@ -44,6 +46,8 @@ The queue gate prevents claims for GitHub-wide unavailability. A rate-limited cr
 ### 3. App health monitor
 
 Every 15 minutes by default, the monitor reads `GET /app` and `GET /app/hook/config` with an App JWT. It reports missing event subscriptions, the permission that gates each event, delivery-URL drift against `PRELOOP_PUBLIC_URL`, and read errors. It only reports and logs drift; it does not modify GitHub App settings.
+
+An App whose own breaker is open is not re-read: its last verdict stays published until the breaker closes, while the other Apps are checked as normal. A held-back App never vanishes from the published list: with no earlier verdict—its breaker was open on the first pass—it is published as explicitly unchecked. Every verdict carries its own `checked_at`, and `app_config_checked_at` advances only when a pass checked every App, so a reused verdict never looks freshly verified.
 
 ### 4. Operator surface
 
@@ -72,7 +76,7 @@ preloop webhooks health [--json]
 | `webhook_dead_letter` | At least one delivery is `failed`. |
 | `webhook_queue_stalled` | The oldest received/processing row is older than 15 minutes. |
 | `github_unavailable` | A breaker is open. |
-| `webhook_watchdog_stale` | No successful watchdog poll for more than 30 minutes. |
+| `webhook_watchdog_stale` | No poll of *every* App in 30 minutes—lost deliveries would go unnoticed. |
 | `webhook_repairs_pending` | At least one repair remains open. |
 | `webhook_config_drift` | An App event, permission, or delivery URL check is unhealthy. |
 
@@ -86,17 +90,13 @@ preloop webhooks health [--json]
 | `PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS` | `300` | Poll cadence; values below 10 become 10. Invalid values use the default. |
 | `PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS` | `120` | Late-delivery grace period; zero is accepted. |
 | `PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS` | `5` | Redelivery requests per GUID. |
-| `PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES` | `5` | History pages per poll; the scan always examines at least one page. |
+| `PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES` | `5` | History pages per App per poll; the scan always examines at least one page. |
 | `PRELOOP_GITHUB_BREAKER` | on | Same off spellings as the watchdog. |
 | `PRELOOP_GITHUB_BREAKER_THRESHOLD` | `3` | Positive consecutive-failure count; invalid or zero values use 3. |
 | `PRELOOP_WEBHOOK_HEALTH_INTERVAL_SECS` | `900` | App health cadence; values below 60 become 60. |
 | `PRELOOP_WEBHOOK_WORKERS` | `8` | Concurrent deliveries per node; invalid values use 8 and the effective minimum is 1. |
 | `PRELOOP_PUBLIC_URL` | loopback from `serve` | Expected public webhook base and Check Run link base. A standalone server with no value treats the expected URL as unknown. |
 
-## Shared-store and replay notes
+## Shared store and replay
 
-SQLite workers wake locally. A Postgres deployment shares the durable queue and claims with `FOR UPDATE SKIP LOCKED`; workers also poll for work. PR-dependent: PR #478 adds Postgres `LISTEN/NOTIFY` wakeups with short coalescing and reconnect wake forwarding; SQLite remains local-only.
-
-PR-dependent: PR #591 widens replay identity to `(delivery, workflow path, event)`. A pull-request delivery can therefore create both its `pull_request` and synthesized `pull_request_target` runs without one suppressing the other.
-
-PR-dependent: PR #475 partitions App-JWT breaker state by App ID. Watchdog and health checks can continue for a healthy App while another App's GitHub authentication bucket is open.
+Postgres deployments share the durable queue and claims with `FOR UPDATE SKIP LOCKED`, and the wake notification described above reaches every node's workers. SQLite keeps the queue on the single engine and wakes only its own worker. Replay always requeues the retained local payload, so it needs neither GitHub nor an App JWT.

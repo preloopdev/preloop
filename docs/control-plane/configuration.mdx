@@ -45,12 +45,6 @@ exclude = ["release/*"]         # branch patterns that never get a pull request
 kind = "official"               # "official", "oci", "dockerfile", or "file"
 # base_image = "ghcr.io/acme/base@sha256:…"   # set for a custom image
 
-[actions_policy]                 # controls `uses:` references
-require_sha_pinning = false      # require full commit SHAs
-require_lockfile = false         # require .github/workflows/actions.lock
-verify_commit_reachability = true
-allowed_actions = []              # optional [!] repository/ref patterns
-
 [secrets]                       # written by `preloop secret set`
 DOCKERHUB_TOKEN = "sealed:v1:…"
 
@@ -71,14 +65,7 @@ Keys under `[github]` that hold credentials, such as `app_pem_ref` and `webhook_
 | `[execution_protection]` | Event and actor rules that gate workflow runs. | [Security](/control-plane/operate/security) |
 | `[token_permissions_ceiling]` | A cap on the `permissions:` a job token may request. | [Security](/control-plane/operate/security) |
 | `[environment_rules."owner/repo".<env>]` | Protection rules for a deployment environment. | [Security](/control-plane/operate/security) |
-| `[actions_policy]` | Which `uses:` references a run may execute, and pinning requirements. | [Security](/control-plane/operate/security) |
 | `[cache]`, `[checkout_cache]` | Actions cache quota and checkout reuse. | [Environment variables](/control-plane/reference/environment) |
-
-### Actions policy
-
-The actions policy applies to top-level and reusable workflows. `require_sha_pinning` requires full commit-SHA references. `require_lockfile` requires a repository `actions.lock` file. `verify_commit_reachability` checks that a full-SHA reference is reachable from the referenced repository and is enabled by default. `allowed_actions` accepts `[!]PATTERN` entries for repository and ref matching; it has no environment-variable override.
-
-When an `actions.lock` file exists, `preloop run` submits it with the workflow. A lockfile larger than 1 MiB or with a malformed path is rejected before the run is accepted. See [Environment variables](/control-plane/reference/environment) for boolean overrides.
 
 ## GitHub credentials
 
@@ -133,7 +120,9 @@ Runs from untrusted sources get no stored secrets. This includes pull requests f
 
 ### How stored values are protected
 
-Values in the file are encrypted. The file holds `sealed:v1:` ciphertext, and the data key lives in the credential directory. A `0600` `secrets.key` file next to the config is used only when that store is unreachable. `preloop secret list` and `preloop doctor` never print values, and job logs mask them.
+Values in the file are encrypted. The file holds `sealed:v1:` ciphertext, and the data key lives in the credential store. A `0600` `secrets.key` file next to the config is written only while that store cannot hold the key, and it is migrated into the store once it can. `preloop secret list` and `preloop doctor` never print values, and job logs mask them.
+
+If the key cannot be read, for example while the macOS login keychain is locked, startup fails and names what to unlock. Preloop never generates a replacement key over sealed secrets, because a new key cannot open them. A `secrets.key` file that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>`, never deleted.
 
 To keep secrets out of the configuration file entirely, use `secrets_store = "memory"` with a systemd encrypted credential. [Deploy](/control-plane/operate/deploy) describes the credential setup.
 
@@ -143,7 +132,6 @@ The engine keeps run history, queued jobs, runners, sessions, and logs. They sur
 
 - **SQLite** is the default. The database is `$PRELOOP_HOME/state/preloop.db`, and the engine needs no setup.
 - **Postgres** is optional. Set `PRELOOP_STORE_URL` or pass `--store postgres://…` to `preloop serve`, after running `preloop store migrate`.
-- **Sandbox service state** is `$PRELOOP_HOME/state/sandbox.db`, with sandbox blobs under `$PRELOOP_HOME/state/sandbox-blobs`.
 
 `preloop serve` never changes the schema. It refuses to start on a schema it does not expect, and `preloop store migrate` is the explicit upgrade. [Storage](/control-plane/operate/storage) covers backups, retention, and moving from an older database.
 

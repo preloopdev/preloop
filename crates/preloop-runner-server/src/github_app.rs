@@ -39,8 +39,8 @@ use crate::shared_http::CLIENT;
 /// a variable that holds a path to a PEM file rather than the PEM itself.
 ///
 /// Two naming pairs are accepted: `PRELOOP_GITHUB_APP_PEM{,_FILE}` and the older
-/// `PRELOOP_GITHUB_APP_PRIVATE_KEY{,_PATH}` already published in
-/// `docs/github-app-webhook.md`.
+/// `PRELOOP_GITHUB_APP_PRIVATE_KEY{,_PATH}` documented in
+/// `docs/control-plane/github/tokens.mdx`.
 const PRIVATE_KEY_ENV: [(&str, bool); 4] = [
     ("PRELOOP_GITHUB_APP_PEM", false),
     ("PRELOOP_GITHUB_APP_PEM_FILE", true),

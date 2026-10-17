@@ -53,7 +53,7 @@ sudo preloop server install \
 
 This writes `preloop.service` and `preloop.socket`, a private environment file, and—unless `--no-update-timer` is set—`preloop-update.service` and `preloop-update.timer`. The socket listens on the configured port and starts the service on demand. The update timer waits 10 minutes after boot, then checks hourly with a randomized delay of up to 30 minutes.
 
-The system install uses a dedicated `preloop` account, keeps state in `/var/lib/preloop` by default, delegates CPU/memory/PID cgroups to the VM launcher, and restarts the service after failure. Use `--systemd-credential PATH` to mount an encrypted secret file with `LoadCredentialEncrypted`; create it with:
+The system install uses a dedicated `preloop` account, keeps state in `/var/lib/preloop` by default, delegates CPU/memory/PID cgroups to the VM launcher, and restarts the service after failure. On Linux it also adds that account to the host's `kvm` group when `/dev/kvm` exists, because the VMM opens the device as the service identity; it warns instead when there is no `kvm` group or the change fails. Use `--systemd-credential PATH` to mount an encrypted secret file with `LoadCredentialEncrypted`; create it with:
 
 ```sh
 systemd-creds encrypt --name=preloop-secrets secrets.toml /etc/preloop-secrets.enc
@@ -121,7 +121,7 @@ sudo journalctl -u preloop.service -f
 
 `preloop status` reads queue health and recent runs. The native status endpoint requires the system bearer; keep `PRELOOP_SYSTEM_TOKEN` in the credential store or another protected environment. After updating SmolVM or the binary under a system install, rerun `sudo preloop server install` so the service's protected runtime prefix is refreshed atomically.
 
-Only one engine can own a state directory. Stop both units before starting a replacement:
+Only one engine can own a state directory. A second `preloop serve` on the same `PRELOOP_HOME` exits at once; when the operating system can prove which process owns `serve.lock`, the error names the engine and the way to stop it. Stop both units before starting a replacement:
 
 ```sh
 sudo systemctl stop preloop.socket preloop.service
@@ -129,20 +129,13 @@ sudo systemctl stop preloop.socket preloop.service
 
 A normal restart reconciles claims: jobs returned to `ready` can be delivered again, while terminal or unclaimable work is settled. Pool VMs are not resumed across a process restart; rerun the affected workflow when needed.
 
-<Note>
-PR-dependent: PR #589 gives an autostarted engine up to 35 seconds to wait for a predecessor to release `serve.lock` and extends readiness polling to 70 seconds. A foreground `preloop serve` remains fail-fast when the lock is held.
-</Note>
-
-<Note>
-PR-dependent: PR #588 adds a boot pass that closes unbound attempts whose jobs have left the queue before the engine begins serving.
-</Note>
-
 ## Common problems
 
 | Symptom | Action |
 |---|---|
 | Webhook delivery is `401` | Check the App secret and `X-Hub-Signature-256`; an empty secret is not accepted. |
 | Webhooks are absent | Check the public URL, proxy path, TLS, and App event subscriptions. |
+| Webhook delivered but nothing runs | Confirm the webhook secret matches the App (`PRELOOP_WEBHOOK_SECRET` for the default App; `preloop setup github --via app --webhook-secret` for any other), and that the workflow's `on:` matches the event. |
 | Checks remain queued | Confirm the runner bundle, pool labels, available disk, and memory cap. |
 | VM compiler is killed | Increase `PRELOOP_RUNNER_MEMORY_MIB` and reduce pool concurrency. |
 | `401` from CLI | Match the CLI bearer (`PRELOOP_TOKEN`) to the engine's system credential. |

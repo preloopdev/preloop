@@ -1,6 +1,6 @@
 ---
 title: Job lifecycle
-description: How a webhook or CLI submission becomes a runner job, executes in a sandbox, and reports checks and results.
+description: How a webhook or CLI submission becomes a runner job, executes in an isolated machine, and reports checks and results.
 ---
 
 A Preloop run is durable before a runner starts it. The control plane accepts a trigger, builds a queue of dependency-aware jobs, leases each job to a matching runner, and settles the result before promoting dependents.
@@ -62,7 +62,7 @@ If no matching runner appears, a ready job receives a 120-second grace window. A
 
 ## 4. Execute and report
 
-The runner worker prepares its workspace, evaluates step conditions, resolves actions and scripts, and executes each step in the assigned sandbox. During execution it sends:
+The runner worker prepares its workspace, evaluates step conditions, resolves actions and scripts, and executes each step in the assigned runner. For pool-managed runs that runner is a microVM forked from the resident golden and deleted when the job ends, so every job gets a fresh machine. See [MicroVM pool](/control-plane/architecture/sandboxes). During execution it sends:
 
 - timeline records, annotations, and log chunks through the runner-compatible `/_apis/` routes;
 - step updates and signed log/artifact URLs through Results/Twirp services;
@@ -90,4 +90,4 @@ The outbox projector turns run/job events into coalesced check-run updates. One 
 | `skipped` | A condition, dependency result, or trigger policy prevented execution. |
 | `timed_out` | The stored conclusion refines a failure caused by the job timeout. |
 
-The default job timeout is 360 minutes; declared job timeouts are capped at five days. The background reaper cancels attempts that exceed the effective timeout, expires stale leases, fails permanently unmatchable ready jobs, and reclaims orphaned runner claims after restart. A failed job can be retained for a debug session or a preserved sandbox; see [Debugging](/control-plane/guides/debugging) for the interactive path.
+The default job timeout is 360 minutes; declared job timeouts are capped at five days. The background reaper cancels attempts that exceed the effective timeout, expires stale leases, fails permanently unmatchable ready jobs, and reclaims orphaned runner claims after restart. A failed job can be retained for a debug session or a preserved microVM; see [Debugging](/control-plane/guides/debugging) for the interactive path.

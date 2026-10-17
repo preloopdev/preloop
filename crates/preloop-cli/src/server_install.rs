@@ -88,7 +88,7 @@ pub(crate) struct InstallArgs {
     /// Externally reachable base URL (GitHub webhook + Checks links). GitHub
     /// must be able to reach it: a public domain with DNS + reverse proxy for
     /// production, or a tunnel (cloudflared, ngrok, Tailscale Funnel) to try
-    /// it out. See docs/setup.md "Exposing the engine to GitHub".
+    /// it out. See docs/control-plane/operate/deploy.mdx "Exposure options".
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
 
@@ -1498,7 +1498,7 @@ fn webhook_hint(public_url: Option<&str>) -> String {
              \x20 webhooks:  no --public-url set — GitHub can't reach the engine yet.\n\
              \x20          Re-run with --public-url (tunnel: `cloudflared tunnel --url\n\
              \x20          http://127.0.0.1:9090`; production: DNS + reverse proxy).\n\
-             \x20          See docs/setup.md \"Exposing the engine to GitHub\"."
+             \x20          See docs/control-plane/operate/deploy.mdx \"Exposure options\"."
             .to_owned(),
     }
 }

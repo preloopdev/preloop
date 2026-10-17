@@ -67,7 +67,7 @@ At workload launch, the engine raises hosted-runner limits to a 16 MiB soft stac
 | `fs.inotify.max_user_watches` | `655360` |
 | `fs.inotify.max_user_instances` | `1280` |
 
-The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings.
+The engine also verifies that the guest hostname resolves to a local address and removes stale foreign mappings. The guest does not expose `/dev/kvm`: workloads that need nested virtualization must run on a runner outside the microVM pool.
 
 ## Runner bundle discovery
 
@@ -103,11 +103,6 @@ official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-ar
 ```
 
 That file also records the hosted runtime limits and sysctl values shown above. Changing a compiled pin requires rebuilding and replacing the `preloop` executable; it does not change an already-installed binary.
-
-<Note>
-PR-dependent: PR #617 adds KVM-group setup and makes `/dev/kvm` world-accessible for the guest runner, reasserting access at launch. It adds no operator variable.
-</Note>
-
 
 ## Troubleshooting
 

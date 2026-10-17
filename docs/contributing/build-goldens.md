@@ -121,7 +121,7 @@ sha256sum dist/preloop-ubuntu-24.04-x86_64 \
 configured `PRELOOP_RUNNER_BASE_IMAGE` / `[golden] base_image` when the flag is
 absent). There is no default — the official golden is published packed and
 cannot be built locally. The bake adds the runner contract only; see
-[VM images](/control-plane/operate/vm-images#what-the-golden-contains).
+[VM images](../control-plane/operate/vm-images.mdx#what-the-bake-and-guest-setup-provide).
 
 `build-golden` renames the `.smolmachine` sidecar to the requested output
 path. The launcher stub is discarded; the output file itself is the packed

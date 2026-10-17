@@ -65,6 +65,8 @@ preloop run -f .github/workflows/ci.yml --event push
 - `--event` simulates the trigger that starts the run. It defaults to `push`. For `pull_request` workflows, pass `--event pull_request`. The run then tests the merge with the base branch, which is fetched from `origin`.
 - The run snapshots your working tree, so you do not need to commit or push first.
 
+<video controls src="/demo/debug.mp4" alt="Screen recording of a local run failing, a fix applied in another terminal pane, and the workflow re-run without a push" aria-label="Screen recording of a local run failing, a fix applied in another terminal pane, and the workflow re-run without a push" />
+
 The first job downloads and prepares the official image, so it takes longer than later jobs. Follow the run with:
 
 ```sh

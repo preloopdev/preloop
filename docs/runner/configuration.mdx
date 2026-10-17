@@ -33,9 +33,9 @@ These flags apply to every command.
 | `--token <TOKEN>` | Required. Falls back to `PRELOOP_RUNNER_TOKEN`. | Registration token from GitHub, or the control plane's system token. | `--token` |
 | `--name <NAME>` | Host name | Runner name shown in GitHub. | `--name` |
 | `--labels <LIST>` | None | Extra labels, separated by commas. | `--labels` |
-| `--runner-group <NAME>` | `default` | Self-hosted runner group to join. The name matches case-insensitively. | `--runnergroup` |
+| `--runner-group <NAME>` | `default` | Runner group recorded in the runner's settings, for organization runners. | `--runnergroup` |
 | `--work <DIR>` | `_work` | Work directory name. See the notes below. | `--work` |
-| `--replace` | Off | Replaces an existing local configuration, and a same-named runner on the server. | `--replace` |
+| `--replace` | Off | Replaces an existing local configuration, and a runner of the same name that registration finds on the server. | `--replace` |
 | `--ephemeral` | Off | The runner exits after one job. | `--ephemeral` |
 | `--no-externals` | Off | Skips the Node 20 and Node 24 download. | None |
 | `--unattended` | Off | Accepted for compatibility. `configure` never prompts, so this changes nothing. | `--unattended` |
@@ -56,7 +56,7 @@ capabilities, or change `runs-on` to match the labels you actually advertise.
 For a control-plane-managed runner, add labels with `PRELOOP_RUNNER_LABELS`;
 for this standalone runner, pass them to `configure --labels`.
 
-- `--runner-group` must name a self-hosted group. An unknown or ambiguous name fails `configure` and lists the available groups.
+- `--runner-group` is stored in the runner's settings; it does not change the pool registration targets.
 - `--work` is saved in `.runner`, but job workspaces are always created under `_work/` in the runner root. Changing this value does not move them.
 - With `--no-externals`, JavaScript actions use the `node` found on `PATH`. Its major version must match the action's Node version, or the action fails.
 
@@ -66,7 +66,6 @@ for this standalone runner, pass them to `configure --labels`.
 |---|---|---|---|
 | `--once` | Off | Exits after the first job finishes. | `run.sh --once` |
 | `--via` | `broker` | Protocol path. `broker` is GitHub's job service path. `azdo` is the older distributed-task path. | None |
-| `--jitconfig <VALUE>` | Unset | Starts from a just-in-time configuration. Cannot be combined with `--via`. Implies `--once`. Deletes the configuration files on exit. | `run.sh --jitconfig` |
 
 - Ctrl-C or SIGTERM stops the runner. A running job gets 60 seconds to wind down, then the runner stops it and reports it canceled.
 - A runner configured with `--ephemeral` exits after one job, the same as `--once`.
@@ -77,7 +76,7 @@ for this standalone runner, pass them to `configure --labels`.
 |---|---|---|---|
 | `--token <TOKEN>` | Required | Remove token from GitHub. | `config.sh remove --token` |
 
-`remove` deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `_work/` and `externals/` in place. If the server cannot deregister the runner, `remove` exits with an error.
+`remove` deregisters the runner with the server, then deletes `.runner`, `.credentials`, and `.credentials_rsaparams`. It leaves `_work/` and `externals/` in place. If the server cannot deregister the runner, it warns and deletes the local files anyway, so remove the runner in the repository or organization settings as well.
 
 ## lint
 

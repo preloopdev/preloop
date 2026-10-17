@@ -43,6 +43,8 @@ The rewrite applies only when checkout inputs are default-equivalent. A non-defa
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
+The command stores the App ID, private key, and webhook secret in the credential store. When you attach an existing App—or register one through the engine's browser flow—pass `--webhook-secret` so the secret is bound to that App's id; `PRELOOP_WEBHOOK_SECRET` remains the single default-App slot and cannot address a second App. See [GitHub App](/control-plane/github/app) for the registration walkthrough.
+
 An App installation token is minted per job, scoped to the repository and the job's effective `permissions:`. The engine requests one repository and an explicit permission map, never the installation's entire repository set. Installation discovery pages 100 installations at a time, up to 10 pages, and caches only the installation ID for the process lifetime. Tokens themselves are not reused.
 
 Relevant settings are:
@@ -61,6 +63,8 @@ Relevant settings are:
 The first nonblank PEM setting wins. PKCS#1 and PKCS#8 PEMs are accepted, and literal `\n` sequences are restored when an environment variable flattened the key. An App ID without a key is a warning and disables minting; an unreadable or invalid key paired with an App ID is a startup error. Unknown mint-failure values are startup errors.
 
 The App JWT is RS256, backdated 60 seconds, and expires after 10 minutes. A GitHub `422` for unavailable permissions causes Preloop to read the installation grants, narrow the request, and retry once. The resulting permissions are visible in `system.github.token.permissions`.
+
+App-JWT breaker state is partitioned by App id. An outage for one registered App therefore does not block minting through another; an open bucket for an App still invokes the configured mint-failure policy for that App.
 
 ## Permission mapping and fallback
 
@@ -101,15 +105,3 @@ For an ordinary trusted job, the effective order is:
 3. An empty `GITHUB_TOKEN`; anonymous public API reads may still work.
 
 The runtime JWT remains separate at every step. It continues to authenticate cache, artifacts, logs, OIDC, and local checkout.
-
-<Note>
-PR-dependent: PR #633 adds a runner control-plane classification. When the registration URL is a GitHub control plane, the GitHub token context is projected to `GITHUB_TOKEN`; for an engine/self-hosted control plane it remains fenced from the runtime credential. The `system.github.token.permissions` wire map is unchanged.
-</Note>
-
-<Note>
-PR-dependent: PR #597 adds an anonymous public-checkout relay when no App or PAT was applied. Eligible default checkouts use a fresh local runtime JWT to reach the relay; the relay strips that JWT before the anonymous upstream request. Explicit credentials, SSH, different forges, and private repositories remain direct or fail upstream.
-</Note>
-
-<Note>
-PR-dependent: PR #475 partitions App-JWT breaker state by App ID, so an outage for one registered App does not block minting through another. An open App bucket still invokes the configured mint-failure policy for that App.
-</Note>

@@ -3,15 +3,15 @@
 **Purpose and status:** this is an engineering tracker comparing Preloop with
 the official GitHub Actions runner/server. It contains dated campaign results
 and design notes; do not read every item below as a current support matrix.
-For current setup and host requirements, see [Self-hosting](/control-plane/operate/deploy)
-and [Preloop vs. other runners](/comparison).
+For current setup and host requirements, see [Self-hosting](../control-plane/operate/deploy.mdx)
+and [Preloop vs. other runners](../comparison.mdx).
 
 Preloop combines the control plane with a runner pool. The default product
 execution path uses SmolVM/libkrun microVMs; AgentENV is an optional Linux
 backend. The control-plane protocol is a separate component, but protocol
 compatibility does not mean every alternative runner host is a supported or
 productized deployment. Remote-runner authentication and multi-host pool
-limitations are tracked in [the roadmap](/roadmap).
+limitations are tracked in [the roadmap](../roadmap.md).
 
 The Rust runner protocol client (`preloop-runner`) lives in this workspace
 alongside the control plane.
@@ -40,7 +40,8 @@ third-party GitHub Apps can trigger runs against it with no code changes:
 Auth follows the github.com model: bearer installation tokens (own App offline
 via a mint ledger; any App online via a GitHub round-trip), own-App JWTs, a
 PAT, or the system token; `actions: write` is required for dispatch. See
-[`GitHub tokens`](/control-plane/github/tokens) §7.
+[the dispatch API docs](../control-plane/github/rest-api.mdx) ("Base URL and
+authentication").
 
 Deliberately **not** implemented: numeric workflow/run ids (filenames only —
 the read endpoints expose deterministic hashes), the rest of the GitHub REST
@@ -433,7 +434,7 @@ dump-workflow change in `runner-image-blobs` before a corrected image lands.
 | A custom `shell:` command line was collapsed into one argv entry                       | `taiki-e/install-action` declares `shell: /usr/bin/env -u ENV … /bin/sh -eu {0}`; `env` unset one absurdly named variable, found no command, printed the environment, exited 0 — the step "succeeded" installing nothing and the next step died with `no such command: hack`                                 | `resolve_shell` splits every whitespace token; `{0}` substitution per token                                                                                                                                                                                     |
 | Toolchain bin directories were not on the runner's PATH **(obsolete — no toolchain is baked any more, and the guest PATH is the system PATH, as on GitHub)**                                | `dtolnay/rust-toolchain` only appends `$CARGO_HOME/bin` to `$GITHUB_PATH` when it installs rustup itself, so on an image that already has rustup (ours, and GitHub's) anything `cargo install`-ed was unreachable                                                                                            | the guest runner is launched with an explicit PATH covering `$HOME/.cargo/bin` and `/usr/local/go/bin`                                                                                                                                                          |
 | The baseline wiped `/var/lib/apt/lists` **(obsolete — there is no bake to wipe them; the golden keeps the image's own apt state)**                                                | uv's musl cell runs `sudo apt-get install musl-tools` with no `apt-get update`: `E: Unable to locate package`                                                                                                                                                                                                | keep the lists; a fork of a pack that shipped without them refreshes on provision                                                                                                                                                                               |
-| Rosetta enable failure left a half-created machine | An Apple Silicon host without Rosetta or a failed update must surface the provider error | The provider deletes the partial machine; see [VM images](/control-plane/operate/vm-images) |
+| Rosetta enable failure left a half-created machine | An Apple Silicon host without Rosetta or a failed update must surface the provider error | The provider deletes the partial machine; see [VM images](../control-plane/operate/vm-images.mdx) |
 | A fork of the packed golden trusted the pack's bake **(obsolete — there is no per-fork toolchain install: the golden is the image plus the runner contract, and nothing is installed on top)**                                    | a published pack predating the workspace's toolchain pin boots without cargo, and cargo-dist dies on "you don't appear to have cargo installed" in 11s                                                                                                                                                       | probe each toolchain layer per fork and install only what the pack lacks; and `build-golden` now bakes the workspace's toolchains (`rust-toolchain.toml` etc.) into the artifact, so forks inherit them — the per-fork install is gone once the pack is rebuilt |
 | The guest hostname did not resolve                                                     | every `sudo` call printed `sudo: unable to resolve host <name>`, which appears in no hosted log                                                                                                                                                                                                              | the baseline adds the hostname to `/etc/hosts`                                                                                                                                                                                                                  |
 | `apt-get install` prompted, and a step's stdin never reached EOF                       | the hosted images ship `/etc/apt/apt.conf.d/90assumeyes`, so uv's `sudo apt-get install musl-tools` (no `-y`) installs three packages without a prompt; here it asked `Do you want to continue? [Y/n]` and, because the runner is a child of a guest `exec` whose stdin never closes, blocked for 45 minutes | ship the same apt config, and give every step `Stdio::null()` for stdin                                                                                                                                                                                         |

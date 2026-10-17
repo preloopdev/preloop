@@ -1,7 +1,7 @@
 # Preloop Roadmap
 
 **Status snapshot:** current-state descriptions were checked against `public/main`
-(`b188b58ed`) on October 16, 2026. This is an engineering tracker, not a
+(`3134b969b`) on October 17, 2026. This is an engineering tracker, not a
 support contract; verify with the linked docs before planning a deployment.
 Protocol-fidelity campaigns and historical gaps live in
 [Compatibility](/compatibility).
@@ -38,7 +38,7 @@ Protocol-fidelity campaigns and historical gaps live in
 | 9   | Notifications (Slack/email/webhook-out) on run results     | Not implemented                                                                                                  | [INFERENCE: no code or doc references]                                | — |
 | 10  | Protected-environment approval gates                       | Implemented: GitHub-sourced reviewer rules, authorized Check Run Approve/Reject actions, and a native operator override. Local TOML mode supports at most one shared-credential approval, not distinct-user quorum | `environment_resolver.rs`; `github.rs`; `routes.rs`; `config.rs` | — |
 | 11  | Complete multi-node HA (leader election, shared queue and node-aware routing) | Shared Postgres control state, cross-node runner wakeups, and outbox-backed event delivery are implemented. Complete HA still requires node-aware handling for local payload/reservation state and a shared secret provider; authoritative runs/jobs no longer diverge through process-local state | `control/`; `control/wake.rs`; `event_feed.rs`; `secret_provider.rs`; [API and state](/control-plane/architecture/api-and-state) | Node-aware payloads and shared secrets |
-| 14  | Pool agent: microVM pools on hosts other than the control plane | Built-in pool is co-hosted in-process and shares demand, image-selection, preparation, and provision-token state with the server. Label sharing is optional for fixed-image pools; a standalone authenticated remote pool-agent integration is not shipped on public/main; open PR #619 adds that path | `preloop-cli/src/main.rs`; `bootstrap.rs`; `preloop-orchestrator/src/lib.rs`; `runtime_scheduling.rs` | #13 |
+| 14  | Pool agent: microVM pools on hosts other than the control plane | Built-in pool is co-hosted in-process and shares demand, image-selection, preparation, and provision-token state with the server. Label sharing is optional for fixed-image pools; a standalone authenticated remote pool-agent integration is not shipped | `preloop-cli/src/main.rs`; `bootstrap.rs`; `preloop-orchestrator/src/lib.rs`; `runtime_scheduling.rs` | #13 |
 
 
 ## Sequencing (prioritization; not hard technical dependencies)
@@ -75,10 +75,10 @@ so strict-by-default needs an explicit opt-out for the harness.
 at a reachable address; the wire protocol already allows it, which is the whole point of
 the fidelity work.
 - #14 depends on #13. The built-in pool is shipped in-process and shares demand,
-  image-selection, preparation, and provision-token state with the server; open
-  PR #619 adds an authenticated remote pool-agent path. Its technical blocker
-  is one field: replacing the shared `next_job_runs_on` lock with a request
-  ("what labels are queued?") is what lets the orchestrator run anywhere. Guests
+  image-selection, preparation, and provision-token state with the server. A
+  standalone remote pool-agent path would need one field replaced: the shared
+  `next_job_runs_on` lock becomes a request ("what labels are queued?"), which is
+  what would let the orchestrator run anywhere. Guests
   still never touch the network. The earlier 791 MB bandwidth figure is not part
   of the current evidence.
 

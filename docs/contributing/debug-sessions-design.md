@@ -1,6 +1,6 @@
 # Debug sessions: design notes
 
-This note records the shipped debug-session contract for contributors. The user-facing workflow is [Debugging failed jobs](/control-plane/guides/debugging); this document explains why the current boundaries exist and which state each component owns.
+This note records the shipped debug-session contract for contributors. The user-facing workflow is [Debugging failed jobs](../control-plane/guides/debugging.mdx); this document explains why the current boundaries exist and which state each component owns.
 
 ## One session, several controllers
 

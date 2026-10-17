@@ -40,14 +40,13 @@ preloop run --job test --secret TOKEN=x
 
 **Local workspace.** A run snapshots your working tree, including uncommitted and untracked files that git does not ignore. The run never depends on what you pushed.
 
-**Interactive debugging.** In a terminal, a non-detached run pauses a failed job for `preloop debug`. Pass `--debug` to opt in for detached or non-interactive runs.
+**Interactive debugging.** In a terminal, a non-detached run on the default SmolVM backend pauses a failed job for `preloop debug`. Pass `--debug` to opt in for detached or non-interactive runs; the AgentENV backend (`PRELOOP_VM_BACKEND=agentenv`) never pauses implicitly, so it needs the flag as well.
 
-**`pull_request` runs.** Like GitHub, a local `pull_request` run tests the merge of the base branch's current tip into your head. The base is fetched from `origin`. If it cannot be fetched, the run fails, and `--no-merge` tests the branch alone. A clean submission to a remote engine also needs `--no-merge`; local-workspace and dirty-push submissions retain the merge behavior.
+**`pull_request` runs.** Like GitHub, a local `pull_request` run tests the merge of the base branch's current tip into your head; the base is fetched from `origin`. A conflicted pull request fails the submission with the conflicted files listed, and an unfetchable base fails loudly. `--no-merge` tests the branch alone in either case. `push` events are unaffected: they test the commit itself.
 
 **Derived event data.** A local run fills in what git can answer: changed files (for `paths:` filters, from `git diff` against the base), the target branch for `branches:` filters, and the current branch or tag. It does not invent a pull request number, actor, or labels. Pass `--payload` when a workflow depends on those.
 
-**Actions lock.** When the repository contains `.github/workflows/actions.lock`, the submission includes it. A malformed or oversized lockfile is rejected before the run is accepted when the actions policy is enabled.
-When `--job` selects one job, the secret preflight checks that job and its transitive `needs:` closure. Without `--job`, it checks the whole workflow.
+**Secret preflight.** Before submitting, `preloop run` warns about the `secrets.*` names the workflow reads that the engine has not stored, and prints the `preloop secret set` commands to fix them. `--strict-secrets` turns that warning into a failure. The check reads the engine's own store — global, repository, and each `environment:` tier the workflow declares — never GitHub's, whose values are write-only. A job that passes `secrets: inherit` to a reusable workflow is called out, because its callee's names cannot be listed statically. `GITHUB_TOKEN` and the `ACTIONS_*` runtime tokens are ignored: the engine mints those per job.
 
 **`--push`.** A dirty tree is committed as a snapshot of exactly the files that were tested, and that commit is pushed only after the run succeeds. Publishing needs a GitHub App with `checks: write` to report check runs.
 
@@ -237,7 +236,6 @@ preloop setup github --via pat --repo owner/repo
 | `--token <TOKEN>` | Personal access token, with `--via pat`. Falls back to `PRELOOP_GITHUB_PAT`, then a hidden prompt. |
 | `--repo <OWNER/NAME>` | Repository to verify the credential against. Repeatable. |
 | `--workspace <PATH>` | Workspace whose workflows set the permission checklist. |
-| `--github-runner-admin` | With the App browser flow, request repository `Administration: write` for runner administration. Default `false`. Env: `PRELOOP_GITHUB_RUNNER_ADMIN`. Existing Apps need a permission review; this flag does not edit them. |
 
 ### preloop doctor
 
@@ -245,7 +243,7 @@ preloop setup github --via pat --repo owner/repo
 preloop doctor --repo owner/repo
 ```
 
-Reports which GitHub credentials are configured and how many secrets are stored. With `--repo`, it also verifies the credential against GitHub, and it exits non-zero if a check fails. It needs a configuration file.
+Reports which GitHub credentials are configured and how many global secrets are stored. With `--repo`, it also verifies the credential against GitHub, and it exits non-zero if a check fails. It needs a configuration file.
 
 | Flag | Description |
 |---|---|
@@ -380,37 +378,6 @@ preloop update --check
 | `--ensure-runtime` | Hidden Unix-only operation: install the compatible SmolVM runtime without updating the Preloop binary. |
 
 On macOS, `update` also refreshes the Linux guest runner. On Unix it ensures the SmolVM runtime is present.
-
-## Sandbox service
-
-`preloop sandbox` manages the Sandbox Service and its providers, templates, pools, and leases. Its global options apply to every subcommand:
-
-| Global flag | Description |
-|---|---|
-| `--service <URL>` | Sandbox API URL. Default `http://127.0.0.1:9191`. Env: `PRELOOP_SANDBOX_URL`. |
-| `--token <TOKEN>` | Sandbox API bearer token. Env: `PRELOOP_SANDBOX_TOKEN`. |
-
-| Command | Arguments and flags |
-|---|---|
-| `serve` | `--listen <ADDR>` (default `127.0.0.1:9191`), `--store <URL>` (env: `PRELOOP_SANDBOX_STORE_URL`; default `$PRELOOP_HOME/state/sandbox.db`), `--no-local` to avoid attaching this host's SmolVM. |
-| `agent` | `--name <NAME>` (default `local-<hostname>`), `--provider-token <TOKEN>` (env: `PRELOOP_SANDBOX_PROVIDER_TOKEN`), `--slots <N>` (default `0`, no cap). |
-| `template put` | Required `--name <NAME>`; `--os <OS>` default `linux`; mutually exclusive `--image <REF>` and `--recipe <RECIPE>`; optional `--driver <NAME>`. |
-| `template ls` | List templates. No flags. |
-| `template rm <NAME>` | Delete a template. |
-| `pool put` | Required `--name <NAME>` and `--template <NAME>`; `--warm <N>` default `0`; `--max <N>` default `0` (unbounded); `--cpus <N>` default `2`; `--memory <MIB>` default `2048`; `--disk <GIB>` default `10`. |
-| `pool ls` | List pools. No flags. |
-| `pool rm <NAME>` | Delete a pool. |
-| `acquire` | Mutually exclusive `--pool <NAME>`/`--template <NAME>`; `--key <KEY>` (random by default); `--ttl <SECONDS>` default `3600`; repeatable `--env KEY=VALUE`; optional `--os <OS>`; `--build`; `--cpus <N>` and `--memory <MIB>` default `0`. |
-| `exec <SANDBOX> -- <COMMAND...>` | Repeatable `--env KEY=VALUE`, optional `--workdir <DIR>`, and a required trailing command. Streams output and exits with the guest status. |
-| `cp <SOURCE> <DESTINATION>` | Copy between the host and a sandbox. The sandbox side uses `sbx-…:/absolute/path`. |
-| `stop <SANDBOX>` | Power off a sandbox while keeping it and its disk. |
-| `start <SANDBOX>` | Start a stopped sandbox; `--forkable` starts it as a branch base. |
-| `release <LEASE>` | Release a lease; `--preserve <SECONDS>` keeps the sandbox for debugging instead of destroying it. |
-| `snapshot <SANDBOX>` | Capture a leased sandbox as a template; required `--name <NAME>`. |
-| `ls` | List sandboxes. No flags. |
-| `providers` | List providers and capabilities. No flags. |
-
-`PRELOOP_SANDBOX_LISTEN` controls the embedded API address (`127.0.0.1:9191` by default); set it to `off` to keep the in-process service without a TCP listener. `PRELOOP_SANDBOX_DRIVERS` is a comma-separated driver list (default `smolvm`), `PRELOOP_SANDBOX_SMOLVM_SLOTS` caps local SmolVM slots (default `0`), and `PRELOOP_SANDBOX_POOL_DRIVER` selects the runner-pool driver. A non-loopback API requires both `PRELOOP_SANDBOX_TOKEN` and `PRELOOP_SANDBOX_PROVIDER_TOKEN`.
 
 ## Companion client: preloop-runner-client
 

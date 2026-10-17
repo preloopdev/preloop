@@ -194,12 +194,11 @@ of the correctness priorities in section 1.
 Push for the smallest change that accomplishes the goal, and reject scope creep
 such as retries, validation, telemetry, or abstraction added "while we're here"
 unless the task actually asked for it. Resist speculative abstraction, since one
-concrete caller does not justify a trait, and lean on the current ControlBackend
-and sandbox-service boundaries in
+concrete caller does not justify a trait, and lean on the current `ControlBackend`
+and `VmProvider` boundaries in
 `docs/control-plane/architecture/api-and-state.mdx` and
 `docs/control-plane/architecture/sandboxes.mdx` when a real seam exists rather
 than inventing new ones.
-
 
 Keep one way to do each thing, because a second convention living beside an
 existing one is a defect, so a new masking helper sitting next to `mask_secrets`

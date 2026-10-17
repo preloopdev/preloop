@@ -2035,7 +2035,7 @@ async fn cmd_engine(
                 "no runner pool: jobs will fail after the queue grace window. \
                  Install the Linux guest runner with `preloop update`, or set \
                  PRELOOP_RUNNER_BUNDLE to a directory containing preloop-runner \
-                 (see docs/vm-images.md)"
+                 (see docs/control-plane/operate/vm-images.mdx)"
             );
             false
         }
@@ -2562,7 +2562,7 @@ fn local_runner_pool_config(
                 .find(|directory| directory.join("preloop-runner").is_file())
         })
         .filter(|path| linux_runner_bundle(path))
-        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
+        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)")?;
     let backend = vm_backend()?;
     // AgentENV has no socket relay: the guest dials the runner URL over plain
     // TCP, so a loopback URL points at the guest itself and no job can ever

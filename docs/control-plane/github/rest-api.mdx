@@ -96,7 +96,3 @@ These routes use the stable IDs returned by the run listing and return an HTTP e
 `/api/v3` is reserved for runner registration, registration-token compatibility, deprecation checks, and authenticated checkout relay paths. It is not the base path for dispatch. The `/_apis`, `/broker`, `/twirp`, and OIDC paths are runner and protocol surfaces, not general-purpose GitHub REST APIs.
 
 Keep the engine origin private or path-filtered. The native management API, runner registration, signed artifact URLs, and job protocol carry credentials and are not substitutes for the public GitHub API. See [Deployment](/control-plane/operate/deploy) and [Security](/control-plane/operate/security) before exposing an engine.
-
-<Note>
-PR-dependent: PR #641 makes dispatch fetch the repository's `actions.lock` and carry it into the submitted workflow. A lock-fetch failure is `502`; action-policy failures are reported as `403`, malformed locks as `422`, and an oversized lock as `413`.
-</Note>

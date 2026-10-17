@@ -16,8 +16,8 @@ For reliable Check Run reporting, configure a GitHub App with `checks: write`. C
 | Command | Result |
 |---|---|
 | `preloop run -f .github/workflows/ci.yml` | Submit and run CI without publishing a branch or pull request. |
-| `preloop run --push -f .github/workflows/ci.yml` | After a terminal result, push the tested commit and report its checks. An existing open PR for the branch is updated; no new PR is requested by this command. |
-| `preloop run --push --create-pr -f .github/workflows/ci.yml` | Push the tested commit and create a PR when the branch has no open PR. New PRs are drafts by default. |
+| `preloop run --push -f .github/workflows/ci.yml` | After a terminal result, push the tested commit and report its checks. An existing pull request for the branch is updated; no new one is requested by this command. |
+| `preloop run --push --create-pr -f .github/workflows/ci.yml` | Push the tested commit and create a pull request when the branch has none. New pull requests are drafts by default. |
 | `preloop run --push --create-pr --pr-draft=false -f .github/workflows/ci.yml` | Create a ready-for-review PR instead of a draft. |
 | `preloop push RUN_ID` | Publish a completed `--push` run from the checkout where it was submitted. The operation is idempotent. |
 | `preloop push` | Publish the control plane's most recent run. Pass an ID on a shared engine so another user's run is not selected. |
@@ -60,7 +60,7 @@ When the run is terminal, the CLI pushes the exact tested commit to `origin` and
 POST /api/v1/runs/RUN_ID/push
 ```
 
-The local Git operation is a branch creation, an already-equal update, or a fast-forward. A diverged remote branch is refused rather than force-pushed. The server then verifies the pushed commit's tree, reuses an open PR for the branch, creates one when requested, and reports any missing Check Runs.
+The local Git operation is a branch creation, an already-equal update, or a fast-forward. A diverged remote branch is refused rather than force-pushed. The server then verifies the pushed commit's tree, reuses the branch's pull request, creates one when requested, and reports any missing Check Runs.
 
 </Step>
 </Steps>
@@ -81,7 +81,7 @@ The submit output, `preloop status`, and error messages expose the run ID. Use t
 preloop push 3c9759be-0000-4000-8000-000000000000
 ```
 
-The CLI retries transient publish failures after 1 minute, 5 minutes, and 15 minutes. Pressing `Ctrl-C` stops the wait; running `preloop push RUN_ID` later resumes the same idempotent operation. Read-only GitHub calls in the server also retry transient transport failures three times with short backoff; writes are not replayed. [PR-dependent: #501 — persistent read-only GitHub transport errors return as an upstream failure instead of permanently marking the publish as a client-side block.]
+The CLI retries transient publish failures after 1 minute, 5 minutes, and 15 minutes. Pressing `Ctrl-C` stops the wait; running `preloop push RUN_ID` later resumes the same idempotent operation. The server does not retry its own GitHub reads: a transport or 5xx failure is returned as a gateway error and the push-back is recorded as blocked with the upstream message, while other failures are returned as client errors.
 
 ## Checks on the pull request
 
@@ -101,8 +101,8 @@ The control plane verifies the tested tree before publishing checks. If the GitH
 | `no GitHub credentials configured` | Configure a GitHub App or the supported GitHub token on the control plane. |
 | Check Runs are missing or return 403 | Grant the App `checks: write`. A PAT-only setup can still allow some repository operations while leaving Check Runs unpublished. |
 | PR creation returns 403 | Grant the App or token `pull_requests: write`. |
-| The branch is pushed but no PR appears | Include `--create-pr`, use `[pr]`/`[draft]` in the head commit message, or create the PR separately. An existing open PR is reused. |
-| GitHub transport error | Keep the run ID and retry with `preloop push RUN_ID`; persistent upstream transport failures are retryable. |
+| The branch is pushed but no PR appears | Include `--create-pr`, use `[pr]`/`[draft]` in the head commit message, or create the pull request separately. An existing pull request for the branch is reused. |
+| GitHub transport error | Keep the run ID and retry with `preloop push RUN_ID` from the submitting checkout. The sync is idempotent, and a branch push that already landed is a no-op. |
 
 Verify the branch and PR after a successful publish:
 

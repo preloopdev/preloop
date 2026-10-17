@@ -21,22 +21,24 @@ digraph job_lifecycle {
   }
 
   subgraph cluster_exec {
-    label="Execution"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
-    run [label="6  Execute\nAgentJobRequestMessage\nlistener → worker → steps", fillcolor="#fef3c7"];
+    label="Execution (microVM pool)"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    pool [label="6  Fork a job VM\nRunner pool (preloop-orchestrator)\nforks a microVM per job from the\nresident golden via preloop-vm's\nVmProvider (SmolVM by default)", fillcolor="#fef3c7"];
+    run [label="7  Execute\nAgentJobRequestMessage\nlistener → worker → steps\ninside the guest", fillcolor="#fef3c7"];
   }
 
   subgraph cluster_report {
     label="Report and settle"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
-    report [label="7  Report\nTimeline, Logfiles, live logs\ncompletejob / FinishJob", fillcolor="#dcfce7"];
-    settle [label="8  Settle\nControlBackend.complete_job\nstatus, needs promotion, release", fillcolor="#dcfce7"];
-    checks [label="9  GitHub Checks\ncheck_run_updates projector\nleased sender with retry/backoff", fillcolor="#bbf7d0"];
+    report [label="8  Report\nTimeline, Logfiles, live logs\ncompletejob / FinishJob", fillcolor="#dcfce7"];
+    settle [label="9  Settle\nControlBackend.complete_job\nstatus, needs promotion, release", fillcolor="#dcfce7"];
+    checks [label="10  GitHub Checks\ncheck_run_updates projector\nleased sender with retry/backoff", fillcolor="#bbf7d0"];
   }
 
   trigger -> parse [label="workflow YAML"];
   parse -> expand [label="matched trigger"];
   expand -> enqueue [label="AgentJobRequestMessage\ntemplate"];
   enqueue -> acquire [label="ready queue"];
-  acquire -> run [label="claim + message"];
+  acquire -> pool [label="claim + message"];
+  pool -> run [label="fork from the golden"];
   run -> report [label="logs, timeline, result"];
   report -> settle [label="completion input"];
   settle -> checks [label="outbox projection"];

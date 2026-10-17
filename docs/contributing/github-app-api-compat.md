@@ -43,7 +43,7 @@ extends that to the *dispatch* contract.
 - Multi-App registry (per-App webhook secret + PEM) so several Apps can coexist
 - App event-subscription support so social/trigger events (issue_comment, issues,
   pull_request_review, repository_dispatch, workflow_dispatch) reach preloop
-- The GitHub App documentation now lives at [/control-plane/github/app](/control-plane/github/app); its event table covers the supported webhook adapters.
+- The GitHub App documentation now lives at [`docs/control-plane/github/app.mdx`](../control-plane/github/app.mdx); its event table covers the supported webhook adapters.
 
 ### Non-Goals
 - Full GitHub REST API parity (only the Actions-facing dispatch/read subset)
@@ -68,7 +68,7 @@ extends that to the *dispatch* contract.
 | Config | `src/config.rs` `Github` struct | Single `webhook_secret`, `pat`, App env vars |
 | Check runs | `src/github.rs` / check-run reporting | queued/in_progress/completed with `details_url` |
 | Parser context | `preloop-gha-parser` | `github.event_name`, `github.event.inputs` supported (test `workflow_dispatch_inputs_are_in_event_context`) |
-| Docs | `/control-plane/github/app` | Current product documentation covers the event table and signature requirements |
+| Docs | `docs/control-plane/github/app.mdx` | Current product documentation covers the event table and signature requirements |
 | Tests | `src/lib_tests.rs` (axum router: `app()`, `request_json`), `src/concurrency_http_properties.rs`, `src/events/property_tests.rs` | Patterns to follow |
 
 ## 4. Design Decisions
@@ -242,8 +242,8 @@ src/
   openapi.rs             # EDIT — document the new endpoints (native doc convention)
 docs/
   github-app-api-compat.md   # THIS FILE — keep as the design doc
-  /control-plane/github/app   # EDIT — fix webhook documentation
-  /control-plane/github/tokens # EDIT — dispatch auth section
+  control-plane/github/app.mdx   # EDIT — fix webhook documentation
+  control-plane/github/tokens.mdx # EDIT — dispatch auth section
   contributing/fidelity-gap.md  # EDIT — record the new surface
 ```
 
@@ -273,7 +273,7 @@ docs/
 ## 8. Milestones & Acceptance Criteria
 
 ### Docs fix + event subscription
-- [ ] `/control-plane/github/app` corrected (full event list from `all_event_names()`)
+- [ ] `docs/control-plane/github/app.mdx` corrected (full event list from `all_event_names()`)
 - [ ] Manifest `default_events` configurable, including `push`, `pull_request`,
       and `check_run`, with manual GitHub settings guidance for additional events
 - [ ] Startup read-back of `GET /app` events; loud warning when trigger events missing
@@ -308,7 +308,7 @@ docs/
 
 ### Fidelity hardening + gate
 - [ ] Property tests for dispatch payloads
-- [ ] `openapi.rs` docs; `/control-plane/github/tokens` +
+- [ ] `openapi.rs` docs; `docs/control-plane/github/tokens.mdx` +
       `docs/contributing/fidelity-gap.md` updated
 - [ ] Dogfood: add a fixture workflow to `fixtures/workflows/` exercising
       `repository_dispatch` (broadcast) end to end locally
@@ -342,7 +342,7 @@ Milestone status and open-question decisions, updated as the work lands.
 
 ### Docs fix + event subscription (done)
 
-- `/control-plane/github/app` rewritten: full event table from
+- `docs/control-plane/github/app.mdx` rewritten: full event table from
   `all_event_names()` (Tier A/B/C + `schedule` note); signature verification
   is mandatory (doc previously claimed it is skipped without a secret — the
   code 401s); webhook setup steps list the trigger events; multi-secret
@@ -459,7 +459,7 @@ test proving a job's `GITHUB_TOKEN` comes from the installed App end to end.
 ### Fidelity hardening + gate (done except the final gate)
 
 Shipped: dispatch-payload property tests (`events/property_tests.rs` style),
-`openapi.rs` docs for the new endpoints, `/control-plane/github/tokens` +
+`openapi.rs` docs for the new endpoints, `docs/control-plane/github/tokens.mdx` +
 `docs/contributing/fidelity-gap.md` updates, and the `repository_dispatch` dogfood fixture.
 Pending: `just test-ci` (fmt-check + clippy + workspace tests). The crate's lib
 test suite is green (535 tests) but the full gate has not run.

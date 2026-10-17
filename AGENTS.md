@@ -10,7 +10,7 @@
 | `preloop-gha-parser` / `-expressions` / `-protocol` | Workflow YAML → job DAG/matrix; `${{ }}` evaluator; wire DTOs, session crypto, `SecretString`, NDJSON events |
 | `preloop-runner` / `-runner-client` | Rust runner (Listener + Worker); CLI that submits workflows |
 | `preloop-cli` | The `preloop` binary (run/serve/debug/push) |
-| `preloop-orchestrator` / `preloop-vm` | Golden/env provisioning + runner pool; the sandbox-service cutover is tracked in open PR #619. |
+| `preloop-orchestrator` / `preloop-vm` | Golden/env provisioning + runner pool; `VmProvider` backends (SmolVM default, AgentENV opt-in via `PRELOOP_VM_BACKEND`). |
 | `preloop-cache` / `-artifacts` / `-dap` / `-observability` / `-socket-activation` | File-backed storage, DAP bridge, logging/OTel, systemd activation |
 | `preloop-conformance` / `runner-watch` | Conformance harnesses and protocol-diff tooling |
 
@@ -32,7 +32,7 @@ just dogfood    # E2E with the real runner
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests. Broker + Twirp results protocol only (v2.329.0+).
 - **State**: the control database is authoritative. All durable control mutations go through the `ControlBackend` trait (`control/backend.rs`); backends are SQLite (default) and Postgres, chosen by `PRELOOP_STORE_URL`. `state.rs::InnerState` is node-local only. See [API and state](docs/control-plane/architecture/api-and-state.mdx) before touching `control/`.
 - **At-rest encryption is obfuscation**: the key sits beside the DB, so it stops a stolen DB file, not a compromised state dir.
-- **VM substrates**: main uses `PRELOOP_VM_BACKEND` to select its current provider. Read [Sandbox architecture](docs/control-plane/architecture/sandboxes.mdx) and open PR #619 before changing the sandbox-service boundary.
+- **VM substrates**: `PRELOOP_VM_BACKEND` selects SmolVM (default) or AgentENV (opt-in); the orchestrator branches on `VmProvider::capabilities()`. Read [Sandbox architecture](docs/control-plane/architecture/sandboxes.mdx) before touching pool or provider code.
 
 ## Agent preferences
 

@@ -7,6 +7,8 @@ Preloop runs GitHub Actions workflows on hardware-isolated microVMs. Your `.gith
 
 Preloop ships as two products. You can use either one on its own.
 
+![A failed step, a fix in another pane, and a re-run, all local with no push required](/demo/demo.gif)
+
 <CardGroup cols={2}>
   <Card title="Control plane" icon="server" href="/control-plane/quickstart">
     Run unmodified workflows locally or on your own infrastructure. `preloop run` executes a workflow against your working tree, including uncommitted files. `preloop serve` runs the engine, which can start runs from GitHub pushes and pull requests through a GitHub App, and can pause a failed job so you can debug it.
@@ -16,7 +18,7 @@ Preloop ships as two products. You can use either one on its own.
   </Card>
 </CardGroup>
 
-![Preloop system overview: clients, the control plane, the sandbox service, and microVMs](/diagrams/system-overview.svg)
+![Preloop system overview: clients, the control plane, the VM pool, and microVMs](/diagrams/system-overview.svg)
 
 ## Where to go next
 

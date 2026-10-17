@@ -16,34 +16,49 @@ On the machine that runs the control plane, run:
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
-The command starts a one-shot loopback listener and opens GitHub's App-creation page. Use `--org ORG` to create the App in an organization. Use `--no-browser` to print the URL instead. Without `--public-url`, the App is created without webhooks; this is suitable for `preloop run` and API dispatches, but GitHub cannot send event deliveries.
+The command opens a single-use loopback listener and GitHub's App-creation page, so the private key and webhook secret never leave the machine. Use `--org ORG` to create the App in an organization, and `--no-browser` to print the URL instead of opening it. Without `--public-url`, the App is created without webhooks; that suits `preloop run` and API dispatches, but GitHub cannot send event deliveries.
 
-If an App already exists, provide its credentials instead of creating another one:
+To attach an existing App, pass its credentials instead of creating another one:
 
 ```sh
 preloop setup github --via app \
   --app-id 123456 \
   --pem-file /secure/path/preloop-app.pem \
+  --webhook-secret "$WEBHOOK_SECRET" \
   --public-url https://ci.example.com
 ```
 
 </Step>
 <Step title="Install the App">
 
-When GitHub finishes creating the App, follow the installation link and select the account, organization, or repositories it may access. An installation is required before the control plane can mint an installation token.
+When GitHub finishes creating the App, follow the installation link and select the account, organization, or repositories it may access. No installation token can be minted until this step is complete. The control plane finds the installation for each repository owner unless `PRELOOP_GITHUB_APP_INSTALLATION_ID` pins one.
 
 </Step>
 <Step title="Keep the returned credentials private">
 
-The CLI flow stores the App ID, private key, and webhook secret through the configured credential store. The default file store keeps credentials in the control plane's private credentials directory; `credential_store = "os"` uses the operating-system credential store.
-
-A remote setup can also visit `https://ci.example.com/api/v1/github/register`. That page is public and displays the App ID, webhook secret, private-key PEM, and installation link after GitHub's callback. It does not save those values on the server. Copy them into a protected credential store, then restart the engine.
+The CLI stores the App ID, private key, and webhook secret through the configured credential store. The default file store keeps credentials in the control plane's private credentials directory; `credential_store = "os"` uses the operating-system credential store. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them.
 
 </Step>
 </Steps>
 
+### Register from a browser against a remote engine
+
+Use this only when the command above cannot run on the engine host. The engine serves the manifest itself and *displays* the credentials on a web page, so both routes are off by default: `/api/v1/github/register` and `/api/v1/github/callback` return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. Enable it only while registering an App, then turn it off again.
+
+1. Set `PRELOOP_ENABLE_APP_REGISTRATION=1` on the engine and restart it.
+2. Open `https://ci.example.com/api/v1/github/register` in the browser you will use to create the App. The page sets an HTTP-only `preloop_app_manifest_state` cookie, valid for one hour and scoped to `/api/v1/github`, and gives GitHub the same token as its `state` parameter. Opening the page again replaces the cookie, so use the latest page.
+3. Click **Register App on GitHub**. GitHub opens its App-creation flow with the control plane's redirect URL, webhook URL, default events, and default permissions pre-filled.
+4. GitHub redirects the same browser to `/api/v1/github/callback?code=...&state=...`. The code is exchanged only when `state` matches the cookie in that browser, is signed by this engine, and has not expired; otherwise the callback answers `400` and does not contact GitHub. The page then shows the App ID, the owning account, the webhook secret, the private-key PEM, and the command for the next step. Confirm that the owning account is the one you registered with. The response is never cached, its URL is not sent in `Referer`, and the cookie is cleared.
+5. On the engine host, save the PEM to a file and run the command from the page:
+
+   ```sh
+   preloop setup github --via app --app-id <app-id> --pem-file ./app.pem --webhook-secret '<webhook-secret>'
+   ```
+
+   The secret is bound to this App's id. Do not set `PRELOOP_WEBHOOK_SECRET` for it: that variable is the single default-App slot and cannot address a second App. Then unset `PRELOOP_ENABLE_APP_REGISTRATION` and restart the engine.
+
 <Note>
-PR-dependent: PR #477 gates the remote registration and callback pages behind `PRELOOP_ENABLE_APP_REGISTRATION` (`1`, `true`, or `on`). When enabled, the browser flow carries a signed, one-hour state cookie and the callback requires the matching state before exchanging the code; it hands the per-App secret to `preloop setup github` rather than using the legacy default secret.
+`localhost` can display the registration form, but GitHub cannot deliver webhook events or callback redirects to it. The manifest only includes webhook settings for non-local hosts.
 </Note>
 
 ## Permissions and events
@@ -57,7 +72,9 @@ Start with these permissions for ordinary CI:
 | `metadata: read` | GitHub's read-only repository floor. |
 | `pull_requests: read` | Reads pull-request event data and changed files. |
 
-Grant additional permissions when the corresponding triggers or workflow features need them: `actions: read` for `workflow_run` (and the `workflow_job` subscription described below), `issues: read` for `issues` and `issue_comment`, and `deployments: write` for environment deployment reporting. The installation's grants still cap every job token.
+Grant additional permissions when the corresponding triggers or workflow features need them: `actions: read` for `workflow_run`, `issues: read` for `issues` and `issue_comment`, and `deployments: write` for environment deployment reporting. The installation's grants still cap every job token.
+
+The App created by the manifest flow is private and pre-fills `actions: read`, `checks: write`, `contents: read`, `deployments: write`, `metadata: read`, and `pull_requests: read`. Adjust the set in the creation flow or in the App's settings afterwards.
 
 A new App's current manifest events are `push`, `pull_request`, and `check_run`. Set a different creation-time list with:
 
@@ -79,10 +96,6 @@ The event adapters currently understand:
 
 `pull_request_target` is synthesized from a `pull_request` delivery, so it is not a GitHub event checkbox. The minimum subscription checks are `push`, `pull_request`, `pull_request_review`, `workflow_dispatch`, `workflow_run`, `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`, `create`, `delete`, and `release`; each is checked against the permission that gates it.
 
-<Note>
-PR-dependent: builds containing PR #634 add `workflow_job` to new-App manifests and the subscription check, gated by `actions: read`. The PR adds no `workflow_job` event adapter, so the event is a subscription compatibility change rather than a new workflow trigger.
-</Note>
-
 ## Webhook URL and signature verification
 
 Set the App webhook URL to:
@@ -91,7 +104,7 @@ Set the App webhook URL to:
 https://ci.example.com/api/v1/github/webhooks
 ```
 
-`PRELOOP_PUBLIC_URL` is the GitHub-facing base URL and is also used for Check Run links. `PRELOOP_WEBHOOK_SECRET` supplies the legacy/default App secret. Multi-App configurations may store a different webhook secret for each App; a delivery signed by any registered secret is accepted.
+`PRELOOP_PUBLIC_URL` is the GitHub-facing base URL and is also used for Check Run links. `PRELOOP_WEBHOOK_SECRET` verifies `X-Hub-Signature-256` for the default App; a payload it signs is bound to that App's installation coverage. Additional Apps store their own secret against that App's id with `preloop setup github --via app --webhook-secret`, and a delivery signed by any registered secret is accepted.
 
 Every delivery must include `X-Hub-Signature-256: sha256=...`. The engine computes HMAC-SHA256 over the raw body and compares it in constant time. Missing, malformed, unmatched, or unset secrets return `401`. A valid signature for an App that is not installed for the payload's repository returns `403`. Missing `X-GitHub-Event` returns `400`.
 
@@ -107,11 +120,7 @@ GET /repos/{owner}/{repo}/contents/.github/workflows?ref={commit_sha}
 
 A nonempty ref is never replaced with the current working directory. If no immutable ref is requested and no GitHub credential is available, a local `.github/workflows/` directory may be used. An event whose ref or SHA cannot be resolved is retried as a delivery error.
 
-For normal pull-request deliveries, workflow files come from the pull request's test merge. If the live merge is unavailable, the engine builds that merge in its mirror; only a failed mirror read falls back to the pull-request head with a warning. A payload without a merge SHA can use the projected head path.
-
-<Note>
-PR-dependent: PR #591 keys replay identity by delivery, workflow path, and event. A pull-request delivery can therefore retain separate `pull_request` and `pull_request_target` runs. The same PR also refuses a clean test-merge submission when the engine cannot build the merge, instead of silently testing an unrelated tree.
-</Note>
+For normal pull-request deliveries, workflow files come from the pull request's test merge, which the engine verifies or builds in its mirror; only a failed read of an engine-built merge falls back to the pull-request head, with a warning. If the merge cannot be built, a transient failure retries the delivery and a permanent one dead-letters it; a conflicted merge skips the `pull_request` runs while the base-branch `pull_request_target` leg still runs.
 
 ## Check Runs
 

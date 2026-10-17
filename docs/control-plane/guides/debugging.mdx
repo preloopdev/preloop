@@ -141,6 +141,16 @@ The adapter exposes `github`, `env`, `runner`, `job`, `steps`, and `secrets` sco
 
 The recording finds `github.event.inputs.target` in the `github` scope, identifies the wrong deployment input, and submits the corrected payload. It is a demonstration of the DAP inspection loop; use your own workflow and credentials for a real run.
 
+<Accordion title="Full DAP session recording">
+
+The complete recording shows the agent's whole session, from attaching to the paused run through the corrected rerun.
+
+<video controls src="/demo/dap/demo.mp4" alt="Full screen recording of an agent debugging a run over DAP from attach to corrected rerun" aria-label="Full screen recording of an agent debugging a run over DAP from attach to corrected rerun" />
+
+The same recording is available as an [animated GIF](https://github.com/preloopdev/preloop/blob/main/docs/demo/dap/demo.gif) and as asciinema casts (`docs/demo/dap/demo.cast`, `docs/demo/dap/demo-highlight.cast`) in the repository.
+
+</Accordion>
+
 ## Session limits and clean verification
 
 A paused session has one controller at a time. The server records operations with an idempotency key and a session version, so a reconnecting controller does not execute a retry twice. A worker that stops polling for 90 seconds is no longer live, and a session with more than four hours of accumulated pause credit returns to ordinary timeout handling. These limits protect the job's normal timeout and the runner pool.
