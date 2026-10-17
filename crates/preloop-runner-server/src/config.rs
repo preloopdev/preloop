@@ -59,17 +59,18 @@ pub struct GoldenConfig {
     pub dockerfile: Option<PathBuf>,
 }
 
-/// Effective golden base image: [`BASE_IMAGE_ENV`] when set to a non-blank
-/// value, else the `[golden]` section. `None` means the packed official golden.
+/// Effective golden base image: `env` (the resolved [`BASE_IMAGE_ENV`] value)
+/// when set to a non-blank value, else the `[golden]` section. `None` means
+/// the packed official golden.
 ///
 /// An exported-but-blank variable behaves like an unset one — the same rule
 /// `PRELOOP_GOLDEN_URL` follows — so a shell that exports an empty value
 /// cannot silently configure an empty base image.
-pub fn golden_base_image(config: &ConfigFile) -> Option<String> {
-    if let Ok(value) = std::env::var(BASE_IMAGE_ENV)
+pub fn golden_base_image(config: &ConfigFile, env: Option<&str>) -> Option<String> {
+    if let Some(value) = env
         && !value.trim().is_empty()
     {
-        return Some(value);
+        return Some(value.to_owned());
     }
     config
         .golden
@@ -932,18 +933,16 @@ pub const RERUN_WINDOW_DAYS_ENV: &str = "PRELOOP_RERUN_WINDOW_DAYS";
 /// re-run limit.
 pub const DEFAULT_RERUN_WINDOW_DAYS: u64 = 30;
 
-/// Resolve the archiver's in-place re-run hold: `PRELOOP_RERUN_WINDOW_DAYS`
-/// (default [`DEFAULT_RERUN_WINDOW_DAYS`]), in days. A run whose completed
+/// Resolve the archiver's in-place re-run hold from `env` (the resolved
+/// `PRELOOP_RERUN_WINDOW_DAYS` value; default [`DEFAULT_RERUN_WINDOW_DAYS`]),
+/// in days. A run whose completed
 /// attempt has at least one failed/cancelled/timed-out job stays live this
 /// long so a re-run can reset its jobs in place; `0` disables the hold and
 /// restores the plain 60-second archive policy. An unparseable value is an
 /// error — a typo must fail closed rather than hold (or drop) scheduler rows
 /// silently; callers warn and disable the hold.
-pub fn rerun_window_days() -> anyhow::Result<u64> {
-    if let Some(raw) = std::env::var(RERUN_WINDOW_DAYS_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+pub fn rerun_window_days(env: Option<&str>) -> anyhow::Result<u64> {
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
         return raw.trim().parse().with_context(|| {
             format!("invalid unsigned integer in {RERUN_WINDOW_DAYS_ENV} (`{raw}`)")
         });
@@ -959,14 +958,12 @@ fn default_max_jobs_per_run() -> u64 {
     DEFAULT_MAX_JOBS_PER_RUN
 }
 
-/// Resolve the effective per-run job cap: `PRELOOP_MAX_JOBS_PER_RUN` wins
-/// over the config file key. An unparseable value is an error — a typo must
-/// fail closed rather than silently run uncapped (or capped at zero).
-pub fn max_jobs_per_run(config: &ConfigFile) -> anyhow::Result<u64> {
-    if let Some(raw) = std::env::var(MAX_JOBS_PER_RUN_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+/// Resolve the effective per-run job cap: `env` (the resolved
+/// `PRELOOP_MAX_JOBS_PER_RUN` value) wins over the config file key. An
+/// unparseable value is an error — a typo must fail closed rather than
+/// silently run uncapped (or capped at zero).
+pub fn max_jobs_per_run(config: &ConfigFile, env: Option<&str>) -> anyhow::Result<u64> {
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
         return raw.trim().parse().with_context(|| {
             format!("invalid unsigned integer in {MAX_JOBS_PER_RUN_ENV} (`{raw}`)")
         });
@@ -974,14 +971,12 @@ pub fn max_jobs_per_run(config: &ConfigFile) -> anyhow::Result<u64> {
     Ok(config.max_jobs_per_run)
 }
 
-/// Resolve the effective run retention: `PRELOOP_RETENTION_DAYS` wins over
-/// the config file key. An unparseable value is an error — a typo must fail
-/// closed rather than silently keep (or drop) years of run history.
-pub fn retention_days(config: &ConfigFile) -> anyhow::Result<u64> {
-    if let Some(raw) = std::env::var(RETENTION_DAYS_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+/// Resolve the effective run retention: `env` (the resolved
+/// `PRELOOP_RETENTION_DAYS` value) wins over the config file key. An
+/// unparseable value is an error — a typo must fail closed rather than
+/// silently keep (or drop) years of run history.
+pub fn retention_days(config: &ConfigFile, env: Option<&str>) -> anyhow::Result<u64> {
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
         return raw.trim().parse().with_context(|| {
             format!("invalid unsigned integer in {RETENTION_DAYS_ENV} (`{raw}`)")
         });
@@ -999,15 +994,12 @@ fn default_diag_staging_max_age_hours() -> u64 {
     DEFAULT_DIAG_STAGING_MAX_AGE_HOURS
 }
 
-/// Resolve the effective diag staging max age, in hours:
-/// `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` wins over the config file key. An
-/// unparseable value is an error — a typo must fail closed rather than
+/// Resolve the effective diag staging max age, in hours: `env` (the resolved
+/// `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` value) wins over the config file key.
+/// An unparseable value is an error — a typo must fail closed rather than
 /// silently keep (or delete) staging data on the wrong schedule.
-pub fn diag_staging_max_age_hours(config: &ConfigFile) -> anyhow::Result<u64> {
-    if let Some(raw) = std::env::var(DIAG_STAGING_MAX_AGE_HOURS_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+pub fn diag_staging_max_age_hours(config: &ConfigFile, env: Option<&str>) -> anyhow::Result<u64> {
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
         return raw.trim().parse().with_context(|| {
             format!("invalid unsigned integer in {DIAG_STAGING_MAX_AGE_HOURS_ENV} (`{raw}`)")
         });
@@ -1029,16 +1021,30 @@ pub fn parse_checkout_cache_mode(raw: &str) -> anyhow::Result<CheckoutCacheMode>
     }
 }
 
-/// Resolve checkout-cache configuration with environment variables taking
-/// precedence. An unknown mode warns and falls back to `off`: off retains
-/// nothing, so a typo costs caching, never startup.
-pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCacheConfig> {
+/// Explicit env-layer inputs for [`checkout_cache_config`]: the resolved
+/// values of the `PRELOOP_CHECKOUT_CACHE_*` variables, `None` when unset.
+#[derive(Debug, Clone, Default)]
+pub struct CheckoutCacheEnv {
+    /// Resolved [`CHECKOUT_CACHE_MODE_ENV`] value.
+    pub mode: Option<String>,
+    /// Resolved [`CHECKOUT_CACHE_RUN_RETENTION_ENV`] value.
+    pub run_retention_seconds: Option<String>,
+    /// Resolved [`CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV`] value.
+    pub repository_retention_seconds: Option<String>,
+    /// Resolved [`CHECKOUT_CACHE_MAX_BYTES_ENV`] value.
+    pub max_bytes: Option<String>,
+}
+
+/// Resolve checkout-cache configuration with the explicit `env` inputs taking
+/// precedence over the config file. An unknown mode warns and falls back to
+/// `off`: off retains nothing, so a typo costs caching, never startup.
+pub fn checkout_cache_config(
+    config: &ConfigFile,
+    env: &CheckoutCacheEnv,
+) -> anyhow::Result<CheckoutCacheConfig> {
     let mut effective = config.checkout_cache.clone();
-    if let Some(raw) = std::env::var(CHECKOUT_CACHE_MODE_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        effective.mode = match parse_checkout_cache_mode(&raw) {
+    if let Some(raw) = env.mode.as_deref().filter(|value| !value.trim().is_empty()) {
+        effective.mode = match parse_checkout_cache_mode(raw) {
             Ok(mode) => mode,
             Err(_) => {
                 tracing::warn!(
@@ -1048,21 +1054,24 @@ pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCach
             }
         };
     }
-    for (name, target) in [
+    for (name, value, target) in [
         (
             CHECKOUT_CACHE_RUN_RETENTION_ENV,
+            env.run_retention_seconds.as_deref(),
             &mut effective.run_retention_seconds,
         ),
         (
             CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV,
+            env.repository_retention_seconds.as_deref(),
             &mut effective.repository_retention_seconds,
         ),
-        (CHECKOUT_CACHE_MAX_BYTES_ENV, &mut effective.max_bytes),
+        (
+            CHECKOUT_CACHE_MAX_BYTES_ENV,
+            env.max_bytes.as_deref(),
+            &mut effective.max_bytes,
+        ),
     ] {
-        if let Some(raw) = std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
+        if let Some(raw) = value.filter(|value| !value.trim().is_empty()) {
             *target = raw
                 .trim()
                 .parse()
@@ -1074,15 +1083,13 @@ pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCach
 
 pub const CACHE_TOTAL_QUOTA_BYTES_ENV: &str = "PRELOOP_CACHE_TOTAL_QUOTA_BYTES";
 
-/// Resolve the Actions-cache quota: `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` wins
-/// over the `[cache] total_quota_bytes` key; an unparseable value is an
-/// error rather than silently keeping or dropping cached entries.
-pub fn cache_config(config: &ConfigFile) -> anyhow::Result<CacheConfig> {
+/// Resolve the Actions-cache quota: `env` (the resolved
+/// `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` value) wins over the
+/// `[cache] total_quota_bytes` key; an unparseable value is an error rather
+/// than silently keeping or dropping cached entries.
+pub fn cache_config(config: &ConfigFile, env: Option<&str>) -> anyhow::Result<CacheConfig> {
     let mut effective = config.cache;
-    if let Some(raw) = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
         effective.total_quota_bytes = raw.trim().parse().with_context(|| {
             format!("invalid unsigned integer in {CACHE_TOTAL_QUOTA_BYTES_ENV} (`{raw}`)")
         })?;
@@ -1091,8 +1098,6 @@ pub fn cache_config(config: &ConfigFile) -> anyhow::Result<CacheConfig> {
 }
 
 #[cfg(test)]
-// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
-#[allow(unsafe_code)]
 mod cache_quota_config_tests {
     use super::*;
 
@@ -1106,7 +1111,7 @@ mod cache_quota_config_tests {
             DEFAULT_CACHE_TOTAL_QUOTA_BYTES
         );
         assert_eq!(
-            cache_config(&config).unwrap().total_quota_bytes,
+            cache_config(&config, None).unwrap().total_quota_bytes,
             DEFAULT_CACHE_TOTAL_QUOTA_BYTES
         );
     }
@@ -1117,31 +1122,33 @@ mod cache_quota_config_tests {
         assert_eq!(config.cache.total_quota_bytes, 1024 * 1024 * 1024);
     }
 
-    /// Env wins over the file; a blank value counts as unset; an unparseable
-    /// value is an error. These cases live in one test so the process-wide
-    /// env var is never mutated by two tests at once.
+    /// The env layer wins over the file; a blank value counts as unset; an
+    /// unparseable value is an error. Inputs are explicit — no process
+    /// environment is involved.
     #[test]
-    fn cache_quota_env_handling() {
-        let prior = std::env::var(CACHE_TOTAL_QUOTA_BYTES_ENV).ok();
+    fn cache_quota_env_override_handling() {
         let config: ConfigFile = toml::from_str("[cache]\ntotal_quota_bytes = 1073741824").unwrap();
-        unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) };
-        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
-        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "5368709120") };
-        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 5368709120);
-        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "   ") };
-        assert_eq!(cache_config(&config).unwrap().total_quota_bytes, 1073741824);
-        unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, "ten-gib") };
-        assert!(cache_config(&config).is_err());
-        match prior {
-            Some(value) => unsafe { std::env::set_var(CACHE_TOTAL_QUOTA_BYTES_ENV, value) },
-            None => unsafe { std::env::remove_var(CACHE_TOTAL_QUOTA_BYTES_ENV) },
-        }
+        assert_eq!(
+            cache_config(&config, None).unwrap().total_quota_bytes,
+            1073741824
+        );
+        assert_eq!(
+            cache_config(&config, Some("5368709120"))
+                .unwrap()
+                .total_quota_bytes,
+            5368709120
+        );
+        assert_eq!(
+            cache_config(&config, Some("   "))
+                .unwrap()
+                .total_quota_bytes,
+            1073741824
+        );
+        assert!(cache_config(&config, Some("ten-gib")).is_err());
     }
 }
 
 #[cfg(test)]
-// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
-#[allow(unsafe_code)]
 mod checkout_cache_tests {
     use super::*;
 
@@ -1183,31 +1190,26 @@ run_retention_seconds = 60
         assert_eq!(typo.checkout_cache.mode, CheckoutCacheMode::Off);
     }
 
-    /// An unknown mode from the environment warns and keeps retention off
-    /// instead of refusing to boot. No other test touches this variable, so
-    /// setting it here cannot race.
+    /// An unknown mode from the env layer warns and keeps retention off
+    /// instead of refusing to boot. Input is explicit — no process
+    /// environment is involved.
     #[test]
-    fn checkout_cache_unknown_env_mode_falls_back_to_off() {
-        let prior = std::env::var(CHECKOUT_CACHE_MODE_ENV).ok();
-        unsafe { std::env::set_var(CHECKOUT_CACHE_MODE_ENV, "everything") };
+    fn checkout_cache_unknown_override_mode_falls_back_to_off() {
+        let env = CheckoutCacheEnv {
+            mode: Some("everything".to_owned()),
+            ..Default::default()
+        };
         let effective =
-            checkout_cache_config(&ConfigFile::default()).expect("fallback is not an error");
+            checkout_cache_config(&ConfigFile::default(), &env).expect("fallback is not an error");
         assert_eq!(effective.mode, CheckoutCacheMode::Off);
-        match prior {
-            Some(value) => unsafe { std::env::set_var(CHECKOUT_CACHE_MODE_ENV, value) },
-            None => unsafe { std::env::remove_var(CHECKOUT_CACHE_MODE_ENV) },
-        }
     }
 }
 
 #[cfg(test)]
-// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
-#[allow(unsafe_code)]
 mod retention_config_tests {
     use super::*;
 
-    /// Absent key keeps the GitHub-matching default of 90 days. This test
-    /// never touches the process env; see `retention_days_env_handling`.
+    /// Absent key keeps the GitHub-matching default of 90 days.
     #[test]
     fn retention_days_defaults_to_90() {
         let config: ConfigFile = toml::from_str("").unwrap();
@@ -1226,27 +1228,17 @@ mod retention_config_tests {
         assert_eq!(disabled.retention_days, 0);
     }
 
-    /// Env wins over the file; a blank value counts as unset; an unparseable
-    /// value is an error rather than silently keeping or dropping run
-    /// history; with the var unset the file value is used. These cases live
-    /// in one test so the process-wide env var is never mutated by two
-    /// tests at once.
+    /// The env layer wins over the file; a blank value counts as unset; an
+    /// unparseable value is an error rather than silently keeping or
+    /// dropping run history; with no override the file value is used.
+    /// Inputs are explicit — no process environment is involved.
     #[test]
-    fn retention_days_env_handling() {
-        let prior = std::env::var(RETENTION_DAYS_ENV).ok();
+    fn retention_days_env_override_handling() {
         let config: ConfigFile = toml::from_str("retention_days = 30").unwrap();
-        unsafe { std::env::remove_var(RETENTION_DAYS_ENV) };
-        assert_eq!(retention_days(&config).unwrap(), 30);
-        unsafe { std::env::set_var(RETENTION_DAYS_ENV, "7") };
-        assert_eq!(retention_days(&config).unwrap(), 7);
-        unsafe { std::env::set_var(RETENTION_DAYS_ENV, "   ") };
-        assert_eq!(retention_days(&config).unwrap(), 30);
-        unsafe { std::env::set_var(RETENTION_DAYS_ENV, "ninety") };
-        assert!(retention_days(&config).is_err());
-        match prior {
-            Some(value) => unsafe { std::env::set_var(RETENTION_DAYS_ENV, value) },
-            None => unsafe { std::env::remove_var(RETENTION_DAYS_ENV) },
-        }
+        assert_eq!(retention_days(&config, None).unwrap(), 30);
+        assert_eq!(retention_days(&config, Some("7")).unwrap(), 7);
+        assert_eq!(retention_days(&config, Some("   ")).unwrap(), 30);
+        assert!(retention_days(&config, Some("ninety")).is_err());
     }
 
     /// A missing config file still gets the GitHub-matching default.
@@ -1257,13 +1249,10 @@ mod retention_config_tests {
 }
 
 #[cfg(test)]
-// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
-#[allow(unsafe_code)]
 mod max_jobs_per_run_config_tests {
     use super::*;
 
-    /// Absent key keeps the default cap of 500. This test never touches the
-    /// process env; see `max_jobs_per_run_env_handling`.
+    /// Absent key keeps the default cap of 500.
     #[test]
     fn max_jobs_per_run_defaults_to_500() {
         let config: ConfigFile = toml::from_str("").unwrap();
@@ -1282,26 +1271,17 @@ mod max_jobs_per_run_config_tests {
         assert_eq!(disabled.max_jobs_per_run, 0);
     }
 
-    /// Env wins over the file; a blank value counts as unset; an unparseable
-    /// value is an error rather than silently running uncapped; with the var
-    /// unset the file value is used. These cases live in one test so the
-    /// process-wide env var is never mutated by two tests at once.
+    /// The env layer wins over the file; a blank value counts as unset; an
+    /// unparseable value is an error rather than silently running uncapped;
+    /// with no override the file value is used. Inputs are explicit — no
+    /// process environment is involved.
     #[test]
-    fn max_jobs_per_run_env_handling() {
-        let prior = std::env::var(MAX_JOBS_PER_RUN_ENV).ok();
+    fn max_jobs_per_run_env_override_handling() {
         let config: ConfigFile = toml::from_str("max_jobs_per_run = 1000").unwrap();
-        unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) };
-        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
-        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "250") };
-        assert_eq!(max_jobs_per_run(&config).unwrap(), 250);
-        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "   ") };
-        assert_eq!(max_jobs_per_run(&config).unwrap(), 1000);
-        unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, "many") };
-        assert!(max_jobs_per_run(&config).is_err());
-        match prior {
-            Some(value) => unsafe { std::env::set_var(MAX_JOBS_PER_RUN_ENV, value) },
-            None => unsafe { std::env::remove_var(MAX_JOBS_PER_RUN_ENV) },
-        }
+        assert_eq!(max_jobs_per_run(&config, None).unwrap(), 1000);
+        assert_eq!(max_jobs_per_run(&config, Some("250")).unwrap(), 250);
+        assert_eq!(max_jobs_per_run(&config, Some("   ")).unwrap(), 1000);
+        assert!(max_jobs_per_run(&config, Some("many")).is_err());
     }
 
     /// A missing config file still gets the default cap.
@@ -1323,12 +1303,16 @@ pub enum SecretsStoreMode {
     Memory,
 }
 
-/// Resolve the secrets-store mode: `PRELOOP_SECRETS_STORE` wins over the
-/// config file key. Unknown values are an error — a typo must fail closed
-/// (never silently fall back to writing plaintext secrets to the file).
-pub fn secrets_store_mode(config: &ConfigFile) -> anyhow::Result<SecretsStoreMode> {
-    let raw = std::env::var(SECRETS_STORE_ENV)
-        .ok()
+/// Resolve the secrets-store mode: `env` (the resolved `PRELOOP_SECRETS_STORE`
+/// value) wins over the config file key. Unknown values are an error — a
+/// typo must fail closed (never silently fall back to writing plaintext
+/// secrets to the file).
+pub fn secrets_store_mode(
+    config: &ConfigFile,
+    env: Option<&str>,
+) -> anyhow::Result<SecretsStoreMode> {
+    let raw = env
+        .map(str::to_owned)
         .filter(|value| !value.trim().is_empty())
         .or_else(|| config.secrets_store.clone());
     match raw.as_deref().map(str::trim) {
@@ -1343,22 +1327,23 @@ pub fn secrets_store_mode(config: &ConfigFile) -> anyhow::Result<SecretsStoreMod
 
 /// True when stored secrets must stay out of the config file: values live in
 /// engine memory only, mutated live through the secrets API and lost on
-/// restart. `PRELOOP_SECRETS_STORE=memory` wins over the config file key.
-pub fn store_memory(config: &ConfigFile) -> anyhow::Result<bool> {
-    Ok(secrets_store_mode(config)? == SecretsStoreMode::Memory)
+/// restart. `env` (`PRELOOP_SECRETS_STORE`) wins over the config file key.
+pub fn store_memory(config: &ConfigFile, env: Option<&str>) -> anyhow::Result<bool> {
+    Ok(secrets_store_mode(config, env)? == SecretsStoreMode::Memory)
 }
 
 /// Load the systemd credential mounted at
-/// `$CREDENTIALS_DIRECTORY/preloop-secrets`, if any: a TOML fragment with
+/// `<credentials_dir>/preloop-secrets`, if any: a TOML fragment with
 /// the same `[secrets]` / `[repo_secrets."owner/repo"]` schema as the config
 /// file. Missing directory or file yields an empty config; a malformed
 /// credential is an error — the operator mounted it explicitly, so a typo
-/// must not be silently ignored at startup.
-pub fn load_credential_secrets() -> anyhow::Result<ConfigFile> {
-    let Some(dir) = std::env::var_os(CREDENTIALS_ENV) else {
+/// must not be silently ignored at startup. `credentials_dir` is the resolved
+/// [`CREDENTIALS_ENV`] value.
+pub fn load_credential_secrets(credentials_dir: Option<&Path>) -> anyhow::Result<ConfigFile> {
+    let Some(dir) = credentials_dir else {
         return Ok(ConfigFile::default());
     };
-    load_credential_from(&PathBuf::from(dir).join(CREDENTIAL_NAME))
+    load_credential_from(&dir.join(CREDENTIAL_NAME))
 }
 
 fn load_credential_from(path: &Path) -> anyhow::Result<ConfigFile> {
@@ -1427,38 +1412,36 @@ impl std::fmt::Debug for ConfigFile {
 }
 
 /// Resolve the config file path: `PRELOOP_CONFIG` when set, else
-/// `$HOME/.preloop/config.toml`.
+/// `$HOME/.preloop/config.toml`. Startup-boundary helper — resolve once
+/// (into [`StartupConfig::config_path`]) and pass the result down; nothing
+/// below the startup boundary should call this.
 pub fn config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(CONFIG_PATH_ENV) {
+        return PathBuf::from(path);
+    }
     // Tests must never resolve (or worse: write) the developer's real
-    // config through the default path; route the default through the pinned
-    // per-process temp file. Callers that set `PRELOOP_CONFIG` explicitly
-    // are left alone.
+    // config through the default path: the default is a per-process pinned
+    // temp file instead — the same path for the whole process, so tests that
+    // share config through the file still agree.
     #[cfg(any(test, feature = "test-support"))]
-    pin_test_config_path();
-    std::env::var_os(CONFIG_PATH_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".preloop").join("config.toml")
-        })
+    {
+        pinned_test_config_path()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".preloop").join("config.toml")
+    }
 }
 
 /// Load the config file. A missing or empty file yields the default config;
 /// a malformed file is an error so a typo is caught at startup, not when a
 /// mint first fails.
 pub fn load_config() -> anyhow::Result<ConfigFile> {
-    // Tests must never read the developer's real config: a machine with a
-    // configured GitHub App leaks credentials into every `AppState::new`.
-    // Pin the path to a per-process temp file, and serialize config I/O so
-    // parallel tests never observe each other's temp files.
+    // Serialize config I/O in test builds: the pinned config path is shared
+    // by the whole test process, so a concurrent write must not tear a read.
     #[cfg(any(test, feature = "test-support"))]
-    let _config_guard = {
-        // Held across the read, not just the pin: dropped early, a concurrent
-        // test could swap `PRELOOP_CONFIG` between resolve and read.
-        let guard = CONFIG_PATH_LOCK.lock();
-        pin_test_config_path();
-        guard
-    };
+    let _config_guard = CONFIG_PATH_LOCK.lock();
     load_config_from(&config_path())
 }
 
@@ -1477,6 +1460,472 @@ pub fn webhook_secret_from_env_or_config(config: &ConfigFile) -> Option<String> 
                 .filter(|secret| !secret.is_empty())
                 .map(str::to_owned)
         })
+}
+
+/// Typed startup configuration for one engine process.
+///
+/// This is the process-startup boundary: production resolves it once from
+/// the inherited environment ([`StartupConfig::from_env`]) plus explicit
+/// entry-point values (a CLI flag overrides the field after `from_env`),
+/// then hands it to [`crate::AppState::new`]. Nothing below the boundary
+/// re-reads the process environment, so one engine is bound to one
+/// configuration for its whole life and tests inject values explicitly
+/// without touching global state.
+///
+/// Layering for every setting, preserved from the env-driven era:
+/// **explicit field > inherited env > config file key > built-in default**.
+/// A blank override value counts as unset everywhere it did before.
+#[derive(Clone)]
+pub struct StartupConfig {
+    // ---- paths ----
+    /// Engine config file (see [`config_path`]).
+    pub config_path: PathBuf,
+    /// Durable store URL (`sqlite://…`, bare path, `postgres://…`).
+    /// `None` → SQLite at `<state_dir>/preloop.db`.
+    /// `from_env()`: `PRELOOP_STORE_URL`.
+    pub store_url: Option<String>,
+    /// Engine home for token/credential storage. `None` → `state_dir`.
+    /// `from_env()`: `PRELOOP_HOME`.
+    pub engine_home: Option<PathBuf>,
+    /// systemd `LoadCredential=` mount directory.
+    /// `from_env()`: [`CREDENTIALS_ENV`].
+    pub credentials_dir: Option<PathBuf>,
+    /// Local workflow workspace. `from_env()`: `PRELOOP_LOCAL_WORKSPACE`.
+    pub local_workspace: Option<PathBuf>,
+
+    // ---- tokens / credentials (redacted in `Debug`) ----
+    /// Native API administrator token. `from_env()`: `PRELOOP_SYSTEM_TOKEN`.
+    pub system_token: Option<String>,
+    /// Hex-encoded 32-byte runner/job JWT key. Takes precedence over
+    /// `hmac_key`; `None` for both loads-or-generates the key file under
+    /// `state_dir`. `from_env()` fills `hmac_key` from `PRELOOP_HMAC_KEY`.
+    pub local_jwt_key: Option<Vec<u8>>,
+    /// Hex-encoded 32-byte runner/job JWT key (`from_env()`:
+    /// `PRELOOP_HMAC_KEY`). See `local_jwt_key`.
+    pub hmac_key: Option<String>,
+    /// GitHub PAT; overrides the config file's `github.pat`.
+    /// `from_env()`: `PRELOOP_GITHUB_TOKEN`.
+    pub github_token: Option<SecretString>,
+    /// GitHub App webhook secret; overrides `github.webhook_secret`.
+    /// `from_env()`: `PRELOOP_WEBHOOK_SECRET`.
+    pub webhook_secret: Option<String>,
+    /// GitHub App id; overrides `github.app_id`.
+    /// `from_env()`: `PRELOOP_GITHUB_APP_ID`.
+    pub github_app_id: Option<String>,
+    /// GitHub App installation id (`PRELOOP_GITHUB_APP_INSTALLATION_ID`).
+    pub github_installation_id: Option<String>,
+    /// GitHub App private key: `(source label, value-is-path, value)`, same
+    /// shape and precedence order as the legacy
+    /// `PRELOOP_GITHUB_APP_PEM{,_FILE}` / `PRELOOP_GITHUB_APP_PRIVATE_KEY{,_PATH}`
+    /// variables, then the config file's `github.app_pem`.
+    pub github_app_pem: Vec<(String, bool, String)>,
+    /// Extra GitHub Apps JSON; overrides `github.apps`.
+    /// `from_env()`: `PRELOOP_GITHUB_APPS_JSON`.
+    pub github_apps_json: Option<String>,
+    /// Mint-failure policy (`local|error|pat`); overrides
+    /// `github.mint_failure`. `from_env()`: `PRELOOP_GITHUB_APP_MINT_FAILURE`.
+    pub github_mint_failure: Option<String>,
+
+    // ---- URLs (normalized: trailing `/` trimmed when stored on AppState) ----
+    /// `from_env()`: `PRELOOP_GITHUB_SERVER_URL`; default `https://github.com`.
+    pub github_server_url: Option<String>,
+    /// `from_env()`: `PRELOOP_GITHUB_API_URL`; default `https://api.github.com`.
+    pub github_api_url: Option<String>,
+    /// `from_env()`: `PRELOOP_GITHUB_GRAPHQL_URL`;
+    /// default `https://api.github.com/graphql`.
+    pub github_graphql_url: Option<String>,
+    /// Public (GitHub-facing) base URL. `from_env()`: `PRELOOP_PUBLIC_URL`;
+    /// default `http://127.0.0.1:9090`.
+    pub public_url: Option<String>,
+    /// Runner-facing base URL. `None` → the public URL.
+    /// `from_env()`: `PRELOOP_RUNNER_URL`.
+    pub runner_url: Option<String>,
+
+    // ---- config-file-key overrides (raw values; the pure resolvers keep the
+    //      fail-closed / warn-and-keep parse semantics) ----
+    /// `PRELOOP_RUNNER_BASE_IMAGE` over `[golden] base_image`.
+    pub base_image: Option<String>,
+    /// `PRELOOP_SECRETS_STORE` over `secrets_store`.
+    pub secrets_store: Option<String>,
+    /// `PRELOOP_CACHE_TOTAL_QUOTA_BYTES` over `[cache] total_quota_bytes`.
+    pub cache_total_quota_bytes: Option<String>,
+    /// `PRELOOP_CHECKOUT_CACHE_MODE` over `[checkout_cache] mode`.
+    pub checkout_cache_mode: Option<String>,
+    /// `PRELOOP_CHECKOUT_CACHE_RUN_RETENTION_SECONDS`.
+    pub checkout_cache_run_retention_seconds: Option<String>,
+    /// `PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS`.
+    pub checkout_cache_repository_retention_seconds: Option<String>,
+    /// `PRELOOP_CHECKOUT_CACHE_MAX_BYTES`.
+    pub checkout_cache_max_bytes: Option<String>,
+    /// `PRELOOP_RETENTION_DAYS` over `retention_days`.
+    pub retention_days: Option<String>,
+    /// `PRELOOP_MAX_JOBS_PER_RUN` over `max_jobs_per_run`.
+    pub max_jobs_per_run: Option<String>,
+    /// `PRELOOP_RERUN_WINDOW_DAYS`.
+    pub rerun_window_days: Option<String>,
+    /// `PRELOOP_DIAG_STAGING_MAX_AGE_HOURS` over `diag_staging_max_age_hours`.
+    pub diag_staging_max_age_hours: Option<String>,
+    /// `PRELOOP_CREDENTIAL_STORE` over the config file's `credential_store`.
+    pub credential_store: Option<String>,
+
+    // ---- engine knobs ----
+    /// `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS` (default 1800, floored at
+    /// `3 *` the max poll window).
+    pub runner_liveness_timeout_secs: Option<u64>,
+    /// `PRELOOP_MAX_POLL_WINDOW_SECS` (default 60; values `0`/unparseable
+    /// fall back to the default).
+    pub max_poll_window_secs: Option<u64>,
+    /// `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
+    pub snapshot_retention_seconds: Option<u64>,
+    /// `PRELOOP_RUNNER_VERSION_DEPRECATED` (`1|true|yes`).
+    pub runner_version_deprecated: Option<bool>,
+    /// `PRELOOP_REGISTRATION_POLICY` (`permissive` opts in; default strict).
+    pub registration_policy: Option<String>,
+    /// `PRELOOP_WEBHOOK_WORKERS` (default 8).
+    pub webhook_workers: Option<usize>,
+    /// `PRELOOP_WEBHOOK_WATCHDOG` (`off|0|false|disabled` disables; default
+    /// enabled).
+    pub webhook_watchdog_enabled: Option<bool>,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS` (default 300).
+    pub webhook_watchdog_interval_secs: Option<u64>,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS`.
+    pub webhook_watchdog_grace_secs: Option<u64>,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS` (default 5).
+    pub webhook_watchdog_max_attempts: Option<u32>,
+    /// `PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES` (default 5).
+    pub webhook_watchdog_max_pages: Option<usize>,
+    /// `PRELOOP_TOKEN_TTL_SECS` (default 2999).
+    pub token_ttl_secs: Option<u64>,
+    /// `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600).
+    pub outbox_retention_seconds: Option<u64>,
+    /// `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` over the manifest default
+    /// (`push,pull_request,check_run`).
+    pub github_app_default_events: Option<String>,
+    /// `PRELOOP_GITHUB_SKIP_WORKFLOWS`: workflow filenames the engine never
+    /// runs (comma-separated).
+    pub github_skip_workflows: Option<String>,
+    /// `PRELOOP_GITHUB_PR_AUTO` (`feature|never`) over `[github.pr] auto`.
+    pub github_pr_auto: Option<String>,
+    /// `PRELOOP_GITHUB_PR_DRAFT` (`1|true|yes|0|false|no`) over
+    /// `[github.pr] draft`.
+    pub github_pr_draft: Option<String>,
+    /// `PRELOOP_GITHUB_PR_EXCLUDE` (comma-separated patterns) over
+    /// `[github.pr] exclude`.
+    pub github_pr_exclude: Option<String>,
+    /// `PRELOOP_GITHUB_BREAKER` (`off|0|false|disabled` disables tripping).
+    pub github_breaker_enabled: Option<bool>,
+    /// `PRELOOP_GITHUB_BREAKER_THRESHOLD` (u32 > 0).
+    pub github_breaker_threshold: Option<u32>,
+}
+
+/// Blank values count as unset, matching every historical override filter.
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// `1|true|yes` (case-insensitive) parse used by the boolean overrides.
+fn env_flag_value(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+impl StartupConfig {
+    /// The production startup boundary: read the inherited process
+    /// environment exactly once. Values already present on `self` (explicit
+    /// CLI values) win; unset fields fall back to the environment here, then
+    /// to the config file / defaults applied by [`crate::AppState::new`].
+    ///
+    /// Build explicit-over-env with
+    /// `StartupConfig { public_url: Some(url), ..StartupConfig::from_env() }`.
+    pub fn from_env() -> Self {
+        Self {
+            config_path: config_path(),
+            store_url: env_override(crate::store::STORE_URL_ENV),
+            engine_home: std::env::var_os("PRELOOP_HOME")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+            credentials_dir: std::env::var_os(CREDENTIALS_ENV).map(PathBuf::from),
+            local_workspace: std::env::var_os("PRELOOP_LOCAL_WORKSPACE").map(PathBuf::from),
+
+            system_token: std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
+            local_jwt_key: None,
+            hmac_key: env_override(crate::state::HMAC_KEY_ENV),
+            github_token: std::env::var("PRELOOP_GITHUB_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(SecretString::new),
+            webhook_secret: std::env::var("PRELOOP_WEBHOOK_SECRET")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            github_app_id: env_override("PRELOOP_GITHUB_APP_ID"),
+            github_installation_id: env_override("PRELOOP_GITHUB_APP_INSTALLATION_ID"),
+            github_app_pem: crate::github_app::PRIVATE_KEY_ENV
+                .into_iter()
+                .filter_map(|(name, is_path)| {
+                    env_override(name).map(|value| (name.to_owned(), is_path, value))
+                })
+                .collect(),
+            github_apps_json: env_override("PRELOOP_GITHUB_APPS_JSON"),
+            github_mint_failure: env_override("PRELOOP_GITHUB_APP_MINT_FAILURE"),
+
+            github_server_url: env_override("PRELOOP_GITHUB_SERVER_URL"),
+            github_api_url: env_override("PRELOOP_GITHUB_API_URL"),
+            github_graphql_url: env_override("PRELOOP_GITHUB_GRAPHQL_URL"),
+            public_url: env_override("PRELOOP_PUBLIC_URL"),
+            runner_url: env_override("PRELOOP_RUNNER_URL"),
+
+            base_image: env_override(BASE_IMAGE_ENV),
+            secrets_store: env_override(SECRETS_STORE_ENV),
+            cache_total_quota_bytes: env_override(CACHE_TOTAL_QUOTA_BYTES_ENV),
+            checkout_cache_mode: env_override(CHECKOUT_CACHE_MODE_ENV),
+            checkout_cache_run_retention_seconds: env_override(CHECKOUT_CACHE_RUN_RETENTION_ENV),
+            checkout_cache_repository_retention_seconds: env_override(
+                CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV,
+            ),
+            checkout_cache_max_bytes: env_override(CHECKOUT_CACHE_MAX_BYTES_ENV),
+            retention_days: env_override(RETENTION_DAYS_ENV),
+            max_jobs_per_run: env_override(MAX_JOBS_PER_RUN_ENV),
+            rerun_window_days: env_override(RERUN_WINDOW_DAYS_ENV),
+            diag_staging_max_age_hours: env_override(DIAG_STAGING_MAX_AGE_HOURS_ENV),
+            credential_store: env_override(crate::credential_store::CREDENTIAL_STORE_ENV),
+
+            runner_liveness_timeout_secs: env_override("PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS")
+                .and_then(|raw| raw.parse().ok()),
+            max_poll_window_secs: env_override("PRELOOP_MAX_POLL_WINDOW_SECS")
+                .and_then(|raw| raw.parse().ok())
+                .filter(|value| *value > 0),
+            snapshot_retention_seconds: env_override("PRELOOP_SNAPSHOT_RETENTION_SECONDS")
+                .and_then(|raw| raw.parse().ok()),
+            runner_version_deprecated: env_flag_value("PRELOOP_RUNNER_VERSION_DEPRECATED"),
+            registration_policy: env_override("PRELOOP_REGISTRATION_POLICY"),
+            webhook_workers: env_override("PRELOOP_WEBHOOK_WORKERS")
+                .and_then(|raw| raw.parse().ok()),
+            webhook_watchdog_enabled: env_override("PRELOOP_WEBHOOK_WATCHDOG").map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "disabled"
+                )
+            }),
+            webhook_watchdog_interval_secs: env_override("PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS")
+                .and_then(|raw| raw.parse().ok()),
+            webhook_watchdog_grace_secs: env_override("PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS")
+                .and_then(|raw| raw.parse().ok()),
+            webhook_watchdog_max_attempts: env_override("PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS")
+                .and_then(|raw| raw.parse().ok()),
+            webhook_watchdog_max_pages: env_override("PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES")
+                .and_then(|raw| raw.parse().ok()),
+            token_ttl_secs: env_override("PRELOOP_TOKEN_TTL_SECS").and_then(|raw| raw.parse().ok()),
+            outbox_retention_seconds: env_override("PRELOOP_OUTBOX_RETENTION_SECONDS")
+                .and_then(|raw| raw.parse().ok()),
+            github_app_default_events: env_override("PRELOOP_GITHUB_APP_DEFAULT_EVENTS"),
+            github_skip_workflows: env_override(crate::github::GITHUB_OWNED_WORKFLOWS_ENV),
+            github_pr_auto: env_override("PRELOOP_GITHUB_PR_AUTO"),
+            github_pr_draft: env_override("PRELOOP_GITHUB_PR_DRAFT"),
+            github_pr_exclude: env_override("PRELOOP_GITHUB_PR_EXCLUDE"),
+            github_breaker_enabled: env_override("PRELOOP_GITHUB_BREAKER").map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "disabled"
+                )
+            }),
+            github_breaker_threshold: env_override("PRELOOP_GITHUB_BREAKER_THRESHOLD")
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .filter(|threshold| *threshold > 0),
+        }
+    }
+
+    /// Deterministic test configuration: the pinned per-process temp config
+    /// path (never the developer's real one), the fixed test system token and
+    /// JWT key, and no environment-derived values. Extend with
+    /// `StartupConfig { github_api_url: Some(stub), ..StartupConfig::for_tests() }`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests() -> Self {
+        Self {
+            config_path: pinned_test_config_path(),
+            store_url: None,
+            engine_home: None,
+            credentials_dir: None,
+            local_workspace: None,
+            system_token: Some(crate::DEFAULT_PRELOOP_SYSTEM_TOKEN.to_owned()),
+            local_jwt_key: Some(crate::TEST_LOCAL_JWT_KEY.to_vec()),
+            hmac_key: None,
+            github_token: None,
+            webhook_secret: None,
+            github_app_id: None,
+            github_installation_id: None,
+            github_app_pem: Vec::new(),
+            github_apps_json: None,
+            github_mint_failure: None,
+            github_server_url: None,
+            github_api_url: None,
+            github_graphql_url: None,
+            public_url: None,
+            runner_url: None,
+            base_image: None,
+            secrets_store: None,
+            cache_total_quota_bytes: None,
+            checkout_cache_mode: None,
+            checkout_cache_run_retention_seconds: None,
+            checkout_cache_repository_retention_seconds: None,
+            checkout_cache_max_bytes: None,
+            retention_days: None,
+            max_jobs_per_run: None,
+            rerun_window_days: None,
+            diag_staging_max_age_hours: None,
+            credential_store: None,
+            runner_liveness_timeout_secs: None,
+            max_poll_window_secs: None,
+            snapshot_retention_seconds: None,
+            runner_version_deprecated: None,
+            registration_policy: None,
+            webhook_workers: None,
+            webhook_watchdog_enabled: None,
+            webhook_watchdog_interval_secs: None,
+            webhook_watchdog_grace_secs: None,
+            webhook_watchdog_max_attempts: None,
+            webhook_watchdog_max_pages: None,
+            token_ttl_secs: None,
+            outbox_retention_seconds: None,
+            github_app_default_events: None,
+            github_skip_workflows: None,
+            github_pr_auto: None,
+            github_pr_draft: None,
+            github_pr_exclude: None,
+            github_breaker_enabled: None,
+            github_breaker_threshold: None,
+        }
+    }
+}
+
+/// Manual `Debug`: credential material is never printed.
+impl std::fmt::Debug for StartupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartupConfig")
+            .field("config_path", &self.config_path)
+            .field(
+                "store_url",
+                &self.store_url.as_deref().map(redact_store_url_debug),
+            )
+            .field("engine_home", &self.engine_home)
+            .field("credentials_dir", &self.credentials_dir)
+            .field("local_workspace", &self.local_workspace)
+            .field(
+                "system_token",
+                &self.system_token.as_deref().map(|_| "<redacted>"),
+            )
+            .field(
+                "local_jwt_key",
+                &self.local_jwt_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("hmac_key", &self.hmac_key.as_deref().map(|_| "<redacted>"))
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_deref().map(|_| "<redacted>"),
+            )
+            .field("github_app_id", &self.github_app_id)
+            .field("github_installation_id", &self.github_installation_id)
+            .field(
+                "github_app_pem",
+                &self
+                    .github_app_pem
+                    .iter()
+                    .map(|(source, ..)| source)
+                    .collect::<Vec<_>>(),
+            )
+            .field("github_apps_json", &self.github_apps_json)
+            .field("github_mint_failure", &self.github_mint_failure)
+            .field("github_server_url", &self.github_server_url)
+            .field("github_api_url", &self.github_api_url)
+            .field("github_graphql_url", &self.github_graphql_url)
+            .field("public_url", &self.public_url)
+            .field("runner_url", &self.runner_url)
+            .field("base_image", &self.base_image)
+            .field("secrets_store", &self.secrets_store)
+            .field("cache_total_quota_bytes", &self.cache_total_quota_bytes)
+            .field("checkout_cache_mode", &self.checkout_cache_mode)
+            .field(
+                "checkout_cache_run_retention_seconds",
+                &self.checkout_cache_run_retention_seconds,
+            )
+            .field(
+                "checkout_cache_repository_retention_seconds",
+                &self.checkout_cache_repository_retention_seconds,
+            )
+            .field("checkout_cache_max_bytes", &self.checkout_cache_max_bytes)
+            .field("retention_days", &self.retention_days)
+            .field("max_jobs_per_run", &self.max_jobs_per_run)
+            .field("rerun_window_days", &self.rerun_window_days)
+            .field(
+                "diag_staging_max_age_hours",
+                &self.diag_staging_max_age_hours,
+            )
+            .field("credential_store", &self.credential_store)
+            .field(
+                "runner_liveness_timeout_secs",
+                &self.runner_liveness_timeout_secs,
+            )
+            .field("max_poll_window_secs", &self.max_poll_window_secs)
+            .field(
+                "snapshot_retention_seconds",
+                &self.snapshot_retention_seconds,
+            )
+            .field("runner_version_deprecated", &self.runner_version_deprecated)
+            .field("registration_policy", &self.registration_policy)
+            .field("webhook_workers", &self.webhook_workers)
+            .field("webhook_watchdog_enabled", &self.webhook_watchdog_enabled)
+            .field(
+                "webhook_watchdog_interval_secs",
+                &self.webhook_watchdog_interval_secs,
+            )
+            .field(
+                "webhook_watchdog_grace_secs",
+                &self.webhook_watchdog_grace_secs,
+            )
+            .field(
+                "webhook_watchdog_max_attempts",
+                &self.webhook_watchdog_max_attempts,
+            )
+            .field(
+                "webhook_watchdog_max_pages",
+                &self.webhook_watchdog_max_pages,
+            )
+            .field("token_ttl_secs", &self.token_ttl_secs)
+            .field("outbox_retention_seconds", &self.outbox_retention_seconds)
+            .field("github_app_default_events", &self.github_app_default_events)
+            .field("github_skip_workflows", &self.github_skip_workflows)
+            .field("github_pr_auto", &self.github_pr_auto)
+            .field("github_pr_draft", &self.github_pr_draft)
+            .field("github_pr_exclude", &self.github_pr_exclude)
+            .field("github_breaker_enabled", &self.github_breaker_enabled)
+            .field("github_breaker_threshold", &self.github_breaker_threshold)
+            .finish()
+    }
+}
+
+/// Redact the password portion of a `postgres://user:pass@host/db` store URL
+/// for `Debug` output; bare sqlite paths pass through untouched.
+fn redact_store_url_debug(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let Some((userinfo, hostport)) = rest.rsplit_once('@') else {
+        return url.to_owned();
+    };
+    match userinfo.split_once(':') {
+        Some((user, _)) => format!("{scheme}://{user}:***@{hostport}"),
+        None => url.to_owned(),
+    }
 }
 
 /// The `credential_store` key of the config file at `path`, read on its own.
@@ -1892,9 +2341,28 @@ fn unseal_config_secrets(
     })
 }
 
-/// Load the config file at `path`. A missing or empty file yields the default
-/// config; a malformed file is an error.
+/// Load the config file at `path`.
+///
+/// A missing or empty file yields the default config; a malformed file is an
+/// error. The credential-store env layer (`PRELOOP_CREDENTIAL_STORE`) is read
+/// at the config-load entry point, and passed down explicitly; startup
+/// callers that already resolved it use [`load_config_from_with`] so nothing
+/// below the [`StartupConfig`] boundary re-reads the process environment.
 pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
+    load_config_from_with(
+        path,
+        std::env::var(crate::credential_store::CREDENTIAL_STORE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`load_config_from`] with the `PRELOOP_CREDENTIAL_STORE` env layer passed
+/// explicitly (blank counts as unset, matching the historical filter).
+pub fn load_config_from_with(
+    path: &Path,
+    credential_store_env: Option<&str>,
+) -> anyhow::Result<ConfigFile> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1910,6 +2378,7 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         .with_context(|| format!("validating config {}", path.display()))?;
     let store = crate::credential_store::selected_store_for_config(
         path,
+        credential_store_env.filter(|value| !value.trim().is_empty()),
         config.credential_store.as_deref(),
     )?;
     resolve_credential_references(&mut config, store.as_ref())?;
@@ -2021,7 +2490,27 @@ pub fn write_config(config: &ConfigFile) -> anyhow::Result<PathBuf> {
 }
 
 /// Atomically write `config` to `path` with mode 0600.
+///
+/// The credential-store env layer is read here exactly as in
+/// [`load_config_from`]; startup callers that resolved it use
+/// [`write_config_to_with`].
 pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
+    write_config_to_with(
+        path,
+        config,
+        std::env::var(crate::credential_store::CREDENTIAL_STORE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`write_config_to`] with the `PRELOOP_CREDENTIAL_STORE` env layer passed
+/// explicitly.
+pub fn write_config_to_with(
+    path: &Path,
+    config: &ConfigFile,
+    credential_store_env: Option<&str>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
@@ -2035,6 +2524,7 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
         // backend than unsealing makes the file unreadable.
         let store = crate::credential_store::selected_store_for_config(
             path,
+            credential_store_env.filter(|value| !value.trim().is_empty()),
             sealed.credential_store.as_deref(),
         )?;
         seal_config_secrets(&mut sealed, dir, store.as_ref())
@@ -2068,37 +2558,27 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// First value that is `Some`, used to layer config under env overrides.
-pub fn env_or<T>(env_value: Option<T>, config_value: Option<T>) -> Option<T> {
-    env_value.or(config_value)
-}
-
-/// Serializes env-resolved config I/O in tests so a test that pins
-/// `PRELOOP_CONFIG` (the secrets API tests in `lib_tests.rs` do) cannot swap
-/// the path out from under another test between resolve and read/write.
+/// Serializes config-file I/O against the shared pinned test config path so
+/// concurrent tests cannot tear each other's read-modify-write cycles.
 #[cfg(any(test, feature = "test-support"))]
 static CONFIG_PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// The pinned per-process test config path. Test builds never resolve (or
+/// write) the developer's real config through the default path: the default
+/// is one temp file per test process, shared so tests that pass config
+/// through the file still agree.
 #[cfg(any(test, feature = "test-support"))]
-// SAFETY: env write is confined to test builds and runs before parallel
-// tests can observe a torn value (callers hold CONFIG_PATH_LOCK).
-#[allow(unsafe_code)]
-fn pin_test_config_path() {
+pub fn pinned_test_config_path() -> PathBuf {
     use std::sync::LazyLock;
-    static TEST_CONFIG_PATH: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
+    static TEST_CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
         let dir = std::env::temp_dir().join(format!("preloop-test-config-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("config.toml")
     });
-    if std::env::var_os(CONFIG_PATH_ENV).is_none() {
-        unsafe { std::env::set_var(CONFIG_PATH_ENV, TEST_CONFIG_PATH.as_path()) };
-    }
+    TEST_CONFIG_PATH.clone()
 }
 
 #[cfg(test)]
-// SAFETY: env writes here are confined to tests that serialize on the
-// module's own usage; each case restores its variables.
-#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::credential_store::WriteOnlyCredentialStore;
@@ -2274,8 +2754,8 @@ mod tests {
     }
 
     use crate::credential_store::{
-        CREDENTIAL_STORE_ENV, CredentialWriter, FileCredentialStore, MemoryCredentialStore,
-        UnavailableCredentialStore, credential_store_dir, github_reference,
+        CredentialWriter, FileCredentialStore, MemoryCredentialStore, UnavailableCredentialStore,
+        credential_store_dir, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
@@ -2462,9 +2942,9 @@ mod tests {
         assert!(whole.contains("repo_secrets: 1 repos"), "{whole}");
     }
 
-    /// Config-driven form of the store-mode check: no process env is
-    /// touched, so the test cannot race other tests that read
-    /// `PRELOOP_SECRETS_STORE`.
+    /// Store-mode resolution over explicit inputs: the env layer wins over
+    /// the config file, blanks count as unset, and unknown values fail
+    /// closed. No process env is involved.
     #[test]
     fn secrets_store_mode_resolves_config_field_and_rejects_unknowns() {
         let file_mode = ConfigFile {
@@ -2476,16 +2956,26 @@ mod tests {
             ..ConfigFile::default()
         };
         assert_eq!(
-            secrets_store_mode(&file_mode).unwrap(),
+            secrets_store_mode(&file_mode, None).unwrap(),
             SecretsStoreMode::File
         );
         assert_eq!(
-            secrets_store_mode(&memory_mode).unwrap(),
+            secrets_store_mode(&memory_mode, None).unwrap(),
             SecretsStoreMode::Memory
         );
         assert_eq!(
-            secrets_store_mode(&ConfigFile::default()).unwrap(),
+            secrets_store_mode(&ConfigFile::default(), None).unwrap(),
             SecretsStoreMode::File
+        );
+        assert_eq!(
+            secrets_store_mode(&file_mode, Some("memory")).unwrap(),
+            SecretsStoreMode::Memory,
+            "the env layer wins over the config file"
+        );
+        assert_eq!(
+            secrets_store_mode(&memory_mode, Some("  ")).unwrap(),
+            SecretsStoreMode::Memory,
+            "a blank override counts as unset"
         );
         // Fail closed: a typo in either source must error, never silently
         // fall back to writing plaintext secrets to the file.
@@ -2493,10 +2983,11 @@ mod tests {
             secrets_store: Some("memroy".into()),
             ..ConfigFile::default()
         };
-        assert!(secrets_store_mode(&typo).is_err());
-        assert!(store_memory(&typo).is_err());
-        assert!(store_memory(&memory_mode).unwrap());
-        assert!(!store_memory(&file_mode).unwrap());
+        assert!(secrets_store_mode(&typo, None).is_err());
+        assert!(secrets_store_mode(&file_mode, Some("memroy")).is_err());
+        assert!(store_memory(&typo, None).is_err());
+        assert!(store_memory(&memory_mode, None).unwrap());
+        assert!(!store_memory(&file_mode, None).unwrap());
     }
 
     #[test]
@@ -2810,8 +3301,6 @@ REPO_OVERLAY = "repo-from-credential"
     /// byte-for-byte, with the file store selected by default.
     #[tokio::test]
     async fn pem_in_the_file_store_loads_through_the_config_file() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::unset(crate::credential_store::CREDENTIAL_STORE_ENV);
         let dir = tempfile::tempdir().unwrap();
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nabc/def+ghi=\n-----END RSA PRIVATE KEY-----\n";
         let pem_ref = github_reference("app-pem", Some("123")).unwrap();
@@ -2830,7 +3319,7 @@ REPO_OVERLAY = "repo-from-credential"
         };
         let path = dir.path().join("config.toml");
         write_config_to(&path, &config).unwrap();
-        let loaded = load_config_from(&path).unwrap();
+        let loaded = load_config_from_with(&path, None).unwrap();
         assert_eq!(loaded.github.app_pem(), Some(pem));
         assert_eq!(loaded.credential_store, None);
     }
@@ -2838,8 +3327,6 @@ REPO_OVERLAY = "repo-from-credential"
     /// override still selects the OS-primary store on the next load.
     #[tokio::test]
     async fn os_env_reads_pem_and_pat_from_the_file_fallback() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _env = crate::state::TestEnvVar::set(CREDENTIAL_STORE_ENV, "os");
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let credentials = FileCredentialStore::new(credential_store_dir(&config_path));
@@ -2863,7 +3350,7 @@ REPO_OVERLAY = "repo-from-credential"
         };
         write_config_to(&config_path, &config).unwrap();
 
-        let loaded = load_config_from(&config_path).unwrap();
+        let loaded = load_config_from_with(&config_path, Some("os")).unwrap();
         assert_eq!(loaded.github.app_pem(), Some(pem));
         assert_eq!(loaded.github.pat(), Some("fallback-pat"));
     }
@@ -2872,13 +3359,14 @@ REPO_OVERLAY = "repo-from-credential"
     /// outside `PRELOOP_HOME`, for both App PEMs and PATs.
     #[tokio::test]
     async fn explicit_config_path_uses_its_sibling_credentials_directory() {
-        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _store_env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
         let home = tempfile::tempdir().unwrap();
-        let _home_env = crate::state::TestEnvVar::set("PRELOOP_HOME", home.path());
+        // The engine home is an explicit input now: it is what a resolved
+        // `PRELOOP_HOME` becomes at the startup boundary. A writer keyed to a
+        // config file elsewhere must not place credentials under it.
+        let _home_scope = crate::credential_store::engine_token_dir(home.path(), Some(home.path()));
         let config_root = tempfile::tempdir().unwrap();
         let config_path = config_root.path().join("config.toml");
-        let mut writer = CredentialWriter::for_config(&config_path, None).unwrap();
+        let mut writer = CredentialWriter::for_config(&config_path, None, None).unwrap();
         let pem_ref = github_reference("app-pem", Some("888")).unwrap();
         let pat_ref = github_reference("pat", None).unwrap();
         writer
@@ -2901,7 +3389,7 @@ REPO_OVERLAY = "repo-from-credential"
         assert!(credential_store_dir(&config_path).exists());
         assert!(!home.path().join("credentials").exists());
 
-        let loaded = load_config_from(&config_path).unwrap();
+        let loaded = load_config_from_with(&config_path, None).unwrap();
         assert_eq!(loaded.github.app_pem(), Some("external-pem"));
         assert_eq!(loaded.github.pat(), Some("external-pat"));
     }

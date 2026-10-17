@@ -235,7 +235,7 @@ impl EnvironmentResolver {
         environment: &str,
     ) -> anyhow::Result<Arc<EnvironmentRules>> {
         self.resolve_at(
-            &crate::github::github_api_base(),
+            &shared.state.github_api_base(),
             shared,
             repository,
             environment,
@@ -305,14 +305,18 @@ impl EnvironmentResolver {
             for creds in &candidates {
                 // The installation id is the rate-limit identity; never
                 // invent one (same convention as check runs).
-                let bucket = match crate::github_app::installation_for_repo(creds, repository).await
-                {
-                    Ok(installation) if installation != 0 => {
-                        crate::github_breaker::GithubCredentialBucket::Installation(installation)
-                    }
-                    _ => crate::github_breaker::GithubCredentialBucket::Pat,
-                };
-                let fetched = match environment_token(creds, repository).await {
+                let bucket =
+                    match crate::github_app::installation_for_repo(api_base, creds, repository)
+                        .await
+                    {
+                        Ok(installation) if installation != 0 => {
+                            crate::github_breaker::GithubCredentialBucket::Installation(
+                                installation,
+                            )
+                        }
+                        _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                    };
+                let fetched = match environment_token(api_base, creds, repository).await {
                     Ok(token) => {
                         fetch_environment_rules(
                             shared,
@@ -519,14 +523,18 @@ impl EnvironmentResolver {
             let mut permissions = std::collections::BTreeMap::new();
             permissions.insert("members".to_owned(), "read".to_owned());
             permissions.insert("contents".to_owned(), "read".to_owned());
+            let api_base = shared.state.github_api_base();
             let token =
-                crate::github_app::get_or_mint_token(&creds, repository, &permissions).await?;
-            let bucket = match crate::github_app::installation_for_repo(&creds, repository).await {
-                Ok(installation) if installation != 0 => {
-                    crate::github_breaker::GithubCredentialBucket::Installation(installation)
-                }
-                _ => crate::github_breaker::GithubCredentialBucket::Pat,
-            };
+                crate::github_app::get_or_mint_token(&api_base, &creds, repository, &permissions)
+                    .await?;
+            let bucket =
+                match crate::github_app::installation_for_repo(&api_base, &creds, repository).await
+                {
+                    Ok(installation) if installation != 0 => {
+                        crate::github_breaker::GithubCredentialBucket::Installation(installation)
+                    }
+                    _ => crate::github_breaker::GithubCredentialBucket::Pat,
+                };
             (token, bucket)
         } else {
             let token = shared.state.static_github_pat().ok_or_else(|| {
@@ -536,7 +544,7 @@ impl EnvironmentResolver {
         };
         let members = fetch_team_members(
             shared,
-            &crate::github::github_api_base(),
+            &shared.state.github_api_base(),
             &token,
             bucket,
             org,
@@ -562,13 +570,14 @@ fn url_path_segment(value: &str) -> String {
 /// (docs.github.com/en/rest/authentication/permissions-required-for-github-apps),
 /// so the mint requests it alongside `contents: read`.
 async fn environment_token(
+    api_base: &str,
     creds: &crate::github_app::GitHubAppCredentials,
     repository: &str,
 ) -> anyhow::Result<String> {
     let mut permissions = std::collections::BTreeMap::new();
     permissions.insert("contents".to_owned(), "read".to_owned());
     permissions.insert("actions".to_owned(), "read".to_owned());
-    crate::github_app::get_or_mint_token(creds, repository, &permissions).await
+    crate::github_app::get_or_mint_token(api_base, creds, repository, &permissions).await
 }
 
 /// GET `path` under the token, decoding JSON. `Ok(None)` on 404.
@@ -952,7 +961,6 @@ async fn fetch_team_members(
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)] // SAFETY: env writes confined to serialized tests.
 mod tests {
     use super::*;
     use axum::routing::{get, post};
@@ -1040,9 +1048,9 @@ mod tests {
         }
     }
 
-    async fn shared() -> Arc<crate::state::SharedState> {
+    async fn shared(startup: crate::config::StartupConfig) -> Arc<crate::state::SharedState> {
         let temp = tempfile::tempdir().unwrap();
-        let state = crate::AppState::new(temp.path().join("state"))
+        let state = crate::AppState::new(temp.path().join("state"), startup)
             .await
             .unwrap();
         Arc::new(crate::state::SharedState {
@@ -1051,29 +1059,15 @@ mod tests {
         })
     }
 
-    /// PAT-mode resolve (no App configured): `PRELOOP_GITHUB_TOKEN` +
-    /// `PRELOOP_GITHUB_API_URL` point the fetch at the stub. Held for the
-    /// test — the vars are process-global — and restored when the guards
-    /// drop (including on panic): a leaked stub base or token poisons every
-    /// later test in the binary that resolves refs or reads the config PAT.
-    ///
-    /// The lock guard is the LAST tuple field on purpose: tuple fields drop
-    /// in declaration order, so the env vars are restored before the lock is
-    /// released. The previous order (`(guard, token, api)`) released the lock
-    /// first, letting the next test set its own stub base and then have it
-    /// clobbered by this test's still-pending restore — the fetch then went
-    /// to the real github.com and failed the test flakily.
-    async fn pat_env(
-        api_base: &str,
-    ) -> (
-        crate::state::TestEnvVar,
-        crate::state::TestEnvVar,
-        tokio::sync::MutexGuard<'static, ()>,
-    ) {
-        let lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-        let api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
-        (token, api, lock)
+    /// PAT-mode resolve (no App configured): the stub base and a static PAT
+    /// passed explicitly through the startup config — no process env, so the
+    /// fixture cannot leak into a sibling test.
+    fn pat_startup(api_base: &str) -> crate::config::StartupConfig {
+        crate::config::StartupConfig {
+            github_api_url: Some(api_base.to_owned()),
+            github_token: Some(preloop_gha_protocol::SecretString::new("ghp_test_token")),
+            ..crate::config::StartupConfig::for_tests()
+        }
     }
 
     #[tokio::test]
@@ -1103,8 +1097,7 @@ mod tests {
             ]}),
         )
         .await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
 
@@ -1135,8 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_environment_resolves_to_no_rules() {
         let stub = StubApi::serve(Value::Null, json!({}), json!({})).await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
 
@@ -1158,8 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn unreadable_actions_surface_keeps_a_404_fail_closed() {
         let stub = StubApi::serve_with_unreadable_actions(Value::Null).await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
 
@@ -1211,8 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn unprobed_repo_reports_pending_until_resolved() {
         let stub = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
 
@@ -1253,8 +1243,7 @@ mod tests {
             json!({}),
         )
         .await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
         resolver
@@ -1311,15 +1300,18 @@ mod tests {
             json!({}),
         )
         .await;
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _unset = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", stub.base.as_str());
         // The config-file credential shape: `AppState::new` populates
         // `github_pat` from `github.pat`, so seed the field it would hold.
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().join("state"))
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().join("state"),
+            crate::config::StartupConfig {
+                github_api_url: Some(stub.base.clone()),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_pat = Some(preloop_gha_protocol::SecretString::new("ghp_config_token"));
         let shared = Arc::new(crate::state::SharedState {
             state,
@@ -1397,7 +1389,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let _env = pat_env(&base).await;
 
         let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let mut first = crate::github_app::GitHubAppCredentials::for_tests(
@@ -1414,7 +1405,7 @@ mod tests {
         second.installation_id = Some(202);
 
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().join("state"))
+        let mut state = crate::AppState::new(temp.path().join("state"), pat_startup(&base))
             .await
             .unwrap();
         state.github_apps = Some(crate::github_app::GitHubApps {
@@ -1480,7 +1471,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let shared = shared().await;
+        let shared = shared(crate::config::StartupConfig::for_tests()).await;
 
         let protected_error = fetch_protected_branches(
             &shared,
@@ -1556,8 +1547,7 @@ mod tests {
     #[tokio::test]
     async fn unused_environment_keys_are_neither_refreshed_nor_kept() {
         let stub = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
         resolver
@@ -1613,8 +1603,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_pass_skips_expired_environments_nothing_uses() {
         let stub = StubApi::serve(json!({"protection_rules": []}), json!({}), json!({})).await;
-        let _env = pat_env(&stub.base).await;
-        let shared = shared().await;
+        let shared = shared(pat_startup(&stub.base)).await;
         let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
         resolver.set_github_configured();
         resolver

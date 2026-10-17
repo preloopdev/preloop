@@ -35,11 +35,23 @@ homepage = "https://github.com/preloopdev/preloop"
 rust-version = "1.97"
 
 [workspace.lints.rust]
-# `deny` (not `forbid`) so test targets may `#[allow(unsafe_code)]` around
-# `std::env::set_var`/`remove_var` — unsafe under edition 2024, with no safe
-# std alternative. Production code in workspace crates remains unsafe-free.
-unsafe_code = "deny"
+# Inherited by every workspace crate and not liftable by `allow`/`expect`:
+# no `unsafe` in production, tests, benchmarks, or build scripts — including
+# `std::env::set_var`/`remove_var` (unsafe under edition 2024). Tests take
+# explicit inputs or spawn child processes with `Command::env`/`env_remove`;
+# production reads the environment once at startup and passes typed config
+# (see AGENTS.md).
+unsafe_code = "forbid"
 missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Low-noise correctness guards; broader lints (pedantic, unwrap bans) stay
+# off. Exceptions only via narrow `#[expect(<lint>, reason = "...")]`, never
+# for `unsafe_code`.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+await_holding_lock = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0"

@@ -114,7 +114,9 @@ async fn put_url(app: &axum::Router, url: &str, bytes: Vec<u8>) -> StatusCode {
 #[tokio::test]
 async fn refresh_mints_fresh_url_for_same_staging_jti() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, plan_id, job_id, token) = live_job(&app, &state).await;
 
@@ -146,7 +148,9 @@ async fn refresh_mints_fresh_url_for_same_staging_jti() {
 #[tokio::test]
 async fn refresh_expired_url_succeeds() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, plan_id, job_id, token) = live_job(&app, &state).await;
 
@@ -199,7 +203,9 @@ async fn refresh_expired_url_succeeds() {
 #[tokio::test]
 async fn refresh_by_settled_job_is_forbidden() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (run_id, plan_id, job_id, token) = live_job(&app, &state).await;
 
@@ -221,7 +227,9 @@ async fn refresh_by_settled_job_is_forbidden() {
 #[tokio::test]
 async fn refresh_unknown_pending_is_not_found() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, _plan_id, job_id, token) = live_job(&app, &state).await;
 
@@ -246,7 +254,9 @@ async fn refresh_unknown_pending_is_not_found() {
 #[tokio::test]
 async fn refresh_other_jobs_pending_is_forbidden() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_a, plan_a, job_a, token_a) = live_job(&app, &state).await;
     let (_run_b, _plan_b, _job_b, token_b) = live_job(&app, &state).await;
@@ -265,7 +275,9 @@ async fn refresh_other_jobs_pending_is_forbidden() {
 #[tokio::test]
 async fn refresh_rejects_tampered_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, plan_id, job_id, token) = live_job(&app, &state).await;
 
@@ -286,7 +298,9 @@ async fn refresh_rejects_tampered_token() {
 #[tokio::test]
 async fn refresh_rejects_download_url() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let (_run_id, plan_id, job_id, token) = live_job(&app, &state).await;
 

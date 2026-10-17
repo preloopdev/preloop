@@ -1,14 +1,46 @@
-// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
-#![allow(unsafe_code)]
-
-//! `PRELOOP_STORE_URL` selection tests. They mutate the process environment,
-//! and every `AppState::new` falls back to that variable, so they live in
-//! their own test binary: a sibling test opening a store mid-mutation would
-//! pick up this test's temporary database and fail once it is deleted.
+//! `PRELOOP_STORE_URL` selection tests. The variable is exercised through a
+//! child process (`Command::env`/`env_remove`), never by mutating this
+//! process's environment: the child shares a temp directory with the parent
+//! through [`DIR_ENV`], and the parent asserts on the database files it left
+//! behind. They live in their own test binary so a sibling test opening a
+//! store cannot observe the child's temporary database.
 
 mod common;
 
 use common::*;
+
+/// Marks the child process spawned by [`rerun`].
+const CHILD_ENV: &str = "PRELOOP_TEST_CHILD";
+/// The temp directory shared between the parent and its child.
+const DIR_ENV: &str = "PRELOOP_TEST_SHARED_DIR";
+
+/// In the spawned child: the shared directory the parent created.
+fn child_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(CHILD_ENV)?;
+    Some(std::path::PathBuf::from(std::env::var_os(DIR_ENV)?))
+}
+
+/// Re-run this test binary's `test_name` in a child process with the given
+/// environment applied (`None` removes the variable). The child shares `dir`
+/// through [`DIR_ENV`] and takes the `child_dir()` branch of the same test.
+fn rerun(test_name: &str, dir: &std::path::Path, vars: &[(&str, Option<String>)]) {
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current test binary"));
+    cmd.args([test_name, "--exact"]);
+    cmd.env(CHILD_ENV, "1");
+    cmd.env(DIR_ENV, dir);
+    for (name, value) in vars {
+        match value {
+            Some(value) => {
+                cmd.env(name, value);
+            }
+            None => {
+                cmd.env_remove(name);
+            }
+        }
+    }
+    let status = cmd.status().expect("spawn child test");
+    assert!(status.success(), "child run of {test_name} failed");
+}
 
 /// `PRELOOP_STORE_URL` selects the control backend when no explicit URL is
 /// given — the documented `preloop engine`/systemd configuration, which has no
@@ -17,19 +49,26 @@ use common::*;
 /// reported `postgres` (the label path kept reading the env).
 #[tokio::test]
 async fn store_url_env_selects_the_control_backend() {
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    if let Some(dir) = child_dir() {
+        let state_dir = dir.join("state");
+        let backend = crate::state::test_open_backend(None, &state_dir)
+            .await
+            .expect("env-selected backend must open");
+        assert_eq!(backend, "sqlite");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let env_db = dir.path().join("from-env.db");
-    let _env = crate::state::TestEnvVar::set(
-        crate::store::STORE_URL_ENV,
-        format!("sqlite://{}", env_db.display()),
-    );
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
-    let backend = crate::state::test_open_backend(None, &state_dir)
-        .await
-        .expect("env-selected backend must open");
-    assert_eq!(backend, "sqlite");
+    rerun(
+        "store_url_env_selects_the_control_backend",
+        dir.path(),
+        &[(
+            crate::store::STORE_URL_ENV,
+            Some(format!("sqlite://{}", env_db.display())),
+        )],
+    );
     assert!(
         env_db.exists(),
         "PRELOOP_STORE_URL must select the database"
@@ -41,24 +80,28 @@ async fn store_url_env_selects_the_control_backend() {
 }
 
 /// Regression: test builds never let the ambient `PRELOOP_STORE_URL` reach
-/// [`AppState`]. The env-mutating tests above serialize on
-/// `GITHUB_ENV_LOCK`, but every other test in this binary opens an `AppState`
-/// while that variable may point at a sibling's temp database — deleted with
-/// the tempdir or still live as a foreign store. `AppState::new_with_store`
-/// pins `None` to the state-dir default in test builds; production keeps the
-/// env fallback, which `test_open_backend` still exercises.
+/// [`AppState`]. `AppState::new_for_tests` pins `None` to the state-dir
+/// default in test builds; production keeps the env fallback, which
+/// `test_open_backend` still exercises above.
 #[tokio::test]
 async fn app_state_ignores_ambient_store_url_in_test_builds() {
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    if let Some(dir) = child_dir() {
+        let state_dir = dir.join("state");
+        AppState::new_for_tests(state_dir).await.unwrap();
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let env_db = dir.path().join("from-env.db");
-    let _env = crate::state::TestEnvVar::set(
-        crate::store::STORE_URL_ENV,
-        format!("sqlite://{}", env_db.display()),
-    );
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
-    AppState::new(state_dir.clone()).await.unwrap();
+    rerun(
+        "app_state_ignores_ambient_store_url_in_test_builds",
+        dir.path(),
+        &[(
+            crate::store::STORE_URL_ENV,
+            Some(format!("sqlite://{}", env_db.display())),
+        )],
+    );
     assert!(
         state_dir.join("preloop.db").exists(),
         "a test-build AppState must use <state_dir>/preloop.db"
@@ -72,23 +115,30 @@ async fn app_state_ignores_ambient_store_url_in_test_builds() {
 /// Explicit URL wins over the environment — the precedence the merge base had.
 #[tokio::test]
 async fn explicit_store_url_wins_over_env() {
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    if let Some(dir) = child_dir() {
+        let state_dir = dir.join("state");
+        let backend = crate::state::test_open_backend(
+            Some(&format!("sqlite://{}", dir.join("explicit.db").display())),
+            &state_dir,
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend, "sqlite");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let env_db = dir.path().join("from-env.db");
     let explicit_db = dir.path().join("explicit.db");
-    let _env = crate::state::TestEnvVar::set(
-        crate::store::STORE_URL_ENV,
-        format!("sqlite://{}", env_db.display()),
-    );
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
-    let backend = crate::state::test_open_backend(
-        Some(&format!("sqlite://{}", explicit_db.display())),
-        &state_dir,
-    )
-    .await
-    .unwrap();
-    assert_eq!(backend, "sqlite");
+    rerun(
+        "explicit_store_url_wins_over_env",
+        dir.path(),
+        &[(
+            crate::store::STORE_URL_ENV,
+            Some(format!("sqlite://{}", env_db.display())),
+        )],
+    );
     assert!(explicit_db.exists());
     assert!(!env_db.exists());
     assert!(!state_dir.join("preloop.db").exists());
@@ -100,11 +150,16 @@ async fn explicit_store_url_wins_over_env() {
 /// bogus relative path.
 #[tokio::test]
 async fn store_url_parsing_matches_the_label_path() {
-    // The whitespace case falls back to `PRELOOP_STORE_URL`, so this test has
-    // to serialize with the other env-mutating tests and pin the variable
-    // unset — otherwise a sibling's temp database leaks in and is gone.
-    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
+    if let Some(dir) = child_dir() {
+        // The whitespace case falls back to `PRELOOP_STORE_URL`, which the
+        // child has removed (an explicitly unset variable).
+        let ws_state = dir.join("ws-state");
+        let backend = crate::state::test_open_backend(Some("   "), &ws_state)
+            .await
+            .unwrap();
+        assert_eq!(backend, "sqlite");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
@@ -120,15 +175,14 @@ async fn store_url_parsing_matches_the_label_path() {
 
     // A whitespace-only value is "unset": the state-dir default is opened, and
     // no database file literally named " " appears in the working directory.
-    let ws_dir = tempfile::tempdir().unwrap();
-    let ws_state = ws_dir.path().join("state");
-    fs::create_dir_all(&ws_state).unwrap();
-    let backend = crate::state::test_open_backend(Some("   "), &ws_state)
-        .await
-        .unwrap();
-    assert_eq!(backend, "sqlite");
+    std::fs::create_dir_all(dir.path().join("ws-state")).unwrap();
+    rerun(
+        "store_url_parsing_matches_the_label_path",
+        dir.path(),
+        &[(crate::store::STORE_URL_ENV, None)],
+    );
     assert!(
-        ws_state.join("preloop.db").exists(),
+        dir.path().join("ws-state/preloop.db").exists(),
         "a whitespace-only URL must fall back to <state_dir>/preloop.db"
     );
     assert!(

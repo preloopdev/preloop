@@ -23,10 +23,9 @@ use crate::github_setup::{self, GithubSetupArgs, Via};
 use crate::preloop_home;
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use preloop_runner_server::config::{ConfigFile, GoldenConfig, load_config, write_config};
+use preloop_runner_server::config::{ConfigFile, GoldenConfig, load_config_from, write_config_to};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::future::Future;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -104,7 +103,7 @@ use preloop_orchestrator::oci::{
 };
 use preloop_orchestrator::{
     DISK_PREFLIGHT_OVERRIDE, GIB, GOLDEN_BUILD_DISK_HEADROOM_GIB, GOLDEN_DOWNLOAD_DISK_MARGIN,
-    disk_preflight_overridden, golden_builder_storage_gib,
+    golden_builder_storage_gib,
 };
 
 /// Compressed packed-official-golden transfer, the size the engine's own
@@ -267,9 +266,10 @@ impl RunMode {
 pub(crate) async fn run(
     args: InitArgs,
     observability: Option<preloop_observability::Observability>,
+    config_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     if args.probe {
-        return print_probe().await;
+        return print_probe(config_path).await;
     }
     // The wizard owns the terminal; `--json` output is one object per line, so
     // it is never mixed with prompts.
@@ -281,6 +281,7 @@ pub(crate) async fn run(
         json,
         yes: args.yes,
         from_serve: false,
+        config_path: config_path.to_path_buf(),
     };
     match session.execute(args, observability, false).await {
         Ok(()) => Ok(()),
@@ -309,7 +310,7 @@ pub(crate) async fn run(
 /// Run the wizard from `serve` when no golden is configured yet. The mode step
 /// is fixed to "configure only": this process already *is* the foreground
 /// engine, and a nested `serve` would fight it for the socket.
-pub(crate) async fn run_from_serve() -> anyhow::Result<()> {
+pub(crate) async fn run_from_serve(config_path: &std::path::Path) -> anyhow::Result<()> {
     let args = InitArgs {
         mode: Some(RunMode::Configure),
         ..InitArgs::default()
@@ -319,6 +320,7 @@ pub(crate) async fn run_from_serve() -> anyhow::Result<()> {
         json: false,
         yes: false,
         from_serve: true,
+        config_path: config_path.to_path_buf(),
     };
     session.execute(args, None, true).await
 }
@@ -331,6 +333,11 @@ struct Session {
     /// Entered from `serve`, which is already running this config: the
     /// "start `serve` on its next run" messages would be wrong.
     from_serve: bool,
+    /// The engine config file this run reads and writes. `main` resolves it
+    /// once (an explicit `PRELOOP_CONFIG`, else the engine home's
+    /// `config.toml`); the service-mode step may redirect it at
+    /// [`Session::prepare_service_home`].
+    config_path: std::path::PathBuf,
 }
 
 /// The answers the four steps produce, before any of them is applied.
@@ -416,7 +423,7 @@ impl Session {
         observability: Option<preloop_observability::Observability>,
         from_serve: bool,
     ) -> anyhow::Result<()> {
-        let config = load_config().context("reading the engine config")?;
+        let config = load_config_from(&self.config_path).context("reading the engine config")?;
         let answers = self.resolve(&args, &config, from_serve)?;
 
         // A system service reads its own state dir, so when the operator did
@@ -458,13 +465,15 @@ impl Session {
         let preflight = self.preflight(&decision, answers.mode)?;
 
         // Re-read: the credentials step rewrote the file (or created it).
-        let mut config = load_config().context("re-reading the engine config")?;
+        let mut config =
+            load_config_from(&self.config_path).context("re-reading the engine config")?;
         config.golden = GoldenConfig {
             kind: Some(decision.kind.as_str().to_owned()),
             base_image: decision.base_image.clone(),
             dockerfile: decision.dockerfile.clone(),
         };
-        let written = write_config(&config).context("writing the engine config")?;
+        write_config_to(&self.config_path, &config).context("writing the engine config")?;
+        let written = self.config_path.clone();
         if !self.json {
             println!("\nwrote {}", written.display());
         }
@@ -497,7 +506,7 @@ impl Session {
             println!(
                 "preloop init — configuring {}\n\
                  Four steps; press Enter to keep the current answer.",
-                preloop_runner_server::config::config_path().display()
+                self.config_path.display()
             );
         }
         let (auth, auth_unchanged) = self.ask_auth(args, config)?;
@@ -582,7 +591,7 @@ impl Session {
             self.note(&format!("using --auth {}", describe_auth(auth)));
             return Ok((auth, false));
         }
-        if let Some((prior, summary)) = credential_prior(config) {
+        if let Some((prior, summary)) = credential_prior(config, &self.config_path) {
             self.note(&format!("current: {summary}"));
             if !self.ask_bool("    change? [y/N] ", false)? {
                 return Ok((prior, true));
@@ -875,15 +884,19 @@ impl Session {
         // In `--json` the reused flow's human output would land between our
         // one-object-per-line steps, so it is captured and attached instead.
         let log = if self.json {
-            let (result, captured) =
-                capture_stdout(github_setup::cmd_setup_github(setup_args)).await;
-            result?;
-            captured
+            let mut out = crate::output::Out::capturing();
+            github_setup::cmd_setup_github(setup_args, &mut out, &self.config_path).await?;
+            out.into_captured()
         } else {
-            github_setup::cmd_setup_github(setup_args).await?;
+            github_setup::cmd_setup_github(
+                setup_args,
+                &mut crate::output::Out::stdout(),
+                &self.config_path,
+            )
+            .await?;
             String::new()
         };
-        let config = load_config().context("re-reading the engine config")?;
+        let config = load_config_from(&self.config_path).context("re-reading the engine config")?;
         let summary = credential_summary(&config).unwrap_or_else(|| "configured".to_owned());
         self.note(&format!("configured: {summary}"));
         let verified = self.verify_credentials(&config, args).await?;
@@ -924,13 +937,36 @@ impl Session {
             self.note("credential check skipped (pass --repo owner/name to verify against GitHub)");
             return Ok(json!({"skipped": "no --repo and no detected remote"}));
         }
+        // Resolved once at this boundary and passed down: the live check never
+        // reads the process environment itself.
+        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "https://api.github.com".to_owned());
         let result = match (
             config.github.app_id.as_deref(),
             config.github.app_pem(),
             config.github.pat(),
         ) {
-            (Some(app_id), Some(pem), _) => github_setup::doctor_app(app_id, pem, &repos).await,
-            (_, _, Some(token)) => github_setup::doctor_pat(token, &repos).await,
+            (Some(app_id), Some(pem), _) => {
+                github_setup::doctor_app(
+                    app_id,
+                    pem,
+                    &repos,
+                    &mut crate::output::Out::stdout(),
+                    &api_base,
+                )
+                .await
+            }
+            (_, _, Some(token)) => {
+                github_setup::doctor_pat(
+                    token,
+                    &repos,
+                    &mut crate::output::Out::stdout(),
+                    &api_base,
+                )
+                .await
+            }
             _ => {
                 self.note("no credential is configured to verify");
                 return Ok(json!({"skipped": "no credential"}));
@@ -1220,7 +1256,7 @@ impl Session {
     fn preflight(&mut self, decision: &GoldenDecision, mode: RunMode) -> anyhow::Result<Value> {
         self.section("4/4 Preflight");
         let starting = matches!(mode, RunMode::Foreground | RunMode::Service);
-        let data_root = preloop_vm::machine_data_root();
+        let data_root = preloop_vm::VmPathConfig::resolve().machine_data_root();
         let free = data_root.as_deref().and_then(|root| {
             match preloop_vm::filesystem_available_bytes(root) {
                 Ok(free) => Some(free),
@@ -1238,7 +1274,9 @@ impl Session {
             }
         });
         // The engine's own builder rule: builder disk + pack staging.
-        let builder_gib = u64::from(golden_builder_storage_gib(crate::runner_storage_gib()));
+        let builder_gib = u64::from(golden_builder_storage_gib(crate::runner_storage_gib(
+            std::env::var(crate::RUNNER_STORAGE_GB_ENV).ok().as_deref(),
+        )));
         let bake_bytes = (builder_gib + GOLDEN_BUILD_DISK_HEADROOM_GIB) * GIB;
         let download_bytes = decision
             .artifact_bytes
@@ -1349,7 +1387,13 @@ impl Session {
 
         if !shortfalls.is_empty() {
             let disk_only = shortfalls.iter().all(|short| short["resource"] == "disk");
-            if disk_only && disk_preflight_overridden() {
+            // Resolved at this command's startup boundary: the same rule the
+            // pool's `skip_disk_preflight` config field gets.
+            if disk_only
+                && crate::skip_disk_preflight(
+                    std::env::var(DISK_PREFLIGHT_OVERRIDE).ok().as_deref(),
+                )
+            {
                 self.emit(json!({"step": "preflight", "decision": "overridden", "result": report}));
                 if !self.json {
                     println!(
@@ -1387,7 +1431,7 @@ impl Session {
     /// A system service reads its own state dir; write the config there when
     /// the operator did not pin `PRELOOP_HOME` (which the service would then
     /// be told to use, because `install` gets the same value).
-    fn prepare_service_home(&self) -> anyhow::Result<()> {
+    fn prepare_service_home(&mut self) -> anyhow::Result<()> {
         ensure_service_root()?;
         let service_home = std::env::var_os("PRELOOP_HOME")
             .map(PathBuf::from)
@@ -1400,13 +1444,12 @@ impl Session {
             "service state dir: {} — the installed service reads this file, so the answers below \
              are written there (not {})",
             target.display(),
-            preloop_runner_server::config::config_path().display(),
+            self.config_path.display(),
         ));
-        // SAFETY: the CLI is single-threaded here and nothing else reads the
-        // environment concurrently; `main` sets the same variable the same way.
-        unsafe {
-            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &target);
-        }
+        // Redirect the run's config file: every later step reads and writes
+        // the service's config, exactly as the old process-wide publication
+        // did — as explicit state instead of process environment.
+        self.config_path = target;
         Ok(())
     }
 
@@ -1444,15 +1487,24 @@ impl Session {
                 // migrate` is the explicit path.
                 let state_dir = crate::preloop_home().join("state");
                 std::fs::create_dir_all(&state_dir)?;
-                if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)?
-                    && !self.json
+                if preloop_runner_server::store_admin::prepare_brand_new_local(
+                    &state_dir,
+                    std::env::var(preloop_runner_server::store::STORE_URL_ENV)
+                        .ok()
+                        .as_deref(),
+                )? && !self.json
                 {
                     println!(
                         "initialized the control database at {}",
                         state_dir.join("preloop.db").display()
                     );
                 }
-                crate::cmd_engine(crate::ServeArgs::default(), observability).await
+                crate::cmd_engine(
+                    crate::ServeArgs::default(),
+                    observability,
+                    config_path.to_path_buf(),
+                )
+                .await
             }
             RunMode::Service => {
                 ensure_service_root()?;
@@ -1660,7 +1712,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn ensure_service_root() -> anyhow::Result<()> {
-    if unsafe { libc::geteuid() } == 0 {
+    if nix::unistd::geteuid().is_root() {
         return Ok(());
     }
     Err(anyhow::anyhow!(
@@ -1676,7 +1728,7 @@ fn ensure_service_root() -> anyhow::Result<()> {
 /// as the previous answer instead of asking the whole menu again. A machine
 /// that has never run `init` has no file, and gets the menu (whose default is
 /// the recommended App).
-fn credential_prior(config: &ConfigFile) -> Option<(AuthChoice, String)> {
+fn credential_prior(config: &ConfigFile, config_path: &Path) -> Option<(AuthChoice, String)> {
     if let Some(summary) = credential_summary(config) {
         let choice = if config.github.app_id.is_none()
             && config.github.apps.is_empty()
@@ -1688,7 +1740,7 @@ fn credential_prior(config: &ConfigFile) -> Option<(AuthChoice, String)> {
         };
         return Some((choice, summary));
     }
-    preloop_runner_server::config::config_path()
+    config_path
         .exists()
         .then(|| (AuthChoice::None, "none — local only".to_owned()))
 }
@@ -1866,20 +1918,24 @@ fn hypervisor_state() -> (bool, String) {
 
 /// `preloop init --probe --json`: a side-effect-free capability report. Nothing
 /// here writes, creates, or starts anything.
-async fn print_probe() -> anyhow::Result<()> {
-    let data_root = preloop_vm::machine_data_root();
+async fn print_probe(config_path: &Path) -> anyhow::Result<()> {
+    let data_root = preloop_vm::VmPathConfig::resolve().machine_data_root();
     let disk_free_bytes = data_root
         .as_deref()
         .and_then(|root| preloop_vm::filesystem_available_bytes(root).ok());
     let (hypervisor, hypervisor_detail) = hypervisor_state();
-    let (config, config_error) = match load_config() {
+    let (config, config_error) = match load_config_from(config_path) {
         Ok(config) => (config, None),
         Err(error) => (ConfigFile::default(), Some(format!("{error:#}"))),
     };
-    let config_path = preloop_runner_server::config::config_path();
     let docker = container_engine();
     let dockerfile_detected = default_dockerfile().is_file();
-    let base_image = preloop_runner_server::config::golden_base_image(&config);
+    let base_image = preloop_runner_server::config::golden_base_image(
+        &config,
+        std::env::var(preloop_runner_server::config::BASE_IMAGE_ENV)
+            .ok()
+            .as_deref(),
+    );
     let report = json!({
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
@@ -2217,89 +2273,6 @@ fn github_pat_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-// -- stdout capture -------------------------------------------------------
-
-/// Run `future` with this process's stdout redirected into a temporary file,
-/// and return what it printed there. Used so the reused `preloop setup` flow's
-/// human output cannot corrupt `--json`'s one-object-per-line contract.
-async fn capture_stdout<F: Future>(future: F) -> (F::Output, String) {
-    #[cfg(unix)]
-    {
-        let Ok(capture) = StdoutCapture::begin() else {
-            return (future.await, String::new());
-        };
-        let output = future.await;
-        (output, capture.finish())
-    }
-    #[cfg(not(unix))]
-    {
-        (future.await, String::new())
-    }
-}
-
-/// Restores fd 1 on drop, so an unwinding future cannot leave the process
-/// writing its output into the capture file.
-#[cfg(unix)]
-struct StdoutCapture {
-    saved: libc::c_int,
-    file: std::fs::File,
-    active: bool,
-}
-
-#[cfg(unix)]
-impl StdoutCapture {
-    fn begin() -> anyhow::Result<Self> {
-        use std::os::fd::AsRawFd;
-        std::io::stdout().flush().context("flushing stdout")?;
-        let file = tempfile::tempfile().context("creating the capture file")?;
-        // SAFETY: dup/dup2 operate on this process's own descriptor table, and
-        // the guard restores fd 1 when it is dropped.
-        let saved = unsafe { libc::dup(1) };
-        if saved < 0 {
-            anyhow::bail!("dup(1) failed");
-        }
-        if unsafe { libc::dup2(file.as_raw_fd(), 1) } < 0 {
-            unsafe { libc::close(saved) };
-            anyhow::bail!("dup2(2) failed");
-        }
-        Ok(Self {
-            saved,
-            file,
-            active: true,
-        })
-    }
-
-    fn finish(mut self) -> String {
-        self.restore();
-        use std::io::{Read, Seek, SeekFrom};
-        let mut text = String::new();
-        if self.file.seek(SeekFrom::Start(0)).is_ok() {
-            let _ = self.file.read_to_string(&mut text);
-        }
-        text
-    }
-
-    fn restore(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.active = false;
-        let _ = std::io::stdout().flush();
-        // SAFETY: same descriptor table; `saved` is the fd dup'd in `begin`.
-        unsafe {
-            libc::dup2(self.saved, 1);
-            libc::close(self.saved);
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for StdoutCapture {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2311,6 +2284,7 @@ mod tests {
             json: true,
             yes: true,
             from_serve: false,
+            config_path: PathBuf::from("/nonexistent/preloop-init-test/config.toml"),
         };
         // Nothing supplied: every step flag is named, so a script knows what to
         // add instead of guessing.
@@ -2331,6 +2305,7 @@ mod tests {
             json: false,
             yes: false,
             from_serve: false,
+            config_path: PathBuf::from("/nonexistent/preloop-init-test/config.toml"),
         };
         let args = InitArgs {
             auth: Some(AuthChoice::None),
@@ -2350,6 +2325,7 @@ mod tests {
             json: false,
             yes: false,
             from_serve: false,
+            config_path: PathBuf::from("/nonexistent/preloop-init-test/config.toml"),
         };
         let args = InitArgs {
             auth: Some(AuthChoice::None),
@@ -2439,7 +2415,7 @@ mod tests {
 
     #[test]
     fn service_mode_refuses_to_install_without_root() {
-        if unsafe { libc::geteuid() } == 0 {
+        if nix::unistd::geteuid().is_root() {
             return;
         }
         let error = ensure_service_root().unwrap_err();
@@ -2453,7 +2429,7 @@ mod tests {
         // its precedence here is what makes the probe's answer trustworthy.
         let mut config = ConfigFile::default();
         assert_eq!(
-            preloop_runner_server::config::golden_base_image(&config),
+            preloop_runner_server::config::golden_base_image(&config, None),
             None
         );
         config.golden = GoldenConfig {
@@ -2462,7 +2438,17 @@ mod tests {
             dockerfile: None,
         };
         assert_eq!(
-            preloop_runner_server::config::golden_base_image(&config).as_deref(),
+            preloop_runner_server::config::golden_base_image(&config, None).as_deref(),
+            Some("ghcr.io/x/y:1")
+        );
+        // The environment override wins over the persisted choice; a blank
+        // export behaves like an unset one, so the probe reports the persisted
+        // image either way.
+        let with_env =
+            preloop_runner_server::config::golden_base_image(&config, Some("ghcr.io/env:2"));
+        assert_eq!(with_env.as_deref(), Some("ghcr.io/env:2"));
+        assert_eq!(
+            preloop_runner_server::config::golden_base_image(&config, Some("  ")).as_deref(),
             Some("ghcr.io/x/y:1")
         );
     }

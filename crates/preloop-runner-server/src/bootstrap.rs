@@ -12,10 +12,11 @@ pub struct ServerConfig {
     pub unix_socket: Option<PathBuf>,
     /// State directory for cache/artifacts and future durable state.
     pub state_dir: PathBuf,
-    /// Durable-state backend URL (`sqlite://<path>`, a bare path, or
-    /// `postgres://…`). `None` falls back to `PRELOOP_STORE_URL`, then to
-    /// SQLite at `<state_dir>/preloop.db`.
-    pub store_url: Option<String>,
+    /// Typed startup configuration (engine config path, store URL, tokens,
+    /// URLs, GitHub credentials — everything resolved once at process
+    /// startup by [`crate::config::StartupConfig`]). `serve` passes it to
+    /// [`AppState::new`] verbatim.
+    pub startup: crate::config::StartupConfig,
     /// Optional file path to write recorded flows to (NDJSON format).
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
@@ -69,10 +70,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("systemd_socket_activation", &self.systemd_socket_activation)
             .field("unix_socket", &self.unix_socket)
             .field("state_dir", &self.state_dir)
-            .field(
-                "store_url",
-                &self.store_url.as_deref().map(redact_store_url),
-            )
+            .field("startup", &self.startup)
             .field("record_flows", &self.record_flows)
             .field("tls", &self.tls)
             .field("queue_depth", &self.queue_depth)
@@ -88,21 +86,6 @@ impl std::fmt::Debug for ServerConfig {
             .field("pool_status", &self.pool_status)
             .field("require_job_assignments", &self.require_job_assignments)
             .finish()
-    }
-}
-
-/// Mask the password portion of a `postgres://user:pass@host/db` URL. Non-URL
-/// values (bare sqlite paths, sqlite:// URLs) pass through untouched.
-fn redact_store_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
-    };
-    let Some((userinfo, hostport)) = rest.rsplit_once('@') else {
-        return url.to_owned();
-    };
-    match userinfo.split_once(':') {
-        Some((user, _)) => format!("{scheme}://{user}:***@{hostport}"),
-        None => url.to_owned(),
     }
 }
 
@@ -736,7 +719,11 @@ async fn run_checkout_cache_pruner(shared: Arc<SharedState>) {
 
 /// Move settled run rows out of the hot scheduler tables. A missed wakeup or
 /// process crash is repaired by the next scan; each batch commits atomically.
-async fn run_history_archiver(shared: Arc<SharedState>) {
+/// Outbox rows are pruned once older than `outbox_retention` *and* at or
+/// below the slowest durable consumer bookmark (the `check-runs` projector);
+/// rows a consumer has not read yet are retained however old they are
+/// (resolved `PRELOOP_OUTBOX_RETENTION_SECONDS`, default 3600).
+async fn run_history_archiver(shared: Arc<SharedState>, outbox_retention: Duration) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -748,24 +735,11 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
                 if let Err(error) = shared.state.backend.prune_timelines(week_ago).await {
                     tracing::warn!(?error, "timeline prune failed; will retry");
                 }
-                prune_outbox_once(&shared, outbox_retention()).await;
+                prune_outbox_once(&shared, outbox_retention).await;
             }
             _ = shared.shutdown.cancelled() => break,
         }
     }
-}
-
-/// Outbox rows are pruned once older than the retention window *and* at or
-/// below the slowest durable consumer bookmark (the `check-runs` projector);
-/// rows a consumer has not read yet are retained however old they are. Env:
-/// `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600).
-fn outbox_retention() -> Duration {
-    Duration::from_secs(
-        std::env::var("PRELOOP_OUTBOX_RETENTION_SECONDS")
-            .ok()
-            .and_then(|raw| raw.trim().parse().ok())
-            .unwrap_or(3600),
-    )
 }
 
 /// Delete expired outbox rows in batches until a short batch or an error.
@@ -799,21 +773,9 @@ pub(crate) async fn prune_outbox_once(shared: &SharedState, older_than: Duration
 /// disables) so `rerun_run` can reset them in place; everything else archives
 /// on the 60-second policy.
 pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
-    // Resolved once: the value is static for the process's lifetime and the
-    // 5s pass must not re-parse (or re-warn about) an env var.
-    static RERUN_HOLD: std::sync::LazyLock<Option<std::time::Duration>> =
-        std::sync::LazyLock::new(|| match crate::config::rerun_window_days() {
-            Ok(0) => None,
-            Ok(days) => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "invalid PRELOOP_RERUN_WINDOW_DAYS; disabling the in-place rerun hold"
-                );
-                None
-            }
-        });
-    let rerun_hold = *RERUN_HOLD;
+    // Resolved once at startup (`AppState::new`); the 5s pass reads the
+    // parsed hold and never re-parses (or re-warns about) the variable.
+    let rerun_hold = shared.state.rerun_window_hold;
     let mut archived_total = 0;
     loop {
         match shared
@@ -1478,12 +1440,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // it binds, so a second engine can say how to stop it.
     let listen = (!config.systemd_socket_activation).then_some(config.listen);
     let _serve_lock = acquire_serve_lock(&config.state_dir, EngineOrigin::current(), listen)?;
-    let mut state = AppState::new_with_store(
-        config.state_dir.clone(),
-        crate::config::config_path(),
-        config.store_url.as_deref(),
-    )
-    .await?;
+    let mut state = AppState::new(config.state_dir.clone(), config.startup.clone()).await?;
     // Wire observability if supplied (CLI/server will pass its handle).
     // Adopt the caller's handle when supplied; `AppState::new` already
     // installed a no-op one otherwise. Either way the store is instrumented,
@@ -1502,20 +1459,14 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if state.github_app.is_none()
         && let Some(pat) = state.static_github_pat()
     {
-        crate::runs::warm_pat_scope_cache(&pat).await;
+        crate::runs::warm_pat_scope_cache(state.github_api_request_base.as_deref(), &pat).await;
     }
-    // Resolve the effective store URL exactly once, mirroring `open_store`
-    // precedence: the explicit URL wins, then the environment, then SQLite at
-    // the state dir. Both the instrumentation label and the status-snapshot
-    // backend are derived from this single parsed value so they cannot
-    // drift — a stale `PRELOOP_STORE_URL=postgres://…` must not mislabel
-    // every SQLite operation.
+    // Resolve the effective store URL exactly once from the startup config
+    // (explicit `--store` / resolved `PRELOOP_STORE_URL`, else SQLite at the
+    // state dir). Both the instrumentation label and the status-snapshot
+    // backend are derived from this single parsed value so they cannot drift.
     let store_backend = {
-        let effective_url = config
-            .store_url
-            .clone()
-            .or_else(|| std::env::var(crate::store::STORE_URL_ENV).ok())
-            .unwrap_or_default();
+        let effective_url = config.startup.store_url.clone().unwrap_or_default();
         let store_url = crate::store::parse_store_url(&effective_url);
         match &store_url {
             Ok(crate::store::StoreUrl::Postgres(_)) => {
@@ -1678,7 +1629,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let oidc_issuer = normalize_oidc_issuer(
         config
             .oidc_issuer
-            .unwrap_or_else(|| format!("{}/oidc", runner_base_url())),
+            .unwrap_or_else(|| format!("{}/oidc", state.runner_base_url())),
     )?;
     {
         let mut inner = state.inner.lock().await;
@@ -1714,6 +1665,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                     .await;
             });
         } else {
+            // The remote scan's explicit configuration: retained startup env
+            // reads, passed in rather than re-read below the boundary.
+            let repository = std::env::var("PRELOOP_GITHUB_REPOSITORY")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let token = std::env::var("PRELOOP_GITHUB_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
             let shared_for_scan = shared_for_scan.clone();
             tokio::spawn(async move {
                 let handle = scan_hb.register(
@@ -1721,7 +1682,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                     preloop_observability::Criticality::Critical,
                 );
                 scheduler_clone
-                    .scan_remote(shared_for_scan, Some(handle))
+                    .scan_remote(shared_for_scan, Some(handle), repository, token)
                     .await;
             });
         }
@@ -1731,10 +1692,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // App created earlier — or narrowed by hand — may miss trigger events,
     // and GitHub cannot change a subscription through the API. Warn loudly
     // so the operator ticks the missing events in App settings.
+    let app_api_base = state.github_api_base();
     if let Some(app) = state.github_app.clone() {
         let app_id = app.app_id.clone();
+        let api_base = app_api_base.clone();
         tokio::spawn(async move {
-            match app.read_app_subscription().await {
+            match app.read_app_subscription(&api_base).await {
                 Ok(subscription) => {
                     crate::github_app::warn_missing_trigger_events(&app_id, &subscription)
                 }
@@ -1755,9 +1718,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                 continue;
             }
             let app = app.clone();
+            let api_base = app_api_base.clone();
             tokio::spawn(async move {
                 let app_id = app.app_id.clone();
-                match app.read_app_subscription().await {
+                match app.read_app_subscription(&api_base).await {
                     Ok(subscription) => {
                         crate::github_app::warn_missing_trigger_events(&app_id, &subscription)
                     }
@@ -1838,7 +1802,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
     let archive_shared = shared.clone();
-    tokio::spawn(async move { run_history_archiver(archive_shared).await });
+    let outbox_retention =
+        Duration::from_secs(config.startup.outbox_retention_seconds.unwrap_or(3600));
+    tokio::spawn(async move { run_history_archiver(archive_shared, outbox_retention).await });
     let flusher_shared = shared.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

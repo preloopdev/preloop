@@ -8,6 +8,7 @@ const DEPLOYMENT_ID: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
 pub const INSTANCE_ID: &str = "bc944321-3dbc-431b-8cf2-8afa3e25e359";
 
 pub async fn connection_data(
+    State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     if params.get("connectOptions").map(String::as_str) == Some("0")
@@ -30,14 +31,20 @@ pub async fn connection_data(
         .into_response();
     }
 
-    let service_root = runner_base_url();
-    let runner_root = runner_server_url();
+    let service_root = shared.state.runner_base_url();
+    let runner_root = shared.state.runner_server_url();
+    // Bind the resolved roots once; the service tables below were written
+    // against bare `svc`/`resource_svc` calls and keep that shape.
+    let svc = |name, id, location| svc(name, id, location, &runner_root, &service_root);
+    let resource_svc = |name, id, area, location| {
+        resource_svc(name, id, area, location, &runner_root, &service_root)
+    };
     let body = serde_json::json!({
         "deploymentId": DEPLOYMENT_ID,
         "deploymentType": "hosted",
         "instanceId": INSTANCE_ID,
         "serverUrlV2": runner_root,
-        "brokerUrl": runner_base_url(),
+        "brokerUrl": shared.state.runner_base_url(),
         "resultsServiceUrl": runner_root,
         "locationServiceData": {
             "lastChangeId": 1,
@@ -125,7 +132,14 @@ fn area_svc(
     })
 }
 
-fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json::Value {
+fn resource_svc(
+    name: &str,
+    id: &str,
+    area: &str,
+    location: &str,
+    scale_unit_root: &str,
+    public_root: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "serviceType": area,
         "identifier": id,
@@ -134,8 +148,8 @@ fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json:
         "description": name,
         "toolId": area,
         "locationMappings": [
-            {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
-            {"accessMappingMoniker": "PublicAccessMapping", "location": runner_base_url()}
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": scale_unit_root},
+            {"accessMappingMoniker": "PublicAccessMapping", "location": public_root}
         ],
         "serviceOwner": SVC_OWNER,
         "resourceVersion": 1,
@@ -147,7 +161,13 @@ fn resource_svc(name: &str, id: &str, area: &str, location: &str) -> serde_json:
     })
 }
 
-fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
+fn svc(
+    name: &str,
+    id: &str,
+    location: &str,
+    scale_unit_root: &str,
+    public_root: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "serviceType": name,
         "identifier": id,
@@ -157,8 +177,8 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "description": name,
         "toolId": name,
         "locationMappings": [
-            {"accessMappingMoniker": "ScaleUnitMapping", "location": runner_server_url()},
-            {"accessMappingMoniker": "PublicAccessMapping", "location": runner_base_url()}
+            {"accessMappingMoniker": "ScaleUnitMapping", "location": scale_unit_root},
+            {"accessMappingMoniker": "PublicAccessMapping", "location": public_root}
         ],
         "serviceOwner": SVC_OWNER,
         "resourceVersion": 6,

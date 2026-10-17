@@ -334,7 +334,7 @@ pub fn apply_file_commands(
             );
             continue;
         }
-        debug!("GITHUB_ENV: {k}={v}");
+        debug!("GITHUB_ENV: set {k}");
         job.env.insert(k, v);
     }
 
@@ -479,7 +479,7 @@ pub fn apply_file_commands_to_job(
             );
             continue;
         }
-        debug!("GITHUB_ENV (composite): {k}={v}");
+        debug!("GITHUB_ENV (composite): set {k}");
         job.env.insert(k, v);
     }
     // Preserve AddPathFileCommand's file order for composite steps too.

@@ -324,7 +324,7 @@ pub async fn list_actions_runs(
                 "run_number": run.run_number,
                 "run_attempt": run.run_attempt,
                 "workflow_path": run.workflow_path_str,
-                "html_url": crate::github::run_details_url(run.run_id),
+                "html_url": shared.state.run_details_url(run.run_id),
             })
         })
         .collect();
@@ -918,7 +918,7 @@ async fn resolve_default_branch(
         }
         return Ok("main".to_owned());
     }
-    let api_base = crate::github::github_api_base();
+    let api_base = shared.state.github_api_base();
     let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await
     {
         let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
@@ -930,7 +930,7 @@ async fn resolve_default_branch(
                 ))
             })?
     } else {
-        std::env::var("PRELOOP_GITHUB_TOKEN").ok().ok_or_else(|| {
+        shared.state.static_github_pat().ok_or_else(|| {
             ApiError::not_found(format!(
                 "{repository} is not accessible: no GitHub credential is configured"
             ))

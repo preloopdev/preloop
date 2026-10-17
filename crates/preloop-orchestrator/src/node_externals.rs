@@ -16,14 +16,21 @@ use std::process::Command;
 /// Manifest written next to each `externals/nodeXX` directory.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeManifest {
+    /// Runtime directory this manifest describes, e.g. `node20` or `node24`.
     pub runtime: String,
+    /// Exact node version string the directory holds (without the `v` prefix).
     pub version: String,
+    /// Node platform label of the archive, e.g. `linux-arm64` or `darwin-x64`.
     pub platform: String,
+    /// Hex SHA-256 digest of the downloaded archive.
     pub archive_sha256: String,
+    /// URL the archive was downloaded from.
     pub source: String,
 }
 
 impl NodeManifest {
+    /// Record the identity of one materialized runtime: which runtime, its
+    /// exact version, platform, archive checksum, and download source.
     pub fn new(
         runtime: &str,
         version: &str,

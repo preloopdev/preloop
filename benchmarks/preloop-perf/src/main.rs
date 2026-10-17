@@ -208,12 +208,28 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async fn make_app(state_dir: &Path) -> Result<(Router, preloop_runner_server::AppState)> {
-    let state = preloop_runner_server::AppState::new(state_dir.to_path_buf())
+    let state = preloop_runner_server::AppState::new(state_dir.to_path_buf(), startup_config())
         .await
         .context("creating AppState")?;
     let shutdown = CancellationToken::new();
     let app = preloop_runner_server::app_with_test_api(state.clone(), shutdown, "test-token");
     Ok((app, state))
+}
+
+/// The engine startup config this benchmark's in-process server runs with.
+///
+/// The native-API token is resolved at this boundary — the inherited
+/// `PRELOOP_SYSTEM_TOKEN` when set, else [`SYSTEM_TOKEN`] — and handed to the
+/// server's typed config. This benchmark authenticates with an explicit
+/// in-process client and does not exercise engine-token discovery, and
+/// nothing here mutates the process environment.
+fn startup_config() -> preloop_runner_server::config::StartupConfig {
+    preloop_runner_server::config::StartupConfig {
+        system_token: Some(
+            std::env::var("PRELOOP_SYSTEM_TOKEN").unwrap_or_else(|_| SYSTEM_TOKEN.to_owned()),
+        ),
+        ..preloop_runner_server::config::StartupConfig::from_env()
+    }
 }
 
 /// Fresh router on a fresh state directory. The returned `TempDir` must outlive
@@ -894,9 +910,10 @@ async fn bench_cold_boot(cfg: BenchConfig) -> Result<()> {
         for _ in 0..COLD_BOOT_ITERATIONS {
             let temp = tempfile::tempdir().context("creating temp state dir")?;
             let start = Instant::now();
-            let state = preloop_runner_server::AppState::new(temp.path().to_path_buf())
-                .await
-                .context("creating AppState")?;
+            let state =
+                preloop_runner_server::AppState::new(temp.path().to_path_buf(), startup_config())
+                    .await
+                    .context("creating AppState")?;
             times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             std::hint::black_box(&state);
         }
@@ -1089,11 +1106,6 @@ fn emit_run_provenance(cfg: BenchConfig) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::var_os("PRELOOP_SYSTEM_TOKEN").is_none() {
-        // This benchmark uses an explicit in-process client; it does not
-        // exercise engine-token discovery.
-        unsafe { std::env::set_var("PRELOOP_SYSTEM_TOKEN", SYSTEM_TOKEN) };
-    }
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str).unwrap_or("all");
     let cfg = BenchConfig::from_env()?;

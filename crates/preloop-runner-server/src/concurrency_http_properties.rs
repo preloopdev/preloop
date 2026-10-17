@@ -297,7 +297,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn pending_runs_have_no_queued_jobs() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         // Workflow A takes the group; workflow B should be pending.
@@ -331,7 +333,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn cancel_in_progress_emits_exactly_one_cancellation() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         let yaml = "on: push\nconcurrency:\n  group: cip-test\n  cancel-in-progress: true\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo go\n";
@@ -393,7 +397,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn pending_only_replacement_no_runner_cancellation() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         let yaml = "on: push\nconcurrency:\n  group: single-repl\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -444,7 +450,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn promotion_after_predecessor_completes() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         let yaml = "on: push\nconcurrency:\n  group: promo\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -483,7 +491,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn repo_isolation_and_case_folding() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         let yaml = "on: push\nconcurrency:\n  group: Deploy\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -526,7 +536,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn no_cross_run_output_contamination() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         // Two runs with DIFFERENT groups so they're independent.
@@ -564,7 +576,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn broker_complete_promotes_successor() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
         let (status, value) = req(
             &app,
@@ -653,7 +667,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn max_queue_preserves_pending_holders() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         let yaml = "on: push\nconcurrency:\n  group: max-q\n  queue: max\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -685,7 +701,9 @@ pub mod http_sequences {
     #[tokio::test]
     async fn max_queue_fifo_promotion() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = make_app(state.clone(), CancellationToken::new());
 
         let yaml = "on: push\nconcurrency:\n  group: fifo\n  queue: max\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
@@ -728,7 +746,9 @@ pub mod http_sequences {
             .unwrap();
         rt.block_on(async {
             let temp = tempfile::tempdir().unwrap();
-            let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+            let state = AppState::new_for_tests(temp.path().to_path_buf())
+                .await
+                .unwrap();
             let app = make_app(state.clone(), CancellationToken::new());
 
             // Track submitted run IDs per workflow index.

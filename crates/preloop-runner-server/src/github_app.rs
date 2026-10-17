@@ -38,7 +38,7 @@ use crate::shared_http::CLIENT;
 /// Two naming pairs are accepted: `PRELOOP_GITHUB_APP_PEM{,_FILE}` and the older
 /// `PRELOOP_GITHUB_APP_PRIVATE_KEY{,_PATH}` already published in
 /// `docs/github-app-webhook.md`.
-const PRIVATE_KEY_ENV: [(&str, bool); 4] = [
+pub const PRIVATE_KEY_ENV: [(&str, bool); 4] = [
     ("PRELOOP_GITHUB_APP_PEM", false),
     ("PRELOOP_GITHUB_APP_PEM_FILE", true),
     ("PRELOOP_GITHUB_APP_PRIVATE_KEY", false),
@@ -176,18 +176,9 @@ pub enum MintFailurePolicy {
 }
 
 impl MintFailurePolicy {
-    /// Read the policy from `PRELOOP_GITHUB_APP_MINT_FAILURE`, falling back to
-    /// the config file's `github.mint_failure`.
-    fn from_env_or_config(config: &crate::config::GitHubConfig) -> anyhow::Result<Self> {
-        Self::parse(
-            env_non_empty(MINT_FAILURE_ENV)
-                .as_deref()
-                .or(config.mint_failure.as_deref()),
-        )
-    }
-
-    /// [`Self::from_env`] against an explicit value, so the mapping is testable
-    /// without mutating process-wide environment state.
+    /// Parse the resolved `PRELOOP_GITHUB_APP_MINT_FAILURE` value (or the
+    /// config file's `github.mint_failure` when it is unset), so the mapping
+    /// is testable without process-wide environment state.
     fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
         let Some(raw) = raw else {
             return Ok(Self::LocalJwt);
@@ -425,13 +416,15 @@ impl GitHubAppCredentials {
     /// (`GET /app`).
     ///
     /// Authenticates with the App JWT, the only credential `/app` accepts.
-    pub async fn read_app_subscription(&self) -> anyhow::Result<AppSubscription> {
-        read_app_subscription_at(&api_base(), &self.app_id, &self.private_key).await
+    pub async fn read_app_subscription(&self, api_base: &str) -> anyhow::Result<AppSubscription> {
+        read_app_subscription_at(api_base, &self.app_id, &self.private_key).await
     }
 }
 
 /// Read the GitHub App registry from the config file, overlaid by the
-/// environment (`PRELOOP_GITHUB_*` wins over `~/.preloop/config.toml`).
+/// startup-resolved `PRELOOP_GITHUB_*` values carried in `startup` (the same
+/// precedence as the env-driven era: explicit/env layer over
+/// `~/.preloop/config.toml`).
 ///
 /// Returns `Ok(None)` when no App is configured — including partial
 /// configuration of the legacy single-App vars, which is logged rather than
@@ -439,27 +432,41 @@ impl GitHubAppCredentials {
 /// key that is present but unreadable or malformed *is* fatal: the operator
 /// plainly meant to configure an App, and starting without one would silently
 /// downgrade every job token.
-pub fn load_from_env() -> anyhow::Result<Option<GitHubApps>> {
-    load_from(&crate::config::load_config()?)
-}
-
-/// [`load_from_env`] against an already-loaded config file.
-///
-/// A caller that resolved the config path once (the engine does, at startup)
-/// uses this so the file is read exactly once and every consumer agrees on
-/// which file that was.
 ///
 /// The App at [`GitHubApps::default_index`] is the first registered App: the
 /// legacy env-var App when configured, otherwise the first `github.apps`
 /// entry.
-pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Option<GitHubApps>> {
+pub fn load_from(
+    file_config: &crate::config::ConfigFile,
+    startup: &crate::config::StartupConfig,
+) -> anyhow::Result<Option<GitHubApps>> {
     // Parsed before the not-configured early return so a typo is a startup
     // error rather than a surprise the first time a mint fails in production.
-    let mint_failure = MintFailurePolicy::from_env_or_config(&file_config.github)?;
-    let pat_fallback = std::env::var("PRELOOP_GITHUB_TOKEN")
-        .ok()
+    let mint_failure = MintFailurePolicy::parse(
+        startup
+            .github_mint_failure
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(file_config.github.mint_failure.as_deref()),
+    )?;
+    let pat_fallback = startup
+        .github_token
+        .as_ref()
+        .map(|token| token.expose().to_owned())
         .filter(|value| !value.is_empty())
         .or_else(|| file_config.github.pat().map(str::to_owned));
+    // The single-installation override applies to every App that does not
+    // name one of its own (the legacy env var was consulted at mint time for
+    // exactly this set).
+    let installation_id_override = startup
+        .github_installation_id
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<u64>().with_context(|| {
+                format!("PRELOOP_GITHUB_APP_INSTALLATION_ID={raw} is not a number")
+            })
+        })
+        .transpose()?;
 
     let mut apps: Vec<GitHubAppCredentials> = Vec::new();
     // The default entry is index 0 because the legacy App, when present, is
@@ -469,16 +476,20 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
 
     // Legacy single-App env/config first — the default entry when configured
     // (back-compat).
-    let app_id =
-        env_non_empty("PRELOOP_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
-    let key_source = PRIVATE_KEY_ENV
-        .iter()
-        .find_map(|&(name, is_path)| env_non_empty(name).map(|value| (name, is_path, value)))
+    let app_id = startup
+        .github_app_id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| file_config.github.app_id.clone());
+    let key_source = startup
+        .github_app_pem
+        .first()
+        .map(|(source, is_path, value)| (source.clone(), *is_path, value.clone()))
         .or_else(|| {
             file_config
                 .github
                 .app_pem()
-                .map(|pem| ("config github.app_pem", false, pem.to_owned()))
+                .map(|pem| ("config github.app_pem".to_owned(), false, pem.to_owned()))
         });
     match (app_id, key_source) {
         (Some(app_id), Some((source, is_path, value))) => {
@@ -510,7 +521,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 // receiver dedups against `AppState::webhook_secret`, which
                 // carries the same value.
                 webhook_secret: crate::config::webhook_secret_from_env_or_config(file_config),
-                installation_id: installation_id_override()?,
+                installation_id: installation_id_override,
                 verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             });
         }
@@ -531,20 +542,23 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
 
     // Additional registered Apps: `PRELOOP_GITHUB_APPS_JSON` (env) wins over
     // the config file's `github.apps`.
-    let extra: Vec<crate::config::AppConfig> = match std::env::var("PRELOOP_GITHUB_APPS_JSON")
-        .ok()
+    let extra: Vec<crate::config::AppConfig> = match startup
+        .github_apps_json
+        .as_deref()
         .map(|raw| raw.trim().to_owned())
         .filter(|raw| !raw.is_empty())
     {
         Some(raw) => {
             let mut env_apps: Vec<crate::config::AppConfig> =
                 serde_json::from_str(&raw).with_context(|| "parsing PRELOOP_GITHUB_APPS_JSON")?;
-            let cred_base = crate::config::config_path()
+            let cred_base = startup
+                .config_path
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             let store = crate::credential_store::selected_store(
                 &cred_base,
+                startup.credential_store.as_deref(),
                 file_config.credential_store.as_deref(),
             )?;
             let store = store.as_ref();
@@ -591,7 +605,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
             installation_cache: Arc::new(RwLock::new(HashMap::new())),
             mint_ledger: Arc::new(MintLedger::default()),
             webhook_secret,
-            installation_id: app.installation_id,
+            installation_id: app.installation_id.or(installation_id_override),
             verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         });
     }
@@ -697,7 +711,7 @@ pub async fn candidate_apps_for_repo_inner(
             };
         }
     };
-    let api_base = api_base();
+    let api_base = shared.state.github_api_base();
     let mut candidates: Vec<GitHubAppCredentials> = Vec::new();
     // The first non-definitive failure, kept in case no App turns out to cover
     // the owner: an empty (or non-empty) candidate list built while lookups
@@ -755,12 +769,15 @@ pub async fn candidate_apps_for_repo_inner(
 /// returns false (the caller rejects with 403). Webhook deliveries are
 /// low-volume relative to App rate limits, so this lookup is not cached; the
 /// owner-granularity installation id it complements stays cached per App.
-pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
+pub async fn app_covers_repository(
+    api_base: &str,
+    app: &GitHubAppCredentials,
+    repository: &str,
+) -> bool {
     let (owner, repo) = match split_repository(repository) {
         Ok(parts) => parts,
         Err(_) => return false,
     };
-    let api_base = api_base();
     let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
         Ok(jwt) => jwt,
         Err(_) => return false,
@@ -831,12 +848,13 @@ pub async fn select_app_for_repo(
 /// carry: `0` is never a valid GitHub installation, and discovery is cached
 /// per App+owner, so steady state costs no extra API call.
 pub async fn installation_for_repo(
+    api_base: &str,
     app: &GitHubAppCredentials,
     repository: &str,
 ) -> anyhow::Result<u64> {
     let (owner, _) = split_repository(repository)?;
     let app_jwt = sign_app_jwt(&app.app_id, &app.private_key)?;
-    installation_id_for(&api_base(), app, &app_jwt, owner).await
+    installation_id_for(api_base, app, &app_jwt, owner).await
 }
 
 /// Mint an installation token for `repository`, scoped to `permissions`.
@@ -851,12 +869,13 @@ pub async fn installation_for_repo(
 /// fresh token. Never panics and never touches `AppState::inner`, so it is
 /// safe to call from the dispatch path.
 pub async fn get_or_mint_token(
+    api_base: &str,
     creds: &GitHubAppCredentials,
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
     Ok(
-        mint_for_repository(&api_base(), creds, repository, permissions, false)
+        mint_for_repository(api_base, creds, repository, permissions, false)
             .await?
             .0,
     )
@@ -874,12 +893,13 @@ pub async fn get_or_mint_token(
 /// when narrowing occurred. Callers must restate it to the job: a token that
 /// silently holds less than the job was told is a 403 with no explanation.
 pub async fn get_or_mint_token_declared(
+    api_base: &str,
     creds: &GitHubAppCredentials,
     repository: &str,
     permissions: &BTreeMap<String, String>,
     declared: bool,
 ) -> anyhow::Result<(String, Option<BTreeMap<String, String>>)> {
-    mint_for_repository(&api_base(), creds, repository, permissions, declared).await
+    mint_for_repository(api_base, creds, repository, permissions, declared).await
 }
 
 pub async fn get_or_mint_token_at(
@@ -1170,13 +1190,10 @@ async fn installation_id_for(
     owner: &str,
 ) -> anyhow::Result<u64> {
     // Per-App override first (`AppConfig.installation_id`), then the
-    // legacy global env override, then discovery (cached).
+    // legacy global override, then discovery (cached). Both overrides are
+    // resolved at load (`load_from` bakes the global one onto every App that
+    // names no id of its own), so this is cache-or-discovery now.
     if let Some(installation_id) = creds.installation_id {
-        verify_override_installation_owner(api_base, creds, app_jwt, installation_id, owner)
-            .await?;
-        return Ok(installation_id);
-    }
-    if let Some(installation_id) = installation_id_override()? {
         verify_override_installation_owner(api_base, creds, app_jwt, installation_id, owner)
             .await?;
         return Ok(installation_id);
@@ -1263,17 +1280,6 @@ async fn verify_override_installation_owner(
     Ok(())
 }
 
-/// Explicit installation id from `PRELOOP_GITHUB_APP_INSTALLATION_ID`, which
-/// bypasses discovery entirely for single-installation deployments.
-fn installation_id_override() -> anyhow::Result<Option<u64>> {
-    let Some(raw) = env_non_empty("PRELOOP_GITHUB_APP_INSTALLATION_ID") else {
-        return Ok(None);
-    };
-    raw.parse()
-        .map(Some)
-        .with_context(|| format!("PRELOOP_GITHUB_APP_INSTALLATION_ID={raw} is not a number"))
-}
-
 /// Translate workflow `permissions:` scopes into installation-token scopes.
 ///
 /// Workflow YAML uses kebab-case names and the value `none` to withhold a
@@ -1328,21 +1334,6 @@ fn parse_private_key(pem: &str) -> anyhow::Result<rsa::RsaPrivateKey> {
     }
 }
 
-/// GitHub REST API base, overridable for GitHub Enterprise Server and tests.
-fn api_base() -> String {
-    env_non_empty("PRELOOP_GITHUB_API_URL")
-        .map(|base| base.trim_end_matches('/').to_owned())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
-}
-
-/// Read an environment variable, treating blank and whitespace-only as unset.
-fn env_non_empty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
 fn base64_json(value: &serde_json::Value) -> anyhow::Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
 }
@@ -1364,10 +1355,11 @@ const PROBED_PERMISSIONS: [(&str, &str); 4] = [
 /// an error naming the status GitHub returned; individually missing
 /// permissions simply don't appear in the list.
 pub async fn verify_repo_access_with_token(
+    api_base: &str,
     token: &str,
     repo: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    verify_repo_access_at(&api_base(), token, repo).await
+    verify_repo_access_at(api_base, token, repo).await
 }
 
 /// [`verify_repo_access_with_token`] against an explicit API base.
@@ -1435,11 +1427,12 @@ async fn verify_repo_access_at(
 /// Verify a GitHub App configuration by minting a scoped installation token
 /// for `repo` and probing it.
 pub async fn verify_app_config(
+    api_base: &str,
     app_id: &str,
     pem: &str,
     repo: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    verify_app_config_at(&api_base(), app_id, pem, repo).await
+    verify_app_config_at(api_base, app_id, pem, repo).await
 }
 
 /// [`verify_app_config`] against an explicit API base.
@@ -1501,12 +1494,13 @@ async fn verify_app_config_at(
 /// `hook_attributes.active = false` keeps that checkbox until it is flipped
 /// in the App's settings. The caller is expected to say so.
 pub async fn set_app_webhook_config(
+    api_base: &str,
     app_id: &str,
     pem: &str,
     url: &str,
     secret: &str,
 ) -> anyhow::Result<()> {
-    set_app_webhook_config_at(&api_base(), app_id, pem, url, secret).await
+    set_app_webhook_config_at(api_base, app_id, pem, url, secret).await
 }
 
 /// [`set_app_webhook_config`] against an explicit API base.
@@ -1955,24 +1949,6 @@ mod tests {
     async fn load_from_binds_the_primary_slots_secret_to_the_default_app() {
         use rsa::pkcs1::EncodeRsaPrivateKey as _;
 
-        // Held for the whole test: every variable read here is process-global.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _guards: Vec<crate::state::TestEnvVar> = [
-            "PRELOOP_GITHUB_APP_ID",
-            "PRELOOP_GITHUB_APP_PEM",
-            "PRELOOP_GITHUB_APP_PEM_FILE",
-            "PRELOOP_GITHUB_APP_PRIVATE_KEY",
-            "PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH",
-            "PRELOOP_GITHUB_APP_INSTALLATION_ID",
-            "PRELOOP_GITHUB_APP_MINT_FAILURE",
-            "PRELOOP_GITHUB_APPS_JSON",
-            "PRELOOP_GITHUB_TOKEN",
-            "PRELOOP_WEBHOOK_SECRET",
-        ]
-        .iter()
-        .map(|name| crate::state::TestEnvVar::unset(name))
-        .collect();
-
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
         let pem = test_key()
@@ -1990,7 +1966,10 @@ mod tests {
         )
         .unwrap();
         let file = crate::config::load_config_from(&config).unwrap();
-        let registry = load_from(&file).unwrap().expect("the primary App loads");
+        let startup = crate::config::StartupConfig::for_tests();
+        let registry = load_from(&file, &startup)
+            .unwrap()
+            .expect("the primary App loads");
         assert_eq!(registry.default_app().app_id, "987654");
         assert_eq!(
             registry.default_app().webhook_secret.as_deref(),
@@ -2004,20 +1983,25 @@ mod tests {
             "the primary slot's secret is the default App's"
         );
 
-        // The environment variable is the same slot and binds the same way.
-        let env_secret = crate::state::TestEnvVar::set("PRELOOP_WEBHOOK_SECRET", "from-env");
+        // An explicit startup override has the same precedence as the old
+        // environment override, without mutating process-global state.
+        let startup = crate::config::StartupConfig {
+            webhook_secret: Some("from-startup".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        };
         std::fs::write(
             &config,
             format!("[github]\napp_id = \"987654\"\napp_pem = \"{pem}\"\n"),
         )
         .unwrap();
         let file = crate::config::load_config_from(&config).unwrap();
-        let registry = load_from(&file).unwrap().expect("the primary App loads");
+        let registry = load_from(&file, &startup)
+            .unwrap()
+            .expect("the primary App loads");
         assert_eq!(
             registry.default_app().webhook_secret.as_deref(),
-            Some("from-env")
+            Some("from-startup")
         );
-        drop(env_secret);
     }
 
     #[test]
@@ -3049,14 +3033,18 @@ mod tests {
         let api_base = format!("http://{}", listener.local_addr().expect("stub address"));
         tokio::spawn(async move { axum::serve(listener, stub).await.expect("serve stub API") });
 
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let mut app = GitHubAppCredentials::for_tests("101", test_key(), MintFailurePolicy::Error);
         app.installation_id = Some(101);
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().join("state"))
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().join("state"),
+            crate::config::StartupConfig {
+                github_api_url: Some(api_base),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_apps = Some(GitHubApps {
             apps: vec![app],
             default_index: 0,

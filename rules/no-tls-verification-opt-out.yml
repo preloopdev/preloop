@@ -1,0 +1,25 @@
+id: no-tls-verification-opt-out
+message: |
+  Explicitly disabling TLS certificate or hostname verification exposes
+  runner traffic — bearer tokens, signed URLs, job payloads — to
+  man-in-the-middle interception. Verify against the expected roots; for
+  local test servers, trust the test CA instead of skipping verification.
+severity: error
+language: rust
+# runner-watch (the conformance flow replayer) replays captured flows against
+# local preloop instances whose endpoints carry self-signed certificates; the
+# single opt-out at crates/runner-watch/src/main.rs is deliberate and reviewed.
+# This is a one-file exemption in the same spirit as recording.rs in
+# no-sensitive-log-fields — not a workspace-wide suppression.
+ignores:
+  - "crates/runner-watch/src/main.rs"
+rule:
+  any:
+    # reqwest / native-tls builder opt-outs. Only the literal `true` counts:
+    # passing `false` re-enables verification and must not match.
+    - pattern: $B.danger_accept_invalid_certs(true)
+    - pattern: $B.danger_accept_invalid_hostnames(true)
+    - pattern: $B.danger_accept_untrusted_certs(true)
+    # openssl: verification switched off wholesale. Qualified and bare paths.
+    - pattern: $X.set_verify(SslVerifyMode::NONE)
+    - pattern: $X.set_verify(openssl::ssl::SslVerifyMode::NONE)

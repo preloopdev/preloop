@@ -253,7 +253,10 @@ pub async fn twirp_artifact_v2_create(
         &crate::blob_store::blob_owner_for_job(job_backend_id),
         &jti,
     )?;
-    let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
+    let upload_url = format!(
+        "{}/twirp-blob/artifact/{token}",
+        shared.state.runner_base_url()
+    );
     info!(
         name = request.name,
         workflow_run_backend_id = request.workflow_run_backend_id,
@@ -476,7 +479,10 @@ pub async fn twirp_artifact_v2_get_signed_url(
         crate::memory_caps::SIGNED_BLOB_URL_TTL,
     )?;
     // URL must end in .zip so the toolkit's streamExtract detects it as a zip.
-    let signed_url = format!("{}/twirp-blob/artifact/{dl_token}.zip", runner_base_url());
+    let signed_url = format!(
+        "{}/twirp-blob/artifact/{dl_token}.zip",
+        shared.state.runner_base_url()
+    );
     Ok(Json(json!({ "signed_url": signed_url })))
 }
 

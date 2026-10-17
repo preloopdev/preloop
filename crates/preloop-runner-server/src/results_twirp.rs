@@ -82,7 +82,7 @@ pub async fn twirp_get_job_logs_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
             "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
-            runner_base_url(), path
+            shared.state.runner_base_url(), path
         )
     })))
 }
@@ -151,7 +151,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     }
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
-        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
+        "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", shared.state.runner_base_url()),
     })))
 }
 
@@ -282,7 +282,7 @@ pub async fn twirp_refresh_blob_upload_url(
         crate::blob_store::mint_upload_blob_token(&shared.state, &claimed_kind, token_job, &jti)?;
     let upload_url = format!(
         "{}/twirp-blob/{claimed_kind}/{new_token}",
-        crate::broker::runner_base_url()
+        shared.state.runner_base_url()
     );
     Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
 }
@@ -309,7 +309,7 @@ pub async fn twirp_get_step_logs_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "logs_url": format!(
             "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
-            runner_base_url(), path
+            shared.state.runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
     })))
@@ -344,7 +344,7 @@ pub async fn twirp_get_step_summary_signed_blob_url(
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "summary_url": format!(
             "{}{}?sv=2021-08-06&se={expires_at}&sr=c&sp=rw&sig={sig}",
-            runner_base_url(), path
+            shared.state.runner_base_url(), path
         ),
         "soft_size_limit": "1048576"
     })))
@@ -984,7 +984,10 @@ pub async fn twirp_cache_v2_create(
         &crate::blob_store::blob_owner_for_job(job_backend_id),
         &jti,
     )?;
-    let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
+    let upload_url = format!(
+        "{}/twirp-blob/cache/{token}",
+        shared.state.runner_base_url()
+    );
     // The cache key is workflow-controlled content; never log it or the
     // version verbatim. A SHA-256 digest identifies the entry well enough to
     // correlate with the finalize/restore logs while leaking nothing.
@@ -1237,7 +1240,10 @@ pub async fn twirp_cache_v2_get_dl_url(
         inner.cache_v2_dl_tokens_created.insert(dl_jti, now_unix());
         trim_cache_dl_tokens(&mut inner);
     }
-    let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());
+    let download_url = format!(
+        "{}/twirp-blob/cache/{dl_token}",
+        shared.state.runner_base_url()
+    );
     let matched_key = entry
         .key
         .split_once('\0')
@@ -1637,7 +1643,9 @@ mod cache_pb_tests {
         // its own ref's namespace — otherwise it could poison the default
         // branch's cache (first write wins).
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         bind_job_to_ref(&state, job_id, 1, "owner/repo", "refs/heads/feature").await;
         let headers = bearer_headers(&job_token(&state, &job_id));
@@ -1679,7 +1687,9 @@ mod cache_pb_tests {
         // fallback (GitHub semantics). Unrelated branches stay invisible even
         // when the client lists them first.
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         bind_job_to_ref(&state, job_id, 1, "owner/repo", "refs/heads/feature").await;
         let headers = bearer_headers(&job_token(&state, &job_id));
@@ -1729,7 +1739,9 @@ mod cache_pb_tests {
         // hard-coded `main` — a repo defaulting to `trunk` would otherwise
         // miss its own default-branch caches.
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         bind_job_to_ref_with_payload(
             &state,
@@ -1761,7 +1773,9 @@ mod cache_pb_tests {
         // seeded on the PR's *base* branch must stay readable or PRs
         // targeting non-default branches lose their cache.
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         bind_job_to_ref_with_payload(
             &state,
@@ -1818,7 +1832,9 @@ mod cache_pb_tests {
         // `repository` in the request body must not move the caller into
         // another repository's namespace.
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let job_id = uuid::Uuid::new_v4();
         bind_job_to_repository(&state, job_id, "owner/real-repo").await;
         let headers = bearer_headers(&job_token(&state, &job_id));

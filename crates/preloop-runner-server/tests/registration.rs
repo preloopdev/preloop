@@ -76,14 +76,15 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
         );
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global, and
-    // `TestEnvVar` restores it through a panicking assertion.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+    // The stub base rides the test startup config; nothing here reads the
+    // process environment.
+    let startup = stub_startup(Some(&api_base), None);
 
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
@@ -255,16 +256,13 @@ async fn a_completed_job_drops_its_deferred_token_request() {
         probe.local_addr().unwrap().port()
     };
 
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url = crate::state::TestEnvVar::set(
-        "PRELOOP_GITHUB_API_URL",
-        format!("http://127.0.0.1:{closed_port}"),
-    );
+    let startup = stub_startup(Some(&format!("http://127.0.0.1:{closed_port}")), None);
 
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
@@ -416,7 +414,9 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
     // fails — `local-workspace-only` fails before any network I/O.
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
     creds.pat_fallback = Some("github_pat_broad".to_owned());
     state.github_app = Some(creds);
@@ -444,7 +444,9 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
 #[tokio::test]
 async fn fork_pr_runs_get_read_only_cache_access() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
@@ -641,7 +643,9 @@ async fn fork_pr_runs_get_read_only_cache_access() {
 #[tokio::test]
 async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let submit = |tier: Option<&'static str>| {
@@ -743,7 +747,9 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
 #[tokio::test]
 async fn cache_v2_namespace_follows_the_job_token_not_the_request_body() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let submit = |repository: &'static str| {
@@ -861,21 +867,26 @@ async fn cache_v2_namespace_follows_the_job_token_not_the_request_body() {
 #[tokio::test]
 async fn fork_job_never_receives_the_configured_pat_override() {
     // The effective PAT is env-then-config; writers of `PRELOOP_GITHUB_TOKEN`
-    // serialize on the env lock, so this reader must take it too or the
-    // asserted token flips under parallelism.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    // Each state pins its own API stub, so the asserted token cannot flip
+    // under parallelism.
     // PAT scope introspection must stay hermetic — without a stub the probe
     // would reach api.github.com, where the fake PAT 401s and the run is
     // refused. A stub reporting read-only scopes lets the PAT be verified, and
     // therefore embedded, without a real credential.
-    let _live_api = live_pat_scope_api("read:org, read:user").await;
+    let api_base = live_pat_scope_api("read:org, read:user").await;
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
-    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
-        .await
-        .unwrap();
+    let state = AppState::new(
+        temp.path().to_path_buf(),
+        StartupConfig {
+            config_path,
+            github_api_url: Some(api_base),
+            ..StartupConfig::for_tests()
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         state.github_app.is_none(),
         "config declares no app id or pem"
@@ -979,13 +990,9 @@ async fn fork_job_never_receives_the_configured_pat_override() {
 async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     // The webhook path creates check runs, and it only takes its mock branch
     // while no GitHub credential is visible. `PRELOOP_GITHUB_TOKEN` and
-    // `PRELOOP_GITHUB_API_URL` are process-global, so a co-scheduled test that
-    // points them at its own stub would send this run's check-run POST there
-    // and turn the webhook 200 into a 502. Serialize on the same lock those
-    // tests hold, and guarantee the mock branch for this body.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    // This state pins no GitHub API or token, so the check-run reporting
+    // stays on the mock branch for this body.
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -1002,7 +1009,9 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
     add_fixture_origin(temp.path(), &ws_dir);
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
     {
@@ -1149,9 +1158,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
 async fn issue_comment_webhook_jobs_receive_stored_secrets() {
     // Same serialization as the fork test above: the webhook path takes its
     // mock GitHub branch only while no process-global credential is visible.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+    let startup = stub_startup(None, None);
 
     let temp = tempfile::tempdir().unwrap();
     let ws_dir = temp.path().join("workspace");
@@ -1169,7 +1176,9 @@ async fn issue_comment_webhook_jobs_receive_stored_secrets() {
     .unwrap();
     commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
 
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
     state.local_workspace = Some(ws_dir);
     {
@@ -1301,7 +1310,9 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
 
     for policy in [MintFailurePolicy::LocalJwt, MintFailurePolicy::Error] {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state.github_app = Some(GitHubAppCredentials::for_tests(
             "424",
             private_key.clone(),
@@ -1365,7 +1376,9 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
     // before it signs anything or opens a socket.
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
@@ -1479,7 +1492,9 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
 #[tokio::test]
 async fn a_settled_attempt_cannot_be_acquired_again() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let registered = request_json(
         &app,
@@ -1624,7 +1639,9 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
@@ -1697,7 +1714,7 @@ async fn pat_only_server_fetches_webhook_workflows_with_configured_pat() {
         "[github]\npat = \"ghp_config_workflow_token\"\n",
     )
     .unwrap();
-    let mut state = AppState::new_with_config(temp.path().join("state"), config_path)
+    let mut state = AppState::new_for_tests_with_config(temp.path().join("state"), config_path)
         .await
         .unwrap();
     state.local_workspace = None;
@@ -1780,7 +1797,9 @@ async fn app_only_server_resolves_pull_request_changed_files_with_installation_t
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
@@ -1808,7 +1827,9 @@ async fn app_only_server_resolves_pull_request_changed_files_with_installation_t
 #[tokio::test]
 async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -1875,7 +1896,9 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 #[tokio::test]
 async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     // Up past the grace window: an unknown age measures from boot, not now.
     state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
@@ -1909,7 +1932,9 @@ async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window(
 #[tokio::test]
 async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2123,7 +2148,9 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
 #[tokio::test]
 async fn liveness_sweep_fails_job_without_recovery_copy() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2185,7 +2212,9 @@ async fn liveness_sweep_fails_job_without_recovery_copy() {
 #[tokio::test]
 async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2221,7 +2250,9 @@ async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
 #[tokio::test]
 async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
 
@@ -2293,7 +2324,9 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 async fn restored_old_job_survives_the_restarted_pools_warm_window() {
     let temp = tempfile::tempdir().unwrap();
     let run_id = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
@@ -2309,7 +2342,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         run_id
     };
 
-    let mut restored = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut restored = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     restored.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         true,
     )));
@@ -2334,7 +2369,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
 #[tokio::test]
 async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
 
@@ -2386,7 +2423,9 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
 #[tokio::test]
 async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
@@ -2449,7 +2488,9 @@ async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
 #[tokio::test]
 async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
@@ -2542,7 +2583,9 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
 #[tokio::test]
 async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     state.started_at = std::time::Instant::now() - Duration::from_secs(300);
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
@@ -2621,7 +2664,9 @@ async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
 #[tokio::test]
 async fn queued_job_does_not_starve_while_a_runner_is_being_provisioned() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2666,7 +2711,9 @@ async fn queued_job_does_not_starve_while_a_runner_is_being_provisioned() {
 #[tokio::test]
 async fn starvation_clock_ignores_provisioning_time_across_a_retry_gap() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2717,7 +2764,9 @@ async fn starvation_clock_ignores_provisioning_time_across_a_retry_gap() {
 #[tokio::test]
 async fn job_timeout_enforcement_cancels_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -2791,7 +2840,9 @@ async fn job_timeout_enforcement_cancels_job() {
 #[tokio::test]
 async fn debug_session_suspends_job_timeout() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -3015,7 +3066,9 @@ async fn debug_session_suspends_job_timeout() {
 #[tokio::test]
 async fn a_job_token_cannot_touch_another_jobs_debug_session() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -3152,7 +3205,9 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
 #[tokio::test]
 async fn the_debug_surface_rejects_a_non_job_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     assert_eq!(
@@ -3199,7 +3254,9 @@ async fn the_debug_surface_rejects_a_non_job_token() {
 #[tokio::test]
 async fn the_job_message_never_carries_the_debug_worker_token() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -3275,7 +3332,9 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
 #[tokio::test]
 async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let native_app = app(state.clone(), CancellationToken::new());
     // This is the path used by a runner inside a microVM. The worker reaches
     // the server through the mounted control socket, so the socket guard must
@@ -3415,7 +3474,9 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
 #[tokio::test]
 async fn debug_worker_token_outlives_job_and_pause_windows() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let token = state.mint_debug_worker_token("plan", &uuid::Uuid::new_v4());
     let claims = state
         .verify_local_jwt_claims(&token)
@@ -3441,7 +3502,9 @@ async fn debug_worker_token_outlives_job_and_pause_windows() {
 #[tokio::test]
 async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -3479,7 +3542,9 @@ async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
 #[tokio::test]
 async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     request_json(
@@ -3531,7 +3596,9 @@ async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
 #[tokio::test]
 async fn pause_credit_runs_out_and_the_job_times_out() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -3639,7 +3706,9 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
 #[tokio::test]
 async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {
@@ -3781,7 +3850,9 @@ async fn verdict_poll_timeout_is_not_an_abort() {
 async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
     for (preserve, expect_run_id) in [(true, true), (false, false)] {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
 
         let accepted = request_json(
@@ -3819,7 +3890,9 @@ async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
 #[tokio::test]
 async fn runner_lease_expiration_disconnect_reaper() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shutdown = CancellationToken::new();
     let app = app(state.clone(), shutdown.clone());
     let shared = Arc::new(SharedState {

@@ -1212,7 +1212,9 @@ mod tests {
     #[tokio::test]
     async fn production_router_builds_and_serves_healthz() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let router = app(state, CancellationToken::new());
         let response = router
             .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
