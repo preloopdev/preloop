@@ -111,6 +111,18 @@ Releases before v0.27.0 predate the changelog.
   re-check job liveness after action-reference resolution before signing
   bearerless download tickets.
 
+- **Local composite actions may call remote actions**: a workflow's local
+  composite (`uses: ./.github/actions/…`) that runs a remote action, such as
+  `dtolnay/rust-toolchain@stable`, was refused at download with HTTP 403
+  (`not declared in this run's workflow uses:`) because the declared-action
+  allowlist did not read local composite manifests. The engine now reads the
+  run's own commit for local composites, including the composites nested in
+  them, and admits their remote `uses:`. A run with a workspace snapshot reads
+  the snapshot; a GitHub-sourced run without one reads its own repository at
+  its head commit through the contents API, with a `contents: read`
+  installation token for that repository. A manifest that cannot be read still
+  fails closed, and every other action stays denied.
+
 - **Large replay step logs are retained** (#599): signed
   `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
   inheriting Axum's 2 MiB default, so long failing steps remain available for

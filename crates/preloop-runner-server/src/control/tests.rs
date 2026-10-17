@@ -503,6 +503,28 @@ pub(crate) mod suite {
             "a session-backed runner with no active request is idle"
         );
         assert_eq!((inputs.runner_busy, inputs.runner_stale), (0, 0));
+        // The ages are reported rather than left blank, and staleness
+        // follows the caller's window: the same session is idle capacity
+        // under the liveness window and gone under a zero-length one. That
+        // pair is what tells a busy pool apart from a dead one.
+        assert!(
+            inputs.max_poll_age_seconds.is_some_and(|age| age < 5),
+            "a session that just polled reports a small poll age, got {:?}",
+            inputs.max_poll_age_seconds
+        );
+        assert_eq!(
+            inputs.max_lease_age_seconds, None,
+            "nothing has been claimed, so no lease is held"
+        );
+        let zero_window = backend
+            .status_inputs(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_window.runner_stale, 1,
+            "a zero-length window makes a session that has polled stale"
+        );
+        assert_eq!(zero_window.runner_idle, 0);
     }
 
     /// The pool's busy gauge counts only busy runners the pool proved: a
