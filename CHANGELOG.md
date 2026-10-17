@@ -35,6 +35,16 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Local runs resolve a local composite's nested remote action again** (#649
+  regression from #620): the runner resolves such an action with its job's
+  runtime token and names the job by `system.orchestrationId`
+  (`{planId}.{jobId}.__default`), and the Results identity check refused that
+  plan segment. A job token now names its own plan in that form too; the job
+  UUID must still match, so a token reaches only its own job. Every refusal on
+  the action-download path logs a WARN with its run and reason, and a local
+  composite source that cannot be read is treated as incomplete, never
+  remembered as an empty answer.
+
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 
 - **The GitHub App JWT breaker is partitioned by App id**: one App's rate

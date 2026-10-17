@@ -834,11 +834,26 @@ pub fn results_identity(
     Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
+/// Whether a Results path's plan segment names the token's plan. The bare plan
+/// id does, and so does the runner's `system.orchestrationId`
+/// (`{planId}.{jobId}.{suffix}`): the runner sends that value as the plan
+/// segment when it addresses its own job, with the plan id as its prefix.
+fn path_names_token_plan(path_plan: &str, token_plan: &str) -> bool {
+    !token_plan.is_empty()
+        && (path_plan == token_plan
+            || path_plan
+                .strip_prefix(token_plan)
+                .is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Whether a job token addresses the Results target `plan_id` / `job_id`. The
+/// job UUID must match exactly, so a token never reaches another job, and the
+/// plan segment must name the token's own plan (see [`path_names_token_plan`]).
 pub fn results_identity_binds_job(identity: &ResultsIdentity, plan_id: &str, job_id: &str) -> bool {
     match identity {
         ResultsIdentity::System => true,
         ResultsIdentity::Job(identity) => {
-            identity.plan_id == plan_id
+            path_names_token_plan(plan_id, &identity.plan_id)
                 && job_id
                     .parse::<uuid::Uuid>()
                     .is_ok_and(|job| job == identity.job_id)
