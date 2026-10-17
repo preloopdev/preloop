@@ -7,27 +7,13 @@
 //! - skip if any commit message matches [skip ci] / [ci skip] / etc.
 //! - trust_tier = Trusted for default branch, Internal otherwise
 
+use super::has_skip_label;
 use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
 use serde_json::Value;
 
 /// Event adapter.
 pub struct Adapter;
-
-/// [skip ci] labels that suppress CI runs.
-/// Source: Runner.Server/Controllers/MessageController.cs:6258-6259,6283-6285.
-const SKIP_CI_LABELS: &[&str] = &[
-    "[skip ci]",
-    "[ci skip]",
-    "[no ci]",
-    "[skip actions]",
-    "[actions skip]",
-    "***NO_CI***",
-];
-
-fn has_skip_label(message: &str) -> bool {
-    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
-}
 
 /// Check whether any commit in the push batch carries a skip-CI label.
 ///

@@ -1296,7 +1296,6 @@ jobs:
 // them failed while `just test-ci` stayed green — the gate had no restart
 // dimension at all.
 // ---------------------------------------------------------------------------
-
 /// Secrets a submission supplies must come back as themselves after a
 /// restart — from the SecretProvider's sealed run tier, where acquire
 /// resolves them — and must never be written into the control database.
@@ -1517,7 +1516,6 @@ async fn postgres_recovery_preserves_run_secrets() {
 // ---------------------------------------------------------------------------
 // Regression tests for the cubic.dev review blockers on PR #27.
 // ---------------------------------------------------------------------------
-
 /// Restart while a reusable-caller node is parked (its concurrency gate is
 /// held by an earlier run) must keep the caller plan and the expansion-only
 /// fields (`github`, `head_sha`, `workflow_ref`) that the scheduler needs to
@@ -2156,7 +2154,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             get(|| async { Json(json!({"default_branch": "main"})) }),
         )
         .route(
-            "/repos/owner/repo/commits/:sha",
+            "/repos/owner/repo/commits/{sha}",
             get(|Path(_sha): Path<String>| async move {
                 Json(json!({"commit": {"tree": {"sha": TREE}}}))
             }),
@@ -2182,7 +2180,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             post(|| async { Json(json!({"id": 7})) }),
         )
         .route(
-            "/repos/owner/repo/check-runs/:id",
+            "/repos/owner/repo/check-runs/{id}",
             axum::routing::patch({
                 let check_completions = check_completions.clone();
                 move |Path(id): Path<u64>, body: axum::extract::Json<Value>| {
@@ -2532,7 +2530,7 @@ async fn push_intake_reports_no_check_run_for_expandable_placeholders() {
             get(|| async { Json(json!({"default_branch": "main"})) }),
         )
         .route(
-            "/repos/owner/repo/commits/:sha",
+            "/repos/owner/repo/commits/{sha}",
             get(|Path(_sha): Path<String>| async move {
                 Json(json!({"commit": {"tree": {"sha": TREE}}}))
             }),
@@ -2842,7 +2840,7 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
         .route(
             // Branch names may contain slashes; GitHub's commits/{ref}
             // endpoint matches the whole remaining path.
-            "/repos/owner/repo/commits/*ref",
+            "/repos/owner/repo/commits/{*ref}",
             get(|Path(r#ref): Path<String>| async move {
                 // The wildcard also catches the check-run sender's
                 // `commits/{sha}/check-runs` dedup lookup: nothing exists yet.
@@ -2883,7 +2881,7 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
             }),
         )
         .route(
-            "/repos/owner/repo/check-runs/:id",
+            "/repos/owner/repo/check-runs/{id}",
             axum::routing::patch(|| async { Json(json!({"id": 7})) }),
         );
 
@@ -2999,7 +2997,7 @@ async fn dirty_push_sync_surfaces_a_failed_terminal_state_write() {
             get(|| async { Json(json!({"default_branch": "main"})) }),
         )
         .route(
-            "/repos/owner/repo/commits/*ref",
+            "/repos/owner/repo/commits/{*ref}",
             get(|Path(r#ref): Path<String>| async move {
                 assert_eq!(r#ref, "feat/x", "dirty sync must verify the branch head");
                 Json(json!({
@@ -3019,7 +3017,7 @@ async fn dirty_push_sync_surfaces_a_failed_terminal_state_write() {
             post(|_body: axum::extract::Json<Value>| async move { Json(json!({"id": 7})) }),
         )
         .route(
-            "/repos/owner/repo/check-runs/:id",
+            "/repos/owner/repo/check-runs/{id}",
             axum::routing::patch(|| async { Json(json!({"id": 7})) }),
         );
 
@@ -3316,7 +3314,6 @@ async fn flow_recording_redacts_credentials() {
 }
 
 // ─── : /twirp-blob/:kind/:token authentication & path validation ───
-
 // ─── : /twirp-blob/:kind/:token authentication & path validation ───
 
 #[tokio::test]
@@ -3527,7 +3524,6 @@ fn parses_blob_path_allowlist() {
 }
 
 // ─── : job token lifecycle (jti uniqueness + liveness enforcement) ───
-
 // ─── : job token lifecycle (jti uniqueness + liveness enforcement) ───
 
 #[test]

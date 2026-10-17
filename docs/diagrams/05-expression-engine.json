@@ -132,16 +132,16 @@
     "y": 740,
     "width": 200,
     "height": 230,
-    "backgroundColor": "#ffc9c9",
+    "backgroundColor": "#d3f9d8",
     "fillStyle": "solid",
     "opacity": 30,
-    "strokeColor": "#ef4444",
+    "strokeColor": "#15803d",
     "strokeWidth": 1.5,
     "roundness": {
       "type": 3
     },
     "label": {
-      "text": "Known Gaps\n\u2022 no [a.b] bracket access\n\u2022 no object filter '*'\n\u2022 no '{{' escaping",
+      "text": "Supported Features\n\u2022 bracket access [a.b]\n\u2022 object filter '*'\n\u2022 format '{{' / '}}' escaping",
       "fontSize": 14
     }
   },

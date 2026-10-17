@@ -1665,3 +1665,63 @@ fn step_timeout_is_read_from_a_number_token() {
     assert_eq!(built.len(), 1);
     assert_eq!(built[0].timeout_minutes, Some(1));
 }
+
+/// Wire format regression: `PipelineContextData` serializes arrays as
+/// `{"t":1,"a":[…]}`. The old decoder read tag 1 as a legacy string and arrays
+/// nested inside a dictionary (e.g. `github.event.pull_request.labels`)
+/// decoded to null, so `contains(github.event.pull_request.labels.*.name, …)`
+/// was always false in runner-side evaluation.
+#[test]
+fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
+    let github = serde_json::json!({
+        "t": 2,
+        "d": [
+            {"k": "event_name", "v": "pull_request"},
+            {"k": "event", "v": {
+                "t": 2,
+                "d": [
+                    {"k": "action", "v": "labeled"},
+                    {"k": "label", "v": {
+                        "t": 2,
+                        "d": [{"k": "name", "v": "dependency-migration"}]
+                    }},
+                    {"k": "pull_request", "v": {
+                        "t": 2,
+                        "d": [
+                            {"k": "labels", "v": {
+                                "t": 1,
+                                "a": [
+                                    {"t": 2, "d": [{"k": "name", "v": "dependency-migration"}]},
+                                    {"t": 2, "d": [{"k": "name", "v": "other"}]},
+                                ]
+                            }}
+                        ]
+                    }}
+                ]
+            }}
+        ]
+    });
+
+    let decoded = decode_typed_value(&github);
+    assert_eq!(decoded["event_name"], "pull_request");
+    assert_eq!(decoded["event"]["action"], "labeled");
+    assert_eq!(
+        decoded["event"]["pull_request"]["labels"],
+        serde_json::json!([{"name": "dependency-migration"}, {"name": "other"}])
+    );
+
+    // The whole labeled-event guard expression must now see the label list.
+    let mut ctx = preloop_gha_expressions::Context::new();
+    ctx.insert("github", decoded);
+    assert_eq!(
+        preloop_gha_expressions::eval_expression(
+            "github.event.action == 'labeled' && \
+             github.event.label.name == 'dependency-migration' && \
+             contains(github.event.pull_request.labels.*.name, 'dependency-migration')",
+            &ctx,
+        )
+        .expect("expression evaluates"),
+        serde_json::json!(true),
+        "the dependency-migration guard expression must be true for this payload"
+    );
+}

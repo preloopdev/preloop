@@ -1,28 +1,20 @@
 # Fidelity Gap &amp; Roadmap
 
-**preloop** is a faithful Rust reimplementation of the GitHub Actions control plane, a host-side service that the **official** `actions/runner`**(**`Runner.Listener`**)**  or our rust-equivalent can register against, poll for jobs, execute, and report results to, without GitHub-hosted minutes. This doc is a tracker of any fidelity gaps between preloop and the official runner/server.
+**Purpose and status:** this is an engineering tracker comparing Preloop with
+the official GitHub Actions runner/server. It contains dated campaign results
+and design notes; do not read every item below as a current support matrix.
+For current setup and host requirements, see [Self-hosting](self-hosting.md)
+and [Preloop vs. other runners](preloop_vs_others.md).
 
-**preloop is not tied to any specific runner host.** It speaks the runner protocol and accepts
+Preloop combines the control plane with a runner pool. The default product
+execution path uses SmolVM/libkrun microVMs; AgentENV is an optional Linux
+backend. The control-plane protocol is a separate component, but protocol
+compatibility does not mean every alternative runner host is a supported or
+productized deployment. Remote-runner authentication and multi-host pool
+limitations are tracked in [the roadmap](roadmap.md).
 
-incoming runner connections; the runner itself handles execution. This means preloop works
-
-equally well with:
-
-- libkrun/fircracker/CH/Qemu microVMs (preloop by default uses libkrun)
-- Docker / Podman containers
-- Virtual machines (cloud or local)
-- Bare processes on the same machine
-- Remote runners on other servers
-
-**Preloop** is the *product* that combines preloop (control plane) + a libkrun-based
-
-ephemeral runner host for local CI. preloop is its control plane. But preloop is independently
-
-usable: anyone can `cargo install preloop` and point their own runners at it.
-
-Runner *provisioning* integrations live in separate repos/crates. The Rust runner
-
-protocol client (`preloop-runner`) lives in this workspace alongside the control plane.
+The Rust runner protocol client (`preloop-runner`) lives in this workspace
+alongside the control plane.
 
 Upstream reference: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
 
@@ -435,7 +427,8 @@ kept out of git, see `.gitignore`):
 ### 1b.2 Host/image gaps the campaign found
 
 Every one of these passed the wire conformance gate and still failed a real
-workflow. All are fixed:
+workflow. All are fixed except the `/etc/skel` golden rebake, which needs a
+dump-workflow change in `runner-image-blobs` before a corrected image lands.
 
 
 | Gap                                                                                    | Symptom in a real workflow                                                                                                                                                                                                                                                                                   | Fix                                                                                                                                                                                                                                                             |
@@ -451,6 +444,7 @@ workflow. All are fixed:
 | A fork of the packed golden trusted the pack's bake **(obsolete — there is no per-fork toolchain install: the golden is the image plus the runner contract, and nothing is installed on top)**                                    | a published pack predating the workspace's toolchain pin boots without cargo, and cargo-dist dies on "you don't appear to have cargo installed" in 11s                                                                                                                                                       | probe each toolchain layer per fork and install only what the pack lacks; and `build-golden` now bakes the workspace's toolchains (`rust-toolchain.toml` etc.) into the artifact, so forks inherit them — the per-fork install is gone once the pack is rebuilt |
 | The guest hostname did not resolve                                                     | every `sudo` call printed `sudo: unable to resolve host <name>`, which appears in no hosted log                                                                                                                                                                                                              | the baseline adds the hostname to `/etc/hosts`                                                                                                                                                                                                                  |
 | `apt-get install` prompted, and a step's stdin never reached EOF                       | the hosted images ship `/etc/apt/apt.conf.d/90assumeyes`, so uv's `sudo apt-get install musl-tools` (no `-y`) installs three packages without a prompt; here it asked `Do you want to continue? [Y/n]` and, because the runner is a child of a guest `exec` whose stdin never closes, blocked for 45 minutes | ship the same apt config, and give every step `Stdio::null()` for stdin                                                                                                                                                                                         |
+| `/etc/skel` is stripped from the golden while root's dotfiles still source it (#573)   | the runner-images dump (`runner-image-blobs` `dump.yml` base layer) carries `--exclude=/etc/skel` for toolchain dedup, but rustup wrote `. "/etc/skel/.cargo/env"` into `/root/.profile` and `/root/.bashrc`; any root login shell (`sh -lc`, `su -`, the debug shell) exits 2 before running the command — fatal under dash, cosmetic under bash | the debug shell now runs `sh -c` (#612); the durable fix needs a **dump-workflow update + golden rebake**: either keep a stub `/etc/skel/.cargo/env` or scrub the two sourcing lines from root's dotfiles during dump |
 
 
 ### 1b.3 Results
@@ -1353,13 +1347,12 @@ Steps:
 4. **Crypto isolation:** all RSA/AES lives in one reviewed module (`protocol::crypto`);
 
   `unsafe` stays forbidden; use `rsa`/`aes-gcm`/`cbc` crates. Document algorithm choices.
-5. **Known FIPS gap:** upstream `actions/runner` uses RSA-OAEP-SHA1 by default but switches to
-
-  RSA-OAEP-SHA256 when `UseFipsEncryption` is enabled. preloop currently implements the default
-
-   SHA-1 OAEP path only; FIPS-mode runners require an explicit algorithm switch before they can
-
-   decrypt `TaskAgentSession.encryptionKey`.
+5. **FIPS-mode encryption (implemented):** upstream `actions/runner` uses
+   RSA-OAEP-SHA1 by default and switches to RSA-OAEP-SHA256 when
+   `UseFipsEncryption` is enabled. Current session setup selects SHA-256 for
+   FIPS mode and rejects plaintext fallback; see the implemented evidence in
+   the compatibility table above. This historical campaign note is not an
+   outstanding gap.
 
 **Validate (Phase C):**
 

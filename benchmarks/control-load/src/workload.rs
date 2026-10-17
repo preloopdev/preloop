@@ -2,7 +2,7 @@
 //! through the REST API and as signed GitHub push webhooks.
 
 use hmac::{Hmac, Mac};
-use rand::distributions::{Distribution, WeightedIndex};
+use rand::distr::{weighted::WeightedIndex, Distribution};
 use rand::Rng;
 use sha2::Sha256;
 

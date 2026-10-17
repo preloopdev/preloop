@@ -16,6 +16,23 @@ pub async fn require_protocol_bearer(
         ))
     }
 }
+/// Require the system credential or a Results job runtime token.
+///
+/// This is narrower than [`require_protocol_bearer`]: action-resolution
+/// endpoints must not admit runner-listen, registration, debug-worker, blob,
+/// or other locally signed JWT classes as bearer credentials.
+pub async fn require_results_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer = bearer_token(&request)
+        .ok_or_else(|| ApiError::unauthorized("system or job runtime token required"))?;
+    let identity = results_identity(&shared.state, bearer)
+        .map_err(|_| ApiError::unauthorized("system or job runtime token required"))?;
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
+}
 /// Require that a protocol reporting request is authenticated by the system
 /// credential or by the runtime token minted for the exact job request.
 ///
@@ -69,6 +86,33 @@ pub fn authorize_reporting_request(
             "job runtime token does not own the reporting target",
         ))
     }
+}
+
+/// [`authorize_reporting_request`] plus the liveness rule: the caller must own
+/// the target *and* the attempt must still be live.
+///
+/// A settled attempt's runtime credential is spent — the rule the Results
+/// writes ([`require_live_results_job`]), the cache and artifact writes, and
+/// the live-log ingest all apply — so it must not keep mutating the run's
+/// records (timeline records, logs, console logs) after the attempt has
+/// settled. The credential is handed to workflow code and outlives the
+/// attempt, so without this a finished job could rewrite its own step records
+/// and annotations for the rest of the token's lifetime. Reads stay available,
+/// and the system identity bypasses exactly as it does everywhere else.
+pub async fn authorize_live_reporting_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    authorize_reporting_request(state, headers, request)?;
+    if system_bearer_authorized(state, headers) {
+        return Ok(());
+    }
+    let Some(record) = request else {
+        // Unresolvable targets were refused above for a non-system caller.
+        return Ok(());
+    };
+    require_live_job(state, record.agent_job_id).await
 }
 
 pub async fn require_results_bearer(

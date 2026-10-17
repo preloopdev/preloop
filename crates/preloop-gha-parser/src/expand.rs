@@ -26,16 +26,19 @@ const DEFERRED_MATRIX_SPEC_PREFIX: &str = "__preloop_deferred_matrix_spec__:";
 fn validate_reusable_workflow_tree(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+    origin: Option<&str>,
     depth: usize,
     call_chain: &mut Vec<String>,
     unique_workflows: &mut std::collections::BTreeSet<String>,
 ) -> Result<(), ParserError> {
     for job in workflow.jobs.values() {
-        if let Some(uses) = &job.uses {
+        if let Some(declared) = &job.uses {
             if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
                 return Err(ParserError::MaxNestingDepthExceeded);
             }
-            let path = normalize_reusable_path(uses);
+            let uses = callee_reference(declared, origin, reusable_workflow_shas)?;
+            let path = normalize_reusable_path(&uses);
             if call_chain.contains(&path) {
                 return Err(ParserError::MaxNestingDepthExceeded);
             }
@@ -47,7 +50,7 @@ fn validate_reusable_workflow_tree(
                 });
             }
             if let Some(yaml) = reusable_workflows
-                .get(uses)
+                .get(&uses)
                 .or_else(|| reusable_workflows.get(&path))
             {
                 let called = parse_workflow(yaml)?;
@@ -55,6 +58,8 @@ fn validate_reusable_workflow_tree(
                 validate_reusable_workflow_tree(
                     &called,
                     reusable_workflows,
+                    reusable_workflow_shas,
+                    (!is_local_workflow_ref(&uses)).then_some(uses.as_str()),
                     depth + 1,
                     call_chain,
                     unique_workflows,
@@ -818,11 +823,20 @@ pub(crate) fn coerce_value(
     }
 }
 
+/// Where the workflow being expanded sits in the reusable-call tree: how many
+/// levels below the top-level caller it is, and the remote reusable workflow it
+/// was fetched from (`None` for the submitted repository).
+#[derive(Clone, Copy)]
+struct CallFrame<'a> {
+    depth: usize,
+    origin: Option<&'a str>,
+}
+
 fn expand_jobs_with_reusables_internal(
     workflow: &Workflow,
     reusable_workflows: &BTreeMap<String, String>,
     reusable_workflow_shas: &BTreeMap<String, String>,
-    depth: usize,
+    frame: CallFrame<'_>,
     reusable_calls: &mut BTreeMap<String, ReusableCallMetadata>,
     inputs: Option<&BTreeMap<String, Value>>,
     event_name: Option<&str>,
@@ -830,10 +844,11 @@ fn expand_jobs_with_reusables_internal(
     let mut plans = Vec::new();
     let global_env = workflow.env.clone().into_strings();
     for (job_id, job) in &workflow.jobs {
-        if let Some(uses) = &job.uses {
-            if depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
+        if let Some(declared) = &job.uses {
+            if frame.depth >= MAX_REUSABLE_WORKFLOW_DEPTH {
                 return Err(ParserError::MaxNestingDepthExceeded);
             }
+            let uses = &callee_reference(declared, frame.origin, reusable_workflow_shas)?;
             let path = normalize_reusable_path(uses);
             let yaml = reusable_workflows
                 .get(uses)
@@ -1015,10 +1030,7 @@ fn expand_jobs_with_reusables_internal(
                         embedded_concurrency: called.concurrency.clone(),
                         matrix: matrix.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                         workflow_sha: reusable_workflow_shas.get(uses).cloned(),
-                        workflow_repository: uses.split_once('/').and_then(|(owner, rest)| {
-                            rest.split_once('/')
-                                .map(|(repo, _)| format!("{owner}/{repo}"))
-                        }),
+                        workflow_repository: reusable_workflow_repository(uses),
                         if_condition: job.if_condition.clone(),
                     },
                 );
@@ -1059,10 +1071,7 @@ fn expand_jobs_with_reusables_internal(
                     workflow_file: Some(path.clone()),
                     workflow_ref: Some(uses.clone()),
                     workflow_sha: reusable_workflow_shas.get(uses).cloned(),
-                    workflow_repository: uses.split_once('/').and_then(|(owner, rest)| {
-                        rest.split_once('/')
-                            .map(|(repo, _)| format!("{owner}/{repo}"))
-                    }),
+                    workflow_repository: reusable_workflow_repository(uses),
                     secrets_inherit,
                     secrets_map: secrets_map.clone(),
                     job_outputs: BTreeMap::new(),
@@ -1087,11 +1096,8 @@ fn expand_jobs_with_reusables_internal(
                         uses: uses.clone(),
                         workflow_file: path.clone(),
                         workflow_sha: reusable_workflow_shas.get(uses).cloned(),
-                        workflow_repository: uses.split_once('/').and_then(|(owner, rest)| {
-                            rest.split_once('/')
-                                .map(|(repo, _)| format!("{owner}/{repo}"))
-                        }),
-                        depth: depth + 1,
+                        workflow_repository: reusable_workflow_repository(uses),
+                        depth: frame.depth + 1,
                     }),
                     timeout_minutes: None,
                 });
@@ -1192,6 +1198,8 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
     validate_reusable_workflow_tree(
         workflow,
         reusable_workflows,
+        reusable_workflow_shas,
+        None,
         0,
         &mut call_chain,
         &mut unique_workflows,
@@ -1202,7 +1210,10 @@ pub fn expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         workflow,
         reusable_workflows,
         reusable_workflow_shas,
-        0,
+        CallFrame {
+            depth: 0,
+            origin: None,
+        },
         &mut reusable_calls,
         dispatch_inputs,
         event_name,
@@ -1291,7 +1302,10 @@ pub fn expand_reusable_call(
         called,
         reusable_workflows,
         reusable_workflow_shas,
-        call.depth,
+        CallFrame {
+            depth: call.depth,
+            origin: (!is_local_workflow_ref(uses)).then_some(uses.as_str()),
+        },
         &mut reusable_calls,
         Some(&caller_plan.inputs),
         None,
@@ -1378,6 +1392,111 @@ fn merge_job_conditions(outer: Option<&str>, inner: Option<&str>) -> Option<Stri
         }
     }
 }
+/// Whether a reusable `uses:` reference names a file in the repository and
+/// commit of the workflow that contains it (`./` or `$/`), rather than a file
+/// in another repository (`owner/repo/path@ref`).
+pub fn is_local_workflow_ref(uses: &str) -> bool {
+    uses.starts_with("./") || uses.starts_with("$/")
+}
+
+/// Whether a path segment is a plain name: non-empty ASCII letters, digits,
+/// `-`, `_` or `.`, and neither `.` nor `..`. A URL parser can reinterpret the
+/// other characters (separators, backslashes, `%`-escapes, `?`, `#`, whitespace,
+/// control characters), and a dot segment climbs out of the path it sits in, so
+/// anything else is refused before it reaches a request URL.
+pub fn is_plain_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Whether `path` is a plain relative path: `/`-separated plain segments with no
+/// leading, trailing, or doubled separator.
+pub fn is_plain_path(path: &str) -> bool {
+    !path.is_empty() && path.split('/').all(is_plain_segment)
+}
+
+/// Whether `path` names a reusable workflow file in a repository: a plain path
+/// under `.github/workflows/`. Every reusable reference path, same-repository or
+/// remote, is checked against this one rule before it reaches a request URL.
+pub fn is_reusable_workflow_path(path: &str) -> bool {
+    path.starts_with(".github/workflows/") && is_plain_path(path)
+}
+
+/// The repository-relative path a same-repository reference (`./` or `$/`)
+/// names. `None` when `uses` is not same-repository or its path is not a
+/// reusable workflow path (see `is_reusable_workflow_path`).
+pub fn same_repository_path(uses: &str) -> Option<&str> {
+    let path = uses
+        .strip_prefix("./")
+        .or_else(|| uses.strip_prefix("$/"))?;
+    is_reusable_workflow_path(path).then_some(path)
+}
+
+/// The key a same-repository reference names when it is written inside the
+/// reusable workflow `origin` (an `owner/repo/path@ref` key) pinned to
+/// `origin_pin`: the same file in that repository at that commit. Returns
+/// `None` for a reference whose path is not plain, a malformed `origin`, or a
+/// pin that is not a plain ref.
+pub fn scope_same_repository_ref(uses: &str, origin: &str, origin_pin: &str) -> Option<String> {
+    let path = same_repository_path(uses)?;
+    let (owner, rest) = origin.split_once('/')?;
+    let (repo, _) = rest.split_once('/')?;
+    if !is_plain_segment(owner) || !is_plain_segment(repo) || !is_plain_path(origin_pin) {
+        return None;
+    }
+    Some(format!("{owner}/{repo}/{path}@{origin_pin}"))
+}
+
+/// The pin a remote reusable workflow resolves its same-repository references
+/// against: the commit recorded for its key when the caller resolved it, else
+/// the ref it was written with.
+fn origin_pin<'a>(
+    origin: &'a str,
+    reusable_workflow_shas: &'a BTreeMap<String, String>,
+) -> &'a str {
+    match reusable_workflow_shas.get(origin) {
+        Some(sha) => sha.as_str(),
+        None => origin.rsplit_once('@').map_or("", |(_, git_ref)| git_ref),
+    }
+}
+
+/// The key a `uses:` inside a reusable workflow resolves to. A same-repository
+/// reference inside a remote reusable workflow names that workflow's repository
+/// at its pinned commit; anywhere else the reference is used as written.
+fn callee_reference(
+    declared: &str,
+    origin: Option<&str>,
+    reusable_workflow_shas: &BTreeMap<String, String>,
+) -> Result<String, ParserError> {
+    match origin {
+        Some(origin) if is_local_workflow_ref(declared) => {
+            scope_same_repository_ref(declared, origin, origin_pin(origin, reusable_workflow_shas))
+                .ok_or_else(|| ParserError::MissingReusableWorkflow {
+                    path: declared.to_owned(),
+                })
+        }
+        _ => Ok(declared.to_owned()),
+    }
+}
+
+/// The `owner/repo` a reusable reference names. `None` for a same-repository
+/// reference, which names no repository of its own.
+fn reusable_workflow_repository(uses: &str) -> Option<String> {
+    if is_local_workflow_ref(uses) {
+        return None;
+    }
+    uses.split_once('/').and_then(|(owner, rest)| {
+        rest.split_once('/')
+            .map(|(repo, _)| format!("{owner}/{repo}"))
+    })
+}
+
+/// Normalized repository path of a reusable reference: `./` and `$/` stripped
+/// and any `@ref` dropped.
 fn normalize_reusable_path(uses: &str) -> String {
     let without_ref = uses.split('@').next().unwrap_or(uses);
     let path = without_ref

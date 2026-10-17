@@ -260,7 +260,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// `NotFound` when the run does not exist (nothing is written). The
     /// outcome carries the post-transition run record, every job of the run
     /// now `Cancelled` (job-id order), and the global ready-queue depth and
-    /// front `runs-on` labels for the pool wake gauges.
+    /// front `runs-on` labels for the pool wake gauges. `run_cancelled` reports
+    /// whether this call transitioned a live run under the same lock;
+    /// cancelling an already-terminal run remains an idempotent no-op.
     async fn cancel_run(
         &self,
         run_id: RunId,
@@ -1594,6 +1596,18 @@ impl Backend {
         match self {
             Self::Sqlite(_) => None,
             Self::Postgres(b) => Some(b.subscribe_event_notifications()),
+        }
+    }
+
+    /// Webhook-queue hints from any node sharing this database (payload: the
+    /// writer's origin). `None` on SQLite: one node owns the queue and wakes
+    /// its own worker.
+    pub(crate) fn subscribe_webhook_wakes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(b) => Some(b.subscribe_webhook_wakes()),
         }
     }
 

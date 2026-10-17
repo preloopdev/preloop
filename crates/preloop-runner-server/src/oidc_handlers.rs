@@ -52,6 +52,7 @@ pub async fn oidc_token(
     let requested_job_id = job_id
         .parse::<uuid::Uuid>()
         .map_err(|_| ApiError::not_found("OIDC: plan and job do not match"))?;
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     // Authoritative lookups (plan binding, job request, id-token grant, OIDC
     // context, run) come from the backend; the signing keypair and issuer are
     // node-local.

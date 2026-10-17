@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -56,20 +57,54 @@ USES = re.compile(
 VERSION_LIKE = re.compile(r"^v?\d+(\.\d+)*$")
 
 
+# api.github.com answers an occasional 5xx/429 or drops a connection; a pin
+# check must not fail a PR on that. Retry transient failures with backoff.
+RETRY_ATTEMPTS = 5
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_RETRY_AFTER = 60
+
+
+def retry_after(exc: urllib.error.HTTPError) -> int | None:
+    """Seconds the server asked us to wait, capped; None if absent/unparseable."""
+    value = exc.headers.get("Retry-After") if exc.headers else None
+    if value and value.isdigit():
+        return min(int(value), MAX_RETRY_AFTER)
+    return None
+
+
 def api(path: str) -> object | None:
-    """GET a JSON endpoint; None on 404/422 (absent ref, unknown commit)."""
+    """GET a JSON endpoint; None on 404/422 (absent ref, unknown commit).
+
+    Transient failures (HTTP 429/5xx, connection errors, timeouts) are retried
+    with exponential backoff (1s, 2s, 4s, 8s), honouring Retry-After. Any other
+    error, or the last failed attempt, raises."""
     req = urllib.request.Request(f"{API}{path}")
     req.add_header("Accept", "application/vnd.github+json")
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as exc:
-        if exc.code in (404, 422):
-            return None
-        raise
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 422):
+                return None
+            if exc.code not in RETRY_STATUSES or attempt == RETRY_ATTEMPTS:
+                raise
+            reason = f"HTTP {exc.code}"
+            delay = retry_after(exc) or 2 ** (attempt - 1)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            if attempt == RETRY_ATTEMPTS:
+                raise
+            reason = str(exc)
+            delay = 2 ** (attempt - 1)
+        print(
+            f"warning: GET {path} failed ({reason}); retry {attempt}/{RETRY_ATTEMPTS - 1} in {delay}s",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def tag_shas(repo: str, ref: str) -> set[str]:

@@ -627,12 +627,19 @@ impl PgBackend {
                 )
                 .await?;
             } else if let Some(mut message) = stored_job_message(&tx, run_id, &job_id).await? {
-                patch_message_attempt(&mut message, run_attempt)?;
+                patch_message_attempt(&mut message, run_attempt, triggering_actor.as_deref())?;
                 PgBackend::write_node_message(&tx, run_id, &job_id, &message).await?;
                 // The stored `if:` context is the previous attempt's; refresh
                 // the attempt stamp inside it so the promotion sweep sees the
                 // same context the runner will.
-                patch_condition_context(&tx, run_id, &job_id, run_attempt).await?;
+                patch_condition_context(
+                    &tx,
+                    run_id,
+                    &job_id,
+                    run_attempt,
+                    triggering_actor.as_deref(),
+                )
+                .await?;
             } else if expandable {
                 // An expandable node re-mints its runnable messages at
                 // expansion; a `pending`/`blocked` placeholder is correct here.
@@ -1172,6 +1179,7 @@ fn raw_terminal(status: &str) -> bool {
 fn patch_message_attempt(
     message: &mut azdo::AgentJobRequestMessage,
     run_attempt: i64,
+    triggering_actor: Option<&str>,
 ) -> Result<uuid::Uuid, ControlError> {
     let agent_job_id = uuid::Uuid::new_v4();
     message.job_id = agent_job_id;
@@ -1183,6 +1191,12 @@ fn patch_message_attempt(
             "run_attempt".to_owned(),
             azdo::PipelineContextData::Number(run_attempt as f64),
         );
+        if let Some(actor) = triggering_actor {
+            github.insert(
+                "triggering_actor".to_owned(),
+                azdo::PipelineContextData::String(actor.to_owned()),
+            );
+        }
     }
     if let Some(azdo::PipelineContextData::Dict(job)) = message.context_data.get_mut("job") {
         job.insert(
@@ -1208,6 +1222,7 @@ async fn patch_condition_context(
     run_id: RunId,
     job_id: &JobId,
     run_attempt: i64,
+    triggering_actor: Option<&str>,
 ) -> Result<(), ControlError> {
     let Some(row) = tx
         .query_opt(
@@ -1222,7 +1237,16 @@ async fn patch_condition_context(
     };
     let mut context: preloop_gha_expressions::Context =
         serde_json::from_str(&row.get::<_, String>(0)).unwrap_or_default();
-    context.merge_root("github", serde_json::json!({"run_attempt": run_attempt}));
+    let mut patch = serde_json::json!({"run_attempt": run_attempt});
+    if let Some(actor) = triggering_actor
+        && let Some(github) = patch.as_object_mut()
+    {
+        github.insert(
+            "triggering_actor".to_owned(),
+            serde_json::Value::String(actor.to_owned()),
+        );
+    }
+    context.merge_root("github", patch);
     tx.execute(
         "UPDATE job_messages SET condition_context = $3::text::jsonb \
          WHERE run_id = $1::text::uuid AND job_id = $2",

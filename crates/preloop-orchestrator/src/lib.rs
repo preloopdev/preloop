@@ -3018,7 +3018,7 @@ impl GoldenBudget {
     /// another golden.
     fn try_reserve(&self) -> Option<GoldenReservation<'_>> {
         self.free
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                 free.checked_sub(1)
             })
             .ok()
@@ -10104,6 +10104,10 @@ done
             runner_environment_labels("ubuntu:24.04"),
             vec!["ubuntu-24.04", "ubuntu-latest"]
         );
+
+        // No 26.04 golden is published yet, so the pool must not advertise
+        // that hosted label until the image and artifact migration lands.
+        assert!(runner_environment_labels("ubuntu:26.04").is_empty());
     }
 
     #[test]

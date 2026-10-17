@@ -215,9 +215,11 @@ async fn render_session_message(
                 endpoint.url = Some(runner_server_url());
                 endpoint.authorization.parameters.insert(
                     "AccessToken".to_owned(),
-                    shared
-                        .state
-                        .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                    shared.state.mint_runtime_token_for_job(
+                        &msg.plan.plan_id,
+                        &msg.job_id,
+                        msg.job_timeout,
+                    ),
                 );
                 endpoint.data.insert(
                     "ResultsServiceUrl".to_owned(),

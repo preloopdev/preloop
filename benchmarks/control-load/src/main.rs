@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use metrics::Metrics;
 
@@ -145,7 +145,7 @@ fn multiplier(bursts: &[(u64, u64, f64)], t: u64) -> f64 {
 /// (inverse transform). `rand_distr`'s `Exp` is not used because that crate
 /// is unvetted in this workspace.
 fn exponential_gap(rng: &mut impl Rng, rate: f64) -> f64 {
-    -(1.0 - rng.gen::<f64>()).ln() / rate
+    -(1.0 - rng.random::<f64>()).ln() / rate
 }
 
 async fn run(args: RunArgs) -> Result<()> {
@@ -220,7 +220,7 @@ async fn run(args: RunArgs) -> Result<()> {
     let in_flight = Arc::new(tokio::sync::Semaphore::new(args.max_in_flight));
     let mut sequence: u64 = 0;
     let mut next = Instant::now();
-    let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
     while Instant::now() < submit_end {
         let t = metrics.elapsed().as_secs();
         let rate = args.runs_per_sec * multiplier(&bursts, t);
@@ -234,9 +234,9 @@ async fn run(args: RunArgs) -> Result<()> {
         let repo = format!(
             "load-org-{}/repo-{}",
             sequence % 37,
-            rng.gen_range(0..args.repos)
+            rng.random_range(0..args.repos)
         );
-        let webhook = args.webhook_sha.is_some() && rng.gen_bool(args.webhook_fraction);
+        let webhook = args.webhook_sha.is_some() && rng.random_bool(args.webhook_fraction);
         let base = args.servers[sequence as usize % args.servers.len()].clone();
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
             // The harness itself is saturated: count it, never block the clock.
@@ -381,7 +381,7 @@ async fn rerun_loop(
     let mut next = Instant::now();
     while Instant::now() < deadline {
         let gap = {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             exponential_gap(&mut rng, rate)
         };
         next += Duration::from_secs_f64(gap);
