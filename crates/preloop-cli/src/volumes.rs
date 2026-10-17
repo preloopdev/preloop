@@ -20,6 +20,7 @@
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
+use preloop_vm::agentenv::gc as volume_gc;
 use preloop_vm::agentenv::volume;
 use preloop_vm::agentenv::{AgentEnvProvider, AgentEnvVolume, VolumeIndex};
 use std::path::PathBuf;
@@ -44,6 +45,30 @@ enum VolumesCommand {
     /// but not while a volume is being populated. A mounted volume is reported
     /// as in use and left alone.
     Prune(PruneArgs),
+    /// Collect the volumes nothing needs any more.
+    ///
+    /// Deletes only what the retention policy calls superseded: volumes no
+    /// sandbox mounts, past the grace period, beyond the rollback depth, and not
+    /// a tree the engine mounts (the same tree selection `prune` keeps, or
+    /// `--keep`). A volume nothing recorded a creation time for is kept, so a
+    /// leftover from an older build needs `prune`. Prints the plan: one row per
+    /// volume with its size, kind, age and the reason it is kept or deleted.
+    ///
+    /// The engine runs the same plan by itself after it populates a volume and
+    /// every `PRELOOP_VOLUMES_GC_INTERVAL_SECS`; `PRELOOP_VOLUMES_GC=off` stops
+    /// those and leaves this command.
+    Gc(GcArgs),
+}
+
+#[derive(Debug, Args)]
+struct GcArgs {
+    /// A host tree whose volume is kept (repeatable). Without it, the engine's
+    /// bundle and the installed Node externals are kept.
+    #[arg(long = "keep", value_name = "DIR")]
+    keep: Vec<PathBuf>,
+    /// Report the plan without deleting anything.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -67,6 +92,7 @@ pub(crate) async fn run(args: VolumesArgs) -> anyhow::Result<()> {
     match args.command {
         VolumesCommand::List => list(&provider).await,
         VolumesCommand::Prune(args) => prune(provider, args).await,
+        VolumesCommand::Gc(args) => gc(provider, args).await,
     }
 }
 
@@ -114,6 +140,40 @@ fn render_list(volumes: &[AgentEnvVolume], index: &VolumeIndex) -> String {
         ));
     }
     out
+}
+
+/// Collect what the retention policy calls superseded, and report it.
+///
+/// The plan is what a pass acts on: `--dry-run` prints it and stops there, and a
+/// real run deletes exactly the volumes it names (a mounted volume comes back as
+/// in use, never as deleted).
+async fn gc(provider: AgentEnvProvider, args: GcArgs) -> anyhow::Result<()> {
+    let trees = if args.keep.is_empty() {
+        default_keep_trees()
+    } else {
+        args.keep
+    };
+    if trees.is_empty() {
+        eprintln!(
+            "warning: no runner bundle is installed and none was named with --keep: \
+             only mounted, young and rollback volumes are kept"
+        );
+    }
+    let mut live = Vec::with_capacity(trees.len());
+    for tree in &trees {
+        live.push(
+            provider
+                .runner_volume_name(tree)
+                .await
+                .with_context(|| format!("naming the runner volume for {}", tree.display()))?,
+        );
+    }
+    let request = volume_gc::Request::new()
+        .with_live(live)
+        .dry_run(args.dry_run);
+    let outcome = volume_gc::run_pass(&provider, request).await?;
+    print!("{}", outcome.render(volume_gc::unix_now()));
+    Ok(())
 }
 
 async fn prune(provider: AgentEnvProvider, args: PruneArgs) -> anyhow::Result<()> {

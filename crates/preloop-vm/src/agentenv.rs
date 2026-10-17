@@ -60,6 +60,7 @@
 //!   and removal) run through [`crate::guest_privilege`], which uses `sudo -n` when the
 //!   exec user is not root. Payloads keep the exec user, as a plain `exec` does.
 
+pub mod gc;
 pub mod volume;
 
 use crate::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
@@ -305,6 +306,10 @@ pub struct AgentEnvProvider {
     volume_index: Arc<Mutex<VolumeIndex>>,
     /// Where the index is persisted, when persistence is configured.
     volume_index_path: Option<PathBuf>,
+    /// Automatic collection of the volumes nothing needs any more: the knobs,
+    /// the staging volumes a populate in this process is writing, and the
+    /// scheduler's own bookkeeping. Nothing is deleted without it.
+    volume_gc: Arc<gc::GcState>,
 }
 
 impl Default for AgentEnvProvider {
@@ -329,6 +334,7 @@ impl AgentEnvProvider {
             bundle_manifest: volume::BundleManifest::default(),
             volume_index: Arc::new(Mutex::new(VolumeIndex::default())),
             volume_index_path: None,
+            volume_gc: Arc::new(gc::GcState::disabled()),
         }
     }
 
@@ -353,7 +359,7 @@ impl AgentEnvProvider {
                 .with_registry_path(home.join("agentenv-machines.json"))
                 .with_volume_index_path(home.join("agentenv-runner-volumes.json"));
         }
-        provider
+        provider.with_volume_gc(gc::GcState::from_environment())
     }
 
     /// Stamp `manifest` into every volume this provider populates.
@@ -363,6 +369,17 @@ impl AgentEnvProvider {
     /// the default records `unknown` for every version instead of guessing.
     pub fn with_bundle_manifest(mut self, manifest: volume::BundleManifest) -> Self {
         self.bundle_manifest = manifest;
+        self
+    }
+
+    /// Collect the volumes nothing needs with `state`'s policy and snapshot of
+    /// what is being written.
+    ///
+    /// A provider built with [`AgentEnvProvider::new`] collects nothing until it
+    /// is given a state: [`AgentEnvProvider::from_environment`] is the
+    /// constructor that turns it on from `PRELOOP_VOLUMES_GC`.
+    pub fn with_volume_gc(mut self, state: gc::GcState) -> Self {
+        self.volume_gc = Arc::new(state);
         self
     }
 
@@ -986,6 +1003,9 @@ impl AgentEnvProvider {
         target: &str,
         cold: Option<&MachineSpec>,
     ) -> Result<String, VmError> {
+        // An engine that needs a volume is an engine that can collect the ones
+        // nothing needs, on a timer from here on.
+        gc::ensure_scheduled(self);
         let lock = self.volume_lock(host).await;
         let _populate = lock.lock().await;
         let fingerprint = volume::fingerprint_tree(host, &self.bundle_manifest).await?;
@@ -996,7 +1016,7 @@ impl AgentEnvProvider {
         let name = volume::volume_name(&tree.digest);
         if !self.volume_is_ready(&name).await? {
             let size_mb = volume::volume_size_mb(tree.bytes)?;
-            self.populate_volume(&name, &tree, size_mb, target, cold)
+            self.populate_volume(host, &name, &tree, size_mb, target, cold)
                 .await?;
             info!(
                 volume = %name,
@@ -1006,6 +1026,9 @@ impl AgentEnvProvider {
                 "populated read-only runner volume"
             );
             self.remember_volume(host, &tree).await;
+            // Publishing a volume is what supersedes one, so this is where a
+            // pass is worth asking for. It runs in the background.
+            gc::request_pass(self);
         }
         self.published_volumes.lock().await.insert(
             host.to_path_buf(),
@@ -1128,6 +1151,7 @@ impl AgentEnvProvider {
     /// a sandbox.
     async fn populate_volume(
         &self,
+        host: &Path,
         name: &str,
         tree: &volume::ArchivedTree,
         size_mb: u64,
@@ -1136,6 +1160,9 @@ impl AgentEnvProvider {
     ) -> Result<(), VmError> {
         let attempt = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let staging = volume::staging_name(&tree.digest, attempt);
+        // Record the staging volume before it exists: a pass that saw the volume
+        // and not the record would treat a populate in flight as a leftover.
+        let _staging = self.volume_gc.begin_staging(&staging, &tree.digest, host);
         let size = size_mb.to_string();
         self.checked(
             "runner_volume",

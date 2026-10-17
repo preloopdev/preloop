@@ -485,9 +485,10 @@ control backend replaced) into a fresh control database. See
 Read-only volumes the engine mounts. Each holds one host tree — today the runner
 bundle, including the Node externals it carries — named
 `preloop-runner-<digest>` after the digest of the tree, so a new bundle is a new
-volume. Nothing removes a superseded volume on its own; these commands do. They
-are offline: they talk to AgentENV (`PRELOOP_AENV_BINARY`, default `aenv`) and
-never bootstrap the engine.
+volume. The engine collects superseded volumes on its own (`gc`, and the
+`PRELOOP_VOLUMES_*` variables); these commands run that plan by hand, or reclaim
+volumes it deliberately leaves alone. They are offline: they talk to AgentENV
+(`PRELOOP_AENV_BINARY`, default `aenv`) and never bootstrap the engine.
 
 ### `preloop volumes list`
 
@@ -521,6 +522,34 @@ between a populate's create and its first mount fails that populate.
 |---|---|
 | `--keep <DIR>` | Host tree whose volume is kept (repeatable) |
 | `--dry-run` | Report candidates without deleting anything |
+
+### `preloop volumes gc [--keep <DIR>]... [--dry-run]`
+
+Collects the volumes nothing needs any more. It keeps the trees named with
+`--keep` (without that flag, the same tree selection `prune` keeps), every volume a
+sandbox mounts, every volume this engine published and remembers, every volume
+younger than the grace period or with no recorded creation time, the newest
+superseded volume per kind for a rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`,
+default 1), and any staging volume a populate is writing.
+
+It deletes the rest and prints one row per volume — size, kind, age and the reason
+it is kept or deleted — so `--dry-run` shows exactly what a real run does. The
+reasons are `live`, `mounted`, `populating`, `young`, `unknown-age`, `previous`
+and `unmanaged` for kept volumes, and `superseded`, `abandoned` (a staging volume
+whose populate is gone) and `unusable` (a volume AgentENV reports as something
+other than `ready`) for deleted ones. A volume whose age nothing recorded —
+populated by an older build, or by another host — is kept, which is what `prune`
+is for.
+
+The engine runs the same plan in the background after it populates a volume and
+every `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600 seconds), so a bundle
+change reclaims the bundle it replaced once the grace period is over.
+`PRELOOP_VOLUMES_GC=off` stops those automatic passes and leaves this command.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable) |
+| `--dry-run` | Print the plan without deleting anything |
 
 ## `preloop update [OPTIONS]`
 
@@ -622,6 +651,10 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
+| `PRELOOP_VOLUMES_GC` | `auto` (default) or `off`: whether the engine collects superseded AgentENV volumes on its own, after it populates one and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS`. `off` leaves `preloop volumes gc` |
+| `PRELOOP_VOLUMES_KEEP_PREVIOUS` | Superseded volumes kept per kind for a rollback (default 1). `0` reclaims every superseded volume |
+| `PRELOOP_VOLUMES_GC_GRACE_SECS` | How long a volume is left alone after it was created (default 3600) |
+| `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | Period between automatic collection passes (default 21600; `0` disables the periodic pass) |
 | `PRELOOP_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
 | `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |

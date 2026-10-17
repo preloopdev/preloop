@@ -108,6 +108,25 @@ orchestrator branches on it instead of assuming SmolVM's semantics.
   volume deleted between a populate's create and its first mount fails that
   populate. Populates of different trees run in parallel; one tree populates
   once, under its own lock.
+* **Superseded volumes are collected.** A bundle change publishes a new volume and
+  leaves the old one behind, because an unmounted volume may be about to be
+  mounted. The engine reclaims the leftovers itself — a pass after each populate
+  and every six hours — keeping the volumes it published, anything a sandbox
+  mounts (AgentENV refuses those deletes), anything younger than the grace period
+  or without a recorded creation time, and the newest superseded volume for a
+  rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`). Every deletion is logged at info
+  with its name, size and reason, and a volume AgentENV reports as something
+  other than `ready` is reclaimed once it is past the grace period, so a start
+  stuck on a failed volume can populate again. `preloop volumes gc [--dry-run]`
+  prints and runs the same plan; `PRELOOP_VOLUMES_GC=off` stops the automatic
+  passes. Ages come from the index (`$PRELOOP_HOME/agentenv-runner-volumes.json`)
+  and, for staging volumes, from `$PRELOOP_HOME/agentenv-volume-staging.json`,
+  whose records a populate writes before it creates its staging volume and
+  removes when it ends — so a pass can tell a populate in flight from a leftover
+  without taking the per-tree lock. With more than one engine on one server, an
+  idle volume another engine published can still be collected once it is past the
+  grace period: that engine revalidates the name it remembers before reuse and
+  repopulates (~1 minute) instead of failing.
 * **The bundle carries Node externals.** The engine mounts only the bundle at
   `/opt/preloop/bin` and links `/home/runner/externals` to its `externals/`
   subtree. A second mount at `/home/runner/externals` failed on AgentENV with
@@ -219,6 +238,10 @@ under-provisioning or failing a spec that is merely smaller than the base.
 | `PRELOOP_AENV_TTL_SECS` | sandbox TTL requested and re-armed (default 3600) |
 | `PRELOOP_RUNNER_URL` | must be guest-reachable on this backend (no socket relay) |
 | `PRELOOP_RUNNER_BUNDLE` | host tree archived into a content-addressed read-only AgentENV volume; bundle changes create a new volume |
+| `PRELOOP_VOLUMES_GC` | `auto` (default) or `off`: collect superseded volumes after a populate and on a timer |
+| `PRELOOP_VOLUMES_KEEP_PREVIOUS` | superseded volumes kept for a rollback (default 1) |
+| `PRELOOP_VOLUMES_GC_GRACE_SECS` | grace period before a volume may be collected (default 3600) |
+| `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | automatic pass period (default 21600; `0` disables it) |
 
 ## Prerequisites on the host
 

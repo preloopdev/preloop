@@ -20,6 +20,26 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **Superseded AgentENV volumes are collected automatically.** A runner bundle
+  change publishes a new content-addressed volume and leaves the old one behind;
+  the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
+  the grace period, beyond the newest one kept for a rollback, and not a tree the
+  engine mounts — in a pass after each populate and every six hours. A pass never
+  deletes a volume a sandbox mounts (AgentENV refuses), a volume whose creation
+  time nothing recorded, or a staging volume a populate is writing, and every
+  deletion is logged with its name, size and reason. A volume AgentENV reports as
+  something other than `ready` is reclaimed once it is past the grace period,
+  which unblocks a start that would otherwise stay stuck on it.
+  `PRELOOP_VOLUMES_GC=off` turns the automatic passes off;
+  `PRELOOP_VOLUMES_KEEP_PREVIOUS` (default 1), `PRELOOP_VOLUMES_GC_GRACE_SECS`
+  (default 3600) and `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600) set the
+  retention.
+
+- **`preloop volumes gc [--keep <DIR>]... [--dry-run]`** prints the plan a pass
+  acts on — one row per volume with its size, kind, age and the reason it is kept
+  or deleted — and deletes it unless `--dry-run` is given. `prune` stays as the
+  explicit one-shot for volumes that have no recorded age.
+
 ### Changed
 
 - **The file credential store is the default.** The engine token, GitHub App
@@ -42,8 +62,9 @@ Releases before v0.27.0 predate the changelog.
   volume; a new bundle is therefore a new volume rather than a golden rebuild.
   Writable host mounts are refused, symlinks that would leave the tree and
   set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
-  failures are reported by name with no tar fallback. `preloop volumes
-  list|prune` manages leftovers.
+  failures are reported by name with no tar fallback. `preloop volumes list|prune`
+  manages leftovers; `preloop volumes gc` — the plan the engine also runs by
+  itself — collects the superseded ones.
 
 ### Fixed
 
