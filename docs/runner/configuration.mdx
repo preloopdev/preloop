@@ -42,6 +42,20 @@ These flags apply to every command.
 
 - `configure` stops when the runner root is already configured, or when a runner with the same name exists. Pass `--replace` to proceed.
 - The runner always adds the labels `self-hosted`, the OS (`Linux` or `macOS`), and the architecture (`X64` or `ARM64`). Labels match case-insensitively, so duplicates are dropped. No flag removes the defaults.
+
+### Match labels the GitHub way
+
+`runs-on` labels are requirements joined by AND. A runner must advertise every
+requested label, and matching is case-insensitive; extra labels do not hurt.
+`--labels` adds labels to the defaults, which are `self-hosted`, the host OS,
+and the host architecture.
+
+GitHub-hosted labels such as `ubuntu-latest` do not make a standalone host
+equivalent to a GitHub-hosted image. Use labels that describe the host and its
+capabilities, or change `runs-on` to match the labels you actually advertise.
+For a control-plane-managed runner, add labels with `PRELOOP_RUNNER_LABELS`;
+for this standalone runner, pass them to `configure --labels`.
+
 - `--runner-group` must name a self-hosted group. An unknown or ambiguous name fails `configure` and lists the available groups.
 - `--work` is saved in `.runner`, but job workspaces are always created under `_work/` in the runner root. Changing this value does not move them.
 - With `--no-externals`, JavaScript actions use the `node` found on `PATH`. Its major version must match the action's Node version, or the action fails.

@@ -41,6 +41,23 @@ The ready queue is ordered by priority and stable run/job order. A runner listen
 
 The control backend checks labels, runner groups, concurrency, and the attempt's ownership before returning the encrypted job message. A normal job lease lasts 2,700 seconds (45 minutes) and the worker renews it about every 60 seconds. The server uses shorter reaper thresholds for a hung worker (180 seconds with a live session) or a dead session (600 seconds), so a lost runner does not hold a job indefinitely.
 
+### Match labels the GitHub way
+
+`runs-on` is an AND requirement, not a preference. If a job asks for
+`[self-hosted, Linux, ARM64, gpu]`, a runner must advertise every label; extra
+runner labels are fine. Matching is case-insensitive. This is the same
+set-inclusion rule GitHub uses.
+
+GitHub-hosted image labels such as `ubuntu-latest` are not automatically
+capabilities of an external runner. The built-in Preloop microVM pool maps the
+supported Ubuntu labels to its configured golden; a standalone or remote runner
+must advertise the labels its host actually supports. Set extra labels with
+`PRELOOP_RUNNER_LABELS` for managed local runners or
+`preloop-runner configure --labels` for the standalone runner. If an existing
+workflow uses a label that the runner does not advertise, change `runs-on` or
+add that label to the runner.
+
+
 If no matching runner appears, a ready job receives a 120-second grace window. A host pool that is preparing can use the one-hour backstop; a pool whose advertised labels can never satisfy the job fails it as unschedulable instead of leaving it queued forever.
 
 ## 4. Execute and report
