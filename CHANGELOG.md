@@ -35,12 +35,15 @@ Releases before v0.27.0 predate the changelog.
 
 - **AgentENV runners mount the runner bundle as a read-only volume**: the
   complete bundle (including Node externals) is archived once into a
-  content-addressed volume named `preloop-runner-<digest>`, and clones mount it
-  at start with `aenv start --volume`. Fork bases stay volume-free because
-  AgentENV 0.2.1 cannot snapshot a sandbox with a read-only volume; a new
-  bundle is therefore a new volume rather than a golden rebuild. Writable host
-  mounts are refused, and volume create/populate failures are reported by name
-  with no tar fallback. `preloop runner-volumes list|prune` manages leftovers.
+  content-addressed volume named `preloop-runner-<digest>`, stamped with a
+  `.preloop-bundle.json` manifest saying which runner and Node versions it
+  holds, and clones mount it at start with `aenv start --volume`. Fork bases stay
+  volume-free because AgentENV 0.2.1 cannot snapshot a sandbox with a read-only
+  volume; a new bundle is therefore a new volume rather than a golden rebuild.
+  Writable host mounts are refused, symlinks that would leave the tree and
+  set-user-ID/set-group-ID/sticky bits are stripped, and volume create/populate
+  failures are reported by name with no tar fallback. `preloop volumes
+  list|prune` manages leftovers.
 
 ### Fixed
 

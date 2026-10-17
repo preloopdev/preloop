@@ -204,6 +204,18 @@ case "${1-}" in
           printf 'backend refused volume %s\n' "$name" >&2
           exit 1
         fi
+        # Overlap probe: with `<exe>.overlap-probe`, a create holds a marker
+        # directory for a moment and records it when a second create is inside
+        # it at the same time. One global populate lock can never overlap; a
+        # per-tree lock does, which is how a test tells them apart without
+        # measuring wall time or waiting for the other side.
+        if [ -f "$0.overlap-probe" ]; then
+          if ! mkdir "$0.in-create" 2>/dev/null; then
+            : > "$0.overlap"
+          fi
+          sleep 1
+          rmdir "$0.in-create" 2>/dev/null || true
+        fi
         if grep -q "^$name|" "$volumes"; then
           printf 'volume %s already exists\n' "$name" >&2
           exit 1
@@ -320,9 +332,16 @@ fn set_state(executable: &Path, state: &str) {
     fs::write(executable.with_extension("state"), state).unwrap();
 }
 
+/// The version pins test volumes are archived with.
+fn bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest {
+    preloop_vm::agentenv::volume::BundleManifest::new("2.336.0", "20.20.2", "24.19.0")
+}
+
 fn provider(executable: &Path, registry: &Path) -> AgentEnvProvider {
     AgentEnvProvider::new(executable)
         .with_registry_path(registry.join("machines.json"))
+        .with_volume_index_path(registry.join("volumes.json"))
+        .with_bundle_manifest(bundle_manifest())
         .with_ttl_secs(600)
 }
 
@@ -828,7 +847,7 @@ async fn a_volume_in_a_state_other_than_ready_is_refused_not_repopulated() {
     let home = tempfile::tempdir().unwrap();
     let bundle = tempfile::tempdir().unwrap();
     fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
-    let digest = preloop_vm::agentenv::volume::archive_tree(bundle.path())
+    let digest = preloop_vm::agentenv::volume::archive_tree(bundle.path(), &bundle_manifest())
         .await
         .unwrap()
         .digest;
@@ -917,6 +936,190 @@ async fn a_clone_mounts_the_golden_bundle_volume_at_fork_and_uploads_nothing() {
     let clone = starts.last().unwrap();
     assert!(clone.starts_with("start|golden-vol-snap-"), "{clone}");
     assert!(mounted_volume(clone, "/opt/preloop/bin").is_some());
+}
+
+#[tokio::test]
+async fn an_in_place_bundle_update_is_noticed_by_the_same_engine() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF-v1").unwrap();
+    let provider = provider(&executable, home.path());
+
+    for (name, contents) in [("runner-before", b"ELF-v1"), ("runner-after", b"ELF-v2")] {
+        fs::write(bundle.path().join("preloop-runner"), contents).unwrap();
+        let mut machine = spec(name, "ubuntu:24.04");
+        machine.volumes = vec![bundle_mount(bundle.path())];
+        provider.create(&machine).await.unwrap();
+        provider
+            .start(&MachineName::new(name).unwrap())
+            .await
+            .unwrap();
+    }
+
+    let starts = calls_for(&executable, "start");
+    let before = mounted_volume(&starts[1], "/opt/preloop/bin").unwrap();
+    let after = mounted_volume(&starts[3], "/opt/preloop/bin").unwrap();
+    assert_ne!(
+        before, after,
+        "an in-place update must not keep mounting the old volume"
+    );
+    assert_eq!(
+        calls_for(&executable, "upload").len(),
+        2,
+        "each version is populated once"
+    );
+    assert_eq!(volume_creates(&executable).len(), 4);
+}
+
+#[tokio::test]
+async fn a_volume_deleted_under_a_running_engine_is_populated_again() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
+    let provider = provider(&executable, home.path());
+
+    for name in ["runner-a", "runner-b"] {
+        let mut machine = spec(name, "ubuntu:24.04");
+        machine.volumes = vec![bundle_mount(bundle.path())];
+        provider.create(&machine).await.unwrap();
+        provider
+            .start(&MachineName::new(name).unwrap())
+            .await
+            .unwrap();
+        if name == "runner-a" {
+            // `preloop volumes prune` deleted the volume while the engine ran.
+            fs::write(executable.with_extension("volumes"), "").unwrap();
+        }
+    }
+
+    assert_eq!(
+        calls_for(&executable, "upload").len(),
+        2,
+        "a remembered volume that is gone is populated again, not mounted dead"
+    );
+    let starts = calls_for(&executable, "start");
+    assert!(
+        starts[2].contains("--volume|/mnt/preloop-volume=preloop-runner-stage-"),
+        "the second start repopulates: {starts:?}"
+    );
+    assert_eq!(
+        mounted_volume(&starts[1], "/opt/preloop/bin"),
+        mounted_volume(&starts[3], "/opt/preloop/bin"),
+        "the repopulated volume has the same content address"
+    );
+}
+
+#[tokio::test]
+async fn a_populated_volume_records_what_it_holds_and_prune_forgets_it() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
+    let provider = provider(&executable, home.path());
+    let machine = MachineName::new("runner-indexed").unwrap();
+
+    let mut spec = spec("runner-indexed", "ubuntu:24.04");
+    spec.volumes = vec![bundle_mount(bundle.path())];
+    provider.create(&spec).await.unwrap();
+    provider.start(&machine).await.unwrap();
+
+    let volume = mounted_volume(&calls_for(&executable, "start")[1], "/opt/preloop/bin").unwrap();
+    let entry = provider
+        .volume_index()
+        .await
+        .get(&volume)
+        .cloned()
+        .expect("the populated volume is indexed");
+    assert_eq!(entry.manifest.runner_version(), "2.336.0");
+    assert_eq!(entry.manifest.node20_version(), "20.20.2");
+    assert_eq!(entry.manifest.node24_version(), "24.19.0");
+    assert_eq!(entry.bundle_files, 1);
+    assert!(entry.bundle_bytes > 0);
+    assert_eq!(entry.host, bundle.path().display().to_string());
+    assert!(entry.created > 0, "the index carries the created time");
+
+    // The index is on disk, so a restarted engine still knows what it holds.
+    let reloaded = AgentEnvProvider::new(&executable)
+        .with_volume_index_path(home.path().join("volumes.json"))
+        .volume_index()
+        .await;
+    assert_eq!(reloaded.get(&volume), Some(&entry));
+
+    // Prune drops the entry once the volume is gone, and nothing is mounted.
+    provider.delete(&machine).await.unwrap();
+    let report = provider.prune_volumes(&[], false).await.unwrap();
+    assert_eq!(report.deleted, vec![volume.clone()]);
+    assert!(provider.volume_index().await.is_unknown(&volume));
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_candidates_and_a_real_run_reports_a_mounted_volume() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
+    let provider = provider(&executable, home.path());
+    let machine = MachineName::new("runner-mounted").unwrap();
+
+    let mut spec = spec("runner-mounted", "ubuntu:24.04");
+    spec.volumes = vec![bundle_mount(bundle.path())];
+    provider.create(&spec).await.unwrap();
+    provider.start(&machine).await.unwrap();
+    let mounted = mounted_volume(&calls_for(&executable, "start")[1], "/opt/preloop/bin").unwrap();
+    let stale = "preloop-runner-0123456789ab".to_owned();
+    fs::write(
+        executable.with_extension("volumes"),
+        format!("{mounted}|ro|\n{stale}|ro|\n"),
+    )
+    .unwrap();
+
+    // A dry run cannot ask the server which volumes a sandbox holds, so it
+    // names candidates and claims nothing was, or would be, deleted.
+    let dry = provider.prune_volumes(&[], true).await.unwrap();
+    let mut candidates = dry.candidates.clone();
+    candidates.sort();
+    assert_eq!(candidates, vec![stale.clone(), mounted.clone()]);
+    assert!(dry.deleted.is_empty() && dry.in_use.is_empty());
+    assert!(executable.with_extension("volumes").exists());
+
+    // The real run learns from the delete attempt: the mounted one stays.
+    let real = provider.prune_volumes(&[], false).await.unwrap();
+    assert_eq!(real.deleted, vec![stale]);
+    assert_eq!(real.in_use, vec![mounted]);
+    assert!(real.candidates.is_empty());
+}
+
+#[tokio::test]
+async fn different_trees_populate_without_waiting_for_each_other() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let first_bundle = tempfile::tempdir().unwrap();
+    let second_bundle = tempfile::tempdir().unwrap();
+    fs::write(first_bundle.path().join("preloop-runner"), b"ELF-one").unwrap();
+    fs::write(second_bundle.path().join("preloop-runner"), b"ELF-two").unwrap();
+    fs::write(executable.with_extension("overlap-probe"), "").unwrap();
+    let provider = provider(&executable, home.path());
+
+    let mut names = Vec::new();
+    for (index, bundle) in [&first_bundle, &second_bundle].into_iter().enumerate() {
+        let name = format!("runner-par-{index}");
+        let mut machine = spec(&name, "ubuntu:24.04");
+        machine.volumes = vec![bundle_mount(bundle.path())];
+        provider.create(&machine).await.unwrap();
+        names.push(MachineName::new(&name).unwrap());
+    }
+
+    let (first, second) = tokio::join!(provider.start(&names[0]), provider.start(&names[1]));
+    first.unwrap();
+    second.unwrap();
+    assert!(
+        executable.with_extension("overlap").exists(),
+        "two creates must be inside the probe at once: a per-tree lock lets \
+         different trees populate together, one global lock never would"
+    );
+    assert_eq!(calls_for(&executable, "upload").len(), 2);
 }
 
 #[tokio::test]

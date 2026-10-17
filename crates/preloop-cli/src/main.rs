@@ -26,10 +26,10 @@ mod github_setup;
 mod init;
 
 mod push;
-mod runner_volumes;
 mod server_install;
 mod store;
 mod update;
+mod volumes;
 mod webhooks;
 
 pub(crate) fn server_url() -> String {
@@ -590,7 +590,10 @@ fn default_vm_backend() -> VmBackend {
 pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider> {
     match backend {
         VmBackend::Smolvm => Box::new(preloop_vm::SmolVmProvider::default()),
-        VmBackend::Agentenv => Box::new(preloop_vm::agentenv::AgentEnvProvider::default()),
+        VmBackend::Agentenv => Box::new(
+            preloop_vm::agentenv::AgentEnvProvider::default()
+                .with_bundle_manifest(preloop_orchestrator::runner_bundle_manifest()),
+        ),
     }
 }
 
@@ -889,10 +892,10 @@ enum Command {
     /// (refinery has no down; restore the backup to roll back).
     Store(store::StoreArgs),
 
-    /// List and reclaim the read-only volumes AgentENV runners mount. The
-    /// engine creates one per distinct runner tree; `prune` deletes the ones
-    /// no sandbox mounts, keeping the current bundle.
-    RunnerVolumes(runner_volumes::RunnerVolumesArgs),
+    /// List and reclaim the read-only volumes the engine mounts. Each holds one
+    /// tree (today: the runner bundle); `prune` deletes the ones no sandbox
+    /// mounts, keeping the tree the engine would mount.
+    Volumes(volumes::VolumesArgs),
 
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
@@ -1264,7 +1267,7 @@ async fn main() -> anyhow::Result<()> {
         // Schema administration and the legacy import are explicit and
         // offline; never bootstrap (or migrate) the engine for them.
         Command::Store(args) => store::run(args).await,
-        Command::RunnerVolumes(args) => runner_volumes::run(args).await,
+        Command::Volumes(args) => volumes::run(args).await,
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
@@ -1299,7 +1302,7 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Secret(_)
                     | Command::Server(_)
                     | Command::Store(_)
-                    | Command::RunnerVolumes(_) => {
+                    | Command::Volumes(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },
@@ -2618,28 +2621,14 @@ async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Configuration assembly, not a public API: the parameter list mirrors the
-// inputs the pool genuinely needs.
-#[allow(clippy::too_many_arguments)]
-fn local_runner_pool_config(
-    home: &std::path::Path,
-    server_url: String,
-    control_origin: Option<String>,
-    control_upstream: Option<String>,
-    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
-    pool_enabled: bool,
-    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pending_registrations: std::sync::Arc<
-        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
-    >,
-    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
-    observability: preloop_observability::Observability,
-) -> anyhow::Result<RunnerPoolConfig> {
-    let control_bridge = home.join("control-bridge");
-    std::fs::create_dir_all(&control_bridge)?;
-    set_private_directory_permissions(&control_bridge)?;
-    let runner_bundle = std::env::var_os("PRELOOP_RUNNER_BUNDLE")
+/// The Linux runner bundle the engine mounts: `PRELOOP_RUNNER_BUNDLE` when it
+/// names a usable tree, otherwise the installed or development bundle beside
+/// this executable.
+///
+/// Shared with `preloop volumes prune`, which must keep the volume of the
+/// bundle the engine would actually mount.
+pub(crate) fn discovered_runner_bundle() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_RUNNER_BUNDLE")
         .map(PathBuf::from)
         .filter(|path| linux_runner_bundle(path))
         .or_else(|| {
@@ -2677,7 +2666,54 @@ fn local_runner_pool_config(
                 .find(|directory| directory.join("preloop-runner").is_file())
         })
         .filter(|path| linux_runner_bundle(path))
-        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
+}
+
+/// The Node externals directory the engine mounts from: `PRELOOP_RUNNER_EXTERNALS`
+/// when set, otherwise `<preloop home>/externals`.
+///
+/// Mirrors the pool config's choice so `preloop volumes prune` reasons
+/// about the same tree the engine does.
+pub(crate) fn local_externals_dir() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_RUNNER_EXTERNALS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PRELOOP_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop"))
+                })
+                .map(|home| home.join("externals"))
+        })
+}
+
+/// The runner binary the pool expects inside a bundle, as
+/// [`RunnerPoolConfig::runner_binary_name`] sets it.
+pub(crate) const RUNNER_BINARY_NAME: &str = "preloop-runner";
+
+// Configuration assembly, not a public API: the parameter list mirrors the
+// inputs the pool genuinely needs.
+#[allow(clippy::too_many_arguments)]
+fn local_runner_pool_config(
+    home: &std::path::Path,
+    server_url: String,
+    control_origin: Option<String>,
+    control_upstream: Option<String>,
+    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    pool_enabled: bool,
+    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending_registrations: std::sync::Arc<
+        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
+    >,
+    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<RunnerPoolConfig> {
+    let control_bridge = home.join("control-bridge");
+    std::fs::create_dir_all(&control_bridge)?;
+    set_private_directory_permissions(&control_bridge)?;
+    let runner_bundle = discovered_runner_bundle().context(
+        "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)",
+    )?;
     let backend = vm_backend()?;
     // AgentENV has no socket relay: the guest dials the runner URL over plain
     // TCP, so a loopback URL points at the guest itself and no job can ever

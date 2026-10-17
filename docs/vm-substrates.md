@@ -79,12 +79,35 @@ orchestrator branches on it instead of assuming SmolVM's semantics.
   the mount is enforced read-only by the guest block device: uid 1001 and root
   writes both fail with `EROFS`, while executable files remain executable.
   Writable host mounts are refused; there is no silent tar fallback.
+* **A volume carries its own manifest.** The archive includes a synthetic
+  `.preloop-bundle.json` (never written to the host tree) naming the runner and
+  Node externals versions the tree was archived with, plus its file count and
+  byte total. It is part of the digest, so a version change publishes a new
+  volume. The engine also records the manifest, the host tree, and the creation
+  time in a local index beside its machine registry, because AgentENV cannot be
+  asked what is inside a volume without mounting it; `preloop volumes list`
+  answers from that index. Nothing in the manifest is time- or host-dependent:
+  the creation time lives only in the index.
+* **Two things never reach a guest.** A symlink whose target is absolute or
+  climbs out of the tree with `..` fails the archive, and set-user-ID,
+  set-group-ID and sticky bits are masked out of the archived modes. Both are
+  enforced while the archive is built; the mount flags themselves are AgentENV's
+  to decide, so `nosuid`/`nodev` are not something this backend can set.
 * **Fork bases cannot carry read-only volumes.** AgentENV 0.2.1 rejects a
   snapshot of a sandbox with a read-only volume (`HTTP 500`, volume catalog
   backing must enter `uploading`). The golden therefore stays volume-free and
   the provider attaches the current content-addressed bundle volume when
   starting each clone. This means a runner update creates a new volume rather
   than requiring a golden rebuild.
+* **A remembered volume is revalidated, never trusted.** Each start re-derives
+  the tree's fingerprint (a metadata walk, not an archive) and re-checks that
+  the volume still exists before mounting it, so an in-place bundle update and a
+  `preloop volumes prune` are both noticed: the tree is archived again and, if
+  the volume is gone, populated again. Pruning therefore costs a repopulate, not
+  a failure — but it is still unsafe while a volume is being populated, since a
+  volume deleted between a populate's create and its first mount fails that
+  populate. Populates of different trees run in parallel; one tree populates
+  once, under its own lock.
 * **The bundle carries Node externals.** The engine mounts only the bundle at
   `/opt/preloop/bin` and links `/home/runner/externals` to its `externals/`
   subtree. A second mount at `/home/runner/externals` failed on AgentENV with

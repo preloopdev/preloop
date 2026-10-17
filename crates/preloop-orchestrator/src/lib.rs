@@ -295,7 +295,12 @@ fn externals_complete(externals_root: &Path) -> bool {
 /// can run at all — unlike the release directory, which is root-owned when the
 /// engine runs unprivileged.
 fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
-    config.externals_dir.join("runner-bundle")
+    mirror_bundle_dir_in(&config.externals_dir)
+}
+
+/// [`mirror_bundle_dir`] from the externals directory alone.
+fn mirror_bundle_dir_in(externals_dir: &Path) -> PathBuf {
+    externals_dir.join("runner-bundle")
 }
 
 /// The bundle directory actually mounted into guests at `/opt/preloop/bin`.
@@ -308,23 +313,50 @@ fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
 /// `<root>/externals` symlink dangled, so every JS action step failed with
 /// `bundled nodeXX is missing` long after the pool reported itself ready.
 fn effective_runner_bundle(config: &RunnerPoolConfig) -> Result<PathBuf, OrchestratorError> {
-    if externals_complete(&config.runner_bundle.join("externals")) {
-        return Ok(config.runner_bundle.clone());
+    effective_runner_bundle_path(
+        &config.runner_bundle,
+        &config.externals_dir,
+        &config.runner_binary_name,
+    )
+}
+
+/// The bundle [`effective_runner_bundle`] would mount, without a pool config.
+///
+/// Split out so `preloop runner-volumes prune` can name the same tree the engine
+/// mounts — including the engine-owned mirror — and keep its volume.
+pub fn effective_runner_bundle_path(
+    bundle: &Path,
+    externals_dir: &Path,
+    runner_binary_name: &str,
+) -> Result<PathBuf, OrchestratorError> {
+    if externals_complete(&bundle.join("externals")) {
+        return Ok(bundle.to_path_buf());
     }
-    let mirror = mirror_bundle_dir(config);
-    if mirror.join(&config.runner_binary_name).is_file()
-        && externals_complete(&mirror.join("externals"))
-    {
+    let mirror = mirror_bundle_dir_in(externals_dir);
+    if mirror.join(runner_binary_name).is_file() && externals_complete(&mirror.join("externals")) {
         return Ok(mirror);
     }
     Err(OrchestratorError::Config(format!(
         "no runner bundle with complete node externals: release bundle {} and \
          engine-owned mirror {} are both incomplete; check network egress to \
          nodejs.org and the host externals at {}",
-        config.runner_bundle.display(),
+        bundle.display(),
         mirror.display(),
-        config.externals_dir.join("externals").display(),
+        externals_dir.join("externals").display(),
     )))
+}
+
+/// The version pins stamped into every AgentENV runner volume.
+///
+/// `versions.toml` is compiled into this crate (and the CLI) by `build.rs`, not
+/// into `preloop-vm`, which archives the tree — so the provider is handed the
+/// manifest by whoever constructs it.
+pub fn runner_bundle_manifest() -> preloop_vm::agentenv::volume::BundleManifest {
+    preloop_vm::agentenv::volume::BundleManifest::new(
+        RUNNER_VERSION,
+        NODE20_EXTERNALS_VERSION,
+        NODE24_EXTERNALS_VERSION,
+    )
 }
 
 /// Publish an engine-owned bundle carrying the runner binary and the validated

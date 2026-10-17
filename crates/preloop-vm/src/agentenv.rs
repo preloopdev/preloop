@@ -154,17 +154,80 @@ pub struct AgentEnvVolume {
     pub status: String,
 }
 
-/// What [`AgentEnvProvider::prune_runner_volumes`] did, volume by volume.
+/// What [`AgentEnvProvider::prune_volumes`] did, volume by volume.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
-    /// Deleted, or to be deleted on a dry run.
+    /// Deleted by this call.
     pub deleted: Vec<String>,
     /// Named in `keep`, so left in place.
     pub kept: Vec<String>,
     /// Still mounted by a sandbox, so the server refused the deletion.
     pub in_use: Vec<String>,
+    /// A dry run's candidates: the volumes a real run would attempt to delete.
+    ///
+    /// A dry run cannot say which of them a sandbox holds. AgentENV reveals a
+    /// reservation only when a delete is attempted (`HTTP 409: volume is
+    /// reserved by sandbox …`) and no read-only API reports it, so the report
+    /// names them as candidates instead of claiming they would be deleted.
+    pub candidates: Vec<String>,
     /// Refused for another reason, with the reason.
     pub failed: Vec<(String, String)>,
+}
+
+/// The read-only volume a host tree resolved to, and the fingerprint of the tree
+/// it was archived from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedVolume {
+    /// The tree's fingerprint at the time it was archived.
+    fingerprint: String,
+    /// The content-addressed volume name.
+    name: String,
+}
+
+/// What one populated volume holds, as the local index records it.
+///
+/// The manifest is also stamped inside the volume itself, but AgentENV has no
+/// API that reads inside a volume without mounting it, so `volumes list`
+/// answers from here. `created` lives only here: a timestamp inside the tree
+/// would change the digest of an unchanged bundle on every archive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedVolume {
+    /// The version pins the tree was archived with.
+    #[serde(default)]
+    pub manifest: volume::BundleManifest,
+    /// Regular files in the archived tree.
+    #[serde(default)]
+    pub bundle_files: u64,
+    /// Summed size of those files, in bytes.
+    #[serde(default)]
+    pub bundle_bytes: u64,
+    /// The host tree the volume was archived from.
+    #[serde(default)]
+    pub host: String,
+    /// When the volume was populated, in Unix seconds.
+    #[serde(default)]
+    pub created: u64,
+}
+
+/// What this host's populated volumes hold, keyed by volume name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeIndex {
+    /// Volume name → what it holds.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, IndexedVolume>,
+}
+
+impl VolumeIndex {
+    /// What `name` holds, when this host populated it.
+    pub fn get(&self, name: &str) -> Option<&IndexedVolume> {
+        self.volumes.get(name)
+    }
+
+    /// Whether the index knows nothing about `name`, which is what a volume
+    /// populated before this index existed, or by another host, looks like.
+    pub fn is_unknown(&self, name: &str) -> bool {
+        !self.volumes.contains_key(name)
+    }
 }
 
 /// The descriptor [`VmProvider::pack`] writes in place of a `.smolmachine`.
@@ -227,10 +290,21 @@ pub struct AgentEnvProvider {
     keepalives: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// One in-flight snapshot creation per fork base.
     fork_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Read-only volume each archived host tree resolved to, keyed by the tree's
-    /// path. Held across the whole ensure, so concurrent starts of one tree wait
-    /// for a single archive and a single populate.
-    runner_volumes: Arc<Mutex<HashMap<PathBuf, String>>>,
+    /// The read-only volume each archived host tree resolved to, with the
+    /// fingerprint of the tree it was archived from. A start re-derives the
+    /// fingerprint and re-checks that the volume still exists, so an in-place
+    /// bundle update and a `prune` both invalidate the entry.
+    published_volumes: Arc<Mutex<HashMap<PathBuf, PublishedVolume>>>,
+    /// One populate lock per host tree, so different trees archive and populate
+    /// concurrently while repeated starts of one tree wait on the first instead
+    /// of archiving it twice.
+    volume_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    /// The version pins stamped into every volume this provider populates.
+    bundle_manifest: volume::BundleManifest,
+    /// What the populated volumes hold, keyed by volume name.
+    volume_index: Arc<Mutex<VolumeIndex>>,
+    /// Where the index is persisted, when persistence is configured.
+    volume_index_path: Option<PathBuf>,
 }
 
 impl Default for AgentEnvProvider {
@@ -250,7 +324,11 @@ impl AgentEnvProvider {
             registry_path: None,
             keepalives: Arc::new(Mutex::new(HashMap::new())),
             fork_locks: Arc::new(Mutex::new(HashMap::new())),
-            runner_volumes: Arc::new(Mutex::new(HashMap::new())),
+            published_volumes: Arc::new(Mutex::new(HashMap::new())),
+            volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            bundle_manifest: volume::BundleManifest::default(),
+            volume_index: Arc::new(Mutex::new(VolumeIndex::default())),
+            volume_index_path: None,
         }
     }
 
@@ -259,7 +337,8 @@ impl AgentEnvProvider {
     /// `PRELOOP_AENV_BINARY` overrides the executable and
     /// `PRELOOP_AENV_TTL_SECS` the sandbox TTL; the registry is persisted under
     /// the effective preloop home so a restarted engine can still enumerate and
-    /// tear down the machines it created.
+    /// tear down the machines it created, and the volume index beside it so
+    /// `volumes list` can say what a volume holds without mounting it.
     pub fn from_environment() -> Self {
         let mut provider = Self::new(binary());
         if let Some(ttl) = std::env::var(TTL_ENV)
@@ -270,9 +349,58 @@ impl AgentEnvProvider {
             provider.ttl_secs = ttl;
         }
         if let Some(home) = crate::effective_preloop_home() {
-            provider = provider.with_registry_path(home.join("agentenv-machines.json"));
+            provider = provider
+                .with_registry_path(home.join("agentenv-machines.json"))
+                .with_volume_index_path(home.join("agentenv-runner-volumes.json"));
         }
         provider
+    }
+
+    /// Stamp `manifest` into every volume this provider populates.
+    ///
+    /// The pins come from the caller because `versions.toml` is compiled into
+    /// the CLI and the orchestrator, not into this crate. A provider that keeps
+    /// the default records `unknown` for every version instead of guessing.
+    pub fn with_bundle_manifest(mut self, manifest: volume::BundleManifest) -> Self {
+        self.bundle_manifest = manifest;
+        self
+    }
+
+    /// Persist the volume index at `path`, loading it if it exists.
+    ///
+    /// A missing or malformed file is not fatal: `volumes list` then
+    /// reports the manifest as unknown for every volume. Nothing else depends on
+    /// the index — it exists so an operator can see what a volume holds without
+    /// mounting it, since AgentENV has no API that reads inside a volume.
+    pub fn with_volume_index_path(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<VolumeIndex>(&bytes) {
+                Ok(index) => {
+                    self.volume_index = Arc::new(Mutex::new(index));
+                }
+                Err(error) => warn!(
+                    path = %path.display(), %error,
+                    "AgentENV volume index is unreadable; starting empty"
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %path.display(), %error,
+                "AgentENV volume index could not be read; starting empty"
+            ),
+        }
+        self.volume_index_path = Some(path);
+        self
+    }
+
+    /// What the volumes this host populated hold, keyed by volume name.
+    ///
+    /// A volume with no entry was populated by an engine that did not keep an
+    /// index (or by another host): `volumes list` says so rather than
+    /// claiming a version.
+    pub async fn volume_index(&self) -> VolumeIndex {
+        self.volume_index.lock().await.clone()
     }
 
     /// Persist the name → sandbox registry at `path`, loading it if it exists.
@@ -845,20 +973,26 @@ impl AgentEnvProvider {
     ///
     /// The volume name derives from the digest of the archived tree (see
     /// [`volume`]), so a changed tree resolves to a new volume and an unchanged
-    /// one to the volume already published. The memo lock is held across the
-    /// whole call: concurrent first starts of one tree wait for a single archive
-    /// and a single populate, and every later start resolves from memory.
+    /// one to the volume already published. A start re-derives the tree's
+    /// fingerprint and re-checks the volume before reusing it, so an in-place
+    /// bundle update and a `prune` that removed the volume are both noticed:
+    /// the tree is archived again and, when the volume is gone, populated again.
+    ///
+    /// The lock is per tree: two starts of the same tree wait for one archive and
+    /// one populate, while starts of different trees proceed in parallel.
     async fn ensure_read_only_volume(
         &self,
         host: &Path,
         target: &str,
         cold: Option<&MachineSpec>,
     ) -> Result<String, VmError> {
-        let mut published = self.runner_volumes.lock().await;
-        if let Some(name) = published.get(host) {
-            return Ok(name.clone());
+        let lock = self.volume_lock(host).await;
+        let _populate = lock.lock().await;
+        let fingerprint = volume::fingerprint_tree(host, &self.bundle_manifest).await?;
+        if let Some(name) = self.published_volume(host, &fingerprint).await? {
+            return Ok(name);
         }
-        let tree = volume::archive_tree(host).await?;
+        let tree = volume::archive_tree(host, &self.bundle_manifest).await?;
         let name = volume::volume_name(&tree.digest);
         if !self.volume_is_ready(&name).await? {
             let size_mb = volume::volume_size_mb(tree.bytes)?;
@@ -867,12 +1001,121 @@ impl AgentEnvProvider {
             info!(
                 volume = %name,
                 bytes = tree.bytes,
+                files = tree.files,
                 host = %host.display(),
                 "populated read-only runner volume"
             );
+            self.remember_volume(host, &tree).await;
         }
-        published.insert(host.to_path_buf(), name.clone());
+        self.published_volumes.lock().await.insert(
+            host.to_path_buf(),
+            PublishedVolume {
+                fingerprint,
+                name: name.clone(),
+            },
+        );
         Ok(name)
+    }
+
+    /// The volume the memo holds for `host`, when it still matches `fingerprint`
+    /// and the server still has the volume.
+    async fn published_volume(
+        &self,
+        host: &Path,
+        fingerprint: &str,
+    ) -> Result<Option<String>, VmError> {
+        let remembered = {
+            let published = self.published_volumes.lock().await;
+            match published.get(host) {
+                Some(entry) if entry.fingerprint == fingerprint => Some(entry.name.clone()),
+                _ => None,
+            }
+        };
+        let Some(name) = remembered else {
+            return Ok(None);
+        };
+        // A remembered name is only reusable while the volume exists: `prune`
+        // can delete an unmounted volume while this engine keeps running.
+        if self.volume_is_ready(&name).await? {
+            Ok(Some(name))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The populate lock for `host`: one per tree, so different trees archive and
+    /// populate concurrently instead of waiting on each other.
+    async fn volume_lock(&self, host: &Path) -> Arc<Mutex<()>> {
+        let mut locks = self.volume_locks.lock().await;
+        Arc::clone(locks.entry(host.to_path_buf()).or_default())
+    }
+
+    /// Record a freshly populated volume in the local index.
+    ///
+    /// Best-effort: the volume is already published and the engine can start
+    /// runners from it, so a failed write is logged and ignored. The index is
+    /// what lets `volumes list` say what a volume holds.
+    async fn remember_volume(&self, host: &Path, tree: &volume::ArchivedTree) {
+        let entry = IndexedVolume {
+            manifest: self.bundle_manifest.clone(),
+            bundle_files: tree.files,
+            bundle_bytes: tree.bytes,
+            host: host.display().to_string(),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default(),
+        };
+        let mut index = self.volume_index.lock().await;
+        index
+            .volumes
+            .insert(volume::volume_name(&tree.digest), entry);
+        self.persist_volume_index(&index);
+    }
+
+    /// Drop volumes `names` from the index, after `prune` deleted them.
+    ///
+    /// Best-effort, like every other index write. Names are content-addressed,
+    /// so a volume re-populated from the same tree records the same entry again.
+    async fn forget_volumes(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut index = self.volume_index.lock().await;
+        let before = index.volumes.len();
+        index.volumes.retain(|name, _| !names.contains(name));
+        if index.volumes.len() != before {
+            self.persist_volume_index(&index);
+        }
+    }
+
+    /// Persist the volume index, atomically, best-effort.
+    fn persist_volume_index(&self, index: &VolumeIndex) {
+        let Some(path) = &self.volume_index_path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(parent)?;
+            let temporary = parent.join(format!(
+                ".agentenv-runner-volumes.{}.tmp",
+                std::process::id()
+            ));
+            let bytes = serde_json::to_vec_pretty(index)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            std::fs::write(&temporary, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&temporary, path)
+        };
+        if let Err(error) = write() {
+            warn!(path = %path.display(), %error, "AgentENV volume index write failed");
+        }
     }
 
     /// Write `tree` into a new read-only volume named `name`.
@@ -1052,13 +1295,13 @@ impl AgentEnvProvider {
     /// Reads the tree but creates nothing, so an operator can name the volumes
     /// `prune` must keep.
     pub async fn runner_volume_name(&self, host: &Path) -> Result<String, VmError> {
-        let tree = volume::archive_tree(host).await?;
+        let tree = volume::archive_tree(host, &self.bundle_manifest).await?;
         Ok(volume::volume_name(&tree.digest))
     }
 
     /// Every runner volume AgentENV lists: published volumes and populate
     /// leftovers alike.
-    pub async fn list_runner_volumes(&self) -> Result<Vec<AgentEnvVolume>, VmError> {
+    pub async fn list_volumes(&self) -> Result<Vec<AgentEnvVolume>, VmError> {
         let output = self
             .checked("volume_list", &["volume".into(), "list".into()])
             .await?;
@@ -1070,42 +1313,74 @@ impl AgentEnvProvider {
             .collect())
     }
 
+    /// Delete exactly `names` and classify each outcome.
+    ///
+    /// AgentENV refuses a volume a sandbox mounts (`HTTP 409: volume is reserved
+    /// by sandbox …`), which is an outcome rather than a failure, and a volume
+    /// that is already gone counts as deleted. Index entries for what was
+    /// deleted are dropped.
+    ///
+    /// Deleting a set decided by the caller is what an automatic collection pass
+    /// needs: it plans from one listing and then deletes exactly the volumes it
+    /// classified, so a volume another engine publishes in between is never
+    /// deleted unclassified.
+    pub async fn delete_volumes(&self, names: &[String]) -> Result<PruneReport, VmError> {
+        let mut report = PruneReport::default();
+        for name in names {
+            let deletion = self
+                .checked(
+                    "volume_delete",
+                    &["volume".into(), "delete".into(), name.clone()],
+                )
+                .await;
+            match deletion {
+                Ok(_) => report.deleted.push(name.clone()),
+                Err(VmError::Command { message, .. }) if is_absent(&message) => {
+                    report.deleted.push(name.clone());
+                }
+                Err(VmError::Command { message, .. }) if is_mounted(&message) => {
+                    report.in_use.push(name.clone());
+                }
+                Err(error) => report.failed.push((name.clone(), error.to_string())),
+            }
+        }
+        self.forget_volumes(&report.deleted).await;
+        Ok(report)
+    }
+
     /// Delete every runner volume that is not in `keep` and that no sandbox
     /// mounts. AgentENV refuses to delete a mounted volume, which is reported as
-    /// in use rather than as a failure. `dry_run` deletes nothing.
+    /// in use rather than as a failure. `dry_run` deletes nothing and reports
+    /// candidates instead: the server only reveals a reservation when a delete
+    /// is attempted, so a dry run does not claim those volumes would be deleted.
     ///
-    /// Run it when no engine is populating volumes: a volume deleted between a
-    /// populate's create and its first mount makes that populate fail.
-    pub async fn prune_runner_volumes(
+    /// Safe while an engine is running: a provider revalidates a remembered
+    /// volume before reusing it and repopulates a volume that is gone. It is not
+    /// safe while a volume is being populated — a volume deleted between its
+    /// populate's create and its first mount fails that populate.
+    pub async fn prune_volumes(
         &self,
         keep: &[String],
         dry_run: bool,
     ) -> Result<PruneReport, VmError> {
         let mut report = PruneReport::default();
-        for volume in self.list_runner_volumes().await? {
+        let mut doomed = Vec::new();
+        for volume in self.list_volumes().await? {
             if keep.contains(&volume.name) {
                 report.kept.push(volume.name);
             } else if dry_run {
-                report.deleted.push(volume.name);
+                report.candidates.push(volume.name);
             } else {
-                let deletion = self
-                    .checked(
-                        "volume_delete",
-                        &["volume".into(), "delete".into(), volume.name.clone()],
-                    )
-                    .await;
-                match deletion {
-                    Ok(_) => report.deleted.push(volume.name),
-                    Err(VmError::Command { message, .. }) if is_absent(&message) => {
-                        report.deleted.push(volume.name);
-                    }
-                    Err(VmError::Command { message, .. }) if is_mounted(&message) => {
-                        report.in_use.push(volume.name);
-                    }
-                    Err(error) => report.failed.push((volume.name, error.to_string())),
-                }
+                doomed.push(volume.name);
             }
         }
+        if dry_run {
+            return Ok(report);
+        }
+        let deleted = self.delete_volumes(&doomed).await?;
+        report.deleted = deleted.deleted;
+        report.in_use = deleted.in_use;
+        report.failed = deleted.failed;
         Ok(report)
     }
 
