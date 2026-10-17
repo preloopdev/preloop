@@ -148,6 +148,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Boot closes unbound attempts whose job left the queue** (#579): an attempt
+  with no runner or session binding outlived its job when the job left the queue
+  without settling it, as cancelled and starved jobs did. Nothing claimed or
+  reaped such an attempt, so it pinned its job's in-flight slot, and a job
+  parked outside the queue kept its run `in_progress` with nothing executing it.
+  Boot now closes these attempts: a parked job fails so its run can settle, a
+  concluded job closes its attempt with its own verdict (a `timed_out` job
+  keeps its persisted verdict), and an attempt whose job row is gone is closed
+  and its run settles once no job remains. A state read that fails, or a job a
+  peer moved since the boot read, leaves the attempt open for the next boot
+  instead of writing a guess.
+
 - **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
 
 - **Reusable workflows called as `uses: $/...` resolve** (#581): the runner

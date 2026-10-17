@@ -468,6 +468,42 @@ impl LiteBackend {
         })
     }
 
+    /// Unbound unsettled attempts whose job is gone or has left the queue: no
+    /// runner or session binding, and either no `jobs` row, or `queue_state =
+    /// 'none'` on a concluded job or a plain job. Expansion parents and
+    /// reusable callers also sit at `'none'` while their subtree runs, so their
+    /// kinds are excluded; `ready`, `blocked`, `held` and expansion states hold
+    /// unbound attempts legitimately and never match. Returns
+    /// `(request_id, run_id, job_id, agent_job_id)`.
+    pub(crate) async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
+        self.read(|tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT q.request_id, q.run_id, q.job_id, q.agent_job_id FROM job_requests q \
+                     LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                     WHERE q.result IS NULL AND q.runner_id IS NULL AND q.session_id IS NULL \
+                       AND (j.run_id IS NULL OR (j.queue_state = 'none' AND ( \
+                            j.status IN ('success','failure','cancelled','skipped','timed_out') \
+                            OR j.kind IN ('job','matrix_leg')))) \
+                     ORDER BY q.request_id",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        codec::run_id(&row.get::<_, String>(1)?),
+                        JobId(row.get(2)?),
+                        codec::uuid(&row.get::<_, String>(3)?),
+                    ))
+                })
+                .map_err(db)?;
+            rows.collect::<Result<_, _>>().map_err(db)
+        })
+    }
+
     /// Release a claimed attempt for redelivery: clear the session binding,
     /// owner, start stamp and timeout flag, and drop its lease (a lease
     /// needs an owner). `Ok(false)` when settled or unknown.
@@ -543,6 +579,71 @@ impl LiteBackend {
                 .map_err(db)?;
             stamp_result(tx, request_id, result, locked_until)?;
             Ok(Some(attempt))
+        })
+    }
+
+    /// Settle an attempt whose job row is gone and close its run in the same
+    /// transaction once no job remains. `summarize_run_row` keeps an empty run
+    /// queued by design, so the empty case is written as a failure; a run with
+    /// other live jobs keeps its open state. Returns whether the attempt
+    /// existed.
+    pub(crate) async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<bool, ControlError> {
+        self.write(|tx| {
+            let Some(run_id) = tx
+                .prepare_cached("SELECT run_id FROM job_requests WHERE request_id = ?1")
+                .map_err(db)?
+                .query_row([request_id], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(db)?
+                .map(|run| codec::run_id(&run))
+            else {
+                return Ok(false);
+            };
+            let was_completed: Option<bool> = tx
+                .prepare_cached("SELECT status = 'completed' FROM runs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([codec::run_key(run_id)], |row| row.get(0))
+                .optional()
+                .map_err(db)?;
+            super::dispatch::settle_request_tx(tx, request_id, result)?;
+            let Some(was_completed) = was_completed else {
+                return Ok(true);
+            };
+            let remaining: i64 = tx
+                .prepare_cached("SELECT COUNT(*) FROM jobs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([codec::run_key(run_id)], |row| row.get(0))
+                .map_err(db)?;
+            let status = if remaining == 0 {
+                let now = now_us();
+                tx.prepare_cached(
+                    "UPDATE runs SET status = 'completed', conclusion = 'failure', \
+                         started_at = COALESCE(started_at, ?2), \
+                         completed_at = COALESCE(completed_at, ?2) \
+                     WHERE run_id = ?1",
+                )
+                .map_err(db)?
+                .execute(params![codec::run_key(run_id), now])
+                .map_err(db)?;
+                ExecutionStatus::Failure
+            } else {
+                super::jobs::summarize_run_row(tx, run_id)?
+            };
+            if !was_completed && status.is_terminal() {
+                super::settle::release_concurrency_for_run(tx, self, run_id)?;
+                super::jobs::emit_outbox(
+                    tx,
+                    super::jobs::namespace_of(tx, run_id)?.as_str(),
+                    Some(run_id),
+                    "run.completed.v1",
+                    serde_json::json!({"status": crate::runtime_scheduling::status_string(status)}),
+                )?;
+            }
+            Ok(true)
         })
     }
 

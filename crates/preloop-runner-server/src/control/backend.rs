@@ -1031,6 +1031,17 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Boot reconcile input: `(request_id, run_id, job_id)`.
     async fn orphaned_claims(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError>;
 
+    /// Unsettled attempts nothing holds: no runner or session binding, and the
+    /// backing job is gone or has left the queue (`queue_state = 'none'`). A
+    /// terminal job never completes its attempt, and a plain job parked there
+    /// is never claimed again. Boot reconcile input:
+    /// `(request_id, run_id, job_id, agent_job_id)`. Live queue states
+    /// (`ready`, `blocked`, `held`, expansion) legitimately hold unbound
+    /// attempts and are never returned.
+    async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError>;
+
     /// Release a claimed request for redelivery (`release_request_for_retry`
     /// in SQL): clears the session binding, owner, start/renew stamps and
     /// timeout flag, and extends the lease. `Ok(false)` when the request is
@@ -1053,6 +1064,17 @@ pub(crate) trait ControlBackend: Send + Sync {
         result: ExecutionStatus,
         locked_until: &str,
     ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError>;
+
+    /// Settle an orphaned attempt whose job row is gone and close its run in
+    /// the same transaction once no job remains. `summarize_run_row` keeps an
+    /// empty run open (and the Postgres aggregate would call it a success), so
+    /// the empty case is written as `failure`; a run with other live jobs
+    /// keeps its open state. Returns whether the attempt existed.
+    async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<bool, ControlError>;
 
     /// `jobs` row (`queue_kind`, `status`) for one logical job; `None` when
     /// absent. Boot reconcile classifies orphaned claims with it.
@@ -2881,6 +2903,16 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.settle_request(request_id, result, locked_until).await,
         }
     }
+    async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.settle_attempt_and_close_run(request_id, result).await,
+            Self::Postgres(b) => b.settle_attempt_and_close_run(request_id, result).await,
+        }
+    }
     async fn job_queue_state(
         &self,
         run_id: RunId,
@@ -2905,6 +2937,14 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.orphaned_claims().await,
             Self::Postgres(b) => b.orphaned_claims().await,
+        }
+    }
+    async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.unbound_orphaned_requests().await,
+            Self::Postgres(b) => b.unbound_orphaned_requests().await,
         }
     }
     async fn release_claimed_request(

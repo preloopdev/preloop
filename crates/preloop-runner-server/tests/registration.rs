@@ -2182,6 +2182,311 @@ async fn liveness_sweep_fails_job_without_recovery_copy() {
     );
 }
 
+/// A second connection to the test store, as a restart would open it.
+fn raw_store(temp: &tempfile::TempDir) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(temp.path().join("preloop.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db
+}
+
+/// `(request_id, result)` and, when the job row exists, `(status, queue_state)`
+/// of every attempt, read from the store itself.
+fn attempt_rows(temp: &tempfile::TempDir) -> Vec<(i64, Option<String>, Option<(String, String)>)> {
+    let db = raw_store(temp);
+    let mut stmt = db
+        .prepare(
+            "SELECT q.request_id, q.result, j.status, j.queue_state FROM job_requests q \
+             LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
+             ORDER BY q.request_id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        let job = match (
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ) {
+            (Some(status), Some(queue)) => Some((status, queue)),
+            _ => None,
+        };
+        Ok((row.get(0)?, row.get(1)?, job))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// A job parked outside the ready queue keeps an unbound attempt that nothing
+/// will ever claim or reap. Boot closes that attempt, fails the job and settles
+/// its run. A job still waiting in the ready queue has the same unbound shape
+/// and is left alone.
+#[tokio::test]
+async fn boot_settles_unbound_attempt_of_job_parked_outside_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE jobs SET queue_state = 'none', status = 'in_progress'",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+    submit_simple_run(&app).await;
+    assert_eq!(
+        crate::broker::reconcile_orphaned_requests(&shared).await,
+        1,
+        "only the parked job's attempt is orphaned"
+    );
+    let rows = attempt_rows(&temp);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].1.as_deref(), Some("failure"));
+    assert_eq!(
+        rows[0].2,
+        Some(("failure".to_owned(), "none".to_owned())),
+        "the parked job must fail so its run can settle"
+    );
+    assert_eq!(rows[1].1, None, "a ready job's attempt stays open");
+    assert_eq!(
+        rows[1].2.as_ref().map(|(_, queue)| queue.as_str()),
+        Some("ready")
+    );
+    let completed: i64 = raw_store(&temp)
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE status = 'completed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(completed, 1, "only the parked job's run concludes");
+}
+
+/// An attempt whose job concluded without settling it stays open. Boot closes
+/// the attempt with the job's own verdict and leaves the job as it is.
+#[tokio::test]
+async fn boot_closes_attempt_of_concluded_job_with_its_verdict() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE jobs SET status = 'success', queue_state = 'none'",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    let rows = attempt_rows(&temp);
+    assert_eq!(rows[0].1.as_deref(), Some("success"));
+    assert_eq!(
+        rows[0].2,
+        Some(("success".to_owned(), "none".to_owned())),
+        "closing the attempt must not change the job"
+    );
+}
+
+/// A store written without foreign-key enforcement can keep an attempt after
+/// its job row is gone, because the cascade from `jobs` never runs. Boot closes
+/// that attempt and settles the run it leaves behind; there is no job left to
+/// fail.
+#[tokio::test]
+async fn boot_closes_attempt_whose_job_row_is_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs;")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    let rows = attempt_rows(&temp);
+    assert_eq!(rows[0].1.as_deref(), Some("failure"));
+    assert_eq!(rows[0].2, None);
+    assert_eq!(
+        run_state(&temp),
+        ("completed".to_owned(), Some("failure".to_owned())),
+        "a run whose last job row vanished must settle"
+    );
+}
+
+/// A run's `(status, conclusion)`, read from the store itself.
+fn run_state(temp: &tempfile::TempDir) -> (String, Option<String>) {
+    raw_store(temp)
+        .query_row("SELECT status, conclusion FROM runs", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+}
+
+/// A missing job row leaves its run open while another job can still run;
+/// boot closes the orphaned attempt and settles the run when its last job row
+/// disappears.
+#[tokio::test]
+async fn boot_settles_run_only_after_its_last_job_row_is_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    let _ = submit_yaml(
+        &app,
+        "on: push\njobs:\n  first:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n  second:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs WHERE job_id = 'first';")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    assert_ne!(
+        run_state(&temp).0,
+        "completed",
+        "the other job can still run"
+    );
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs WHERE job_id = 'second';")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    assert_eq!(
+        run_state(&temp),
+        ("completed".to_owned(), Some("failure".to_owned())),
+        "the run settles once no job remains"
+    );
+}
+
+/// A failed read of the job's state says nothing about the job. The attempt
+/// stays open for the next boot: the candidate query only matches open
+/// attempts, so closing it on a guess would hide it from every later pass.
+#[tokio::test]
+async fn boot_leaves_attempt_open_when_the_job_state_cannot_be_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute("UPDATE jobs SET queue_state = 'none'", [])
+                .unwrap();
+        })
+        .await;
+    // A BLOB status still matches the candidate query, but it cannot be read
+    // as text, so the job-state lookup fails.
+    raw_store(&temp)
+        .execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE jobs SET status = X'00';")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 0);
+    assert_eq!(open_attempt_count(&temp), 1, "the attempt must stay open");
+}
+
+/// A parked job whose completion cannot be written keeps its attempt open.
+/// Boot must not close the attempt and then fail to fail the job: nothing
+/// would select the run again.
+#[tokio::test]
+async fn boot_keeps_parked_attempt_open_when_the_job_cannot_be_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE jobs SET queue_state = 'none', status = 'in_progress'",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+    // The job row survives its run, so the completion has no run to settle.
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM runs;")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 0);
+    assert_eq!(open_attempt_count(&temp), 1, "the attempt must stay open");
+    let rows = attempt_rows(&temp);
+    assert_eq!(
+        rows[0].2,
+        Some(("in_progress".to_owned(), "none".to_owned())),
+        "the job row is untouched"
+    );
+}
+
+/// A timed-out job keeps its persisted verdict. Boot closes its attempt with
+/// the failure verdict, which is what the event stream reports for a timeout,
+/// and leaves the job row alone.
+#[tokio::test]
+async fn boot_closes_attempt_of_timed_out_job_without_rewriting_the_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE jobs SET status = 'timed_out', queue_state = 'none'",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    let rows = attempt_rows(&temp);
+    assert_eq!(rows[0].1.as_deref(), Some("failure"));
+    assert_eq!(
+        rows[0].2,
+        Some(("timed_out".to_owned(), "none".to_owned())),
+        "the job keeps its timed_out verdict"
+    );
+}
+
+/// Attempts that have no result yet, counted from the store itself.
+fn open_attempt_count(temp: &tempfile::TempDir) -> i64 {
+    raw_store(temp)
+        .query_row(
+            "SELECT COUNT(*) FROM job_requests WHERE result IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 #[tokio::test]
 async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
     let temp = tempfile::tempdir().unwrap();

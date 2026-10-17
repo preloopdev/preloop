@@ -1374,6 +1374,12 @@ pub(crate) struct SettleJob {
     /// `status` must be terminal (the handler rejects anything else).
     pub(crate) completion: preloop_gha_protocol::JobCompletion,
     pub(crate) settle: Option<AttemptSettle>,
+    /// Boot reconcile closing a job it found parked outside the queue: the
+    /// completion is refused unless the job is still a plain parked job with
+    /// no bound open attempt when the completion transaction takes the run.
+    /// A peer node sharing the store can move the job after the boot-visible
+    /// read, and only the locked transaction can tell.
+    pub(crate) require_parked: bool,
 }
 
 /// What `settle_job` did.
