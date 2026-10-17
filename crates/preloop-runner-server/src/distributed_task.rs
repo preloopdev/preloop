@@ -130,33 +130,6 @@ async fn render_session_message(
             .await
             .map_err(ApiError::from)?;
         let mut msg = ctx.message;
-        // The stored message is a secret-free template: resolve secrets back
-        // in from the SecretProvider, then fill the token slots — the AzDO
-        // path has no App-mint, so the PAT (or the job-scoped runtime token
-        // for fork-restricted tiers) is the credential. Never written back.
-        let filled = crate::message_template::fill_template(
-            &mut msg,
-            shared.state.secret_provider.as_ref(),
-            &ctx.repository,
-            ctx.request.run_id,
-        )
-        .map_err(|error| ApiError::internal(format!("failed to fill job message: {error}")))?;
-        // Merge every resolved scope value (env-tier secrets included) into
-        // the node masker entry seeded at submit: masking stays wider than
-        // the injected variable set so unreferenced values stay redacted.
-        if !filled.masked.is_empty() {
-            let plan_id = msg.plan.plan_id.clone();
-            let mut inner = shared.state.inner.lock().await;
-            let mut merged: Vec<String> = inner
-                .plan_secret_masker
-                .get(&plan_id)
-                .map(|v| (**v).clone())
-                .unwrap_or_default();
-            merged.extend(filled.masked.iter().cloned());
-            merged.sort();
-            merged.dedup();
-            inner.plan_secret_masker.insert(plan_id, Arc::new(merged));
-        }
         let tier = ctx.trust_tier.as_deref().and_then(|tier| {
             serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
         });
@@ -201,6 +174,37 @@ async fn render_session_message(
                     );
                 }
             }
+        }
+        // Fill after the PAT has been applied (above): the fill resolves
+        // `${{ secrets.GITHUB_TOKEN }}` and `${{ github.token }}` in reusable
+        // `secrets:` maps and job `env:` against the message as the claim leaves
+        // it, so both read the same token.
+        // The stored message is a secret-free template: resolve secrets back
+        // in from the SecretProvider, then fill the token slots — the AzDO
+        // path has no App-mint, so the PAT (or the job-scoped runtime token
+        // for fork-restricted tiers) is the credential. Never written back.
+        let filled = crate::message_template::fill_template(
+            &mut msg,
+            shared.state.secret_provider.as_ref(),
+            &ctx.repository,
+            ctx.request.run_id,
+        )
+        .map_err(|error| ApiError::internal(format!("failed to fill job message: {error}")))?;
+        // Merge every resolved scope value (env-tier secrets included) into
+        // the node masker entry seeded at submit: masking stays wider than
+        // the injected variable set so unreferenced values stay redacted.
+        if !filled.masked.is_empty() {
+            let plan_id = msg.plan.plan_id.clone();
+            let mut inner = shared.state.inner.lock().await;
+            let mut merged: Vec<String> = inner
+                .plan_secret_masker
+                .get(&plan_id)
+                .map(|v| (**v).clone())
+                .unwrap_or_default();
+            merged.extend(filled.masked.iter().cloned());
+            merged.sort();
+            merged.dedup();
+            inner.plan_secret_masker.insert(plan_id, Arc::new(merged));
         }
         // The pinned snapshot checkout token and the origin-rewrite header
         // are minted at submission and blanked in the stored template; this

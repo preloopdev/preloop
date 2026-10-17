@@ -132,6 +132,10 @@ pub(crate) fn strip_template(msg: &mut AgentJobRequestMessage, secret_hints: usi
 /// `None` spec = a fully-formed message stored before templates carried a
 /// spec: filled as-is (no secret slot exists to populate) and `spec` left
 /// `None`.
+///
+/// The claim must already have applied the minted token (see
+/// `broker::apply_minted_token_to_message`): `secrets:` maps and job `env:`
+/// that read `secrets.GITHUB_TOKEN` or `github.token` resolve here.
 pub(crate) fn fill_template(
     msg: &mut AgentJobRequestMessage,
     provider: &dyn SecretProvider,
@@ -191,32 +195,23 @@ pub(crate) fn fill_template(
         // back out of the stored `context_data` so `${{ vars.X }}`-style maps
         // keep working. This is the sanctioned resolution point;
         // `build_context` masks everywhere else.
-        let mut ctx = preloop_gha_expressions::Context::new();
-        for (key, value) in &msg.context_data {
-            ctx.insert(key.clone(), value.to_json());
-        }
-        ctx.insert(
-            "secrets",
-            serde_json::Value::Object(
-                scoped
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect(),
-            ),
-        );
+        let ctx = fill_expr_ctx(msg, &scoped);
         for (callee_name, expr) in &spec.map {
             let value = preloop_gha_parser::eval::resolve_string(expr, &ctx)
                 .unwrap_or_else(|_| expr.clone());
             resolved.insert(callee_name.clone(), value);
         }
     }
+    // The claim owns the GitHub token variables: a `secrets:` map entry or a
+    // stored secret of the same name must never replace the minted token.
+    resolved.retain(|name, _| !is_claim_owned_variable(name));
 
     // `env:` values referencing `secrets.*` ship as expression tokens: the
     // builder cannot resolve them (values are absent by design) and the
     // runner has no secrets context at run time, so the fill evaluates them
     // here and stamps the literal — the same resolution point as `spec.map`.
     if !resolved.is_empty() {
-        let ctx = env_expr_ctx(msg, &resolved);
+        let ctx = fill_expr_ctx(msg, &resolved);
         for entry in &mut msg.environment_variables {
             let Some(pair) = entry
                 .get_mut("map")
@@ -296,27 +291,44 @@ pub(crate) fn fill_template(
     })
 }
 
-/// Expression context for resolving `secrets.*` (and `github.*`/`vars.*`
-/// helpers) inside `environment_variables` tokens at fill time: stored
-/// `context_data` plus the freshly resolved real secret values.
-fn env_expr_ctx(
+/// Expression context for the `${{ }}` a fill resolves: the stored
+/// `context_data` (whose `github.token` the claim has already patched) and a
+/// `secrets` context holding the resolved values plus the claim's own
+/// `GITHUB_TOKEN`.
+fn fill_expr_ctx(
     msg: &AgentJobRequestMessage,
-    resolved: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
 ) -> preloop_gha_expressions::Context {
     let mut ctx = preloop_gha_expressions::Context::new();
     for (key, value) in &msg.context_data {
         ctx.insert(key.clone(), value.to_json());
     }
-    ctx.insert(
-        "secrets",
-        serde_json::Value::Object(
-            resolved
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect(),
-        ),
-    );
+    let mut values: serde_json::Map<String, serde_json::Value> = secrets
+        .iter()
+        .filter(|(name, _)| !is_claim_owned_variable(name))
+        .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    // `secrets.GITHUB_TOKEN` is the value the claim stamped into
+    // `github_token`: the same token `github.token` reads.
+    if let Some(token) = msg
+        .variables
+        .get("github_token")
+        .and_then(|variable| variable.value.as_deref())
+        .filter(|token| !token.is_empty())
+    {
+        values.insert(
+            "GITHUB_TOKEN".to_owned(),
+            serde_json::Value::String(token.to_owned()),
+        );
+    }
+    ctx.insert("secrets", serde_json::Value::Object(values));
     ctx
+}
+
+/// Variables the claim owns: the minted GitHub token. A stored secret or a
+/// `secrets:` map entry never replaces them.
+fn is_claim_owned_variable(name: &str) -> bool {
+    name.eq_ignore_ascii_case("github_token") || name.eq_ignore_ascii_case("system.github.token")
 }
 
 /// Evaluate one bare expression body (`secrets.X`, `format(...)`, …) as a
@@ -392,6 +404,69 @@ mod tests {
         assert_eq!(
             filled.values.get("TOKEN").map(String::as_str),
             Some("s3cr3t")
+        );
+    }
+
+    /// The claim stamps the minted token into `github_token` before the fill.
+    /// A `secrets:` map entry and a job `env:` literal that read
+    /// `secrets.GITHUB_TOKEN` must carry that token, and no stored secret of the
+    /// same name may replace the claim's variable.
+    #[test]
+    fn fill_reads_the_claim_minted_token_for_secrets_github_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        provider(dir.path())
+            .put_run(
+                run_id,
+                &BTreeMap::from([
+                    ("DEPLOY_KEY".to_owned(), SecretString::new("deploy-value")),
+                    ("github_token".to_owned(), SecretString::new("stored-value")),
+                ]),
+            )
+            .unwrap();
+        let mut message = template(&["DEPLOY_KEY", "github_token"]);
+        message.variables.insert(
+            "github_token".to_owned(),
+            VariableValue::secret("ghs_claim_minted"),
+        );
+        let spec = message.preloop_secret_spec.as_mut().expect("template spec");
+        spec.map.insert(
+            "MAPPED".to_owned(),
+            "${{ secrets.GITHUB_TOKEN }}".to_owned(),
+        );
+        message.environment_variables = vec![serde_json::json!({
+            "type": 2,
+            "map": [{
+                "Key": {"type": 0, "lit": "VIA_TOKEN"},
+                "Value": {"type": 3, "expr": "secrets.GITHUB_TOKEN"}
+            }]
+        })];
+
+        let filled = fill_template(&mut message, &provider(dir.path()), "o/r", run_id).unwrap();
+
+        assert_eq!(
+            message.variables["MAPPED"].value.as_deref(),
+            Some("ghs_claim_minted"),
+            "a `secrets:` map reading `secrets.GITHUB_TOKEN` gets the claim's token"
+        );
+        assert_eq!(
+            message.environment_variables[0]["map"][0]["Value"],
+            serde_json::json!({"type": 0, "lit": "ghs_claim_minted"}),
+            "a job env reading `secrets.GITHUB_TOKEN` is stamped with the claim's token"
+        );
+        assert_eq!(
+            message.variables["github_token"].value.as_deref(),
+            Some("ghs_claim_minted"),
+            "a stored secret must never replace the claim's `github_token`"
+        );
+        assert!(
+            filled.names.iter().all(|name| name != "github_token"),
+            "the claim-owned variable is not a filled name: {:?}",
+            filled.names
+        );
+        assert_eq!(
+            filled.values.get("DEPLOY_KEY").map(String::as_str),
+            Some("deploy-value")
         );
     }
 }
