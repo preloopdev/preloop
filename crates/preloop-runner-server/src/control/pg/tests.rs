@@ -18,7 +18,10 @@ use crate::control::backend::{
 use crate::control::types::{
     ControlError, PollOutcome, SessionProtocol, StepPatch, SubmitJob, SubmitRun,
 };
-use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
+use crate::models::{
+    QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord, WebhookDeliveryRecord,
+    WebhookDeliveryStatus,
+};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -566,6 +569,202 @@ async fn commits_wake_waiters_on_another_node() {
     assert!(
         wake.ready >= 1,
         "the hint must ask for at least one waiter, got {wake:?}"
+    );
+}
+
+/// Longest a webhook hint may take from an enqueue to another node's worker.
+/// The worker's own tick is five seconds, so a hint that lands later than this
+/// is not a wake.
+const WAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A new webhook delivery for the wake tests.
+fn webhook_record(delivery_id: &str) -> WebhookDeliveryRecord {
+    WebhookDeliveryRecord {
+        delivery_id: delivery_id.to_owned(),
+        event: "push".to_owned(),
+        payload: br#"{"installation":{"id":9},"ref":"refs/heads/main"}"#.to_vec(),
+        received_at_us: 1,
+        state: WebhookDeliveryStatus::Received,
+        attempts: 0,
+        lease_until_us: None,
+        lease_token: None,
+        last_error: None,
+    }
+}
+
+/// Let in-flight hints land, then discard them.
+async fn drain_hints(hints: &mut tokio::sync::broadcast::Receiver<String>) {
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    while hints.try_recv().is_ok() {}
+}
+
+/// Probe enqueues through `writer` until `hints`, a subscription on another
+/// node, sees one. That node's LISTEN registers asynchronously with `connect`,
+/// so early hints can be lost. The caller then starts from an empty
+/// subscription.
+async fn await_webhook_listener(
+    writer: &PgBackend,
+    hints: &mut tokio::sync::broadcast::Receiver<String>,
+) {
+    for _ in 0..50 {
+        let probe = webhook_record(&format!("probe-{}", uuid::Uuid::new_v4()));
+        assert!(writer.enqueue_webhook_delivery(&probe).await.unwrap());
+        let heard = tokio::time::timeout(PROBE_WAIT, hints.recv()).await;
+        if let Ok(Ok(_)) = heard {
+            drain_hints(hints).await;
+            return;
+        }
+    }
+    panic!("the webhook wake listener never registered");
+}
+
+/// An enqueue on one node wakes the webhook worker of another well inside its
+/// five-second tick, and the hint names the node that wrote the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enqueued_webhook_delivery_wakes_other_nodes() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("wake"))
+        .await
+        .unwrap();
+    assert!(written);
+    let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+        .await
+        .expect("node B must hear the enqueue well before its five-second tick")
+        .expect("the hint channel stays open");
+    assert_eq!(origin, node_a.origin(), "the hint names the writing node");
+}
+
+/// A burst of enqueues shares notifications: node B hears at least one, and far
+/// fewer than the 64 rows written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_of_webhook_enqueues_shares_notifications() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+
+    let records: Vec<WebhookDeliveryRecord> = (0..64)
+        .map(|i| webhook_record(&format!("burst-{i}")))
+        .collect();
+    let written = futures::future::join_all(
+        records
+            .iter()
+            .map(|record| node_a.enqueue_webhook_delivery(record)),
+    )
+    .await;
+    assert!(
+        written.iter().all(|result| matches!(result, Ok(true))),
+        "every burst row is new: {written:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut sent = 0;
+    while hints.try_recv().is_ok() {
+        sent += 1;
+    }
+    assert!(sent >= 1, "the burst must wake node B");
+    assert!(
+        sent <= 16,
+        "64 enqueues sent {sent} hints; the notifier must coalesce them"
+    );
+}
+
+/// A node's own enqueue echoes back on its own subscription carrying its own
+/// origin, which is what lets the forwarder drop the echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_webhook_enqueue_echoes_with_the_writers_origin() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut own = node_a.subscribe_webhook_wakes();
+    let mut other = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut other).await;
+    await_webhook_listener(&node_b, &mut own).await;
+    drain_hints(&mut other).await;
+
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("echo"))
+        .await
+        .unwrap();
+    assert!(written);
+    for hints in [&mut own, &mut other] {
+        let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+            .await
+            .expect("both nodes hear the enqueue")
+            .expect("the hint channel stays open");
+        assert_eq!(
+            origin,
+            node_a.origin(),
+            "the echo carries the writer's origin"
+        );
+    }
+}
+
+/// A hint is only a hint: with no subscriber on any node the enqueue still
+/// commits, and polling finds the delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_enqueue_is_claimable_without_any_subscriber() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("unhinted"))
+        .await
+        .unwrap();
+    assert!(written);
+    let claimed = node_b.claim_webhook_deliveries(10, 60).await.unwrap();
+    assert!(
+        claimed
+            .iter()
+            .any(|delivery| delivery.delivery_id == "unhinted"),
+        "polling must find the row even though no node took its hint"
+    );
+}
+
+/// Requeueing a finished delivery (the operator replay) wakes the other nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeued_webhook_delivery_wakes_other_nodes() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    assert!(
+        node_a
+            .enqueue_webhook_delivery(&webhook_record("replay"))
+            .await
+            .unwrap()
+    );
+    let claimed = node_a.claim_webhook_deliveries(1_000, 60).await.unwrap();
+    let token = claimed
+        .iter()
+        .find(|delivery| delivery.delivery_id == "replay")
+        .and_then(|delivery| delivery.lease_token.clone())
+        .expect("the replayed row is claimable");
+    assert!(
+        node_a
+            .complete_webhook_delivery("replay", &token)
+            .await
+            .unwrap()
+    );
+
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+    assert!(node_a.requeue_webhook_delivery("replay").await.unwrap());
+    let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+        .await
+        .expect("the requeue must wake node B well before its tick")
+        .expect("the hint channel stays open");
+    assert_eq!(
+        origin,
+        node_a.origin(),
+        "the requeue's hint names the writing node"
     );
 }
 

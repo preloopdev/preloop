@@ -1869,6 +1869,19 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::github::run_webhook_queue_worker(webhook_worker_shared, webhook_worker_handle).await;
     });
+    // Hints from the other nodes: a delivery they make claimable wakes this
+    // worker now, not at its next tick. This node's own echo is dropped, since
+    // the handler that wrote the row already woke the worker.
+    if let (Some(hints), Some(origin)) = (
+        shared.state.backend.subscribe_webhook_wakes(),
+        shared.state.backend.event_origin(),
+    ) {
+        tokio::spawn(crate::control::wake::forward_webhook_wakes(
+            hints,
+            origin.to_owned(),
+            shared.state.webhook_queue_notify.clone(),
+        ));
+    }
 
     // Repair layers. None of them is on the request path, and each is
     // independently disable-able, so they are best-effort tasks rather than

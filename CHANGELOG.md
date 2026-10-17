@@ -35,6 +35,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
+  replayed on one node waited for the other nodes' five-second queue poll before
+  it was claimed. The committing node now sends one coalesced `preloop_webhooks`
+  notification after its commit, and each peer's worker wakes on it.
 - **A GitHub App's private key survives an OS keychain failure.** With
   `credential_store = "os"`, an unavailable keychain or a refused write now
   stores the credential in the file store, prints a warning naming the

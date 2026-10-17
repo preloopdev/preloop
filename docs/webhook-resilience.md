@@ -12,6 +12,13 @@ The durable boundary: the raw delivery is committed to `webhook_deliveries`
 payload", not "we received some bytes". Everything after that is preloop's
 problem, and everything below is how it gets fixed.
 
+Workers are woken, not only polled. A delivery that one node makes claimable (an
+enqueue, or an operator replay) wakes that node's worker at once. On Postgres the
+node also sends one `preloop_webhooks` notification after the commit, coalesced
+over 15 ms, so every other node's worker wakes too. A lost notification costs only
+latency: each worker re-reads the queue at least every five seconds. SQLite is
+single-node and wakes only its own worker.
+
 ## Failure modes and what handles them
 
 | # | Failure | Symptom | Handled by |
