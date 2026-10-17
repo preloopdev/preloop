@@ -767,10 +767,6 @@ criteria = "safe-to-deploy"
 version = "0.2.190"
 criteria = "safe-to-deploy"
 
-[[exemptions.listenfd]]
-version = "1.0.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.libm]]
 version = "0.2.16"
 criteria = "safe-to-deploy"
@@ -789,6 +785,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.linux-raw-sys]]
 version = "0.12.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.listenfd]]
+version = "1.0.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.litemap]]
@@ -2088,7 +2088,7 @@ version = "0.11.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.zip]]
-version = "8.6.0"
+version = "9.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zlib-rs]]
