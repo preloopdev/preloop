@@ -582,6 +582,71 @@ impl LiteBackend {
         })
     }
 
+    /// Settle an attempt whose job row is gone and close its run in the same
+    /// transaction once no job remains. `summarize_run_row` keeps an empty run
+    /// queued by design, so the empty case is written as a failure; a run with
+    /// other live jobs keeps its open state. Returns whether the attempt
+    /// existed.
+    pub(crate) async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<bool, ControlError> {
+        self.write(|tx| {
+            let Some(run_id) = tx
+                .prepare_cached("SELECT run_id FROM job_requests WHERE request_id = ?1")
+                .map_err(db)?
+                .query_row([request_id], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(db)?
+                .map(|run| codec::run_id(&run))
+            else {
+                return Ok(false);
+            };
+            let was_completed: Option<bool> = tx
+                .prepare_cached("SELECT status = 'completed' FROM runs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([codec::run_key(run_id)], |row| row.get(0))
+                .optional()
+                .map_err(db)?;
+            super::dispatch::settle_request_tx(tx, request_id, result)?;
+            let Some(was_completed) = was_completed else {
+                return Ok(true);
+            };
+            let remaining: i64 = tx
+                .prepare_cached("SELECT COUNT(*) FROM jobs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([codec::run_key(run_id)], |row| row.get(0))
+                .map_err(db)?;
+            let status = if remaining == 0 {
+                let now = now_us();
+                tx.prepare_cached(
+                    "UPDATE runs SET status = 'completed', conclusion = 'failure', \
+                         started_at = COALESCE(started_at, ?2), \
+                         completed_at = COALESCE(completed_at, ?2) \
+                     WHERE run_id = ?1",
+                )
+                .map_err(db)?
+                .execute(params![codec::run_key(run_id), now])
+                .map_err(db)?;
+                ExecutionStatus::Failure
+            } else {
+                super::jobs::summarize_run_row(tx, run_id)?
+            };
+            if !was_completed && status.is_terminal() {
+                super::settle::release_concurrency_for_run(tx, self, run_id)?;
+                super::jobs::emit_outbox(
+                    tx,
+                    super::jobs::namespace_of(tx, run_id)?.as_str(),
+                    Some(run_id),
+                    "run.completed.v1",
+                    serde_json::json!({"status": crate::runtime_scheduling::status_string(status)}),
+                )?;
+            }
+            Ok(true)
+        })
+    }
+
     /// Renew an in-flight AgentRequest's lease; `false` when settled,
     /// unknown, or holder-less (the PATCH contract renews nothing silently).
     /// The holder ladder is the recorded owner, else the claiming session's

@@ -6537,6 +6537,89 @@ impl PgBackend {
         Ok(parked)
     }
 
+    /// Settle an attempt whose job row is gone and close its run in the same
+    /// run-locked transaction once no job remains. The empty-graph aggregate
+    /// would call the run a success, so it is written as a failure here; a run
+    /// with other live jobs keeps its open state. Returns whether the attempt
+    /// existed.
+    pub(super) async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<bool, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let Some(row) = tx
+            .query_opt(
+                "SELECT run_id::text FROM job_requests WHERE request_id=$1 FOR NO KEY UPDATE",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?
+        else {
+            return Ok(false);
+        };
+        let run_id = codec::run_id(row.get(0))?;
+        let run = run_id.0.to_string();
+        let run_exists = PgBackend::lock_run(&tx, run_id).await?;
+        settle_request_tx(&tx, request_id, result).await?;
+        if run_exists {
+            let was_completed: bool = tx
+                .query_one(
+                    "SELECT status = 'completed' FROM runs WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            let remaining: i64 = tx
+                .query_one(
+                    "SELECT count(*) FROM jobs WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            if remaining == 0 {
+                tx.execute(
+                    "UPDATE runs SET status='completed', conclusion='failure', \
+                     started_at=COALESCE(started_at, now()), \
+                     completed_at=COALESCE(completed_at, now()) \
+                     WHERE run_id=$1::text::uuid",
+                    &[&run],
+                )
+                .await
+                .map_err(db)?;
+            } else {
+                summarize_run_tx(&tx, run_id).await?;
+            }
+            let (status, conclusion): (String, Option<String>) = {
+                let row = tx
+                    .query_one(
+                        "SELECT status, conclusion FROM runs WHERE run_id=$1::text::uuid",
+                        &[&run],
+                    )
+                    .await
+                    .map_err(db)?;
+                (row.get(0), row.get(1))
+            };
+            if !was_completed && status == "completed" {
+                release_concurrency_for_run(self, &tx, run_id).await?;
+                emit_outbox(
+                    &tx,
+                    Some(run_id),
+                    "run.completed.v1",
+                    serde_json::json!({
+                        "conclusion": conclusion.unwrap_or_else(|| "failure".to_owned())
+                    }),
+                )
+                .await?;
+            }
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
     /// `settle_job`: the broker-shaped completion (attempt ownership checked
     /// against the reporting runner) returning the settled projection.
     pub(super) async fn settle_job(

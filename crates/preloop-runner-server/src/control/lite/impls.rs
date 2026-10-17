@@ -678,6 +678,13 @@ impl ControlBackend for LiteBackend {
     ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
         self.settle_request(request_id, result, locked_until).await
     }
+    async fn settle_attempt_and_close_run(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+    ) -> Result<bool, ControlError> {
+        self.settle_attempt_and_close_run(request_id, result).await
+    }
     async fn job_queue_state(
         &self,
         run_id: RunId,

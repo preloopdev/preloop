@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 /// undelivered cancellations (queued rows and the session's moot
 /// `JobCancellation` message), clear the session binding, stamp the result
 /// and the final lease expiry.
-fn settle_request_tx(
+pub(super) fn settle_request_tx(
     tx: &Transaction<'_>,
     request_id: i64,
     result: ExecutionStatus,

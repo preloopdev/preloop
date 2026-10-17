@@ -2302,7 +2302,8 @@ async fn boot_closes_attempt_of_concluded_job_with_its_verdict() {
 
 /// A store written without foreign-key enforcement can keep an attempt after
 /// its job row is gone, because the cascade from `jobs` never runs. Boot closes
-/// that attempt; there is no job left to fail.
+/// that attempt and settles the run it leaves behind; there is no job left to
+/// fail.
 #[tokio::test]
 async fn boot_closes_attempt_whose_job_row_is_gone() {
     let temp = tempfile::tempdir().unwrap();
@@ -2321,6 +2322,59 @@ async fn boot_closes_attempt_whose_job_row_is_gone() {
     let rows = attempt_rows(&temp);
     assert_eq!(rows[0].1.as_deref(), Some("failure"));
     assert_eq!(rows[0].2, None);
+    assert_eq!(
+        run_state(&temp),
+        ("completed".to_owned(), Some("failure".to_owned())),
+        "a run whose last job row vanished must settle"
+    );
+}
+
+/// A run's `(status, conclusion)`, read from the store itself.
+fn run_state(temp: &tempfile::TempDir) -> (String, Option<String>) {
+    raw_store(temp)
+        .query_row("SELECT status, conclusion FROM runs", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+}
+
+/// A missing job row leaves its run open while another job can still run;
+/// boot closes the orphaned attempt and settles the run when its last job row
+/// disappears.
+#[tokio::test]
+async fn boot_settles_run_only_after_its_last_job_row_is_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    let _ = submit_yaml(
+        &app,
+        "on: push\njobs:\n  first:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n  second:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs WHERE job_id = 'first';")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    assert_ne!(
+        run_state(&temp).0,
+        "completed",
+        "the other job can still run"
+    );
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs WHERE job_id = 'second';")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    assert_eq!(
+        run_state(&temp),
+        ("completed".to_owned(), Some("failure".to_owned())),
+        "the run settles once no job remains"
+    );
 }
 
 /// A failed read of the job's state says nothing about the job. The attempt

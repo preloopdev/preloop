@@ -1495,9 +1495,15 @@ async fn close_orphaned_request(
     agent_job_id: uuid::Uuid,
 ) -> Result<bool, ControlError> {
     let Some((_, status)) = shared.state.backend.job_queue_state(run_id, job_id).await? else {
-        // The job row is gone: close the attempt. Nothing else in the run
-        // depends on a row that no longer exists.
-        return settle_orphan(shared, request_id, ExecutionStatus::Failure).await;
+        // The job row is gone: close the attempt and, when nothing else is
+        // left to run, its run — one transaction, so a partial write cannot
+        // leave the run open with no attempt for a later boot to select.
+        let attempt = shared
+            .state
+            .backend
+            .settle_attempt_and_close_run(request_id, ExecutionStatus::Failure)
+            .await?;
+        return Ok(attempt);
     };
     if let Some(verdict) = concluded_verdict(&status) {
         // The job already holds a verdict; the attempt takes the same one.
