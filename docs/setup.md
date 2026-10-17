@@ -241,26 +241,53 @@ Run this command:
 preloop setup github --via app
 ```
 
-The command binds a single-use listener on loopback, opens it in your
-browser, and uses it as the manifest's redirect target. You click **Create on
-GitHub**; GitHub redirects back with a one-time code, and the CLI converts it
-into the App id, private key, and webhook secret and stores the secrets in the
-credential store (private `0600` files under `$PRELOOP_HOME/credentials` by
-default). The config file retains only non-secret
-credential references (and remains mode 0600). The browser then lands on the
-installation page, pick the repositories you run, and the CLI reports the
-installation id and exits.
+The command creates the App through GitHub's manifest flow and stores what
+comes back: the App id, private key, and webhook secret go into the credential
+store (private `0600` files under `$PRELOOP_HOME/credentials` by default), and
+the config file keeps only non-secret references, mode 0600. Which page hosts
+the App-creation form, and where GitHub's redirect lands, depends on where you
+run the command:
 
-The private key never leaves the machine: the redirect target is
-`127.0.0.1`, not a hosted page.
+- **A public URL is set** (`--public-url` or `PRELOOP_PUBLIC_URL`). The running
+  engine hosts the form. The CLI asks the engine for a setup session and prints
+  a one-time link, `{public-url}/setup/github?t=…`. Open it in a browser that
+  can reach the engine; it works once and expires in ten minutes. GitHub then
+  redirects back to the engine, which converts the code and stores the
+  credentials itself. The CLI prints the result. Restart the engine
+  (`preloop serve`) to load them. The engine must be running, and the CLI
+  reaches it at `PRELOOP_URL` (default `http://127.0.0.1:9090`) with the system
+  token.
+- **You are on an SSH session** and no public URL is set. The command listens on
+  `127.0.0.1:8765` on the server (`--port` changes it) and prints the command to
+  run in a second terminal on your laptop:
+
+  ```sh
+  ssh -L 8765:127.0.0.1:8765 alice@build-box
+  ```
+
+  Use the name you normally connect with if it differs, for example an
+  `~/.ssh/config` alias. Keep that terminal open, then open
+  `http://127.0.0.1:8765` in your laptop's browser. The forward carries both
+  trips: the form page and GitHub's redirect back. The private key stays on the
+  server.
+
+  `$BROWSER` is tried first when the command opens a page. VS Code and Cursor
+  set it in remote terminals to a helper that opens the URL on your laptop and
+  forwards the port, so there is nothing to type.
+- **Otherwise**, the command binds a single-use listener on loopback on a free
+  port (`--port` pins it), opens it in your browser, and uses it as the redirect
+  target. Nothing leaves the machine.
 
 | Flag | Effect |
 |---|---|
 | `--org NAME` | Create the App under an organization instead of your account. |
-| `--public-url URL` | Also enable webhook delivery to that URL. Omitted, the App is created with webhooks off since GitHub cannot reach `localhost`. |
+| `--public-url URL` | Selects the engine-hosted setup above, and enables webhook delivery to that URL. GitHub validates the webhook URL when it creates the App, so use an address GitHub can reach; a tailnet-only address makes App creation fail. |
 | `--app-name NAME` | App name (GitHub requires global uniqueness). Default `preloop-local`. |
-| `--port N` | Pin the loopback port instead of taking a free one. |
-| `--no-browser` | Print the URL instead of opening a browser (headless/SSH). |
+| `--port N` | Listener port for the loopback and SSH flows. Default: a free port locally, `8765` over SSH. |
+| `--no-browser` | Print the URL instead of opening a browser. |
+
+`PRELOOP_PUBLIC_URL` is read only when `--public-url` is not given. Set it for
+`preloop serve` and the same value selects the engine-hosted setup here.
 
 #### What "webhooks off" means
 

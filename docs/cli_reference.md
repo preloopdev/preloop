@@ -322,13 +322,13 @@ Configure GitHub credentials.
 | Flag | Description |
 |---|---|
 | `--via <app\|pat>` | Credential type. `app` (recommended) or `pat` (fine-grained PAT, for orgs that gate App installations) |
-| *(no App flags)* | With `--via app` and no `--app-id`/`--pem-file`, creates the App through GitHub's manifest flow in your browser and stores everything |
+| *(no App flags)* | With `--via app` and no `--app-id`/`--pem-file`, creates the App through GitHub's manifest flow and stores everything. With a public URL the running engine hosts the form and stores the credentials; over SSH the listener is reached through a port forward; otherwise it is a local listener. See [setup](setup.md#option-a--github-app) |
 | `--app-id <ID>` | GitHub App ID (with `--via app`) |
 | `--pem-file <PATH>` | Path to the GitHub App private key PEM (with `--via app`) |
 | `--org <NAME>` | Create the App under an organization instead of your account |
-| `--public-url <URL>` | Enable webhook delivery to this URL. On an already-configured App, updates its webhook instead of creating a second App |
+| `--public-url <URL>` | Selects engine-hosted App setup (the running engine serves the form and receives GitHub's redirect), and enables webhook delivery to this URL. Falls back to `PRELOOP_PUBLIC_URL`. On an already-configured App, updates its webhook instead of creating a second App |
 | `--app-name <NAME>` | Name of the created App (default `preloop-local`; GitHub requires global uniqueness) |
-| `--port <N>` | Pin the loopback port GitHub redirects back to (default: a free port) |
+| `--port <N>` | Listener port for the local and SSH flows (default: a free port locally, `8765` over SSH, so the `ssh -L` forward has a known port) |
 | `--no-browser` | Print the URL instead of opening a browser |
 | `--webhook-secret <SECRET>` | Store a webhook secret you created yourself (the App flow gets one from GitHub automatically) |
 | `--token <TOKEN>` | PAT to store (with `--via pat`). Falls back to `PRELOOP_GITHUB_PAT`, then an interactive prompt |

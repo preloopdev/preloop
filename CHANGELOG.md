@@ -10,6 +10,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
+  `PRELOOP_PUBLIC_URL`), `preloop setup github --via app` asks the running
+  engine to host the App-creation form. The CLI prints a single-use setup link
+  that expires in ten minutes. The engine serves the form at `/setup/github`,
+  converts GitHub's code at `/setup/github/callback`, and stores the credentials
+  the same way the CLI does, so the browser never needs a route back to a
+  laptop. The routes answer 404 unless a setup is in progress. New endpoints:
+  `POST /api/v1/github/setup-sessions` and
+  `GET /api/v1/github/setup-sessions/{id}`, both with the system token.
+
+- **App setup over SSH.** Without a public URL, an SSH session binds the
+  loopback listener on port 8765 (or `--port`) and prints the `ssh -L` command
+  to run on your laptop, then the address to open. The redirect path is the
+  same as the local flow.
+
 - **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
   the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
   release digest and GitHub artifact attestation. Pin a release with
@@ -32,6 +47,11 @@ Releases before v0.27.0 predate the changelog.
   either is an error that names the valid choices. Credentials an earlier build
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
+
+- **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
+  `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
+  setup page on your laptop and forward its port. The platform opener remains
+  the fallback.
 
 ### Fixed
 

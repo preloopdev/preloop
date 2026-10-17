@@ -190,6 +190,10 @@ pub struct RunResponse {
         cancel_actions_run,
         github_register,
         github_callback,
+        github_setup_session_open,
+        github_setup_session_poll,
+        github_setup_form,
+        github_setup_callback,
         list_runners,
         readyz,
         status,
@@ -985,6 +989,67 @@ fn github_register() {}
     )
 )]
 fn github_callback() {}
+
+/// Open an engine-hosted GitHub App setup session (`preloop setup github
+/// --via app` with a public URL). Returns the session handle and the one-time
+/// setup link, which works once and expires ten minutes after it is opened.
+#[utoipa::path(
+    post, path = "/api/v1/github/setup-sessions", tag = "GitHub",
+    request_body = JsonValue,
+    responses(
+        (status = 201, description = "Session opened; `setup_url` carries the one-time link"),
+        (status = 400, description = "public_url, org, or app_name is invalid"),
+        (status = 401, description = "Missing or invalid system token")
+    ),
+    security(("native_bearer" = []))
+)]
+fn github_setup_session_open() {}
+
+/// Status of an engine-hosted App setup session: `awaiting_link`,
+/// `awaiting_approval`, `converting`, `completed`, `failed`, or `expired`.
+#[utoipa::path(
+    get, path = "/api/v1/github/setup-sessions/{session_id}", tag = "GitHub",
+    params(("session_id" = String, Path, description = "Session handle from the open response")),
+    responses(
+        (status = 200, description = "Session status; carries no key material"),
+        (status = 401, description = "Missing or invalid system token"),
+        (status = 404, description = "No such session; it was replaced or the engine restarted")
+    ),
+    security(("native_bearer" = []))
+)]
+fn github_setup_session_poll() {}
+
+/// Engine-hosted App setup: the App-creation form (browser-facing). Serves
+/// the form once for a live setup link; 404 otherwise.
+#[utoipa::path(
+    get, path = "/setup/github", tag = "GitHub",
+    params(("t" = String, Query, description = "One-time setup token")),
+    responses(
+        (status = 200, content_type = "text/html", description = "App-creation form that submits itself to GitHub", body = String),
+        (status = 404, description = "No live setup link matches the token"),
+        (status = 429, description = "Too many setup requests")
+    )
+)]
+fn github_setup_form() {}
+
+/// Engine-hosted App setup: GitHub's redirect (browser-facing). Converts the
+/// one-time code and stores the App's credentials on the engine.
+#[utoipa::path(
+    get, path = "/setup/github/callback", tag = "GitHub",
+    params(
+        ("code" = String, Query, description = "GitHub manifest conversion code"),
+        ("state" = String, Query, description = "State nonce from the form")
+    ),
+    responses(
+        (status = 200, content_type = "text/html", description = "Setup complete", body = String),
+        (status = 400, description = "State or code did not match the setup in progress"),
+        (status = 404, description = "No setup is awaiting this redirect"),
+        (status = 429, description = "Too many setup requests"),
+        (status = 500, description = "The App was created but its credentials could not be stored"),
+        (status = 502, description = "GitHub did not return the App credentials")
+    )
+)]
+fn github_setup_callback() {}
 
 /// Registered runners (read-only; used by the CLI to detect a dead pool).
 #[utoipa::path(

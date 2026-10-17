@@ -12,8 +12,7 @@ use preloop_runner_server::config::{
     ConfigFile, config_path, load_config, store_memory, write_config,
 };
 use preloop_runner_server::credential_store::{
-    CredentialRef, CredentialWriter, SecretString, Written, github_reference,
-    github_reference_with_host,
+    CredentialRef, CredentialWriter, github_reference_with_host,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -377,13 +376,10 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     doctor_app(&app_id, &pem, &args.repos).await
 }
 
-/// Persist App credentials to the engine's config file and credential store.
-///
-/// Supports both the primary legacy App and additional Apps in `github.apps`:
-/// - If `app_id` matches `config.github.app_id`, updates the legacy fields in place.
-/// - If `app_id` matches an existing entry in `config.github.apps`, updates that entry in place.
-/// - If `config.github.app_id` is empty and `config.github.apps` is empty, writes to the legacy fields.
-/// - If `config.github.app_id` is set to a different App, appends a new `AppConfig` to `config.github.apps`.
+/// Persist App credentials to the CLI's config file and credential store, and
+/// print the notices the write produced. Supports both the primary legacy App
+/// and additional Apps in `github.apps`; see
+/// [`preloop_runner_server::github_app_setup::save_app_credentials_at`].
 ///
 /// The webhook secret only exists on the manifest path — GitHub generates it
 /// during creation — so it is written when present and left untouched
@@ -393,122 +389,135 @@ fn save_app_credentials(
     pem: &str,
     webhook_secret: Option<String>,
 ) -> anyhow::Result<PathBuf> {
-    let mut config = load_config()?;
-    let mut writer =
-        CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
-    record_app_credentials(&mut config, &mut writer, app_id, pem, webhook_secret)?;
-    write_config(&config)
+    let path = config_path();
+    let notices = preloop_runner_server::github_app_setup::save_app_credentials_at(
+        &path,
+        app_id,
+        pem,
+        webhook_secret,
+    )?;
+    for notice in notices {
+        println!("{notice}");
+    }
+    Ok(path)
 }
 
-/// Record one App's credentials in `config`. The secrets go through `writer`,
-/// and `config` keeps only their references. Kept apart from
-/// [`save_app_credentials`] so the fallback path can be tested without the real
-/// home directory or keychain.
-fn record_app_credentials(
-    config: &mut ConfigFile,
-    writer: &mut CredentialWriter,
-    app_id: &str,
-    pem: &str,
-    webhook_secret: Option<String>,
-) -> anyhow::Result<()> {
-    let host = config.github.server_url.clone();
-    let host = host.as_deref();
-    if config.github.mint_failure.is_none() {
-        config.github.mint_failure = Some("local".into());
-    }
-
-    let pem_ref = github_reference_with_host("app-pem", host, Some(app_id))?;
-    persist_secret(writer, config, &pem_ref, pem)?;
-    let webhook_ref = match &webhook_secret {
-        Some(secret) => {
-            let reference = github_reference_with_host("webhook", host, Some(app_id))?;
-            persist_secret(writer, config, &reference, secret)?;
-            Some(reference.as_str().to_owned())
-        }
-        None => None,
-    };
-    let pem_ref = pem_ref.as_str().to_owned();
-
-    if let Some(existing_primary) = &config.github.app_id
-        && existing_primary == app_id
-    {
-        config.github.legacy_app_pem = None;
-        config.github.app_pem_ref = Some(pem_ref);
-        if webhook_ref.is_some() {
-            config.github.legacy_webhook_secret = None;
-            config.github.webhook_secret_ref = webhook_ref;
-        }
-        return Ok(());
-    }
-    if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
-        existing.legacy_pem.clear();
-        existing.pem_ref = Some(pem_ref);
-        if webhook_ref.is_some() {
-            existing.legacy_webhook_secret = None;
-            existing.webhook_secret_ref = webhook_ref;
-        }
-        return Ok(());
-    }
-    if config.github.app_id.is_none() && config.github.apps.is_empty() {
-        config.github.app_id = Some(app_id.to_owned());
-        config.github.legacy_app_pem = None;
-        config.github.app_pem_ref = Some(pem_ref);
-        // An App id now exists, so a secret parked inline by `--webhook-secret`
-        // can finally be namespaced and moved.
-        if webhook_ref.is_some() {
-            config.github.legacy_webhook_secret = None;
-            config.github.webhook_secret_ref = webhook_ref;
-        } else if let Some(secret) = config.github.legacy_webhook_secret.take() {
-            let reference = github_reference("webhook", Some(app_id))?;
-            persist_secret(writer, config, &reference, &secret)?;
-            config.github.webhook_secret_ref = Some(reference.as_str().to_owned());
-        }
-        return Ok(());
-    }
-    config
-        .github
-        .apps
-        .push(preloop_runner_server::config::AppConfig {
-            app_id: app_id.to_owned(),
-            pem_ref: Some(pem_ref),
-            webhook_secret_ref: webhook_ref,
-            ..Default::default()
-        });
-    Ok(())
-}
-
-/// Write one credential through `writer`. When the OS store could not hold it,
-/// the private file store did: say where it went, and record
-/// `credential_store = "file"` in `config` so the next start reads the same
-/// place.
+/// Write one credential through `writer`, printing the notice when the OS
+/// store could not hold it and the private file store did.
 fn persist_secret(
     writer: &mut CredentialWriter,
     config: &mut ConfigFile,
     reference: &CredentialRef,
     value: &str,
 ) -> anyhow::Result<()> {
-    if let Written::FileFallback { reason } = writer.write(reference, &SecretString::new(value))? {
-        println!(
-            "warning: the operating-system credential store could not hold this credential ({reason:#}).\n\
-             \x20 Stored it in the private file store at {} instead; config.toml now sets credential_store = \"file\".",
-            writer.file_dir().display()
-        );
-        config.credential_store = Some("file".to_owned());
+    if let Some(notice) =
+        preloop_runner_server::github_app_setup::persist_secret(writer, config, reference, value)?
+    {
+        println!("{notice}");
     }
     Ok(())
 }
 
+/// Which transport carries GitHub's redirect back to the operator.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AppSetupTransport {
+    /// The running engine hosts the form and receives the redirect.
+    Engine { public_url: String },
+    /// A loopback listener on a fixed port, reached through an SSH port forward.
+    SshForward,
+    /// A loopback listener on this machine.
+    Loopback,
+}
+
+/// The transport decision: a public URL wins, an SSH session comes next, and
+/// everything else uses the local listener. `public_url` is the already
+/// resolved value; blank counts as unset.
+pub(crate) fn choose_app_setup_transport(
+    public_url: Option<&str>,
+    ssh_session: bool,
+) -> AppSetupTransport {
+    match public_url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => AppSetupTransport::Engine {
+            public_url: url.to_owned(),
+        },
+        None if ssh_session => AppSetupTransport::SshForward,
+        None => AppSetupTransport::Loopback,
+    }
+}
+
+/// The public URL for App setup: the `--public-url` flag, else
+/// `PRELOOP_PUBLIC_URL`. Blank values count as unset.
+pub(crate) fn resolve_public_url(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    [flag, env]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Create the App through GitHub's manifest flow and store what comes back.
+///
+/// The transport follows [`choose_app_setup_transport`]: the engine hosts the
+/// form when a public URL is set; over SSH the listener is reached through a
+/// port forward; otherwise it is local.
 async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
+    let public_url = resolve_public_url(
+        args.public_url.as_deref(),
+        std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
+    );
+    let ssh = crate::app_manifest::ssh_session_from_env(|key| std::env::var(key).ok());
+    match choose_app_setup_transport(public_url.as_deref(), ssh) {
+        AppSetupTransport::Engine { public_url } => {
+            crate::engine_app_setup::setup_app_via_engine(args, &public_url).await
+        }
+        AppSetupTransport::SshForward => {
+            let target = ssh_target();
+            setup_app_via_loopback(args, Some(&target)).await
+        }
+        AppSetupTransport::Loopback => setup_app_via_loopback(args, None).await,
+    }
+}
+
+/// This session's SSH target, as the forward command needs it.
+fn ssh_target() -> crate::app_manifest::SshTarget {
+    let hostname = crate::app_manifest::local_hostname();
+    crate::app_manifest::SshTarget::from_env(
+        std::env::var("SSH_CONNECTION").ok().as_deref(),
+        std::env::var("USER").ok().as_deref(),
+        &hostname,
+    )
+}
+
+/// The loopback flow: a single-use listener on this machine. Over SSH the
+/// listener binds the forward port and prints how to reach it.
+async fn setup_app_via_loopback(
+    args: &GithubSetupArgs,
+    ssh: Option<&crate::app_manifest::SshTarget>,
+) -> anyhow::Result<()> {
     // Settle the config and the store selection before GitHub creates the App:
     // its one-time private key must have somewhere to land once it exists.
     let preflight = load_config()?;
     CredentialWriter::for_config(&config_path(), preflight.credential_store.as_deref())?;
+    let (port, guidance) = match ssh {
+        Some(target) => {
+            let port = if args.port == 0 {
+                crate::app_manifest::SSH_FORWARD_PORT
+            } else {
+                args.port
+            };
+            (
+                port,
+                Some(crate::app_manifest::forwarded_guidance(target, port)),
+            )
+        }
+        None => (args.port, None),
+    };
     let (registration, path) = crate::app_manifest::register_with_persist(
         &args.app_name,
         args.org.as_deref(),
-        args.port,
-        args.public_url.as_deref(),
+        port,
+        guidance.as_deref(),
         !args.no_browser,
         |credentials| {
             let app_id = credentials.id.to_string();
@@ -1349,7 +1358,8 @@ pub(crate) fn config_path_for_home() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use preloop_runner_server::credential_store::CREDENTIAL_STORE_ENV;
+    use preloop_runner_server::credential_store::{CREDENTIAL_STORE_ENV, SecretString};
+    use preloop_runner_server::github_app_setup::record_app_credentials;
     #[test]
     fn checklist_union_of_workflow_permissions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1589,5 +1599,55 @@ mod tests {
         assert_eq!(loaded.github.pat(), Some("github_pat_external"));
         assert!(config_root.path().join("credentials").is_dir());
         assert!(!home.path().join("credentials").exists());
+    }
+
+    #[test]
+    fn the_transport_decision_is_public_url_then_ssh_then_loopback() {
+        assert_eq!(
+            choose_app_setup_transport(Some("https://ci.example.com/"), true),
+            AppSetupTransport::Engine {
+                public_url: "https://ci.example.com/".to_owned()
+            },
+            "a public URL wins even over SSH"
+        );
+        assert_eq!(
+            choose_app_setup_transport(Some("https://ci.example.com"), false),
+            AppSetupTransport::Engine {
+                public_url: "https://ci.example.com".to_owned()
+            }
+        );
+        assert_eq!(
+            choose_app_setup_transport(None, true),
+            AppSetupTransport::SshForward
+        );
+        assert_eq!(
+            choose_app_setup_transport(None, false),
+            AppSetupTransport::Loopback
+        );
+        assert_eq!(
+            choose_app_setup_transport(Some("  "), true),
+            AppSetupTransport::SshForward,
+            "a blank URL is no URL"
+        );
+    }
+
+    #[test]
+    fn the_public_url_comes_from_the_flag_then_the_environment() {
+        assert_eq!(
+            resolve_public_url(Some(" https://flag.example "), Some("https://env.example"))
+                .as_deref(),
+            Some("https://flag.example")
+        );
+        assert_eq!(
+            resolve_public_url(None, Some("https://env.example")).as_deref(),
+            Some("https://env.example")
+        );
+        assert_eq!(
+            resolve_public_url(Some(""), Some("https://env.example")).as_deref(),
+            Some("https://env.example"),
+            "a blank flag does not hide the environment"
+        );
+        assert_eq!(resolve_public_url(None, Some("  ")), None);
+        assert_eq!(resolve_public_url(None, None), None);
     }
 }

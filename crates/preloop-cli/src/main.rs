@@ -21,6 +21,7 @@ mod aenv_egress;
 mod app_manifest;
 mod dap_client;
 mod debug_session;
+mod engine_app_setup;
 mod github_auth;
 mod github_setup;
 mod init;

@@ -396,6 +396,13 @@ require_approval = false    # true = run is created but all jobs hold until the 
 
 Set `PRELOOP_PUBLIC_URL` to whatever address others actually reach.
 
+`preloop setup github --via app` uses this URL when it hosts the App-creation
+form itself: the browser loads `/setup/github` and GitHub redirects to
+`/setup/github/callback`. Those two routes answer `404` except while a setup
+link is open, and the link works once for ten minutes. Your browser must reach
+the URL to finish the setup, but GitHub also validates the webhook URL in the
+App manifest, so the address needs to be one GitHub can reach.
+
 ### A. No public inbound access
 
 The most locked-down option, and the only one with zero public attack surface.
