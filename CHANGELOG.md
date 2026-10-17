@@ -46,6 +46,16 @@ Releases before v0.27.0 predate the changelog.
   the pass's, and App JWT responses charge their advertised bytes to the
   consumption counters.
 
+- **A locked credential store no longer replaces the config-secrets key.** Sealed
+  `[secrets]` values are opened with the key the credential store holds. When
+  that store was locked, the engine minted a new key over them, so every start
+  failed with `store envelope authentication failed`, and after unlocking it
+  failed with `config-secrets key conflict`. Preloop now refuses to mint while
+  sealed values exist and names what to unlock. A `secrets.key` that disagrees
+  with the store is settled by which key opens the sealed values, and the losing
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
+  background engine start now prints the engine's last log lines (#653).
+
 - **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
   RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
   extraction) flagged by `cargo audit`.

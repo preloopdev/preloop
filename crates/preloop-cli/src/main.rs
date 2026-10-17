@@ -1500,6 +1500,31 @@ async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
         .is_ok()
 }
 
+/// The last lines the engine wrote to `engine.log` at or after `offset`, which
+/// hold its own exit error. Empty when the log cannot be read.
+fn engine_log_tail(path: &std::path::Path, offset: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_LINES: usize = 20;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut file| {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_to_end(&mut bytes)
+    });
+    if read.is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
+    if tail.is_empty() {
+        return String::new();
+    }
+    format!("\n{}\n(full log: {})", tail.join("\n"), path.display())
+}
+
 async fn ensure_engine_running() -> anyhow::Result<()> {
     if std::env::var("PRELOOP_URL").is_ok() {
         return Ok(());
@@ -1556,10 +1581,13 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
         cmd.env("RUST_LOG", "info,preloop=debug");
     }
 
+    let engine_log = preloop_dir.join("engine.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(preloop_dir.join("engine.log"))?;
+        .open(&engine_log)?;
+    // Where this start's output begins, so a failed start quotes only its own error.
+    let log_offset = log_file.metadata()?.len();
 
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(log_file.try_clone()?);
@@ -1575,7 +1603,10 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     while start.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("engine exited before becoming ready: {status}");
+            anyhow::bail!(
+                "engine exited before becoming ready: {status}{}",
+                engine_log_tail(&engine_log, log_offset)
+            );
         }
         if client
             .get(format!("{url}/healthz"))
@@ -7685,5 +7716,25 @@ mod tests {
             !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
             "the /healthz probe must not send an Authorization header"
         );
+    }
+
+    #[test]
+    fn engine_log_tail_quotes_only_this_starts_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("engine.log");
+        let previous = "previous run\nold error\n";
+        std::fs::write(&log, previous).unwrap();
+        let offset = u64::try_from(previous.len()).unwrap();
+        std::fs::write(
+            &log,
+            format!("{previous}starting engine\nError: unlock the login keychain\n"),
+        )
+        .unwrap();
+
+        let tail = engine_log_tail(&log, offset);
+        assert!(tail.contains("Error: unlock the login keychain"), "{tail}");
+        assert!(!tail.contains("old error"), "{tail}");
+        assert!(tail.contains(&log.display().to_string()), "{tail}");
+        assert_eq!(engine_log_tail(&dir.path().join("missing.log"), 0), "");
     }
 }

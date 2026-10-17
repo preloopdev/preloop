@@ -595,6 +595,7 @@ Also worth knowing:
 | `state/snapshots/` | Per-run immutable workspace snapshots; in-flight captures stage under `state/snapshots/.staging/` |
 | `vms/` | Golden images and per-machine state |
 | `credentials/` | Credentials in the default file store (App key, PAT, webhook secrets, engine token): `0600` files. Set `credential_store = "os"` to keep them in the OS keychain instead |
+| `secrets.key` | Legacy config-secrets key, written only while the credential store cannot be reached and migrated into it once it can. A file that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>`, never deleted |
 | `engine.token` | Legacy last-resort file for the generated native API token, used only when the credential store cannot hold it |
 
 Keep the whole state directory on one filesystem. Everything the engine

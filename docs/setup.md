@@ -471,6 +471,13 @@ and its file copy is read even while a stale or corrupted OS entry stays
 readable. This keeps setup's file fallback readable without requiring the
 environment override to be removed.
 
+Stored secrets (`[secrets]` in `config.toml`) are sealed with a key that lives in
+the same credential store. If that key cannot be read, for example while the
+macOS login keychain is locked, startup fails and names what to unlock. Preloop
+never generates a replacement key over sealed secrets, since a new key cannot
+open them. A `secrets.key` file beside the config that disagrees with the store
+is renamed `secrets.key.orphan-<unix-ts>` rather than deleted.
+
 Fields:
 
 ```toml
