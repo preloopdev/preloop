@@ -35,6 +35,9 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
+  RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
+  extraction) flagged by `cargo audit`.
 - **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
   replayed on one node waited for the other nodes' five-second queue poll before
   it was claimed. The committing node now sends one coalesced `preloop_webhooks`
