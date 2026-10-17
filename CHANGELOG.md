@@ -22,6 +22,16 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
+  `smolvm_golden_version` in `versions.toml`). The floor now also covers the
+  x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
+  is what a packed golden with preloop's mounts needs; `preloop update
+  --ensure-runtime` upgrades any engine below it, and `install.sh` gates the
+  same release. The floor is compiled once, by `crates/preloop-vm/build.rs`,
+  and read by the updater. Raising the golden pin does not rebuild the
+  published golden: it is a digest-pinned OCI artifact, so a 1.30.1-baked
+  golden needs a bake, publish, and digest bump per `docs/build-goldens.md`.
+
 - **The file credential store is the default.** The engine token, GitHub App
   private key, PAT, and webhook secrets are written to `0600` files under
   `$PRELOOP_HOME/credentials` instead of the OS keychain. GitHub credentials
@@ -34,6 +44,17 @@ Releases before v0.27.0 predate the changelog.
   read; the keychain entry is left in place.
 
 ### Fixed
+
+- **A microVM that runs out of IRQ lines says so.** When `machine start` fails
+  with libkrun's `no more IRQs are available` (the device budget x86_64
+  libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
+  engine now reports `VmError::IrqExhausted` instead of passing smolvm's bare
+  `-22 (EINVAL)` through: the message names the machine's declared volume and
+  socket mounts on top of the launcher's fixed device set, the SmolVM version
+  in use, both x86_64 ceilings, and the remedy (upgrade to the floor or start
+  with fewer mounts), with the raw smolvm output appended. Previously this was
+  indistinguishable from a held or corrupt disk image, and the pool restarted
+  forever without naming the cause.
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 
