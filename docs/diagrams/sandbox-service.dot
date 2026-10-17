@@ -1,0 +1,44 @@
+digraph sandbox_service {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.5, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.12,0.07"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_cp {
+    label="Control plane (preloop serve)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    control [label="Runner pool client\nSandboxMachines → SandboxApi\nAcquire, Renew, Release, Exec", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_svc {
+    label="Sandbox service (preloop-sandbox)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    api [label="Connect API (server.rs)\n/preloop.sandbox.v1.Sandboxes/{method}\n/preloop.sandbox.v1.Providers/{method}", fillcolor="#bae6fd"];
+    service [label="Service (service.rs)\ntemplates, pools, leases, placement\nExec → ExecWork → ReportExec", fillcolor="#bae6fd"];
+    lifecycle [label="SandboxState lifecycle\nPROVISIONING → READY → LEASED\nPRESERVED / PAUSED / STOPPED\nTERMINATING → GONE; create → FAILED", fillcolor="#bae6fd"];
+    store [label="Store (store.rs)\nSQLite sandbox.db, or Postgres\nsandbox schema", fillcolor="#dcfce7"];
+    ticket [label="Ticketed data plane\n/sandbox/v1/streams/{ticket}\ntar PUT/GET over HTTP", fillcolor="#dcfce7"];
+  }
+
+  subgraph cluster_host {
+    label="Host provider"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    agent [label="Host agent (agent.rs)\nRegister, Heartbeat, Poll (25 s)\nReport, ReportExec, Reconcile", fillcolor="#fef3c7"];
+    driver [label="Driver trait (driver.rs)\ncreate, destroy, exec, copy_in/out\nsnapshot, stop/start, pause/resume", fillcolor="#fef3c7"];
+    smolvm [label="SmolVM driver\nSmolvmDriver + MachineSpec\nforks golden snapshots via CLI", fillcolor="#fef3c7"];
+  }
+
+  subgraph cluster_exec {
+    label="Execution"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    vm [label="SmolVM microVM (libkrun)\nguest agent handles exec/copy\nbranch from golden snapshot", fillcolor="#fef3c7"];
+  }
+
+  control -> api [label="Connect JSON over HTTP"];
+  api -> service [label="decoded RPC"];
+  service -> store [label="write-through state"];
+  service -> lifecycle [label="acquire / release / power"];
+  service -> agent [label="CreateWork, ExecWork"];
+  agent -> driver [label="Poll work, run"];
+  driver -> smolvm;
+  smolvm -> vm [label="machine exec, copy, start"];
+  service -> agent [label="CreateWork, ExecWork"];
+  agent -> service [label="Report, ReportExec\nfenced generation", constraint=false];
+  control -> ticket [label="OpenStream → ticket\nPUT/GET tar", style=dashed, constraint=false];
+  ticket -> agent [label="agent blob fetch/return", style=dashed, constraint=false];
+}

@@ -44,17 +44,14 @@ preloop run -f .github/workflows/ci.yml --event pull_request
 `preloop init` is a short setup wizard. It sets up your GitHub credential,
 picks the VM image your jobs run in, and chooses how the engine runs, then
 writes `~/.preloop/config.toml`. Without a terminal it takes the same answers
-as flags. Every flag is in the [`init` reference](docs/cli_reference.md#preloop-init-options).
+as flags. Every flag is in the [`init` reference](docs/control-plane/reference/cli.mdx).
 
 `preloop serve` runs in the foreground. Add `-d` to detach it.
 
-The first run downloads the default VM image, a packed copy of the official
-GitHub runner image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)),
-and builds a local "golden" VM from it. That takes a few minutes. The image is
-about 9 GB compressed and almost 50 GB unpacked, so keep at least 80 GB of disk
-free. Every job then forks from the golden VM in about 300 ms. Each VM uses
-only the memory its job needs, and the idle engine takes about 25 MB. To use
-your own image, point `init` at an OCI image; see [docs/vm-images.md](docs/vm-images.md).
+The first run downloads and prepares the default VM image. Its size depends on
+the release and host architecture; see the [VM image guide](docs/control-plane/operate/vm-images.mdx)
+before provisioning a machine. Each job runs in an isolated VM. To use your
+own image, see the same guide.
 
 Prefer not to run a script? Download `preloop-cli-<target>.tar.gz` and its
 `.sha256` from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
@@ -62,30 +59,32 @@ check the checksum, put `preloop` on your `PATH`, and run `preloop update` to
 install the pinned SmolVM runtime. Release assets also carry build provenance:
 `gh attestation verify <asset> --repo preloopdev/preloop`. MicroVM jobs also
 need the Linux guest runner at `<prefix>/lib/preloop/runner/<triple>/preloop-runner`.
-`install.sh` installs it, and [docs/self-hosting.md §3](docs/self-hosting.md)
+`install.sh` installs it, and the [deployment guide](docs/control-plane/operate/deploy.mdx)
 has the manual commands.
 
-On Apple Silicon, x86_64 goldens run through Rosetta 2 at close to native
-speed. Prefer arm64 goldens when you can. Known limits are in
-[docs/fidelity-gap.md](docs/fidelity-gap.md).
+On Apple Silicon, x86_64 goldens run through Rosetta 2. Prefer arm64 goldens
+when you can. Known limits are in the [compatibility guide](docs/compatibility.mdx).
 
-You can simulate most if not all GitHub events locally. For some events, you might need to add a payload.
-See [docs/cli_reference.md](docs/cli_reference.md) for more flags you can pass.
+You can simulate most GitHub events locally. For some events, you might need to add a payload.
+See the [CLI reference](docs/control-plane/reference/cli.mdx) for more flags you can pass.
 
-To continue with the setup, see GitHub App and PAT credentials, secrets, config file, and the troubleshooting guide: [docs/setup.md](docs/setup.md)
+To continue with the setup, see [configuration and credentials](docs/control-plane/configuration.mdx).
 
-Run it as a server, service install, every runtime knob, and how to expose it (tailnet only, Tailscale Funnel, Cloudflare Tunnel, or your own
-domain): [docs/self-hosting.md](docs/self-hosting.md)
+Run it as a server, service install, runtime knobs, and exposure options in the
+[deployment guide](docs/control-plane/operate/deploy.mdx).
 
 ### Just the runner
 
+
+
 `preloop-runner` is a drop-in Rust replacement for `actions/runner`. It
-registers against GitHub (or a preloop server) the same way, with a 36×
-smaller install and 19× lower peak memory:
+registers against GitHub (or a preloop server) the same way. The repository's
+runner comparison shows a smaller install and lower idle and peak RSS; see the
+benchmark table below for the measured values.
 
 ```sh
 # Fetch the installer at a release tag, read it, then run it with --runner.
-ver=v0.34.0   # latest release; --runner needs v0.33.7 or newer
+ver=v0.34.4   # replace with another release tag if needed
 curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
 less install.sh
 sh install.sh --runner
@@ -93,17 +92,11 @@ export PATH="$HOME/.local/bin:$PATH"
 preloop-runner configure --url https://github.com/owner/repo --token <registration-token>
 preloop-runner run
 ```
+Each release publishes standalone binaries for Linux (x86_64/aarch64) and
+macOS (x86_64/arm64), each with a CycloneDX SBOM
+(`preloop-runner_<triple>.cdx.json`) and a sha256 checksum. Windows uses the
+Linux build under WSL2.
 
-Every release also publishes standalone binaries for Linux (x86_64/aarch64),
-macOS (x86_64/arm64), and Windows (x86_64), each with a CycloneDX SBOM
-(`preloop-runner_<triple>.cdx.json`) and a sha256 checksum:
-
-```sh
-curl -fsSLO https://github.com/preloopdev/preloop/releases/latest/download/preloop-runner-<triple>
-chmod +x preloop-runner-<triple>
-./preloop-runner-<triple> configure --url https://github.com/owner/repo --token <registration-token>
-./preloop-runner-<triple> run
-```
 
 Or use the container image with a persistent volume:
 
@@ -116,18 +109,18 @@ docker run --rm -v preloop-runner-data:/runner \
   --runner-root /runner run
 ```
 
-Details: [docs/setup.md](docs/setup.md#just-the-runner-standalone-github-actions-runner).
+Details: [runner installation](docs/runner/install.mdx).
 
 ## What makes it different vs others.
 
 - We use the real runner protocol, not a behavior approximation: the official runner binary works against it unchanged.
-- Hardware-isolated microvms for each job that spin up in 300ms, elastically scale up and down, and cross-platform.
+- Hardware-isolated microVMs run control-plane jobs; host requirements and startup behavior vary by substrate.
 - GitHub App and fine-grained PAT support with per-job token minting so your checks get updated.
-- DAP-powered job inspection: attach at entry, inspect live GitHub/job context, pause, and continue, and allow for step-level retries. 
-- Heavily tested with property tests, differential tests, and formal verification. Conformance is table-stakes. 
+- DAP-powered job inspection: attach at entry, inspect live GitHub/job context, pause, and continue, and allow for step-level retries.
+- Heavily tested with property tests, differential tests, and formal verification. Conformance is table-stakes.
 - NDJSON event output for agents and developer tooling.
 
-For a more detailed comparison of how we compare, please see: [docs/preloop_vs_others.md](docs/preloop_vs_others.md)
+For a detailed comparison, see [the comparison guide](docs/comparison.mdx).
 
 
 ### Agent-driven debugging
@@ -177,17 +170,16 @@ Reproduce: `scripts/bench-runner-compare.sh` (set `BENCH_RUNS=N`; needs
 
 | Topic | Doc |
 |---|---|
-| Setup, credentials, secrets, config | [docs/setup.md](docs/setup.md) |
-| CLI reference | [docs/cli_reference.md](docs/cli_reference.md) |
-| Hosting it yourself: service install, knobs, exposure | [docs/self-hosting.md](docs/self-hosting.md) |
-| VM images, version pins, and custom goldens | [docs/vm-images.md](docs/vm-images.md) |
-| GitHub App webhooks and check runs | [docs/github-app-webhook.md](docs/github-app-webhook.md) |
-| Job tokens, minting, OIDC | [docs/github-tokens.md](docs/github-tokens.md) |
-| Debug sessions (pause, inspect, retry) | [docs/debug-sessions.md](docs/debug-sessions.md) |
-| Pre-push checks for coding agents | [docs/agent-pre-push.md](docs/agent-pre-push.md) |
-| Architecture and crate map | [docs/architecture.md](docs/architecture.md) |
-| Protocol conformance | [docs/conformance.md](docs/conformance.md) |
-| Fidelity gaps and roadmap | [docs/fidelity-gap.md](docs/fidelity-gap.md) |
+| Setup, credentials, secrets, config | [control-plane install](docs/control-plane/install.mdx) · [configuration](docs/control-plane/configuration.mdx) |
+| CLI reference | [docs/control-plane/reference/cli.mdx](docs/control-plane/reference/cli.mdx) |
+| Hosting it yourself: service install, knobs, exposure | [docs/control-plane/operate/deploy.mdx](docs/control-plane/operate/deploy.mdx) |
+| VM images, version pins, and custom goldens | [docs/control-plane/operate/vm-images.mdx](docs/control-plane/operate/vm-images.mdx) |
+| GitHub App webhooks and check runs | [docs/control-plane/github/app.mdx](docs/control-plane/github/app.mdx) |
+| Job tokens, minting, OIDC | [docs/control-plane/github/tokens.mdx](docs/control-plane/github/tokens.mdx) |
+| Debug sessions (pause, inspect, retry) | [docs/control-plane/guides/debugging.mdx](docs/control-plane/guides/debugging.mdx) |
+| Pre-push checks for coding agents | [docs/control-plane/guides/agents.mdx](docs/control-plane/guides/agents.mdx) |
+| Architecture and crate map | [docs/control-plane/architecture/overview.mdx](docs/control-plane/architecture/overview.mdx) |
+| Protocol compatibility | [docs/compatibility.mdx](docs/compatibility.mdx) |
 | Contributing and CI requirements | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
 ## License

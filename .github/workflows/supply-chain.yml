@@ -166,7 +166,7 @@ jobs:
           node24_upstream="$(grep -E 'NODE24_VERSION=' /tmp/externals.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
           echo "Upstream externals.sh: NODE20_VERSION=$node20_upstream NODE24_VERSION=$node24_upstream"
 
-          # Also check v2.337.0 upstream externals (documented forward-port in docs/fidelity-gap.md)
+          # Also check v2.337.0 upstream externals (documented forward-port in docs/contributing/fidelity-gap.md)
           curl -fsSL --retry 3 --retry-all-errors "https://raw.githubusercontent.com/actions/runner/v2.337.0/src/Misc/externals.sh" -o /tmp/externals_337.sh || true
           node20_337="$(grep -E 'NODE20_VERSION=' /tmp/externals_337.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
           node24_337="$(grep -E 'NODE24_VERSION=' /tmp/externals_337.sh | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"

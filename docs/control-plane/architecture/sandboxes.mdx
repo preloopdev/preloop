@@ -1,0 +1,71 @@
+---
+title: Sandbox service and microVMs
+description: How the control plane acquires isolated sandboxes from providers, runs commands, and cleans them up.
+---
+
+Preloop's runner pool obtains every job machine from a Sandbox Service. The service is an external boundary: the control plane is one client, while host agents own drivers and report machine work back to the service.
+
+<Note>
+PR-dependent: #619 — this page describes the Sandbox Service cutover, including its Connect API, provider protocol, store, and SmolVM driver.
+</Note>
+
+![Sandbox service architecture](/diagrams/sandbox-service.svg)
+
+## Service boundary
+
+The service keeps templates, pools, leases, placement, provider work queues, and reconciliation separate from the CI control database. A caller asks for a sandbox; a provider agent performs the host-side operation. The CI control plane never calls a VM CLI directly.
+
+The public driver is `smolvm`. A host can attach additional drivers in a downstream build, but driver implementations are in-process host code rather than a public plugin ABI. Third parties integrate by implementing the Providers protocol.
+
+## Two Connect APIs
+
+The service serves hand-written Connect JSON over one HTTP port. Calls are unary or server-streaming, so HTTP/1.1 proxies and providers behind NAT can work without a service-side inbound connection.
+
+| API | Operations |
+| --- | --- |
+| **Sandboxes** | Put/list/delete templates and pools; acquire, renew, release, get, and list sandboxes; stream `Exec`; open upload/download streams; snapshot; stop/start; pause/resume; list providers. |
+| **Providers** | Register drivers and capabilities; heartbeat; long-poll for work; report create/destroy/power/snapshot results; report streamed exec output; reconcile the provider inventory. |
+
+The RPC routes are `/preloop.sandbox.v1.Sandboxes/{Method}` and `/preloop.sandbox.v1.Providers/{Method}`. Bulk bytes do not travel inside JSON RPCs: `OpenStream` returns a short-lived ticket, then a tar stream moves through `/sandbox/v1/streams/{ticket}`. Provider agents use `/sandbox/v1/agent/blobs/{ticket}` for the corresponding transfer. `/sandbox/v1/healthz` is the service health endpoint.
+
+Client and provider bearer tokens are separate. Loopback deployments can omit them; a non-loopback listener requires both `PRELOOP_SANDBOX_TOKEN` and `PRELOOP_SANDBOX_PROVIDER_TOKEN`. Data-plane tickets are scoped to a sandbox and direction, single-use, and short-lived. Provider work is fenced by the registration generation, so a re-registered provider cannot complete work from an older session.
+
+## Templates, pools, and placement
+
+- A **template** names an image, driver recipe, or captured snapshot. Snapshot templates retain the provider and driver that hold their native snapshot.
+- A **pool** combines a template with a shape, network policy, mounts, socket mounts, warm target, maximum size, and lease TTL.
+- **Capabilities** decide placement: operating system, architecture, features, network modes, slot count, and capabilities such as pause, snapshot, fork, socket mounts, host mounts, or multi-exec. Placement filters on these declarations rather than branching on driver names.
+- A caller's `Acquire` request must choose a pool or template and include an idempotency key. Repeating the key returns the existing lease instead of creating another sandbox. Environment variables in the lease are merged into every exec; injected files are uploaded before the lease is returned.
+
+A provider can be temporarily offline or at capacity. The service waits for a matching provider when the caller supplies a wait period; a permanently unmet capability fails with the missing requirement named. Unsupported operations return `failed_precondition` instead of being emulated.
+
+## Lifecycle: create, run once, and destroy
+
+A normal CI machine is ephemeral:
+
+1. The runner pool acquires a sandbox from an image template and receives a lease.
+2. The provider creates and starts the machine. The sandbox moves from `PROVISIONING` to `READY`, then `LEASED` when the caller owns it.
+3. The runner executes multiple commands through streaming `Exec` and uses ticketed copy operations for files. The pool renews its lease before expiry.
+4. The pool releases the lease with `DESTROY` after the job. A failed or expired lease also destroys its sandbox. `PRESERVE` keeps a failed sandbox for a short debugging window before maintenance destroys it.
+
+Warm pools keep idle `READY` sandboxes and refill them after claims. A build sandbox can be started snapshot-capable, provisioned with the runner image, and captured as a template. Later job sandboxes are copy-on-write forks from that snapshot, so the pool keeps a reusable golden while each job gets an isolated machine. The pool's machine adapter uses a six-hour lease and renews it every 15 minutes.
+
+Maintenance expires leases and preserve windows, times out unreported creates, removes expired data-plane tickets, refills warm pools with a short failure backoff, and fails sandboxes whose provider has stopped heartbeating. Provider reconciliation compares the live inventory with durable records: missing machines fail, while orphaned or stale incarnations are returned to the provider for destruction.
+
+## SmolVM driver
+
+The SmolVM driver invokes typed `smolvm machine` operations through its host agent:
+
+- create from an OCI image or a `smolmachine:` recipe, with default shape values of 2 vCPUs, 4096 MiB memory, and 20 GiB storage when the request leaves them unset;
+- start normally or as a forkable base; fork a captured template into a named machine;
+- stream `machine exec` output, apply environment/workdir/user/stdin settings, and enforce a request timeout;
+- copy tar archives into and out of a guest; stop, start, pause, resume, and delete; and
+- inventory native names so reconciliation can recover after a process restart.
+
+The guest agent is the in-VM execution endpoint used by SmolVM's machine commands. The driver exposes disabled, unrestricted, public-only, and restricted network modes, plus host-volume and socket mounts when the runtime supports them. `PRELOOP_SANDBOX_SMOLVM_SLOTS` caps concurrent SmolVM sandboxes (`0` means no cap).
+
+## Running the service
+
+`preloop engine` runs the service in-process with the local SmolVM provider. Its API defaults to `127.0.0.1:9191`; set `PRELOOP_SANDBOX_LISTEN=off` to keep the API in-process only. The service store defaults to `<state_dir>/sandbox.db` and can use SQLite or a Postgres URL through `PRELOOP_SANDBOX_STORE_URL`.
+
+For a standalone service, the #619 CLI exposes `preloop sandbox serve`; a remote host joins with `preloop sandbox agent --service http://host:9191`. The CLI also provides template, pool, acquire, exec, copy, snapshot, release, and provider inspection commands. Set `PRELOOP_SANDBOX_DRIVERS` to the comma-separated drivers attached by an agent and `PRELOOP_SANDBOX_POOL_DRIVER` to pin the CI pool to one of them.

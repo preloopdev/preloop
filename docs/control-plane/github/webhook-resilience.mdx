@@ -1,0 +1,102 @@
+---
+title: "Webhook resilience"
+description: "Understand durable webhook delivery, recovery layers, breaker behavior, and operator repair commands."
+---
+
+GitHub does not automatically retry a failed webhook response. Preloop commits the raw delivery before acknowledging it, then uses a worker queue, watchdog, circuit breaker, health monitor, and operator API to recover failures that happen after the acknowledgement.
+
+## Delivery boundary
+
+A successful webhook request returns `202` only after the payload is durable. The enqueue budget is 8 seconds with two attempts; each attempt can use up to 4 seconds and a failed attempt is followed by a 50 ms delay. A duplicate also returns `202`. A store failure returns `500`, so use GitHub's delivery redelivery action after the store recovers.
+
+Delivery states are `received`, `processing`, `done`, and `failed`. Workers hold a 60-second lease, renew it every 20 seconds, and make at most six processing attempts. Transient failures normally wait 1, 5, 15, 30, and 30 seconds before the final attempt. Permanent failures become `failed`; a GitHub outage parks the delivery as `received` and refunds the claim attempt.
+
+Terminal rows are retained for 30 days and pruned every five minutes in batches of 256. This keeps recent delivery IDs available for idempotency and gives operators a local replay window well beyond GitHub's delivery history.
+
+## Recovery layers
+
+### 1. Delivery watchdog
+
+The watchdog polls GitHub's App delivery history:
+
+```text
+GET /app/hook/deliveries?per_page=100[&cursor=...]
+POST /app/hook/deliveries/{delivery-id}/attempts
+```
+
+It joins GitHub's delivery GUIDs with the local queue and requests a redelivery for:
+
+- a GitHub failure with no local row (`remote_failure`); or
+- a GitHub success with no local row (`phantom_ack`).
+
+The first poll adopts a grace-boundary watermark before reading history. Poll failures do not advance it, and a page limit stores its continuation cursor. Open repair records are retried independently of the watermark. A repair is claimed before the GitHub request, so overlapping watchdogs cannot charge or request the same GUID twice.
+
+Per-GUID repair delays are 0, 5 minutes, 15 minutes, 1 hour, then 6 hours repeatedly. The default cap is five attempts; capped rows stay visible as unresolved findings. The watchdog skips redelivery while the store is unhealthy, while the App breaker is open, or when no App is configured.
+
+### 2. GitHub circuit breaker
+
+Three consecutive transport or 5xx failures open the breaker. A `429` opens it immediately. A `403` opens it when `x-ratelimit-remaining` is zero or a valid `retry-after` is present. The wait uses `retry-after` first, then `x-ratelimit-reset`, and is bounded between 1 second and 1 hour for rate limits.
+
+The normal open interval starts at 30 seconds and grows to a 300-second ceiling. One 60-second half-open probe tests recovery. A successful response—including a GitHub `404` or `422`—resets the breaker. Payload errors and ordinary non-rate-limit 4xx responses do not trip it.
+
+The queue gate prevents claims for GitHub-wide unavailability. A rate-limited credential can still be claimed, then parked and refunded when its dependency call reports the limit. This prevents a temporary outage from dead-lettering good deliveries.
+
+### 3. App health monitor
+
+Every 15 minutes by default, the monitor reads `GET /app` and `GET /app/hook/config` with an App JWT. It reports missing event subscriptions, the permission that gates each event, delivery-URL drift against `PRELOOP_PUBLIC_URL`, and read errors. It only reports and logs drift; it does not modify GitHub App settings.
+
+### 4. Operator surface
+
+Use the native API with the system bearer:
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /api/v1/webhooks/deliveries?state=&limit=` | Lists summaries and counters, never payloads. `limit` defaults to 50 and is clamped to 1–500. |
+| `POST /api/v1/webhooks/deliveries/{delivery-id}/replay` | Requeues a terminal local payload. `404` means unknown; `409` means it is still active. |
+| `GET /api/v1/webhooks/health` | Reports queue, watchdog, breaker, GitHub consumption, and App configuration state. |
+
+The CLI uses the same native credential:
+
+```sh
+preloop webhooks list [--state received|processing|done|failed] [--limit 50] [--json]
+preloop webhooks replay <delivery-id>
+preloop webhooks health [--json]
+```
+
+## Status conditions
+
+`GET /api/v1/status` includes warning conditions for:
+
+| Condition | Meaning |
+|---|---|
+| `webhook_dead_letter` | At least one delivery is `failed`. |
+| `webhook_queue_stalled` | The oldest received/processing row is older than 15 minutes. |
+| `github_unavailable` | A breaker is open. |
+| `webhook_watchdog_stale` | No successful watchdog poll for more than 30 minutes. |
+| `webhook_repairs_pending` | At least one repair remains open. |
+| `webhook_config_drift` | An App event, permission, or delivery URL check is unhealthy. |
+
+`/readyz` is a separate unauthenticated readiness probe. It returns readiness and a reason, not the webhook condition objects.
+
+## Configuration
+
+| Variable | Default | Effect |
+|---|---:|---|
+| `PRELOOP_WEBHOOK_WATCHDOG` | on | `off`, `0`, `false`, or `disabled` disables it. Other values enable it. |
+| `PRELOOP_WEBHOOK_WATCHDOG_INTERVAL_SECS` | `300` | Poll cadence; values below 10 become 10. Invalid values use the default. |
+| `PRELOOP_WEBHOOK_WATCHDOG_GRACE_SECS` | `120` | Late-delivery grace period; zero is accepted. |
+| `PRELOOP_WEBHOOK_WATCHDOG_MAX_ATTEMPTS` | `5` | Redelivery requests per GUID. |
+| `PRELOOP_WEBHOOK_WATCHDOG_MAX_PAGES` | `5` | History pages per poll; the scan always examines at least one page. |
+| `PRELOOP_GITHUB_BREAKER` | on | Same off spellings as the watchdog. |
+| `PRELOOP_GITHUB_BREAKER_THRESHOLD` | `3` | Positive consecutive-failure count; invalid or zero values use 3. |
+| `PRELOOP_WEBHOOK_HEALTH_INTERVAL_SECS` | `900` | App health cadence; values below 60 become 60. |
+| `PRELOOP_WEBHOOK_WORKERS` | `8` | Concurrent deliveries per node; invalid values use 8 and the effective minimum is 1. |
+| `PRELOOP_PUBLIC_URL` | loopback from `serve` | Expected public webhook base and Check Run link base. A standalone server with no value treats the expected URL as unknown. |
+
+## Shared-store and replay notes
+
+SQLite workers wake locally. A Postgres deployment shares the durable queue and claims with `FOR UPDATE SKIP LOCKED`; workers also poll for work. PR-dependent: PR #478 adds Postgres `LISTEN/NOTIFY` wakeups with short coalescing and reconnect wake forwarding; SQLite remains local-only.
+
+PR-dependent: PR #591 widens replay identity to `(delivery, workflow path, event)`. A pull-request delivery can therefore create both its `pull_request` and synthesized `pull_request_target` runs without one suppressing the other.
+
+PR-dependent: PR #475 partitions App-JWT breaker state by App ID. Watchdog and health checks can continue for a healthy App while another App's GitHub authentication bucket is open.
