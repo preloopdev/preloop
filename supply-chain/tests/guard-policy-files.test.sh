@@ -332,8 +332,8 @@ modify "$dir" crates/demo/src/lib.rs 'use new;'
 commit_change "$dir" mainline
 mainline="$head"
 
-case_no=$((case_no + 1))
 if [[ -n "$(git -C "$dir" diff --name-only "$mainline" "$topic")" ]]; then
+  case_no=$((case_no + 1))
   bad "fixture broken: the two tips were expected to be identical"
 else
   expect "identical change on both tips -> FAIL (merge-base diff)" 1 \
