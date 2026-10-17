@@ -79,14 +79,23 @@ test-ci: fmt-check clippy zizmor
 # cargo deny check all (licenses/bans/sources), and Node externals OSV/SBOM audit.
 # Local runs are on trusted code (report-only for Node externals). CI gate is
 # .github/workflows/supply-chain.yml (runs-on: ubuntu-latest; triggers: pull_request,
-# push to main, weekly schedule) — it drops any PR-shipped .cargo/config*, rejects
-# mixed policy PRs, runs the Node externals OSV+SBOM audit, and enforces upstream
-# pin parity.
+# push to main, weekly schedule) — it drops any PR-shipped .cargo/config*, runs the
+# dependency/policy isolation guard, runs the Node externals OSV+SBOM audit, and
+# enforces upstream pin parity.
 supply-chain:
     cargo vet
     cargo audit
     cargo deny check all
     ./scripts/audit-node-externals.sh --report-only
+
+# Dependency/policy isolation: a PR may carry the lockfile, the audit policy, the
+# vet state, and the manifests that declare a dependency, and nothing else. Code
+# that needs a new dependency lands in a follow-up PR after that one merges.
+# Same rule as the CI step "Guard policy files"; compares the merge base of
+# origin/main and HEAD against HEAD, so `git fetch origin main` first. See
+# supply-chain/README.md.
+supply-chain-guard:
+    supply-chain/guard-policy-files.sh origin/main HEAD
 
 #lint (ast-grep structural rules)
 

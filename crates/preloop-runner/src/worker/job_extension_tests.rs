@@ -1683,7 +1683,7 @@ fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
                     {"k": "action", "v": "labeled"},
                     {"k": "label", "v": {
                         "t": 2,
-                        "d": [{"k": "name", "v": "dependency-migration"}]
+                        "d": [{"k": "name", "v": "dependencies"}]
                     }},
                     {"k": "pull_request", "v": {
                         "t": 2,
@@ -1691,7 +1691,7 @@ fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
                             {"k": "labels", "v": {
                                 "t": 1,
                                 "a": [
-                                    {"t": 2, "d": [{"k": "name", "v": "dependency-migration"}]},
+                                    {"t": 2, "d": [{"k": "name", "v": "dependencies"}]},
                                     {"t": 2, "d": [{"k": "name", "v": "other"}]},
                                 ]
                             }}
@@ -1707,21 +1707,22 @@ fn decode_typed_value_preserves_arrays_nested_in_wire_dicts() {
     assert_eq!(decoded["event"]["action"], "labeled");
     assert_eq!(
         decoded["event"]["pull_request"]["labels"],
-        serde_json::json!([{"name": "dependency-migration"}, {"name": "other"}])
+        serde_json::json!([{"name": "dependencies"}, {"name": "other"}])
     );
 
-    // The whole labeled-event guard expression must now see the label list.
+    // The label list must be visible to a `contains(… .labels.*.name, …)`
+    // expression, which is how a labeled-event workflow branch reads it.
     let mut ctx = preloop_gha_expressions::Context::new();
     ctx.insert("github", decoded);
     assert_eq!(
         preloop_gha_expressions::eval_expression(
             "github.event.action == 'labeled' && \
-             github.event.label.name == 'dependency-migration' && \
-             contains(github.event.pull_request.labels.*.name, 'dependency-migration')",
+             github.event.label.name == 'dependencies' && \
+             contains(github.event.pull_request.labels.*.name, 'dependencies')",
             &ctx,
         )
         .expect("expression evaluates"),
         serde_json::json!(true),
-        "the dependency-migration guard expression must be true for this payload"
+        "a labeled-event expression must see the label list for this payload"
     );
 }
