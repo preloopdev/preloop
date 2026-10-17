@@ -196,6 +196,13 @@ fn main() {
     out.push_str("    NODE_EXTERNALS_SHA256.iter().find_map(|(k, v)| if *k == key { Some(*v) } else { None })\n");
     out.push_str("}\n");
 
+    // Also exported as an env var so `concat!`/`env!` sites (the clap
+    // `version` attribute in cli.rs) can embed the same value: a derive
+    // attribute cannot reference a generated const.
+    if let Some(runner_version) = pins.get("runner_version") {
+        println!("cargo:rustc-env=PRELOOP_PROTOCOL_COMPAT_VERSION={runner_version}");
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     fs::write(out_dir.join("pins.rs"), out).expect("write pins.rs");
     println!("cargo:rerun-if-changed=../../versions.toml");

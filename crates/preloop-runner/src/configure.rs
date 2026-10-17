@@ -74,6 +74,9 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     // but the runner must reach it via the upstream LAN address during
     // configure (the loopback bridge is not yet running). Rewrite transparently.
     registration.service_url = http.rewrite_url(&registration.service_url).into_owned();
+    // The deprecations lookup is advisory and bounded: private GHES instances
+    // may require a credential, while offline configure must remain usable.
+    warn_if_runner_version_deprecated(&http, &args.url).await;
     info!(
         "Registration successful, service URL: {}",
         registration.service_url
@@ -759,6 +762,228 @@ fn current_arch_label() -> &'static str {
         "ARM64"
     } else {
         "X64"
+    }
+}
+
+/// GitHub's runtime policy stops queuing jobs to a runner shortly after this
+/// date. Keep the check advisory: a private GHES may require authentication,
+/// and an offline configure must remain usable.
+const DEPRECATION_WARNING_DAYS: i64 = 14;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeprecationCheck {
+    Known {
+        runtime_deprecates_at: Option<chrono::DateTime<chrono::Utc>>,
+        registration_deprecates_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    Unverified(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeprecationNotice {
+    Warning(String),
+    Unverified(String),
+}
+
+/// Build the public GitHub-compatible deprecations URL for a registration
+/// target. Local HTTP control planes are intentionally skipped; GHES is
+/// expected to be HTTPS and uses the same `/api/v3` route family.
+fn deprecation_url(target: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(target).ok()?;
+    let host = parsed.host_str()?;
+    let segments: Vec<_> = parsed
+        .path_segments()
+        .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
+        .unwrap_or_default();
+    let version = crate::PROTOCOL_COMPAT_VERSION;
+    if host.eq_ignore_ascii_case("github.com") {
+        let [owner, repo, ..] = segments.as_slice() else {
+            return None;
+        };
+        return Some(format!(
+            "https://api.github.com/repos/{owner}/{repo}/actions/runners/deprecations/{version}"
+        ));
+    }
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let mut base = parsed.clone();
+    base.set_path("");
+    base.set_query(None);
+    base.set_fragment(None);
+    let base = base.as_str().trim_end_matches('/');
+    let scope = match segments.as_slice() {
+        [owner, repo, ..] => format!("repos/{owner}/{repo}"),
+        [org] => format!("orgs/{org}"),
+        [] => String::new(),
+    };
+    let scope = (!scope.is_empty())
+        .then_some(format!("{scope}/"))
+        .unwrap_or_default();
+    Some(format!(
+        "{base}/api/v3/{scope}actions/runners/deprecations/{version}"
+    ))
+}
+
+fn parse_deprecation_response(value: &serde_json::Value) -> DeprecationCheck {
+    fn parse_field(
+        value: &serde_json::Value,
+        name: &str,
+    ) -> std::result::Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        let Some(raw) = value.get(name) else {
+            return Err(format!("response is missing `{name}`"));
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| format!("`{name}` is not a string or null"))?;
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|date| Some(date.with_timezone(&chrono::Utc)))
+            .map_err(|error| format!("invalid `{name}` timestamp: {error}"))
+    }
+
+    match (
+        parse_field(value, "runtime_deprecates_at"),
+        parse_field(value, "registration_deprecates_at"),
+    ) {
+        (Ok(runtime_deprecates_at), Ok(registration_deprecates_at)) => DeprecationCheck::Known {
+            runtime_deprecates_at,
+            registration_deprecates_at,
+        },
+        (Err(error), _) | (_, Err(error)) => DeprecationCheck::Unverified(error),
+    }
+}
+
+/// Decide whether a deprecation lookup warrants a configure-time message.
+///
+/// `now` is injected so the date-window policy is deterministic in tests.
+fn deprecation_notice(
+    now: chrono::DateTime<chrono::Utc>,
+    check: &DeprecationCheck,
+) -> Option<DeprecationNotice> {
+    let (runtime_deprecates_at, registration_deprecates_at) = match check {
+        DeprecationCheck::Known {
+            runtime_deprecates_at,
+            registration_deprecates_at,
+        } => (runtime_deprecates_at, registration_deprecates_at),
+        DeprecationCheck::Unverified(reason) => {
+            return Some(DeprecationNotice::Unverified(reason.clone()));
+        }
+    };
+
+    let deadline = now + chrono::Duration::days(DEPRECATION_WARNING_DAYS);
+    let mut fields = Vec::new();
+    if let Some(date) = runtime_deprecates_at
+        .as_ref()
+        .filter(|date| **date <= deadline)
+    {
+        fields.push(format!("runtime_deprecates_at={}", date.to_rfc3339()));
+    }
+    if let Some(date) = registration_deprecates_at
+        .as_ref()
+        .filter(|date| **date <= deadline)
+    {
+        fields.push(format!("registration_deprecates_at={}", date.to_rfc3339()));
+    }
+    (!fields.is_empty()).then(|| {
+        DeprecationNotice::Warning(format!(
+            "advertised runner version {} is near GitHub deprecation ({}) — \
+             update `runner_version` in versions.toml",
+            crate::PROTOCOL_COMPAT_VERSION,
+            fields.join(", ")
+        ))
+    })
+}
+
+async fn warn_if_runner_version_deprecated(http: &HttpClient, target: &str) {
+    let Some(url) = deprecation_url(target) else {
+        return;
+    };
+    let check = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        http.get_json::<serde_json::Value>(&url),
+    )
+    .await
+    {
+        Ok(Ok(value)) => parse_deprecation_response(&value),
+        Ok(Err(error)) => DeprecationCheck::Unverified(format!("{error:#}")),
+        Err(_) => DeprecationCheck::Unverified("lookup timed out".to_owned()),
+    };
+    match deprecation_notice(chrono::Utc::now(), &check) {
+        Some(DeprecationNotice::Warning(message)) => warn!("{message}"),
+        Some(DeprecationNotice::Unverified(reason)) => {
+            info!("runner version deprecation status is unverified (non-fatal): {reason}");
+        }
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod deprecation_tests {
+    use super::*;
+
+    #[test]
+    fn warns_inside_runtime_window_and_names_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let check = DeprecationCheck::Known {
+            runtime_deprecates_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            registration_deprecates_at: None,
+        };
+        let notice = deprecation_notice(now, &check).expect("date is in warning window");
+        assert!(matches!(notice, DeprecationNotice::Warning(message) if
+            message.contains("runtime_deprecates_at=2026-10-20T00:00:00+00:00")));
+    }
+
+    #[test]
+    fn does_not_warn_for_a_distant_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let check = DeprecationCheck::Known {
+            runtime_deprecates_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-12-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            registration_deprecates_at: None,
+        };
+        assert!(deprecation_notice(now, &check).is_none());
+    }
+
+    #[test]
+    fn unreachable_lookup_is_unverified_not_fatal() {
+        let now = chrono::Utc::now();
+        let check = DeprecationCheck::Unverified("auth required".to_owned());
+        assert!(matches!(
+            deprecation_notice(now, &check),
+            Some(DeprecationNotice::Unverified(reason)) if reason == "auth required"
+        ));
+    }
+    #[test]
+    fn deprecation_url_scopes_github_repo_and_ghes_repo() {
+        assert_eq!(
+            deprecation_url("https://github.com/acme/project").unwrap(),
+            format!(
+                "https://api.github.com/repos/acme/project/actions/runners/deprecations/{}",
+                crate::PROTOCOL_COMPAT_VERSION
+            )
+        );
+        assert_eq!(
+            deprecation_url("https://ghes.example/acme/project").unwrap(),
+            format!(
+                "https://ghes.example/api/v3/repos/acme/project/actions/runners/deprecations/{}",
+                crate::PROTOCOL_COMPAT_VERSION
+            )
+        );
+        assert!(deprecation_url("http://127.0.0.1:9191").is_none());
     }
 }
 

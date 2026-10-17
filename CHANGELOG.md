@@ -34,6 +34,12 @@ Releases before v0.27.0 predate the changelog.
   read; the keychain entry is left in place.
 
 ### Fixed
+- **RunnerPool external control-plane seams and runner-version freshness**:
+  GitHub/GHES pools can keep a queue-free warm set with a fresh registration
+  credential per VM and a caller-supplied teardown hook, while engine mode
+  retains queue demand and purge behavior. The runner advertises the
+  `versions.toml` `runner_version` pin everywhere and warns at configure time
+  when GitHub reports an approaching runtime deprecation.
 
 - **The GitHub App JWT breaker is partitioned by App id**: one App's rate
   limit or outage no longer skips the webhook-health and delivery-watchdog

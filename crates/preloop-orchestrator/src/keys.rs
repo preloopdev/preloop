@@ -125,12 +125,32 @@ pub(crate) struct StagedKey {
 }
 
 impl StagedKey {
-    /// Write `params` to a private file under `directory`.
+    /// Write `params` to a private file named after `machine`.
     pub(crate) fn write(directory: &Path, machine: &str, params: &str) -> std::io::Result<Self> {
+        Self::write_named(directory, &format!("{machine}.json"), params)
+    }
+
+    /// Write an arbitrary short-lived secret to a private file.
+    pub(crate) fn write_named(
+        directory: &Path,
+        filename: &str,
+        contents: &str,
+    ) -> std::io::Result<Self> {
+        if filename.is_empty()
+            || filename.contains('/')
+            || filename.contains('\\')
+            || filename == "."
+            || filename == ".."
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staged secret filename must be a plain filename",
+            ));
+        }
         std::fs::create_dir_all(directory)?;
         restrict(directory, 0o700)?;
-        let path = directory.join(format!("{machine}.json"));
-        std::fs::write(&path, params)?;
+        let path = directory.join(filename);
+        std::fs::write(&path, contents)?;
         restrict(&path, 0o600)?;
         Ok(Self { path })
     }
