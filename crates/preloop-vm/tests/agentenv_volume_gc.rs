@@ -356,15 +356,15 @@ fn provider(
         ))
 }
 
-/// A provider that collects on its own: automatic mode, no timer (the trigger a
-/// populate fires is what these tests exercise), and a grace period long enough
-/// that only the planted leftovers are old.
+/// A provider that collects on its own: automatic mode, the given timer, and a
+/// grace period long enough that only the planted leftovers are old.
 fn collecting_engine(
     executable: &Path,
     home: &Path,
     gc_home: &Path,
     grace_secs: u64,
     keep_previous: usize,
+    interval: Duration,
 ) -> AgentEnvProvider {
     AgentEnvProvider::new(executable)
         .with_registry_path(home.join("machines.json"))
@@ -375,7 +375,7 @@ fn collecting_engine(
                 mode: Mode::Auto,
                 keep_previous,
                 grace: Duration::from_secs(grace_secs),
-                interval: Duration::ZERO,
+                interval,
             },
             Some(staging_path(gc_home)),
         ))
@@ -695,7 +695,14 @@ async fn a_populate_collects_a_superseded_volume_in_the_background() {
         .unwrap(),
     )
     .unwrap();
-    let provider = collecting_engine(&executable, home.path(), gc_home.path(), 3600, 0);
+    let provider = collecting_engine(
+        &executable,
+        home.path(),
+        gc_home.path(),
+        3600,
+        0,
+        Duration::ZERO,
+    );
 
     // One start publishes this engine's volume and asks for a pass. Nothing
     // waits for that pass, so the test waits for its effect instead.
@@ -719,6 +726,36 @@ async fn a_populate_collects_a_superseded_volume_in_the_background() {
         "the pass deleted it through aenv: {:?}",
         calls_for(&executable, "volume")
     );
+}
+
+#[tokio::test]
+async fn the_timer_collects_without_any_start() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let gc_home = tempfile::tempdir().unwrap();
+    let stale = "preloop-runner-999999999999";
+    plant_volume(&executable, stale);
+    fs::write(
+        home.path().join("agentenv-runner-volumes.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "volumes": { stale: { "created": gc::unix_now().saturating_sub(7200) } },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // A 50 ms period instead of six hours, so the test can watch the timer work:
+    // no machine, no populate, no pass asked for.
+    let provider = collecting_engine(
+        &executable,
+        home.path(),
+        gc_home.path(),
+        3600,
+        0,
+        Duration::from_millis(50),
+    );
+
+    gc::ensure_scheduled(&provider);
+    wait_for_volume_gone(&executable, stale).await;
 }
 
 #[tokio::test]
