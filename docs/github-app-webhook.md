@@ -15,7 +15,7 @@ status back to the repository.
 ### Supported events
 
 The webhook receiver understands every event the `EventAdapter` registry
-supports (`src/events/mod.rs`, `all_event_names()`):
+supports (`src/events/mod.rs`, `adapter_for`):
 
 
 | Tier                        | Events                                                                                                                                                                                      |

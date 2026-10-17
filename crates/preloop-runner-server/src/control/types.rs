@@ -1048,7 +1048,7 @@ pub(crate) struct RunQueueClaimability {
     /// The run's jobs in the ready queue (`queue_state = ready`).
     pub(crate) queued: usize,
     /// Registered runners whose capabilities
-    /// (`crate::runtime_scheduling::job_matches_runner_capabilities`) match at
+    /// (`crate::runtime_scheduling::job_matches_runner`) match at
     /// least one of those ready jobs. 0 when `queued` is 0.
     pub(crate) claimable: usize,
 }
