@@ -35,6 +35,8 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
+
 - **The GitHub App JWT breaker is partitioned by App id**: one App's rate
   limit or outage no longer skips the webhook-health and delivery-watchdog
   checks of the other Apps, and installation lookup, token minting, and App

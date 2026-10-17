@@ -1618,10 +1618,12 @@ fn resolve_config_sealing_key_with_store(
 ) -> anyhow::Result<[u8; 32]> {
     let key_path = dir.join(SECRETS_KEY_FILE);
     let file_key = read_sealing_key_file(&key_path)?;
-    match store.available() {
+    let resolved = match store.available() {
         Ok(()) => resolve_from_store(dir, &key_path, file_key, store, sealed),
         Err(error) => resolve_without_store(dir, &key_path, file_key, store, &error, sealed),
-    }
+    }?;
+    remember_resolved_sealing_key(dir, resolved)?;
+    Ok(resolved)
 }
 
 /// The store cannot be reached, so only the legacy file can supply the key.
@@ -1858,6 +1860,59 @@ fn authenticates_any(key: &[u8; 32], sealed: &[String]) -> bool {
         .any(|value| matches!(try_unseal_secret_value(key, value), Ok(Some(_))))
 }
 
+/// Config-secrets keys this process has resolved, by credential reference.
+///
+/// A config write can switch stores after the key was read from the old one.
+/// The keychain locks mid-session, setup falls back to the file store for a new
+/// credential, and the write that records the switch finds the file store
+/// without the sealing key. The process still holds the key that opened the
+/// sealed secrets, so the write carries that key across instead of failing and
+/// stranding the credential it was meant to record. The map stays private to
+/// this module and is never logged.
+static RESOLVED_SEALING_KEYS: std::sync::LazyLock<parking_lot::Mutex<BTreeMap<String, [u8; 32]>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(BTreeMap::new()));
+
+/// Record the key this process resolved for `dir`, for [`carry_resolved_sealing_key`].
+fn remember_resolved_sealing_key(dir: &Path, key: [u8; 32]) -> anyhow::Result<()> {
+    let reference = config_secrets_key_reference(dir)?;
+    RESOLVED_SEALING_KEYS
+        .lock()
+        .insert(reference.as_str().to_owned(), key);
+    Ok(())
+}
+
+/// Copy a key this process already resolved into `store` when `store` holds no
+/// key for `dir` and sealed values need one. Runs before a config write seals,
+/// so the write lands in the store that now owns the key. A key that does not
+/// open `sealed` is never copied.
+fn carry_resolved_sealing_key(
+    dir: &Path,
+    store: &dyn CredentialStore,
+    sealed: &[String],
+) -> anyhow::Result<()> {
+    if sealed.is_empty() || store.available().is_err() {
+        return Ok(());
+    }
+    let reference = config_secrets_key_reference(dir)?;
+    // A store that holds a key, or cannot be read, is left to resolution, which reports it.
+    if !matches!(store.get(&reference), Ok(None)) {
+        return Ok(());
+    }
+    let remembered = RESOLVED_SEALING_KEYS
+        .lock()
+        .get(reference.as_str())
+        .copied();
+    let Some(key) = remembered.filter(|key| authenticates_any(key, sealed)) else {
+        return Ok(());
+    };
+    store_and_verify_key(store, &reference, &key)?;
+    tracing::warn!(
+        store = store.name(),
+        "the store did not hold the config-secrets key; carried the key this process resolved into it"
+    );
+    Ok(())
+}
+
 /// Whether `store` verifiably holds `value` under `reference`: the write is
 /// accepted and a fresh read returns the same bytes. Checked before retiring a
 /// legacy `secrets.key`, so a credential that was only read through (a
@@ -2036,10 +2091,47 @@ fn is_sealed_envelope(stored: &str) -> bool {
         .is_some_and(|sealed| sealed.len() >= MIN_SEALED_ENVELOPE_LEN)
 }
 
-/// Structurally valid sealed values in raw config text. The text is scanned
-/// rather than parsed, so a damaged file cannot hide its sealed values from the
-/// key check.
+/// Structurally valid sealed values in the config text. Valid TOML is read
+/// through its secret tables, so a comment or an unrelated field can never
+/// count as a sealed value. Malformed TOML has no tables to read, so it is
+/// scanned as raw text instead: a damaged file must not hide its sealed values
+/// from the key check.
 fn sealed_envelopes_in_text(text: &str) -> Vec<String> {
+    match toml::from_str::<toml::Table>(text) {
+        Ok(document) => sealed_envelopes_in_document(&document),
+        Err(_) => sealed_envelopes_scanned(text),
+    }
+}
+
+/// The sealed values in a parsed config, in the scopes `for_each_secret_value`
+/// covers: global, per-repo, and per-environment.
+fn sealed_envelopes_in_document(document: &toml::Table) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut take = |value: &toml::Value| {
+        if let Some(text) = value.as_str().filter(|text| is_sealed_envelope(text)) {
+            found.push(text.to_owned());
+        }
+    };
+    if let Some(global) = document.get("secrets").and_then(toml::Value::as_table) {
+        global.values().for_each(&mut take);
+    }
+    if let Some(per_repo) = document.get("repo_secrets").and_then(toml::Value::as_table) {
+        for repo in per_repo.values().filter_map(toml::Value::as_table) {
+            repo.values().for_each(&mut take);
+        }
+    }
+    if let Some(per_repo) = document.get("env_secrets").and_then(toml::Value::as_table) {
+        for envs in per_repo.values().filter_map(toml::Value::as_table) {
+            for repo in envs.values().filter_map(toml::Value::as_table) {
+                repo.values().for_each(&mut take);
+            }
+        }
+    }
+    found
+}
+
+/// Raw-text scan: the fallback for a file that is not valid TOML.
+fn sealed_envelopes_scanned(text: &str) -> Vec<String> {
     text.match_indices(SEALED_SECRET_PREFIX)
         .filter_map(|(start, _)| {
             let rest = &text[start + SEALED_SECRET_PREFIX.len()..];
@@ -2080,6 +2172,7 @@ fn seal_config_secrets(
     // seals new ones.
     let mut sealed = on_disk.to_vec();
     sealed.extend(sealed_envelopes(config));
+    carry_resolved_sealing_key(dir, store, &sealed)?;
     let key = resolve_config_sealing_key_with_store(dir, store, &sealed)?;
     for_each_secret_value(config, |value| {
         // Only authenticated envelopes are already sealed. A plaintext secret
@@ -2245,6 +2338,22 @@ pub fn write_config(config: &ConfigFile) -> anyhow::Result<PathBuf> {
 
 /// Atomically write `config` to `path` with mode 0600.
 pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
+    // Same store selection as `load_config_from`; sealing with a different
+    // backend than unsealing makes the file unreadable.
+    let store = crate::credential_store::selected_store_for_config(
+        path,
+        config.credential_store.as_deref(),
+    )?;
+    write_sealed_config(path, config, store.as_ref())
+}
+
+/// Seal `config`'s secrets under `store`, then atomically write it to `path`
+/// with mode 0600.
+fn write_sealed_config(
+    path: &Path,
+    config: &ConfigFile,
+    store: &dyn CredentialStore,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
@@ -2254,14 +2363,8 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     // config keeps plaintext for the running process.
     let mut sealed = config.clone();
     if let Some(dir) = path.parent() {
-        // Same store selection as `load_config_from`; sealing with a different
-        // backend than unsealing makes the file unreadable.
-        let store = crate::credential_store::selected_store_for_config(
-            path,
-            sealed.credential_store.as_deref(),
-        )?;
         let on_disk = sealed_envelopes_on_disk(path)?;
-        seal_config_secrets(&mut sealed, dir, store.as_ref(), &on_disk)
+        seal_config_secrets(&mut sealed, dir, store, &on_disk)
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
     let text = toml::to_string_pretty(&sealed).context("serializing config")?;
@@ -2499,7 +2602,7 @@ mod tests {
 
     use crate::credential_store::{
         CREDENTIAL_STORE_ENV, CredentialWriter, FileCredentialStore, MemoryCredentialStore,
-        UnavailableCredentialStore, credential_store_dir, github_reference,
+        UnavailableCredentialStore, Written, credential_store_dir, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
@@ -3116,6 +3219,162 @@ REPO_OVERLAY = "repo-from-credential"
         found.sort();
         expected.sort();
         assert_eq!(found.len(), 3);
+        assert_eq!(found, expected);
+    }
+
+    /// A keychain stand-in that locks mid-test: every operation fails while locked.
+    #[derive(Clone, Default)]
+    struct LockableStore {
+        inner: MemoryCredentialStore,
+        locked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LockableStore {
+        fn lock(&self) {
+            self.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn check(&self) -> anyhow::Result<()> {
+            if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("keychain is locked");
+            }
+            Ok(())
+        }
+    }
+
+    impl CredentialStore for LockableStore {
+        fn get(&self, reference: &CredentialRef) -> anyhow::Result<Option<SecretString>> {
+            self.check()?;
+            self.inner.get(reference)
+        }
+
+        fn set(&self, reference: &CredentialRef, value: &SecretString) -> anyhow::Result<()> {
+            self.check()?;
+            self.inner.set(reference, value)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> anyhow::Result<()> {
+            self.check()?;
+            self.inner.delete(reference)
+        }
+
+        fn name(&self) -> &'static str {
+            "lockable keychain stand-in"
+        }
+
+        fn available(&self) -> anyhow::Result<()> {
+            self.check()
+        }
+    }
+
+    /// Regression (#655 follow-up, P1): setup falls back to the file store after
+    /// the keychain locks. The config write that records the switch must carry
+    /// the sealing key this process resolved into the file store. Failing instead
+    /// would strand the App key the fallback just stored.
+    #[test]
+    fn fallback_to_the_file_store_carries_the_resolved_sealing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let keychain = LockableStore::default();
+        let config = ConfigFile {
+            credential_store: Some("os".to_owned()),
+            secrets: BTreeMap::from([("DOCKERHUB_TOKEN".to_owned(), "abc123".to_owned())]),
+            ..ConfigFile::default()
+        };
+        // Sealing mints the key into the keychain; loading the file resolves it.
+        write_sealed_config(&path, &config, &keychain).unwrap();
+        let mut loaded: ConfigFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        unseal_config_secrets(&mut loaded, dir.path(), &keychain).unwrap();
+        assert_eq!(loaded.secrets["DOCKERHUB_TOKEN"], "abc123");
+
+        // The keychain locks mid-setup. The new App key falls back to the file
+        // store, and the setting flips the way `persist_secret` flips it.
+        keychain.lock();
+        let file = FileCredentialStore::new(credential_store_dir(&path));
+        let pem_ref = github_reference("app-pem", Some("123")).unwrap();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nAPP-KEY\n-----END RSA PRIVATE KEY-----\n";
+        let mut writer =
+            CredentialWriter::with_fallback(std::sync::Arc::new(keychain.clone()), file.clone());
+        let written = writer.write(&pem_ref, &SecretString::new(pem)).unwrap();
+        assert!(
+            matches!(written, Written::FileFallback { .. }),
+            "{written:?}"
+        );
+        loaded.credential_store = Some("file".to_owned());
+        loaded.github.app_pem_ref = Some(pem_ref.as_str().to_owned());
+
+        // The write that records the switch succeeds: it carries the sealing key
+        // into the file store, then references the App key.
+        write_sealed_config(&path, &loaded, &file)
+            .expect("the switch to the file store must not strand the App key");
+        assert_eq!(
+            file.get(&pem_ref)
+                .unwrap()
+                .map(|secret| secret.expose().to_owned()),
+            Some(pem.to_owned())
+        );
+        let mut reread: ConfigFile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reread.credential_store.as_deref(), Some("file"));
+        assert_eq!(reread.github.app_pem_ref.as_deref(), Some(pem_ref.as_str()));
+        // The file store alone opens the secrets now, and no key file was minted.
+        unseal_config_secrets(&mut reread, dir.path(), &file).unwrap();
+        assert_eq!(reread.secrets["DOCKERHUB_TOKEN"], "abc123");
+        assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    /// Regression (#655 follow-up, P2): a commented-out ciphertext sealed under
+    /// another key is not a sealed value. Counting it made both keys look like
+    /// they opened the secrets, so an ordinary config update failed as an
+    /// ambiguous conflict.
+    #[test]
+    fn commented_out_ciphertext_is_not_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let store = MemoryCredentialStore::default();
+        write_sealed_config(&path, &populated_config(), &store).unwrap();
+        // An old value under another key, kept as a comment and in an unrelated table.
+        let other_key = [0x66; 32];
+        let old = seal_secret_value(&other_key, "retired-token").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{text}\n# OLD_TOKEN = \"{old}\"\n\n[notes]\nold = \"{old}\"\n"),
+        )
+        .unwrap();
+        // A secrets.key from an earlier build holds the other key: the sources conflict.
+        write_sealing_key_file(&dir.path().join(SECRETS_KEY_FILE), &other_key).unwrap();
+
+        assert_eq!(
+            sealed_envelopes_on_disk(&path).unwrap().len(),
+            3,
+            "only the real secrets are evidence"
+        );
+        // The store's key opens the real secrets, so it wins and the superseded
+        // file is renamed aside.
+        write_sealed_config(&path, &populated_config(), &store)
+            .expect("a commented-out ciphertext must not make the conflict ambiguous");
+        assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+        assert_eq!(orphan_key_files(dir.path()).len(), 1);
+    }
+
+    /// Evidence is read from the secret tables of valid TOML, so it matches the
+    /// sealed values in every scope and ignores comments and unrelated tables.
+    #[test]
+    fn sealed_evidence_comes_from_the_secret_tables_of_valid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let mut text = toml::to_string_pretty(&sealed).unwrap();
+        let stray = seal_secret_value(&[0x77; 32], "value").unwrap();
+        text.push_str(&format!(
+            "# OLD = \"{stray}\"\n[notes]\nold = \"{stray}\"\n"
+        ));
+        let mut found = sealed_envelopes_in_text(&text);
+        let mut expected = sealed_envelopes(&sealed);
+        found.sort();
+        expected.sort();
+        assert_eq!(found.len(), 3, "one sealed value per scope");
         assert_eq!(found, expected);
     }
 
