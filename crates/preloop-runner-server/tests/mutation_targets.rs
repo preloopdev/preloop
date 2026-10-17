@@ -28,6 +28,8 @@ const INITDB_DIRS: [&str; 10] = [
     "/usr/lib/postgresql/16/bin",
 ];
 
+const EXCLUDED: &[(&str, &str)] = &[];
+
 const FLAKY_PG_TEST: &str = "control::tests::pg::prune_outbox_respects_slowest_consumer";
 
 struct Target {
@@ -351,9 +353,13 @@ fn run_sub(root: &Path, target: &Target, pg_url: Option<&str>, pg_required: Opti
     fs::create_dir_all(&scratch).expect("create mutation scratch dir");
     fs::create_dir_all(&out).expect("create mutants.out target directory");
 
+    let exclude_re = std::iter::once(target.exclude_re.to_string())
+        .chain(EXCLUDED.iter().map(|(pattern, _)| (*pattern).to_string()))
+        .collect::<Vec<_>>()
+        .join("|");
     let mut cmd = Command::new("cargo");
     cmd.args(["mutants", "--baseline", "run"])
-        .args(["--exclude-re", target.exclude_re])
+        .args(["--exclude-re", exclude_re.as_str()])
         .arg("--output")
         .arg(&out)
         .args(target.args);
@@ -548,6 +554,30 @@ fn triage(target_id: &str, report: &Path, scope: &str, files: &[String]) {
     if rows.is_empty() {
         return;
     }
+    let mut verdicts = std::collections::BTreeMap::new();
+    for row in &rows {
+        let mut fields = row.split('|');
+        let verdict = fields.nth(3).unwrap_or("unknown").trim().to_string();
+        *verdicts.entry(verdict).or_insert(0usize) += 1;
+    }
+    let caught = fs::read_to_string(report.join("caught.txt"))
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    let gaps = verdicts.get("real_gap").copied().unwrap_or(0);
+    let score = if caught + gaps == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.0}%", 100.0 * caught as f64 / (caught + gaps) as f64)
+    };
+    let breakdown = verdicts
+        .iter()
+        .map(|(verdict, count)| format!("{verdict}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "mutation target {target_id}: triage {breakdown} caught={caught} score={score} \
+         (caught / (caught + real_gap))"
+    );
 
     let mut markdown =
         String::from("| # | survivor | verdict | confidence |\n| --- | --- | --- | --- |\n");
