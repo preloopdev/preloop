@@ -273,6 +273,15 @@ Releases before v0.27.0 predate the changelog.
   The delete path now SIGKILLs only that machine's hypervisor (attributed by
   the boot-config path in its argv, never a neighboring machine's), retries
   the delete, and detaches an orphaned layer mount if one remains.
+- **A dropped GitHub connection no longer blocks a push as a user error**: the
+  dirty-push sync verifies the branch head with a read-only GitHub call, and
+  its first transport failure was reported as "branch … not found … did the
+  client push the materialized commit?" (HTTP 400) after permanently marking
+  the push blocked. Read-only GitHub calls now retry transport failures
+  (three attempts, short backoff); writes are never replayed. A transport
+  failure that persists says "transport error" and answers 502, an upstream
+  outage, not a client mistake. This also removes a flaky CI test
+  (`dirty_push_sync_verifies_the_branch_head_…`).
 
 ## [0.34.0] - 2026-10-09
 
