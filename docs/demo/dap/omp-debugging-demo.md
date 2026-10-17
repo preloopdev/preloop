@@ -38,16 +38,26 @@ asciinema play docs/demo/dap/demo.cast
 
 ## Re-run the demo yourself
 
-Prerequisites: the local DAP transport fix in
-`crates/preloop-runner-server/src/runs.rs` (sends a valid local-mode
-`debuggerTunnel` in the job message; without it the runner refuses to start
-the debugger), built binaries, `asciinema`, and `omp`.
+Prerequisites: the current checkout (including the DAP transport support),
+built binaries, `asciinema`, `omp`, and Python 3. The demo's helper prompt
+expects its files under `/tmp/dapdemo`; create that layout from the repository
+root before starting the engine:
 
 ```sh
 cargo build --release -p preloop-runner-server -p preloop-runner
+mkdir -p /tmp/dapdemo/runner
+cp docs/demo/dap/demo.yml docs/demo/dap/payload-release.json \
+  docs/demo/dap/payload-prod.json docs/demo/dap/submit.sh \
+  docs/demo/dap/dapctl docs/demo/dap/agent-prompt.md /tmp/dapdemo/
+cp target/release/preloop-runner /tmp/dapdemo/runner/
+chmod +x /tmp/dapdemo/submit.sh /tmp/dapdemo/dapctl
+```
 
-# 1. engine (permissive registration for the demo runner)
-# Set this same variable in every client terminal; do not print it.
+Start the engine in one terminal. This demo-only permissive registration
+setting is restricted to loopback and must not be used on an exposed listener.
+Set the system token in every client terminal; do not print it.
+
+```sh
 export PRELOOP_SYSTEM_TOKEN="${PRELOOP_SYSTEM_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 PRELOOP_REGISTRATION_POLICY=permissive \
 PRELOOP_PUBLIC_URL=http://127.0.0.1:9191 \
@@ -56,25 +66,28 @@ target/release/preloop-server serve --listen 127.0.0.1:9191 \
   --state-dir /tmp/dapdemo/server-state --enable-test-api --test-api-token dev-token
 ```
 
+In a second terminal, start the runner:
+
 ```sh
-# 2. runner (30 min window to attach the debugger)
-mkdir -p /tmp/dapdemo/runner && cd /tmp/dapdemo/runner
+cd /tmp/dapdemo/runner
 ACTIONS_RUNNER_DAP_CONNECTION_TIMEOUT=30 \
-  ../../target/release/preloop-runner configure --url http://127.0.0.1:9191 \
+  ./preloop-runner configure --url http://127.0.0.1:9191 \
   --token dummy-token --name demo-runner --unattended --no-externals
 ACTIONS_RUNNER_DAP_CONNECTION_TIMEOUT=30 \
-  ../../target/release/preloop-runner run
+  ./preloop-runner run
+```
 
-# 3. record the agent
-cd docs/demo/dap
-asciinema rec demo-again.cast --command \
+In a third terminal, start the agent from the copied demo directory:
+
+```sh
+cd /tmp/dapdemo
+export PRELOOP_SYSTEM_TOKEN='<same token as the engine terminal>'
+PATH="/tmp/dapdemo:$PATH" asciinema rec demo-again.cast --command \
   "omp --auto-approve --cwd . @agent-prompt.md"
 ```
 
-Run the client commands above in the shell that exported
-`PRELOOP_SYSTEM_TOKEN`, or export the same value in each client terminal.
-`agent-prompt.md` consumes the variable directly; it does not contain a
-credential.
+The `agent-prompt.md` reads the token from the environment; it does not
+contain a credential.
 
 ## Files
 

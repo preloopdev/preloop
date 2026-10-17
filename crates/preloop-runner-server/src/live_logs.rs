@@ -335,6 +335,11 @@ pub fn live_log_sender(
 /// Idempotent, and safe to call for a job that never streamed a line.
 pub fn close_live_log(inner: &mut InnerState, key: &str) {
     inner.live_log_closed.insert(key.to_string());
+    inner
+        .live_log_close_epochs
+        .entry(key.to_string())
+        .and_modify(|epoch| *epoch = epoch.saturating_add(1))
+        .or_insert(1);
     inner.live_log_tx.remove(key);
 }
 
@@ -352,7 +357,11 @@ pub async fn ws_live_logs(
     // agent job id in its `FeedStreamUrl`; the system credential bypasses.
     let bearer = crate::auth::bearer_from_headers(&headers)
         .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
-    if bearer != shared.state.system_token {
+    // The liveness subject for the socket's lifetime: the upgrade-time gate
+    // is one-shot, so frames that would *reopen* a closed feed re-prove
+    // liveness against this identity inside `record_live_log_wrapper`.
+    // The system credential bypasses, matching the results-plane rule.
+    let live_subject: Option<uuid::Uuid> = if bearer != shared.state.system_token {
         // Verify the credential first: a malformed or expired token is a 401
         // no matter what the target is.
         shared
@@ -392,16 +401,24 @@ pub async fn ws_live_logs(
         {
             return Err(ApiError::forbidden("live-log ingest job is not live"));
         }
-    }
-    Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
+        Some(agent_job_id)
+    } else {
+        None
+    };
+    Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared, live_subject)))
 }
 
 pub async fn handle_live_log_socket(
     mut socket: WebSocket,
     job_id: String,
     shared: Arc<SharedState>,
+    live_subject: Option<uuid::Uuid>,
 ) {
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    // Once a frame proves this socket's credential stale, reject every later
+    // frame without another backend lookup, even if another writer reopens
+    // the same key for a retry.
+    let mut stale_rejection_latched = false;
     loop {
         let message = match tokio::time::timeout(IDLE_TIMEOUT, socket.next()).await {
             Ok(Some(msg)) => msg,
@@ -416,7 +433,14 @@ pub async fn handle_live_log_socket(
                 match serde_json::from_str::<LiveLogFeedLinesWrapper>(&text) {
                     Ok(mut wrapper) => {
                         wrapper.count = wrapper.value.len();
-                        record_live_log_wrapper(&shared, &job_id, wrapper).await;
+                        record_live_log_wrapper_for_socket(
+                            &shared,
+                            &job_id,
+                            wrapper,
+                            live_subject,
+                            &mut stale_rejection_latched,
+                        )
+                        .await;
                     }
                     Err(error) => warn!(%error, %job_id, "invalid live log websocket payload"),
                 }
@@ -437,16 +461,90 @@ pub async fn handle_live_log_socket(
 }
 /// Record one live-log wrapper under a canonical run/job key.
 ///
-/// The global and per-job locks are acquired in that order and held through
-/// the retained-buffer push and broadcast. `live_log_stream` uses the same
-/// ordering for its snapshot/subscription pair, which makes the handoff
-/// atomic from a follower's perspective.
+/// Direct callers get a fresh stale-frame latch; a WebSocket uses the
+/// socket-scoped helper below so a rejected credential cannot repeat the
+/// backend lookup on later frames.
 pub async fn record_live_log_wrapper(
     shared: &Arc<SharedState>,
     job_id: &str,
     wrapper: LiveLogFeedLinesWrapper,
+    live_subject: Option<uuid::Uuid>,
 ) {
-    let mut inner = shared.state.inner.lock().await;
+    let mut stale_rejection_latched = false;
+    record_live_log_wrapper_for_socket(
+        shared,
+        job_id,
+        wrapper,
+        live_subject,
+        &mut stale_rejection_latched,
+    )
+    .await;
+}
+
+/// Record a frame while carrying the stale-frame rejection latch for one
+/// WebSocket. The backend liveness proof runs outside `AppState.inner`; the
+/// close epoch prevents a settle that races that proof from being reopened.
+async fn record_live_log_wrapper_for_socket(
+    shared: &Arc<SharedState>,
+    job_id: &str,
+    wrapper: LiveLogFeedLinesWrapper,
+    live_subject: Option<uuid::Uuid>,
+    stale_rejection_latched: &mut bool,
+) {
+    let reopen_epoch = {
+        let mut inner = shared.state.inner.lock().await;
+        if live_subject.is_some() && *stale_rejection_latched {
+            return;
+        }
+        if !inner.live_log_closed.contains(job_id) || live_subject.is_none() {
+            record_live_log_wrapper_locked(&mut inner, job_id, wrapper).await;
+            return;
+        }
+        Some(
+            inner
+                .live_log_close_epochs
+                .get(job_id)
+                .copied()
+                .unwrap_or_default(),
+        )
+    };
+
+    if let (Some(subject), Some(reopen_epoch)) = (live_subject, reopen_epoch) {
+        if !crate::auth::job_is_live(&shared.state, subject)
+            .await
+            .unwrap_or(false)
+        {
+            *stale_rejection_latched = true;
+            warn!(%job_id, "dropping live-log frame that would reopen a settled job's feed");
+            return;
+        }
+
+        let mut inner = shared.state.inner.lock().await;
+        if inner
+            .live_log_close_epochs
+            .get(job_id)
+            .copied()
+            .unwrap_or_default()
+            != reopen_epoch
+        {
+            *stale_rejection_latched = true;
+            warn!(%job_id, "dropping live-log frame after a concurrent feed close");
+            return;
+        }
+        record_live_log_wrapper_locked(&mut inner, job_id, wrapper).await;
+    } else {
+        let mut inner = shared.state.inner.lock().await;
+        record_live_log_wrapper_locked(&mut inner, job_id, wrapper).await;
+    }
+}
+
+/// Push and broadcast a frame while `inner` is held. This helper contains no
+/// backend calls, so callers may safely await the per-job buffer lock here.
+async fn record_live_log_wrapper_locked(
+    inner: &mut InnerState,
+    job_id: &str,
+    wrapper: LiveLogFeedLinesWrapper,
+) {
     // Fresh lines for a key we had marked complete mean the job is producing
     // again (a retry reusing the same agent job). Reopen it and replace the
     // prior attempt's retained tail before broadcasting.
@@ -456,7 +554,7 @@ pub async fn record_live_log_wrapper(
         .entry(job_id.to_string())
         .or_default()
         .clone();
-    let tx = live_log_sender(&mut inner, job_id);
+    let tx = live_log_sender(inner, job_id);
     let mut lines = lines_arc.lock().await;
     if reopened {
         lines.clear();
@@ -491,7 +589,7 @@ pub async fn record_live_log_wrapper_for_run(
         .unwrap_or(None)
         .map(|(key, _)| key)
         .unwrap_or_else(|| job_id.to_owned());
-    record_live_log_wrapper(shared, &key, wrapper).await;
+    record_live_log_wrapper(shared, &key, wrapper, None).await;
 }
 
 #[cfg(test)]

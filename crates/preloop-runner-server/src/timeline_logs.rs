@@ -585,7 +585,9 @@ pub async fn console_log(
                 )
                 .await;
             }
-            None => crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper).await,
+            None => {
+                crate::live_logs::record_live_log_wrapper(&shared, &plan_id, wrapper, None).await
+            }
         }
     }
     StatusCode::OK
@@ -653,6 +655,7 @@ pub async fn finish_job(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(event): Json<azdo::JobCompletedEvent>,
+    authorized: Option<TaskAgentJobRequestRecord>,
 ) -> Json<serde_json::Value> {
     let status = task_result_status(event.result);
     let outputs = event
@@ -660,37 +663,52 @@ pub async fn finish_job(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect();
-    let callback = shared
-        .state
-        .backend
-        .callback_job(&plan_id, Some(event.timeline_id), Some(event.job_id))
-        .await
-        .unwrap_or(None);
-    // Compatibility: when no request carries this callback's identifiers,
-    // fall back to the single in-flight request (old runners); failing
-    // that, a plan id that *is* a run id still completes the job record.
-    let resolved = match callback {
-        Some(callback) => Some((
-            callback.request_id,
-            callback.run_id,
-            callback.job_id,
-            Some(callback.agent_job_id),
+    // The token was already bound to `authorized` by `authorize_reporting_callback`:
+    // complete that exact request, and only it. Re-resolving here — with the
+    // `sole_inflight_request` fallback — could complete a different request
+    // than the token was authorized against. The heuristic fallbacks below
+    // remain for the system credential, which bypasses request binding.
+    let resolved = match authorized {
+        Some(request) => Some((
+            request.request_id,
+            request.run_id,
+            request.job_id,
+            Some(request.agent_job_id),
         )),
-        None => shared
-            .state
-            .backend
-            .sole_inflight_request()
-            .await
-            .unwrap_or(None)
-            .map(|(request_id, run_id, job_id, agent_job_id)| {
-                (request_id, run_id, job_id, Some(agent_job_id))
-            })
-            .or_else(|| {
-                plan_id
-                    .parse::<RunId>()
-                    .ok()
-                    .map(|run_id| (0, run_id, JobId(event.job_id.to_string()), None))
-            }),
+        None => {
+            let callback = shared
+                .state
+                .backend
+                .callback_job(&plan_id, Some(event.timeline_id), Some(event.job_id))
+                .await
+                .unwrap_or(None);
+            // Compatibility: when no request carries this callback's identifiers,
+            // fall back to the single in-flight request (old runners); failing
+            // that, a plan id that *is* a run id still completes the job record.
+            match callback {
+                Some(callback) => Some((
+                    callback.request_id,
+                    callback.run_id,
+                    callback.job_id,
+                    Some(callback.agent_job_id),
+                )),
+                None => shared
+                    .state
+                    .backend
+                    .sole_inflight_request()
+                    .await
+                    .unwrap_or(None)
+                    .map(|(request_id, run_id, job_id, agent_job_id)| {
+                        (request_id, run_id, job_id, Some(agent_job_id))
+                    })
+                    .or_else(|| {
+                        plan_id
+                            .parse::<RunId>()
+                            .ok()
+                            .map(|run_id| (0, run_id, JobId(event.job_id.to_string()), None))
+                    }),
+            }
+        }
     };
     let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
         if request_id != 0 {
@@ -865,6 +883,7 @@ pub async fn finish_job_plan(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     Json(event): Json<serde_json::Value>,
+    authorized: Option<TaskAgentJobRequestRecord>,
 ) -> Json<serde_json::Value> {
     let result_str = event
         .get("result")
@@ -894,30 +913,43 @@ pub async fn finish_job_plan(
         "finish_job_plan"
     );
 
-    let callback = shared
-        .state
-        .backend
-        .callback_job(&plan_id, None, None)
-        .await
-        .unwrap_or(None);
+    // The token was already bound to `authorized`: complete that exact
+    // request, never the heuristic fallback below. The fallbacks remain for
+    // the system credential, which bypasses request binding.
     // Compatibility fallback: the single in-flight request, when exactly
     // one exists (older runners correlate only by plan).
-    let resolved = match callback {
-        Some(callback) => Some((
-            callback.request_id,
-            callback.run_id,
-            callback.job_id,
-            Some(callback.agent_job_id),
+    let resolved = match authorized {
+        Some(request) => Some((
+            request.request_id,
+            request.run_id,
+            request.job_id,
+            Some(request.agent_job_id),
         )),
-        None => shared
-            .state
-            .backend
-            .sole_inflight_request()
-            .await
-            .unwrap_or(None)
-            .map(|(request_id, run_id, job_id, agent_job_id)| {
-                (request_id, run_id, job_id, Some(agent_job_id))
-            }),
+        None => {
+            let callback = shared
+                .state
+                .backend
+                .callback_job(&plan_id, None, None)
+                .await
+                .unwrap_or(None);
+            match callback {
+                Some(callback) => Some((
+                    callback.request_id,
+                    callback.run_id,
+                    callback.job_id,
+                    Some(callback.agent_job_id),
+                )),
+                None => shared
+                    .state
+                    .backend
+                    .sole_inflight_request()
+                    .await
+                    .unwrap_or(None)
+                    .map(|(request_id, run_id, job_id, agent_job_id)| {
+                        (request_id, run_id, job_id, Some(agent_job_id))
+                    }),
+            }
+        }
     };
     let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
         // Settle is a guarded UPDATE — an already-settled row keeps its
@@ -959,7 +991,7 @@ pub async fn authorize_reporting_callback(
     plan_id: &str,
     timeline_id: Option<uuid::Uuid>,
     agent_job_id: Option<uuid::Uuid>,
-) -> Result<(), ApiError> {
+) -> Result<Option<TaskAgentJobRequestRecord>, ApiError> {
     use crate::control::backend::RequestKey;
     let keys = [
         agent_job_id.map(RequestKey::AgentJobId),
@@ -978,7 +1010,8 @@ pub async fn authorize_reporting_callback(
         }
     }
     let request = request.filter(|request| request.plan_id == plan_id);
-    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
+    crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())?;
+    Ok(request)
 }
 
 /// [`authorize_reporting_callback`] for routes that *mutate* the run's
@@ -1072,8 +1105,9 @@ pub async fn finish_job_authenticated(
     headers: HeaderMap,
     Json(event): Json<azdo::JobCompletedEvent>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_reporting_callback(&shared, &headers, &path.2, None, Some(event.job_id)).await?;
-    Ok(finish_job(State(shared), Path(path), Json(event)).await)
+    let request =
+        authorize_reporting_callback(&shared, &headers, &path.2, None, Some(event.job_id)).await?;
+    Ok(finish_job(State(shared), Path(path), Json(event), request).await)
 }
 
 pub async fn finish_job_plan_authenticated(
@@ -1086,8 +1120,9 @@ pub async fn finish_job_plan_authenticated(
         .get("jobId")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| value.parse().ok());
-    authorize_reporting_callback(&shared, &headers, &plan_id, None, agent_job_id).await?;
-    Ok(finish_job_plan(State(shared), Path(plan_id), Json(event)).await)
+    let request =
+        authorize_reporting_callback(&shared, &headers, &plan_id, None, agent_job_id).await?;
+    Ok(finish_job_plan(State(shared), Path(plan_id), Json(event), request).await)
 }
 
 pub async fn patch_timeline_records_plan_authenticated(

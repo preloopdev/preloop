@@ -387,7 +387,7 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            preloop_runner_server::credential_store::load_engine_token_from_env(&preloop_home())
+            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
                 .ok()
                 .flatten()
         })
@@ -401,7 +401,7 @@ pub(crate) fn api_token() -> Option<String> {
             if home == cwd_default {
                 return None;
             }
-            preloop_runner_server::credential_store::load_engine_token_from_env(&cwd_default)
+            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
                 .ok()
                 .flatten()
         })
@@ -633,6 +633,16 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
 
 #[cfg(test)]
 pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes every test that reads or writes process-global environment
+/// variables (`PRELOOP_HOME`, `PRELOOP_CONFIG`, `PRELOOP_CREDENTIAL_STORE`,
+/// `PRELOOP_TOKEN`, `HOME`, …). Process env is per-process state, so parallel
+/// test threads would otherwise race each other's `set_var`/`remove_var`
+/// pairs and observe each other's transient values across modules. Sync
+/// tests take it with [`tokio::sync::Mutex::blocking_lock`]; async tests with
+/// `lock().await`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A fake `smolvm` on PATH that records the sandbox environment it was given
 /// and answers the debug-session byte-count probe. Serialized with
@@ -1490,6 +1500,31 @@ async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
         .is_ok()
 }
 
+/// The last lines the engine wrote to `engine.log` at or after `offset`, which
+/// hold its own exit error. Empty when the log cannot be read.
+fn engine_log_tail(path: &std::path::Path, offset: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_LINES: usize = 20;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut file| {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_to_end(&mut bytes)
+    });
+    if read.is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
+    if tail.is_empty() {
+        return String::new();
+    }
+    format!("\n{}\n(full log: {})", tail.join("\n"), path.display())
+}
+
 async fn ensure_engine_running() -> anyhow::Result<()> {
     if std::env::var("PRELOOP_URL").is_ok() {
         return Ok(());
@@ -1523,7 +1558,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
         );
     }
 
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_dir);
+    let store = preloop_runner_server::credential_store::engine_store(&preloop_dir)?;
     let token = prepare_engine_token(
         &preloop_dir,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
@@ -1536,14 +1571,23 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     cmd.arg("engine");
     cmd.env("PRELOOP_SYSTEM_TOKEN", token);
     cmd.env("PRELOOP_HOME", &preloop_dir);
+    // Lets the engine record in serve.lock that a preloop command started it,
+    // so a second `preloop serve` names the right way to stop it.
+    cmd.env(
+        preloop_runner_server::bootstrap::ENGINE_ORIGIN_ENV,
+        preloop_runner_server::bootstrap::EngineOrigin::Background.as_str(),
+    );
     if std::env::var_os("RUST_LOG").is_none() {
         cmd.env("RUST_LOG", "info,preloop=debug");
     }
 
+    let engine_log = preloop_dir.join("engine.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(preloop_dir.join("engine.log"))?;
+        .open(&engine_log)?;
+    // Where this start's output begins, so a failed start quotes only its own error.
+    let log_offset = log_file.metadata()?.len();
 
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(log_file.try_clone()?);
@@ -1559,7 +1603,10 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     while start.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("engine exited before becoming ready: {status}");
+            anyhow::bail!(
+                "engine exited before becoming ready: {status}{}",
+                engine_log_tail(&engine_log, log_offset)
+            );
         }
         if client
             .get(format!("{url}/healthz"))
@@ -1629,7 +1676,7 @@ fn prepare_engine_token(
     )
 }
 
-/// Move any inline GitHub credential in `config` into the OS credential
+/// Move any inline GitHub credential in `config` into the selected credential
 /// store, returning whether anything moved.
 ///
 /// Only the `legacy_*` fields are inspected, and those are populated purely
@@ -1817,7 +1864,11 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
     let mut file_config = preloop_runner_server::config::load_config()?;
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
+    let config_path = preloop_runner_server::config::config_path();
+    let store = preloop_runner_server::credential_store::selected_store_for_config(
+        &config_path,
+        file_config.credential_store.as_deref(),
+    )?;
     // Read before migrating: migration moves the inline values out of
     // `config.github`, and the freshly stored ones are not re-resolved here.
     let from_file = github_auth::StoredAuth {
@@ -1828,9 +1879,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     };
     if migrate_legacy_github_credentials(&mut file_config, store.as_ref())? {
         preloop_runner_server::config::write_config(&file_config)?;
-        eprintln!(
-            "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
-        );
+        eprintln!("[preloop] migrated legacy GitHub credentials to the credential store");
     }
     auth.fill_gaps(from_file);
 
@@ -1862,7 +1911,7 @@ async fn cmd_engine(
 
     // Keep AppState's resolver on the same engine home as this CLI.
     unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-    let store = preloop_runner_server::credential_store::store_from_env(&home);
+    let store = preloop_runner_server::credential_store::engine_store(&home)?;
     let token = prepare_engine_token(
         &home,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
@@ -5801,12 +5850,8 @@ mod tests {
         // reason is the server error, inside the backoff window.
     }
 
-    /// Serializes tests that mutate process-global env vars read by
-    /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
-    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
-    /// race each other's set_var/remove_var pairs.
-    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env-var serialization for these tests lives in the crate-wide
+    // [`crate::TEST_ENV_LOCK`].
 
     mod github_credential_migration {
         use super::super::migrate_legacy_github_credentials;
@@ -6109,7 +6154,7 @@ mod tests {
 
     #[test]
     fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("1", 1),
             (" 8 ", 8),
@@ -6131,7 +6176,7 @@ mod tests {
 
     #[test]
     fn runner_storage_gib_ignores_invalid_or_zero_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("80", 80),
             (" 96 ", 96),
@@ -6223,7 +6268,7 @@ mod tests {
     /// `PRELOOP_RUNNER_BASE_IMAGE` still overrides it.
     #[test]
     fn the_pool_reads_the_golden_init_recorded() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut config = preloop_runner_server::config::ConfigFile::default();
@@ -6291,7 +6336,7 @@ mod tests {
     /// it forever and idle runners would be replaced forever.
     #[test]
     fn only_the_official_golden_keeps_environment_replacement() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
         // the construction reaches the base-image decision.
@@ -6389,7 +6434,7 @@ mod tests {
 
     #[test]
     fn packed_artifact_cache_key_tracks_base_image_digest() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -7020,6 +7065,7 @@ mod tests {
     #[tokio::test]
     async fn shell_spawn_carries_the_sandbox_environment() {
         let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let (directory, executable) = crate::fake_smolvm_on_path();
         let previous_path = std::env::var_os("PATH");
         let previous_home = std::env::var_os("PRELOOP_HOME");
@@ -7653,8 +7699,7 @@ mod tests {
     /// the probe must still arrive without an `Authorization` header.
     #[tokio::test]
     async fn health_probe_sends_no_authorization_header() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _env_guard = ENV_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let saw_authorization = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_authorization_clone = std::sync::Arc::clone(&saw_authorization);
         let app = axum::Router::new().route(
@@ -7689,5 +7734,25 @@ mod tests {
             !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
             "the /healthz probe must not send an Authorization header"
         );
+    }
+
+    #[test]
+    fn engine_log_tail_quotes_only_this_starts_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("engine.log");
+        let previous = "previous run\nold error\n";
+        std::fs::write(&log, previous).unwrap();
+        let offset = u64::try_from(previous.len()).unwrap();
+        std::fs::write(
+            &log,
+            format!("{previous}starting engine\nError: unlock the login keychain\n"),
+        )
+        .unwrap();
+
+        let tail = engine_log_tail(&log, offset);
+        assert!(tail.contains("Error: unlock the login keychain"), "{tail}");
+        assert!(!tail.contains("old error"), "{tail}");
+        assert!(tail.contains(&log.display().to_string()), "{tail}");
+        assert_eq!(engine_log_tail(&dir.path().join("missing.log"), 0), "");
     }
 }

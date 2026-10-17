@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
+  the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
+  release digest and GitHub artifact attestation. Pin a release with
+  `mise use -g github:preloopdev/preloop@<version>`. See the
+  [Quick start](README.md#quick-start).
+
+- **Dev tools pinned in `mise.toml`.** `mise install` provides zig, cargo-zigbuild,
+  ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
+  cargo-zigbuild match `release-runner.yml`.
+
+### Changed
+
+- **The file credential store is the default.** The engine token, GitHub App
+  private key, PAT, and webhook secrets are written to `0600` files under
+  `$PRELOOP_HOME/credentials` instead of the OS keychain. GitHub credentials
+  follow the config file, so a `PRELOOP_CONFIG` outside `$PRELOOP_HOME` gets a
+  `credentials` directory beside it. Select the keychain with
+  `credential_store = "os"` in `config.toml` or `PRELOOP_CREDENTIAL_STORE=os`.
+  The environment variable overrides the config key, and an unknown value in
+  either is an error that names the valid choices. Credentials an earlier build
+  kept in the keychain are copied into the file store the first time they are
+  read; the keychain entry is left in place.
+
 ### Fixed
 
 - **Local composite actions may call remote actions**: a workflow's local
@@ -22,6 +47,60 @@ Releases before v0.27.0 predate the changelog.
   installation token for that repository. A manifest that cannot be read still
   fails closed, and every other action stays denied.
 
+- **The GitHub App JWT breaker is partitioned by App id**: one App's rate
+  limit or outage no longer skips the webhook-health and delivery-watchdog
+  checks of the other Apps, and installation lookup, token minting, and App
+  reads now go through the breaker and the `app-auth` consumption counters.
+  A pass that skips an App behind its breaker no longer counts as a successful
+  watchdog poll, so `webhook_watchdog_stale` still fires while any App's
+  deliveries go unwatched; a held-back App stays visible in the health snapshot
+  as explicitly unchecked and keeps its own check time instead of inheriting
+  the pass's, and App JWT responses charge their advertised bytes to the
+  consumption counters.
+
+- **A locked credential store no longer replaces the config-secrets key.** Sealed
+  `[secrets]` values are opened with the key the credential store holds. When
+  that store was locked, the engine minted a new key over them, so every start
+  failed with `store envelope authentication failed`, and after unlocking it
+  failed with `config-secrets key conflict`. Preloop now refuses to mint while
+  sealed values exist and names what to unlock. A `secrets.key` that disagrees
+  with the store is settled by which key opens the sealed values, and the losing
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
+  background engine start now prints the engine's last log lines (#653).
+
+- **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
+  RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
+  extraction) flagged by `cargo audit`.
+- **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
+  replayed on one node waited for the other nodes' five-second queue poll before
+  it was claimed. The committing node now sends one coalesced `preloop_webhooks`
+  notification after its commit, and each peer's worker wakes on it.
+- **A GitHub App's private key survives an OS keychain failure.** With
+  `credential_store = "os"`, an unavailable keychain or a refused write now
+  stores the credential in the file store, prints a warning naming the
+  directory, and records `credential_store = "file"` in `config.toml`. Before,
+  `preloop setup github` aborted after GitHub had issued the one-time App key,
+  and headless setups stored secrets inline in `config.toml`. Setup also loads
+  the config before creating the App, so a config error cannot strand the key.
+  The manifest flow also persists converted credentials before waiting for the
+  optional installation redirect, so an install timeout or Ctrl-C cannot lose
+  the one-time PEM.
+
+- **`preloop serve` explains a `serve.lock` collision.** A second engine on the same
+  state directory reports the recorded holder's pid, start time, and how it was
+  started (a preloop command's autostart, a systemd service, or another terminal).
+  On Linux, when `/proc/locks` proves that pid holds the lock, it also prints how to
+  stop it; for systemd that is `sudo systemctl stop preloop.socket preloop.service`,
+  since the socket unit would otherwise start the service again. Otherwise the pid is
+  shown as unverified, with a command to find the holder, and no stop command is
+  suggested.
+
+- **Action credential minting is liveness- and identity-bound** (#468):
+  ActionDownloadInfo and runnerresolve accept only the system credential or a
+  Results job runtime token, bind that token to the requested plan/job, and
+  re-check job liveness after action-reference resolution before signing
+  bearerless download tickets.
+
 - **Large replay step logs are retained** (#599): signed
   `/replay/results/*` uploads now accept bodies up to 64 MiB instead of
   inheriting Axum's 2 MiB default, so long failing steps remain available for
@@ -32,6 +111,20 @@ Releases before v0.27.0 predate the changelog.
   cache chunks stream to disk up to the existing 512 MiB upload budget instead
   of inheriting Axum's 2 MiB default. Oversized requests still get a
   deterministic 413 without buffering the whole cache chunk in RAM.
+
+- **Runner-side `github.event` arrays decode correctly** (#571): the
+  runner's typed-context decoder used a legacy `{"t":1,"d":…}` tag map while
+  the wire codec serializes arrays as `{"t":1,"a":[…]}`. Nested arrays inside
+  `github.event` (labels, commits, head-commit fields) arrived as `null`, so
+  step env/condition expressions such as
+  `contains(github.event.pull_request.labels.*.name, 'x')` always evaluated
+  false and label-gated workflows never saw their labels.
+
+- **Partial merged job logs no longer hide step logs**: a failed temporary
+  log-file flush no longer produces an apparently complete but truncated
+  merged upload, and the logs endpoint falls back to the larger per-step
+  representation when one exists. This preserves mutation and other
+  heavy-step output after guest temporary-storage pressure.
 
 ## [0.34.4] - 2026-10-13
 
@@ -92,6 +185,45 @@ Releases before v0.27.0 predate the changelog.
 ### Fixed
 
 - **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
+
+- **Reusable workflows called as `uses: $/...` resolve** (#581): the runner
+  client, the `preloop-runner` resolver, and the server's remote-workflow
+  resolver treated `$/` as a remote `owner/repo/path@ref` reference and
+  rejected it as unsupported. `$/` and `./` now name a file in the submitting
+  repository: the client resolves them from the workspace, the server fetches
+  them at the submitted commit, and a call inside a remote reusable workflow
+  resolves in that workflow's repository at its pinned commit. The path must
+  be under `.github/workflows/`, with segments of letters, digits, `-`, `_` and
+  `.` only: a `..` segment, an empty or absolute path, or any other character
+  is refused before a request is sent.
+
+- **Breaker refusals are typed and the webhook queue gate sees live probes**:
+  action downloads answer `503` only for a real breaker refusal, and the queue
+  stops claiming while a half-open probe is in flight. A failed delivery is
+  parked without spending an attempt only when GitHub is down or its own
+  credential bucket is throttled, not whenever any bucket is.
+
+- **Pull-request runs read their workflows from the merge they check out**: a
+  webhook `pull_request` run on a merge preloop built itself took its workflow
+  files from the pull request head, so a workflow the base branch had changed
+  (and the head had not) ran its older copy, while GitHub's own `pull_request`
+  run executes the merge's copy. The files now come from that merge commit in
+  the engine's mirror; only a failed mirror read falls back to the head's copies,
+  with a warning. Check runs still report on the pull request head.
+
+- **A webhook worker is no longer parked for the whole merge poll under load**:
+  a pull-request delivery that waited for GitHub's test merge held its worker for
+  up to the 30-second budget, and every superseded head polled to the full
+  budget, so a burst of pushes (fork pull requests included) could occupy all
+  `PRELOOP_WEBHOOK_WORKERS` and stall every other webhook. At most a quarter of
+  the workers (and at least one) may probe GitHub's merge state at once, and at
+  most that many may wait between probes. A probe waits up to two seconds for a
+  permit; a delivery whose GitHub merge is already available still uses it once
+  it gets one, and otherwise builds the engine's merge, as the budget-expiry
+  fallback does. A delivery that finds no wait slot builds it at once. Each
+  permit and slot is released when its probe or wait ends, including on failure
+  or cancellation.
+
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment
   against one counter that was never unwound, so `format('{0}', github.ref, …)`
@@ -121,6 +253,21 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **GitHub App manifest registration is off by default and bound to its
+  browser**: `/api/v1/github/register` and `/api/v1/github/callback` return
+  `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. The
+  registration page sets a signed, one-hour `preloop_app_manifest_state`
+  cookie, and the callback exchanges GitHub's one-time code only when the
+  echoed `state` matches that cookie, so a forged callback never reaches
+  GitHub. The credentials page is no longer cacheable, HTML-escapes every value
+  GitHub returns, shows the owning account to confirm, and hands the webhook
+  secret to `preloop setup github --via app --webhook-secret` rather than the
+  legacy `PRELOOP_WEBHOOK_SECRET` slot. That per-App secret — the first App's
+  included — verifies as the App itself, so a payload it signs is bound to the
+  App's installation coverage; only values no App claims keep the unbound
+  legacy signer. Refusals and failed code exchanges both answer with the same
+  uncachable, no-referrer page, and a request that cannot parse gets the
+  generic refusal rather than an extractor rejection.
 - **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
   process**: the env-selected backend handed each caller a fresh empty store,
   so a config write sealed `[secrets]` under a key stored in a store instance

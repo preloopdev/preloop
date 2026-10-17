@@ -23,7 +23,7 @@ Usage: preloop <COMMAND>
 | `setup` | Configure GitHub credentials (App or fine-grained PAT) |
 | `doctor` | Verify the GitHub credential configuration |
 | `server` | Install/remove the control plane as a supervised service |
-| `store` | Control-database operations: import a legacy `preloop.db` |
+| `store` | Initialize/upgrade or inspect the control database; import a legacy `preloop.db` |
 | `shell` | Open a shell in a preserved VM |
 | `debug` | Attach to a job paused at a failed step |
 | `dap` | Attach an interactive DAP client to a debugger-enabled run |
@@ -61,9 +61,11 @@ Submit a workflow and stream its events until terminal.
 | `-m, --message <TEXT>` | Commit message for the commit `--push` creates when the working tree is dirty. Without it, `$EDITOR` opens prefilled in an interactive terminal; otherwise a generated message is used |
 
 Behavior notes:
-- **Pausing**: pausing is the SmolVM default in an interactive terminal so you
-  can fix and retry; on the AgentENV backend pass `--debug` to open a session.
-  Non-interactive runs (pipes, CI, `--detach`) never pause.
+- **Pausing**: SmolVM may pause a failed job for interactive debugging when
+  run from a terminal; AgentENV requires `--debug` to open a session. Explicit
+  `--debug` opts in even for non-interactive or detached runs. Without that
+  flag, non-interactive runs do not pause implicitly. Check `preloop status`
+  for a detached run's current state.
 - **Local workspace**: the run snapshots the current workspace (uncommitted
   changes included) — the run never depends on what was pushed.
 - **Hosted dirty submits**: `--push` tests a commit made from the working tree
@@ -434,11 +436,40 @@ and per-App webhook configuration drift.
 Control-database operations. They are offline and explicit — they never
 bootstrap the engine.
 
+| Command | Description |
+|---|---|
+| `migrate` | Initialize a fresh store or apply pending schema migrations |
+| `status` | Show applied, pending, and unknown migration versions |
+| `import-legacy` | Import a released v11 `preloop.db` into a fresh control database |
+
+### `preloop store migrate [OPTIONS]`
+
+Initialize or upgrade the schema. `preloop serve` never applies migrations;
+run this command explicitly. SQLite migrations take a pre-migration backup by
+default when the database exists and has pending migrations.
+
+| Flag | Description |
+|---|---|
+| `--store <URL>` | Store URL; defaults to `PRELOOP_STORE_URL`, then `<PRELOOP_HOME>/state/preloop.db` |
+| `--adopt-baseline` | Adopt a recognized pre-ledger schema after structural verification, then migrate |
+| `--no-backup` | Skip the automatic SQLite pre-migration backup |
+| `--dry-run` | Report planned migrations without applying SQL; SQLite may still create/open the file and normalize permissions |
+
+### `preloop store status [OPTIONS]`
+
+Report applied, pending, and unknown versions without applying migration SQL.
+SQLite may create the database file and normalize permissions while opening
+it, so this is not a strictly read-only filesystem probe.
+
+| Flag | Description |
+|---|---|
+| `--store <URL>` | Store URL; defaults to `PRELOOP_STORE_URL`, then `<PRELOOP_HOME>/state/preloop.db` |
+
 ### `preloop store import-legacy [OPTIONS]`
 
 One-time import of a released v11 `preloop.db` (the durable-state store the
 control backend replaced) into a fresh control database. See
-[Importing a legacy `preloop.db`](./setup.md#importing-a-legacy-preloopdb).
+[Importing a legacy `preloop.db`](./setup.md).
 
 | Flag | Description |
 |---|---|
@@ -559,10 +590,13 @@ uses the configured image, baked locally as-is.
 ### Engine token storage
 
 The native API administrator token is generated on first engine startup when
-`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the operating system's
-credential store, scoped to the engine home. On hosts without an available or
-readable OS credential service, it uses `$PRELOOP_HOME/engine.token` with private
-permissions instead. Managed CLI commands read this token automatically; do
+`PRELOOP_SYSTEM_TOKEN` is not set. Preloop stores it in the engine's credential
+store, scoped to the engine home: private `0600` files under
+`$PRELOOP_HOME/credentials` by default, or the operating system's credential
+store with `credential_store = "os"`. With `os` selected, a credential the OS
+store cannot hold falls back to the file store under `$PRELOOP_HOME/credentials`;
+`$PRELOOP_HOME/engine.token` is a last resort, used only when the file store
+cannot hold the token either. Managed CLI commands read this token automatically; do
 not commit or print the file. Set `PRELOOP_SYSTEM_TOKEN` explicitly for a
 separate client or service.
 

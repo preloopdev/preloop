@@ -16,6 +16,23 @@ pub async fn require_protocol_bearer(
         ))
     }
 }
+/// Require the system credential or a Results job runtime token.
+///
+/// This is narrower than [`require_protocol_bearer`]: action-resolution
+/// endpoints must not admit runner-listen, registration, debug-worker, blob,
+/// or other locally signed JWT classes as bearer credentials.
+pub async fn require_results_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer = bearer_token(&request)
+        .ok_or_else(|| ApiError::unauthorized("system or job runtime token required"))?;
+    let identity = results_identity(&shared.state, bearer)
+        .map_err(|_| ApiError::unauthorized("system or job runtime token required"))?;
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
+}
 /// Require that a protocol reporting request is authenticated by the system
 /// credential or by the runtime token minted for the exact job request.
 ///

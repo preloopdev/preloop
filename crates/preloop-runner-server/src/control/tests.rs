@@ -10228,6 +10228,13 @@ mod lite {
         suite::webhook_replay_is_idempotent(&LiteBackend::in_memory().unwrap()).await;
     }
 
+    /// SQLite is one node: nothing else enqueues, so there is no hint stream.
+    #[test]
+    fn webhook_wakes_are_local_only() {
+        let backend = crate::control::Backend::Sqlite(LiteBackend::in_memory().unwrap());
+        assert!(backend.subscribe_webhook_wakes().is_none());
+    }
+
     #[tokio::test]
     async fn request_lookup_resolves_attempt_correlations() {
         suite::request_lookup_resolves_attempt_correlations(&LiteBackend::in_memory().unwrap())

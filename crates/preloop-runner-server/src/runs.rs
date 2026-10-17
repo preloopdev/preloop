@@ -3306,10 +3306,11 @@ enum JobLogs {
 
 /// Resolve one job's logs through the tier fallback.
 ///
-/// Unfiltered requests prefer the merged upload because it is the runner's
-/// authoritative whole-job representation. A step-filtered request prefers
-/// individual step blobs when both are present; the merged upload has no
-/// recoverable boundaries and is only used to produce the explicit 409.
+/// Unfiltered requests normally prefer the merged upload. If the aggregate
+/// per-step blob size is larger, the merged scratch file may be partial, so
+/// the step blobs are used instead. A step-filtered request always prefers
+/// individual step blobs when present; the merged upload has no recoverable
+/// boundaries and is only used to produce the explicit 409.
 ///
 /// `workflow_step_ids` is the attempt's declared-step order, taken from the
 /// manifest built out of the job request message. There is deliberately no
@@ -3335,11 +3336,12 @@ async fn resolve_job_logs(
             )));
         }
     };
-    if !prefer_steps && let Some(contents) = merged {
-        return Ok(JobLogs::Merged(contents));
-    }
+    // Inspect step blobs before choosing the unfiltered source: a failed flush
+    // can leave a shorter merged upload even though per-step uploads exist.
 
     let mut step_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut step_bytes = 0u64;
+
     match tokio::fs::read_dir(results_dir).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(|error| {
@@ -3366,6 +3368,7 @@ async fn resolve_job_logs(
                 if !metadata.is_file() {
                     continue;
                 }
+                step_bytes = step_bytes.saturating_add(metadata.len());
                 step_files.push((step_id, entry.path()));
             }
         }
@@ -3391,7 +3394,15 @@ async fn resolve_job_logs(
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    if !step_files.is_empty() {
+    // Keep the merged upload as the normal whole-job source, but do not let a
+    // shorter partial scratch file hide the larger per-step representation.
+    if !step_files.is_empty()
+        && (prefer_steps
+            || merged.is_none()
+            || merged
+                .as_ref()
+                .is_some_and(|contents| step_bytes > contents.len() as u64))
+    {
         let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
             ids.iter()
                 .map(|id| {

@@ -74,6 +74,10 @@ keyring.workspace = true
 toml = { workspace = true }
 parking_lot.workspace = true
 prost = "0.14.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user"] }
+
 [[bin]]
 name = "preloop-server"
 path = "src/main.rs"

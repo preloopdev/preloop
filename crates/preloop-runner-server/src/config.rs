@@ -8,13 +8,14 @@
 //!
 //! Secret values in the `[secrets]` tables are envelope-sealed at rest
 //! (see [`SEALED_SECRET_PREFIX`]): the file holds ciphertext, never the
-//! plaintext. The data-encryption key lives in the OS credential store when
-//! one is reachable, falling back to a 0600 `secrets.key` file next to the
-//! config otherwise (documented below). The config file itself is written
+//! plaintext. The data-encryption key lives in the engine's credential store
+//! (the private file store by default; see [`crate::credential_store`]), and a
+//! 0600 `secrets.key` file next to the config is used only when that store is
+//! unreachable (documented below). The config file itself is written
 //! with mode 0600 and secret values are never echoed back by
 //! `preloop secret list` or `preloop doctor`.
 
-use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
+use crate::credential_store::{CredentialRef, CredentialStore, SecretString};
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -86,14 +87,14 @@ pub struct GitHubConfig {
     pub app_id: Option<String>,
     /// GitHub App private key PEM, stored inline (legacy).
     ///
-    /// Read from disk and migrated into the OS credential store on the next
+    /// Read from disk and migrated into the selected credential store on the next
     /// `preloop serve`; never populated from the credential store, so a
     /// load/write round-trip can neither lose an unmigrated credential nor
     /// reintroduce plaintext for a migrated one. Use [`GitHubConfig::app_pem`]
     /// to read the effective value.
     #[serde(default, rename = "app_pem")]
     pub legacy_app_pem: Option<String>,
-    /// OS credential-store reference for the App private key.
+    /// Credential-store reference for the App private key.
     #[serde(default)]
     pub app_pem_ref: Option<String>,
     /// Value behind [`Self::app_pem_ref`], resolved at load. Never persisted.
@@ -112,7 +113,7 @@ pub struct GitHubConfig {
     /// Prefer a GitHub App so installation tokens are minted least-privilege.
     #[serde(default, rename = "pat")]
     pub legacy_pat: Option<String>,
-    /// OS credential-store reference for the PAT.
+    /// Credential-store reference for the PAT.
     #[serde(default)]
     pub pat_ref: Option<String>,
     /// Value behind [`Self::pat_ref`], resolved at load. Never persisted.
@@ -122,7 +123,7 @@ pub struct GitHubConfig {
     /// Stored inline (legacy); see [`Self::legacy_app_pem`].
     #[serde(default, rename = "webhook_secret")]
     pub legacy_webhook_secret: Option<String>,
-    /// OS credential-store reference for the webhook secret.
+    /// Credential-store reference for the webhook secret.
     #[serde(default)]
     pub webhook_secret_ref: Option<String>,
     /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
@@ -195,7 +196,7 @@ pub struct AppConfig {
     /// [`GitHubConfig::legacy_app_pem`]; read via [`AppConfig::pem`].
     #[serde(default, rename = "pem")]
     pub legacy_pem: String,
-    /// OS credential-store reference for the App private key.
+    /// Credential-store reference for the App private key.
     #[serde(default)]
     pub pem_ref: Option<String>,
     /// Value behind [`Self::pem_ref`], resolved at load. Never persisted.
@@ -206,7 +207,7 @@ pub struct AppConfig {
     /// App). Stored inline (legacy); read via [`AppConfig::webhook_secret`].
     #[serde(default, rename = "webhook_secret")]
     pub legacy_webhook_secret: Option<String>,
-    /// OS credential-store reference for the App webhook secret.
+    /// Credential-store reference for the App webhook secret.
     #[serde(default)]
     pub webhook_secret_ref: Option<String>,
     /// Value behind [`Self::webhook_secret_ref`], resolved at load. Never persisted.
@@ -865,6 +866,14 @@ pub struct ConfigFile {
     /// `PRELOOP_SECRETS_STORE` overrides this key.
     #[serde(default)]
     pub secrets_store: Option<String>,
+    /// Credential backend for the engine token and the GitHub App, PAT, and
+    /// webhook secrets. For config-backed GitHub credentials, `file` (the
+    /// default) stores `0600` files under the config file's parent
+    /// `credentials` directory; the engine token remains scoped to its engine
+    /// home. `os` uses the native keychain or secret-service.
+    /// `PRELOOP_CREDENTIAL_STORE` overrides this key.
+    #[serde(default)]
+    pub credential_store: Option<String>,
     /// Maximum jobs one run may expand to (after matrix expansion), a
     /// fail-fast DoS guard for the submit path: a run expanding past this
     /// is rejected with 400 before the insert transaction opens, so no
@@ -1453,6 +1462,46 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
     load_config_from(&config_path())
 }
 
+/// The default App's webhook secret: `PRELOOP_WEBHOOK_SECRET` wins over the
+/// config file's `github.webhook_secret`, matching every other credential.
+/// An empty value in either source counts as unset: a blank export must not
+/// disable signature verification silently.
+pub fn webhook_secret_from_env_or_config(config: &ConfigFile) -> Option<String> {
+    std::env::var("PRELOOP_WEBHOOK_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty())
+        .or_else(|| {
+            config
+                .github
+                .webhook_secret()
+                .filter(|secret| !secret.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+/// The `credential_store` key of the config file at `path`, read on its own.
+///
+/// The store has to be chosen before any credential reference can be resolved
+/// through it, so this reads only that key: no reference is resolved, and
+/// unrelated keys cannot fail the read. A missing file means the key is unset.
+pub fn credential_store_setting(path: &Path) -> anyhow::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Setting {
+        #[serde(default)]
+        credential_store: Option<String>,
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading config {}", path.display()));
+        }
+    };
+    let setting: Setting =
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    Ok(setting.credential_store)
+}
+
 /// Populate the `resolved_*` fields from the credential store.
 ///
 /// Only the `*_ref` fields are consulted and only the non-persisted
@@ -1528,97 +1577,311 @@ fn read_credential(
 /// being readable straight off disk.
 pub const SEALED_SECRET_PREFIX: &str = "sealed:v1:";
 
-/// File holding the config-secrets data-encryption key (hex-encoded) when
-/// the OS credential store is unreachable — headless Linux hosts and service
-/// accounts typically have no secret-service daemon. It is written with mode
-/// 0600 next to the config file; anyone who can read it (or the OS keychain
-/// entry) can unseal the secrets, so it protects against a stolen config
-/// file or backup, not against a compromised engine home.
+/// Legacy location of the config-secrets data-encryption key (hex-encoded),
+/// written when no credential store was reachable. It is written with mode 0600
+/// next to the config file, and anyone who can read it can unseal the secrets,
+/// so it protects against a stolen config file or backup, not against a
+/// compromised engine home. A leftover file is migrated into the selected store
+/// the next time the key is needed. When it disagrees with the store, the key
+/// that opens the sealed secrets wins and the superseded file is renamed to
+/// `secrets.key.orphan-<unix-ts>`; it is never deleted.
 pub const SECRETS_KEY_FILE: &str = "secrets.key";
 
-/// Resolve the 32-byte data-encryption key that seals `[secrets]` values at
-/// rest. The OS credential store is tried first (reference scoped by config
-/// directory, so two engine homes owned by one OS user do not share a key);
-/// the 0600 `secrets.key` file is the fallback. A file key is migrated into
-/// the store when the store becomes reachable.
-pub fn resolve_config_sealing_key(dir: &Path) -> anyhow::Result<[u8; 32]> {
-    resolve_config_sealing_key_with_store(dir, &OsCredentialStore)
-}
+/// Shortest decoded `sealed:v1:` envelope: format byte, AES-CBC IV, and HMAC
+/// tag. Shorter values are plaintext that merely starts with the prefix.
+const MIN_SEALED_ENVELOPE_LEN: usize = 1 + 16 + 32;
 
+/// Terminal hint for unlocking a credential store that holds the sealing key.
+const UNLOCK_STORE_HINT: &str = if cfg!(target_os = "macos") {
+    "unlock the login keychain (macOS over SSH: `security unlock-keychain ~/Library/Keychains/login.keychain-db`) and retry"
+} else {
+    "unlock the credential store and retry"
+};
+
+/// Resolve the 32-byte data-encryption key that seals `[secrets]` values at
+/// rest, from `store` (the engine's selected credential store). The reference
+/// is scoped by config directory, so two engine homes owned by one OS user do
+/// not share a key.
+///
+/// `sealed` lists the structurally valid `sealed:v1:` values that already exist
+/// for this directory. A key is returned only once it authenticates them. A new
+/// key is minted only when `sealed` is empty: a key minted over sealed values
+/// cannot open them, and it would replace the key that can.
+///
+/// The 0600 `secrets.key` file is used when the store is unreachable. A file
+/// beside a reachable store is migrated into it and retired, unless it
+/// disagrees with the store; see [`resolve_conflict`].
 fn resolve_config_sealing_key_with_store(
     dir: &Path,
     store: &dyn CredentialStore,
+    sealed: &[String],
 ) -> anyhow::Result<[u8; 32]> {
     let key_path = dir.join(SECRETS_KEY_FILE);
     let file_key = read_sealing_key_file(&key_path)?;
-    if store.available().is_ok() {
-        let reference = config_secrets_key_reference(dir)?;
-        match store
-            .get(&reference)
-            .with_context(|| format!("reading config-secrets key from {} store", store.name()))?
-        {
-            Some(secret) => {
-                let key = parse_sealing_key(secret.expose().as_bytes()).with_context(|| {
-                    format!("parsing config-secrets key from {} store", store.name())
-                })?;
-                if let Some(file_key) = file_key {
-                    anyhow::ensure!(
-                        file_key == key,
-                        "config-secrets key conflict between {} store and {}",
-                        store.name(),
-                        key_path.display()
-                    );
-                    std::fs::remove_file(&key_path)
-                        .with_context(|| format!("retiring {}", key_path.display()))?;
-                }
-                return Ok(key);
-            }
-            None => {
-                // A reachable store with no entry is not interchangeable with
-                // an unreadable store. Persist the existing fallback key, or
-                // create one, then require an authenticated read-back before
-                // retiring the file or trusting the store.
-                let key = file_key.unwrap_or_else(generate_sealing_key);
-                store
-                    .set(&reference, &SecretString::new(hex::encode(key)))
-                    .with_context(|| format!("writing config-secrets key to {}", store.name()))?;
-                let read_back = store
-                    .get_fresh(&reference)
-                    .with_context(|| {
-                        format!("verifying config-secrets key in {} store", store.name())
-                    })?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "{} store accepted the config-secrets key but did not return it",
-                            store.name()
-                        )
-                    })?;
-                let read_back =
-                    parse_sealing_key(read_back.expose().as_bytes()).with_context(|| {
-                        format!(
-                            "parsing config-secrets key read from {} store",
-                            store.name()
-                        )
-                    })?;
-                anyhow::ensure!(
-                    read_back == key,
-                    "{} store returned a different config-secrets key after write",
-                    store.name()
+    match store.available() {
+        Ok(()) => resolve_from_store(dir, &key_path, file_key, store, sealed),
+        Err(error) => resolve_without_store(dir, &key_path, file_key, store, &error, sealed),
+    }
+}
+
+/// The store cannot be reached, so only the legacy file can supply the key.
+fn resolve_without_store(
+    dir: &Path,
+    key_path: &Path,
+    file_key: Option<[u8; 32]>,
+    store: &dyn CredentialStore,
+    unavailable: &anyhow::Error,
+    sealed: &[String],
+) -> anyhow::Result<[u8; 32]> {
+    match file_key {
+        Some(key) => {
+            if !sealed.is_empty() && !authenticates_any(&key, sealed) {
+                anyhow::bail!(
+                    "{SECRETS_KEY_FILE} in {} does not open the sealed config secrets, and the {} is unavailable ({unavailable:#}), so it cannot supply the right key; {UNLOCK_STORE_HINT}. Nothing was changed.",
+                    dir.display(),
+                    store.name(),
                 );
-                if key_path.exists() {
-                    std::fs::remove_file(&key_path)
-                        .with_context(|| format!("retiring {}", key_path.display()))?;
-                }
-                return Ok(key);
             }
+            Ok(key)
+        }
+        // A fresh home: no sealed value depends on a key yet, so the 0600 file
+        // holds one until the store is reachable.
+        None if sealed.is_empty() => {
+            let key = generate_sealing_key();
+            write_sealing_key_file(key_path, &key)?;
+            Ok(key)
+        }
+        None => anyhow::bail!(
+            "config secrets in {} are sealed with the config-secrets key held in the {}, which is unavailable ({unavailable:#}); {UNLOCK_STORE_HINT}. No key was minted: a new key cannot open these secrets.",
+            dir.display(),
+            store.name(),
+        ),
+    }
+}
+
+/// The store is reachable. Its copy of the key is authoritative unless the
+/// legacy file disagrees, which [`resolve_conflict`] settles by evidence.
+fn resolve_from_store(
+    dir: &Path,
+    key_path: &Path,
+    file_key: Option<[u8; 32]>,
+    store: &dyn CredentialStore,
+    sealed: &[String],
+) -> anyhow::Result<[u8; 32]> {
+    let reference = config_secrets_key_reference(dir)?;
+    let Some(secret) = store
+        .get(&reference)
+        .with_context(|| format!("reading config-secrets key from {} store", store.name()))?
+    else {
+        return resolve_missing_from_store(dir, key_path, file_key, store, &reference, sealed);
+    };
+    let store_key = parse_sealing_key(secret.expose().as_bytes())
+        .with_context(|| format!("parsing config-secrets key from {} store", store.name()))?;
+    match file_key {
+        Some(file_key) if file_key != store_key => {
+            resolve_conflict(dir, key_path, store, store_key, file_key, sealed)
+        }
+        file_key => {
+            if !sealed.is_empty() && !authenticates_any(&store_key, sealed) {
+                anyhow::bail!(
+                    "the config-secrets key in the {} does not open the sealed config secrets in {}; restore the key that sealed them. Nothing was changed.",
+                    store.name(),
+                    dir.display(),
+                );
+            }
+            if file_key.is_some() {
+                // Retire the legacy file only once the store proves it can hold
+                // the key. A value that was only read through (a migration whose
+                // copy failed) must leave the file in place as the last way to
+                // unseal the secrets.
+                if store_confirms(store, &reference, &secret) {
+                    std::fs::remove_file(key_path)
+                        .with_context(|| format!("retiring {}", key_path.display()))?;
+                } else {
+                    tracing::warn!(
+                        store = store.name(),
+                        path = %key_path.display(),
+                        "could not verify a durable copy of the config-secrets key; \
+                         keeping the legacy key file"
+                    );
+                }
+            }
+            Ok(store_key)
         }
     }
-    if let Some(key) = file_key {
-        return Ok(key);
+}
+
+/// The store is reachable but holds no key for this directory.
+fn resolve_missing_from_store(
+    dir: &Path,
+    key_path: &Path,
+    file_key: Option<[u8; 32]>,
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    sealed: &[String],
+) -> anyhow::Result<[u8; 32]> {
+    match file_key {
+        Some(key) => {
+            if !sealed.is_empty() && !authenticates_any(&key, sealed) {
+                anyhow::bail!(
+                    "{SECRETS_KEY_FILE} in {} does not open the sealed config secrets, and the {} holds no key for them; if the right key is in a locked store, {UNLOCK_STORE_HINT}, otherwise restore it. Nothing was changed.",
+                    dir.display(),
+                    store.name(),
+                );
+            }
+            // Migrate the legacy key into the store. The file goes only once the
+            // store reads the same key back.
+            store_and_verify_key(store, reference, &key)?;
+            if key_path.exists() {
+                std::fs::remove_file(key_path)
+                    .with_context(|| format!("retiring {}", key_path.display()))?;
+            }
+            Ok(key)
+        }
+        None if sealed.is_empty() => {
+            let key = generate_sealing_key();
+            store_and_verify_key(store, reference, &key)?;
+            Ok(key)
+        }
+        None => anyhow::bail!(
+            "config secrets in {} are sealed with a config-secrets key that the {} does not hold, and there is no {SECRETS_KEY_FILE} to recover it from; if the key is in a locked store, {UNLOCK_STORE_HINT}, otherwise restore it. No key was minted: a new key cannot open these secrets.",
+            dir.display(),
+            store.name(),
+        ),
     }
-    let key = generate_sealing_key();
-    write_sealing_key_file(&key_path, &key)?;
-    Ok(key)
+}
+
+/// The store and `secrets.key` both hold a key, and they differ. Evidence
+/// decides: the key that opens the sealed secrets wins, and the file it
+/// displaces is renamed aside, never deleted. With nothing sealed, nothing
+/// depends on either key, so the store is the key of record.
+fn resolve_conflict(
+    dir: &Path,
+    key_path: &Path,
+    store: &dyn CredentialStore,
+    store_key: [u8; 32],
+    file_key: [u8; 32],
+    sealed: &[String],
+) -> anyhow::Result<[u8; 32]> {
+    let store_opens = authenticates_any(&store_key, sealed);
+    let file_opens = authenticates_any(&file_key, sealed);
+    match (sealed.is_empty(), store_opens, file_opens) {
+        (true, _, _) | (false, true, false) => {
+            let orphan = retire_sealing_key_file(key_path)?;
+            tracing::warn!(
+                store = store.name(),
+                path = %key_path.display(),
+                orphan = %orphan.display(),
+                "config-secrets key file disagreed with the store; kept the store's key and retired the file"
+            );
+            Ok(store_key)
+        }
+        (false, false, true) => {
+            tracing::warn!(
+                store = store.name(),
+                path = %key_path.display(),
+                "the store's config-secrets key does not open the sealed config secrets; using the key file, which does"
+            );
+            Ok(file_key)
+        }
+        (false, false, false) => anyhow::bail!(
+            "config-secrets key conflict in {}: the {} key and {} differ, and neither opens the sealed config secrets; restore the key that sealed them. Nothing was changed.",
+            dir.display(),
+            store.name(),
+            key_path.display(),
+        ),
+        (false, true, true) => anyhow::bail!(
+            "config-secrets key conflict in {}: the {} key and {} both open the sealed config secrets, so the right one cannot be told apart. Nothing was changed.",
+            dir.display(),
+            store.name(),
+            key_path.display(),
+        ),
+    }
+}
+
+/// Write `key` to the store, then require a fresh read to return it unchanged.
+fn store_and_verify_key(
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    key: &[u8; 32],
+) -> anyhow::Result<()> {
+    store
+        .set(reference, &SecretString::new(hex::encode(key)))
+        .with_context(|| format!("writing config-secrets key to {}", store.name()))?;
+    let read_back = store
+        .get_fresh(reference)
+        .with_context(|| format!("verifying config-secrets key in {} store", store.name()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} store accepted the config-secrets key but did not return it",
+                store.name()
+            )
+        })?;
+    let read_back = parse_sealing_key(read_back.expose().as_bytes()).with_context(|| {
+        format!(
+            "parsing config-secrets key read from {} store",
+            store.name()
+        )
+    })?;
+    anyhow::ensure!(
+        read_back == *key,
+        "{} store returned a different config-secrets key after write",
+        store.name()
+    );
+    Ok(())
+}
+
+/// Move a superseded key file aside as `secrets.key.orphan-<unix-ts>`. It is
+/// renamed, never deleted: it may be the only copy of a key that still matters
+/// for recovery. A name already taken gets a numeric suffix.
+fn retire_sealing_key_file(path: &Path) -> anyhow::Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let base = format!("{SECRETS_KEY_FILE}.orphan-{stamp}");
+    let mut orphan = path.with_file_name(&base);
+    let mut suffix = 1;
+    while orphan.exists() {
+        orphan = path.with_file_name(format!("{base}-{suffix}"));
+        suffix += 1;
+    }
+    std::fs::rename(path, &orphan)
+        .with_context(|| format!("retiring {} as {}", path.display(), orphan.display()))?;
+    Ok(orphan)
+}
+
+/// Whether `key` opens at least one of `sealed`. Trial decryption is the only
+/// evidence that a key sealed the config, so with nothing sealed this is false.
+fn authenticates_any(key: &[u8; 32], sealed: &[String]) -> bool {
+    sealed
+        .iter()
+        .any(|value| matches!(try_unseal_secret_value(key, value), Ok(Some(_))))
+}
+
+/// Whether `store` verifiably holds `value` under `reference`: the write is
+/// accepted and a fresh read returns the same bytes. Checked before retiring a
+/// legacy `secrets.key`, so a credential that was only read through (a
+/// migration whose copy failed) never causes the file to be deleted.
+fn store_confirms(
+    store: &dyn CredentialStore,
+    reference: &CredentialRef,
+    value: &SecretString,
+) -> bool {
+    match store
+        .set(reference, value)
+        .and_then(|()| store.get_fresh(reference))
+    {
+        Ok(Some(stored)) => stored.expose() == value.expose(),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                store = store.name(),
+                %error,
+                "credential store could not confirm a durable copy"
+            );
+            false
+        }
+    }
 }
 
 /// Credential-store reference for the config-secrets key, scoped by the
@@ -1714,7 +1977,7 @@ fn try_unseal_secret_value(key: &[u8; 32], stored: &str) -> anyhow::Result<Optio
     };
     // SNAPSHOT_FORMAT + AES-CBC IV + HMAC tag. Short prefixed plaintext is
     // not a candidate ciphertext and must remain readable.
-    if sealed.len() < 1 + 16 + 32 {
+    if sealed.len() < MIN_SEALED_ENVELOPE_LEN {
         return Ok(None);
     }
     let plaintext = crate::store::Envelope::new(key).unseal(&sealed)?;
@@ -1747,10 +2010,62 @@ fn for_each_secret_value(
     Ok(())
 }
 
+/// Every structurally valid `sealed:v1:` value in `config`, across all scopes.
+fn sealed_envelopes(config: &ConfigFile) -> Vec<String> {
+    config
+        .secrets
+        .values()
+        .chain(config.repo_secrets.values().flat_map(|repo| repo.values()))
+        .chain(
+            config
+                .env_secrets
+                .values()
+                .flat_map(|envs| envs.values().flat_map(|repo| repo.values())),
+        )
+        .filter(|value| is_sealed_envelope(value))
+        .cloned()
+        .collect()
+}
+
+/// Whether `stored` is a structurally valid sealed value. Anything else is
+/// plaintext, which is not evidence about any key.
+fn is_sealed_envelope(stored: &str) -> bool {
+    stored
+        .strip_prefix(SEALED_SECRET_PREFIX)
+        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+        .is_some_and(|sealed| sealed.len() >= MIN_SEALED_ENVELOPE_LEN)
+}
+
+/// Structurally valid sealed values in raw config text. The text is scanned
+/// rather than parsed, so a damaged file cannot hide its sealed values from the
+/// key check.
+fn sealed_envelopes_in_text(text: &str) -> Vec<String> {
+    text.match_indices(SEALED_SECRET_PREFIX)
+        .filter_map(|(start, _)| {
+            let rest = &text[start + SEALED_SECRET_PREFIX.len()..];
+            let run = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')))
+                .unwrap_or(rest.len());
+            let candidate = &text[start..start + SEALED_SECRET_PREFIX.len() + run];
+            is_sealed_envelope(candidate).then(|| candidate.to_owned())
+        })
+        .collect()
+}
+
+/// Sealed values already stored in the config file at `path`.
+fn sealed_envelopes_on_disk(path: &Path) -> anyhow::Result<Vec<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(sealed_envelopes_in_text(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 fn seal_config_secrets(
     config: &mut ConfigFile,
     dir: &Path,
     store: &dyn CredentialStore,
+    on_disk: &[String],
 ) -> anyhow::Result<()> {
     let has_secrets = !config.secrets.is_empty()
         || config.repo_secrets.values().any(|repo| !repo.is_empty())
@@ -1761,7 +2076,11 @@ fn seal_config_secrets(
     if !has_secrets {
         return Ok(());
     }
-    let key = resolve_config_sealing_key_with_store(dir, store)?;
+    // Values already sealed, on disk or in memory, must open with the key that
+    // seals new ones.
+    let mut sealed = on_disk.to_vec();
+    sealed.extend(sealed_envelopes(config));
+    let key = resolve_config_sealing_key_with_store(dir, store, &sealed)?;
     for_each_secret_value(config, |value| {
         // Only authenticated envelopes are already sealed. A plaintext secret
         // is allowed to begin with the marker; malformed marker-prefixed
@@ -1783,22 +2102,11 @@ fn unseal_config_secrets(
     dir: &Path,
     store: &dyn CredentialStore,
 ) -> anyhow::Result<()> {
-    let mut needs_key = false;
-    for_each_secret_value(config, |value| {
-        if value.starts_with(SEALED_SECRET_PREFIX) {
-            let encoded = value
-                .strip_prefix(SEALED_SECRET_PREFIX)
-                .expect("checked prefix");
-            if let Ok(sealed) = BASE64_STANDARD.decode(encoded) {
-                needs_key |= sealed.len() >= 1 + 16 + 32;
-            }
-        }
-        Ok(())
-    })?;
-    if !needs_key {
+    let sealed = sealed_envelopes(config);
+    if sealed.is_empty() {
         return Ok(());
     }
-    let key = resolve_config_sealing_key_with_store(dir, store)?;
+    let key = resolve_config_sealing_key_with_store(dir, store, &sealed)?;
     for_each_secret_value(config, |value| {
         if let Some(plaintext) = try_unseal_secret_value(&key, value)? {
             *value = plaintext;
@@ -1823,11 +2131,10 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         .with_context(|| format!("validating config {}", path.display()))?;
     validate_execution_protection(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
-    let cred_base = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let store = crate::credential_store::store_from_env(&cred_base);
+    let store = crate::credential_store::selected_store_for_config(
+        path,
+        config.credential_store.as_deref(),
+    )?;
     resolve_credential_references(&mut config, store.as_ref())?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1949,8 +2256,12 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         // Same store selection as `load_config_from`; sealing with a different
         // backend than unsealing makes the file unreadable.
-        let store = crate::credential_store::store_from_env(dir);
-        seal_config_secrets(&mut sealed, dir, store.as_ref())
+        let store = crate::credential_store::selected_store_for_config(
+            path,
+            sealed.credential_store.as_deref(),
+        )?;
+        let on_disk = sealed_envelopes_on_disk(path)?;
+        seal_config_secrets(&mut sealed, dir, store.as_ref(), &on_disk)
             .with_context(|| format!("sealing secrets in config {}", path.display()))?;
     }
     let text = toml::to_string_pretty(&sealed).context("serializing config")?;
@@ -2048,6 +2359,7 @@ mod tests {
             fork_policy: ForkPolicyConfig::default(),
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
+            credential_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
             cache: CacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
@@ -2186,7 +2498,8 @@ mod tests {
     }
 
     use crate::credential_store::{
-        MemoryCredentialStore, UnavailableCredentialStore, github_reference,
+        CREDENTIAL_STORE_ENV, CredentialWriter, FileCredentialStore, MemoryCredentialStore,
+        UnavailableCredentialStore, credential_store_dir, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
@@ -2477,7 +2790,7 @@ REPO_OVERLAY = "repo-from-credential"
         let store = MemoryCredentialStore::default();
         let dir = tempfile::tempdir().unwrap();
         let mut config = populated_config();
-        seal_config_secrets(&mut config, dir.path(), &store).unwrap();
+        seal_config_secrets(&mut config, dir.path(), &store, &[]).unwrap();
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(!text.contains("abc123"), "global secret leaked: {text}");
         assert!(!text.contains("xyz789"), "repo secret leaked: {text}");
@@ -2526,7 +2839,7 @@ REPO_OVERLAY = "repo-from-credential"
         );
         // The next write seals them.
         let store = MemoryCredentialStore::default();
-        seal_config_secrets(&mut config, dir.path(), &store).unwrap();
+        seal_config_secrets(&mut config, dir.path(), &store, &[]).unwrap();
         let sealed_text = toml::to_string_pretty(&config).unwrap();
         assert!(
             !sealed_text.contains("abc123"),
@@ -2538,8 +2851,9 @@ REPO_OVERLAY = "repo-from-credential"
     #[test]
     fn credential_store_read_errors_are_not_treated_as_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let error = resolve_config_sealing_key_with_store(dir.path(), &WriteOnlyCredentialStore)
-            .expect_err("unreadable credential store must fail closed");
+        let error =
+            resolve_config_sealing_key_with_store(dir.path(), &WriteOnlyCredentialStore, &[])
+                .expect_err("unreadable credential store must fail closed");
         assert!(
             error.to_string().contains("reading config-secrets key"),
             "unexpected error: {error:#}"
@@ -2550,8 +2864,187 @@ REPO_OVERLAY = "repo-from-credential"
         );
     }
 
+    /// Retired `secrets.key.orphan-*` files in `dir`.
+    fn orphan_key_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("secrets.key.orphan-"))
+            })
+            .collect()
+    }
+
+    /// `populated_config`, sealed under the key `store` holds for `dir`.
+    fn sealed_under(dir: &Path, store: &MemoryCredentialStore) -> ConfigFile {
+        let mut config = populated_config();
+        seal_config_secrets(&mut config, dir, store, &[]).unwrap();
+        config
+    }
+
+    /// A locked store with sealed values and no `secrets.key` fails the load.
+    /// Minting here would replace the only key that opens the secrets.
     #[test]
-    fn conflicting_store_and_file_keys_fail_closed() {
+    fn locked_store_never_mints_over_sealed_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let error =
+            unseal_config_secrets(&mut sealed.clone(), dir.path(), &UnavailableCredentialStore)
+                .expect_err("a locked store must not yield a fresh key");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("sealed with the config-secrets key"),
+            "{message}"
+        );
+        assert!(message.contains("which is unavailable"), "{message}");
+        assert!(message.contains("unlock"), "{message}");
+        assert!(message.contains("No key was minted"), "{message}");
+        assert!(
+            !dir.path().join(SECRETS_KEY_FILE).exists(),
+            "a key file was written over sealed secrets"
+        );
+    }
+
+    /// The write path sees sealed values only on disk, so a locked store must
+    /// stop the mint there as well.
+    #[test]
+    fn locked_store_never_mints_on_the_write_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let on_disk = sealed_envelopes(&sealed);
+        assert_eq!(on_disk.len(), 3, "expected one sealed value per scope");
+        let mut config = populated_config();
+        let error = seal_config_secrets(
+            &mut config,
+            dir.path(),
+            &UnavailableCredentialStore,
+            &on_disk,
+        )
+        .expect_err("a locked store must not seal under a fresh key");
+        assert!(
+            format!("{error:#}").contains("No key was minted"),
+            "{error:#}"
+        );
+        assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    /// A genuinely fresh home has no sealed values, so a locked store still
+    /// gets the legacy file key.
+    #[test]
+    fn fresh_home_with_a_locked_store_mints_the_file_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key =
+            resolve_config_sealing_key_with_store(dir.path(), &UnavailableCredentialStore, &[])
+                .unwrap();
+        assert_eq!(
+            read_sealing_key_file(&dir.path().join(SECRETS_KEY_FILE)).unwrap(),
+            Some(key)
+        );
+    }
+
+    /// A reachable store with no entry is no reason to mint either: the sealed
+    /// values would become unrecoverable.
+    #[test]
+    fn reachable_store_without_an_entry_never_mints_over_sealed_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let store = MemoryCredentialStore::default();
+        let error = unseal_config_secrets(&mut sealed.clone(), dir.path(), &store)
+            .expect_err("an empty store must not yield a fresh key");
+        assert!(format!("{error:#}").contains("does not hold"), "{error:#}");
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        assert!(
+            store.get(&reference).unwrap().is_none(),
+            "a key was minted into the store"
+        );
+        assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    /// A key file that opens nothing is neither migrated into an empty store nor
+    /// retired while the right key may still be locked away.
+    #[test]
+    fn unopened_key_file_is_kept_out_of_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &[0x22; 32]).unwrap();
+        let store = MemoryCredentialStore::default();
+        let error = unseal_config_secrets(&mut sealed.clone(), dir.path(), &store)
+            .expect_err("a key file that opens nothing must not be trusted");
+        assert!(format!("{error:#}").contains("does not open"), "{error:#}");
+        assert!(key_path.exists(), "the key file was retired");
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        assert!(
+            store.get(&reference).unwrap().is_none(),
+            "the key file was migrated"
+        );
+    }
+
+    /// `secrets.key` from an earlier build disagrees with the store, and the
+    /// store's key opens the sealed secrets: the store wins and the file is
+    /// renamed aside, never deleted.
+    #[test]
+    fn orphan_key_file_is_renamed_aside_when_the_store_key_opens_the_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryCredentialStore::default();
+        let sealed = sealed_under(dir.path(), &store);
+        let orphan_key = [0x22; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &orphan_key).unwrap();
+
+        let mut loaded = sealed;
+        unseal_config_secrets(&mut loaded, dir.path(), &store).unwrap();
+        assert_eq!(loaded.secrets["DOCKERHUB_TOKEN"], "abc123");
+        assert!(!key_path.exists(), "the orphan key file was not retired");
+        let orphans = orphan_key_files(dir.path());
+        assert_eq!(
+            orphans.len(),
+            1,
+            "expected one retired key file: {orphans:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&orphans[0]).unwrap(),
+            hex::encode(orphan_key),
+            "the retired file must keep its key"
+        );
+    }
+
+    /// The store's key does not open the sealed secrets but `secrets.key` does:
+    /// the file key is used, and it stays where it is.
+    #[test]
+    fn file_key_is_used_when_the_store_key_does_not_open_the_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_key = [0x33; 32];
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        let sealing = MemoryCredentialStore::default();
+        sealing
+            .set(&reference, &SecretString::new(hex::encode(file_key)))
+            .unwrap();
+        let sealed = sealed_under(dir.path(), &sealing);
+
+        let store = MemoryCredentialStore::default();
+        store
+            .set(&reference, &SecretString::new(hex::encode([0x44; 32])))
+            .unwrap();
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &file_key).unwrap();
+
+        let mut loaded = sealed;
+        unseal_config_secrets(&mut loaded, dir.path(), &store).unwrap();
+        assert_eq!(loaded.secrets["DOCKERHUB_TOKEN"], "abc123");
+        assert!(
+            key_path.exists(),
+            "the key file that opens the secrets was retired"
+        );
+        assert!(orphan_key_files(dir.path()).is_empty());
+    }
+
+    /// With nothing sealed, neither key is depended on: the store's key is the
+    /// key of record and the superseded file is retired.
+    #[test]
+    fn conflicting_keys_without_sealed_values_prefer_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let store = MemoryCredentialStore::default();
         let reference = config_secrets_key_reference(dir.path()).unwrap();
@@ -2560,12 +3053,70 @@ REPO_OVERLAY = "repo-from-credential"
         store
             .set(&reference, &SecretString::new(hex::encode(store_key)))
             .unwrap();
-        write_sealing_key_file(&dir.path().join(SECRETS_KEY_FILE), &file_key).unwrap();
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &file_key).unwrap();
 
-        let error = resolve_config_sealing_key_with_store(dir.path(), &store)
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap(),
+            store_key
+        );
+        assert!(
+            !key_path.exists(),
+            "the superseded key file was not retired"
+        );
+        let orphans = orphan_key_files(dir.path());
+        assert_eq!(
+            orphans.len(),
+            1,
+            "expected one retired key file: {orphans:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&orphans[0]).unwrap(),
+            hex::encode(file_key)
+        );
+    }
+
+    /// Neither source opens the sealed secrets: the conflict is an error that
+    /// names both, and nothing is renamed or minted.
+    #[test]
+    fn conflicting_keys_that_neither_open_the_secrets_fail_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let store = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        store
+            .set(&reference, &SecretString::new(hex::encode([0x11; 32])))
+            .unwrap();
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &[0x22; 32]).unwrap();
+
+        let error = unseal_config_secrets(&mut sealed.clone(), dir.path(), &store)
             .expect_err("conflicting key sources must not silently choose one");
-        assert!(error.to_string().contains("key conflict"));
-        assert!(dir.path().join(SECRETS_KEY_FILE).exists());
+        let message = format!("{error:#}");
+        assert!(message.contains("key conflict"), "{message}");
+        assert!(message.contains("neither opens"), "{message}");
+        assert!(message.contains(SECRETS_KEY_FILE), "{message}");
+        assert!(
+            key_path.exists(),
+            "an unresolved conflict retired the key file"
+        );
+        assert!(orphan_key_files(dir.path()).is_empty());
+    }
+
+    /// The write path reads sealed values from raw text, so a damaged file still
+    /// counts. Plaintext that merely starts with the prefix does not.
+    #[test]
+    fn sealed_values_are_found_in_raw_text_even_when_the_file_is_damaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_under(dir.path(), &MemoryCredentialStore::default());
+        let mut text = toml::to_string_pretty(&sealed).unwrap();
+        text.push_str("\n[damaged\nTOKEN = \"sealed:v1:not-a-ciphertext\"\n");
+        let mut found = sealed_envelopes_in_text(&text);
+        let mut expected = sealed_envelopes(&sealed);
+        found.sort();
+        expected.sort();
+        assert_eq!(found.len(), 3);
+        assert_eq!(found, expected);
     }
 
     #[test]
@@ -2585,7 +3136,7 @@ REPO_OVERLAY = "repo-from-credential"
             config.secrets["TOKEN"],
             format!("{SEALED_SECRET_PREFIX}not-a-ciphertext")
         );
-        seal_config_secrets(&mut config, dir.path(), &store).unwrap();
+        seal_config_secrets(&mut config, dir.path(), &store, &[]).unwrap();
         assert_ne!(
             config.secrets["TOKEN"],
             format!("{SEALED_SECRET_PREFIX}not-a-ciphertext")
@@ -2603,11 +3154,11 @@ REPO_OVERLAY = "repo-from-credential"
     fn sealing_key_is_stable_per_directory() {
         let store = MemoryCredentialStore::default();
         let dir = tempfile::tempdir().unwrap();
-        let first = resolve_config_sealing_key_with_store(dir.path(), &store).unwrap();
-        let second = resolve_config_sealing_key_with_store(dir.path(), &store).unwrap();
+        let first = resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap();
+        let second = resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap();
         assert_eq!(first, second, "key changed between resolutions");
         let other = tempfile::tempdir().unwrap();
-        let other_key = resolve_config_sealing_key_with_store(other.path(), &store).unwrap();
+        let other_key = resolve_config_sealing_key_with_store(other.path(), &store, &[]).unwrap();
         assert_ne!(first, other_key, "directories share a key");
     }
 
@@ -2618,7 +3169,8 @@ REPO_OVERLAY = "repo-from-credential"
         let key_path = dir.path().join(SECRETS_KEY_FILE);
         assert!(!key_path.exists());
         let first =
-            resolve_config_sealing_key_with_store(dir.path(), &UnavailableCredentialStore).unwrap();
+            resolve_config_sealing_key_with_store(dir.path(), &UnavailableCredentialStore, &[])
+                .unwrap();
         assert!(key_path.exists(), "key file was not created");
         #[cfg(unix)]
         {
@@ -2627,12 +3179,13 @@ REPO_OVERLAY = "repo-from-credential"
             assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
         }
         let second =
-            resolve_config_sealing_key_with_store(dir.path(), &UnavailableCredentialStore).unwrap();
+            resolve_config_sealing_key_with_store(dir.path(), &UnavailableCredentialStore, &[])
+                .unwrap();
         assert_eq!(first, second, "key file was not reused");
         // A file key migrates into the store when one becomes reachable, and
         // the file is retired so the key cannot silently fork.
         let store = MemoryCredentialStore::default();
-        let migrated = resolve_config_sealing_key_with_store(dir.path(), &store).unwrap();
+        let migrated = resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap();
         assert_eq!(first, migrated, "migration changed the key");
         assert!(!key_path.exists(), "stale key file was not retired");
     }
@@ -2645,7 +3198,7 @@ REPO_OVERLAY = "repo-from-credential"
         let store_b = MemoryCredentialStore::default();
         let dir = tempfile::tempdir().unwrap();
         let mut config = populated_config();
-        seal_config_secrets(&mut config, dir.path(), &store_a).unwrap();
+        seal_config_secrets(&mut config, dir.path(), &store_a, &[]).unwrap();
         let result = unseal_config_secrets(&mut config, dir.path(), &store_b);
         assert!(result.is_err(), "unsealed with the wrong key");
     }
@@ -2656,10 +3209,256 @@ REPO_OVERLAY = "repo-from-credential"
     fn secretless_writes_never_touch_the_key_backend() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = ConfigFile::default();
-        seal_config_secrets(&mut config, dir.path(), &UnavailableCredentialStore).unwrap();
+        seal_config_secrets(&mut config, dir.path(), &UnavailableCredentialStore, &[]).unwrap();
         assert!(
             !dir.path().join(SECRETS_KEY_FILE).exists(),
             "key file created for a secretless config"
+        );
+    }
+
+    /// The `credential_store` key is written and read back, and the unset default stays out of the file.
+    #[test]
+    fn credential_store_key_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = ConfigFile {
+            credential_store: Some("file".into()),
+            ..ConfigFile::default()
+        };
+        write_config_to(&path, &config).unwrap();
+        assert_eq!(
+            credential_store_setting(&path).unwrap().as_deref(),
+            Some("file")
+        );
+        assert_eq!(
+            load_config_from(&path).unwrap().credential_store.as_deref(),
+            Some("file")
+        );
+        write_config_to(&path, &ConfigFile::default()).unwrap();
+        assert_eq!(credential_store_setting(&path).unwrap(), None);
+    }
+
+    /// The store key is read on its own, so a reference that cannot resolve
+    /// cannot hide it. The full load does resolve references, so it still fails.
+    #[test]
+    fn credential_store_key_is_read_without_resolving_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "credential_store = \"file\"\n[github]\napp_pem_ref = \"not a valid reference!\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_store_setting(&path).unwrap().as_deref(),
+            Some("file")
+        );
+        assert!(load_config_from(&path).is_err());
+        assert_eq!(
+            credential_store_setting(&dir.path().join("missing.toml")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_credential_store_fails_the_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "credential_store = \"keychain\"\n").unwrap();
+        let error = format!("{:#}", load_config_from(&path).unwrap_err());
+        assert!(error.contains("credential_store"), "{error}");
+        assert!(error.contains("\"file\" or \"os\""), "{error}");
+    }
+
+    /// A PEM held by the file store reads back through the normal config load
+    /// byte-for-byte, with the file store selected by default.
+    #[tokio::test]
+    async fn pem_in_the_file_store_loads_through_the_config_file() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::unset(crate::credential_store::CREDENTIAL_STORE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nabc/def+ghi=\n-----END RSA PRIVATE KEY-----\n";
+        let pem_ref = github_reference("app-pem", Some("123")).unwrap();
+        crate::credential_store::FileCredentialStore::new(
+            crate::credential_store::FileCredentialStore::default_dir(dir.path()),
+        )
+        .set(&pem_ref, &SecretString::new(pem))
+        .unwrap();
+        let config = ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("123".into()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        let path = dir.path().join("config.toml");
+        write_config_to(&path, &config).unwrap();
+        let loaded = load_config_from(&path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some(pem));
+        assert_eq!(loaded.credential_store, None);
+    }
+    /// A setup fallback remains readable when the explicit environment
+    /// override still selects the OS-primary store on the next load.
+    #[tokio::test]
+    async fn os_env_reads_pem_and_pat_from_the_file_fallback() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _env = crate::state::TestEnvVar::set(CREDENTIAL_STORE_ENV, "os");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let credentials = FileCredentialStore::new(credential_store_dir(&config_path));
+        let pem_ref = github_reference("app-pem", Some("777")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nFALLBACK-PEM\n-----END RSA PRIVATE KEY-----\n";
+        credentials.set(&pem_ref, &SecretString::new(pem)).unwrap();
+        credentials
+            .set(&pat_ref, &SecretString::new("fallback-pat"))
+            .unwrap();
+
+        let config = ConfigFile {
+            credential_store: Some("file".to_owned()),
+            github: GitHubConfig {
+                app_id: Some("777".to_owned()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        write_config_to(&config_path, &config).unwrap();
+
+        let loaded = load_config_from(&config_path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some(pem));
+        assert_eq!(loaded.github.pat(), Some("fallback-pat"));
+    }
+
+    /// Writers and readers use the config's parent when `PRELOOP_CONFIG` is
+    /// outside `PRELOOP_HOME`, for both App PEMs and PATs.
+    #[tokio::test]
+    async fn explicit_config_path_uses_its_sibling_credentials_directory() {
+        let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _store_env = crate::state::TestEnvVar::unset(CREDENTIAL_STORE_ENV);
+        let home = tempfile::tempdir().unwrap();
+        let _home_env = crate::state::TestEnvVar::set("PRELOOP_HOME", home.path());
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("config.toml");
+        let mut writer = CredentialWriter::for_config(&config_path, None).unwrap();
+        let pem_ref = github_reference("app-pem", Some("888")).unwrap();
+        let pat_ref = github_reference("pat", None).unwrap();
+        writer
+            .write(&pem_ref, &SecretString::new("external-pem"))
+            .unwrap();
+        writer
+            .write(&pat_ref, &SecretString::new("external-pat"))
+            .unwrap();
+
+        let config = ConfigFile {
+            github: GitHubConfig {
+                app_id: Some("888".to_owned()),
+                app_pem_ref: Some(pem_ref.as_str().to_owned()),
+                pat_ref: Some(pat_ref.as_str().to_owned()),
+                ..Default::default()
+            },
+            ..ConfigFile::default()
+        };
+        write_config_to(&config_path, &config).unwrap();
+        assert!(credential_store_dir(&config_path).exists());
+        assert!(!home.path().join("credentials").exists());
+
+        let loaded = load_config_from(&config_path).unwrap();
+        assert_eq!(loaded.github.app_pem(), Some("external-pem"));
+        assert_eq!(loaded.github.pat(), Some("external-pat"));
+    }
+
+    /// Sealed secrets survive the move to the file store: a key an earlier
+    /// build kept in the OS store is found, copied, and reused, not replaced.
+    #[test]
+    fn sealing_key_is_migrated_from_a_legacy_os_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        let key = [0x5a; 32];
+        legacy
+            .set(&reference, &SecretString::new(hex::encode(key)))
+            .unwrap();
+        let store = crate::credential_store::FileCredentialStore::new(
+            crate::credential_store::FileCredentialStore::default_dir(dir.path()),
+        )
+        .migrating_from(std::sync::Arc::new(legacy));
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap(),
+            key
+        );
+        assert!(!dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    /// A store that reads a value but cannot keep one — the shape a failed
+    /// OS-to-file migration copy leaves behind.
+    struct ReadOnlyStore {
+        value: String,
+    }
+
+    impl CredentialStore for ReadOnlyStore {
+        fn get(&self, _reference: &CredentialRef) -> anyhow::Result<Option<SecretString>> {
+            Ok(Some(SecretString::new(self.value.clone())))
+        }
+
+        fn set(&self, _reference: &CredentialRef, _value: &SecretString) -> anyhow::Result<()> {
+            anyhow::bail!("credentials directory is not writable")
+        }
+
+        fn delete(&self, _reference: &CredentialRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "read-only store"
+        }
+    }
+
+    /// A durable copy retires the legacy `secrets.key`: the store writes the
+    /// key and reads it back before the file goes away.
+    #[test]
+    fn secrets_key_file_is_retired_once_the_store_confirms_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x5a; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &key).unwrap();
+        let legacy = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        legacy
+            .set(&reference, &SecretString::new(hex::encode(key)))
+            .unwrap();
+        let store = FileCredentialStore::new(dir.path().join("credentials"))
+            .migrating_from(std::sync::Arc::new(legacy));
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap(),
+            key
+        );
+        assert!(
+            !key_path.exists(),
+            "a confirmed durable copy may retire the legacy file"
+        );
+    }
+
+    /// A store that cannot keep the copy must not retire `secrets.key`: the
+    /// file is then the only durable way to unseal the config secrets.
+    #[test]
+    fn secrets_key_file_survives_a_store_that_cannot_keep_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x5a; 32];
+        let key_path = dir.path().join(SECRETS_KEY_FILE);
+        write_sealing_key_file(&key_path, &key).unwrap();
+        let store = ReadOnlyStore {
+            value: hex::encode(key),
+        };
+        assert_eq!(
+            resolve_config_sealing_key_with_store(dir.path(), &store, &[]).unwrap(),
+            key
+        );
+        assert!(
+            key_path.exists(),
+            "an unconfirmed copy must leave the legacy key file in place"
         );
     }
 }
