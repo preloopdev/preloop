@@ -110,39 +110,6 @@ pub fn adapter_for(event_name: &str) -> Option<&'static dyn EventAdapter> {
     }
 }
 
-/// All supported event names.
-pub fn all_event_names() -> &'static [&'static str] {
-    &[
-        "push",
-        "pull_request",
-        "pull_request_target",
-        "pull_request_review",
-        "workflow_dispatch",
-        "workflow_run",
-        "check_run",
-        "check_suite",
-        "repository_dispatch",
-        "create",
-        "delete",
-        "release",
-        "issues",
-        "issue_comment",
-        "discussion",
-        "discussion_comment",
-        "label",
-        "milestone",
-        "watch",
-        "fork",
-        "deployment",
-        "deployment_status",
-        "member",
-        "public",
-        "gollum",
-        "page_build",
-        "schedule",
-    ]
-}
-
 /// Build `EffectiveEvent` vec for events that use the repository default
 /// branch as the ref and `payload.action` as the activity type.
 /// Mirrors MessageController.cs:6287 (* default case).
