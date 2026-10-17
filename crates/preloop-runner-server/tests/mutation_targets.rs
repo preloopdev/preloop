@@ -253,7 +253,13 @@ fn triage_existing_report() {
         .join("mutants.out");
     assert!(report.is_dir(), "no report at {}", report.display());
     let scope = std::env::var("PRELOOP_TRIAGE_SCOPE").unwrap_or_default();
-    triage(&id, &report, &scope);
+    let files = std::env::var("PRELOOP_TRIAGE_FILES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|file| !file.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    triage(&id, &report, &scope, &files);
 }
 
 fn run_target_set(id: &str, targets: &[&Target]) {
@@ -299,7 +305,17 @@ fn run_target_set(id: &str, targets: &[&Target]) {
         .flat_map(|target| target.tests.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
-    triage(id, &merged_dir, &scope);
+    let files = targets
+        .iter()
+        .flat_map(|target| {
+            target
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "--file")
+                .map(|pair| pair[1].to_string())
+        })
+        .collect::<Vec<_>>();
+    triage(id, &merged_dir, &scope, &files);
 
     let summary = merged
         .iter()
@@ -444,7 +460,7 @@ fn shard() -> Option<String> {
 
 const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 
-fn triage(target_id: &str, report: &Path, scope: &str) {
+fn triage(target_id: &str, report: &Path, scope: &str, files: &[String]) {
     let Ok(key) = std::env::var("JEV_API_KEY") else {
         return;
     };
@@ -477,6 +493,7 @@ fn triage(target_id: &str, report: &Path, scope: &str) {
                         "mutant": mutant,
                         "source_line": source_line(mutant),
                         "test_targets": scope,
+                        "test_excerpt": test_excerpts(files, mutant),
                         "question": "This mutant survived: every test in the selected scope still passed with it applied. Classify it."
                     },
                     "criteria": {
@@ -546,6 +563,69 @@ fn triage(target_id: &str, report: &Path, scope: &str) {
         started.elapsed(),
         path.display()
     );
+}
+
+fn test_excerpts(files: &[String], mutant: &str) -> String {
+    let mut keywords: Vec<&str> = Vec::new();
+    if let Some((_, enclosing)) = mutant.rsplit_once(" in ") {
+        keywords.push(enclosing.trim());
+    }
+    if let Some(rest) = mutant.split("delete field ").nth(1) {
+        if let Some((field, tail)) = rest.split_once(" from struct ") {
+            keywords.push(field.trim());
+            if let Some(ty) = tail.split_whitespace().next() {
+                let ty = ty.trim_end_matches(',');
+                keywords.push(ty.rsplit("::").next().unwrap_or(ty));
+            }
+        }
+    }
+    keywords.retain(|keyword| !keyword.is_empty());
+    if keywords.is_empty() {
+        return String::new();
+    }
+
+    let root = workspace_root();
+    let mut excerpt = String::new();
+    let mut budget = 80usize;
+    for file in files {
+        let Ok(text) = fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let start = if file.contains("/tests/") {
+            0
+        } else {
+            lines
+                .iter()
+                .position(|line| line.contains("mod tests") || line.contains("#[cfg(test)]"))
+                .unwrap_or(lines.len())
+        };
+        for (index, line) in lines.iter().enumerate().skip(start) {
+            if !keywords.iter().any(|keyword| line.contains(*keyword)) {
+                continue;
+            }
+            for line in &lines[index.saturating_sub(6)..(index + 7).min(lines.len())] {
+                if budget == 0 {
+                    break;
+                }
+                excerpt.push_str(line);
+                excerpt.push('\n');
+                budget -= 1;
+            }
+            excerpt.push_str("---\n");
+            if budget == 0 {
+                break;
+            }
+        }
+        if budget == 0 {
+            break;
+        }
+    }
+    if excerpt.is_empty() {
+        "(no test code references the mutated symbols)".to_string()
+    } else {
+        excerpt
+    }
 }
 
 fn source_line(mutant: &str) -> String {
