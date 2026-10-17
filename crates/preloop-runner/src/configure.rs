@@ -600,10 +600,10 @@ where
     F: Fn(&str) -> Fut + Sync,
     Fut: Future<Output = Result<bytes::Bytes>> + Send,
 {
-    let node_versions = [
-        ("node20", crate::NODE20_EXTERNALS_VERSION),
-        ("node24", crate::NODE24_EXTERNALS_VERSION),
-    ];
+    // Consume the shared built-in list (`node_externals::expected_runtimes`,
+    // the analogue of upstream `NodeUtil.BuiltInNodeVersions`) so the install
+    // path and its coverage test can never drift apart.
+    let node_versions = node_externals::expected_runtimes();
     download_externals_with_runtimes_and_fetcher(fetcher, &node_versions, root).await
 }
 

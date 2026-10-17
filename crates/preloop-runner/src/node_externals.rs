@@ -222,6 +222,11 @@ pub fn verify_digest(
     Ok(())
 }
 
+/// The runtimes every install must ship. The analogue of upstream
+/// `NodeUtil.BuiltInNodeVersions`, which v2.338.0 grew to
+/// `[node20, node24]`; both were already materialized here so no change was
+/// needed for the internal-node24 spec — this runner execs no internal node
+/// (see `worker/handlers/node.rs::resolve_node_version`).
 pub fn expected_runtimes() -> Vec<(&'static str, &'static str)> {
     vec![
         ("node20", crate::NODE20_EXTERNALS_VERSION),
@@ -233,6 +238,14 @@ pub fn expected_runtimes() -> Vec<(&'static str, &'static str)> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Upstream v2.338.0 ships node20+node24 externals
+    /// (`NodeUtil.BuiltInNodeVersions`); every install must materialize both.
+    #[test]
+    fn expected_runtimes_cover_all_built_in_versions() {
+        let runtimes: Vec<&str> = expected_runtimes().iter().map(|(name, _)| *name).collect();
+        assert_eq!(runtimes, ["node20", "node24"]);
+    }
 
     #[test]
     fn sha256_known() {
