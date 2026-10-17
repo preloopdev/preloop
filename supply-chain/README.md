@@ -20,13 +20,14 @@ The rest of the policy lives at the repository root and in `.github/`:
 Dependency/policy files are:
 
 ```
-Cargo.lock
 deny.toml
 .cargo/audit.toml
 .github/workflows/supply-chain.yml
 supply-chain/**                      (this directory, including this file)
-Cargo.toml                           (the workspace root manifest)
-crates/<crate>/Cargo.toml            (workspace member manifests)
+any Cargo.toml                       (workspace root, crates/*, benchmarks/*,
+                                      a standalone crate, any member added later)
+any Cargo.lock                       (the workspace lockfile, or a standalone
+                                      crate's own)
 ```
 
 Any combination of those may ship together in one PR — lockfile, audit policy,

@@ -46,29 +46,24 @@ EOF
 # Dependency/policy files, in one place: keep these in sync with the failure
 # message and with supply-chain/README.md.
 #
-# The lockfile, the audit policy and the vet state.
+# The audit policy and the vet state.
 is_policy_file() {
   case "$1" in
-    Cargo.lock | deny.toml | .cargo/audit.toml | .github/workflows/supply-chain.yml | supply-chain/*)
+    deny.toml | .cargo/audit.toml | .github/workflows/supply-chain.yml | supply-chain/*)
       return 0
       ;;
-    *)
-      return 1
-      ;;
   esac
+  # Any lockfile, wherever it sits: the workspace root's, and a standalone
+  # crate's own (e.g. packaging/crates-io/preloop/Cargo.lock).
+  [[ "$1" =~ (^|/)Cargo\.lock$ ]]
 }
 
-# The manifests a dependency change has to rewrite: the workspace root and the
-# workspace member manifests under crates/.
+# Any manifest, wherever it sits: the workspace root, any workspace member
+# (crates/*, benchmarks/*), and a standalone crate's own manifest. A dependency
+# bump rewrites whichever manifest declares it, so the shape has to cover all of
+# them and any member added later.
 is_dependency_manifest() {
-  case "$1" in
-    Cargo.toml)
-      return 0
-      ;;
-  esac
-  # crates/<crate>/Cargo.toml, and nothing deeper: `[^/]+` keeps
-  # crates/a/b/Cargo.toml out of the sanctioned set.
-  [[ "$1" =~ ^crates/[^/]+/Cargo\.toml$ ]]
+  [[ "$1" =~ (^|/)Cargo\.toml$ ]]
 }
 
 is_dependency_or_policy_file() {
@@ -155,8 +150,8 @@ code PR then touches no policy or manifest file.
 
 The dependency/policy PR may contain any combination of:
 
-  Cargo.lock  deny.toml  .cargo/audit.toml  .github/workflows/supply-chain.yml
-  supply-chain/**  Cargo.toml  crates/<crate>/Cargo.toml
+  deny.toml  .cargo/audit.toml  .github/workflows/supply-chain.yml  supply-chain/**
+  any Cargo.toml  any Cargo.lock
 
 ...and must not contain anything else -- no source, tests, docs, changelog,
 other workflows, justfile, or scripts. Grouping the lockfile, the policy files

@@ -54,6 +54,11 @@ new_repo() {
   seed "$dir" Cargo.toml '[workspace]'
   seed "$dir" crates/demo/Cargo.toml 'name = "demo"'
   seed "$dir" crates/demo/src/lib.rs '// demo'
+  seed "$dir" benchmarks/preloop-perf/Cargo.toml 'name = "preloop-perf"'
+  seed "$dir" benchmarks/preloop-perf/src/main.rs 'fn main() {}'
+  seed "$dir" packaging/crates-io/preloop/Cargo.toml 'name = "preloop"'
+  seed "$dir" packaging/crates-io/preloop/Cargo.lock 'version = 3'
+  seed "$dir" packaging/crates-io/preloop/src/lib.rs '// packaging shim'
   seed "$dir" deny.toml 'bans = {}'
   seed "$dir" .cargo/audit.toml '[audit]'
   seed "$dir" .github/workflows/supply-chain.yml 'name: supply-chain'
@@ -195,6 +200,53 @@ expect "lockfile + policy + manifests together -> OK" 0 "$dir" "$base" "$head" \
   "Dependency/policy PR detected: OK" "- Cargo.lock" "- deny.toml" \
   "- Cargo.toml" "- crates/demo/Cargo.toml"
 
+# --- PASS: manifests and lockfiles anywhere in the tree ----------------------
+case_start benchmarks-manifest
+modify "$dir" Cargo.lock 'preloop-perf = "0.1.0"'
+modify "$dir" benchmarks/preloop-perf/Cargo.toml 'criterion = "0.5"'
+commit_change "$dir" bench-deps
+expect "Cargo.lock + benchmarks/preloop-perf/Cargo.toml -> OK" 0 "$dir" "$base" "$head" \
+  "Dependency/policy PR detected: OK" "- benchmarks/preloop-perf/Cargo.toml"
+
+case_start nested-lockfile
+modify "$dir" packaging/crates-io/preloop/Cargo.lock 'standalone = "1.0.0"'
+modify "$dir" packaging/crates-io/preloop/Cargo.toml 'standalone = "1.0.0"'
+commit_change "$dir" packaging-deps
+expect "nested lockfile + its manifest -> OK" 0 "$dir" "$base" "$head" \
+  "Dependency/policy PR detected: OK" "- packaging/crates-io/preloop/Cargo.lock"
+
+case_start deep-manifest
+modify "$dir" Cargo.lock 'new = "1.0.0"'
+modify "$dir" crates/demo/nested/Cargo.toml 'new = "1.0.0"'
+commit_change "$dir" nested-manifest
+expect "Cargo.lock + crates/demo/nested/Cargo.toml -> OK (any manifest)" 0 "$dir" "$base" "$head" \
+  "Dependency/policy PR detected: OK" "- crates/demo/nested/Cargo.toml"
+
+# --- FAIL: a manifest or lockfile plus anything else -------------------------
+case_start packaging-manifest-and-doc
+modify "$dir" packaging/crates-io/preloop/Cargo.toml 'publish = true'
+modify "$dir" README.md 'docs'
+commit_change "$dir" packaging-docs
+expect "packaging manifest + README.md -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- packaging/crates-io/preloop/Cargo.toml" "- README.md"
+
+case_start nested-lockfile-and-source
+modify "$dir" packaging/crates-io/preloop/Cargo.lock 'standalone = "1.0.0"'
+modify "$dir" packaging/crates-io/preloop/src/lib.rs '// edit'
+commit_change "$dir" packaging-lock-src
+expect "nested lockfile + source -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- packaging/crates-io/preloop/Cargo.lock" "- packaging/crates-io/preloop/src/lib.rs"
+
+case_start benchmarks-manifest-and-source
+modify "$dir" benchmarks/preloop-perf/Cargo.toml 'criterion = "0.5"'
+modify "$dir" benchmarks/preloop-perf/src/main.rs 'fn main() { /* bench */ }'
+commit_change "$dir" bench-manifest-src
+expect "benchmarks manifest + its source -> FAIL" 1 "$dir" "$base" "$head" \
+  "ERROR: this PR mixes dependency/policy files with other files" \
+  "- benchmarks/preloop-perf/src/main.rs"
+
 # --- FAIL: a dependency/policy file plus anything else -----------------------
 case_start lock-and-source
 modify "$dir" Cargo.lock 'new = "1.0.0"'
@@ -232,14 +284,6 @@ commit_change "$dir" workflows
 expect "supply-chain.yml + ci.yml -> FAIL" 1 "$dir" "$base" "$head" \
   "ERROR: this PR mixes dependency/policy files with other files" \
   "- .github/workflows/ci.yml"
-
-case_start nested-manifest
-modify "$dir" Cargo.lock 'new = "1.0.0"'
-modify "$dir" crates/demo/nested/Cargo.toml 'new = "1.0.0"'
-commit_change "$dir" nested
-expect "Cargo.lock + crates/demo/nested/Cargo.toml -> FAIL" 1 "$dir" "$base" "$head" \
-  "ERROR: this PR mixes dependency/policy files with other files" \
-  "- crates/demo/nested/Cargo.toml"
 
 case_start changelog
 modify "$dir" Cargo.lock 'new = "1.0.0"'
