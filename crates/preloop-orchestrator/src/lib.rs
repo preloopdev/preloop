@@ -18,6 +18,7 @@ pub use preloop_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use preloop_vm::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
@@ -6944,51 +6945,6 @@ async fn provision_runner<P: VmProvider + 'static>(
     Ok(as_runner_user(config, &run))
 }
 
-/// Wrap a guest argv so the runner executes under `runner_user` instead of
-/// root: create the account, provision its runtime directory, open the
-/// control bridge, grant the docker group, then drop privileges with
-/// `setpriv` and export the account identity for the step-environment
-/// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
-/// worker). Purely a guest-side concern — never applied on the host.
-/// Carry a guest shell script so its root-only steps run either directly
-/// (the exec landed on root — locally baked goldens from plain bases declare
-/// no USER) or via passwordless sudo (the official runner image declares
-/// `USER runner`, and `machine exec` runs as that image user). The script is
-/// embedded base64 so every quoting form survives both shells.
-fn run_as_root_or_sudo(script: &str) -> String {
-    run_as_root_or_sudo_impl(script, true)
-}
-
-/// Same root-or-sudo fallback as [`run_as_root_or_sudo`], but status-
-/// preserving: a refused sudo or a failing script propagates a nonzero exit
-/// so the caller's exit-code check is authoritative. Required for provisioning
-/// that has no independent verification step — the lenient form would turn a
-/// passwordless-sudo miss into a false success.
-fn run_as_root_or_sudo_strict(script: &str) -> String {
-    run_as_root_or_sudo_impl(script, false)
-}
-
-fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
-    use base64::Engine as _;
-    // The script is spliced inline as `then {script}; else …`, so a trailing
-    // newline would leave that `;` alone on a line and dash would reject the
-    // whole command (`Syntax error: ";" unexpected`). Scripts that live in a
-    // file (`scripts/docker-start.sh`) end in a newline by convention, and
-    // trailing whitespace means nothing to the shell, so drop it here instead
-    // of asking every file-backed script to remember.
-    let script = script.trim_end();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(script);
-    let fallback = if best_effort {
-        "sudo -n sh 2>/dev/null || true"
-    } else {
-        "sudo -n sh"
-    };
-    format!(
-        "if [ \"$(id -u)\" -eq 0 ]; then {script}; else \
-           printf %s '{b64}' | base64 -d | {fallback}; fi"
-    )
-}
-
 /// Wrap a guest argv so it launches on the hosted process limits without
 /// switching accounts.
 ///
@@ -7015,6 +6971,12 @@ fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
     wrapped
 }
 
+/// Wrap a guest argv so the runner executes under `runner_user` instead of
+/// root: create the account, provision its runtime directory, open the
+/// control bridge, grant the docker group, then drop privileges with
+/// `setpriv` and export the account identity for the step-environment
+/// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
+/// worker). Purely a guest-side concern — never applied on the host.
 fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // Unset or root means no account switch, not no limits: the guest applies
     // neither the image's systemd nor its PAM limits on this path either, so
