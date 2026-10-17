@@ -243,6 +243,19 @@ fn t5_cli_parsing() {
     run_target_set("T5", &[&T5]);
 }
 
+#[test]
+#[ignore = "triage an existing mutants.out report without rerunning it"]
+fn triage_existing_report() {
+    let id = std::env::var("PRELOOP_TRIAGE_TARGET").unwrap_or_else(|_| "T5".to_string());
+    let report = workspace_root()
+        .join("mutants.out")
+        .join(&id)
+        .join("mutants.out");
+    assert!(report.is_dir(), "no report at {}", report.display());
+    let scope = std::env::var("PRELOOP_TRIAGE_SCOPE").unwrap_or_default();
+    triage(&id, &report, &scope);
+}
+
 fn run_target_set(id: &str, targets: &[&Target]) {
     let root = workspace_root();
     let pg_url = std::env::var("PRELOOP_TEST_POSTGRES_URL").ok();
@@ -281,6 +294,12 @@ fn run_target_set(id: &str, targets: &[&Target]) {
     for (kind, text) in &merged {
         fs::write(merged_dir.join(format!("{kind}.txt")), text).expect("write merged report");
     }
+    let scope = targets
+        .iter()
+        .flat_map(|target| target.tests.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    triage(id, &merged_dir, &scope);
 
     let summary = merged
         .iter()
@@ -421,6 +440,130 @@ fn shard() -> Option<String> {
         "PRELOOP_MUTANTS_SHARD must be 0..{count}, got {raw}"
     );
     Some(format!("{index}/{count}"))
+}
+
+const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
+
+fn triage(target_id: &str, report: &Path, scope: &str) {
+    let Ok(key) = std::env::var("JEV_API_KEY") else {
+        return;
+    };
+    if key.is_empty() {
+        return;
+    }
+    let missed = fs::read_to_string(report.join("missed.txt")).unwrap_or_default();
+    let survivors: Vec<&str> = missed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if survivors.is_empty() {
+        return;
+    }
+
+    let started = Instant::now();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime for triage");
+    let mut rows = Vec::new();
+    for (batch_index, batch) in survivors.chunks(50).enumerate() {
+        let mut questions = serde_json::Map::new();
+        for (index, mutant) in batch.iter().enumerate() {
+            questions.insert(
+                format!("s{index}"),
+                serde_json::json!({
+                    "type": "choice",
+                    "instructions": {
+                        "mutant": mutant,
+                        "source_line": source_line(mutant),
+                        "test_targets": scope,
+                        "question": "This mutant survived: every test in the selected scope still passed with it applied. Classify it."
+                    },
+                    "criteria": {
+                        "real_gap": "Behavior a user can observe is wrong when the mutant is applied, and no test asserts it",
+                        "dead_code": "The code path cannot run in practice, so the change is unobservable",
+                        "equivalent": "The change is semantically identical to the original for every input",
+                        "scoping_artifact": "A test outside the selected test targets would likely catch it"
+                    }
+                }),
+            );
+        }
+        let body = serde_json::json!({
+            "state": { "target": target_id },
+            "model": "jev-latest",
+            "questions": questions
+        });
+        let response: Option<serde_json::Value> = runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .ok()?;
+            let response = client
+                .post(JEV_URL)
+                .bearer_auth(&key)
+                .json(&body)
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                eprintln!("triage: jev returned {}", response.status());
+                return None;
+            }
+            response.json().await.ok()
+        });
+        let Some(response) = response else {
+            continue;
+        };
+        for (index, mutant) in batch.iter().enumerate() {
+            let answer = response
+                .pointer(&format!("/answers/s{index}"))
+                .cloned()
+                .unwrap_or_default();
+            let verdict = answer["choice"].as_str().unwrap_or("unknown");
+            let confidence = answer["confidence"].as_f64().unwrap_or(0.0);
+            rows.push(format!(
+                "| {} | {} | {verdict} | {confidence:.2} |",
+                batch_index * 50 + index + 1,
+                mutant.replace('|', "\\|")
+            ));
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut markdown =
+        String::from("| # | survivor | verdict | confidence |\n| --- | --- | --- | --- |\n");
+    for row in &rows {
+        markdown.push_str(row);
+        markdown.push('\n');
+    }
+    let path = report.parent().unwrap_or(report).join("triage.md");
+    fs::write(&path, &markdown).expect("write triage report");
+    eprintln!(
+        "mutation target {target_id}: triaged {} survivor(s) in {:.1?} -> {}",
+        rows.len(),
+        started.elapsed(),
+        path.display()
+    );
+}
+
+fn source_line(mutant: &str) -> String {
+    let mut parts = mutant.splitn(4, ':');
+    let (Some(path), Some(line)) = (parts.next(), parts.next()) else {
+        return String::new();
+    };
+    let Ok(line) = line.parse::<usize>() else {
+        return String::new();
+    };
+    fs::read_to_string(workspace_root().join(path))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .nth(line.saturating_sub(1))
+                .map(|text| text.trim().to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn initdb_available() -> bool {

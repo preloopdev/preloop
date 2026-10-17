@@ -27,6 +27,7 @@ jobs:
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/8
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -117,6 +118,11 @@ jobs:
               cat "$out/missed.txt"
               echo '```'
             fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload mutants report
         if: always()
@@ -143,6 +149,7 @@ jobs:
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -233,6 +240,11 @@ jobs:
               cat "$out/missed.txt"
               echo '```'
             fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload mutants report
         if: always()
@@ -259,6 +271,7 @@ jobs:
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -349,6 +362,11 @@ jobs:
               cat "$out/missed.txt"
               echo '```'
             fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload mutants report
         if: always()
@@ -379,6 +397,7 @@ jobs:
       PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/8
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -469,6 +488,11 @@ jobs:
               cat "$out/missed.txt"
               echo '```'
             fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload mutants report
         if: always()
@@ -490,6 +514,7 @@ jobs:
       CARGO_BUILD_JOBS: "4"
       PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
       PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+      JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -579,6 +604,11 @@ jobs:
               echo '```'
               cat "$out/missed.txt"
               echo '```'
+            fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload mutants report
