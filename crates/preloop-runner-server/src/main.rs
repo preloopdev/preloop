@@ -129,6 +129,13 @@ async fn main() -> anyhow::Result<()> {
                 (None, None, false) => TlsMode::None,
                 _ => unreachable!("clap ensures mutual exclusion"),
             };
+            // The process-startup boundary: the environment is read once
+            // here (`StartupConfig::from_env`), and the explicit `--store`
+            // flag wins over it.
+            let startup = preloop_runner_server::config::StartupConfig {
+                store_url: store,
+                ..preloop_runner_server::config::StartupConfig::from_env()
+            };
             serve(ServerConfig {
                 queue_depth: None,
                 next_job_runs_on: None,
@@ -139,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,
-                store_url: store,
+                startup,
                 record_flows,
                 tls,
                 enable_test_api,

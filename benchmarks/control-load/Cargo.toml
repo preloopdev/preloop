@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 description = "Open-loop load and chaos harness for the Postgres-backed control plane"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "preloop-control-load"
 path = "src/main.rs"

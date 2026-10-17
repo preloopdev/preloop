@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Job scheduling and VM lifecycle orchestration for Preloop CI"
 
+[lints]
+workspace = true
+
 [dependencies]
 preloop-vm = { path = "../preloop-vm" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }

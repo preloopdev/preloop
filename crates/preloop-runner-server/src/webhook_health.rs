@@ -38,9 +38,8 @@ fn health_interval() -> Duration {
 /// The delivery URL GitHub should be calling, when the operator told us what
 /// this server is publicly reachable at. Unknown expectation is `None`:
 /// reporting drift against a guess would be worse than reporting nothing.
-fn expected_webhook_url() -> Option<String> {
-    std::env::var("PRELOOP_PUBLIC_URL")
-        .ok()
+fn expected_webhook_url(public_base: Option<&str>) -> Option<String> {
+    public_base
         .map(|base| base.trim().trim_end_matches('/').to_owned())
         .filter(|base| !base.is_empty())
         .map(|base| format!("{base}{WEBHOOK_PATH}"))
@@ -88,8 +87,19 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
     // covers every App.
     let (previous, previous_checked_at_us) = shared.state.webhook_status.app_config_snapshot();
     let app_count = apps.len();
-    let api_base = crate::github::github_api_base();
-    let expected_url = expected_webhook_url();
+    if let Some(retry_after) = shared
+        .state
+        .github_breakers
+        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
+    {
+        tracing::debug!(
+            retry_in_secs = retry_after.as_secs(),
+            "GitHub breaker open or probe in progress; skipping App webhook health check"
+        );
+        return previous;
+    }
+    let api_base = shared.state.github_api_base();
+    let expected_url = expected_webhook_url(shared.state.public_url.as_deref());
     let mut statuses = Vec::with_capacity(apps.len());
     let mut checked = 0usize;
     for app in apps {
@@ -268,9 +278,11 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn shared_with_app() -> (tempfile::TempDir, Arc<SharedState>) {
+    async fn shared_with_app(
+        startup: crate::config::StartupConfig,
+    ) -> (tempfile::TempDir, Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
+        let mut state = crate::AppState::new(temp.path().to_path_buf(), startup)
             .await
             .unwrap();
         state.github_app = Some(crate::github_app::GitHubAppCredentials::for_tests(
@@ -333,16 +345,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matching_url_modulo_trailing_slash_is_not_drift() {
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks/",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let (_temp, shared) = shared_with_app(crate::config::StartupConfig {
+            github_api_url: Some(api_base),
+            public_url: Some("https://here.example/".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        })
+        .await;
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        assert!(!statuses[0].url_drifted(), "{statuses:?}");
+        assert!(statuses[0].healthy(), "{statuses:?}");
+    }
+
+    #[tokio::test]
     async fn reports_url_drift_against_the_public_url() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let api_base = stub_github(
             "https://elsewhere.example/api/v1/github/webhooks",
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
-        let (_temp, shared) = shared_with_app().await;
+        let (_temp, shared) = shared_with_app(crate::config::StartupConfig {
+            github_api_url: Some(api_base),
+            public_url: Some("https://here.example".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        })
+        .await;
 
         let statuses = check_webhook_config_once(&shared).await;
 
@@ -357,34 +391,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_url_modulo_trailing_slash_is_not_drift() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let api_base = stub_github(
-            "https://here.example/api/v1/github/webhooks/",
-            axum::http::StatusCode::OK,
-        )
-        .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example/");
-        let (_temp, shared) = shared_with_app().await;
-
-        let statuses = check_webhook_config_once(&shared).await;
-
-        assert!(!statuses[0].url_drifted(), "{statuses:?}");
-        assert!(statuses[0].healthy(), "{statuses:?}");
-    }
-
-    #[tokio::test]
     async fn unreadable_hook_config_is_an_error_not_a_clean_bill_of_health() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let api_base = stub_github(
             "https://here.example/api/v1/github/webhooks",
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
-        let (_temp, shared) = shared_with_app().await;
+        let (_temp, shared) = shared_with_app(crate::config::StartupConfig {
+            github_api_url: Some(api_base),
+            public_url: Some("https://here.example".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        })
+        .await;
 
         let statuses = check_webhook_config_once(&shared).await;
 

@@ -635,7 +635,7 @@ pub fn action_download_ticket(
     }
 
     let key = format!("{repo_part}@{git_ref}");
-    let runner_url = runner_base_url();
+    let runner_url = state.runner_base_url();
     // The download route is bearerless and reachable from inside runner VMs,
     // so the URL itself has to be the capability: signed, scoped to this one
     // action, and short-lived (20 minutes — minted at job setup and used
@@ -1479,7 +1479,9 @@ mod tests {
 
     async fn test_state() -> AppState {
         let temp = tempfile::tempdir().unwrap();
-        AppState::new(temp.path().to_path_buf()).await.unwrap()
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap()
     }
 
     /// The static PAT follows the engine onto a configured plain-http
@@ -1774,7 +1776,12 @@ mod tests {
     /// needs no env vars and cannot leak into other tests.
     async fn tarball_shared(stub_base: &str) -> (Arc<SharedState>, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let mut state = AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig::for_tests(),
+        )
+        .await
+        .unwrap();
         state.github_urls = crate::state::GitHubUrls {
             server_url: stub_base.to_owned(),
             api_url: stub_base.to_owned(),
@@ -1831,11 +1838,8 @@ mod tests {
     /// Pre-fix this path had no breaker at all and hammered the 429.
     #[tokio::test]
     async fn tarball_download_429_engages_breaker() {
-        // Held for the whole test, with the PAT cleared before the state is
-        // built: `AppState::new` reads `PRELOOP_GITHUB_TOKEN`, and a concurrent
-        // test that sets it would move this download into the Pat bucket.
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+        // The test startup config carries no PAT (`StartupConfig::for_tests`),
+        // so this download cannot move into the Pat bucket.
         let reset = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1913,8 +1917,6 @@ mod tests {
     /// breaker.
     #[tokio::test]
     async fn tarball_transport_failure_is_internal_not_unavailable() {
-        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let _pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
         // Port 1 on loopback is closed: connection refused, no HTTP exchange.
         let (shared, _temp) = tarball_shared("http://127.0.0.1:1").await;
         let (state, path, query) = download_call(&shared);

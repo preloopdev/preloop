@@ -68,22 +68,17 @@ impl Default for BreakerConfig {
 }
 
 impl BreakerConfig {
-    /// `PRELOOP_GITHUB_BREAKER=off` disables tripping entirely (calls are
-    /// still observed, so the status snapshot keeps reporting failures);
-    /// `PRELOOP_GITHUB_BREAKER_THRESHOLD` overrides the failure count.
-    pub fn from_env() -> Self {
+    /// The `PRELOOP_GITHUB_BREAKER*` overrides as explicit values (resolved
+    /// at startup by [`crate::config::StartupConfig`]): `enabled: Some(false)`
+    /// disables tripping entirely (calls are still observed, so the status
+    /// snapshot keeps reporting failures); `failure_threshold: Some(n)`
+    /// overrides the failure count (`0` and smaller keep the default).
+    pub fn from_overrides(enabled: Option<bool>, failure_threshold: Option<u32>) -> Self {
         let mut config = Self::default();
-        if let Ok(value) = std::env::var("PRELOOP_GITHUB_BREAKER") {
-            let value = value.trim().to_ascii_lowercase();
-            if matches!(value.as_str(), "off" | "0" | "false" | "disabled") {
-                config.enabled = false;
-            }
+        if let Some(enabled) = enabled {
+            config.enabled = enabled;
         }
-        if let Some(threshold) = std::env::var("PRELOOP_GITHUB_BREAKER_THRESHOLD")
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .filter(|threshold| *threshold > 0)
-        {
+        if let Some(threshold) = failure_threshold.filter(|threshold| *threshold > 0) {
             config.failure_threshold = threshold;
         }
         config
@@ -123,7 +118,7 @@ pub struct GithubBreaker {
 
 impl Default for GithubBreaker {
     fn default() -> Self {
-        Self::new(BreakerConfig::from_env())
+        Self::new(BreakerConfig::default())
     }
 }
 
@@ -457,7 +452,7 @@ impl GithubBreakerRegistry {
 
 impl Default for GithubBreakerRegistry {
     fn default() -> Self {
-        Self::new(BreakerConfig::from_env())
+        Self::new(BreakerConfig::default())
     }
 }
 

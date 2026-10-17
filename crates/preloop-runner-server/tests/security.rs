@@ -9,7 +9,9 @@ use std::time::Duration;
 #[tokio::test]
 async fn workflow_steps_update_terminal_first_sighting_does_not_fake_zero_duration() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
@@ -69,7 +71,9 @@ async fn workflow_steps_update_terminal_first_sighting_does_not_fake_zero_durati
 #[tokio::test]
 async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
@@ -152,7 +156,9 @@ async fn workflow_steps_update_records_start_on_in_progress_then_finish() {
 async fn workflow_concurrency_serializes_runs_fifo() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -200,7 +206,9 @@ jobs:
 async fn workflow_concurrency_releases_when_the_last_job_finishes() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -240,7 +248,9 @@ jobs:
 async fn workflow_concurrency_cancel_in_progress_cancels_running() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -320,7 +330,9 @@ jobs:
 async fn pending_run_replaced_by_newer_submission() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -352,7 +364,9 @@ jobs:
 async fn queue_max_holds_multiple_pending_fifo() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -407,7 +421,9 @@ jobs:
 async fn concurrency_group_names_case_insensitive() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let a = submit_yaml(
@@ -452,7 +468,9 @@ jobs:
 async fn job_level_concurrency_gates_single_job() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let accepted = submit_yaml(
@@ -490,7 +508,9 @@ jobs:
 async fn concurrency_blocked_jobs_do_not_block_unrelated_work() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     // First run holds the group.
@@ -565,7 +585,9 @@ jobs:
 #[tokio::test]
 async fn empty_workflow_concurrency_group_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state, CancellationToken::new());
     let response = app
         .oneshot(
@@ -615,7 +637,9 @@ jobs:
 #[tokio::test]
 async fn whitespace_workflow_concurrency_group_emits_no_synthetic_job_event() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     // Subscribe before submitting: `submit` broadcasts its events and a
     // rejected run is never persisted, so there is no stream to re-read.
@@ -662,7 +686,9 @@ async fn whitespace_workflow_concurrency_group_emits_no_synthetic_job_event() {
 #[tokio::test]
 async fn submitted_run_shares_the_namespace_of_its_run_number_counter() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_yaml(
         &app,
@@ -705,7 +731,9 @@ async fn submitted_run_shares_the_namespace_of_its_run_number_counter() {
 async fn concurrency_chaos_interleaved_submits_and_completes() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml_hold = r#"
@@ -782,7 +810,9 @@ async fn broker_root_message_path_delivers_job_cancellation() {
     // The preloop-runner broker client polls `/runner/server/message` (root
     // path), NOT `/_apis/v1/Message`. Cancel must be delivered there.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     // The broker protocol requires a listen token that names a *registered*
     // runner (tokens are revoked with the registration on purge), so register
@@ -930,7 +960,9 @@ async fn broker_busy_poll_ends_promptly_once_job_completes() {
     // beat — never dispatching the successor on Busy — so the Online poll
     // that follows can claim it.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let registered = request_json(
         &app,
@@ -1030,7 +1062,9 @@ jobs:
 async fn concurrency_expression_group_uses_github_ref() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1099,7 +1133,9 @@ jobs:
 async fn concurrency_groups_are_repo_scoped() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1129,7 +1165,9 @@ jobs:
 async fn cancel_in_progress_expression_false_does_not_cancel() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1160,7 +1198,9 @@ jobs:
 async fn cancel_in_progress_expression_true_cancels() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1202,7 +1242,9 @@ jobs:
 async fn late_success_cannot_overwrite_cancelled_job() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1235,7 +1277,9 @@ jobs:
 async fn multi_job_workflow_concurrency_holds_all_jobs() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1287,7 +1331,9 @@ async fn job_level_concurrency_with_needs_gate_order() {
     // group until needs are satisfied.
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let accepted = submit_yaml(
@@ -1355,7 +1401,9 @@ async fn job_level_and_workflow_level_share_namespace() {
     // Plan: groups are one namespace for workflow-level runs and job-level jobs.
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let a = submit_yaml(
@@ -1401,7 +1449,9 @@ jobs:
 async fn queue_max_overflow_cancels_arrival() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1439,7 +1489,9 @@ jobs:
 async fn cancel_run_api_releases_concurrency_slot() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1477,7 +1529,9 @@ async fn cancel_in_progress_then_pending_chain() {
     // C arrives without cancel → pending. Complete B → C queued.
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml_cancel = r#"
@@ -1539,7 +1593,9 @@ jobs:
 async fn bare_string_concurrency_shorthand_enforced() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1567,7 +1623,9 @@ jobs:
 async fn job_level_matrix_concurrency_per_expansion() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     // Two matrix cells share one group → serialize; different group → parallel.
@@ -1651,7 +1709,9 @@ async fn mixed_queue_modes_arrival_owns_join() {
     // → should cancel B and take the pending slot.
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let a = submit_yaml(
@@ -1721,7 +1781,9 @@ jobs:
 async fn cancel_message_targets_agent_job_guid_not_logical_id() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let a = submit_yaml(
@@ -1784,7 +1846,9 @@ async fn workflow_concurrency_cancel_before_dispatch_no_message() {
     // Cancel a pending (not yet dispatched) run → no JobCancellation enqueued.
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -1834,7 +1898,9 @@ async fn c01_max_parallel_concurrency_no_self_deadlock() {
     // Cell A acquires the group, cell B waits. When A completes, B must
     // be promoted exactly once without contending with its own holder.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1909,7 +1975,9 @@ jobs:
 async fn c05_eval_failure_terminates_run() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1948,7 +2016,9 @@ jobs:
 async fn c06_cancel_in_progress_expression_bool_eval() {
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
 
@@ -1989,7 +2059,9 @@ async fn c06_queue_max_with_dynamic_true_cancel_rejected() {
     // rejected. The parser catches literal "true" at parse time → 400.
     // Dynamic expressions are caught at evaluation time → also rejected.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let body = json!({
@@ -2016,7 +2088,9 @@ async fn c06_queue_max_with_dynamic_true_cancel_rejected() {
 #[tokio::test]
 async fn c07_holder_keys_cleaned_after_run_release() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let yaml = r#"
@@ -2062,7 +2136,9 @@ jobs:
 #[tokio::test]
 async fn c02_reusable_call_jobset_blocks_and_promotes_members() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let caller_yaml = r#"
 on: push
@@ -2171,7 +2247,9 @@ jobs:
 #[tokio::test]
 async fn c02_jobset_waits_for_embedded_gate_after_acquiring_caller_gate() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let holder = submit_yaml(
         &app,
@@ -2283,7 +2361,9 @@ jobs:
 #[tokio::test]
 async fn c02_jobset_deduplicates_identical_caller_and_embedded_keys() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
         &app,
@@ -2345,7 +2425,9 @@ jobs:
 #[tokio::test]
 async fn reusable_caller_gated_on_plan_outputs_is_skipped() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
         &app,
@@ -2472,7 +2554,9 @@ jobs:
 #[tokio::test]
 async fn github_shaped_run_record_for_gated_and_passing_callers() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
         &app,
@@ -2608,7 +2692,9 @@ jobs:
 #[tokio::test]
 async fn reusable_caller_gated_on_true_output_runs() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
         &app,
@@ -2742,7 +2828,9 @@ jobs:
 #[tokio::test]
 async fn c02_jobset_resolves_matrix_contexts_on_caller_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let caller_yaml = r#"
@@ -2809,7 +2897,9 @@ jobs:
 #[tokio::test]
 async fn dag_duplicate_completion_idempotent_production() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2918,7 +3008,9 @@ jobs:
 
     // Run through real server
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -2992,7 +3084,9 @@ async fn generated_server_dag_properties_1000_cases() {
         *seed
     }
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     for case in 0..100u64 {

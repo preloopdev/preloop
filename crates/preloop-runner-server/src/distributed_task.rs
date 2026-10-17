@@ -19,7 +19,7 @@ pub async fn next_message(
         .unwrap_or(50)
         // A client-chosen window longer than the liveness floor parks a
         // healthy runner past its own reaping.
-        .min(crate::state::max_poll_window_secs());
+        .min(shared.state.max_poll_window_secs);
     // One window per request (see `broker::next_message_broker_ref`).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
 
@@ -175,7 +175,12 @@ async fn render_session_message(
             // (fresh cache, or re-introspected here: the job may have queued
             // past the cache TTL); unverifiable authority stays withheld and
             // the job keeps an empty token surface.
-            match crate::runs::verified_pat_scopes(&pat).await {
+            match crate::runs::verified_pat_scopes(
+                shared.state.github_api_request_base.as_deref(),
+                &pat,
+            )
+            .await
+            {
                 Some(scopes) => {
                     msg.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),
@@ -212,7 +217,7 @@ async fn render_session_message(
         // same as broker_acquire_job.
         for endpoint in &mut msg.resources.endpoints {
             if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                endpoint.url = Some(runner_server_url());
+                endpoint.url = Some(shared.state.runner_server_url());
                 endpoint.authorization.parameters.insert(
                     "AccessToken".to_owned(),
                     shared.state.mint_runtime_token_for_job(
@@ -223,14 +228,15 @@ async fn render_session_message(
                 );
                 endpoint.data.insert(
                     "ResultsServiceUrl".to_owned(),
-                    format!("{}/", runner_base_url()),
+                    format!("{}/", shared.state.runner_base_url()),
                 );
-                endpoint
-                    .data
-                    .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+                endpoint.data.insert(
+                    "PipelinesServiceUrl".to_owned(),
+                    shared.state.runner_server_url(),
+                );
                 endpoint.data.insert(
                     "CacheServerUrl".to_owned(),
-                    format!("{}/", runner_base_url()),
+                    format!("{}/", shared.state.runner_base_url()),
                 );
             }
         }
@@ -1044,7 +1050,9 @@ mod tests {
     #[tokio::test]
     async fn completion_response_reflects_post_expansion_failure() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = test_app(state.clone(), CancellationToken::new());
 
         let accepted = test_request(
@@ -1106,7 +1114,9 @@ jobs:
     #[tokio::test]
     async fn completion_annotations_are_masked_before_storage_and_response() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state
             .secrets
             .write()
@@ -1190,7 +1200,9 @@ jobs:
     #[tokio::test]
     async fn deferred_reusable_caller_with_needs_matrix_fans_out_per_cell() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = test_app(state.clone(), CancellationToken::new());
 
         let accepted = test_request(
@@ -1292,7 +1304,9 @@ jobs:
     #[tokio::test]
     async fn deferred_matrix_inside_reusable_expands_against_the_callee() {
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = test_app(state.clone(), CancellationToken::new());
 
         let accepted = test_request(

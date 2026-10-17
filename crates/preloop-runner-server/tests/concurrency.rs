@@ -1,6 +1,3 @@
-// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
-#![allow(unsafe_code)]
-
 //! preloop-runner-server integration tests — concurrency group.
 //! Split from the former `lib_tests.rs` unit; see `tests/common/mod.rs`.
 
@@ -11,7 +8,9 @@ use common::*;
 #[tokio::test]
 async fn listen_tokens_are_revoked_when_the_runner_identity_is_purged() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Registration precedes token issuance in every real flow: register the
@@ -255,7 +254,9 @@ async fn startup_purge_removes_only_restored_ephemeral_runners() {
     drop(app);
     drop(state);
 
-    let restored_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let restored_state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     {
         let inner = restored_state.test_tx().await;
         assert!(inner.runners[&ephemeral_id].ephemeral);
@@ -269,7 +270,9 @@ async fn startup_purge_removes_only_restored_ephemeral_runners() {
     drop(restored_shared);
     drop(restored_state);
 
-    let final_state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let final_state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = final_state.test_tx().await;
     assert!(!inner.runners.contains_key(&ephemeral_id));
     assert!(inner.runners.contains_key(&external_id));
@@ -329,7 +332,9 @@ async fn workflow_gate_released_when_run_ends_via_dependency_skip() {
     // cancel-in-progress parked permanently).
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     let yaml = r#"
@@ -392,7 +397,9 @@ async fn needs_gated_job_concurrency_acquired_at_promote_time() {
     // jobs, so a needs-gated job with a busy group was dispatched anyway.
     let temp = tempfile::tempdir().unwrap();
     let app = app(
-        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap(),
         CancellationToken::new(),
     );
     // Run A: `one` holds job group g (needs-empty → gated at submit).
@@ -483,7 +490,9 @@ async fn expanded_matrix_placeholder_does_not_leak_request_correlation() {
     // request stays inflight for the life of the process, still resolvable to
     // a job that no longer exists.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -608,7 +617,9 @@ async fn deferred_matrix_cells_see_the_dispatch_inputs() {
     // its job-level `if:` fired in the matrix job alone, while plain jobs saw
     // the real value.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -688,7 +699,9 @@ async fn cancelled_deferred_matrix_node_settles_submit_requests() {
     // every session) exactly as completion would — the state the
     // reusable-caller path has from submit, since callers mint nothing.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -823,7 +836,9 @@ async fn cancelled_deferred_matrix_node_job_cancel_settles_requests() {
     // progress, holder cancellation) hits the same leak as a run cancel: a
     // parked deferred-matrix node's submit-time records stay active forever.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -891,17 +906,18 @@ jobs:
 async fn overflowed_run_settles_deferred_matrix_node_requests() {
     // The job VM injects a real PRELOOP_GITHUB_TOKEN; without clearing it the
     // 101 submits below each hit live PAT scope introspection and the run is
-    // refused with 403 once the token fails auth. Hold the env lock so the
-    // unset cannot race a parallel test that needs the token.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    // refused with 403 once the token fails auth. No token is configured
+    // here (the startup config carries none), so the probe stays local.
+    let startup = stub_startup(None, None);
     // A run cancelled at submit by a workflow-concurrency queue
     // overflow never dispatches anything, yet the deferred-matrix node's
     // submit-time request records were minted before the gate check. They
     // must be settled like any other cancellation instead of leaking as
     // active forever.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let yaml = r#"
 on: push
@@ -969,7 +985,9 @@ async fn dependency_skipped_deferred_matrix_node_settles_requests() {
     // correlation. The skip arm must settle it like any other terminal
     // conclusion.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1057,7 +1075,9 @@ async fn dependency_error_deferred_matrix_node_settles_requests() {
     // promote sweep. Its submit-time request correlation must be settled the
     // same way.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1143,7 +1163,9 @@ async fn cancel_preserves_completed_reusable_caller_result() {
     // The run-cancel sweep settles every expandable node, so it must settle
     // this one with its real verdict — Success — not clobber it to Cancelled.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -1305,7 +1327,9 @@ async fn store_recovery_preserves_run_secrets() {
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let run_id = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let accepted = request_json(
             &app,
@@ -1326,7 +1350,9 @@ async fn store_recovery_preserves_run_secrets() {
             .unwrap()
     };
 
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     assert_run_secrets_outside_database(&recovered, run_id, "owner/repo").await;
     let resolved = recovered.test_resolve_run_secrets("owner/repo", run_id);
     assert_eq!(
@@ -1355,7 +1381,9 @@ async fn store_recovery_preserves_cross_run_queue_order() {
     let temp = tempfile::tempdir().unwrap();
     let workflow = "on: push\njobs:\n  one:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  two:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let before: Vec<String> = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         for repo in ["owner/alpha", "owner/beta", "owner/gamma"] {
             request_json(
@@ -1374,7 +1402,9 @@ async fn store_recovery_preserves_cross_run_queue_order() {
     };
     assert_eq!(before.len(), 6, "three runs of two jobs must all be queued");
 
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = recovered.test_tx().await;
     let after: Vec<String> = inner
         .ready()
@@ -1390,7 +1420,9 @@ async fn store_recovery_preserves_cross_run_queue_order() {
 async fn store_recovery_preserves_broker_and_inflight_messages() {
     let temp = tempfile::tempdir().unwrap();
     {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         state
             .test_db_mutate(|tx| {
                 tx.insert_session("sess-1", 1, "broker", true).unwrap();
@@ -1411,7 +1443,9 @@ async fn store_recovery_preserves_broker_and_inflight_messages() {
             })
             .await;
     }
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = recovered.test_tx().await;
     let session = inner
         .inflight_messages
@@ -1470,10 +1504,10 @@ async fn postgres_recovery_preserves_run_secrets() {
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let run_id = {
-        let state = AppState::new_with_store(
+        let state = AppState::new_for_tests_with_store(
             temp.path().to_path_buf(),
             config_path.clone(),
-            Some(&pg_url),
+            Some(pg_url.as_str()),
         )
         .await
         .unwrap();
@@ -1497,9 +1531,13 @@ async fn postgres_recovery_preserves_run_secrets() {
             .unwrap()
     };
 
-    let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
-        .await
-        .unwrap();
+    let recovered = AppState::new_for_tests_with_store(
+        temp.path().to_path_buf(),
+        config_path,
+        Some(pg_url.as_str()),
+    )
+    .await
+    .unwrap();
     assert_run_secrets_outside_database(&recovered, run_id, "owner/pg-secrets").await;
 }
 
@@ -1551,7 +1589,9 @@ jobs:
     };
 
     let (parked_run, github, head_sha, workflow_ref) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let first = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
         let second = request_json(&app, Method::POST, "/api/v1/runs", submission()).await;
@@ -1585,7 +1625,9 @@ jobs:
         )
     };
 
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = recovered.test_tx().await;
     let run = inner
         .runs
@@ -1611,7 +1653,9 @@ async fn store_recovery_preserves_claim_state_across_run_events() {
     let temp = tempfile::tempdir().unwrap();
     let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let (claimed_job, other_job, request_id) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let accepted = request_json(
             &app,
@@ -1662,7 +1706,9 @@ async fn store_recovery_preserves_claim_state_across_run_events() {
         (claimed_job, other_job, request_id)
     };
 
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = recovered.test_tx().await;
     assert!(
         inner
@@ -1704,7 +1750,9 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let (run_id, now) = {
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let app = app(state.clone(), CancellationToken::new());
         let accepted = request_json(
             &app,
@@ -1778,7 +1826,9 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
         (run_id, now)
     };
 
-    let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let recovered = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let inner = recovered.test_tx().await;
     assert_eq!(
         inner.runner_client_ids.get("client-abc"),
@@ -1858,10 +1908,10 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
     let config_path = crate::config::config_path();
     let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let (claimed_job, other_job, request_id, session_id) = {
-        let state = AppState::new_with_store(
+        let state = AppState::new_for_tests_with_store(
             temp.path().to_path_buf(),
             config_path.clone(),
-            Some(&pg_url),
+            Some(pg_url.as_str()),
         )
         .await
         .unwrap();
@@ -1911,9 +1961,13 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
         (claimed_job, other_job, request_id, session_id)
     };
 
-    let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
-        .await
-        .unwrap();
+    let recovered = AppState::new_for_tests_with_store(
+        temp.path().to_path_buf(),
+        config_path,
+        Some(pg_url.as_str()),
+    )
+    .await
+    .unwrap();
     let inner = recovered.test_tx().await;
     assert!(
         inner
@@ -1948,7 +2002,9 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
 async fn startup_fails_claims_orphaned_by_a_restart() {
     let temp = tempfile::tempdir().unwrap();
     let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
         &app,
@@ -2035,7 +2091,9 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
 #[tokio::test]
 async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
@@ -2199,14 +2257,17 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // Held for the whole test: the GitHub env vars are process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url =
-        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+    // The stub base and token ride the test startup config; nothing here
+    // reads the process environment.
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("sync-test-token"),
+    );
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // A --push submission reports queued check runs at accept time and
@@ -2557,14 +2618,17 @@ async fn push_intake_reports_no_check_run_for_expandable_placeholders() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // Held for the whole test: the GitHub env vars are process-global.
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url =
-        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "placeholder-filter-token");
+    // The stub base and token ride the test startup config; nothing here
+    // reads the process environment.
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("placeholder-filter-token"),
+    );
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // `matrix` is a deferred matrix: its row is a `matrix_parent`
@@ -2658,13 +2722,15 @@ async fn bundled_push_submission_defers_check_runs_until_the_commit_is_published
     tokio::spawn(async move {
         axum::serve(listener, mock_app).await.unwrap();
     });
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let _api_url =
-        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "deferral-test-token");
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("deferral-test-token"),
+    );
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().join("state")).await.unwrap();
+    let state = AppState::new(temp.path().join("state"), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     // Control: a commit GitHub already has reports its queued check at submit,
@@ -2792,7 +2858,9 @@ async fn bundled_push_submission_defers_check_runs_until_the_commit_is_published
 #[tokio::test]
 async fn already_published_fails_closed_when_the_backend_read_fails() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown: CancellationToken::new(),
@@ -2891,17 +2959,17 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    // TestEnvVar (not raw set_var): Drop restores declaration order in
-    // reverse — TOKEN first, then API_URL — so a parallel submit never sees
-    // the fake token aimed at live api.github.com, and a panic mid-test
-    // still cleans up.
-    let _api_url =
-        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+    // The stub base and token ride the test startup config, so no submit
+    // can see the fake token aimed at live api.github.com.
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("sync-test-token"),
+    );
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -3027,12 +3095,15 @@ async fn dirty_push_sync_surfaces_a_failed_terminal_state_write() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}")) };
-    unsafe { std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token") };
+    let startup = stub_startup(
+        Some(&format!("http://127.0.0.1:{port}")),
+        Some("sync-test-token"),
+    );
 
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new(temp.path().to_path_buf(), startup)
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = request_json(
@@ -3093,15 +3164,14 @@ async fn dirty_push_sync_surfaces_a_failed_terminal_state_write() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "a lost terminal push-state write must fail the sync instead of re-running CI later: {body}"
     );
-
-    unsafe { std::env::remove_var("PRELOOP_GITHUB_TOKEN") };
-    unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
 }
 
 #[tokio::test]
 async fn broker_hybrid_poll_rejects_a_foreign_live_runner() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let runner_a = request_json(
@@ -3188,7 +3258,9 @@ async fn broker_hybrid_poll_rejects_a_foreign_live_runner() {
 #[tokio::test]
 async fn purged_runner_listen_token_cannot_open_a_broker_session() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let runner = request_json(
         &app,
@@ -3230,7 +3302,9 @@ async fn purged_runner_listen_token_cannot_open_a_broker_session() {
 #[tokio::test]
 async fn reporting_rejects_a_runtime_token_for_a_different_job() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo report\n";
     for _ in 0..2 {
@@ -3285,7 +3359,9 @@ async fn flow_recording_redacts_credentials() {
         .append(true)
         .open(&flow_path)
         .unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let system_token = state.system_token.clone();
     state.inner.lock().await.flows_file = Some(file);
     let app = app(state, CancellationToken::new());
@@ -3322,7 +3398,9 @@ async fn blob_rejects_unregistered_token() {
     // not create a blob. The gate returns 404 (not 401) so unregistered
     // tokens are indistinguishable from missing blobs.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let put = app
@@ -3342,7 +3420,9 @@ async fn blob_rejects_unregistered_token() {
 async fn blob_rejects_wrong_job_write() {
     // A job's bearer must not write another job's blob token.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let owner_job = uuid::Uuid::new_v4();
@@ -3387,7 +3467,9 @@ async fn bearerless_put_requires_live_owner() {
     // owning job is live and stops the moment the job settles — the stale
     // replay window closes everywhere else.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let job_id = uuid::Uuid::new_v4();
@@ -3429,7 +3511,9 @@ async fn bearerless_put_rejects_unsigned_token() {
     // A bearerless PUT to a token that is not a server-signed blob JWT is
     // indistinguishable from a missing blob.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let put = app
@@ -3450,7 +3534,9 @@ async fn blob_rejects_path_traversal() {
     // Raw and percent-encoded separators / traversal must be rejected with
     // 400 before touching the filesystem.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     for uri in [
@@ -3534,7 +3620,7 @@ fn local_jwts_have_unique_jti() {
     // AppState::new is async; use a runtime for this sync test.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let state = rt
-        .block_on(AppState::new(temp.path().to_path_buf()))
+        .block_on(AppState::new_for_tests(temp.path().to_path_buf()))
         .unwrap();
     let job_id = uuid::Uuid::new_v4();
     let t1 = state.mint_runtime_token("plan-jti", &job_id);
@@ -3554,7 +3640,9 @@ async fn legacy_cache_rejects_stale_job_token() {
     // complete the job, then every further write with the stale token must
     // be rejected.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-cache", &job_id);
@@ -3657,7 +3745,9 @@ async fn legacy_cache_allows_live_job_writes() {
     // The liveness gate must not break the normal flow: a live job can
     // reserve, upload, and commit through the legacy cache path.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-cache", &job_id);
@@ -3721,7 +3811,9 @@ async fn legacy_artifact_create_rejects_stale_job_token() {
     // and never checked job liveness, so a stale job token could keep
     // creating artifacts after its job completed.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-artifact", &job_id);
@@ -3775,7 +3867,9 @@ async fn legacy_artifact_handlers_bind_to_caller_run() {
     // could create artifacts catalogued under run B, and list/read run B's
     // artifacts. The list response also leaked the server-side storage path.
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
     let job_a = uuid::Uuid::new_v4();

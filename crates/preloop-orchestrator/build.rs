@@ -174,6 +174,9 @@ fn main() {
     // Emit every pin as UPPER_SNAKE constant for direct access.
     for (key, value) in &pins {
         let const_name = key.trim().to_uppercase().replace(['.', '-'], "_");
+        out.push_str(&format!(
+            "/// Pinned value of `{key}` from the workspace version pin files.\n"
+        ));
         out.push_str(&format!("pub const {const_name}: &str = \"{value}\";\n"));
     }
 
@@ -192,26 +195,27 @@ fn main() {
 
     if !pins.contains_key("node20_externals_version") && !pins.contains_key("node20_version") {
         out.push_str(&format!(
-            "pub const NODE20_EXTERNALS_VERSION: &str = \"{node20}\";\n"
+            "/// Node 20 externals version; the pin files name none, so this is the built-in default.\npub const NODE20_EXTERNALS_VERSION: &str = \"{node20}\";\n"
         ));
     }
     if pins.contains_key("node20_version") && !pins.contains_key("node20_externals_version") {
         out.push_str(&format!(
-            "pub const NODE20_EXTERNALS_VERSION: &str = \"{node20}\";\n"
+            "/// Node 20 externals version, aliased from the `node20_version` pin.\npub const NODE20_EXTERNALS_VERSION: &str = \"{node20}\";\n"
         ));
     }
     if !pins.contains_key("node24_externals_version") && !pins.contains_key("node24_version") {
         out.push_str(&format!(
-            "pub const NODE24_EXTERNALS_VERSION: &str = \"{node24}\";\n"
+            "/// Node 24 externals version; the pin files name none, so this is the built-in default.\npub const NODE24_EXTERNALS_VERSION: &str = \"{node24}\";\n"
         ));
     }
     if pins.contains_key("node24_version") && !pins.contains_key("node24_externals_version") {
         out.push_str(&format!(
-            "pub const NODE24_EXTERNALS_VERSION: &str = \"{node24}\";\n"
+            "/// Node 24 externals version, aliased from the `node24_version` pin.\npub const NODE24_EXTERNALS_VERSION: &str = \"{node24}\";\n"
         ));
     }
 
     // Emit SHA map. Keys are kept as-is (e.g. node20_20.19.0_linux-arm64) for lookup.
+    out.push_str("/// Expected SHA-256 digests of node externals archives, keyed by `nodeXX_<version>_<platform>`.\n");
     out.push_str("pub const NODE_EXTERNALS_SHA256: &[(&str, &str)] = &[\n");
     for (key, value) in &sha_pins {
         let escaped_key = key.replace('\\', "\\\\").replace('"', "\\\"");
@@ -221,6 +225,9 @@ fn main() {
     out.push_str("];\n");
 
     // Helper to look up SHA by key at runtime.
+    out.push_str(
+        "/// Returns the pinned SHA-256 digest for `key`, or `None` when the key is unlisted.\n",
+    );
     out.push_str("pub fn node_externals_pinned_sha256(key: &str) -> Option<&'static str> {\n");
     out.push_str("    NODE_EXTERNALS_SHA256.iter().find_map(|(k, v)| if *k == key { Some(*v) } else { None })\n");
     out.push_str("}\n");

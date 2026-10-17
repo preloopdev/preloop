@@ -120,14 +120,18 @@ the bug, then show it gone, using the same trigger both times.
 ## 2. Security
 
 Secrets and session crypto are load-bearing, and the repo enforces some of this
-with `ast-grep` rules under `rules/*.yml` that you can run through `just
-sg-scan-strict`. A green scan is the floor and not the ceiling, so keep
-reviewing beyond it.
+with `ast-grep` rules under `rules/*.yml`: `just sg-scan-strict` enforces them,
+and `just sg-test` exercises their fixtures. The rules cover sensitive log
+fields, `.expose()` inside a logging macro, inline masking, raw secret
+replacement, and TLS-verification opt-outs. A green scan is the floor and not
+the ceiling, so keep reviewing beyond it.
 
 Confirm that `SecretString` discipline holds, which means `.expose()` is called
 only at a genuine protocol boundary and never for logging, `Debug`, or `Display`.
-Watch in particular for `.expose()` inside loops or iterators, which
-`rules/no-expose-in-loop.yml` is designed to catch.
+`rules/no-expose-in-log.yml` catches an `.expose()` inside a logging macro, but
+no rule can see exposure inside a loop or iterator, so review that by hand:
+resolve a whole collection once with `masking::expose_all` or `expose_values`
+instead of re-exposing per element.
 
 Make sure there is no inline masking, because all redaction has to go through
 `preloop_gha_protocol::masking::mask_secrets`, which guarantees longest-first

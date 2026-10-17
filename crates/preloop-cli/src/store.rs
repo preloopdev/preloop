@@ -113,20 +113,23 @@ struct ImportLegacyArgs {
 }
 
 pub(crate) async fn run(args: StoreArgs) -> anyhow::Result<()> {
+    // Resolved once at this boundary and passed down: the target resolution
+    // never reads the process environment below the command entry.
+    let store_url_env = std::env::var(preloop_runner_server::store::STORE_URL_ENV).ok();
     match args.command {
-        StoreCommand::Migrate(args) => migrate(args).await,
-        StoreCommand::Status(args) => status(args).await,
+        StoreCommand::Migrate(args) => migrate(args, store_url_env.as_deref()).await,
+        StoreCommand::Status(args) => status(args, store_url_env.as_deref()).await,
         StoreCommand::ImportLegacy(args) => import_legacy(args),
-        StoreCommand::InitLocal => init_local(),
+        StoreCommand::InitLocal => init_local(store_url_env.as_deref()),
     }
 }
 
 /// Initialize only a brand-new local store (see `prepare_brand_new_local`).
 /// A no-op when the store already exists, so it is safe as the installer's
 /// preparation step for both a fresh and a repeated install.
-fn init_local() -> anyhow::Result<()> {
+fn init_local(store_url_env: Option<&str>) -> anyhow::Result<()> {
     let state_dir = crate::preloop_home().join("state");
-    if store_admin::prepare_brand_new_local(&state_dir)? {
+    if store_admin::prepare_brand_new_local(&state_dir, store_url_env)? {
         eprintln!(
             "[preloop] initialized the control database at {}",
             state_dir.join("preloop.db").display()
@@ -136,13 +139,13 @@ fn init_local() -> anyhow::Result<()> {
 }
 
 /// Resolve the target exactly like `preloop serve` resolves its store.
-fn target(store: Option<&str>) -> anyhow::Result<StoreTarget> {
+fn target(store: Option<&str>, store_url_env: Option<&str>) -> anyhow::Result<StoreTarget> {
     let state_dir = crate::preloop_home().join("state");
-    StoreTarget::resolve(store, &state_dir)
+    StoreTarget::resolve(store, store_url_env, &state_dir)
 }
 
-async fn migrate(args: MigrateArgs) -> anyhow::Result<()> {
-    let target = target(args.store.as_deref())?;
+async fn migrate(args: MigrateArgs, store_url_env: Option<&str>) -> anyhow::Result<()> {
+    let target = target(args.store.as_deref(), store_url_env)?;
     let options = MigrateOptions {
         adopt_baseline: args.adopt_baseline,
         backup: !args.no_backup,
@@ -184,8 +187,8 @@ async fn migrate(args: MigrateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn status(args: StatusArgs) -> anyhow::Result<()> {
-    let target = target(args.store.as_deref())?;
+async fn status(args: StatusArgs, store_url_env: Option<&str>) -> anyhow::Result<()> {
+    let target = target(args.store.as_deref(), store_url_env)?;
     let status = store_admin::status(target).await?;
     println!("[preloop] {}: {}", status.target, status.state);
     println!("  applied: {}", version_list(&status.applied));

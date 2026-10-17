@@ -1,3 +1,7 @@
+//! Behavioral tests for the preloop VM surface: machine-name validation and
+//! the arguments, environment, and status handling the smolvm CLI provider
+//! produces, exercised against a fake `smolvm` executable.
+
 use preloop_vm::{MachineName, VmError};
 
 #[test]
@@ -28,13 +32,11 @@ mod unix {
     use super::*;
     use preloop_vm::{
         ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount,
-        VmProvider, VolumeMount,
+        VmPathConfig, VmProvider, VolumeMount,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
-
-    static TEST_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn write_executable(path: &Path, contents: &str) {
         // Write through a child process rather than `fs::write`, then publish
@@ -252,7 +254,7 @@ exit 0
             rosetta: false,
         };
 
-        SmolVmProvider::new(&executable)
+        SmolVmProvider::new(&executable, VmPathConfig::default())
             .create(&spec)
             .await
             .unwrap();
@@ -305,7 +307,7 @@ exit 0
             guest: PathBuf::from("/run/preloop-engine.sock"),
         });
 
-        let error = SmolVmProvider::new(&executable)
+        let error = SmolVmProvider::new(&executable, VmPathConfig::default())
             .create(&spec)
             .await
             .unwrap_err();
@@ -344,7 +346,7 @@ exit 0
             let (_directory, executable) = fake_smolvm();
             let mut spec = valid_spec(MachineName::new("valid").unwrap());
             mutate(&mut spec);
-            let error = SmolVmProvider::new(&executable)
+            let error = SmolVmProvider::new(&executable, VmPathConfig::default())
                 .create(&spec)
                 .await
                 .unwrap_err();
@@ -363,7 +365,9 @@ exit 0
             read_only: false,
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message == "volume paths must be absolute"
         ));
         assert!(!executable.with_extension("args").exists());
@@ -376,7 +380,9 @@ exit 0
             read_only: false,
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message.starts_with("volume source does not exist:")
         ));
         assert!(!executable.with_extension("args").exists());
@@ -388,7 +394,9 @@ exit 0
             guest: PathBuf::from("/run/engine.sock"),
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message == "socket paths must be absolute"
         ));
         assert!(!executable.with_extension("args").exists());
@@ -402,7 +410,9 @@ exit 0
             guest: PathBuf::from("relative/guest.sock"),
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message == "socket paths must be absolute"
         ));
         assert!(!executable.with_extension("args").exists());
@@ -414,7 +424,9 @@ exit 0
             guest: PathBuf::from("/run/engine.sock"),
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message.starts_with("socket source does not exist:")
         ));
         assert!(!executable.with_extension("args").exists());
@@ -430,7 +442,9 @@ exit 0
             guest: PathBuf::from("/run/engine.sock"),
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message.starts_with("socket source is not a Unix socket:")
         ));
         assert!(!executable.with_extension("args").exists());
@@ -448,7 +462,9 @@ exit 0
             guest: PathBuf::from("/run/engine.sock"),
         });
         assert!(matches!(
-            SmolVmProvider::new(&executable).create(&spec).await,
+            SmolVmProvider::new(&executable, VmPathConfig::default())
+                .create(&spec)
+                .await,
             Err(VmError::InvalidSpec(message)) if message.starts_with("socket source must not be a symlink:")
         ));
         assert!(!executable.with_extension("args").exists());
@@ -457,7 +473,8 @@ exit 0
     #[tokio::test]
     async fn exec_bounds_both_streams_and_drains_the_child_to_completion() {
         let (_directory, executable) = fake_smolvm();
-        let provider = SmolVmProvider::new(&executable).with_capture_limit(1024);
+        let provider =
+            SmolVmProvider::new(&executable, VmPathConfig::default()).with_capture_limit(1024);
         let name = MachineName::new("runner").unwrap();
 
         let output: ExecOutput = provider
@@ -476,7 +493,7 @@ exit 0
     #[tokio::test]
     async fn status_maps_running_stopped_missing_and_unknown_states() {
         let (_directory, executable) = fake_smolvm();
-        let provider = SmolVmProvider::new(&executable);
+        let provider = SmolVmProvider::new(&executable, VmPathConfig::default());
         for (name, expected) in [
             ("running", MachineState::Running),
             ("stopped", MachineState::Stopped),
@@ -497,7 +514,10 @@ exit 0
     #[tokio::test]
     async fn list_parses_json_machine_names_and_ignores_entries_without_names() {
         let (_directory, executable) = fake_smolvm();
-        let machines = SmolVmProvider::new(&executable).list().await.unwrap();
+        let machines = SmolVmProvider::new(&executable, VmPathConfig::default())
+            .list()
+            .await
+            .unwrap();
         assert_eq!(
             machines,
             vec![
@@ -510,7 +530,7 @@ exit 0
     #[tokio::test]
     async fn pack_requires_absolute_output_and_emits_exact_arguments() {
         let (directory, executable) = fake_smolvm();
-        let provider = SmolVmProvider::new(&executable);
+        let provider = SmolVmProvider::new(&executable, VmPathConfig::default());
         let name = MachineName::new("runner").unwrap();
         let output = directory.path().join("runner.smolmachine");
 
@@ -540,7 +560,7 @@ exit 0
         );
 
         let (_directory, relative_executable) = fake_smolvm();
-        let error = SmolVmProvider::new(&relative_executable)
+        let error = SmolVmProvider::new(&relative_executable, VmPathConfig::default())
             .pack(&name, Path::new("relative.smolmachine"))
             .await
             .unwrap_err();
@@ -553,7 +573,7 @@ exit 0
     #[tokio::test]
     async fn pack_forwards_proxy_configuration_to_export_vm() {
         let (directory, executable) = fake_smolvm();
-        let provider = SmolVmProvider::new(&executable).with_pack_network(
+        let provider = SmolVmProvider::new(&executable, VmPathConfig::default()).with_pack_network(
             Some("http://192.168.1.10:18080".to_owned()),
             Some("localhost,127.0.0.1,.internal".to_owned()),
         );
@@ -582,62 +602,13 @@ exit 0
     }
 
     #[tokio::test]
-    async fn provider_environment_prefers_preloop_pack_proxy() {
-        let _env_guard = TEST_ENV_MUTEX.lock().await;
-        let (directory, executable) = fake_smolvm();
-        let saved = [
-            (
-                "PRELOOP_RUNNER_PACK_PROXY",
-                std::env::var_os("PRELOOP_RUNNER_PACK_PROXY"),
-            ),
-            (
-                "PRELOOP_RUNNER_PACK_NO_PROXY",
-                std::env::var_os("PRELOOP_RUNNER_PACK_NO_PROXY"),
-            ),
-            ("HTTPS_PROXY", std::env::var_os("HTTPS_PROXY")),
-            ("NO_PROXY", std::env::var_os("NO_PROXY")),
-        ];
-        unsafe {
-            std::env::set_var("PRELOOP_RUNNER_PACK_PROXY", "http://preloop.proxy:8080");
-            std::env::set_var("PRELOOP_RUNNER_PACK_NO_PROXY", ".preloop.internal");
-            std::env::set_var("HTTPS_PROXY", "http://standard.proxy:8080");
-            std::env::set_var("NO_PROXY", ".standard.internal");
-        }
-
-        let provider = SmolVmProvider::from_environment(&executable);
-        let name = MachineName::new("runner").unwrap();
-        let output = directory.path().join("runner");
-        provider.pack(&name, &output).await.unwrap();
-        let args = captured_args(&executable);
-
-        for (name, value) in saved {
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        assert!(
-            args.windows(2)
-                .any(|pair| { pair == ["--proxy", "http://preloop.proxy:8080"] })
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| { pair == ["--no-proxy", ".preloop.internal"] })
-        );
-        assert!(!args.iter().any(|arg| arg.contains("standard.proxy")));
-        assert!(!args.iter().any(|arg| arg.contains("standard.internal")));
-    }
-
-    #[tokio::test]
     async fn exec_preserves_shell_metacharacters_as_one_guest_argument() {
         let (directory, executable) = fake_smolvm();
         let marker = directory.path().join("must-not-be-created");
         let hostile = format!("$(touch {}); echo $HOME `uname`", marker.display());
         let name = MachineName::new("runner").unwrap();
 
-        let output = SmolVmProvider::new(&executable)
+        let output = SmolVmProvider::new(&executable, VmPathConfig::default())
             .exec(&name, &["echo".to_owned(), hostile.clone()])
             .await
             .unwrap();
@@ -666,7 +637,7 @@ exit 0
     #[tokio::test]
     async fn public_only_selects_virtio_net_and_sets_smolvm_egress_floor_strict() {
         let (_directory, executable) = fake_smolvm();
-        let provider = SmolVmProvider::new(executable.clone());
+        let provider = SmolVmProvider::new(executable.clone(), VmPathConfig::default());
         let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
         spec.network = NetworkPolicy::PublicOnly;
         provider.create(&spec).await.unwrap();
@@ -698,7 +669,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let provider = SmolVmProvider::new(executable.clone())
+        let provider = SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .with_env_lookup(|key| (key == "PRELOOP_SMOLVM_NET_BACKEND").then(|| "tsi".to_owned()));
         let mut spec = valid_spec(MachineName::new("test-tsi").unwrap());
         spec.network = NetworkPolicy::PublicOnly;
@@ -713,7 +684,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
     #[tokio::test]
     async fn unrestricted_removes_smolvm_egress_floor() {
         let (_directory, executable) = fake_smolvm();
-        let provider = SmolVmProvider::new(executable.clone());
+        let provider = SmolVmProvider::new(executable.clone(), VmPathConfig::default());
         let mut spec = valid_spec(MachineName::new("test-unrestricted").unwrap());
         spec.network = NetworkPolicy::Unrestricted;
         provider.create(&spec).await.unwrap();
@@ -724,7 +695,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
     async fn rosetta_update_failure_is_returned_and_partial_machine_is_deleted() {
         let (_directory, executable) = fake_smolvm();
         fs::write(executable.with_extension("fail-update"), "").unwrap();
-        let provider = SmolVmProvider::new(executable.clone());
+        let provider = SmolVmProvider::new(executable.clone(), VmPathConfig::default());
         let mut spec = valid_spec(MachineName::new("test-rosetta").unwrap());
         spec.rosetta = true;
 
@@ -792,7 +763,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         let (_directory, executable) = fake_blocking_fork_smolvm();
         // Forks are serialized per golden while multiple live clones remain
         // supported by the configured SmolVM runtime.
-        let provider = SmolVmProvider::new(&executable);
+        let provider = SmolVmProvider::new(&executable, VmPathConfig::default());
         let golden = MachineName::new("runner-golden").unwrap();
         let first = MachineName::new("runner-0-1").unwrap();
         let second = MachineName::new("runner-1-1").unwrap();
@@ -839,7 +810,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
     #[tokio::test]
     async fn forks_from_different_goldens_still_overlap() {
         let (_directory, executable) = fake_blocking_fork_smolvm();
-        let provider = SmolVmProvider::new(&executable);
+        let provider = SmolVmProvider::new(&executable, VmPathConfig::default());
         let first_golden = MachineName::new("runner-golden-a").unwrap();
         let second_golden = MachineName::new("runner-golden-b").unwrap();
 
@@ -891,35 +862,35 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         let name = MachineName::new("runner").unwrap();
 
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .create(&valid_spec(name.clone()))
             .await
             .unwrap();
         assert_sandbox_defaults(&executable);
 
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .start(&name)
             .await
             .unwrap();
         assert_sandbox_defaults(&executable);
 
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .start_forkable(&name)
             .await
             .unwrap();
         assert_sandbox_defaults(&executable);
 
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .fork(&name, &MachineName::new("clone").unwrap())
             .await
             .unwrap();
         assert_sandbox_defaults(&executable);
 
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .exec(&name, &["echo".to_owned()])
             .await
             .unwrap();
@@ -927,7 +898,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
 
         let (_directory, executable) = fake_smolvm();
         let (sender, _receiver) = tokio::sync::mpsc::channel(16);
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .exec_stream(&name, &["echo".to_owned()], sender)
             .await
             .unwrap();
@@ -935,7 +906,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
 
         let (directory, executable) = fake_smolvm();
         let output = directory.path().join("packed");
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .pack(&name, &output)
             .await
             .unwrap();
@@ -953,7 +924,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
     #[tokio::test]
     async fn cgroup_root_env_matches_actual_delegation() {
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .create(&valid_spec(MachineName::new("cgroup").unwrap()))
             .await
             .unwrap();
@@ -986,7 +957,7 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
     #[tokio::test]
     async fn non_linux_injects_no_sandbox_env() {
         let (_directory, executable) = fake_smolvm();
-        SmolVmProvider::new(executable.clone())
+        SmolVmProvider::new(executable.clone(), VmPathConfig::default())
             .create(&valid_spec(MachineName::new("macos").unwrap()))
             .await
             .unwrap();

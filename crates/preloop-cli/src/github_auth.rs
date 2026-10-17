@@ -6,7 +6,7 @@
 //! deployment silently: token minting falls back to a local HMAC JWT that
 //! `api.github.com` rejects, and the failure only surfaces later inside a
 //! job's `git fetch`. Storing them under the state directory removes the
-//! re-export step; [`StoredAuth::report`] removes the silence.
+//! re-export step; [`EffectiveAuth::report`] removes the silence.
 //!
 //! The environment always wins. A container or CI runner that injects
 //! `PRELOOP_GITHUB_APP_ID` must not be overridden by a file that some earlier
@@ -25,9 +25,10 @@ const FILE: &str = "github-app.json";
 /// Every environment variable [`load_from_env`] accepts for the private key.
 ///
 /// Must stay in sync with `preloop_runner_server::github_app::PRIVATE_KEY_ENV`.
-/// `PRELOOP_GITHUB_APP_PEM` has the highest precedence there, so writing it would
-/// shadow an operator who deliberately set one of the other three — hence
-/// [`StoredAuth::apply`] checks all four before setting any.
+/// `PRELOOP_GITHUB_APP_PEM` has the highest precedence there, so a CLI-side
+/// key override would shadow an operator who deliberately set one of the
+/// other three — hence [`GithubAuthInputs::resolve`] suppresses the override
+/// entirely when any of the four is set.
 const PRIVATE_KEY_ENV: [&str; 4] = [
     "PRELOOP_GITHUB_APP_PEM",
     "PRELOOP_GITHUB_APP_PEM_FILE",
@@ -166,39 +167,141 @@ impl StoredAuth {
             self.webhook_secret = other.webhook_secret;
         }
     }
+}
 
-    /// Publish these credentials to the environment the server reads.
-    ///
-    /// Only fills variables that are unset, preserving the documented
-    /// precedence: environment first, stored file second.
-    pub fn apply(&self) {
-        set_if_unset(APP_ID_ENV, self.app_id.as_deref());
-        set_if_unset(WEBHOOK_SECRET_ENV, self.webhook_secret.as_deref());
-        set_if_unset(
-            INSTALLATION_ID_ENV,
-            self.installation_id.map(|id| id.to_string()).as_deref(),
-        );
-        // Any one of the four means the operator chose a key source. Setting
-        // the highest-precedence variable on top of that would silently ignore
-        // their choice.
-        let key_already_configured = PRIVATE_KEY_ENV.iter().any(|name| env_present(name));
-        if !key_already_configured {
-            set_if_unset(PRIVATE_KEY_ENV[0], self.private_key_pem.as_deref());
+/// The GitHub credential environment as read once at the `serve` startup
+/// boundary.
+///
+/// Resolution is pure from here on: [`Self::resolve`] combines these raw
+/// values with the merged files/flags, so precedence is tested with explicit
+/// inputs instead of process-environment mutation. The CLI never writes the
+/// process environment.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GithubAuthInputs {
+    /// Raw `PRELOOP_GITHUB_APP_ID` (may be blank; blank counts as unset).
+    pub(crate) app_id: Option<String>,
+    /// Raw `PRELOOP_GITHUB_APP_INSTALLATION_ID`, as the operator typed it.
+    pub(crate) installation_id: Option<String>,
+    /// Raw `PRELOOP_WEBHOOK_SECRET`.
+    pub(crate) webhook_secret: Option<String>,
+    /// Every private-key variable that is set, as (name, raw value), in
+    /// [`PRIVATE_KEY_ENV`] precedence order. A raw value may name a file —
+    /// only the server interprets it.
+    pub(crate) key_vars: Vec<(&'static str, String)>,
+}
+
+impl GithubAuthInputs {
+    /// Read the credential environment. Startup boundary only.
+    pub(crate) fn read() -> Self {
+        Self {
+            app_id: std::env::var(APP_ID_ENV).ok(),
+            installation_id: std::env::var(INSTALLATION_ID_ENV).ok(),
+            webhook_secret: std::env::var(WEBHOOK_SECRET_ENV).ok(),
+            key_vars: PRIVATE_KEY_ENV
+                .iter()
+                .filter_map(|name| std::env::var(name).ok().map(|value| (*name, value)))
+                .collect(),
         }
     }
 
-    /// One-line startup summary of the GitHub integration's effective state.
+    /// Effective state and explicit overrides for one startup.
     ///
-    /// Reads the environment rather than `self` so it reports what the server
-    /// will actually see, including values that came from outside this file.
-    pub fn report() -> String {
-        let app_id = env_value(APP_ID_ENV);
-        let key = PRIVATE_KEY_ENV.iter().find(|name| env_present(name));
-        let webhook = env_present(WEBHOOK_SECRET_ENV);
+    /// `merged` is the CLI-resolved credential (flags over `github-app.json`
+    /// over `config.toml`); `key_label` names where its private key came from.
+    /// Precedence is unchanged: the environment wins field-by-field (a blank
+    /// export counts as unset), and any set key variable replaces the merged
+    /// PEM wholesale — the operator chose a key source, including its
+    /// file-path form, and the server interprets it.
+    pub(crate) fn resolve(
+        &self,
+        merged: StoredAuth,
+        key_label: &'static str,
+    ) -> ResolvedGithubAuth {
+        let app_id = non_blank(self.app_id.as_deref());
+        let installation_id = non_blank(self.installation_id.as_deref());
+        let webhook_secret = non_blank(self.webhook_secret.as_deref());
+        // Any one of the four means the operator chose a key source. Handing
+        // the server a merged PEM on top of that would silently ignore their
+        // choice — including the file-path forms only the server reads.
+        let env_key = self
+            .key_vars
+            .iter()
+            .find(|(_, value)| non_blank(Some(value.as_str())).is_some())
+            .map(|(name, _)| *name);
+        let overrides = StoredAuth {
+            app_id: if app_id.is_none() {
+                merged.app_id
+            } else {
+                None
+            },
+            installation_id: if installation_id.is_none() {
+                merged.installation_id
+            } else {
+                None
+            },
+            private_key_pem: if env_key.is_none() {
+                merged.private_key_pem
+            } else {
+                None
+            },
+            webhook_secret: if webhook_secret.is_none() {
+                merged.webhook_secret
+            } else {
+                None
+            },
+        };
+        let effective = EffectiveAuth {
+            app_id: app_id.clone().or_else(|| overrides.app_id.clone()),
+            installation: installation_id
+                .or_else(|| overrides.installation_id.map(|id| id.to_string())),
+            key_source: env_key.map(str::to_owned).or_else(|| {
+                overrides
+                    .private_key_pem
+                    .is_some()
+                    .then(|| key_label.to_owned())
+            }),
+            webhook: webhook_secret.is_some() || overrides.webhook_secret.is_some(),
+        };
+        ResolvedGithubAuth {
+            effective,
+            overrides,
+        }
+    }
+}
 
-        let tokens = match (&app_id, key) {
+/// One serve startup's resolved GitHub credentials.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedGithubAuth {
+    /// What the server will actually use (environment over merged files/flags).
+    pub(crate) effective: EffectiveAuth,
+    /// Values to hand the server explicitly: the merged credentials minus
+    /// anything the environment already supplies — exactly what the old
+    /// env-publishing `apply` step wrote into the process environment.
+    pub(crate) overrides: StoredAuth,
+}
+
+/// The GitHub App credential state the server will use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectiveAuth {
+    pub(crate) app_id: Option<String>,
+    /// Installation id as reported (raw env value or resolved id).
+    pub(crate) installation: Option<String>,
+    /// Where the private key comes from: the winning env variable's name, or
+    /// `key_label` for the CLI-resolved value.
+    pub(crate) key_source: Option<String>,
+    pub(crate) webhook: bool,
+}
+
+impl EffectiveAuth {
+    /// One-line startup summary of the GitHub integration's effective state —
+    /// what the server will actually see, including values that came from
+    /// outside the credential file.
+    pub(crate) fn report(&self) -> String {
+        let tokens = match (&self.app_id, &self.key_source) {
             (Some(id), Some(source)) => {
-                let installation = env_value(INSTALLATION_ID_ENV)
+                let installation = self
+                    .installation
+                    .as_deref()
                     .map(|id| format!("installation {id}"))
                     .unwrap_or_else(|| "installation auto-discovered".to_owned());
                 format!("App {id} via {source}, {installation}")
@@ -214,7 +317,7 @@ impl StoredAuth {
             (None, None) => "disabled — no App configured (local-only mode)".to_owned(),
         };
 
-        let webhooks = if webhook {
+        let webhooks = if self.webhook {
             "signature verification on"
         } else {
             "UNVERIFIED — no webhook secret; any caller can queue runs"
@@ -224,91 +327,24 @@ impl StoredAuth {
     }
 
     /// Whether the effective configuration is empty — no App, no webhook
-    /// secret. Reads the environment like [`Self::report`], so values that
-    /// came from outside this file count.
-    pub fn is_unconfigured() -> bool {
-        env_value(APP_ID_ENV).is_none() && !env_present(WEBHOOK_SECRET_ENV)
+    /// secret. Values that came from outside the credential file count.
+    pub(crate) fn is_unconfigured(&self) -> bool {
+        self.app_id.is_none() && !self.webhook
     }
 }
 
-/// Whether a variable is set to something other than whitespace.
-///
-/// Blank counts as unset, matching `github_app::env_non_empty`, so an empty
-/// export cannot mask a stored value.
-fn env_present(name: &str) -> bool {
-    env_value(name).is_some()
-}
-
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
+/// Trimmed `value`, with blank counting as unset — matching
+/// `github_app::env_non_empty`, so an empty export cannot mask a stored value.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn set_if_unset(name: &str, value: Option<&str>) {
-    let Some(value) = value else { return };
-    if env_present(name) {
-        return;
-    }
-    unsafe { std::env::set_var(name, value) };
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the tests that mutate process-wide environment state.
-    ///
-    /// Mirrors the `TEST_ENV_LOCK` pattern already used in
-    /// `preloop-orchestrator`'s tests rather than taking a new dependency.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Applies a set of variables and restores the previous values on drop, so
-    /// a panicking assertion cannot leak state into the next test.
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-            let mut saved = Vec::with_capacity(vars.len());
-            for &(name, value) in vars {
-                saved.push((name, std::env::var(name).ok()));
-                match value {
-                    Some(value) => unsafe { std::env::set_var(name, value) },
-                    None => unsafe { std::env::remove_var(name) },
-                }
-            }
-            Self { saved, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.saved.drain(..) {
-                match value {
-                    Some(value) => unsafe { std::env::set_var(name, value) },
-                    None => unsafe { std::env::remove_var(name) },
-                }
-            }
-        }
-    }
-
-    /// Clears every variable `apply` and `report` consult, so each test starts
-    /// from a known-empty environment regardless of the developer's shell.
-    fn clear_all(overrides: &[(&'static str, Option<&str>)]) -> EnvGuard {
-        let mut vars: Vec<(&'static str, Option<&str>)> = vec![
-            (APP_ID_ENV, None),
-            (INSTALLATION_ID_ENV, None),
-            (WEBHOOK_SECRET_ENV, None),
-        ];
-        vars.extend(PRIVATE_KEY_ENV.iter().map(|&name| (name, None)));
-        vars.extend_from_slice(overrides);
-        EnvGuard::set(&vars)
-    }
 
     fn sample() -> StoredAuth {
         StoredAuth {
@@ -418,54 +454,73 @@ mod tests {
     fn partial_configuration_reports_disabled_instead_of_looking_healthy() {
         // The whole failure mode this module targets: an App id with no key
         // reads as "configured" to a human skimming env vars, but every job
-        // silently receives a local JWT that api.github.com rejects.
-        let _env = clear_all(&[
-            (APP_ID_ENV, Some("4429171")),
-            (WEBHOOK_SECRET_ENV, Some("s3cret")),
-        ]);
-        let report = StoredAuth::report();
+        // silently receives a local HMAC JWT that api.github.com rejects.
+        let inputs = GithubAuthInputs {
+            app_id: Some("4429171".to_owned()),
+            webhook_secret: Some("s3cret".to_owned()),
+            ..GithubAuthInputs::default()
+        };
+        let report = inputs
+            .resolve(StoredAuth::default(), "github-app.json")
+            .effective
+            .report();
         assert!(report.contains("DISABLED"), "{report}");
         assert!(report.contains("local JWT"), "{report}");
     }
 
     #[test]
     fn a_missing_webhook_secret_is_called_out_as_unverified() {
-        let _env = clear_all(&[]);
-        let report = StoredAuth::report();
+        let report = GithubAuthInputs::default()
+            .resolve(StoredAuth::default(), "github-app.json")
+            .effective
+            .report();
         assert!(report.contains("UNVERIFIED"), "{report}");
     }
 
     #[test]
     fn an_explicit_key_path_is_not_shadowed_by_the_stored_pem() {
-        // PRELOOP_GITHUB_APP_PEM outranks _PATH in the server, so applying a
-        // stored inline PEM over an operator's explicit path would silently
+        // PRELOOP_GITHUB_APP_PEM outranks _PATH in the server, so overriding an
+        // operator's explicit path with a stored inline PEM would silently
         // swap which key signs the App JWT.
-        let _env = clear_all(&[(PRIVATE_KEY_ENV[3], Some("/secure/key.pem"))]);
-        sample().apply();
-        assert!(std::env::var(PRIVATE_KEY_ENV[0]).is_err());
+        let inputs = GithubAuthInputs {
+            key_vars: vec![(PRIVATE_KEY_ENV[3], "/secure/key.pem".to_owned())],
+            ..GithubAuthInputs::default()
+        };
+        let resolved = inputs.resolve(sample(), "github-app.json");
+        // The env key source wins wholesale: no PEM override is published.
+        assert_eq!(resolved.overrides.private_key_pem, None);
         assert_eq!(
-            std::env::var(PRIVATE_KEY_ENV[3]).unwrap(),
-            "/secure/key.pem"
+            resolved.effective.key_source.as_deref(),
+            Some(PRIVATE_KEY_ENV[3])
         );
         // Fields with no conflicting export still fill in.
-        assert_eq!(std::env::var(APP_ID_ENV).unwrap(), "4429171");
+        assert_eq!(resolved.overrides.app_id.as_deref(), Some("4429171"));
     }
 
     #[test]
     fn environment_wins_over_the_stored_file() {
-        let _env = clear_all(&[(APP_ID_ENV, Some("999"))]);
-        sample().apply();
-        assert_eq!(std::env::var(APP_ID_ENV).unwrap(), "999");
+        let inputs = GithubAuthInputs {
+            app_id: Some("999".to_owned()),
+            ..GithubAuthInputs::default()
+        };
+        let resolved = inputs.resolve(sample(), "github-app.json");
+        assert_eq!(resolved.effective.app_id.as_deref(), Some("999"));
+        assert_eq!(resolved.overrides.app_id, None);
         // Unset fields still come from the stored file.
-        assert_eq!(std::env::var(WEBHOOK_SECRET_ENV).unwrap(), "s3cret");
+        assert_eq!(resolved.overrides.webhook_secret.as_deref(), Some("s3cret"));
+        assert_eq!(resolved.overrides.installation_id, Some(149_939_182));
     }
 
     #[test]
     fn a_blank_export_does_not_mask_a_stored_value() {
         // `export PRELOOP_GITHUB_APP_ID=` is a common way to "unset" a variable
         // in a shell profile; treating it as set would disable minting.
-        let _env = clear_all(&[(APP_ID_ENV, Some("   "))]);
-        sample().apply();
-        assert_eq!(std::env::var(APP_ID_ENV).unwrap(), "4429171");
+        let inputs = GithubAuthInputs {
+            app_id: Some("   ".to_owned()),
+            ..GithubAuthInputs::default()
+        };
+        let resolved = inputs.resolve(sample(), "github-app.json");
+        assert_eq!(resolved.effective.app_id.as_deref(), Some("4429171"));
+        assert_eq!(resolved.overrides.app_id.as_deref(), Some("4429171"));
     }
 }

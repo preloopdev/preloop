@@ -1,0 +1,25 @@
+id: no-expose-in-log
+message: |
+  Calling .expose() inside a log macro writes plaintext secret material into
+  journald, OTLP, or captured stdout at whatever level is enabled. Log
+  presence or safe metadata (name, length, count) instead, or redact first
+  with preloop_gha_protocol::masking::mask_secrets. Known limit: an
+  .expose() wrapped in a nested macro argument (e.g. format! inside the log
+  call) is not matched; still banned by convention.
+severity: error
+language: rust
+rule:
+  all:
+    - kind: macro_invocation
+    # Normalize the macro path so qualified `log::debug!`/`tracing::info!`
+    # invocations match like the unqualified forms. All five levels count:
+    # any of them can end up in captured output. Non-log macros (assert_eq!,
+    # format!) stay out of scope even when they wrap .expose().
+    - regex: ^(tracing::|log::)?(trace|debug|info|warn|error)!\(
+    # Macro arguments are a token tree, not parsed expressions, so match the
+    # argument tokens directly. The `$$$A`/`$$$B` stretches cover every
+    # receiver shape (nested field access, chained .to_owned()/.to_string())
+    # and every prefix form (%, ?, field =, plain message argument). Message
+    # strings cannot false-match: their contents are one string-literal token,
+    # never the `. expose ( )` token run.
+    - pattern: $MACRO!($$$A.expose()$$$B)
