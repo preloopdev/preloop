@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
+### Fixed
+
+- **Reusable callers settle when a callee fails before dispatch** (#598): a
+  promotion, expansion, or starvation failure now folds the caller and
+  releases its downstream `needs` dependents instead of leaving the run
+  active forever.
 
 ### Added
 
