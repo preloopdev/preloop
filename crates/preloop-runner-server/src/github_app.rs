@@ -557,12 +557,20 @@ pub fn load_from(
                 pat_fallback: pat_fallback.clone(),
                 installation_cache: Arc::new(RwLock::new(HashMap::new())),
                 mint_ledger: Arc::new(MintLedger::default()),
-                // The primary slot's webhook secret belongs to this App — it
-                // is the default App's secret — so a payload it signs is bound
-                // to this App's installations like any registered App's. The
-                // receiver dedups against `AppState::webhook_secret`, which
-                // carries the same value.
-                webhook_secret: crate::config::webhook_secret_from_env_or_config(file_config),
+                // The startup-resolved override belongs to the default App,
+                // just like the config-file value. Keeping it on the App
+                // makes webhook signers enforce this App's repository binding.
+                webhook_secret: startup
+                    .webhook_secret
+                    .clone()
+                    .filter(|secret| !secret.is_empty())
+                    .or_else(|| {
+                        file_config
+                            .github
+                            .webhook_secret()
+                            .filter(|secret| !secret.is_empty())
+                            .map(str::to_owned)
+                    }),
                 installation_id: installation_id_override,
                 verified_installation_owners: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 github_breakers: None,
@@ -654,6 +662,18 @@ pub fn load_from(
             github_breakers: None,
             github_consumption: None,
         });
+    }
+    // A registry-only configuration still has a default App. Attach the
+    // startup-resolved secret to that slot when the App did not provide its
+    // own secret; never copy it to every registered App.
+    if let Some(secret) = startup
+        .webhook_secret
+        .as_deref()
+        .filter(|secret| !secret.is_empty())
+        && let Some(default_app) = apps.get_mut(default_index)
+        && default_app.webhook_secret.is_none()
+    {
+        default_app.webhook_secret = Some(secret.to_owned());
     }
     if apps.is_empty() {
         return Ok(None);
@@ -2120,6 +2140,14 @@ mod tests {
         assert_eq!(
             registry.default_app().webhook_secret.as_deref(),
             Some("from-startup")
+        );
+        assert!(
+            matches!(
+                registry.webhook_signers(Some("from-startup")).as_slice(),
+                [(secret, WebhookSigner::App(id))]
+                    if secret == "from-startup" && id == "987654"
+            ),
+            "the startup secret keeps the default App's repository binding"
         );
     }
 

@@ -939,41 +939,31 @@ impl Session {
         }
         // Resolved once at this boundary and passed down: the live check never
         // reads the process environment itself.
-        let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "https://api.github.com".to_owned());
+        let api_base = crate::github_api_base();
+        let mut verify_out = if self.json {
+            crate::output::Out::capturing()
+        } else {
+            crate::output::Out::stdout()
+        };
         let result = match (
             config.github.app_id.as_deref(),
             config.github.app_pem(),
             config.github.pat(),
         ) {
             (Some(app_id), Some(pem), _) => {
-                github_setup::doctor_app(
-                    app_id,
-                    pem,
-                    &repos,
-                    &mut crate::output::Out::stdout(),
-                    &api_base,
-                )
-                .await
+                github_setup::doctor_app(app_id, pem, &repos, &mut verify_out, &api_base).await
             }
             (_, _, Some(token)) => {
-                github_setup::doctor_pat(
-                    token,
-                    &repos,
-                    &mut crate::output::Out::stdout(),
-                    &api_base,
-                )
-                .await
+                github_setup::doctor_pat(token, &repos, &mut verify_out, &api_base).await
             }
             _ => {
                 self.note("no credential is configured to verify");
                 return Ok(json!({"skipped": "no credential"}));
             }
         };
+        let verification_log = verify_out.into_captured();
         match result {
-            Ok(()) => Ok(json!({"repos": repos, "ok": true})),
+            Ok(()) => Ok(json!({"repos": repos, "ok": true, "output": verification_log})),
             Err(error) => {
                 let message = format!("{error:#}");
                 if !self.json {
@@ -982,7 +972,9 @@ impl Session {
                 if self.yes || !self.interactive {
                     if self.yes {
                         self.note("continuing anyway (--yes)");
-                        return Ok(json!({"repos": repos, "ok": false, "error": message}));
+                        return Ok(
+                            json!({"repos": repos, "ok": false, "error": message, "output": verification_log}),
+                        );
                     }
                     return Err(anyhow::anyhow!(
                         "credential check failed: {message}\n\
@@ -991,7 +983,9 @@ impl Session {
                     ));
                 }
                 if self.ask_bool("    continue anyway? [y/N] ", false)? {
-                    Ok(json!({"repos": repos, "ok": false, "error": message}))
+                    Ok(
+                        json!({"repos": repos, "ok": false, "error": message, "output": verification_log}),
+                    )
                 } else {
                     Err(anyhow::anyhow!(
                         "credential check failed: {message}\n\

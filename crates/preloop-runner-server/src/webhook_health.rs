@@ -87,17 +87,6 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
     // covers every App.
     let (previous, previous_checked_at_us) = shared.state.webhook_status.app_config_snapshot();
     let app_count = apps.len();
-    if let Some(retry_after) = shared
-        .state
-        .github_breakers
-        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
-    {
-        tracing::debug!(
-            retry_in_secs = retry_after.as_secs(),
-            "GitHub breaker open or probe in progress; skipping App webhook health check"
-        );
-        return previous;
-    }
     let api_base = shared.state.github_api_base();
     let expected_url = expected_webhook_url(shared.state.public_url.as_deref());
     let mut statuses = Vec::with_capacity(apps.len());
@@ -299,9 +288,11 @@ mod tests {
         )
     }
 
-    async fn shared_with_two_apps() -> (tempfile::TempDir, Arc<SharedState>) {
+    async fn shared_with_two_apps(
+        startup: crate::config::StartupConfig,
+    ) -> (tempfile::TempDir, Arc<SharedState>) {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
+        let mut state = crate::AppState::new(temp.path().to_path_buf(), startup)
             .await
             .unwrap();
         state.github_apps = Some(crate::github_app::GitHubApps {
@@ -416,15 +407,17 @@ mod tests {
     /// as explicitly unchecked rather than vanishing from the snapshot.
     #[tokio::test]
     async fn an_app_behind_an_open_breaker_is_not_checked_while_the_others_are() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let api_base = stub_github(
             "https://here.example/api/v1/github/webhooks",
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
-        let (_temp, shared) = shared_with_two_apps().await;
+        let (_temp, shared) = shared_with_two_apps(crate::config::StartupConfig {
+            github_api_url: Some(api_base),
+            public_url: Some("https://here.example".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        })
+        .await;
         park_app(&shared, "424");
 
         let statuses = check_webhook_config_once(&shared).await;
@@ -451,15 +444,17 @@ mod tests {
     /// published last pass stays in the list.
     #[tokio::test]
     async fn an_app_held_back_keeps_its_last_published_verdict() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let api_base = stub_github(
             "https://here.example/api/v1/github/webhooks",
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
-        let (_temp, shared) = shared_with_two_apps().await;
+        let (_temp, shared) = shared_with_two_apps(crate::config::StartupConfig {
+            github_api_url: Some(api_base),
+            public_url: Some("https://here.example".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        })
+        .await;
         let published = check_webhook_config_once(&shared).await;
         let first_checked_at = shared.state.webhook_status.app_config_snapshot().1;
         park_app(&shared, "424");
@@ -488,15 +483,17 @@ mod tests {
     /// nothing and the publication time does not move.
     #[tokio::test]
     async fn every_app_held_back_leaves_the_published_snapshot_untouched() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let api_base = stub_github(
             "https://here.example/api/v1/github/webhooks",
             axum::http::StatusCode::OK,
         )
         .await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
-        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
-        let (_temp, shared) = shared_with_two_apps().await;
+        let (_temp, shared) = shared_with_two_apps(crate::config::StartupConfig {
+            github_api_url: Some(api_base),
+            public_url: Some("https://here.example".to_owned()),
+            ..crate::config::StartupConfig::for_tests()
+        })
+        .await;
         let published = check_webhook_config_once(&shared).await;
         let checked_at = shared.state.webhook_status.app_config_snapshot().1;
         park_app(&shared, "424");

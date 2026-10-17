@@ -132,10 +132,10 @@ async fn main() -> anyhow::Result<()> {
             // The process-startup boundary: the environment is read once
             // here (`StartupConfig::from_env`), and the explicit `--store`
             // flag wins over it.
-            let startup = preloop_runner_server::config::StartupConfig {
-                store_url: store,
-                ..preloop_runner_server::config::StartupConfig::from_env()
-            };
+            let mut startup = preloop_runner_server::config::StartupConfig::from_env();
+            if let Some(store) = store {
+                startup.store_url = Some(store);
+            }
             serve(ServerConfig {
                 queue_depth: None,
                 next_job_runs_on: None,

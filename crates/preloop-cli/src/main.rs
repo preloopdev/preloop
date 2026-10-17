@@ -38,6 +38,21 @@ pub(crate) fn server_url() -> String {
     std::env::var("PRELOOP_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
+/// Resolve the GitHub REST API root once at each CLI command boundary.
+///
+/// Whitespace-only values are unset, and trailing slashes are removed so
+/// callers can append endpoint paths without changing a GHES/proxy path.
+pub(crate) fn github_api_base() -> String {
+    normalize_github_api_base(std::env::var("PRELOOP_GITHUB_API_URL").ok().as_deref())
+}
+
+fn normalize_github_api_base(value: Option<&str>) -> String {
+    value
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
     if uses_default_transport {
         return true;
@@ -5896,6 +5911,19 @@ fn find_debug_machine(
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn github_api_base_normalizes_whitespace_and_trailing_slashes() {
+        assert_eq!(
+            normalize_github_api_base(Some("  https://ghe.example/api/v3///  ")),
+            "https://ghe.example/api/v3"
+        );
+        assert_eq!(
+            normalize_github_api_base(Some(" \t ")),
+            "https://api.github.com"
+        );
+        assert_eq!(normalize_github_api_base(None), "https://api.github.com");
+    }
 
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
         tokio::spawn(std::future::pending())

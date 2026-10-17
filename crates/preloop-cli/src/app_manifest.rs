@@ -253,10 +253,7 @@ where
         )?;
     }
     writeln!(out, "Waiting for GitHub to redirect back…")?;
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned());
+    let api_base = crate::github_api_base();
     let default_events = std::env::var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS").ok();
     let request = RegistrationRequest {
         name,

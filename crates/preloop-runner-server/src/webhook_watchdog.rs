@@ -1188,13 +1188,17 @@ mod tests {
 
     #[tokio::test]
     async fn an_app_behind_an_open_breaker_is_skipped_while_the_others_are_polled() {
-        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
         let (api_base, _attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
-        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
         let temp = tempfile::tempdir().unwrap();
-        let mut state = crate::AppState::new(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = crate::AppState::new(
+            temp.path().to_path_buf(),
+            crate::config::StartupConfig {
+                github_api_url: Some(api_base),
+                ..crate::config::StartupConfig::for_tests()
+            },
+        )
+        .await
+        .unwrap();
         state.github_apps = Some(crate::github_app::GitHubApps {
             apps: vec![
                 GitHubAppCredentials::for_tests(

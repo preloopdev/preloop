@@ -1445,23 +1445,6 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
     load_config_from(&config_path())
 }
 
-/// The default App's webhook secret: `PRELOOP_WEBHOOK_SECRET` wins over the
-/// config file's `github.webhook_secret`, matching every other credential.
-/// An empty value in either source counts as unset: a blank export must not
-/// disable signature verification silently.
-pub fn webhook_secret_from_env_or_config(config: &ConfigFile) -> Option<String> {
-    std::env::var("PRELOOP_WEBHOOK_SECRET")
-        .ok()
-        .filter(|secret| !secret.is_empty())
-        .or_else(|| {
-            config
-                .github
-                .webhook_secret()
-                .filter(|secret| !secret.is_empty())
-                .map(str::to_owned)
-        })
-}
-
 /// Typed startup configuration for one engine process.
 ///
 /// This is the process-startup boundary: production resolves it once from
@@ -1626,6 +1609,14 @@ fn env_override(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// URL environment overrides use the same blank-as-unset rule as other
+/// startup values, while removing delimiters callers append paths to.
+fn env_url_override(name: &str) -> Option<String> {
+    env_override(name)
+        .map(|value| value.trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 /// `1|true|yes` (case-insensitive) parse used by the boolean overrides.
 fn env_flag_value(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|value| {
@@ -1676,7 +1667,7 @@ impl StartupConfig {
             github_mint_failure: env_override("PRELOOP_GITHUB_APP_MINT_FAILURE"),
 
             github_server_url: env_override("PRELOOP_GITHUB_SERVER_URL"),
-            github_api_url: env_override("PRELOOP_GITHUB_API_URL"),
+            github_api_url: env_url_override("PRELOOP_GITHUB_API_URL"),
             github_graphql_url: env_override("PRELOOP_GITHUB_GRAPHQL_URL"),
             public_url: env_override("PRELOOP_PUBLIC_URL"),
             runner_url: env_override("PRELOOP_RUNNER_URL"),
@@ -1843,7 +1834,13 @@ impl std::fmt::Debug for StartupConfig {
                     .map(|(source, ..)| source)
                     .collect::<Vec<_>>(),
             )
-            .field("github_apps_json", &self.github_apps_json)
+            .field(
+                "github_apps_json",
+                &self
+                    .github_apps_json
+                    .as_ref()
+                    .map(|_| "PRELOOP_GITHUB_APPS_JSON"),
+            )
             .field("github_mint_failure", &self.github_mint_failure)
             .field("github_server_url", &self.github_server_url)
             .field("github_api_url", &self.github_api_url)
@@ -2942,6 +2939,20 @@ mod tests {
         }
     }
 
+    fn write_sealed_config(
+        path: &Path,
+        config: &ConfigFile,
+        store: &dyn CredentialStore,
+    ) -> anyhow::Result<()> {
+        let mut sealed = config.clone();
+        if let Some(dir) = path.parent() {
+            let on_disk = sealed_envelopes_on_disk(path)?;
+            seal_config_secrets(&mut sealed, dir, store, &on_disk)?;
+        }
+        std::fs::write(path, toml::to_string_pretty(&sealed)?)?;
+        Ok(())
+    }
+
     #[test]
     fn missing_file_is_empty_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -3071,8 +3082,8 @@ mod tests {
     }
 
     use crate::credential_store::{
-        CREDENTIAL_STORE_ENV, CredentialWriter, FileCredentialStore, MemoryCredentialStore,
-        UnavailableCredentialStore, Written, credential_store_dir, github_reference,
+        CredentialWriter, FileCredentialStore, MemoryCredentialStore, UnavailableCredentialStore,
+        Written, credential_store_dir, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {
@@ -3257,6 +3268,26 @@ mod tests {
         assert!(!whole.contains("xyz789"), "repo secret leaked: {whole}");
         assert!(whole.contains("secrets: 1 names"), "{whole}");
         assert!(whole.contains("repo_secrets: 1 repos"), "{whole}");
+    }
+
+    #[test]
+    fn startup_debug_redacts_inline_apps_json() {
+        let startup = StartupConfig {
+            github_apps_json: Some(
+                r#"[{"app_id":"1","pem":"PEM-SECRET","webhook_secret":"HOOK-SECRET"}]"#.to_owned(),
+            ),
+            ..StartupConfig::for_tests()
+        };
+        let debug = format!("{startup:?}");
+        assert!(!debug.contains("PEM-SECRET"), "private key leaked: {debug}");
+        assert!(
+            !debug.contains("HOOK-SECRET"),
+            "webhook secret leaked: {debug}"
+        );
+        assert!(
+            debug.contains("github_apps_json: Some(\"PRELOOP_GITHUB_APPS_JSON\")"),
+            "source metadata missing: {debug}"
+        );
     }
 
     /// Store-mode resolution over explicit inputs: the env layer wins over

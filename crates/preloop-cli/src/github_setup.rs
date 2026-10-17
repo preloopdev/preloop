@@ -239,12 +239,7 @@ pub(crate) async fn cmd_setup_github(
     // Resolved once at this boundary and passed down: the store choice never
     // re-reads the process environment below the command entry.
     let credential_store_env = std::env::var(CREDENTIAL_STORE_ENV).ok();
-    // Same boundary rule for the GitHub API base the verification and webhook
-    // calls talk to.
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned());
+    let api_base = crate::github_api_base();
     let via = match args.via {
         Some(via) => via,
         None => {
@@ -1022,10 +1017,7 @@ pub(crate) async fn cmd_doctor(args: DoctorArgs, config_path: &Path) -> anyhow::
     let config = load_config_from(config_path)?;
     // Resolved once at this boundary and passed down: the verification calls
     // never read the process environment themselves.
-    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned());
+    let api_base = crate::github_api_base();
     let mut failed = false;
     let mut app_found = false;
 
