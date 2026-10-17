@@ -1497,7 +1497,7 @@ async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
         .timeout(Duration::from_millis(500))
         .send()
         .await
-        .is_ok()
+        .is_ok_and(|response| response.status().is_success())
 }
 
 async fn ensure_engine_running() -> anyhow::Result<()> {
@@ -1556,10 +1556,12 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
         cmd.env("RUST_LOG", "info,preloop=debug");
     }
 
+    let engine_log = preloop_dir.join("engine.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(preloop_dir.join("engine.log"))?;
+        .open(&engine_log)?;
+    let log_offset = log_file.metadata()?.len();
 
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(log_file.try_clone()?);
@@ -1571,25 +1573,50 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
 
     let _ = std::fs::write(&pid_path, child.id().to_string());
 
+    // Outlasts the engine's 35s lock wait plus its own 30s readiness window.
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(30) {
+    while start.elapsed() < Duration::from_secs(70) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("engine exited before becoming ready: {status}");
+            let detail = engine_failure_detail(&engine_log, log_offset);
+            anyhow::bail!("engine exited before becoming ready: {status}{detail}");
         }
         if client
             .get(format!("{url}/healthz"))
             .timeout(Duration::from_millis(300))
             .send()
             .await
-            .is_ok()
+            .is_ok_and(|response| response.status().is_success())
         {
             eprintln!("[preloop] Engine ready.");
             return Ok(());
         }
     }
 
-    anyhow::bail!("engine auto-boot timed out after 30 seconds");
+    let detail = engine_failure_detail(&engine_log, log_offset);
+    anyhow::bail!("engine auto-boot timed out after 70 seconds{detail}");
+}
+
+/// Quote the new engine's own error line so auto-boot reports the lock or
+/// startup failure instead of only an exit status.
+fn engine_failure_detail(engine_log: &std::path::Path, offset: u64) -> String {
+    use std::io::{Read as _, Seek as _};
+    let written = std::fs::File::open(engine_log).and_then(|mut file| {
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut tail = String::new();
+        file.read_to_string(&mut tail)?;
+        Ok(tail)
+    });
+    let reason = written.ok().and_then(|tail| {
+        tail.lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("Error: "))
+            .map(str::to_owned)
+    });
+    match reason {
+        Some(reason) => format!(": {reason}"),
+        None => format!(" (see {})", engine_log.display()),
+    }
 }
 
 #[cfg(unix)]
@@ -1877,7 +1904,27 @@ async fn cmd_engine(
     let home = preloop_home();
     let state_dir = home.join("state");
     let socket = home.join("preloop.sock");
-
+    let listen: std::net::SocketAddr = args
+        .listen
+        .clone()
+        .or_else(|| std::env::var("PRELOOP_LISTEN").ok())
+        .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
+        .parse()
+        .context("--listen / PRELOOP_LISTEN must be a socket address")?;
+    let systemd_socket_activation = systemd_socket_activation_requested();
+    // Keep this guard in the engine command, not only in the server task. It
+    // must survive server shutdown, socket cleanup, and VM orphan purging so a
+    // successor cannot start while this process is still tearing down.
+    let serve_lock = std::sync::Arc::new(
+        preloop_runner_server::bootstrap::acquire_serve_lock(
+            &state_dir,
+            preloop_runner_server::bootstrap::EngineOrigin::current(),
+            (!systemd_socket_activation).then_some(listen),
+            Duration::from_secs(35),
+        )
+        .await?,
+    );
+    let shutdown = tokio_util::sync::CancellationToken::new();
     // Keep AppState's resolver on the same engine home as this CLI.
     unsafe { std::env::set_var("PRELOOP_HOME", &home) };
     let store = preloop_runner_server::credential_store::engine_store(&home)?;
@@ -1887,13 +1934,8 @@ async fn cmd_engine(
         store.as_ref(),
     )?;
     unsafe { std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token) };
-    let listen: std::net::SocketAddr = args
-        .listen
-        .clone()
-        .or_else(|| std::env::var("PRELOOP_LISTEN").ok())
-        .unwrap_or_else(|| "127.0.0.1:9090".to_owned())
-        .parse()
-        .context("--listen / PRELOOP_LISTEN must be a socket address")?;
+    // The listen address was parsed before taking serve.lock so the successor
+    // waits before touching engine state or attempting to bind a socket.
     let public_url = args
         .public_url
         .clone()
@@ -2009,10 +2051,10 @@ async fn cmd_engine(
             false
         }
     };
-    let mut server = tokio::spawn(preloop_runner_server::serve(
+    let mut server = tokio::spawn(preloop_runner_server::bootstrap::serve_with_lock(
         preloop_runner_server::ServerConfig {
             listen,
-            systemd_socket_activation: systemd_socket_activation_requested(),
+            systemd_socket_activation,
             unix_socket: Some(socket.clone()),
             queue_depth: Some(queue_depth.clone()),
             next_job_runs_on: Some(next_job_runs_on.clone()),
@@ -2030,12 +2072,23 @@ async fn cmd_engine(
             oidc_issuer: None,
             enable_scheduler: false,
         },
+        serve_lock.clone(),
+        shutdown.clone(),
     ));
     // Keep the server in the race so a bind failure surfaces its own error
     // instead of a generic socket-wait timeout.
-    tokio::select! {
+    let readiness = tokio::select! {
         result = &mut server => return result?,
-        result = wait_for_engine_socket(&socket, listen) => result?,
+        result = wait_for_engine_socket(&socket, listen) => result,
+    };
+    if let Err(error) = readiness {
+        // Do not release the caller-held lock while the server task is still
+        // alive: its children may still be using the store or socket.
+        shutdown.cancel();
+        server.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+        let _ = std::fs::remove_file(&socket);
+        return Err(error);
     }
 
     // Every way out of this process — the normal shutdown below, a pool that
@@ -2044,7 +2097,6 @@ async fn cmd_engine(
     // spawn so even those early returns run the exit scan.
     let _vm_teardown = VmTeardownOnExit;
 
-    let shutdown = tokio_util::sync::CancellationToken::new();
     let pool_config = pool_config.ok();
     let mut backend = None;
     if let Some(config) = &pool_config {
@@ -2117,15 +2169,22 @@ async fn cmd_engine(
         },
     )
     .await;
+    let server_finished = matches!(&stop, Stop::Server(_));
     let result = match stop {
         Stop::Server(result) | Stop::Pool(result) => Some(result),
         Stop::Signal => None,
     };
 
+    // Cancel server workers before pool teardown. The caller-held lock remains
+    // active while both the server task and VM exit purge unwind.
     shutdown.cancel();
     settle_pool(&mut pool, Duration::from_secs(30)).await;
-    server.abort();
-    let _ = std::fs::remove_file(socket);
+    if !server_finished {
+        server.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+    }
+    // A successor cannot bind this path until the caller-held serve lock drops.
+    let _ = std::fs::remove_file(&socket);
     match result {
         Some(result) => result,
         None => Ok(()),
@@ -7684,6 +7743,25 @@ mod tests {
         assert!(
             !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
             "the /healthz probe must not send an Authorization header"
+        );
+    }
+    /// A draining predecessor returns 503; that must trigger replacement
+    /// rather than count as a live engine.
+    #[tokio::test]
+    async fn health_probe_rejects_a_draining_engine() {
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        assert!(
+            !probe_engine_health(&build_client(), &base).await,
+            "a draining engine must not satisfy the liveness probe"
         );
     }
 }

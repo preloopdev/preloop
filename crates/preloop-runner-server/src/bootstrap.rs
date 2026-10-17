@@ -1469,15 +1469,35 @@ fn is_routine_unix_disconnect(error: &(dyn std::error::Error + 'static)) -> bool
 }
 
 /// Start the server and block until shutdown.
+///
+/// Standalone callers acquire the lock here and fail fast. The engine command
+/// uses [`serve_with_lock`] so it can wait for a draining predecessor while
+/// retaining the lock through its own VM teardown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    // Mutual exclusion: a second `preloop serve` on the same state dir must
-    // fail fast, not overwrite the unix socket + PID file and orphan the
-    // path the guest bridges mount. The lock file is held for the process
-    // lifetime; the OS releases it on exit, so a crash leaves no stale lock.
-    // The record names this engine, and its listen address when that is the one
-    // it binds, so a second engine can say how to stop it.
     let listen = (!config.systemd_socket_activation).then_some(config.listen);
-    let _serve_lock = acquire_serve_lock(&config.state_dir, EngineOrigin::current(), listen)?;
+    let serve_lock = Arc::new(
+        acquire_serve_lock(
+            &config.state_dir,
+            EngineOrigin::current(),
+            listen,
+            Duration::ZERO,
+        )
+        .await?,
+    );
+    serve_with_lock(config, serve_lock, CancellationToken::new()).await
+}
+
+/// Run a server with a lock acquired by its caller.
+///
+/// The caller retains its own [`Arc<ServeLock>`] until all process-level
+/// teardown is complete. This prevents the server task's return or abort from
+/// releasing `serve.lock` while an old engine is still purging VMs or
+/// unlinking its socket.
+pub async fn serve_with_lock(
+    config: ServerConfig,
+    _serve_lock: Arc<ServeLock>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     let mut state = AppState::new_with_store(
         config.state_dir.clone(),
         crate::config::config_path(),
@@ -1684,7 +1704,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         let mut inner = state.inner.lock().await;
         inner.oidc_issuer = oidc_issuer;
     }
-    let shutdown = CancellationToken::new();
     // Heartbeat for scheduler scan (critical) if enabled — beat periodically.
     let scheduler_heartbeat = state.observability.heartbeat().clone();
     if config.enable_scheduler {
@@ -2027,25 +2046,40 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
 
 /// Exclusive `flock` on `<state_dir>/serve.lock` for the process lifetime.
 ///
-/// A second `preloop serve` on the same state dir would overwrite the unix
-/// socket and PID file, then die — leaving the socket path pointing at a
-/// dead inode while the first engine keeps running on the old one. Guests
-/// mount the socket by path, so every bridge connection hits the dead
-/// socket and the runner goes deaf. The lock makes the second instance
-/// fail fast instead.
+/// The file's content is diagnostic only; the kernel lock is the authority.
+/// A caller may wait for a draining predecessor before taking the lock, but
+/// once acquired the returned guard keeps it held until its last owner drops.
+#[derive(Debug)]
+pub struct ServeLock {
+    file: std::fs::File,
+}
+
+impl Drop for ServeLock {
+    fn drop(&mut self) {
+        // Clear the record while this process still owns the flock. The file
+        // itself is never unlinked: unlinking a flock target lets a waiter
+        // lock an orphaned inode while another process creates a new file.
+        let _ = self.file.set_len(0);
+        if let Err(error) = self.file.unlock() {
+            warn!(%error, "failed to release serve lock");
+        }
+    }
+}
+
+/// Poll interval while waiting for a predecessor to release `serve.lock`.
+const SERVE_LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// Acquire `<state_dir>/serve.lock`, waiting up to `wait`.
 ///
-/// Once the lock is held, the file is replaced with this engine's
-/// [`LockHolder`] record, so a second engine can name the holder and the way
-/// to stop it. The record is advisory: the lock alone excludes a second
-/// engine.
-///
-/// Returns the open file so the caller holds the lock; the OS releases it
-/// on process exit, so a crash leaves no stale lock behind.
-fn acquire_serve_lock(
+/// A recorded PID is never used to skip the wait: PID namespaces and PID
+/// reuse make process existence weaker evidence than the flock itself. The
+/// record is used only when the bounded wait ends, to improve the diagnostic.
+pub async fn acquire_serve_lock(
     state_dir: &std::path::Path,
     origin: EngineOrigin,
     listen: Option<SocketAddr>,
-) -> anyhow::Result<std::fs::File> {
+    wait: Duration,
+) -> anyhow::Result<ServeLock> {
     use std::io::{Seek as _, SeekFrom, Write as _};
 
     let lock_path = state_dir.join("serve.lock");
@@ -2056,25 +2090,31 @@ fn acquire_serve_lock(
         .create(true)
         .read(true)
         .write(true)
-        // Never truncate on open: a second engine must not erase the record of
-        // the one holding the lock. The record is rewritten below, once this
-        // process holds the lock.
+        // Never truncate on open: a waiter must not erase the holder record.
         .truncate(false)
         .open(&lock_path)
         .context(format!("opening serve lock {}", lock_path.display()))?;
-    // try_lock: fail fast rather than queue behind a live engine — a queued
-    // second serve would still overwrite the socket the moment the first
-    // exits, which is exactly the race this prevents.
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            // Read from the inode we tried to lock, not from the path: a
-            // replacement of serve.lock must not make us describe a different
-            // file than the one that caused the contention.
-            let recorded = read_lock_record(&file).unwrap_or_default();
-            anyhow::bail!("{}", lock_held_message(&file, &lock_path, &recorded));
+    let started_waiting = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if started_waiting.elapsed() >= wait {
+                    let recorded = read_lock_record(&file).unwrap_or_default();
+                    anyhow::bail!("{}", lock_held_message(&file, &lock_path, &recorded));
+                }
+                if !announced {
+                    announced = true;
+                    warn!(
+                        path = %lock_path.display(),
+                        "serve.lock is held; waiting for the existing engine to release it"
+                    );
+                }
+                tokio::time::sleep(SERVE_LOCK_POLL).await;
+            }
+            Err(error @ std::fs::TryLockError::Error(_)) => return Err(error.into()),
         }
-        Err(error @ std::fs::TryLockError::Error(_)) => return Err(error.into()),
     }
     let holder = LockHolder {
         pid: std::process::id(),
@@ -2087,7 +2127,7 @@ fn acquire_serve_lock(
     file.seek(SeekFrom::Start(0))?;
     file.write_all(holder.render().as_bytes())?;
     file.sync_data()?;
-    Ok(file)
+    Ok(ServeLock { file })
 }
 
 fn read_lock_record(file: &std::fs::File) -> std::io::Result<String> {
@@ -2454,8 +2494,10 @@ async fn shutdown_signal(shutdown: CancellationToken) {
             warn!(%error, "failed to install ctrl-c handler");
         }
     };
-    ctrl_c.await;
-    shutdown.cancel();
+    tokio::select! {
+        _ = ctrl_c => shutdown.cancel(),
+        _ = shutdown.cancelled() => {}
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2614,11 +2656,18 @@ mod tests {
         assert_eq!(origin_from(None, false), EngineOrigin::Foreground);
     }
 
-    #[test]
-    fn holder_record_round_trips_and_rejects_damage() {
+    #[tokio::test]
+    async fn holder_record_round_trips_and_rejects_damage() {
         let dir = tempfile::tempdir().unwrap();
         let listen: SocketAddr = "127.0.0.1:9090".parse().unwrap();
-        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Background, Some(listen)).unwrap();
+        let _held = acquire_serve_lock(
+            dir.path(),
+            EngineOrigin::Background,
+            Some(listen),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
         let text = std::fs::read_to_string(dir.path().join("serve.lock")).unwrap();
         let holder = LockHolder::parse(&text).expect("the holder record must parse");
         assert_eq!(holder.pid, std::process::id());
@@ -2633,19 +2682,27 @@ mod tests {
 
     /// A second engine names the holder's pid and the fix for how it was
     /// started only when lock metadata proves that PID owns the lock.
-    #[test]
-    fn second_engine_names_the_background_holder_and_the_fix() {
+    #[tokio::test]
+    async fn second_engine_names_the_background_holder_and_the_fix() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("serve.lock");
         let listen: SocketAddr = "127.0.0.1:9090".parse().unwrap();
-        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Background, Some(listen)).unwrap();
+        let _held = acquire_serve_lock(
+            dir.path(),
+            EngineOrigin::Background,
+            Some(listen),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
         let contender = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&lock_path)
             .unwrap();
         let owner = lock_owner_pid(&contender, &lock_path);
-        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None)
+        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
             .unwrap_err()
             .to_string();
         let pid = std::process::id();
@@ -2686,6 +2743,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn serve_lock_waits_for_a_predecessor_to_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let replacement = acquire_serve_lock(
+            dir.path(),
+            EngineOrigin::Foreground,
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the successor should acquire after the predecessor releases");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "lock acquisition returned before the predecessor released it"
+        );
+        drop(replacement);
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_record_does_not_skip_the_lock_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.path().join("serve.lock"),
+            "pid=2147483646\norigin=foreground\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = acquire_serve_lock(
+            dir.path(),
+            EngineOrigin::Foreground,
+            None,
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("the live flock holder must still block the successor")
+        .to_string();
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "a dead recorded PID incorrectly bypassed the flock wait"
+        );
+        assert!(error.contains("could not be verified"), "{error}");
+        drop(held);
+    }
+
     #[test]
     fn foreground_and_systemd_holders_get_their_own_fix() {
         let lock_path = std::path::Path::new("/tmp/preloop-test/serve.lock");
@@ -2722,14 +2835,17 @@ mod tests {
     }
 
     /// A holder that left no usable record gets the generic hint.
-    #[test]
-    fn unreadable_holder_record_gets_the_generic_hint() {
+    #[tokio::test]
+    async fn unreadable_holder_record_gets_the_generic_hint() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("serve.lock");
-        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None).unwrap();
+        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
+            .unwrap();
         // An older build holds the lock and wrote no record.
         std::fs::write(&lock_path, "").unwrap();
-        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None)
+        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("no usable record of itself"), "{error}");
@@ -2738,14 +2854,17 @@ mod tests {
 
     /// A record whose PID is not the kernel owner cannot name a live holder,
     /// even if that PID happens to belong to another process.
-    #[test]
-    fn record_naming_an_unverified_pid_gets_the_generic_hint() {
+    #[tokio::test]
+    async fn record_naming_an_unverified_pid_gets_the_generic_hint() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("serve.lock");
-        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None).unwrap();
+        let _held = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
+            .unwrap();
         // The owner evidence below is deliberately absent from this record.
         std::fs::write(&lock_path, "pid=2147483646\norigin=background\n").unwrap();
-        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None)
+        let error = acquire_serve_lock(dir.path(), EngineOrigin::Foreground, None, Duration::ZERO)
+            .await
             .unwrap_err()
             .to_string();
         assert!(
