@@ -424,9 +424,6 @@ impl Session {
         observability: Option<preloop_observability::Observability>,
         from_serve: bool,
     ) -> anyhow::Result<()> {
-        if let Some(raw) = args.public_url.as_deref() {
-            validate_public_url(raw).map_err(usage_error)?;
-        }
         let config = load_config().context("reading the engine config")?;
         let answers = self.resolve(&args, &config, from_serve)?;
 
@@ -844,6 +841,21 @@ impl Session {
             AuthChoice::App => self.note("GitHub App"),
             AuthChoice::Pat => self.note("fine-grained PAT"),
         }
+        // The stable URL is asked only for an App: a PAT has no webhook to feed.
+        let stable_url = match auth {
+            AuthChoice::App => Some(self.public_url_answer(
+                args.public_url.as_deref(),
+                std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
+            )?),
+            _ => None,
+        };
+        let public_url = match &stable_url {
+            Some(answer) => answer.url.clone(),
+            None => args
+                .public_url
+                .as_deref()
+                .and_then(|raw| validate_public_url(raw).ok()),
+        };
         if !self.interactive {
             // The browser manifest flow waits for a redirect GitHub sends to a
             // local listener, and the PAT prompt reads a line from stdin:
@@ -865,22 +877,6 @@ impl Session {
                 _ => {}
             }
         }
-
-        // The stable URL is asked only for an App: a PAT has no webhook to feed.
-        let stable_url = match auth {
-            AuthChoice::App => Some(self.public_url_answer(
-                args.public_url.as_deref(),
-                std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
-            )?),
-            _ => None,
-        };
-        let public_url = match &stable_url {
-            Some(answer) => answer.url.clone(),
-            None => args
-                .public_url
-                .as_deref()
-                .and_then(|raw| validate_public_url(raw).ok()),
-        };
 
         // The credential flow is `preloop setup github`, verbatim: same flags,
         // same stored config, same browser/PAT handling. No repos are passed,
