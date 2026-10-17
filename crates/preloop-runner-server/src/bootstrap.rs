@@ -854,7 +854,13 @@ type SnapshotInputs = crate::control::types::StatusInputs;
 async fn read_snapshot_inputs(state: &AppState) -> SnapshotInputs {
     match state
         .backend
-        .status_inputs(crate::runs::STALENESS_THRESHOLD)
+        // The runner tallies read "how many machines are dead", so the
+        // window is the session liveness the reaper prunes on. The sampler
+        // threshold used to be passed here, which made every runner mid-step
+        // count as stale on a fully busy pool.
+        .status_inputs(std::time::Duration::from_secs(
+            crate::distributed_task::DEAD_SESSION_LEASE_SECONDS,
+        ))
         .await
     {
         Ok(inputs) => inputs,
@@ -1197,8 +1203,8 @@ fn build_operational_snapshot_sync(
             idle: inputs.runner_idle,
             busy: inputs.runner_busy,
             stale: inputs.runner_stale,
-            max_poll_age_seconds: None,
-            max_lease_age_seconds: None,
+            max_poll_age_seconds: inputs.max_poll_age_seconds.map(|age| age as f64),
+            max_lease_age_seconds: inputs.max_lease_age_seconds.map(|age| age as f64),
             assignments: inputs.runner_assignments,
         },
         pool: pool_snapshot,

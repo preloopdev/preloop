@@ -1336,8 +1336,17 @@ pub(crate) struct StatusInputs {
     /// the pool never provisioned.
     pub(crate) pool_busy: u32,
     /// Runners whose every session last polled more than `stale_after` ago
-    /// (a session never seen is not stale).
+    /// (a session never seen is not stale). Callers pass the session
+    /// liveness window — the same one the reaper prunes on — so this counts
+    /// runners that are gone rather than runners merely mid-step.
     pub(crate) runner_stale: u32,
+    /// Age of the least recently seen live session, in seconds; `None` when
+    /// no session has ever polled. This is the "is it still talking to us"
+    /// signal that the stale tally no longer carries while a step runs.
+    pub(crate) max_poll_age_seconds: Option<u64>,
+    /// Age of the oldest unreleased job lease, in seconds; `None` when no
+    /// request holds one.
+    pub(crate) max_lease_age_seconds: Option<u64>,
     /// Live runner → job pairings from claimed unfinished attempts.
     pub(crate) runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
     /// Age, run and job of the oldest ready job with a known enqueue time.
