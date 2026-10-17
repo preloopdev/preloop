@@ -1647,16 +1647,17 @@ async fn github_app_manifest_registration_flow() {
 
     // Setup a local mock GitHub API server for manifest conversion
     let mock_app = Router::new().route(
-            "/app-manifests/{code}/conversions",
-            post(|Path(code): Path<String>| async move {
-                assert_eq!(code, "mock_code_123");
-                Json(json!({
-                    "id": 987654,
-                    "pem": "-----BEGIN RSA PRIVATE KEY-----\nMOCK-KEY-DATA\n-----END RSA PRIVATE KEY-----",
-                    "webhook_secret": Some("mock-webhook-secret-xyz")
-                }))
-            }),
-        );
+        "/app-manifests/{code}/conversions",
+        post(|Path(code): Path<String>| async move {
+            assert_eq!(code, "mock_code_123");
+            Json(json!({
+                "id": 987654,
+                "owner": { "login": "acme" },
+                "pem": "-----BEGIN RSA PRIVATE KEY-----\nMOCK-KEY-DATA\n-----END RSA PRIVATE KEY-----",
+                "webhook_secret": Some("mock-webhook-secret-xyz")
+            }))
+        }),
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1664,20 +1665,22 @@ async fn github_app_manifest_registration_flow() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // Configure mock API URL in environment
-    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    // Configure the mock API URL and enable the registration routes.
+    // Held for the whole test: both variables are process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     unsafe {
         std::env::set_var(
             "PRELOOP_GITHUB_API_URL",
             format!("http://127.0.0.1:{}", port),
-        )
+        );
+        std::env::set_var("PRELOOP_ENABLE_APP_REGISTRATION", "1");
     };
 
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // Request registration form (GET /api/v1/github/register)
+    // The registration page binds the callback to this browser: it sets a signed
+    // cookie and echoes the same token to GitHub as `state`.
     let response_reg = app
         .clone()
         .oneshot(
@@ -1690,20 +1693,49 @@ async fn github_app_manifest_registration_flow() {
         .await
         .unwrap();
     assert_eq!(response_reg.status(), StatusCode::OK);
+    let set_cookie = response_reg.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+    let token = cookie
+        .strip_prefix("preloop_app_manifest_state=")
+        .unwrap()
+        .to_owned();
     let bytes = to_bytes(response_reg.into_body(), usize::MAX)
         .await
         .unwrap();
     let html = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(html.contains("https://github.com/settings/apps/new"));
     assert!(html.contains("preloop-local-app"));
+    assert!(html.contains(&format!("?state={token}")));
 
-    // Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
+    // A callback that does not carry the cookie is refused before GitHub is contacted.
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/v1/github/callback?code=mock_code_123&state={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+    // The same browser returns with its cookie and GitHub's echoed state.
     let response_callback = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/v1/github/callback?code=mock_code_123")
+                .uri(format!(
+                    "/api/v1/github/callback?code=mock_code_123&state={token}"
+                ))
+                .header("cookie", cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1717,9 +1749,14 @@ async fn github_app_manifest_registration_flow() {
     assert!(html_callback.contains("GitHub App Registered Successfully!"));
     assert!(html_callback.contains("987654"));
     assert!(html_callback.contains("mock-webhook-secret-xyz"));
+    assert!(html_callback.contains("--webhook-secret &#39;mock-webhook-secret-xyz&#39;"));
+    assert!(!html_callback.contains("export PRELOOP_WEBHOOK_SECRET"));
 
     // Clean up
-    unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
+    unsafe {
+        std::env::remove_var("PRELOOP_GITHUB_API_URL");
+        std::env::remove_var("PRELOOP_ENABLE_APP_REGISTRATION");
+    };
 }
 
 #[tokio::test]

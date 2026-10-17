@@ -185,11 +185,12 @@ explicitly; never print or commit the fallback file.
 | `PRELOOP_GITHUB_APP_ID` | App id |
 | `PRELOOP_GITHUB_APP_PEM` / `_PEM_FILE` / `_PRIVATE_KEY` / `_PRIVATE_KEY_PATH` | Private key, inline or by path |
 | `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Installation id; skips discovery |
-| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` |
+| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` for the default App; a payload it signs is bound to that App's installation coverage. Other Apps' secrets are set per App with `preloop setup github --via app --webhook-secret` |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback; also fetches **private remote reusable workflows** |
 | `PRELOOP_GITHUB_APP_MINT_FAILURE` | Policy when installation-token minting fails |
 | `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL` | Point at GitHub Enterprise Server |
 | `PRELOOP_GITHUB_REPOSITORY` | Repository the scheduler scans for `schedule:` workflows at startup |
+| `PRELOOP_ENABLE_APP_REGISTRATION` | `1`, `true`, or `on` serves the App-manifest pages at `/api/v1/github/register` and `/api/v1/github/callback`. Off by default (both return `404`). Keep it off in production and register Apps with `preloop setup github --via app`. |
 
 ### Checkout cache
 
@@ -635,7 +636,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | `could not compile … (signal: 9, SIGKILL)` | Out of memory — raise `PRELOOP_RUNNER_MEMORY_MIB` |
 | Jobs never resume after a restart | Expected; see *Restarts* |
 | Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
-| Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
+| Webhook delivered but nothing runs | Confirm the webhook secret matches the App (`PRELOOP_WEBHOOK_SECRET` for the default App; `preloop setup github --via app --webhook-secret` for any other), and that the workflow's `on:` matches the event |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
 | `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 

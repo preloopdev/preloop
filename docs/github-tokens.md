@@ -114,28 +114,40 @@ credentials up.
 
 ### From a browser, against a remote engine
 
-When the engine already runs somewhere GitHub can reach, the same manifest is
-served by the engine itself. This path *displays* the credentials rather than
-storing them — you copy them to the engine yourself:
+Use this only when the command above cannot run on the engine host. The engine
+serves the manifest itself and *displays* the credentials, so they pass through
+a browser page. Both routes return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION`
+is `1`, `true`, or `on`; turn the flag off again once the App is registered.
 
-1. Visit `https://<server>/api/v1/github/register` in a browser. Use the
-   server's final public HTTPS URL if you also want webhook delivery — GitHub
-   cannot reach `localhost`, and the manifest only includes webhook settings for
-   non-local hosts.
+1. Set `PRELOOP_ENABLE_APP_REGISTRATION=1` on the engine and restart it. Visit
+   `https://<server>/api/v1/github/register` in the browser you will use for the
+   next step. Use the server's final public HTTPS URL if you also want webhook
+   delivery — GitHub cannot reach `localhost`, and the manifest only includes
+   webhook settings for non-local hosts. The page sets an HTTP-only
+   `preloop_app_manifest_state` cookie that lasts one hour; opening the page
+   again replaces it.
 2. Click **Register App on GitHub**. GitHub opens its App-creation flow with
    Preloop's manifest pre-filled: a private App with default permissions
    `checks: write`, `contents: read`, `metadata: read`, `pull_requests: read`.
-3. GitHub redirects back to `/api/v1/github/callback`, which exchanges the
-   one-time code and displays the **App ID**, **webhook secret**, and
-   **private-key PEM**. Copy them now.
+3. GitHub redirects the same browser to `/api/v1/github/callback`. Preloop
+   exchanges the one-time code only when the `state` parameter matches that
+   browser's cookie, is signed by the engine, and has not expired; otherwise it
+   answers `400` without contacting GitHub. The page then shows the **App ID**,
+   the owning account (confirm it is the one you registered with), the
+   **webhook secret**, the **private-key PEM**, and the command for step 5.
+   Copy them now.
 4. Install the App on the target account, org, or repositories from its GitHub
    settings page. No installation token can be minted until it is installed.
-5. Configure the server and restart it:
+5. On the engine host, save the PEM to a file and run the command from the page,
+   then unset `PRELOOP_ENABLE_APP_REGISTRATION` and restart the engine:
 
    ```sh
-   preloop setup github --via app --app-id 123456 --pem-file /secure/path/preloop-app.pem
-   export PRELOOP_WEBHOOK_SECRET="…"   # or set github.webhook_secret in config.toml
+   preloop setup github --via app --app-id 123456 --pem-file /secure/path/preloop-app.pem --webhook-secret '<webhook-secret>'
    ```
+
+   The secret is bound to this App's id. Do not set `PRELOOP_WEBHOOK_SECRET` for
+   this App: that variable is the single default-App slot and cannot address a
+   second App.
 
 ### Configuration reference
 

@@ -92,6 +92,7 @@ The system is configured using the following environment variables:
 | `PRELOOP_GITHUB_TOKEN`              | Static PAT for supported API calls, including remote workflow retrieval, private reusable-workflow resolution, changed-file lookups, and job `GITHUB_TOKEN` when no App is configured. A static PAT is not narrowed per job and is not a Check Runs credential. Prefer an App installation token with `checks: write` for Check Runs. | `github_pat_...`                           |
 | `PRELOOP_GITHUB_APPS_JSON`          | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
 | `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`.                                         | `push,pull_request`                        |
+| `PRELOOP_ENABLE_APP_REGISTRATION` | Serves the App-manifest pages (`/api/v1/github/register`, `/api/v1/github/callback`). Off by default; both routes return `404`. Enable only to create an App from a browser, then turn it off (see section 7). | `1` |
 
 
 ### Security Best Practices
@@ -227,45 +228,39 @@ or trigger any other subscribed event. `preloop` will:
 
 ## 7. GitHub App Registration and Installation
 
-`preloop` supports the official **GitHub App Manifest** flow to create an App. Creating the App and installing it are separate GitHub operations.
+`preloop` creates a GitHub App through the official **GitHub App Manifest** flow. Creating the App and installing it are separate GitHub operations.
 
-1. **Expose preloop at its final public HTTPS URL**:
- Start `preloop-runner-server` behind a publicly reachable HTTPS address, then open:
-  ```text
+On the engine host, run `preloop setup github --via app`. It opens a single-use loopback listener, so the private key and webhook secret never leave the machine, and it stores them against the App. Production should use this path.
+
+The engine can also serve the manifest itself. That path displays the credentials in a web page, so it is **off by default**: `/api/v1/github/register` and `/api/v1/github/callback` return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. Use it only for a remote engine that the command above cannot reach, and turn the flag off afterwards:
+
+1. **Enable the registration routes** by setting `PRELOOP_ENABLE_APP_REGISTRATION=1` on the engine and restarting it.
+2. **Expose preloop at its final public HTTPS URL**: start `preloop-runner-server` behind a publicly reachable HTTPS address, then open this page in the browser you will use to create the App:
+
+   ```text
    https://preloop.example.com/api/v1/github/register
-  ```
+   ```
+
+   The page sets an HTTP-only `preloop_app_manifest_state` cookie, valid for one hour and scoped to `/api/v1/github`, and gives GitHub the same token as its `state` parameter. Opening the page again replaces the cookie, so use the latest page.
 
    `localhost` is suitable for viewing the form, but GitHub cannot deliver webhook events or callback redirects to it. The manifest only includes webhook settings for non-local hosts.
-2. **Create the App from the manifest**:
- Click **Register App on GitHub**. GitHub opens its App-creation flow with preloop's redirect URL, webhook URL, default events, and default permissions pre-filled.
-3. **Capture the callback credentials**:
- After GitHub creates the App, it redirects to:
-  ```text
-   https://preloop.example.com/api/v1/github/callback?code=...
-  ```
+3. **Create the App from the manifest**: click **Register App on GitHub**. GitHub opens its App-creation flow with preloop's redirect URL, webhook URL, default events, and default permissions pre-filled.
+4. **Capture the callback credentials**: GitHub redirects the same browser to:
 
-   preloop exchanges the one-time code for an App ID, webhook secret, and private-key PEM, then displays them. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them.
-4. **Install the App**:
- In GitHub's App settings, install the newly created App on the target account or repository. Copy the installation ID from its installation settings URL, for example:
-  ```text
-   https://github.com/settings/installations/INSTALLATION_ID
-  ```
+   ```text
+   https://preloop.example.com/api/v1/github/callback?code=...&state=...
+   ```
 
-   The App cannot mint an installation access token until this step is complete.
-5. **Configure preloop and restart it**:
-  ```sh
-   export PRELOOP_WEBHOOK_SECRET="your-new-webhook-secret"
-   export PRELOOP_GITHUB_APP_ID="your-new-app-id"
-   export PRELOOP_GITHUB_APP_INSTALLATION_ID="your-installation-id"
-   export PRELOOP_GITHUB_APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----
-   ...
-   -----END PRIVATE KEY-----'
-   # Or: export PRELOOP_GITHUB_APP_PRIVATE_KEY_PATH=/secure/path/preloop-app.pem
-  ```
+   preloop exchanges the one-time code only when `state` matches the cookie in that browser, is signed by this engine, and has not expired. Otherwise it answers `400` and does not contact GitHub. The page then shows the App ID, the owning account, the webhook secret, the private-key PEM, and the command for the next step. Confirm that the owning account is the one you registered with. Treat the PEM and webhook secret as credentials: store them in a secret manager and do not commit them. The response is never cached, its URL is not sent in `Referer`, and the cookie is cleared.
+5. **Hand the credentials to the engine**: save the PEM to `./app.pem`, then run the command from the page on the engine host:
 
-   When these values are set, preloop signs a GitHub App JWT and requests a per-job installation token scoped to the repository and effective `permissions:`. The granted installation permissions still bound what GitHub can mint; see [GitHub Tokens](./github-tokens.md) for permission narrowing and failure behavior. If no App is configured, `PRELOOP_GITHUB_TOKEN` may be used as the job token. If App minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` selects the fallback: `error` fails the job and `pat` explicitly uses the static PAT. `local` is intended to leave the job without an App token, but a later broker fallback can still supply a configured PAT; use `error` or remove the PAT if you require fail-closed behavior. Private reusable-workflow references are resolved with `PRELOOP_GITHUB_TOKEN` or `github.pat`; without either, access to private reusable workflows may fail. App-only deployments do not need a PAT for server-side calls that do not require private reusable-workflow access. Prefer an App with `checks: write` for Check Run reporting, and do not treat a static PAT as a supported replacement.
-6. **Confirm delivery and job credential use**:
-Push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. With a configured App, the runner receives the job-scoped installation token when minting succeeds. For Check Run reporting, use the App with `checks: write`; a static PAT can support other API or job-token paths but is not a Check Runs credential. Private reusable-workflow references require `PRELOOP_GITHUB_TOKEN` or `github.pat`. App-only deployments need no PAT for server-side calls that do not require private reusable-workflow access.
+   ```sh
+   preloop setup github --via app --app-id <app-id> --pem-file ./app.pem --webhook-secret '<webhook-secret>'
+   ```
+
+   The secret is bound to this App's id. Do **not** set `PRELOOP_WEBHOOK_SECRET` for this App: the variable is the single default-App slot and cannot address a second App. Then unset `PRELOOP_ENABLE_APP_REGISTRATION` and restart the engine.
+6. **Install the App**: in GitHub's App settings, install the App on the target account or repository. No installation token can be minted until this step is complete. preloop finds the installation for each repository owner unless `PRELOOP_GITHUB_APP_INSTALLATION_ID` pins one.
+7. **Confirm delivery and job credential use**: push a commit or open a pull request. preloop verifies the webhook and queues matching jobs. With the App configured, preloop signs a GitHub App JWT and requests a per-job installation token scoped to the repository and effective `permissions:`. The granted installation permissions still bound what GitHub can mint; see [GitHub Tokens](./github-tokens.md) for permission narrowing and failure behavior. If no App is configured, `PRELOOP_GITHUB_TOKEN` may be used as the job token. If App minting fails, `PRELOOP_GITHUB_APP_MINT_FAILURE` selects the fallback: `error` fails the job and `pat` explicitly uses the static PAT. `local` is intended to leave the job without an App token, but a later broker fallback can still supply a configured PAT; use `error` or remove the PAT if you require fail-closed behavior. Private reusable-workflow references are resolved with `PRELOOP_GITHUB_TOKEN` or `github.pat`; without either, access to private reusable workflows may fail. App-only deployments do not need a PAT for server-side calls that do not require private reusable-workflow access. Prefer an App with `checks: write` for Check Run reporting, and do not treat a static PAT as a supported replacement.
 
 ---
 

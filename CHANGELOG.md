@@ -46,6 +46,9 @@ Releases before v0.27.0 predate the changelog.
   the pass's, and App JWT responses charge their advertised bytes to the
   consumption counters.
 
+- **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
+  RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
+  extraction) flagged by `cargo audit`.
 - **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
   replayed on one node waited for the other nodes' five-second queue poll before
   it was claimed. The committing node now sends one coalesced `preloop_webhooks`
@@ -228,6 +231,21 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **GitHub App manifest registration is off by default and bound to its
+  browser**: `/api/v1/github/register` and `/api/v1/github/callback` return
+  `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. The
+  registration page sets a signed, one-hour `preloop_app_manifest_state`
+  cookie, and the callback exchanges GitHub's one-time code only when the
+  echoed `state` matches that cookie, so a forged callback never reaches
+  GitHub. The credentials page is no longer cacheable, HTML-escapes every value
+  GitHub returns, shows the owning account to confirm, and hands the webhook
+  secret to `preloop setup github --via app --webhook-secret` rather than the
+  legacy `PRELOOP_WEBHOOK_SECRET` slot. That per-App secret — the first App's
+  included — verifies as the App itself, so a payload it signs is bound to the
+  App's installation coverage; only values no App claims keep the unbound
+  legacy signer. Refusals and failed code exchanges both answer with the same
+  uncachable, no-referrer page, and a request that cannot parse gets the
+  generic refusal rather than an extractor rejection.
 - **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
   process**: the env-selected backend handed each caller a fresh empty store,
   so a config write sealed `[secrets]` under a key stored in a store instance

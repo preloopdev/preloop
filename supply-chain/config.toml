@@ -767,6 +767,10 @@ criteria = "safe-to-deploy"
 version = "0.2.190"
 criteria = "safe-to-deploy"
 
+[[exemptions.listenfd]]
+version = "1.0.2"
+criteria = "safe-to-deploy"
+
 [[exemptions.libm]]
 version = "0.2.16"
 criteria = "safe-to-deploy"

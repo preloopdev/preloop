@@ -1462,6 +1462,23 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
     load_config_from(&config_path())
 }
 
+/// The default App's webhook secret: `PRELOOP_WEBHOOK_SECRET` wins over the
+/// config file's `github.webhook_secret`, matching every other credential.
+/// An empty value in either source counts as unset: a blank export must not
+/// disable signature verification silently.
+pub fn webhook_secret_from_env_or_config(config: &ConfigFile) -> Option<String> {
+    std::env::var("PRELOOP_WEBHOOK_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty())
+        .or_else(|| {
+            config
+                .github
+                .webhook_secret()
+                .filter(|secret| !secret.is_empty())
+                .map(str::to_owned)
+        })
+}
+
 /// The `credential_store` key of the config file at `path`, read on its own.
 ///
 /// The store has to be chosen before any credential reference can be resolved
