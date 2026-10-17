@@ -1047,7 +1047,8 @@ fn extract_binary(archive_path: &Path, destination: &Path) -> anyhow::Result<()>
         let mut copied = false;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
-            if entry.is_dir() || !is_binary_entry(Path::new(entry.name())) {
+            let entry_name = entry.name()?;
+            if entry.is_dir() || !is_binary_entry(Path::new(entry_name.as_ref())) {
                 continue;
             }
             std::io::copy(&mut entry, &mut output)?;

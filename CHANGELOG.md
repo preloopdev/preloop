@@ -35,6 +35,36 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
+
+- **The GitHub App JWT breaker is partitioned by App id**: one App's rate
+  limit or outage no longer skips the webhook-health and delivery-watchdog
+  checks of the other Apps, and installation lookup, token minting, and App
+  reads now go through the breaker and the `app-auth` consumption counters.
+  A pass that skips an App behind its breaker no longer counts as a successful
+  watchdog poll, so `webhook_watchdog_stale` still fires while any App's
+  deliveries go unwatched; a held-back App stays visible in the health snapshot
+  as explicitly unchecked and keeps its own check time instead of inheriting
+  the pass's, and App JWT responses charge their advertised bytes to the
+  consumption counters.
+
+- **A locked credential store no longer replaces the config-secrets key.** Sealed
+  `[secrets]` values are opened with the key the credential store holds. When
+  that store was locked, the engine minted a new key over them, so every start
+  failed with `store envelope authentication failed`, and after unlocking it
+  failed with `config-secrets key conflict`. Preloop now refuses to mint while
+  sealed values exist and names what to unlock. A `secrets.key` that disagrees
+  with the store is settled by which key opens the sealed values, and the losing
+  file is renamed `secrets.key.orphan-<unix-ts>`, never deleted. A failed
+  background engine start now prints the engine's last log lines (#653).
+
+- **`zip` updated to 9.0.4.** Fixes RUSTSEC-2026-0367, RUSTSEC-2026-0368 and
+  RUSTSEC-2026-0369 (insecure symlink and permission handling during archive
+  extraction) flagged by `cargo audit`.
+- **Webhook deliveries wake every node's worker at once**: a delivery enqueued or
+  replayed on one node waited for the other nodes' five-second queue poll before
+  it was claimed. The committing node now sends one coalesced `preloop_webhooks`
+  notification after its commit, and each peer's worker wakes on it.
 - **A GitHub App's private key survives an OS keychain failure.** With
   `credential_store = "os"`, an unavailable keychain or a refused write now
   stores the credential in the file store, prints a warning naming the
@@ -213,6 +243,21 @@ Releases before v0.27.0 predate the changelog.
   `storage.raw`, no registry row, invisible to `delete`), then the named
   machine's own `pack/`; the startup sweep prunes residue a crashed delete
   left inside registered machines.
+- **GitHub App manifest registration is off by default and bound to its
+  browser**: `/api/v1/github/register` and `/api/v1/github/callback` return
+  `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`. The
+  registration page sets a signed, one-hour `preloop_app_manifest_state`
+  cookie, and the callback exchanges GitHub's one-time code only when the
+  echoed `state` matches that cookie, so a forged callback never reaches
+  GitHub. The credentials page is no longer cacheable, HTML-escapes every value
+  GitHub returns, shows the owning account to confirm, and hands the webhook
+  secret to `preloop setup github --via app --webhook-secret` rather than the
+  legacy `PRELOOP_WEBHOOK_SECRET` slot. That per-App secret — the first App's
+  included — verifies as the App itself, so a payload it signs is bound to the
+  App's installation coverage; only values no App claims keep the unbound
+  legacy signer. Refusals and failed code exchanges both answer with the same
+  uncachable, no-referrer page, and a request that cannot parse gets the
+  generic refusal rather than an extractor rejection.
 - **`PRELOOP_CREDENTIAL_STORE=memory` keeps credentials for the life of the
   process**: the env-selected backend handed each caller a fresh empty store,
   so a config write sealed `[secrets]` under a key stored in a store instance

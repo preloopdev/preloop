@@ -1577,6 +1577,18 @@ impl Backend {
         }
     }
 
+    /// Webhook-queue hints from any node sharing this database (payload: the
+    /// writer's origin). `None` on SQLite: one node owns the queue and wakes
+    /// its own worker.
+    pub(crate) fn subscribe_webhook_wakes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(b) => Some(b.subscribe_webhook_wakes()),
+        }
+    }
+
     /// The current end of the outbox stream. SQLite returns event-id order;
     /// PostgreSQL returns its `(txid,event_id)` safe point.
     pub(crate) async fn outbox_head(&self) -> Result<Option<OutboxBookmark>, ControlError> {
