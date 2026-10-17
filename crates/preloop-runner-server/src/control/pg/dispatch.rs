@@ -1903,6 +1903,58 @@ async fn job_under_max_parallel(
     Ok(active < limit as i64)
 }
 
+/// Re-admits a cohort's waiters that `promote_waiter` parked at the cap.
+///
+/// A waiter that finds its cohort saturated is re-parked at its FIFO slot and
+/// its gate's holder row is cleared, so the gate is free and nothing wakes it:
+/// only a release of that gate reaches the waiter. Once `job_id` has left its
+/// cohort's active set, every free gate holding a waiter of `base_id` in this
+/// run is retried through the normal FIFO promotion. The head keeps its
+/// `wait_id`. A gate with a live holder is left to that holder's release.
+async fn retry_cohort_waiters(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    base_id: &str,
+) -> Result<(), ControlError> {
+    let groups = tx
+        .query(
+            "SELECT w.namespace_id, w.repository, w.group_name \
+             FROM concurrency_waits w \
+             JOIN jobs j ON j.run_id = w.holder_run_id AND j.job_id = w.holder_job_id \
+             WHERE w.holder_run_id = $1::text::uuid AND w.holder_kind = 'job' \
+               AND j.base_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM concurrency_holds h \
+                    WHERE h.namespace_id = w.namespace_id AND h.repository = w.repository \
+                      AND h.group_name = w.group_name) \
+             GROUP BY w.namespace_id, w.repository, w.group_name \
+             ORDER BY MIN(w.wait_id)",
+            &[&run_id.0.to_string(), &base_id],
+        )
+        .await
+        .map_err(db)?;
+    if groups.is_empty() || !job_under_max_parallel(tx, run_id, job_id).await? {
+        return Ok(());
+    }
+    for row in groups {
+        let namespace: String = row.get(0);
+        let key = (row.get::<_, String>(1), row.get::<_, String>(2));
+        // The order `acquire_gate` takes: foreign runs first, then the group.
+        lock_gate_runs(tx, &namespace, &key, run_id).await?;
+        // `lock_group` takes the group's mutex (a probe row). A holder that
+        // landed meanwhile keeps the gate; its release retries the cohort.
+        let Some(group) = lock_group(tx, &namespace, &key, &run_id.0.to_string()).await? else {
+            continue;
+        };
+        if group.holder.is_some() {
+            continue;
+        }
+        promote_after_release(backend, tx, &namespace, &key).await?;
+    }
+    Ok(())
+}
+
 /// A run-waiter promoted: the jobs it parked behind its own workflow gate go
 /// back to `blocked` and the normal promotion sweep decides what may run
 /// (needs, job-level gates, max-parallel) — mirroring lite's
@@ -3208,6 +3260,43 @@ impl<'a> Sweep<'a> {
             .any(|row| row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0))
     }
 
+    /// Whether a settled leg freed a `max-parallel` slot that a parked leg of
+    /// its cohort can take: the cohort has a `blocked` leg with zero remaining
+    /// needs and fewer active legs than its cap. A parked leg names no sibling
+    /// in `job_needs`, so `refresh_remaining_needs` never reports it; the caller
+    /// treats `true` as a promotion trigger. The sweep that trigger runs loads
+    /// the run graph, so every such completion pays that load; admitting the
+    /// leg on a leg-scoped view instead is the follow-up.
+    pub(super) async fn cohort_has_admissible_leg(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        base_id: &str,
+    ) -> Result<bool, ControlError> {
+        let row = tx
+            .query_one(
+                "SELECT \
+                   EXISTS (SELECT 1 FROM jobs j \
+                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
+                       AND j.queue_state='blocked' AND j.remaining_needs <= 0 \
+                       AND j.status NOT IN \
+                         ('success','failure','cancelled','skipped','timed_out')), \
+                   (SELECT s.max_parallel FROM job_specs s \
+                     JOIN jobs j ON j.run_id=s.run_id AND j.job_id=s.job_id \
+                     WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
+                       AND s.max_parallel IS NOT NULL LIMIT 1), \
+                   (SELECT count(*) FROM jobs a \
+                     WHERE a.run_id=$1::text::uuid AND a.base_id=$2 \
+                       AND (a.status='in_progress' OR a.queue_state IN ('ready','claimed')))",
+                &[&run_id.0.to_string(), &base_id],
+            )
+            .await
+            .map_err(db)?;
+        let parked: bool = row.get(0);
+        let cap: Option<i32> = row.get(1);
+        let active: i64 = row.get(2);
+        Ok(parked && cap.is_some_and(|cap| active < i64::from(cap)))
+    }
+
     /// Try to fold a reusable workflow caller when one of its inner jobs
     /// completes. If every inner job of one of its callers is terminal,
     /// resolves the caller's `outputs` from its `output_definitions` (the
@@ -3293,7 +3382,9 @@ impl<'a> Sweep<'a> {
                         .is_some_and(|(status, _)| status.is_terminal())
                 });
             if !all_complete {
-                return Ok(None);
+                // This caller still waits on inner jobs; a nested caller that
+                // shares these ids may be complete and must still fold.
+                continue;
             }
             // Expression context: `jobs.<inner-id-without-caller-prefix>
             // .outputs.<name>` plus the call's `with:` inputs.
@@ -6462,6 +6553,19 @@ impl Default for SettleCoreOutcome {
     }
 }
 
+/// A completion reports a terminal verdict. `Queued`, `Pending` and
+/// `InProgress` would leave the job outside the queue with no path that
+/// promotes it again, and the attempt would finish without a result.
+fn require_terminal_completion(status: ExecutionStatus) -> Result<(), ControlError> {
+    if status.is_terminal() {
+        return Ok(());
+    }
+    Err(ControlError::BadRequest(format!(
+        "completion status {} is not terminal",
+        status_str(status)
+    )))
+}
+
 impl PgBackend {
     /// `complete_job`: settle the attempt, flip the job, propagate outputs and
     /// dependents, fail-fast siblings.
@@ -6469,6 +6573,7 @@ impl PgBackend {
         &self,
         completion: JobCompletionInput,
     ) -> Result<CompleteOutcome, ControlError> {
+        require_terminal_completion(completion.status)?;
         let run_id = completion.run_id;
         let job_id = completion.job_id.clone();
         let mut client = self.writer().await?;
@@ -6519,6 +6624,7 @@ impl PgBackend {
         settle: SettleJob,
     ) -> Result<SettleJobOutcome, ControlError> {
         let comp = settle.completion.clone();
+        require_terminal_completion(comp.status)?;
         let run_id = comp.run_id;
         let job_id = comp.job_id.clone();
         let mut client = self.writer().await?;
@@ -6750,11 +6856,9 @@ impl PgBackend {
             current = caller.clone();
             outcome.folded_callers.push(caller);
         }
-        // 5. Refresh the dependents' `remaining_needs` for everything that just
-        // turned terminal: the job, its fail-fast siblings and the folded
-        // callers. A dependent that is now `blocked` with zero needs left is
-        // what the promotion sweep below picks up.
-        let mut promotable = Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
+        // The bases this completion turned terminal in: the job's own, and each
+        // fail-fast sibling's and folded caller's.
+        let mut settled_bases = vec![(job_id.clone(), base_id.clone())];
         for settled in outcome
             .cancelled_siblings
             .iter()
@@ -6768,8 +6872,30 @@ impl PgBackend {
                 .await
                 .map_err(db)?
                 .get(0);
-            promotable |=
-                Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
+            settled_bases.push((settled.clone(), settled_base));
+        }
+        // A settled leg may have freed a `max-parallel` slot that a waiter of
+        // its cohort was parked for behind a gate nothing else will release.
+        for (settled, settled_base) in &settled_bases {
+            retry_cohort_waiters(self, tx, run_id, settled, settled_base).await?;
+        }
+        // 5. Refresh the dependents' `remaining_needs` for everything that just
+        // turned terminal. A dependent that is now `blocked` with zero needs left
+        // is what the promotion sweep below picks up. A parked leg names no
+        // sibling in `job_needs`, so the refresh never reports it: the settled
+        // leg's cohort is checked for a parked leg the freed slot can take.
+        let mut promotable = false;
+        for (settled, settled_base) in &settled_bases {
+            promotable |= Sweep::refresh_remaining_needs(tx, run_id, settled, settled_base).await?;
+        }
+        let mut cohorts: Vec<&str> = settled_bases
+            .iter()
+            .map(|(_, cohort)| cohort.as_str())
+            .collect();
+        cohorts.sort_unstable();
+        cohorts.dedup();
+        for cohort in cohorts {
+            promotable |= Sweep::cohort_has_admissible_leg(tx, run_id, cohort).await?;
         }
         outcome.promotable_dependents = promotable;
         // 6. Run status via the DB aggregate; the caller holds the run lock.

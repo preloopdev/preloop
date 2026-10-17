@@ -18,6 +18,7 @@ held only for the final status transition.
 
 ```
 settle_job(run_id, job_id, status):
+  0. Reject a non-terminal status (BadRequest) before any write
   1. Decide the effective status (first verdict, continue-on-error)
   2. Mark the job terminal (outputs/annotations only when reported)
   3. Retire the attempt rows, clear the machine binding, settle the newest
@@ -25,26 +26,35 @@ settle_job(run_id, job_id, status):
   4. Release the job's concurrency hold (promotes the group's next waiter)
   5. Fail-fast siblings (when this job failed)
   6. Fold reusable callers, walking up nested callers
-  7. Refresh `remaining_needs` for the dependents of everything that just
-     turned terminal — one indexed UPDATE per settled job, which also
-     reports whether a dependent became promotable
-  8. Summarize the run from the DB aggregate; on the first terminal
+  7. Retry the cohort waiters that `promote_waiter` re-parked at max-parallel,
+     on each free gate holding one of the settled legs' cohort waiters (FIFO)
+  8. Refresh `remaining_needs` for the dependents of everything that just
+     turned terminal (one indexed UPDATE per settled job), and check each
+     settled job's cohort for a parked leg a freed slot can take; both report
+     whether promotion is needed
+  9. Summarize the run from the DB aggregate; on the first terminal
      transition release the workflow-level hold and emit run.completed.v1
-  9. Emit job.completed.v1 for every job this completion concluded (the job,
+ 10. Emit job.completed.v1 for every job this completion concluded (the job,
      its fail-fast siblings, the folded callers)
- 10. If step 7 made a dependent promotable: run the shared promotion sweep
-     over the loaded graph
+ 11. If step 8 reported promotion: run the shared promotion sweep over the
+     loaded graph
 ```
 
-Step 10 is the only part of a completion that still loads the run graph.
+Step 11 is the only part of a completion that still loads the run graph.
 Promotion is the one step whose decisions — needs hydration into the runner
 message, job/JobSet gate admission, max-parallel cohorts, deferred matrix
 expansion, unhostable `runs-on` rejection — are not expressible as
 conditional writes, and `Sweep::promote` is the single implementation of
-them. It runs only when the completion actually unblocked something: a matrix
-leg that does not finish its base, or any completion with no dependents,
-never materializes the run. Porting promotion to targeted writes (the way
-lite's `promote_run` does it) is the natural follow-up.
+them. It runs only when the completion actually unblocked something: a
+dependent became promotable, or a parked leg of the settled leg's cohort can
+take the freed slot. A matrix leg that frees no slot, or any completion with
+no dependents, never materializes the run.
+
+A capped cohort is the exception that remains. While a parked leg and a free
+slot coexist, every completion of that cohort runs the sweep and so loads the
+run. Admitting the parked leg on a leg-scoped view, without that load, is the
+follow-up. Porting the whole promotion to targeted writes (the way lite's
+`promote_run` does it) is the longer one.
 
 ## Lock Scope Decision
 
@@ -155,9 +165,10 @@ When a job that is an inner job of a reusable call completes:
    ```
    Status = `aggregate_need_status` over inner statuses (failure > cancelled >
    skipped > success).
-6. Treat the caller as a completed job: find *its* dependents via `dependents_of`,
-   run the unblock step for each. (This replaces lite's `refresh_remaining_needs`
-   and pg's in-memory sweep propagation.)
+6. Treat the caller as a completed job: refresh the `remaining_needs` of every job
+   that declares it (or its matrix base) as a need, the same unblock step each
+   settled job gets (`Sweep::refresh_remaining_needs`). This replaces pg's
+   in-memory sweep propagation.
 7. Emit `job.completed.v1` for the caller. **Note:** pg currently skips this
    (divergence from lite); the redesign fixes it for parity.
 8. Walk up: if the caller itself has a `parent_job_id` pointing to another
@@ -243,7 +254,7 @@ only the trigger (per-job targeted instead of whole-run scan).
 - the in-memory `propagate_reusable_outputs` fold in `complete_job_inner`
   (replaced by the targeted, metadata-driven fold)
 
-Still graph-backed: promotion of newly-unblocked dependents (step 10 above).
+Still graph-backed: promotion of newly-unblocked dependents and of capped cohort legs (step 11 above).
 
 ## What Stays Unchanged
 
@@ -264,9 +275,13 @@ Still graph-backed: promotion of newly-unblocked dependents (step 10 above).
   release on run completion, reusable-caller outputs across a reload, and
   completion bookkeeping. Postgres runs the whole suite per major version in
   `control-plane.yml`.
-- New pg tests pin the targeted helpers: `refresh_remaining_needs` matrix and
-  chain cases, fail-fast sibling cancellation with the `fail_fast=false`
-  opt-out.
+- New pg tests pin the targeted paths: cohort admission (a parked `max-parallel`
+  leg is admitted when a settled leg frees its slot, and a dependent of the
+  capped base waits for every leg), gate-waiter retry (a re-parked waiter keeps
+  its FIFO slot and is admitted when its cohort frees on another gate), nested
+  reusable callers that share inner job ids, and rejection of non-terminal
+  completions. `refresh_remaining_needs` matrix and chain cases and fail-fast
+  sibling cancellation (with the `fail_fast=false` opt-out) stay pinned too.
 - Load-test A/B: confirm per-completion lock hold time drops and throughput
   rises on the 25 rps harness.
 

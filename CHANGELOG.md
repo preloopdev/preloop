@@ -274,6 +274,23 @@ Releases before v0.27.0 predate the changelog.
   the boot-config path in its argv, never a neighboring machine's), retries
   the delete, and detaches an orphaned layer mount if one remains.
 
+### Changed
+
+- **Postgres completions no longer load the run graph in the common case**:
+  `settle_job` and `complete_job` write the terminal transition, retire the
+  attempt, fail-fast the siblings, fold reusable callers, retry cohort waiters
+  parked behind a gate, refresh the dependents' `remaining_needs` and summarize
+  the run with targeted statements. The graph is materialized only when a
+  completion makes a dependent promotable or a parked leg of the settled leg's
+  `max-parallel` cohort can take the freed slot. Promotion (needs hydration,
+  gates, deferred expansion) still runs the shared sweep, so a capped matrix
+  loads the run on each completion while a parked leg and a free slot coexist.
+  Fail-fast now cancels every non-terminal sibling of the base, releasing its
+  concurrency hold and queueing the runner cancellation, matching the SQLite
+  path.
+- A completion that reports a non-terminal status is rejected with a bad
+  request before anything is written.
+
 ## [0.34.0] - 2026-10-09
 
 ### Changed
@@ -467,17 +484,6 @@ Releases before v0.27.0 predate the changelog.
   initiated the rerun, while the original submission's actor is
   retained for authorization.
 ### Changed
-
-- **Postgres completions no longer load the run graph**: `settle_job` and
-  `complete_job` write the terminal transition, retire the attempt, fail-fast
-  the siblings, fold reusable callers, refresh the dependents'
-  `remaining_needs` and summarize the run with targeted statements. The graph
-  is materialized only when a completion actually makes a dependent
-  promotable — promotion (needs hydration, gates, max-parallel cohorts,
-  deferred expansion) still runs the shared sweep — so a leg of a large
-  fan-out settles without touching the rest of the run. Fail-fast now cancels
-  every non-terminal sibling of the base, releasing its concurrency hold and
-  queueing the runner cancellation, matching the SQLite path.
 
 - Jobs from interactive `issue_comment` and `workflow_dispatch` runs now receive
   ready-queue priority over older automatic jobs; Pullfrog reviews run only on
