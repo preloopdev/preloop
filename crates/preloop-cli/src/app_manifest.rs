@@ -32,8 +32,8 @@ use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
 use preloop_runner_server::github_app_setup::{
-    AppCredentials, FormPage, convert_manifest_code, creation_url, error_page, form_page,
-    manifest, random_nonce, success_page,
+    AppCredentials, FormPage, convert_manifest_code, creation_url, error_page, form_page, manifest,
+    random_nonce, success_page,
 };
 use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -536,9 +536,7 @@ mod tests {
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, &api).await },
-            );
+            tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -663,9 +661,7 @@ mod tests {
             axum::serve(api_listener, router).await
         });
         let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, &api).await },
-            );
+            tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
 
         let client = reqwest::Client::new();
         let form = client
@@ -814,6 +810,9 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("http://127.0.0.1:8765"), "{text}");
-        assert!(text.contains("~/.ssh/config"), "the host may need adjusting: {text}");
+        assert!(
+            text.contains("~/.ssh/config"),
+            "the host may need adjusting: {text}"
+        );
     }
 }

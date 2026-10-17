@@ -1303,7 +1303,10 @@ mod runner_surface_tests {
                 "/setup/github/callback",
                 axum::routing::get(|| async { "callback" }),
             )
-            .route("/runner/message", axum::routing::get(|| async { "message" }))
+            .route(
+                "/runner/message",
+                axum::routing::get(|| async { "message" }),
+            )
             .layer(axum::middleware::from_fn(runner_surface_only));
         for path in ["/setup/github", "/setup/github/callback"] {
             let response = app
@@ -1332,6 +1335,10 @@ mod runner_surface_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "the runner protocol still passes");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the runner protocol still passes"
+        );
     }
 }

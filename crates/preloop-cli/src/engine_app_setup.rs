@@ -112,7 +112,9 @@ async fn wait_for_completion(engine: &str, session: &str) -> Result<()> {
                 match state {
                     "awaiting_link" => println!("Waiting for the link to be opened…"),
                     "awaiting_approval" => {
-                        println!("The form was opened. Waiting for the App to be approved on GitHub…")
+                        println!(
+                            "The form was opened. Waiting for the App to be approved on GitHub…"
+                        )
                     }
                     "converting" => {
                         println!("GitHub approved the App. Storing its credentials on the engine…")
@@ -137,7 +139,9 @@ fn completion_lines(status: &Value) -> Vec<String> {
         lines.push("Webhook secret stored — signed deliveries will verify.".to_owned());
     }
     if let Some(url) = status["install_url"].as_str() {
-        lines.push(format!("Install it on your repositories to finish:\n  {url}"));
+        lines.push(format!(
+            "Install it on your repositories to finish:\n  {url}"
+        ));
     }
     lines.push("Restart the engine (`preloop serve`) to pick up the config.".to_owned());
     lines.push(
@@ -179,10 +183,12 @@ fn unreachable_engine(engine: &str, error: &reqwest::Error) -> anyhow::Error {
 /// http never leaves the machine, so it is not warned about.
 pub(crate) fn insecure_public_url_warning(public_url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(public_url).ok()?;
-    let loopback = parsed
-        .host_str()
-        .is_some_and(|host| host.eq_ignore_ascii_case("localhost")
-            || host.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback()));
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
     (parsed.scheme() == "http" && !loopback).then(|| {
         format!(
             "{public_url} is plain http. GitHub and browsers should reach this engine over https; prefer a reverse proxy or tunnel with a certificate."
@@ -237,6 +243,9 @@ mod tests {
     fn completion_without_an_app_id_still_reports_success() {
         let lines = completion_lines(&json!({"status": "completed"}));
         assert!(lines[0].starts_with("Created the App"), "{lines:?}");
-        assert!(lines.iter().all(|line| !line.contains("Webhook")), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("Webhook")),
+            "{lines:?}"
+        );
     }
 }

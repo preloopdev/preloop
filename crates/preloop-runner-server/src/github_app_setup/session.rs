@@ -363,8 +363,7 @@ pub async fn open_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<OpenRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let public_url =
-        normalize_public_url(&request.public_url).map_err(ApiError::bad_request)?;
+    let public_url = normalize_public_url(&request.public_url).map_err(ApiError::bad_request)?;
     let org = match request.org.map(|org| org.trim().to_owned()) {
         Some(org) if !org.is_empty() => {
             if !valid_org(&org) {
@@ -380,11 +379,10 @@ pub async fn open_session(
     if app_name.is_empty() {
         return Err(ApiError::bad_request("app_name must not be empty"));
     }
-    let opened =
-        shared
-            .state
-            .github_setup
-            .open(Instant::now(), public_url.clone(), org, app_name);
+    let opened = shared
+        .state
+        .github_setup
+        .open(Instant::now(), public_url.clone(), org, app_name);
     info!(session = %opened.id, "opened a GitHub App setup session");
     Ok((
         StatusCode::CREATED,
@@ -432,7 +430,12 @@ pub async fn setup_form(
         return refuse(StatusCode::NOT_FOUND);
     };
     let redirect_url = format!("{}/setup/github/callback", grant.public_url);
-    let manifest = manifest(&grant.app_name, &redirect_url, Some(&grant.public_url), None);
+    let manifest = manifest(
+        &grant.app_name,
+        &redirect_url,
+        Some(&grant.public_url),
+        None,
+    );
     let action = creation_url(
         &shared.state.github_urls.server_url,
         grant.org.as_deref(),
@@ -496,7 +499,10 @@ pub async fn setup_callback(
 
 /// Convert the code, store the App's credentials exactly as the CLI does, and
 /// settle the session. Returns the page to show the browser.
-async fn complete_conversion(shared: Arc<SharedState>, conversion: Conversion) -> (StatusCode, String) {
+async fn complete_conversion(
+    shared: Arc<SharedState>,
+    conversion: Conversion,
+) -> (StatusCode, String) {
     let mut settlement = Settlement {
         sessions: shared.state.github_setup.clone(),
         id: conversion.id.clone(),
@@ -544,7 +550,10 @@ async fn complete_conversion(shared: Arc<SharedState>, conversion: Conversion) -
             for notice in notices {
                 warn!("{notice}");
             }
-            info!(app_id, "registered a GitHub App through engine-hosted setup");
+            info!(
+                app_id,
+                "registered a GitHub App through engine-hosted setup"
+            );
             settlement.settle(Ok(completed));
             (StatusCode::OK, done_page(install_url.as_deref()))
         }
@@ -1030,29 +1039,33 @@ mod tests {
         /// A stand-in for GitHub's conversion endpoint. Answers with the App's
         /// credentials when the code is `good-code`, and refuses anything else.
         async fn stub_github() -> String {
-            let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-                .await
-                .unwrap();
+            let listener =
+                tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let router = axum::Router::new().route(
                 "/app-manifests/{code}/conversions",
-                axum::routing::post(|axum::extract::Path(code): axum::extract::Path<String>| async move {
-                    if code == "good-code" {
-                        (
-                            axum::http::StatusCode::CREATED,
-                            axum::Json(json!({
-                                "id": 555001,
-                                "slug": "preloop-local",
-                                "pem": PEM,
-                                "webhook_secret": "hook-secret",
-                                "html_url": "https://github.com/apps/preloop-local",
-                            })),
-                        )
-                            .into_response()
-                    } else {
-                        (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "code expired").into_response()
-                    }
-                }),
+                axum::routing::post(
+                    |axum::extract::Path(code): axum::extract::Path<String>| async move {
+                        if code == "good-code" {
+                            (
+                                axum::http::StatusCode::CREATED,
+                                axum::Json(json!({
+                                    "id": 555001,
+                                    "slug": "preloop-local",
+                                    "pem": PEM,
+                                    "webhook_secret": "hook-secret",
+                                    "html_url": "https://github.com/apps/preloop-local",
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            (axum::http::StatusCode::UNPROCESSABLE_ENTITY, "code expired")
+                                .into_response()
+                        }
+                    },
+                ),
             );
             tokio::spawn(async move { axum::serve(listener, router).await });
             base
@@ -1121,7 +1134,10 @@ mod tests {
         async fn open_link(app: &axum::Router, state: &AppState) -> (String, String) {
             let response = send(
                 app,
-                open_request(state, json!({"public_url": PUBLIC, "app_name": "preloop-local"})),
+                open_request(
+                    state,
+                    json!({"public_url": PUBLIC, "app_name": "preloop-local"}),
+                ),
             )
             .await;
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1148,7 +1164,10 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"public_url": PUBLIC}).to_string()))
                 .unwrap();
-            assert_eq!(send(&app, anonymous).await.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                send(&app, anonymous).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
 
             let response = send(&app, open_request(&state, json!({"public_url": "ftp://x"}))).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1237,14 +1256,20 @@ mod tests {
             assert_eq!(callback.headers()["cache-control"], "no-store");
             let done = text(callback).await;
             assert!(done.contains("GitHub App created"), "{done}");
-            assert!(!done.contains("ENGINE-HOSTED"), "the key is never shown: {done}");
+            assert!(
+                !done.contains("ENGINE-HOSTED"),
+                "the key is never shown: {done}"
+            );
 
             let stored = crate::config::load_config_from(&temp.path().join("config.toml")).unwrap();
             assert_eq!(stored.github.app_id.as_deref(), Some("555001"));
             assert_eq!(stored.github.app_pem(), Some(PEM));
             assert_eq!(stored.github.webhook_secret(), Some("hook-secret"));
             let on_disk = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-            assert!(!on_disk.contains("ENGINE-HOSTED"), "no inline key: {on_disk}");
+            assert!(
+                !on_disk.contains("ENGINE-HOSTED"),
+                "no inline key: {on_disk}"
+            );
 
             let finished = poll_status(&app, &state, &session).await;
             assert_eq!(finished["status"], "completed");

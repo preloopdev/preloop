@@ -135,8 +135,7 @@ pub fn manifest(
             "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
             "active": true,
         });
-        manifest["default_events"] =
-            serde_json::json!(crate::github::manifest_default_events());
+        manifest["default_events"] = serde_json::json!(crate::github::manifest_default_events());
     }
     manifest
 }
@@ -443,7 +442,8 @@ pub fn error_page(title: &str, detail: &str) -> String {
 mod tests {
     use super::*;
 
-    const PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj\n-----END RSA PRIVATE KEY-----\n";
+    const PEM: &str =
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj\n-----END RSA PRIVATE KEY-----\n";
 
     #[test]
     fn manifest_disables_webhooks_without_a_public_url() {
@@ -615,11 +615,20 @@ mod tests {
 
         let notices =
             save_app_credentials_at(&path, "4242", PEM, Some("hook-secret".into())).unwrap();
-        assert!(notices.is_empty(), "the file store needs no fallback: {notices:?}");
+        assert!(
+            notices.is_empty(),
+            "the file store needs no fallback: {notices:?}"
+        );
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("BEGIN RSA"), "private key written inline: {text}");
-        assert!(!text.contains("hook-secret"), "webhook secret written inline: {text}");
+        assert!(
+            !text.contains("BEGIN RSA"),
+            "private key written inline: {text}"
+        );
+        assert!(
+            !text.contains("hook-secret"),
+            "webhook secret written inline: {text}"
+        );
         assert!(text.contains("app_pem_ref"), "{text}");
 
         let loaded = load_config_from(&path).unwrap();
