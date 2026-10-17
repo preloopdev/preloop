@@ -20,6 +20,12 @@ Releases before v0.27.0 predate the changelog.
   ast-grep, just, and cargo-deny at the versions in `mise.toml`. Zig and
   cargo-zigbuild match `release-runner.yml`.
 
+- **`preloop init` workflow readiness checks.** The five-step wizard can ask for
+  a stable HTTPS App webhook URL, scan local and configured repositories for
+  missing workflow secrets, and report every `runs-on` label against the
+  engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
+  `--json` includes the URL, secret, and runner-label decisions.
+
 ### Changed
 
 - **The file credential store is the default.** The engine token, GitHub App
