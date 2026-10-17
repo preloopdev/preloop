@@ -18,6 +18,7 @@ pub use preloop_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use preloop_vm::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
@@ -2114,6 +2115,50 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Give the runner account access to nested KVM.
+///
+/// The bake's validation probe and every KVM job open `/dev/kvm` as the runner,
+/// and the guest has no udev to hand the node its group. So the node goes to the
+/// `kvm` group and is made world-accessible, as hosted runners ship it
+/// (`MODE="0666"`). The mode is what reaches a process: `aenv exec` gives its
+/// processes only the uid's own group, so group access alone never reaches them.
+///
+/// Membership is what `sg kvm` and every `/etc/group` reader use. It is added
+/// last, so nothing after it in the same run can change the runner's groups.
+/// Every step is idempotent. A step that cannot land is reported on stderr,
+/// which the engine logs. It never fails the bake: the mode already covers the
+/// probe, and a guest without `/dev/kvm` still bakes.
+pub fn runner_kvm_access_script(user: &str, device: &str) -> String {
+    format!(
+        "getent group kvm >/dev/null 2>&1 || groupadd -r kvm 2>/dev/null || \
+           echo 'preloop: warning: could not create group kvm' >&2; \
+         if [ -e {device} ]; then \
+           chgrp kvm {device} 2>/dev/null || \
+             echo 'preloop: warning: could not give {device} to group kvm' >&2; \
+           chmod 0666 {device} 2>/dev/null || \
+             echo 'preloop: warning: could not set {device} to mode 0666' >&2; \
+         fi; \
+         if ! err=$(usermod -aG kvm {user} 2>&1); then \
+           gpasswd -a {user} kvm >/dev/null 2>&1 || \
+             echo \"preloop: warning: could not add {user} to group kvm: $err\" >&2; \
+         fi; \
+         getent group kvm | cut -d: -f4 | tr ',' '\\n' | grep -qx {user} || \
+           echo 'preloop: warning: {user} is not in group kvm; sg kvm will fail' >&2"
+    )
+}
+
+/// The udev rule that keeps `/dev/kvm` in the `kvm` group at mode 0666 in any
+/// guest that runs udev, in the shape hosted runners ship. The golden contract
+/// writes it; a guest without udev keeps the node as the contract set it.
+pub fn kvm_udev_rule_script(udev_rules_dir: &str) -> String {
+    format!(
+        "mkdir -p {udev_rules_dir} 2>/dev/null && \
+           printf '%s\\n' 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"' \
+             > {udev_rules_dir}/99-preloop-kvm.rules 2>/dev/null || \
+           echo 'preloop: warning: could not write the kvm udev rule' >&2"
+    )
+}
+
 /// Hand the runner account ownership of everything a job writes.
 ///
 /// One owner-only walk, run once at golden build — a fork inherits the result,
@@ -2445,6 +2490,11 @@ pub fn golden_glibc_check_script() -> &'static str {
 /// `EnvironmentSpec::from_base`), so editing a step rebuilds every golden baked
 /// from an image instead of adopting one the old contract produced.
 pub fn golden_contract_script(user: &str, uid: u32) -> String {
+    golden_contract_steps(user, uid).join("; ")
+}
+
+/// The contract's statements in order; [`golden_contract_script`] joins them.
+pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
     // `PRELOOP_RUNNER_USER=root` restores the old "run as root" behavior, and
     // `as_runner_user` runs the runner unchanged for it. The account steps must
     // skip then: creating and chowning a `root` account (and moving its home
@@ -2457,7 +2507,13 @@ pub fn golden_contract_script(user: &str, uid: u32) -> String {
         steps.push(golden_ownership_script(uid));
     }
     steps.push(golden_apt_lists_script());
-    steps.join("; ")
+    if user != "root" {
+        // The runner's groups are written last: nothing after this step may
+        // change them, so the membership it grants is the one the bake keeps.
+        steps.push(kvm_udev_rule_script("/etc/udev/rules.d"));
+        steps.push(runner_kvm_access_script(user, "/dev/kvm"));
+    }
+    steps
 }
 
 /// Refresh apt's package indices, best-effort and bounded.
@@ -3988,6 +4044,18 @@ async fn apply_golden_contract<P: VmProvider>(
                 .last()
                 .unwrap_or("unknown error")
         )));
+    }
+    // The contract exits 0 when a membership or device step cannot land, and
+    // says why on stderr. The bake still succeeds, but the reason must reach the
+    // engine log rather than disappear with the output.
+    let warnings = String::from_utf8_lossy(&output.stderr);
+    let warnings = warnings.trim();
+    if !warnings.is_empty() {
+        warn!(
+            machine = name.as_str(),
+            warnings = %warnings,
+            "golden contract completed with warnings"
+        );
     }
     Ok(())
 }
@@ -6944,51 +7012,6 @@ async fn provision_runner<P: VmProvider + 'static>(
     Ok(as_runner_user(config, &run))
 }
 
-/// Wrap a guest argv so the runner executes under `runner_user` instead of
-/// root: create the account, provision its runtime directory, open the
-/// control bridge, grant the docker group, then drop privileges with
-/// `setpriv` and export the account identity for the step-environment
-/// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
-/// worker). Purely a guest-side concern — never applied on the host.
-/// Carry a guest shell script so its root-only steps run either directly
-/// (the exec landed on root — locally baked goldens from plain bases declare
-/// no USER) or via passwordless sudo (the official runner image declares
-/// `USER runner`, and `machine exec` runs as that image user). The script is
-/// embedded base64 so every quoting form survives both shells.
-fn run_as_root_or_sudo(script: &str) -> String {
-    run_as_root_or_sudo_impl(script, true)
-}
-
-/// Same root-or-sudo fallback as [`run_as_root_or_sudo`], but status-
-/// preserving: a refused sudo or a failing script propagates a nonzero exit
-/// so the caller's exit-code check is authoritative. Required for provisioning
-/// that has no independent verification step — the lenient form would turn a
-/// passwordless-sudo miss into a false success.
-fn run_as_root_or_sudo_strict(script: &str) -> String {
-    run_as_root_or_sudo_impl(script, false)
-}
-
-fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
-    use base64::Engine as _;
-    // The script is spliced inline as `then {script}; else …`, so a trailing
-    // newline would leave that `;` alone on a line and dash would reject the
-    // whole command (`Syntax error: ";" unexpected`). Scripts that live in a
-    // file (`scripts/docker-start.sh`) end in a newline by convention, and
-    // trailing whitespace means nothing to the shell, so drop it here instead
-    // of asking every file-backed script to remember.
-    let script = script.trim_end();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(script);
-    let fallback = if best_effort {
-        "sudo -n sh 2>/dev/null || true"
-    } else {
-        "sudo -n sh"
-    };
-    format!(
-        "if [ \"$(id -u)\" -eq 0 ]; then {script}; else \
-           printf %s '{b64}' | base64 -d | {fallback}; fi"
-    )
-}
-
 /// Wrap a guest argv so it launches on the hosted process limits without
 /// switching accounts.
 ///
@@ -7015,6 +7038,12 @@ fn with_guest_hosted_limits(argv: &[String]) -> Vec<String> {
     wrapped
 }
 
+/// Wrap a guest argv so the runner executes under `runner_user` instead of
+/// root: create the account, provision its runtime directory, open the
+/// control bridge, grant the docker group, then drop privileges with
+/// `setpriv` and export the account identity for the step-environment
+/// contract (USER/LOGNAME/XDG_RUNTIME_DIR are derived from it by the
+/// worker). Purely a guest-side concern — never applied on the host.
 fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // Unset or root means no account switch, not no limits: the guest applies
     // neither the image's systemd nor its PAM limits on this path either, so
@@ -7057,6 +7086,10 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // `name_to_handle_at`, so fanotify FID watchers (TypeScript's fswatch,
     // 126 tests) failed with "operation not supported". GitHub-hosted
     // runners keep `/tmp` on ext4; the bind mount matches that.
+    // Per launch: re-add the runner to kvm after docker, and re-assert the device
+    // grant, so a golden that lost either still gives every job's steps the group
+    // and the node.
+    let kvm_access = runner_kvm_access_script(user, "/dev/kvm");
     let provisioning = format!(
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
@@ -7072,6 +7105,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
            printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          mkdir -p /run/preloop-control 2>/dev/null; chmod 777 /run/preloop-control 2>/dev/null; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
+         {kvm_access}; \
          if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /tmp 2>/dev/null && \
             [ \"$(stat -f -c %T /tmp 2>/dev/null)\" = tmpfs ]; then \
            umount /tmp 2>/dev/null || mount -o remount,size=75% /tmp 2>/dev/null || true; \
@@ -9823,6 +9857,306 @@ done
         );
     }
 
+    /// Run `runner_kvm_access_script` under recording stubs for the account and
+    /// device tools. The fake state lives in `dir`: `group` and `member` mark the
+    /// group and the runner's membership, `device` is the node, and a
+    /// `fail-<tool>` file makes that stub refuse. Every call is appended to
+    /// `dir/calls.log`, which is what the assertions read.
+    #[cfg(unix)]
+    fn run_kvm_access(dir: &std::path::Path, device: &str) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stubs: [(&str, &str); 6] = [
+            (
+                "getent",
+                r#"if [ "$1" = group ] && [ "$2" = kvm ]; then
+  [ -e "$KVM_TEST_DIR/group" ] || exit 2
+  if [ -e "$KVM_TEST_DIR/member" ]; then echo kvm:x:993:runner; else echo kvm:x:993:; fi
+else
+  exit 2
+fi"#,
+            ),
+            ("groupadd", r#"touch "$KVM_TEST_DIR/group""#),
+            (
+                "usermod",
+                r#"if [ "$1" = -aG ] && [ "$2" = kvm ] && [ "$3" = runner ]; then touch "$KVM_TEST_DIR/member"; fi"#,
+            ),
+            (
+                "gpasswd",
+                r#"if [ "$1" = -a ] && [ "$2" = runner ] && [ "$3" = kvm ]; then touch "$KVM_TEST_DIR/member"; fi"#,
+            ),
+            ("chgrp", ""),
+            ("chmod", ""),
+        ];
+        for (tool, body) in stubs {
+            let script = format!(
+                "#!/bin/sh\n\
+                 echo \"{tool} $*\" >> \"$KVM_TEST_DIR/calls.log\"\n\
+                 if [ -e \"$KVM_TEST_DIR/fail-{tool}\" ]; then echo \"{tool}: refused\" >&2; exit 1; fi\n\
+                 {body}\n\
+                 exit 0\n"
+            );
+            let path = bin.join(tool);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = format!("set -e; {}", runner_kvm_access_script("runner", device));
+        std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("KVM_TEST_DIR", dir)
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn kvm_calls(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn call_position(calls: &str, needle: &str) -> usize {
+        calls
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing `{needle}` in:\n{calls}"))
+    }
+
+    /// The device goes to the `kvm` group at mode 0666, and the runner is added
+    /// last. Asserted on the commands the stubs saw, in order.
+    #[cfg(unix)]
+    #[test]
+    fn runner_kvm_access_opens_the_device_to_every_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, "").unwrap();
+        let device = device.to_str().unwrap();
+        let out = run_kvm_access(dir.path(), device);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "a clean run must not warn: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = kvm_calls(dir.path());
+        assert!(calls.contains(&format!("chmod 0666 {device}")), "{calls}");
+        assert!(!calls.contains("0660"), "{calls}");
+        let created = call_position(&calls, "groupadd -r kvm");
+        let handed = call_position(&calls, &format!("chgrp kvm {device}"));
+        let opened = call_position(&calls, &format!("chmod 0666 {device}"));
+        let member = call_position(&calls, "usermod -aG kvm runner");
+        assert!(
+            created < handed && handed < opened && opened < member,
+            "the group, then the device, then the membership: {calls}"
+        );
+        assert!(
+            !calls.contains("gpasswd"),
+            "gpasswd is the fallback only: {calls}"
+        );
+        assert!(dir.path().join("member").exists(), "{calls}");
+    }
+
+    /// A second boot of the same contract finds the group and the membership in
+    /// place and creates nothing twice.
+    #[cfg(unix)]
+    #[test]
+    fn runner_kvm_access_is_idempotent_across_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, "").unwrap();
+        std::fs::write(dir.path().join("group"), "").unwrap();
+        std::fs::write(dir.path().join("member"), "").unwrap();
+        let out = run_kvm_access(dir.path(), device.to_str().unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = kvm_calls(dir.path());
+        assert!(
+            !calls.contains("groupadd"),
+            "an existing group is not created again: {calls}"
+        );
+        assert!(calls.contains("usermod -aG kvm runner"), "{calls}");
+    }
+
+    /// When `usermod` refuses, `gpasswd` lands the membership, with no warning.
+    #[cfg(unix)]
+    #[test]
+    fn runner_kvm_access_falls_back_to_gpasswd_when_usermod_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, "").unwrap();
+        std::fs::write(dir.path().join("fail-usermod"), "").unwrap();
+        let out = run_kvm_access(dir.path(), device.to_str().unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "a membership that landed is not a warning: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = kvm_calls(dir.path());
+        assert!(
+            call_position(&calls, "usermod -aG kvm runner")
+                < call_position(&calls, "gpasswd -a runner kvm"),
+            "{calls}"
+        );
+        assert!(dir.path().join("member").exists(), "{calls}");
+    }
+
+    /// A membership that cannot land is reported with the tool's own reason. It
+    /// does not fail the bake, because the device mode still covers the probe.
+    #[cfg(unix)]
+    #[test]
+    fn runner_kvm_membership_failure_is_reported_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, "").unwrap();
+        std::fs::write(dir.path().join("fail-usermod"), "").unwrap();
+        std::fs::write(dir.path().join("fail-gpasswd"), "").unwrap();
+        let out = run_kvm_access(dir.path(), device.to_str().unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let warnings = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            warnings.contains("could not add runner to group kvm: usermod: refused"),
+            "{warnings}"
+        );
+        assert!(
+            warnings.contains("runner is not in group kvm"),
+            "{warnings}"
+        );
+    }
+
+    /// A guest without `/dev/kvm` still bakes: the device steps are skipped and
+    /// the membership still lands.
+    #[cfg(unix)]
+    #[test]
+    fn runner_kvm_access_without_a_device_still_adds_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("no-such-device");
+        let out = run_kvm_access(dir.path(), device.to_str().unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let calls = kvm_calls(dir.path());
+        assert!(
+            !calls.contains("chgrp") && !calls.contains("chmod"),
+            "{calls}"
+        );
+        assert!(calls.contains("usermod -aG kvm runner"), "{calls}");
+    }
+
+    /// A refused group change is reported, and the mode is still set.
+    #[cfg(unix)]
+    #[test]
+    fn runner_kvm_access_reports_a_refused_group_and_still_sets_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device");
+        std::fs::write(&device, "").unwrap();
+        std::fs::write(dir.path().join("fail-chgrp"), "").unwrap();
+        let out = run_kvm_access(dir.path(), device.to_str().unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let warnings = String::from_utf8_lossy(&out.stderr);
+        assert!(warnings.contains("could not give"), "{warnings}");
+        let calls = kvm_calls(dir.path());
+        assert!(calls.contains("chmod 0666"), "{calls}");
+        assert!(calls.contains("usermod -aG kvm runner"), "{calls}");
+    }
+
+    /// The udev rule grants the same access as the direct grant: mode 0666.
+    #[cfg(unix)]
+    #[test]
+    fn kvm_udev_rule_grants_the_device_at_mode_0666() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("rules.d");
+        let out = std::process::Command::new("sh")
+            .args(["-c", &kvm_udev_rule_script(rules.to_str().unwrap())])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(rules.join("99-preloop-kvm.rules")).unwrap(),
+            "KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"\n"
+        );
+    }
+
+    /// The runner's membership is the golden contract's final statement, so
+    /// nothing the contract runs after it can change the runner's groups.
+    #[test]
+    fn kvm_membership_is_the_last_group_write_in_the_golden_contract() {
+        let steps = golden_contract_steps("runner", 1001);
+        let membership = steps
+            .iter()
+            .position(|step| step.contains("usermod -aG kvm runner"))
+            .expect("the contract adds the runner to kvm");
+        assert_eq!(
+            membership,
+            steps.len() - 1,
+            "kvm membership must be the final step: {steps:#?}"
+        );
+        assert!(
+            steps[..membership]
+                .iter()
+                .any(|step| step.contains("useradd -m -u 1001 -s /bin/bash runner")),
+            "the account must exist before the membership is granted"
+        );
+    }
+
+    /// Each job launch re-adds the runner to kvm after the docker group and
+    /// re-asserts the device grant, so job steps get the group even when the
+    /// golden's membership was lost.
+    #[test]
+    fn runner_launch_adds_kvm_membership_after_docker() {
+        let mut config = test_config(false);
+        config.runner_user = Some("runner".to_owned());
+        config.runner_uid = Some(1001);
+        let argv = vec![
+            "/opt/preloop/bin/preloop-runner".to_owned(),
+            "run".to_owned(),
+        ];
+        let script = &as_runner_user(&config, &argv)[2];
+        let docker = script
+            .find("usermod -aG docker runner")
+            .expect("the launch joins the docker group");
+        let kvm = script
+            .find("usermod -aG kvm runner")
+            .expect("the launch joins the kvm group");
+        assert!(docker < kvm, "kvm must follow docker: {script}");
+        assert!(script.contains("chmod 0666 /dev/kvm"), "{script}");
+    }
+
     #[test]
     fn rosetta_multiarch_script_parses_as_posix_sh() {
         // A spliced fragment ending in a newline once put `;` at the start of
@@ -9887,6 +10221,14 @@ done
             (
                 "runner_account_script".to_owned(),
                 runner_account_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID),
+            ),
+            (
+                "runner_kvm_access_script".to_owned(),
+                runner_kvm_access_script(DEFAULT_RUNNER_USER, "/dev/kvm"),
+            ),
+            (
+                "kvm_udev_rule_script".to_owned(),
+                kvm_udev_rule_script("/etc/udev/rules.d"),
             ),
             (
                 "docker_start_command".to_owned(),
