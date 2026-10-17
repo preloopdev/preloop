@@ -2323,6 +2323,116 @@ async fn boot_closes_attempt_whose_job_row_is_gone() {
     assert_eq!(rows[0].2, None);
 }
 
+/// A failed read of the job's state says nothing about the job. The attempt
+/// stays open for the next boot: the candidate query only matches open
+/// attempts, so closing it on a guess would hide it from every later pass.
+#[tokio::test]
+async fn boot_leaves_attempt_open_when_the_job_state_cannot_be_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute("UPDATE jobs SET queue_state = 'none'", [])
+                .unwrap();
+        })
+        .await;
+    // A BLOB status still matches the candidate query, but it cannot be read
+    // as text, so the job-state lookup fails.
+    raw_store(&temp)
+        .execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE jobs SET status = X'00';")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 0);
+    assert_eq!(open_attempt_count(&temp), 1, "the attempt must stay open");
+}
+
+/// A parked job whose completion cannot be written keeps its attempt open.
+/// Boot must not close the attempt and then fail to fail the job: nothing
+/// would select the run again.
+#[tokio::test]
+async fn boot_keeps_parked_attempt_open_when_the_job_cannot_be_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE jobs SET queue_state = 'none', status = 'in_progress'",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+    // The job row survives its run, so the completion has no run to settle.
+    raw_store(&temp)
+        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM runs;")
+        .unwrap();
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 0);
+    assert_eq!(open_attempt_count(&temp), 1, "the attempt must stay open");
+    let rows = attempt_rows(&temp);
+    assert_eq!(
+        rows[0].2,
+        Some(("in_progress".to_owned(), "none".to_owned())),
+        "the job row is untouched"
+    );
+}
+
+/// A timed-out job keeps its persisted verdict. Boot closes its attempt with
+/// the failure verdict, which is what the event stream reports for a timeout,
+/// and leaves the job row alone.
+#[tokio::test]
+async fn boot_closes_attempt_of_timed_out_job_without_rewriting_the_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+    submit_simple_run(&app).await;
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE jobs SET status = 'timed_out', queue_state = 'none'",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+    assert_eq!(crate::broker::reconcile_orphaned_requests(&shared).await, 1);
+    let rows = attempt_rows(&temp);
+    assert_eq!(rows[0].1.as_deref(), Some("failure"));
+    assert_eq!(
+        rows[0].2,
+        Some(("timed_out".to_owned(), "none".to_owned())),
+        "the job keeps its timed_out verdict"
+    );
+}
+
+/// Attempts that have no result yet, counted from the store itself.
+fn open_attempt_count(temp: &tempfile::TempDir) -> i64 {
+    raw_store(temp)
+        .query_row(
+            "SELECT COUNT(*) FROM job_requests WHERE result IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 #[tokio::test]
 async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
     let temp = tempfile::tempdir().unwrap();

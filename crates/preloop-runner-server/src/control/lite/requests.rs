@@ -473,14 +473,15 @@ impl LiteBackend {
     /// 'none'` on a concluded job or a plain job. Expansion parents and
     /// reusable callers also sit at `'none'` while their subtree runs, so their
     /// kinds are excluded; `ready`, `blocked`, `held` and expansion states hold
-    /// unbound attempts legitimately and never match.
+    /// unbound attempts legitimately and never match. Returns
+    /// `(request_id, run_id, job_id, agent_job_id)`.
     pub(crate) async fn unbound_orphaned_requests(
         &self,
-    ) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
         self.read(|tx| {
             let mut stmt = tx
                 .prepare_cached(
-                    "SELECT q.request_id, q.run_id, q.job_id FROM job_requests q \
+                    "SELECT q.request_id, q.run_id, q.job_id, q.agent_job_id FROM job_requests q \
                      LEFT JOIN jobs j ON j.run_id = q.run_id AND j.job_id = q.job_id \
                      WHERE q.result IS NULL AND q.runner_id IS NULL AND q.session_id IS NULL \
                        AND (j.run_id IS NULL OR (j.queue_state = 'none' AND ( \
@@ -495,6 +496,7 @@ impl LiteBackend {
                         row.get(0)?,
                         codec::run_id(&row.get::<_, String>(1)?),
                         JobId(row.get(2)?),
+                        codec::uuid(&row.get::<_, String>(3)?),
                     ))
                 })
                 .map_err(db)?;

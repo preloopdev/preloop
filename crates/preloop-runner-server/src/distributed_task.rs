@@ -748,7 +748,19 @@ pub async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
-    complete_job_settling(shared, completion, None).await
+    complete_job_settling(shared, completion, None, false).await
+}
+
+/// Boot reconcile completing a job it found parked outside the queue. The
+/// settlement refuses to write (`Conflict`) unless the job is still a plain
+/// parked job with no bound open attempt when the completion transaction
+/// takes the run, so a peer that moved the job after the boot-visible read
+/// wins.
+pub(crate) async fn complete_parked_job(
+    shared: Arc<SharedState>,
+    completion: JobCompletion,
+) -> Result<Json<RunRecord>, ApiError> {
+    complete_job_settling(shared, completion, None, true).await
 }
 
 /// A runner's own completion report: settle the attempt it owns inside the
@@ -757,7 +769,9 @@ pub(crate) use crate::control::types::AttemptSettle;
 
 /// Complete a job. With `settle`, the reporting runner's attempt is verified,
 /// marked finished and released from its session in the same transaction; a
-/// duplicate or already-released report returns the run unchanged.
+/// duplicate or already-released report returns the run unchanged. With
+/// `require_parked`, the settlement additionally refuses to write unless the
+/// job is still parked outside the queue at commit time.
 ///
 /// The whole scheduling transition — status flip, concurrency release,
 /// dependent promotion, workflow-group widen — lives in
@@ -770,6 +784,7 @@ pub(crate) async fn complete_job_settling(
     shared: Arc<SharedState>,
     mut completion: JobCompletion,
     settle: Option<AttemptSettle>,
+    require_parked: bool,
 ) -> Result<Json<RunRecord>, ApiError> {
     if !completion.status.is_terminal() {
         return Err(ApiError::bad_request(
@@ -783,6 +798,7 @@ pub(crate) async fn complete_job_settling(
         .settle_job(crate::control::types::SettleJob {
             completion: completion.clone(),
             settle,
+            require_parked,
         })
         .await
         .map_err(ApiError::from)?;

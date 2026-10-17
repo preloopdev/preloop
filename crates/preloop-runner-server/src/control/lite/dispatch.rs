@@ -117,6 +117,29 @@ fn attempt_log_key(
     Ok(agent.unwrap_or_else(|| job_id.0.clone()))
 }
 
+/// Whether the job is still a plain parked job: outside the queue, without a
+/// terminal verdict, and with no bound open attempt. The `SettleJob`
+/// precondition `require_parked` re-reads this inside the completion
+/// transaction, so a boot-visible read that went stale cannot fail a job a
+/// peer node has since moved (queued for a retry, claimed, or concluded).
+fn parked_outside_queue(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<bool, ControlError> {
+    tx.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = ?1 AND j.job_id = ?2 \
+           AND j.queue_state = 'none' AND j.kind IN ('job','matrix_leg') \
+           AND j.status NOT IN ('success','failure','cancelled','skipped','timed_out') \
+           AND NOT EXISTS (SELECT 1 FROM job_requests q WHERE q.run_id = j.run_id \
+               AND q.job_id = j.job_id AND q.result IS NULL \
+               AND (q.runner_id IS NOT NULL OR q.session_id IS NOT NULL)))",
+    )
+    .map_err(db)?
+    .query_row(params![codec::run_key(run_id), job_id.0], |row| row.get(0))
+    .map_err(db)
+}
+
 /// What one completion decided (pg's `CompletionApplied`).
 struct CompletionApplied {
     effective_status: ExecutionStatus,
@@ -380,6 +403,14 @@ impl LiteBackend {
         self.write(|tx| {
             if jobs::run_record(tx, run_id)?.is_none() {
                 return Err(ControlError::NotFound("run not found".to_owned()));
+            }
+            // Boot reconcile may only close the job it saw parked: re-read the
+            // predicate inside this transaction, or a job a peer node has since
+            // queued, claimed or concluded would be failed under it.
+            if settle.require_parked && !parked_outside_queue(tx, run_id, &job_id)? {
+                return Err(ControlError::Conflict(
+                    "job is not parked outside the queue".to_owned(),
+                ));
             }
             // Ownership: a broker completion must name an attempt this
             // runner owns (recorded owner or the session runner).

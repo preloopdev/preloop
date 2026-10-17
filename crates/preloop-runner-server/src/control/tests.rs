@@ -2691,6 +2691,7 @@ pub(crate) mod suite {
                     agent_job_id: claimed.request.agent_job_id,
                     runner_id: runner,
                 }),
+                require_parked: false,
             })
             .await
             .unwrap();
@@ -2703,6 +2704,54 @@ pub(crate) mod suite {
             row.environment_url.as_deref(),
             Some("https://vm-42.example.com"),
             "the runner-evaluated URL wins over the unevaluated template"
+        );
+    }
+
+    /// Boot reconcile completes a parked job through the normal completion
+    /// path; the settlement refuses to write once the job has moved. A job
+    /// claimed by a runner is no longer parked, so the completion is refused
+    /// and the attempt stays open.
+    pub(crate) async fn settle_job_refuses_a_job_that_left_the_parked_state(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let job_id = JobId("build".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let (runner, session) = live_runner(backend, "parked-refusal").await;
+        let claimed = match backend.poll_session(poll(&session, runner)).await.unwrap() {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let refusal = backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id,
+                    job_id: job_id.clone(),
+                    agent_job_id: Some(claimed.request.agent_job_id),
+                    status: ExecutionStatus::Failure,
+                    outputs: preloop_gha_protocol::OutputMap::new(),
+                    annotations: Vec::new(),
+                    step_results: Vec::new(),
+                    environment_url: None,
+                },
+                settle: None,
+                require_parked: true,
+            })
+            .await;
+        assert!(
+            matches!(refusal, Err(ControlError::Conflict(_))),
+            "a claimed job is not parked, so the boot completion must be refused, got {refusal:?}"
+        );
+        let attempt = backend
+            .request(RequestKey::Id(claimed.request.request_id))
+            .await
+            .unwrap();
+        assert!(
+            attempt.result.is_none(),
+            "a refused completion leaves the attempt open"
         );
     }
 
@@ -2823,6 +2872,7 @@ pub(crate) mod suite {
                     agent_job_id: claimed.request.agent_job_id,
                     runner_id: runner,
                 }),
+                require_parked: false,
             })
             .await
             .unwrap();
@@ -5051,6 +5101,7 @@ pub(crate) mod suite {
                     agent_job_id: agent,
                     runner_id: runner.runner.id,
                 }),
+                require_parked: false,
             })
             .await;
         assert!(
@@ -5109,6 +5160,7 @@ pub(crate) mod suite {
                     agent_job_id: agent,
                     runner_id: runner.runner.id,
                 }),
+                require_parked: false,
             })
             .await
             .unwrap();
@@ -8820,6 +8872,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn settle_job_refuses_a_job_that_left_the_parked_state() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::settle_job_refuses_a_job_that_left_the_parked_state(&backend).await;
+    }
+
+    #[tokio::test]
     async fn callback_prefers_timeline_match() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -10795,6 +10855,14 @@ mod lite {
     #[tokio::test]
     async fn job_queue_state_speaks_queue_kind() {
         suite::job_queue_state_speaks_queue_kind(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn settle_job_refuses_a_job_that_left_the_parked_state() {
+        suite::settle_job_refuses_a_job_that_left_the_parked_state(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]

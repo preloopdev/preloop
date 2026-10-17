@@ -56,8 +56,10 @@ Releases before v0.27.0 predate the changelog.
   reaped such an attempt, so it pinned its job's in-flight slot, and a job
   parked outside the queue kept its run `in_progress` with nothing executing it.
   Boot now closes these attempts: a parked job fails so its run can settle, a
-  concluded job closes its attempt with its own verdict, and an attempt whose
-  job row is gone is closed alone.
+  concluded job closes its attempt with its own verdict (a `timed_out` job
+  keeps its persisted verdict), and an attempt whose job row is gone is closed
+  alone. A state read that fails, or a job a peer moved since the boot read,
+  leaves the attempt open for the next boot instead of writing a guess.
 
 - **Expression depth no longer rejects sibling-heavy expressions**: the
   nesting ceiling (`MAX_EXPRESSION_DEPTH`, 128) charged every member segment

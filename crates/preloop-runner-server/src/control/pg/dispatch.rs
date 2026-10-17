@@ -6508,6 +6508,35 @@ impl PgBackend {
         })
     }
 
+    /// Whether the job is still a plain parked job: outside the queue,
+    /// without a terminal verdict, and with no bound open attempt. The
+    /// `SettleJob` precondition `require_parked` re-reads this inside the
+    /// completion transaction, so a boot-visible read that went stale cannot
+    /// fail a job a peer node has since moved (queued for a retry, claimed,
+    /// or concluded).
+    async fn parked_outside_queue(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        let row = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.run_id = $1::text::uuid \
+                   AND j.job_id = $2 AND j.queue_state = 'none' \
+                   AND j.kind IN ('job','matrix_leg') \
+                   AND j.status NOT IN ('success','failure','cancelled','skipped','timed_out') \
+                   AND NOT EXISTS (SELECT 1 FROM job_requests q \
+                       WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+                         AND q.result IS NULL \
+                         AND (q.runner_id IS NOT NULL OR q.session_id IS NOT NULL)))",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        let parked: bool = row.get(0);
+        Ok(parked)
+    }
+
     /// `settle_job`: the broker-shaped completion (attempt ownership checked
     /// against the reporting runner) returning the settled projection.
     pub(super) async fn settle_job(
@@ -6521,6 +6550,14 @@ impl PgBackend {
         let tx = client.transaction().await.map_err(db)?;
         if !PgBackend::lock_run(&tx, run_id).await? {
             return Err(ControlError::NotFound("run not found".to_owned()));
+        }
+        // Boot reconcile may only close the job it saw parked: re-read the
+        // predicate inside this transaction, or a job a peer node has since
+        // queued, claimed or concluded would be failed under it.
+        if settle.require_parked && !Self::parked_outside_queue(&tx, run_id, &job_id).await? {
+            return Err(ControlError::Conflict(
+                "job is not parked outside the queue".to_owned(),
+            ));
         }
         // Ownership: a broker completion must name an attempt this runner owns
         // (recorded owner or the session runner).

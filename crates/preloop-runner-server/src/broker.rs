@@ -1449,8 +1449,11 @@ pub async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
 ///
 /// A concluded job closes its attempt with its own verdict. A job still parked
 /// outside the queue fails the way an unclaimable claim does, so its run can
-/// settle. Boot-only, like [`reconcile_orphaned_claims`]: it runs before the
-/// listener opens, so it never races a live transition.
+/// settle: that completion is one transaction, and it re-reads the parked
+/// state inside it, so a peer node sharing the store cannot be raced into a
+/// verdict. Boot-only, like [`reconcile_orphaned_claims`]: it runs before the
+/// listener opens, and an attempt it cannot read or close this pass stays open
+/// for the next boot.
 pub async fn reconcile_orphaned_requests(shared: &Arc<SharedState>) -> usize {
     let requests = match shared.state.backend.unbound_orphaned_requests().await {
         Ok(rows) => rows,
@@ -1460,49 +1463,14 @@ pub async fn reconcile_orphaned_requests(shared: &Arc<SharedState>) -> usize {
         }
     };
     let mut settled = 0usize;
-    for (request_id, run_id, job_id) in requests {
-        let queue_state = shared
-            .state
-            .backend
-            .job_queue_state(run_id, &job_id)
-            .await
-            .ok()
-            .flatten();
-        let closed = match queue_state {
-            // The job row is gone: close the attempt. Nothing else in the run
-            // depends on a row that no longer exists.
-            None => shared
-                .state
-                .backend
-                .settle_request(
-                    request_id,
-                    ExecutionStatus::Failure,
-                    &agent_request_locked_until(),
-                )
-                .await
-                .map(|attempt| attempt.is_some()),
-            Some((_, status)) => {
-                let status = crate::control::types::status_parse(&status);
-                if status.is_terminal() {
-                    shared
-                        .state
-                        .backend
-                        .settle_request(request_id, status, &agent_request_locked_until())
-                        .await
-                        .map(|attempt| attempt.is_some())
-                } else {
-                    fail_unclaimable_request(shared, request_id).await;
-                    Ok(true)
-                }
-            }
-        };
-        match closed {
+    for (request_id, run_id, job_id, agent_job_id) in requests {
+        match close_orphaned_request(shared, request_id, run_id, &job_id, agent_job_id).await {
             Ok(true) => settled += 1,
             Ok(false) => {}
             Err(error) => warn!(
                 request_id,
                 ?error,
-                "reconcile could not close orphaned request"
+                "reconcile could not read the job state; leaving the request open"
             ),
         }
     }
@@ -1513,6 +1481,89 @@ pub async fn reconcile_orphaned_requests(shared: &Arc<SharedState>) -> usize {
         );
     }
     settled
+}
+
+/// Close one orphan and report whether an attempt was settled. A failed state
+/// read says nothing about the job, so it leaves the attempt open: the
+/// candidate query only matches open attempts, and closing one on a guess
+/// would hide it from every later pass.
+async fn close_orphaned_request(
+    shared: &Arc<SharedState>,
+    request_id: i64,
+    run_id: RunId,
+    job_id: &JobId,
+    agent_job_id: uuid::Uuid,
+) -> Result<bool, ControlError> {
+    let Some((_, status)) = shared.state.backend.job_queue_state(run_id, job_id).await? else {
+        // The job row is gone: close the attempt. Nothing else in the run
+        // depends on a row that no longer exists.
+        return settle_orphan(shared, request_id, ExecutionStatus::Failure).await;
+    };
+    if let Some(verdict) = concluded_verdict(&status) {
+        // The job already holds a verdict; the attempt takes the same one.
+        settle_orphan(shared, request_id, verdict).await
+    } else {
+        fail_parked_job(shared, run_id, job_id, agent_job_id).await
+    }
+}
+
+/// The wire verdict for a job that concluded without settling its attempt;
+/// `None` while the job can still run. `timed_out` is a stored refinement of
+/// a failure — the wire enum has no timed-out variant — and the mapping keeps
+/// the persisted verdict: the job row is never rewritten.
+fn concluded_verdict(status: &str) -> Option<ExecutionStatus> {
+    if status == "timed_out" {
+        return Some(ExecutionStatus::Failure);
+    }
+    let parsed = crate::control::types::status_parse(status);
+    parsed.is_terminal().then_some(parsed)
+}
+
+/// Settle one orphaned attempt; `false` when the attempt row was gone.
+async fn settle_orphan(
+    shared: &Arc<SharedState>,
+    request_id: i64,
+    verdict: ExecutionStatus,
+) -> Result<bool, ControlError> {
+    let attempt = shared
+        .state
+        .backend
+        .settle_request(request_id, verdict, &agent_request_locked_until())
+        .await?;
+    Ok(attempt.is_some())
+}
+
+/// Fail a plain job parked outside the queue, which settles its open attempts
+/// in the same transaction as the job write. A failure writes nothing, so the
+/// attempt stays selectable and the next boot retries it.
+async fn fail_parked_job(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &JobId,
+    agent_job_id: uuid::Uuid,
+) -> Result<bool, ControlError> {
+    let completion = JobCompletion {
+        run_id,
+        job_id: job_id.clone(),
+        agent_job_id: Some(agent_job_id),
+        status: ExecutionStatus::Failure,
+        outputs: preloop_gha_protocol::OutputMap::new(),
+        annotations: Vec::new(),
+        step_results: Vec::new(),
+        environment_url: None,
+    };
+    match crate::distributed_task::complete_parked_job(shared.clone(), completion).await {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            warn!(
+                ?error,
+                %run_id,
+                job_id = %job_id.0,
+                "reconcile could not fail the parked job; leaving the request open"
+            );
+            Ok(false)
+        }
+    }
 }
 
 pub async fn mint_dispatch_github_token(
@@ -1793,6 +1844,7 @@ pub async fn broker_complete_job(
             agent_job_id: request.job_id,
             runner_id,
         }),
+        false,
     )
     .await?;
     // Wake long-polling runners so a queued successor job is delivered promptly

@@ -1033,10 +1033,12 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// backing job is gone or has left the queue (`queue_state = 'none'`). A
     /// terminal job never completes its attempt, and a plain job parked there
     /// is never claimed again. Boot reconcile input:
-    /// `(request_id, run_id, job_id)`. Live queue states (`ready`, `blocked`,
-    /// `held`, expansion) legitimately hold unbound attempts and are never
-    /// returned.
-    async fn unbound_orphaned_requests(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError>;
+    /// `(request_id, run_id, job_id, agent_job_id)`. Live queue states
+    /// (`ready`, `blocked`, `held`, expansion) legitimately hold unbound
+    /// attempts and are never returned.
+    async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError>;
 
     /// Release a claimed request for redelivery (`release_request_for_retry`
     /// in SQL): clears the session binding, owner, start/renew stamps and
@@ -2902,7 +2904,9 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.orphaned_claims().await,
         }
     }
-    async fn unbound_orphaned_requests(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+    async fn unbound_orphaned_requests(
+        &self,
+    ) -> Result<Vec<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
         match self {
             Self::Sqlite(b) => b.unbound_orphaned_requests().await,
             Self::Postgres(b) => b.unbound_orphaned_requests().await,
