@@ -6,28 +6,105 @@ const DEPLOYMENT_ID: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
 
 /// Stable instance ID — same reasoning as deployment ID.
 pub const INSTANCE_ID: &str = "bc944321-3dbc-431b-8cf2-8afa3e25e359";
+/// Optional runner-admin protocol values are intentionally environment-backed.
+/// A normal local deployment does not advertise these fields; hosted
+/// deployments can opt in without changing the legacy connection payload.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunnerV2ConnectionOptions {
+    pub auth_url_v2: Option<String>,
+    pub broker_url: Option<String>,
+    pub use_runner_admin_flow: Option<bool>,
+}
+
+pub(crate) fn runner_v2_connection_options() -> RunnerV2ConnectionOptions {
+    RunnerV2ConnectionOptions {
+        auth_url_v2: configured_url("PRELOOP_RUNNER_AUTH_URL_V2"),
+        broker_url: configured_url("PRELOOP_RUNNER_BROKER_URL"),
+        use_runner_admin_flow: std::env::var("PRELOOP_USE_RUNNER_ADMIN_FLOW")
+            .ok()
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }),
+    }
+}
+
+fn configured_url(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn add_runner_v2_connection_fields(
+    body: &mut serde_json::Value,
+    options: &RunnerV2ConnectionOptions,
+) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let mut location_properties = serde_json::Map::new();
+    if let Some(auth_url_v2) = &options.auth_url_v2 {
+        let value = json!(auth_url_v2);
+        object.insert("auth_url_v2".to_owned(), value.clone());
+        location_properties.insert("auth_url_v2".to_owned(), value);
+    }
+    if let Some(broker_url) = &options.broker_url {
+        let value = json!(broker_url);
+        object.insert("BrokerUrl".to_owned(), value.clone());
+        location_properties.insert("BrokerUrl".to_owned(), value);
+    }
+    if let Some(use_runner_admin_flow) = options.use_runner_admin_flow {
+        let value = json!(use_runner_admin_flow);
+        object.insert("UseRunnerAdminFlow".to_owned(), value.clone());
+        location_properties.insert("UseRunnerAdminFlow".to_owned(), value);
+    }
+    if let Some(location_service_data) = object
+        .get_mut("locationServiceData")
+        .and_then(serde_json::Value::as_object_mut)
+        && !location_properties.is_empty()
+    {
+        location_service_data.insert(
+            "properties".to_owned(),
+            serde_json::Value::Object(location_properties),
+        );
+    }
+}
+
+fn connection_response(
+    body: serde_json::Value,
+    options: &RunnerV2ConnectionOptions,
+) -> axum::response::Response {
+    let mut body = body;
+    add_runner_v2_connection_fields(&mut body, options);
+    axum::response::Json(body).into_response()
+}
 
 pub async fn connection_data(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
+    let options = runner_v2_connection_options();
     if params.get("connectOptions").map(String::as_str) == Some("0")
         && params
             .get("lastChangeId")
             .is_some_and(|last_change_id| last_change_id != "-1")
     {
-        return axum::response::Json(json!({
-            "deploymentId": DEPLOYMENT_ID,
-            "deploymentType": "hosted",
-            "instanceId": INSTANCE_ID,
-            "locationServiceData": {
-                "clientCacheFresh": true,
-                "defaultAccessMappingMoniker": "ScaleUnitMapping",
-                "lastChangeId": 1,
-                "lastChangeId64": 1,
-                "serviceOwner": "0000005a-0000-8888-8000-000000000000"
-            }
-        }))
-        .into_response();
+        return connection_response(
+            json!({
+                "deploymentId": DEPLOYMENT_ID,
+                "deploymentType": "hosted",
+                "instanceId": INSTANCE_ID,
+                "locationServiceData": {
+                    "clientCacheFresh": true,
+                    "defaultAccessMappingMoniker": "ScaleUnitMapping",
+                    "lastChangeId": 1,
+                    "lastChangeId64": 1,
+                    "serviceOwner": "0000005a-0000-8888-8000-000000000000"
+                }
+            }),
+            &options,
+        );
     }
 
     let service_root = runner_base_url();
@@ -97,7 +174,7 @@ pub async fn connection_data(
             "serviceOwner": "0000005a-0000-8888-8000-000000000000"
         }
     });
-    axum::response::Json(body).into_response()
+    connection_response(body, &options)
 }
 
 const SVC_OWNER: &str = "0000005a-0000-8888-8000-000000000000";
@@ -167,4 +244,61 @@ fn svc(name: &str, id: &str, location: &str) -> serde_json::Value {
         "status": 1,
         "properties": {}
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_runner_v2_connection_fields_follow_configuration() {
+        let mut legacy = json!({"instanceId": INSTANCE_ID});
+        add_runner_v2_connection_fields(&mut legacy, &RunnerV2ConnectionOptions::default());
+        assert_eq!(legacy, json!({"instanceId": INSTANCE_ID}));
+
+        let options = RunnerV2ConnectionOptions {
+            auth_url_v2: Some("https://auth.example.test/token".to_owned()),
+            broker_url: Some("https://broker.example.test".to_owned()),
+            use_runner_admin_flow: Some(true),
+        };
+        add_runner_v2_connection_fields(&mut legacy, &options);
+        assert_eq!(
+            legacy,
+            json!({
+                "instanceId": INSTANCE_ID,
+                "auth_url_v2": "https://auth.example.test/token",
+                "BrokerUrl": "https://broker.example.test",
+                "UseRunnerAdminFlow": true,
+            })
+        );
+    }
+    #[test]
+    fn connection_data_dto_omits_unconfigured_v2_fields() {
+        let legacy = azdo::ConnectionData {
+            instance_id: Some(INSTANCE_ID.to_owned()),
+            auth_url_v2: None,
+            broker_url: None,
+            use_runner_admin_flow: None,
+            location_service_data: None,
+        };
+        let legacy_wire = serde_json::to_value(legacy).unwrap();
+        assert_eq!(legacy_wire, json!({"instanceId": INSTANCE_ID}));
+
+        let configured = azdo::ConnectionData {
+            instance_id: Some(INSTANCE_ID.to_owned()),
+            auth_url_v2: Some("https://auth.example.test/token".to_owned()),
+            broker_url: Some("https://broker.example.test".to_owned()),
+            use_runner_admin_flow: Some(true),
+            location_service_data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(configured).unwrap(),
+            json!({
+                "instanceId": INSTANCE_ID,
+                "auth_url_v2": "https://auth.example.test/token",
+                "BrokerUrl": "https://broker.example.test",
+                "UseRunnerAdminFlow": true,
+            })
+        );
+    }
 }
