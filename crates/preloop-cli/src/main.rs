@@ -521,7 +521,11 @@ pub(crate) fn build_client() -> reqwest::Client {
     // is the runner/guest surface: it deliberately refuses native APIs
     // (`/api/v1/runs` and friends 404 there), so it must never be the
     // default transport for CLI commands.
-    reqwest::Client::builder()
+    //
+    // `with_tls_roots` pins verification to the shared in-process root set:
+    // the platform verifier would consult the OS trust daemon on every
+    // handshake, and that daemon can prompt or hang.
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
         .build()
         .expect("valid HTTP client configuration")
 }
@@ -860,11 +864,11 @@ enum Command {
 
     /// Configure credentials, the golden image, and how to run — in one step.
     ///
-    /// In a terminal this is a four-step wizard (credentials, golden, run
-    /// mode, preflight); with stdin or stdout not a TTY it takes the same
-    /// answers as flags and never prompts, so scripts and agents get the same
-    /// config. `--probe --json` reports host capabilities without touching
-    /// anything. Re-running reconfigures in place.
+    /// In a terminal this is a five-step wizard (credentials, golden,
+    /// workflows, run mode, preflight); with stdin or stdout not a TTY it
+    /// takes the same answers as flags and never prompts, so scripts and
+    /// agents get the same config. `--probe --json` reports host capabilities
+    /// without touching anything. Re-running reconfigures in place.
     Init(init::InitArgs),
 
     /// Verify the GitHub credential configuration.
@@ -2082,8 +2086,10 @@ async fn cmd_engine(
     //
     // The offer comes first: `preloop init` writes credentials too, and a
     // credential configured by the wizard must be the one this process picks
-    // up, not the one it read a moment earlier.
-    offer_init_when_unconfigured().await?;
+    // up, not the one it read a moment earlier. The wizard may also resolve a
+    // public URL of its own (the App flow's question), which has to reach the
+    // engine *this* process is about to start.
+    offer_init_when_unconfigured(&public_url).await?;
     resolve_github_auth(&args, &state_dir)?;
 
     // Shared with the runner pool so it can size provisioning to the work
@@ -2476,9 +2482,12 @@ async fn wait_for_engine_socket(
     // and port); the Unix client rides the control socket instead. 500ms
     // timeout, 30s window.
     #[cfg(unix)]
-    let client = reqwest::Client::builder().unix_socket(socket).build()?;
+    let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .unix_socket(socket)
+        .build()?;
     #[cfg(not(unix))]
-    let client = reqwest::Client::new();
+    let client =
+        preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder()).build()?;
     let readyz_url = format!("http://{listen}/readyz");
     let start = std::time::Instant::now();
     let mut last_reason: Option<String> = None;
@@ -2585,7 +2594,12 @@ fn configured_base_image() -> anyhow::Result<String> {
 /// `serve` with no golden configured: offer the wizard when a human is
 /// watching, otherwise say the one line an operator needs. A non-interactive
 /// `serve` (systemd, CI, a pipe) must never block on a prompt.
-async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
+///
+/// `engine_public_url` is the origin this engine resolved for itself before the
+/// wizard ran. The wizard can resolve a different one — the App flow asks for
+/// the address GitHub is given — and the handoff installs that answer into the
+/// running engine (or reports which origin won when the two disagree).
+async fn offer_init_when_unconfigured(engine_public_url: &str) -> anyhow::Result<()> {
     let config = preloop_runner_server::config::load_config()?;
     if preloop_runner_server::config::golden_base_image(&config).is_some() {
         return Ok(());
@@ -2613,7 +2627,14 @@ async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
     // graph is genuinely cyclic (`serve` offers `init`, which can start
     // `serve`); the mode this entry point forces is what keeps it from
     // recursing at runtime.
-    Box::pin(init::run_from_serve()).await?;
+    let resolved = Box::pin(init::run_from_serve()).await?;
+    // The engine has not started serving yet, and its Check Run links and
+    // webhook health check read the origin off this environment: the answer
+    // has to land here, in-process, or the App would point at the new URL
+    // while every link and health check stayed on the old one.
+    if let Some(note) = init::apply_engine_public_url(engine_public_url, resolved.as_deref()) {
+        eprintln!("[preloop] {note}");
+    }
     eprintln!("[preloop] configuration written; continuing to serve");
     Ok(())
 }

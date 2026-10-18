@@ -71,6 +71,7 @@ refinery = { version = "0.10.0", default-features = false, features = ["rusqlite
 postgres_rustls = "0.1"
 tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
+webpki-root-certs = "1"
 serde_yaml = "0.9"
 rpassword = "7"
 sha2 = { version = "0.10", features = ["oid"] }

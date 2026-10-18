@@ -401,6 +401,28 @@ pub(crate) fn ssh_session_from_env(get: impl Fn(&str) -> Option<String>) -> bool
     ["SSH_CONNECTION", "SSH_TTY"]
         .iter()
         .any(|key| get(key).is_some_and(|value| !value.trim().is_empty()))
+/// Exchange the one-time manifest code for the App's credentials.
+async fn convert(api_base: &str, code: &str) -> Result<AppCredentials> {
+    let url = format!("{}/app-manifests/{}/conversions", api_base, urlencode(code));
+    // Not `crate::build_client()`: that one targets the engine's native API
+    // surface, and this call goes to api.github.com.
+    let response = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .build()
+        .context("building the GitHub manifest client")?
+        .post(&url)
+        .header("User-Agent", "preloop")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .context("calling GitHub's manifest conversion endpoint")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "GitHub rejected the manifest conversion ({status}): {}",
+        body.trim()
+    );
+    serde_json::from_str(&body).context("parsing GitHub's manifest conversion response")
 }
 
 /// This machine's hostname, for the forward command when `SSH_CONNECTION` is
@@ -617,10 +639,11 @@ mod tests {
         let flow =
             tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
 
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let client = preloop_runner_server::shared_http::with_tls_roots(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .unwrap();
         let form = client
             .get(&base)
             .send()
@@ -747,7 +770,9 @@ mod tests {
         let flow =
             tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
 
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let form = client
             .get(&base)
             .send()

@@ -516,6 +516,26 @@ never generates a replacement key over sealed secrets, since a new key cannot
 open them. A `secrets.key` file beside the config that disagrees with the store
 is renamed `secrets.key.orphan-<unix-ts>` rather than deleted.
 
+Every call into the OS credential store is bounded. A keychain or Secret
+Service that does not answer within 10 seconds (it is waiting on an unlock
+prompt nobody will see, or its daemon is hung) fails that call with an error
+saying so, and preloop treats the OS store as unavailable for the rest of the
+process instead of waiting again. Outbound TLS never asks the OS at handshake
+time: preloop trusts the bundled Mozilla roots, the certificates in the OS
+store (read once at startup, for at most 5 seconds), and
+`PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`. A CA added to the OS store while
+the engine runs is picked up on the next restart.
+
+On a headless macOS host, keep the login keychain from re-locking itself, or
+the next program that reads it raises an unlock dialog on the unattended
+console and `securityd` blocks every other keychain client behind it:
+
+```sh
+security set-keychain-settings ~/Library/Keychains/login.keychain-db
+```
+
+With no flags this removes the idle timeout and the lock-on-sleep setting.
+
 Fields:
 
 ```toml
