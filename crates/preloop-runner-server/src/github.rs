@@ -10371,7 +10371,14 @@ jobs:
             .unwrap()
             .as_secs()
             + 60;
-        let (api, requests) = start_github_stub(move |_, _, _| {
+        let (api, requests) = start_github_stub(move |_, path, _| {
+            // Only the actions path is throttled. Everything else — notably
+            // the submit-time PAT scope probe, which shares this credential's
+            // breaker and would otherwise park the bucket before the test
+            // parks it — answers normally.
+            if path != "/repos/o/r/tarball/main" {
+                return (200, vec![], serde_json::json!({}));
+            }
             (
                 429,
                 vec![("x-ratelimit-reset", reset.to_string())],
