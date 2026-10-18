@@ -313,20 +313,6 @@ pub(super) fn db(error: tokio_postgres::Error) -> ControlError {
     ControlError::backend(error)
 }
 
-/// Statement deadline for the one migration a serving process can run: the
-/// test-support schema creation below, a baseline batch (schema, tables,
-/// indexes, ledger) in one transaction. 10 min is far beyond a baseline on an
-/// empty database, and still a deadline — an unbounded migration is exactly
-/// what [`crate::store_pg::STATEMENT_TIMEOUT`] exists to prevent everywhere else.
-const MIGRATION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Lock deadline for that same batch. It takes the setup advisory lock and,
-/// when another test-support node is already migrating, waits for it: the
-/// serving [`crate::store_pg::LOCK_TIMEOUT`] (15 s, sized for control commands)
-/// would cut that legitimate wait short. 5 min covers a slow baseline and
-/// still fails a waiter whose holder is wedged.
-const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Create the control schema on a brand-new database (test-support only).
 ///
 /// The embedded runner holds the setup advisory lock and applies the
@@ -342,6 +328,17 @@ const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// connection, which never carries the serving guards.
 #[cfg(any(test, feature = "test-support"))]
 async fn create_control_schema(client: &mut Client) -> Result<(), ControlError> {
+    // Statement deadline for a baseline batch (schema, tables, indexes,
+    // ledger) in one transaction. 10 min is far beyond a baseline on an empty
+    // database, and still a deadline: an unbounded migration is exactly what
+    // [`crate::store_pg::STATEMENT_TIMEOUT`] exists to prevent everywhere else.
+    const MIGRATION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    // Lock deadline for the same batch. It takes the setup advisory lock and,
+    // when another test-support node is already migrating, waits for it: the
+    // serving lock timeout (15 s, sized for control commands) would cut that
+    // legitimate wait short. 5 min covers a slow baseline and still fails a
+    // waiter whose holder is wedged.
+    const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
     client
         .batch_execute(&crate::store_pg::session_timeouts_sql_with(
             MIGRATION_STATEMENT_TIMEOUT,
