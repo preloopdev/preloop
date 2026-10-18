@@ -60,10 +60,23 @@ pub async fn workflow_dispatch(
     let default_branch = resolve_default_branch(&shared, &repository).await?;
     let (git_ref, ref_type) =
         resolve_dispatch_ref(&shared, &repository, selected_ref, &default_branch).await?;
-    let workflows = fetch_workflows(&shared, &repository, &git_ref)
+    // The dispatch ref can move between requests, so it is resolved once, up
+    // front: the workflow and its `actions.lock` are both read at that
+    // immutable commit. Reading them at a mutable ref could pair one commit's
+    // workflow with another commit's pins.
+    let sha = resolve_ref_sha(&shared, &repository, &git_ref)
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("failed to resolve {git_ref}: {error}")))?
+        .ok_or_else(|| ApiError::not_found(format!("ref {git_ref} not found in {repository}")))?;
+    let workflows = fetch_workflows(&shared, &repository, &sha)
         .await
         .map_err(|error| {
-            ApiError::bad_gateway(format!("failed to fetch workflows at {git_ref}: {error}"))
+            ApiError::bad_gateway(format!("failed to fetch workflows at {sha}: {error}"))
+        })?;
+    let actions_lockfile = crate::github::fetch_actions_lockfile(&shared, &repository, &sha)
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!("failed to fetch actions.lock at {sha}: {error}"))
         })?;
     let filename = find_workflow(&workflows, &workflow_id).ok_or_else(|| {
         ApiError::not_found(format!(
@@ -100,11 +113,6 @@ pub async fn workflow_dispatch(
         .apply_workflow_dispatch_inputs(&mut payload)
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
 
-    let sha = resolve_ref_sha(&shared, &repository, &git_ref)
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("failed to resolve {git_ref}: {error}")))?
-        .ok_or_else(|| ApiError::not_found(format!("ref {git_ref} not found in {repository}")))?;
-
     let effective = crate::events::workflow_dispatch::Adapter
         .project(&payload)
         .into_iter()
@@ -119,6 +127,7 @@ pub async fn workflow_dispatch(
         &filename,
         &sha,
         resolve_ref_protected(&shared, &repository, &git_ref).await,
+        actions_lockfile.clone(),
         &identity,
     );
     submit_and_report(&shared, submission, &repository, &sha).await?;
@@ -167,10 +176,18 @@ pub async fn repository_dispatch(
         .await
         .map_err(|error| ApiError::bad_gateway(format!("failed to resolve {git_ref}: {error}")))?
         .ok_or_else(|| ApiError::not_found(format!("ref {git_ref} not found in {repository}")))?;
-    let workflows = fetch_workflows(&shared, &repository, &git_ref)
+    // The branch can move between requests: both the workflows and their
+    // `actions.lock` are read at the commit the ref resolved to, so the pins
+    // and the workflows describe one revision.
+    let workflows = fetch_workflows(&shared, &repository, &sha)
         .await
         .map_err(|error| {
-            ApiError::bad_gateway(format!("failed to fetch workflows at {git_ref}: {error}"))
+            ApiError::bad_gateway(format!("failed to fetch workflows at {sha}: {error}"))
+        })?;
+    let actions_lockfile = crate::github::fetch_actions_lockfile(&shared, &repository, &sha)
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!("failed to fetch actions.lock at {sha}: {error}"))
         })?;
 
     // Every workflow this broadcast fans out to runs on the default branch.
@@ -202,6 +219,7 @@ pub async fn repository_dispatch(
             &filename,
             &sha,
             ref_protected,
+            actions_lockfile.clone(),
             &identity,
         );
         match submit_and_report(&shared, submission, &repository, &sha).await {
@@ -749,6 +767,7 @@ fn submission_from_effective(
     filename: &str,
     sha: &str,
     ref_protected: bool,
+    actions_lockfile: Option<String>,
     identity: &DispatchIdentity,
 ) -> WorkflowSubmission {
     WorkflowSubmission {
@@ -763,8 +782,10 @@ fn submission_from_effective(
         secrets: BTreeMap::new(),
         run_secret_names: std::collections::BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
+        actions_lockfile,
         triggering_actor: None,
         reusable_workflow_shas: BTreeMap::new(),
+        reusable_workflow_lockfiles: BTreeMap::new(),
         enable_debugger: false,
         debugger_welcome_message: None,
         sha: sha.to_owned(),

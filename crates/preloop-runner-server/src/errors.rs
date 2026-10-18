@@ -185,6 +185,10 @@ pub enum ApiErrorKind {
     /// A submitted workflow's trigger filters rejected the event
     /// (`workflow does not match event ...`).
     TriggerMismatch,
+    /// The actions policy or the run's `actions.lock` rejected a submission or
+    /// an action resolution. Webhook intake reports it as a workflow failure;
+    /// the status alone would read as "this event did not trigger the workflow".
+    ActionsPolicy,
 }
 
 /// API error.
@@ -229,6 +233,25 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             kind: ApiErrorKind::TriggerMismatch,
+        }
+    }
+
+    /// A submission or action resolution denied by the actions policy or by a
+    /// pin check against `actions.lock` (403).
+    pub fn actions_policy(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+            kind: ApiErrorKind::ActionsPolicy,
+        }
+    }
+
+    /// A run's `actions.lock` that cannot be parsed, or exceeds the size cap (422).
+    pub fn actions_lockfile(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: message.into(),
+            kind: ApiErrorKind::ActionsPolicy,
         }
     }
 

@@ -13,7 +13,7 @@
 //! This module wires `ServerQueue`, `ResultsClient`, and `RunServiceClient` to
 //! implement the full reporting lifecycle.
 
-use super::action_preparation::prepare_remote_actions;
+use super::action_preparation::{actions_dependencies, prepare_remote_actions};
 use super::completion::{evaluate_environment_url, make_hook_step, report_completion};
 use super::helpers::{extract_results_url, extract_service_endpoint, iso_now};
 use super::reporting::{flush_step_updates, upload_diagnostic_logs, upload_job_log};
@@ -227,14 +227,9 @@ pub async fn run_job(
         variables,
         context_data,
     );
-    // v2.336.0 (#4546/#4550): Announce locked dependencies in Setup Job log
-    if let Some(deps) = job_message
-        .get("actionsDependencies")
-        .and_then(|v| v.as_array())
-        && !deps.is_empty()
-    {
-        info!("Using locked actions versions from the workflow's lockfile");
-    }
+    // Lockfile pins from the job message (official `dependencies`). Set Up job announces
+    // them, and every Launch resolve forwards them.
+    job_ctx.actions_dependencies = actions_dependencies(&job_message);
     // The server keeps `container:`/`services:` raw, so a matrix-driven
     // `container: ${{ matrix.build.container }}` reaches us as an expression
     // token. Evaluate those against the job context before parsing, or the
@@ -322,26 +317,35 @@ pub async fn run_job(
     job_ctx.workspace = Some(workspace.clone());
     super::job_extension::inject_github_env(&mut job_ctx, &job_message);
     let main_steps = super::job_extension::build_step_list(&steps, &job_message);
-    let action_paths =
-        match prepare_remote_actions(&job_message, &workspace, &main_steps, &plan_id).await {
-            Ok(paths) => paths,
-            Err(error) => {
-                error!("Set up job failed while preparing actions: {error:#}");
-                job_ctx.job_status = super::contexts::JobStatus::Failure;
-                report_completion(
-                    &job_message,
-                    "Failure",
-                    &job_ctx,
-                    &[],
-                    via,
-                    reporting.as_deref(),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+    let mut setup_action_lines = Vec::new();
+    let action_paths = match prepare_remote_actions(
+        &job_message,
+        &workspace,
+        &main_steps,
+        &plan_id,
+        &mut setup_action_lines,
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            error!("Set up job failed while preparing actions: {error:#}");
+            job_ctx.job_status = super::contexts::JobStatus::Failure;
+            report_completion(
+                &job_message,
+                "Failure",
+                &job_ctx,
+                &[],
+                via,
+                reporting.as_deref(),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     job_ctx.action_paths = action_paths.clone();
+    job_ctx.setup_action_lines = setup_action_lines;
     // Captured before lifecycle expansion: `main_steps` is 1:1 with the job
     // request message's `steps`, so this is the workflow's own declaration.
     // Everything `build_step_list_with_lifecycle` and the hook injections add

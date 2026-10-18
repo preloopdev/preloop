@@ -1467,7 +1467,7 @@ fn origin_pin<'a>(
 /// The key a `uses:` inside a reusable workflow resolves to. A same-repository
 /// reference inside a remote reusable workflow names that workflow's repository
 /// at its pinned commit; anywhere else the reference is used as written.
-fn callee_reference(
+pub fn callee_reference(
     declared: &str,
     origin: Option<&str>,
     reusable_workflow_shas: &BTreeMap<String, String>,
@@ -1497,7 +1497,7 @@ fn reusable_workflow_repository(uses: &str) -> Option<String> {
 
 /// Normalized repository path of a reusable reference: `./` and `$/` stripped
 /// and any `@ref` dropped.
-fn normalize_reusable_path(uses: &str) -> String {
+pub fn normalize_reusable_path(uses: &str) -> String {
     let without_ref = uses.split('@').next().unwrap_or(uses);
     let path = without_ref
         .strip_prefix("./")

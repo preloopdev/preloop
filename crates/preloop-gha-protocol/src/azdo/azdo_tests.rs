@@ -322,6 +322,9 @@ fn expected_job_wire(job: &AgentJobRequestMessage) -> Value {
         "steps".to_owned(),
         Value::Array(job.steps.iter().map(expected_step_wire).collect()),
     );
+    if !job.dependencies.is_empty() {
+        object.insert("dependencies".to_owned(), json!(job.dependencies));
+    }
     if let Some(value) = job.retry_count {
         object.insert("retryCount".to_owned(), json!(value));
     }
@@ -431,6 +434,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
             prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
             prop::option::of(arb_text().prop_map(|value| json!({"type": 2, "lit": value}))),
             prop::option::of(arb_text().prop_map(|name| ActionsEnvironment { name, url: None })),
+            proptest::collection::vec(arb_text(), 0..=2),
         ),
         (
             any::<bool>(),
@@ -463,6 +467,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                     job_service_containers,
                     job_outputs,
                     actions_environment,
+                    dependencies,
                 ),
                 (enable_debugger, debugger_welcome_message, has_tunnel, key_bytes),
             )| AgentJobRequestMessage {
@@ -497,6 +502,7 @@ fn arb_job() -> impl Strategy<Value = AgentJobRequestMessage> {
                 resources,
                 context_data,
                 steps,
+                dependencies,
                 retry_count,
                 pre_job_timeout,
                 job_timeout,
@@ -1337,4 +1343,40 @@ fn action_download_info_collection_roundtrips_with_bearer_token() {
 
     let deserialized: ActionDownloadInfoCollection = serde_json::from_value(serialized).unwrap();
     assert_eq!(deserialized.actions.len(), 1);
+}
+
+/// `dependencies` is the official `AgentJobRequestMessage` member that the
+/// runner announces from: omitted when empty (so jobs of workflows without an
+/// `actions.lock` keep their wire shape), and carried verbatim when set.
+#[test]
+fn job_message_dependencies_are_omitted_when_empty_and_round_trip() {
+    let mut job = serde_json::from_value::<AgentJobRequestMessage>(json!({
+        "jobId": "00000000-0000-0000-0000-000000000001",
+        "requestId": 1,
+        "plan": {"planId": "", "planType": "", "version": 0, "artifactUri": "", "artifactLocation": ""},
+        "timeline": {"id": "00000000-0000-0000-0000-000000000002", "changeId": 0},
+        "jobName": "build",
+        "lockedUntil": "0001-01-01T00:00:00",
+        "resources": {"endpoints": []},
+        "steps": []
+    }))
+    .unwrap();
+    assert!(job.dependencies.is_empty());
+    let plain = serde_json::to_value(&job).unwrap();
+    assert!(plain.get("dependencies").is_none());
+
+    job.dependencies = vec![
+        "actions/checkout@v4".to_owned(),
+        "owner/tool@0123456789abcdef0123456789abcdef01234567".to_owned(),
+    ];
+    let encoded = serde_json::to_value(&job).unwrap();
+    assert_eq!(
+        encoded["dependencies"],
+        json!([
+            "actions/checkout@v4",
+            "owner/tool@0123456789abcdef0123456789abcdef01234567"
+        ])
+    );
+    let decoded: AgentJobRequestMessage = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.dependencies, job.dependencies);
 }

@@ -1,20 +1,75 @@
 //! Remote action download and reference resolution.
 
 use anyhow::Result;
-use tracing::warn;
+use std::collections::{HashMap, HashSet};
+use tracing::{info, warn};
 
 use super::helpers::extract_service_endpoint;
 use super::steps_runner::{Step, StepType};
+use crate::client::actions_download::{ActionsResolveClient, ResolvedAction};
 use crate::client::http::HttpClient;
 
+/// The Set Up job announcement the official runner prints for a job with lockfile
+/// pins (`JobExtension.cs`: after the proxy lines, before `Prepare workflow directory`).
+const LOCKED_ACTIONS_ANNOUNCEMENT: &str =
+    "Using locked action versions from the workflow's lockfile";
+
+/// The lockfile pins a job message carries: the official wire key `dependencies`
+/// (`AgentJobRequestMessage.ActionsDependencies`, `EmitDefaultValue = false`).
+/// Missing or empty means the workflow has no lockfile entry. Other keys, such as
+/// the camelCase `actionsDependencies`, are not the wire name and are ignored.
+pub(crate) fn actions_dependencies(job_message: &serde_json::Value) -> Vec<String> {
+    job_message
+        .get("dependencies")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
+}
+
+/// The Set Up job announcement for a job with lockfile pins, or `None` without pins.
+pub(crate) fn lockfile_announcement(dependencies: &[String]) -> Option<&'static str> {
+    (!dependencies.is_empty()).then_some(LOCKED_ACTIONS_ANNOUNCEMENT)
+}
+
+/// A reference the preparation phase stages.
+enum StagedRef {
+    /// `owner/repo[/subpath]@ref`, fetched from the forge through Launch.
+    Remote { uses: String, parsed: ParsedUses },
+    /// A `$/` reference staged from the run's local-workspace snapshot.
+    Snapshot {
+        uses: String,
+        subpath: String,
+        origin: SnapshotOrigin,
+    },
+}
+
+/// Stage the remote actions a job's steps use, and append the Set Up job lines the
+/// official runner prints for them to `setup_lines`. Lines are unstamped; the caller
+/// stamps them with the Set Up job timestamp.
+///
+/// Follows `ActionManager.PrepareActionsRecursiveLegacyAsync`, the path the official
+/// runner takes unless `actions_batch_action_resolution` is set. The v2.336.0 job
+/// messages carry that variable as `false`, and Preloop never sets it. A call of
+/// references logs `Getting action download info` before its Launch batch when it has
+/// refs to resolve, downloads its refs in order, then prepares each composite's nested
+/// refs depth-first before the next sibling. Two deliberate differences: a reference
+/// this job already downloaded is not expanded or downloaded again, a reference already
+/// resolved is not requested again, and a nested batch that fails falls back to the refs
+/// as written, so preparation still downloads what it can. The job's own batch fails
+/// closed.
 pub(crate) async fn prepare_remote_actions(
     job_message: &serde_json::Value,
     workspace: &str,
     steps: &[Step],
     plan_id: &str,
-) -> Result<std::collections::HashMap<String, String>> {
-    let mut refs = Vec::new();
-    let mut snapshot_refs: Vec<(String, String, SnapshotOrigin)> = Vec::new();
+    setup_lines: &mut Vec<String>,
+) -> Result<HashMap<String, String>> {
+    let mut direct = Vec::new();
     for step in steps {
         let StepType::Action { uses, .. } = &step.step_type else {
             continue;
@@ -26,39 +81,40 @@ pub(crate) async fn prepare_remote_actions(
         // `actions_self_repository` (Constants.Runner.Features.SelfRepository).
         if uses.starts_with("$/") {
             match resolve_self_repository(job_message, uses) {
-                Some(SelfRepositorySource::Forge(parsed)) => refs.push((uses.clone(), parsed)),
+                Some(SelfRepositorySource::Forge(parsed)) => direct.push(StagedRef::Remote {
+                    uses: uses.clone(),
+                    parsed,
+                }),
                 Some(SelfRepositorySource::Snapshot { subpath, origin }) => {
-                    snapshot_refs.push((uses.clone(), subpath, origin));
+                    direct.push(StagedRef::Snapshot {
+                        uses: uses.clone(),
+                        subpath,
+                        origin,
+                    });
                 }
                 None => {}
             }
             continue;
         }
         if let Some(parsed) = parse_remote_uses(uses) {
-            refs.push((uses.clone(), parsed));
+            direct.push(StagedRef::Remote {
+                uses: uses.clone(),
+                parsed,
+            });
         } else {
             warn!("Cannot parse remote action ref (missing @version?): {uses:?}");
         }
+    }
+
+    let mut action_paths = HashMap::new();
+    if direct.is_empty() {
+        return Ok(action_paths);
     }
 
     let actions_dir = std::path::Path::new(workspace)
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("_actions");
-    let mut action_paths = std::collections::HashMap::new();
-
-    for (uses, subpath, origin) in &snapshot_refs {
-        let root = stage_snapshot_tree(origin, &actions_dir).await?;
-        action_paths.insert(
-            uses.clone(),
-            root.join(subpath).to_string_lossy().into_owned(),
-        );
-    }
-
-    if refs.is_empty() {
-        return Ok(action_paths);
-    }
-
     let job_id = job_message
         .get("jobId")
         .and_then(|v| v.as_str())
@@ -68,133 +124,220 @@ pub(crate) async fn prepare_remote_actions(
         .unwrap_or_default();
     let launch_url =
         message_variable(job_message, "system.github.launch_endpoint").map(str::to_string);
+    // Without credentials and a Launch endpoint nothing can be resolved; the downloads
+    // then fail closed on the missing SHA-pinned URL, as they always have.
+    let can_resolve = !access_token.is_empty() && launch_url.is_some();
+    let dependencies = actions_dependencies(job_message);
+    let resolver = ActionsResolveClient::new(HttpClient::new(None)?, launch_url);
 
-    let http = HttpClient::new(None)?;
-    let resolver = crate::client::actions_download::ActionsResolveClient::new(http, launch_url);
-    let action_pairs: Vec<(String, String)> = refs
-        .iter()
-        .map(|(_, parsed)| (parsed.action_name.clone(), parsed.git_ref.clone()))
-        .collect();
-    let action_pair_refs: Vec<(&str, &str)> = action_pairs
-        .iter()
-        .map(|(action, version)| (action.as_str(), version.as_str()))
-        .collect();
-    use tracing::info;
-
-    let resolved = if !access_token.is_empty() {
-        // v2.336.0 (#4536): Log action resolution telemetry
-        let start = std::time::Instant::now();
-        let result = resolver
-            .resolve_batch(&access_token, plan_id, job_id, &action_pair_refs)
-            .await?;
-        let elapsed = start.elapsed();
-        info!(
-            "Action resolution: {} actions resolved in {elapsed:?}",
-            result.len()
-        );
-        result
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    // The official ActionManager.PrepareActionsRecursiveAsync resolves and
-    // downloads nested actions recursively at prepare time (depth-limited,
-    // batched per level). A composite manifest is only readable after its own
-    // download, so walk the manifest tree level by level: each wave resolves
-    // the nested remote refs discovered in the previous wave's manifests.
-    let mut pending: Vec<(String, ParsedUses)> = refs;
-    let mut wave_resolved = resolved;
-    // Exclusive upper bound: at most `composite_max_depth()` executable
-    // nesting levels (official Constants.CompositeActionsMaxDepth = 10).
-    // An inclusive range pre-downloads one extra level the runner will reject.
-    for _depth in 0..composite_max_depth() {
-        if pending.is_empty() {
-            break;
-        }
-        let mut nested: Vec<(String, ParsedUses)> = Vec::new();
-        for (uses, parsed) in pending {
-            if action_paths.contains_key(&uses) {
-                continue;
+    let mut resolved: HashMap<String, ResolvedAction> = HashMap::new();
+    let mut announced: HashSet<String> = HashSet::new();
+    // A frame is one call of references at one composite depth. Frames pop LIFO and
+    // each call's nested frames are pushed in reverse, so a composite's whole subtree
+    // is prepared before its next sibling.
+    let mut frames: Vec<(usize, Vec<StagedRef>)> = vec![(0, direct)];
+    while let Some((depth, frame)) = frames.pop() {
+        let pending = unresolved_refs(&frame, &resolved, &action_paths);
+        if !pending.is_empty() {
+            setup_lines.push("Getting action download info".to_owned());
+            if can_resolve {
+                let pairs: Vec<(&str, &str)> = pending
+                    .iter()
+                    .map(|(action, git_ref)| (action.as_str(), git_ref.as_str()))
+                    .collect();
+                let started = std::time::Instant::now();
+                match resolver
+                    .resolve_batch(&access_token, plan_id, job_id, &pairs, &dependencies)
+                    .await
+                {
+                    Ok(batch) => {
+                        info!(
+                            "Action resolution: {} actions resolved in {:?}",
+                            batch.len(),
+                            started.elapsed()
+                        );
+                        resolved.extend(batch);
+                    }
+                    Err(error) if depth > 0 => {
+                        warn!(
+                            "Nested action resolution failed; downloading refs as \
+                             written: {error:#}"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            let key = format!("{}@{}", parsed.action_name, parsed.git_ref);
-            let meta = wave_resolved.get(&key);
-            let dir_ref = meta
-                .map(|m| m.resolved_sha.as_str())
-                .filter(|sha| !sha.is_empty())
-                .unwrap_or(parsed.git_ref.as_str());
-            let download_url = meta
-                .map(|m| m.tar_url.as_str())
-                .filter(|url| !url.is_empty());
-            let auth_token = meta.and_then(|m| m.auth_token.as_deref());
-            let archive_pin = meta.map(|m| m.archive_sha256.clone()).unwrap_or_default();
+        }
 
-            let (action_root, _) = super::actions::manager::download_action(
-                &parsed.owner,
-                &parsed.repo,
-                dir_ref,
-                &actions_dir,
-                download_url,
-                auth_token,
-                archive_pin,
-            )
-            .await?;
+        let mut fetched: Vec<std::path::PathBuf> = Vec::new();
+        for staged in &frame {
+            match staged {
+                StagedRef::Snapshot {
+                    uses,
+                    subpath,
+                    origin,
+                } => {
+                    if action_paths.contains_key(uses) {
+                        continue;
+                    }
+                    announce_download(
+                        &mut announced,
+                        setup_lines,
+                        &format!("{}/{}", origin.owner, origin.repo),
+                        &origin.commit,
+                        &origin.commit,
+                    );
+                    let root = stage_snapshot_tree(origin, &actions_dir).await?;
+                    action_paths.insert(
+                        uses.clone(),
+                        root.join(subpath).to_string_lossy().into_owned(),
+                    );
+                }
+                StagedRef::Remote { uses, parsed } => {
+                    if action_paths.contains_key(uses) {
+                        continue;
+                    }
+                    let meta = resolved.get(&format!("{}@{}", parsed.action_name, parsed.git_ref));
+                    let dir_ref = meta
+                        .map(|meta| meta.resolved_sha.as_str())
+                        .filter(|sha| !sha.is_empty())
+                        .unwrap_or(parsed.git_ref.as_str());
+                    let name = meta
+                        .map(|meta| meta.name.as_str())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(parsed.action_name.as_str());
+                    let version = meta
+                        .map(|meta| meta.version.as_str())
+                        .filter(|version| !version.is_empty())
+                        .unwrap_or(parsed.git_ref.as_str());
+                    // An unresolved ref is refused by `download_action`, and naming it as a
+                    // SHA would mislead the reader, so only a resolved commit is announced.
+                    if preloop_gha_protocol::git_ref::is_commit_sha_not_zero(dir_ref) {
+                        announce_download(&mut announced, setup_lines, name, version, dir_ref);
+                    }
+                    let download_url = meta
+                        .map(|meta| meta.tar_url.as_str())
+                        .filter(|url| !url.is_empty());
+                    let auth_token = meta.and_then(|meta| meta.auth_token.as_deref());
+                    let archive_pin = meta
+                        .map(|meta| meta.archive_sha256.clone())
+                        .unwrap_or_default();
+                    let (action_root, _) = super::actions::manager::download_action(
+                        &parsed.owner,
+                        &parsed.repo,
+                        dir_ref,
+                        &actions_dir,
+                        download_url,
+                        auth_token,
+                        archive_pin,
+                    )
+                    .await?;
+                    let action_dir = if parsed.subpath.is_empty() {
+                        action_root
+                    } else {
+                        action_root.join(&parsed.subpath)
+                    };
+                    action_paths.insert(uses.clone(), action_dir.to_string_lossy().into_owned());
+                    fetched.push(action_dir);
+                }
+            }
+        }
 
-            let action_dir = if parsed.subpath.is_empty() {
-                action_root
-            } else {
-                action_root.join(&parsed.subpath)
-            };
-            action_paths.insert(uses, action_dir.to_string_lossy().to_string());
-
-            // A composite's nested `uses:` refs are collected for the next
-            // wave, mirroring PrepareActionsRecursiveAsync.
-            let Ok(manifest) = super::handlers::factory::load_action_manifest(&action_dir) else {
+        let mut nested_frames: Vec<Vec<StagedRef>> = Vec::new();
+        for action_dir in &fetched {
+            // A composite's nested `uses:` refs form the next call, as the steps of
+            // ActionManager's PrepareRepositoryActionAsync do.
+            let Ok(manifest) = super::handlers::factory::load_action_manifest(action_dir) else {
                 continue;
             };
             if manifest.runs_using != "composite" {
                 continue;
             }
-            if let Some(steps) = &manifest.runs_steps {
-                for step in steps {
-                    let Some(nested_uses) = step.get("uses").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    if nested_uses.starts_with("./")
-                        || nested_uses.starts_with("../")
-                        || nested_uses.starts_with("docker://")
-                        || nested_uses.starts_with("$/")
-                    {
-                        continue;
-                    }
-                    if action_paths.contains_key(nested_uses) {
-                        continue;
-                    }
-                    if let Some(parsed) = parse_remote_uses(nested_uses)
-                        && !nested.iter().any(|(u, _)| u == nested_uses)
-                    {
-                        nested.push((nested_uses.to_owned(), parsed));
-                    }
+            let Some(runs_steps) = &manifest.runs_steps else {
+                continue;
+            };
+            let mut nested: Vec<StagedRef> = Vec::new();
+            for step in runs_steps {
+                let Some(nested_uses) = step.get("uses").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if nested_uses.starts_with("./")
+                    || nested_uses.starts_with("../")
+                    || nested_uses.starts_with("docker://")
+                    || nested_uses.starts_with("$/")
+                    || action_paths.contains_key(nested_uses)
+                {
+                    continue;
+                }
+                let repeated = nested.iter().any(|staged| match staged {
+                    StagedRef::Remote { uses, .. } => uses.as_str() == nested_uses,
+                    StagedRef::Snapshot { .. } => false,
+                });
+                if repeated {
+                    continue;
+                }
+                if let Some(parsed) = parse_remote_uses(nested_uses) {
+                    nested.push(StagedRef::Remote {
+                        uses: nested_uses.to_owned(),
+                        parsed,
+                    });
                 }
             }
+            if !nested.is_empty() {
+                nested_frames.push(nested);
+            }
         }
-        if nested.is_empty() {
-            break;
+        if depth + 1 < composite_max_depth() {
+            for nested in nested_frames.into_iter().rev() {
+                frames.push((depth + 1, nested));
+            }
         }
-        // Resolve the next wave's refs against the server (batched, like the
-        // official manager), tolerating a failed resolve so preparation still
-        // downloads what it can; execution-time staging covers the rest.
-        let action_pairs: Vec<(&str, &str)> = nested
-            .iter()
-            .map(|(_, parsed)| (parsed.action_name.as_str(), parsed.git_ref.as_str()))
-            .collect();
-        wave_resolved = resolver
-            .resolve_batch(&access_token, plan_id, job_id, &action_pairs)
-            .await
-            .unwrap_or_default();
-        pending = nested;
     }
 
     Ok(action_paths)
+}
+
+/// The `(action, git_ref)` pairs of one call that still need a Launch resolution: not
+/// yet downloaded and not yet resolved in this job, each pair once.
+fn unresolved_refs(
+    frame: &[StagedRef],
+    resolved: &HashMap<String, ResolvedAction>,
+    action_paths: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut pending = Vec::new();
+    for staged in frame {
+        let StagedRef::Remote { uses, parsed } = staged else {
+            continue;
+        };
+        if action_paths.contains_key(uses) {
+            continue;
+        }
+        let key = format!("{}@{}", parsed.action_name, parsed.git_ref);
+        if !resolved.contains_key(&key) && seen.insert(key) {
+            pending.push((parsed.action_name.clone(), parsed.git_ref.clone()));
+        }
+    }
+    pending
+}
+
+/// Append the `Download action repository` line for `name@git_ref`, once per job.
+///
+/// The official runner prints this line only when it downloads; a cache hit is a silent
+/// Debug line there. This runner announces cache hits too, so the log lists every action
+/// the job uses. Repeats within one job are announced once.
+fn announce_download(
+    announced: &mut HashSet<String>,
+    setup_lines: &mut Vec<String>,
+    name: &str,
+    git_ref: &str,
+    resolved_sha: &str,
+) {
+    if announced.insert(format!("{name}@{git_ref}")) {
+        setup_lines.push(format!(
+            "Download action repository '{name}@{git_ref}' (SHA:{resolved_sha})"
+        ));
+    }
 }
 
 /// Official `Constants.CompositeActionsMaxDepth` (10).
@@ -461,6 +604,7 @@ async fn snapshot_git(dir: &std::path::Path, origin: &SnapshotOrigin, args: &[&s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::actions_download::ArchiveDigestPin;
 
     const WORKFLOW_SHA: &str = "6b2de6eb160186cd946fb2f0929e2b265624cd61";
 
@@ -608,9 +752,22 @@ mod tests {
             is_background: false,
         }];
 
-        let paths = prepare_remote_actions(&msg, workspace.to_str().unwrap(), &steps, "plan")
-            .await
-            .expect("snapshot staging succeeds");
+        let mut setup_lines = Vec::new();
+        let paths = prepare_remote_actions(
+            &msg,
+            workspace.to_str().unwrap(),
+            &steps,
+            "plan",
+            &mut setup_lines,
+        )
+        .await
+        .expect("snapshot staging succeeds");
+        assert_eq!(
+            setup_lines,
+            [format!(
+                "Download action repository 'pytest-dev/pytest@{commit}' (SHA:{commit})"
+            )]
+        );
         let staged = std::path::PathBuf::from(&paths["$/.github/actions/setup-tox"]);
         assert_eq!(
             staged,
@@ -620,5 +777,370 @@ mod tests {
                 .join(".github/actions/setup-tox")
         );
         assert!(staged.join("action.yml").is_file());
+    }
+
+    const DEPENDENCY: &str = "actions/checkout@v4:sha256-abc123";
+    const PARENT_SHA: &str = "1111111111111111111111111111111111111111";
+    const OTHER_SHA: &str = "2222222222222222222222222222222222222222";
+    const CHILD_SHA: &str = "3333333333333333333333333333333333333333";
+    const PARENT_ACTION_YML: &str =
+        "name: parent\nruns:\n  using: composite\n  steps:\n    - uses: owner/child@v1\n";
+    const LEAF_ACTION_YML: &str = "name: leaf\nruns:\n  using: node20\n  main: index.js\n";
+
+    fn action_step(uses: &str) -> Step {
+        Step {
+            id: uses.to_owned(),
+            context_name: uses.to_owned(),
+            display_name: uses.to_owned(),
+            step_type: StepType::Action {
+                uses: uses.to_owned(),
+                with: serde_json::json!({}),
+            },
+            condition: None,
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: Default::default(),
+            raw: serde_json::json!({}),
+            is_background: false,
+        }
+    }
+
+    /// A codeload-shaped gzip tarball: one top-level directory, which extraction strips,
+    /// holding `action.yml`.
+    fn action_tarball(action_yml: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut archive = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(action_yml.len() as u64);
+            header.set_mode(0o644);
+            archive
+                .append_data(&mut header, "root/action.yml", action_yml.as_bytes())
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    /// Loopback stand-in for Launch's `runnerresolve/actions` and codeload. The resolve
+    /// route answers each requested `action@version` it knows and records the request.
+    async fn serve_launch_and_codeload(
+        requests: std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+    ) -> String {
+        use axum::routing::{get, post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let resolve_base = base.clone();
+        let parent_tar = action_tarball(PARENT_ACTION_YML);
+        let other_tar = action_tarball(LEAF_ACTION_YML);
+        let child_tar = action_tarball(LEAF_ACTION_YML);
+        let app = axum::Router::new()
+            .route(
+                "/actions/build/plan-1/jobs/job-1/runnerresolve/actions",
+                post(move |body: bytes::Bytes| {
+                    let base = resolve_base.clone();
+                    let requests = requests.clone();
+                    async move {
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let mut resolved = serde_json::Map::new();
+                        for entry in request["actions"].as_array().into_iter().flatten() {
+                            let action = entry["action"].as_str().unwrap_or_default();
+                            let version = entry["version"].as_str().unwrap_or_default();
+                            let (sha, slug) = match format!("{action}@{version}").as_str() {
+                                "owner/parent@v1" => (PARENT_SHA, "parent"),
+                                "owner/other@v1" => (OTHER_SHA, "other"),
+                                "owner/child@v1" => (CHILD_SHA, "child"),
+                                _ => continue,
+                            };
+                            resolved.insert(
+                                format!("{action}@{version}"),
+                                serde_json::json!({
+                                    "name": action,
+                                    "version": version,
+                                    "resolved_sha": sha,
+                                    "tar_url": format!("{base}/tar/{slug}"),
+                                }),
+                            );
+                        }
+                        requests.lock().push(request);
+                        serde_json::json!({ "actions": resolved }).to_string()
+                    }
+                }),
+            )
+            .route("/tar/parent", get(|| async move { parent_tar }))
+            .route("/tar/other", get(|| async move { other_tar }))
+            .route("/tar/child", get(|| async move { child_tar }));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    /// The job's own references are batched and downloaded in step order, then each
+    /// composite's nested reference is resolved and downloaded in its own call. Every
+    /// resolve request carries the job's lockfile pins.
+    #[tokio::test]
+    async fn prepare_logs_direct_and_nested_downloads_in_official_order() {
+        let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let base = serve_launch_and_codeload(requests.clone()).await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("_work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let msg = serde_json::json!({
+            "jobId": "job-1",
+            "resources": {"endpoints": [{
+                "name": "SystemVssConnection",
+                "url": base.clone(),
+                "authorization": {"parameters": {"AccessToken": "token"}},
+            }]},
+            "variables": {"system.github.launch_endpoint": {"value": base}},
+            "dependencies": [DEPENDENCY],
+        });
+        let steps = [
+            action_step("owner/parent@v1"),
+            action_step("owner/other@v1"),
+        ];
+        let mut setup_lines = Vec::new();
+        let paths = prepare_remote_actions(
+            &msg,
+            workspace.to_str().unwrap(),
+            &steps,
+            "plan-1",
+            &mut setup_lines,
+        )
+        .await
+        .expect("preparation succeeds against the stand-in");
+
+        assert_eq!(
+            setup_lines,
+            [
+                "Getting action download info".to_owned(),
+                format!("Download action repository 'owner/parent@v1' (SHA:{PARENT_SHA})"),
+                format!("Download action repository 'owner/other@v1' (SHA:{OTHER_SHA})"),
+                "Getting action download info".to_owned(),
+                format!("Download action repository 'owner/child@v1' (SHA:{CHILD_SHA})"),
+            ]
+        );
+        let actions_dir = temp.path().join("_work").join("_actions");
+        assert_eq!(
+            std::path::PathBuf::from(&paths["owner/child@v1"]),
+            actions_dir.join("owner").join("child").join(CHILD_SHA)
+        );
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]["actions"],
+            serde_json::json!([
+                {"action": "owner/parent", "version": "v1"},
+                {"action": "owner/other", "version": "v1"},
+            ])
+        );
+        assert_eq!(
+            requests[1]["actions"],
+            serde_json::json!([{"action": "owner/child", "version": "v1"}])
+        );
+        for request in requests.iter() {
+            assert_eq!(
+                request["actions_dependencies"],
+                serde_json::json!([DEPENDENCY])
+            );
+        }
+    }
+
+    #[test]
+    fn dependencies_come_from_the_official_wire_key_only() {
+        let pinned = serde_json::json!({ "dependencies": [DEPENDENCY] });
+        assert_eq!(actions_dependencies(&pinned), vec![DEPENDENCY.to_owned()]);
+        assert_eq!(
+            lockfile_announcement(&actions_dependencies(&pinned)),
+            Some("Using locked action versions from the workflow's lockfile")
+        );
+        // The camelCase key is not the wire name, so it never announces.
+        let legacy = serde_json::json!({ "actionsDependencies": [DEPENDENCY] });
+        assert!(actions_dependencies(&legacy).is_empty());
+        assert_eq!(lockfile_announcement(&actions_dependencies(&legacy)), None);
+        // Omitted and empty both mean the workflow has no lockfile entry.
+        let omitted = serde_json::json!({});
+        assert_eq!(lockfile_announcement(&actions_dependencies(&omitted)), None);
+        let empty = serde_json::json!({ "dependencies": [] });
+        assert_eq!(lockfile_announcement(&actions_dependencies(&empty)), None);
+    }
+
+    #[test]
+    fn unresolved_refs_asks_once_per_pair_and_skips_known_refs() {
+        let remote = |uses: &str| StagedRef::Remote {
+            uses: uses.to_owned(),
+            parsed: parse_remote_uses(uses).unwrap(),
+        };
+        let frame = vec![
+            remote("a/x@v1"),
+            remote("a/x@v1"),
+            remote("b/y@v2"),
+            remote("c/z@v3"),
+            StagedRef::Snapshot {
+                uses: "$/s".to_owned(),
+                subpath: "s".to_owned(),
+                origin: SnapshotOrigin {
+                    owner: "o".to_owned(),
+                    repo: "r".to_owned(),
+                    commit: "abc".to_owned(),
+                    url: "https://example.invalid".to_owned(),
+                    auth_header: "AUTHORIZATION: basic x".to_owned(),
+                },
+            },
+        ];
+        let resolved = HashMap::from([(
+            "b/y@v2".to_owned(),
+            ResolvedAction {
+                name: "b/y".to_owned(),
+                version: "v2".to_owned(),
+                resolved_sha: "4444444444444444444444444444444444444444".to_owned(),
+                tar_url: "https://example.invalid/y.tar.gz".to_owned(),
+                auth_token: None,
+                archive_sha256: ArchiveDigestPin::Unsupported,
+            },
+        )]);
+        let action_paths = HashMap::from([("c/z@v3".to_owned(), "/cached".to_owned())]);
+        assert_eq!(
+            unresolved_refs(&frame, &resolved, &action_paths),
+            vec![("a/x".to_owned(), "v1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn announce_download_names_each_action_once_in_the_official_format() {
+        let mut announced = HashSet::new();
+        let mut lines = Vec::new();
+        announce_download(
+            &mut announced,
+            &mut lines,
+            "actions/checkout",
+            "v4",
+            PARENT_SHA,
+        );
+        announce_download(
+            &mut announced,
+            &mut lines,
+            "actions/checkout",
+            "v4",
+            PARENT_SHA,
+        );
+        announce_download(
+            &mut announced,
+            &mut lines,
+            "actions/checkout",
+            "v5",
+            OTHER_SHA,
+        );
+        assert_eq!(
+            lines,
+            [
+                format!("Download action repository 'actions/checkout@v4' (SHA:{PARENT_SHA})"),
+                format!("Download action repository 'actions/checkout@v5' (SHA:{OTHER_SHA})"),
+            ]
+        );
+    }
+
+    /// Runs the Set up job section for `job_message` with no steps and returns its log
+    /// text. Pins come from the message as `run_job` reads them; `setup_lines` stand in for
+    /// action preparation output.
+    async fn set_up_job_log(job_message: &serde_json::Value, setup_lines: Vec<String>) -> String {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        job.actions_dependencies = actions_dependencies(job_message);
+        job.setup_action_lines = setup_lines;
+        let queue = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::worker::server_queue::ServerQueue::new("job".into(), "plan".into()),
+        ));
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        crate::worker::steps_runner::run_steps(
+            &[],
+            &mut job,
+            workspace.path().to_str().unwrap(),
+            cancel_rx,
+            queue.clone(),
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut queue = queue.lock().await;
+        queue.all_step_log_content().unwrap()
+    }
+
+    /// The announcement reaches the Set up job log once, after the proxy lines and before
+    /// `Prepare workflow directory`, where the official runner prints it.
+    #[tokio::test]
+    async fn set_up_job_announces_pinned_jobs_once_at_the_official_position() {
+        let pinned = serde_json::json!({ "dependencies": [DEPENDENCY] });
+        let log = set_up_job_log(&pinned, Vec::new()).await;
+        assert_eq!(log.matches(LOCKED_ACTIONS_ANNOUNCEMENT).count(), 1, "{log}");
+        let announced = log.find(LOCKED_ACTIONS_ANNOUNCEMENT).unwrap();
+        let prepared = log.find("Prepare workflow directory").unwrap();
+        assert!(announced < prepared, "{log}");
+    }
+
+    /// Jobs without pins, and jobs carrying only the camelCase key, print no announcement.
+    #[tokio::test]
+    async fn set_up_job_omits_the_announcement_without_wire_pins() {
+        for message in [
+            serde_json::json!({}),
+            serde_json::json!({ "dependencies": [] }),
+            serde_json::json!({ "actionsDependencies": [DEPENDENCY] }),
+        ] {
+            let log = set_up_job_log(&message, Vec::new()).await;
+            assert!(
+                !log.contains(LOCKED_ACTIONS_ANNOUNCEMENT),
+                "{message}: {log}"
+            );
+        }
+    }
+
+    /// Action preparation lines print between `Prepare all required actions` and
+    /// `Complete job name`, as in the official Set up job log.
+    #[tokio::test]
+    async fn set_up_job_prints_action_preparation_lines_in_order() {
+        let download = format!("Download action repository 'owner/parent@v1' (SHA:{PARENT_SHA})");
+        let log = set_up_job_log(
+            &serde_json::json!({}),
+            vec!["Getting action download info".to_owned(), download.clone()],
+        )
+        .await;
+        let prepare = log.find("Prepare all required actions").unwrap();
+        let getting = log.find("Getting action download info").unwrap();
+        let downloaded = log.find(&download).unwrap();
+        let complete = log.find("Complete job name:").unwrap();
+        assert!(
+            prepare < getting && getting < downloaded && downloaded < complete,
+            "{log}"
+        );
+    }
+
+    /// A ref that did not resolve to a commit is refused by the download. Naming it as a
+    /// SHA would mislead the log reader, so the announcement is withheld.
+    #[tokio::test]
+    async fn unresolved_ref_is_not_announced_as_a_sha() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("_work").join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut setup_lines = Vec::new();
+        let result = prepare_remote_actions(
+            &serde_json::json!({ "jobId": "job-1" }),
+            workspace.to_str().unwrap(),
+            &[action_step("owner/unresolved@v1")],
+            "plan-1",
+            &mut setup_lines,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(setup_lines, ["Getting action download info".to_owned()]);
     }
 }

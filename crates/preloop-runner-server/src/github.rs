@@ -941,7 +941,13 @@ async fn send_queued_check_run(
                         global_issues.push(format!("- {}", markdown_cell(&message)));
                     }
                 }
-                let summary = check_summary(conclusion, &steps, &global_issues, &update.job_id);
+                let actions = crate::actions::job_resolved_actions(
+                    &shared.state,
+                    update.run_id,
+                    &update.job_id,
+                );
+                let summary =
+                    check_summary(conclusion, &steps, &global_issues, &actions, &update.job_id);
                 let title = job
                     .and_then(|j| j.display_name.as_deref())
                     .unwrap_or(name)
@@ -1334,6 +1340,65 @@ fn markdown_cell(value: &str) -> String {
     value.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
+/// Rows the Actions section of a job's check-run summary lists before it
+/// summarizes the rest.
+const CHECK_SUMMARY_ACTION_ROWS: usize = 50;
+/// Characters one Actions-table cell shows before it is cut short.
+const CHECK_SUMMARY_CELL_CHARS: usize = 120;
+
+/// One Actions-table cell from text a workflow or a ref supplies. Only characters a
+/// GitHub action name or ref can contain survive. Anything else, including markdown,
+/// HTML, table pipes, backticks, line breaks and query syntax, shows as `?`. The cell
+/// is capped, so a long name cannot push the table past the summary's size.
+fn summary_cell(value: &str) -> String {
+    let mut cell: String = value
+        .chars()
+        .take(CHECK_SUMMARY_CELL_CHARS)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || "/@._-:+".contains(ch) {
+                ch
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if value.chars().count() > CHECK_SUMMARY_CELL_CHARS {
+        cell.push('…');
+    }
+    cell
+}
+
+/// The Actions section of a job's check-run summary: each action the job resolved,
+/// the commit it ran, and where that commit came from: the run's `actions.lock`, the
+/// job's own repository, or a live ref lookup. Empty when the job resolved no action.
+/// It carries names and commits only, never a URL or a credential.
+fn actions_summary(actions: &[crate::actions::ResolvedAction]) -> String {
+    if actions.is_empty() {
+        return String::new();
+    }
+    let mut section =
+        String::from("\n\n### Actions\n\n| Action | Commit | Source |\n|---|---|---|");
+    for action in actions.iter().take(CHECK_SUMMARY_ACTION_ROWS) {
+        let source = match action.source {
+            crate::actions::PinSource::Locked => "locked",
+            crate::actions::PinSource::Live => "live",
+            crate::actions::PinSource::SelfRepository => "self",
+        };
+        section.push_str(&format!(
+            "\n| `{}` | `{}` | {source} |",
+            summary_cell(&action.uses),
+            summary_cell(action.sha.as_deref().unwrap_or("unresolved")),
+        ));
+    }
+    if actions.len() > CHECK_SUMMARY_ACTION_ROWS {
+        section.push_str(&format!(
+            "\n\n… and {} more",
+            actions.len() - CHECK_SUMMARY_ACTION_ROWS
+        ));
+    }
+    section
+}
+
 fn duration_text(
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     finished_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1355,6 +1420,7 @@ fn check_summary(
     conclusion: &str,
     steps: &[crate::models::StepRecord],
     global_issues: &[String],
+    actions: &[crate::actions::ResolvedAction],
     job_id: &JobId,
 ) -> String {
     let mut summary = format!("Job completed with status: **{conclusion}**");
@@ -1375,6 +1441,7 @@ fn check_summary(
             ));
         }
     }
+    summary.push_str(&actions_summary(actions));
     if !global_issues.is_empty() {
         summary.push_str("\n\n### Failure details\n");
         summary.push_str(&global_issues.join("\n"));
@@ -1914,6 +1981,19 @@ async fn workflows_at_git_ref(
     Ok(workflows)
 }
 
+/// The `actions.lock` of a self-built pull-request merge, read from the merge
+/// commit in the engine's mirror where it was built — the same revision
+/// [`fetch_merge_workflows`] reads the workflows from. GitHub has no copy of
+/// that commit, and its own `pull_request` runs read the merge's tree, so the
+/// pins the run resolves against are the merged ones.
+async fn fetch_merge_actions_lockfile(
+    shared: &Arc<SharedState>,
+    merge: &PrebuiltMerge,
+) -> anyhow::Result<Option<String>> {
+    let mirror = shared.state.state_dir.join(&merge.mirror_repository);
+    local_actions_lockfile(&mirror, &merge.sha).await
+}
+
 /// The workflows of a self-built pull-request merge, read from the merge commit
 /// in the engine's mirror where it was built. GitHub has no copy of that commit,
 /// and its own `pull_request` runs read their workflows from the merge, so this
@@ -1960,6 +2040,49 @@ async fn event_workflows(
     }
 }
 
+/// The run's `actions.lock` and the revision it was read at, chosen the way
+/// [`event_workflows`] chooses the workflows.
+///
+/// A pull-request run on an engine-built merge reads the merge commit in the
+/// engine's mirror, which GitHub does not have; a mirror that cannot serve it
+/// falls back to the pull request head, with a warning, exactly as the
+/// workflows do. Every other event reads `resolved_sha`, the commit the run
+/// checks out. The lockfile and the workflow files therefore describe one
+/// revision, so the pins a run resolves against always belong to the workflows
+/// it executes.
+async fn event_actions_lockfile(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    effective: &EffectiveEvent,
+    engine_built_merge: Option<&PrebuiltMerge>,
+    resolved_sha: &str,
+) -> (String, anyhow::Result<Option<String>>) {
+    match (engine_built_merge, is_pull_request_run_event(effective)) {
+        (Some(merge), true) => match fetch_merge_actions_lockfile(shared, merge).await {
+            Ok(lockfile) => (merge.sha.clone(), Ok(lockfile)),
+            Err(error) => {
+                let head = effective
+                    .status_check_sha
+                    .clone()
+                    .unwrap_or_else(|| resolved_sha.to_owned());
+                warn!(
+                    repository = %repo,
+                    merge = %merge.sha,
+                    head = %head,
+                    ?error,
+                    "could not read actions.lock at the engine-built merge; using the pull request head's"
+                );
+                let read = fetch_actions_lockfile(shared, repo, &head).await;
+                (head, read)
+            }
+        },
+        _ => {
+            let read = fetch_actions_lockfile(shared, repo, resolved_sha).await;
+            (resolved_sha.to_owned(), read)
+        }
+    }
+}
+
 pub async fn fetch_workflows_at(
     shared: &Arc<SharedState>,
     repo: &str,
@@ -1990,27 +2113,7 @@ pub async fn fetch_workflows_at(
         }
         Ok(workflows)
     } else {
-        let (token, bucket) = match crate::github_app::select_app_for_repo(shared, repo).await {
-            Some(app) => {
-                let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-                let token =
-                    crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions)
-                        .await?;
-                // The installation id is the rate-limit identity; never
-                // invent one (same convention as check runs).
-                let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
-                    Ok(installation) if installation != 0 => {
-                        crate::github_breaker::GithubCredentialBucket::Installation(installation)
-                    }
-                    _ => crate::github_breaker::GithubCredentialBucket::Pat,
-                };
-                (Some(token), bucket)
-            }
-            None => (
-                shared.state.static_github_pat(),
-                crate::github_breaker::GithubCredentialBucket::Pat,
-            ),
-        };
+        let (token, bucket) = workflow_source_credentials(shared, repo, api_base).await?;
         if let Some(token) = &token {
             fetch_remote_workflows(shared, bucket, token, repo, git_ref, api_base).await
         } else if !git_ref.is_empty() {
@@ -2037,6 +2140,234 @@ pub async fn fetch_workflows_at(
             Ok(workflows)
         }
     }
+}
+
+/// The credential and rate-limit bucket that reads a repository's workflow
+/// sources: an installation token when a GitHub App covers the repository, else
+/// the static PAT, else none.
+async fn workflow_source_credentials(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    api_base: &str,
+) -> anyhow::Result<(
+    Option<String>,
+    crate::github_breaker::GithubCredentialBucket,
+)> {
+    match crate::github_app::select_app_for_repo(shared, repo).await {
+        Some(app) => {
+            let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+            let token =
+                crate::github_app::get_or_mint_token_at(api_base, &app, repo, &permissions).await?;
+            // The installation id is the rate-limit identity; never invent one
+            // (same convention as check runs).
+            let bucket = match crate::github_app::installation_for_repo(&app, repo).await {
+                Ok(installation) if installation != 0 => {
+                    crate::github_breaker::GithubCredentialBucket::Installation(installation)
+                }
+                _ => crate::github_breaker::GithubCredentialBucket::Pat,
+            };
+            Ok((Some(token), bucket))
+        }
+        None => Ok((
+            shared.state.static_github_pat(),
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        )),
+    }
+}
+
+/// The `actions.lock` of `repo` at `git_ref`: the GitHub Actions workflow
+/// dependency lockfile whose pins the run's jobs resolve from. `None` when the
+/// repository has none. It is read from the same source as the workflow files,
+/// so the lockfile and the workflows come from one revision.
+pub async fn fetch_actions_lockfile(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    git_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    let api_base = github_api_base();
+    fetch_actions_lockfile_at(shared, repo, git_ref, &api_base).await
+}
+
+/// [`fetch_actions_lockfile`] against an explicit API base.
+pub async fn fetch_actions_lockfile_at(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    git_ref: &str,
+    api_base: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(base_path) = &shared.state.local_workspace {
+        return local_actions_lockfile(base_path, git_ref).await;
+    }
+    let (token, bucket) = workflow_source_credentials(shared, repo, api_base).await?;
+    if token.is_some() {
+        return fetch_repository_actions_lockfile(
+            shared,
+            bucket,
+            token.as_deref(),
+            repo,
+            git_ref,
+            api_base,
+        )
+        .await;
+    }
+    if !git_ref.is_empty() {
+        anyhow::bail!(
+            "cannot fetch actions.lock at revision {git_ref:?} without a local workspace or GitHub credentials"
+        );
+    }
+    read_working_tree_actions_lockfile(
+        &PathBuf::from(".").join(preloop_gha_parser::lockfile::LOCKFILE_PATH),
+    )
+    .await
+}
+
+/// The `actions.lock` in a local workspace at `git_ref`, read the way the local
+/// workflow files are: the working tree when `git_ref` is empty, else the tree at
+/// that revision.
+async fn local_actions_lockfile(
+    base_path: &std::path::Path,
+    git_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    use preloop_gha_parser::lockfile::{LOCKFILE_PATH, MAX_LOCKFILE_BYTES};
+    if git_ref.is_empty() {
+        return read_working_tree_actions_lockfile(&base_path.join(LOCKFILE_PATH)).await;
+    }
+    if git_ref.starts_with('-') {
+        anyhow::bail!("workflow revision {git_ref:?} is not a valid Git ref");
+    }
+    let listed = git_stdout(
+        base_path,
+        &["ls-tree", "--name-only", git_ref, "--", LOCKFILE_PATH],
+    )
+    .await?;
+    if listed.is_empty() {
+        return Ok(None);
+    }
+    let spec = format!("{git_ref}:{LOCKFILE_PATH}");
+    let size =
+        String::from_utf8_lossy(&git_stdout(base_path, &["cat-file", "-s", spec.as_str()]).await?)
+            .trim()
+            .parse::<u64>()?;
+    if size > MAX_LOCKFILE_BYTES as u64 {
+        anyhow::bail!(
+            "actions.lock at {git_ref:?} is {size} bytes; the limit is {MAX_LOCKFILE_BYTES} bytes"
+        );
+    }
+    let content = git_stdout(base_path, &["show", spec.as_str()]).await?;
+    Ok(Some(String::from_utf8(content)?))
+}
+
+/// Run `git -C <base_path> <args>` and return its stdout. A failed command is
+/// an error carrying git's stderr.
+async fn git_stdout(base_path: &std::path::Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(base_path)
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} in {} failed: {}",
+            args.join(" "),
+            base_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// A working-tree `actions.lock`: `None` when there is none, and an error for
+/// one over the size cap.
+async fn read_working_tree_actions_lockfile(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    use preloop_gha_parser::lockfile::MAX_LOCKFILE_BYTES;
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > MAX_LOCKFILE_BYTES as u64 {
+        anyhow::bail!(
+            "{} is {} bytes; the limit is {MAX_LOCKFILE_BYTES} bytes",
+            path.display(),
+            metadata.len()
+        );
+    }
+    Ok(Some(tokio::fs::read_to_string(path).await?))
+}
+
+/// Fetch `repo`'s `actions.lock` at `git_ref` through the contents API.
+/// `Ok(None)` when the repository has none. The advertised size is checked
+/// before the content is decoded, and the decoded text against the same cap.
+pub(crate) async fn fetch_repository_actions_lockfile(
+    shared: &Arc<SharedState>,
+    bucket: crate::github_breaker::GithubCredentialBucket,
+    token: Option<&str>,
+    repo: &str,
+    git_ref: &str,
+    api_base: &str,
+) -> anyhow::Result<Option<String>> {
+    use base64::Engine as _;
+    use preloop_gha_parser::lockfile::{LOCKFILE_PATH, MAX_LOCKFILE_BYTES};
+
+    #[derive(Deserialize)]
+    struct ContentItem {
+        content: String,
+        encoding: String,
+        size: u64,
+    }
+
+    let url = format!(
+        "{}/repos/{repo}/contents/{LOCKFILE_PATH}?ref={git_ref}",
+        api_base.trim_end_matches('/')
+    );
+    let mut request = crate::shared_http::CLIENT
+        .get(&url)
+        .header("User-Agent", "preloop")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Workflows,
+        request,
+    )
+    .await?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        anyhow::bail!("GitHub returned {status} for {LOCKFILE_PATH} in {repo}");
+    }
+    let item: ContentItem = response.json().await?;
+    if item.size > MAX_LOCKFILE_BYTES as u64 {
+        anyhow::bail!(
+            "{LOCKFILE_PATH} in {repo} is {} bytes; the limit is {MAX_LOCKFILE_BYTES} bytes",
+            item.size
+        );
+    }
+    if item.encoding != "base64" {
+        anyhow::bail!("unsupported GitHub content encoding `{}`", item.encoding);
+    }
+    let encoded: String = item
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    if bytes.len() > MAX_LOCKFILE_BYTES {
+        anyhow::bail!(
+            "{LOCKFILE_PATH} in {repo} decodes to {} bytes; the limit is {MAX_LOCKFILE_BYTES} bytes",
+            bytes.len()
+        );
+    }
+    Ok(Some(String::from_utf8(bytes)?))
 }
 
 async fn fetch_remote_workflows(
@@ -4821,6 +5152,33 @@ async fn process_delivery_payload_with_lease(
                 ));
             }
         };
+        // The run's `actions.lock`, read at the revision `event_workflows` read
+        // the workflows from, so the pins and the workflow files describe the
+        // one revision the run executes. A failed read fails the delivery,
+        // exactly as a failed workflow read does.
+        let (inventory_sha, lockfile) = event_actions_lockfile(
+            shared,
+            &repo_full_name,
+            effective,
+            engine_built_merge.as_ref(),
+            &resolved_sha,
+        )
+        .await;
+        let actions_lockfile = match lockfile {
+            Ok(lockfile) => lockfile,
+            Err(error) => {
+                error!(
+                    event = %effective.event,
+                    sha = %inventory_sha,
+                    source_ref = %workflow_ref,
+                    ?error,
+                    "Failed to fetch actions.lock at the event commit"
+                );
+                return WebhookOutcome::TransientError(format!(
+                    "Failed to fetch actions.lock at event commit: {error:?}"
+                ));
+            }
+        };
 
         if effective.event == "push"
             && effective.git_ref == ref_default
@@ -4993,7 +5351,9 @@ async fn process_delivery_payload_with_lease(
                 secrets: BTreeMap::new(),
                 run_secret_names: BTreeSet::new(),
                 reusable_workflows: BTreeMap::new(),
+                actions_lockfile: actions_lockfile.clone(),
                 reusable_workflow_shas: BTreeMap::new(),
+                reusable_workflow_lockfiles: BTreeMap::new(),
                 enable_debugger: false,
                 triggering_actor: None,
                 debugger_welcome_message: None,
@@ -5166,6 +5526,25 @@ async fn process_delivery_payload_with_lease(
                         }
                     }
                     triggered_count += 1;
+                }
+                Err(e) if e.kind() == crate::errors::ApiErrorKind::ActionsPolicy => {
+                    // A refused lockfile or actions policy fails this workflow's
+                    // check. It is not "not triggered by this event", so it is
+                    // reported as a permanent failure, not an unmatched workflow.
+                    let error_msg = e.message().to_owned();
+                    warn!("Actions policy refused {filename}: {error_msg}");
+                    let sha = effective
+                        .status_check_sha
+                        .clone()
+                        .or_else(|| Some(resolved_sha.clone()));
+                    if permanent_failure_keys.insert((sha.clone(), filename.clone())) {
+                        permanent_failures.push(WebhookFailure {
+                            sha,
+                            check_name: filename.clone(),
+                            error: error_msg,
+                        });
+                    }
+                    continue;
                 }
                 Err(e) => {
                     let detail = format!("{e:?}");
@@ -5801,6 +6180,7 @@ mod tests {
             "failure",
             &[setup, test],
             &["- exit code 1".to_owned()],
+            &[],
             &preloop_gha_protocol::JobId("test".to_owned()),
         );
         assert!(summary.contains("| Set up \\| tools | success | 1.2s |"));
@@ -7710,9 +8090,10 @@ mod tests {
 
     /// A pull-request graph in which the base changed `.github/workflows/ci.yml`
     /// after the pull request branched, and the head never touched that file.
-    /// Returns the head sha. Once the fixture commits the workspace, the base
-    /// tip is `main`.
-    fn build_base_advanced_workflow_graph(ws_dir: &std::path::Path) -> String {
+    /// `lockfile` is committed on the base alongside that change, so the merge
+    /// carries it and the head does not. Returns the head sha. Once the fixture
+    /// commits the workspace, the base tip is `main`.
+    fn build_base_advanced_graph(ws_dir: &std::path::Path, lockfile: Option<&str>) -> String {
         std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
         std::fs::write(
             ws_dir.join(".github/workflows/ci.yml"),
@@ -7739,12 +8120,27 @@ mod tests {
             marked_pull_request_workflow("merge-version"),
         )
         .unwrap();
+        if let Some(lockfile) = lockfile {
+            std::fs::write(ws_dir.join(".github/workflows/actions.lock"), lockfile).unwrap();
+        }
         git_output(ws_dir, &["add", "-A"]);
         git_output(ws_dir, &["commit", "-qm", "base advances the workflow"]);
         // `WebhookFixture` commits the workspace itself; leave it something to commit.
         std::fs::write(ws_dir.join(".fixture-marker"), "marker\n").unwrap();
         head
     }
+
+    /// A valid lockfile whose pins are visible in the submission, so a test can
+    /// tell which revision the run read it from.
+    const BASE_LOCKFILE: &str = concat!(
+        "version: 'v0.0.3'\n",
+        "dependencies:\n",
+        "  'example/action@v1':\n",
+        "    ref: 'v1'\n",
+        "    commit: 'sha1-1111111111111111111111111111111111111111'\n",
+        "    owner_id: 1\n",
+        "    repo_id: 2\n",
+    );
 
     /// A self-built merge runs the workflow revision at that merge. The base
     /// changed a workflow file the head never touched; GitHub's own
@@ -7757,7 +8153,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
-        let head = build_base_advanced_workflow_graph(&ws_dir);
+        let head = build_base_advanced_graph(&ws_dir, None);
 
         // GitHub never offers a merge for this head, so the engine builds its own.
         let api_head = head.clone();
@@ -7817,6 +8213,95 @@ mod tests {
         assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
     }
 
+    /// The run's `actions.lock` comes from the same revision as its workflows:
+    /// the merge. The base added the pin after the pull request branched and the
+    /// head never had one, so a lockfile read at the head would leave the
+    /// merge's workflow resolving against no pin at all.
+    #[tokio::test]
+    async fn self_built_merge_reads_the_lockfile_revision_at_the_merge() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "test-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        let head = build_base_advanced_graph(&ws_dir, Some(BASE_LOCKFILE));
+
+        // GitHub never offers a merge for this head, so the engine builds its own.
+        let api_head = head.clone();
+        let (api, _requests) = start_github_stub(move |_method, path, _body| {
+            if path == "/repos/owner/repo/pulls/42" {
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({
+                        "mergeable": null,
+                        "merge_commit_sha": null,
+                        "head": { "sha": api_head.clone() },
+                        "base": { "sha": null },
+                    }),
+                );
+            }
+            if path == "/repos/owner/repo/pulls/42/files" {
+                return (200, vec![], pr_files_answer());
+            }
+            (404, vec![], serde_json::json!({ "message": "not found" }))
+        })
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let mut fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        fixture.state.fresh_merge_poll = FreshMergePoll {
+            budget: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(20),
+        };
+        let upstream = publish_merge_upstream(&fixture.state, &ws_dir);
+        serve_merges_from(
+            &mut fixture.state,
+            upstream.parent().unwrap().parent().unwrap(),
+        );
+        // The fixture commits the workspace, so the base tip is read after it.
+        let base_tip = git_output(&ws_dir, &["rev-parse", "main"]);
+
+        let payload = stale_pull_request_payload(&head, &"1".repeat(40), &base_tip);
+        assert_eq!(
+            fixture
+                .post_body("delivery-pr-base-lockfile", Some("pull_request"), &payload)
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let record = fixture
+            .state
+            .backend
+            .get_webhook_delivery("delivery-pr-base-lockfile")
+            .await
+            .unwrap()
+            .expect("delivery row must exist");
+        assert_eq!(
+            record.state,
+            WebhookDeliveryStatus::Done,
+            "the delivery must complete: {:?}",
+            record.last_error
+        );
+        let inner = fixture.state.test_tx().await;
+        assert_eq!(inner.runs.len(), 1, "exactly the pull_request run");
+        let run = inner.runs.values().next().unwrap();
+        assert!(
+            run.submission.workflow_yaml.contains("merge-version"),
+            "the run must execute the workflow revision at the merge, got:\n{}",
+            run.submission.workflow_yaml
+        );
+        assert_eq!(
+            run.submission.actions_lockfile.as_deref(),
+            Some(BASE_LOCKFILE),
+            "the lock must come from the merge, the revision the workflows came from"
+        );
+        let merge_sha = run.submission.sha.clone();
+        drop(inner);
+        assert_engine_merge(&merge_mirror(&fixture.state), &merge_sha, &base_tip, &head);
+    }
+
     /// When the engine's mirror cannot serve the merge's workflows, they come
     /// from the pull request head instead, so the delivery is not lost.
     #[tokio::test]
@@ -7824,7 +8309,7 @@ mod tests {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
-        let head = build_base_advanced_workflow_graph(&ws_dir);
+        let head = build_base_advanced_graph(&ws_dir, None);
         let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
         let shared = Arc::new(SharedState {
             state: fixture.state.clone(),
@@ -13030,5 +13515,95 @@ jobs:
                 .all(|request| !request.contains("check-runs/") && !request.contains("deployments")),
             "an unsatisfied approval touches no GitHub surface: {requests:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod actions_summary_tests {
+    use super::*;
+    use crate::actions::{PinSource, ResolvedAction};
+
+    const LOCKED: &str = "1111111111111111111111111111111111111111";
+
+    /// Locked and live rows name their source. A hostile ref cannot break the table,
+    /// carry markup, or carry a signed URL's query, and it cannot start a second row.
+    #[test]
+    fn actions_summary_renders_sources_and_neutralizes_hostile_refs() {
+        let locked = ResolvedAction {
+            uses: "actions/checkout@v4".to_owned(),
+            sha: Some(LOCKED.to_owned()),
+            source: PinSource::Locked,
+        };
+        let hostile = ResolvedAction {
+            uses: "evil/x@v1|`<b>&sig=abc\n## boom".to_owned(),
+            sha: None,
+            source: PinSource::Live,
+        };
+        let section = actions_summary(&[locked, hostile]);
+        assert!(
+            section.contains(&format!("| `actions/checkout@v4` | `{LOCKED}` | locked |")),
+            "{section}"
+        );
+        assert!(
+            section.contains("| `evil/x@v1???b??sig?abc????boom` | `unresolved` | live |"),
+            "{section}"
+        );
+        assert_eq!(
+            section
+                .lines()
+                .filter(|line| line.starts_with("| `"))
+                .count(),
+            2,
+            "{section}"
+        );
+        assert!(
+            !section.contains('<') && !section.contains('&') && !section.contains("sig="),
+            "{section}"
+        );
+    }
+
+    /// The table stops at its row cap and says how many actions it left out. A long
+    /// name is cut to the cell cap, and no action means no section.
+    #[test]
+    fn actions_summary_caps_rows_and_cell_length() {
+        assert!(actions_summary(&[]).is_empty());
+        let many: Vec<ResolvedAction> = (0..CHECK_SUMMARY_ACTION_ROWS + 5)
+            .map(|index| ResolvedAction {
+                uses: format!("owner/repo{index}@v1"),
+                sha: None,
+                source: PinSource::Live,
+            })
+            .collect();
+        let section = actions_summary(&many);
+        assert_eq!(
+            section
+                .lines()
+                .filter(|line| line.starts_with("| `"))
+                .count(),
+            CHECK_SUMMARY_ACTION_ROWS,
+            "{section}"
+        );
+        assert!(section.contains("… and 5 more"), "{section}");
+        let long = ResolvedAction {
+            uses: format!("owner/{}", "a".repeat(300)),
+            sha: None,
+            source: PinSource::Live,
+        };
+        let cut = format!(
+            "owner/{}…",
+            "a".repeat(CHECK_SUMMARY_CELL_CHARS - "owner/".len())
+        );
+        assert!(actions_summary(&[long]).contains(&format!("| `{cut}` | `unresolved` | live |")));
+    }
+
+    /// A job's own `$/` rows name their source `self`.
+    #[test]
+    fn actions_summary_labels_self_repository_rows() {
+        let own = ResolvedAction {
+            uses: format!("owner/repo/.github/actions/x@{LOCKED}"),
+            sha: Some(LOCKED.to_owned()),
+            source: PinSource::SelfRepository,
+        };
+        assert!(actions_summary(&[own]).contains("| self |"));
     }
 }

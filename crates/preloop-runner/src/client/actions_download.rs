@@ -71,6 +71,22 @@ fn valid_archive_sha256(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The `runnerresolve/actions` request body. `actions_dependencies` is present only when
+/// the job has lockfile pins: the official `ActionReferenceRequestList` marks it
+/// `EmitDefaultValue = false` (`LaunchContracts.cs`), and the runner sends null for an
+/// empty list (`ActionManager.GetDownloadInfoAsync`).
+fn runnerresolve_body(actions: &[(&str, &str)], dependencies: &[String]) -> serde_json::Value {
+    let action_list: Vec<serde_json::Value> = actions
+        .iter()
+        .map(|(action, version)| serde_json::json!({ "action": action, "version": version }))
+        .collect();
+    let mut body = serde_json::json!({ "actions": action_list });
+    if !dependencies.is_empty() {
+        body["actions_dependencies"] = serde_json::json!(dependencies);
+    }
+    body
+}
+
 impl ActionsResolveClient {
     /// Create a new client.
     ///
@@ -85,7 +101,8 @@ impl ActionsResolveClient {
     /// Batch-resolve a list of `uses:` references via `runnerresolve/actions`.
     ///
     /// Golden 10 flow 19: POST `{launch_base}/actions/{build}/{orchestration_id}/jobs/{job_id}/runner`
-    /// with body `{ "actions": [{ "action": "owner/repo", "version": "ref" }] }`.
+    /// with body `{ "actions": [{ "action": "owner/repo", "version": "ref" }] }`, plus
+    /// `actions_dependencies` when `dependencies` (the job's lockfile pins) is non-empty.
     ///
     /// Returns a map from `"owner/repo@ref"` → `ResolvedAction`.
     pub async fn resolve_batch(
@@ -94,17 +111,13 @@ impl ActionsResolveClient {
         orchestration_id: &str,
         job_id: &str,
         actions: &[(&str, &str)], // (action, version) pairs
+        dependencies: &[String],
     ) -> Result<HashMap<String, ResolvedAction>> {
-        let Some(ref base) = self.launch_base_url else {
+        let Some(base) = &self.launch_base_url else {
             return Ok(HashMap::new());
         };
 
-        let action_list: Vec<serde_json::Value> = actions
-            .iter()
-            .map(|(action, version)| serde_json::json!({ "action": action, "version": version }))
-            .collect();
-
-        let body = serde_json::json!({ "actions": action_list });
+        let body = runnerresolve_body(actions, dependencies);
 
         // URL format from golden 10 flow 19:
         // /actions/build/{plan_id}/jobs/{job_id}/runnerresolve/actions
@@ -334,7 +347,7 @@ mod tests {
         let client = ActionsResolveClient::new(HttpClient::new(None).unwrap(), Some(base));
 
         let result = client
-            .resolve_batch("token", "plan", "job", &[("actions/checkout", "v4")])
+            .resolve_batch("token", "plan", "job", &[("actions/checkout", "v4")], &[])
             .await
             .unwrap();
 
@@ -347,7 +360,13 @@ mod tests {
         let client = ActionsResolveClient::new(HttpClient::new(None).unwrap(), Some(base));
 
         let error = client
-            .resolve_batch("bad-token", "plan", "job", &[("actions/checkout", "v4")])
+            .resolve_batch(
+                "bad-token",
+                "plan",
+                "job",
+                &[("actions/checkout", "v4")],
+                &[],
+            )
             .await
             .unwrap_err();
 
@@ -397,7 +416,7 @@ mod tests {
         let client = ActionsResolveClient::new(HttpClient::new(None).unwrap(), Some(base));
 
         let result = client
-            .resolve_batch("token", "plan", "job", &[("actions/checkout", "v4")])
+            .resolve_batch("token", "plan", "job", &[("actions/checkout", "v4")], &[])
             .await
             .unwrap();
 
@@ -419,6 +438,25 @@ mod tests {
             result["actions/bad@v4"].archive_sha256,
             ArchiveDigestPin::Unpinned,
             "malformed pin must not become a Pinned digest"
+        );
+    }
+
+    /// The request carries `actions_dependencies` only when the job has pins, matching
+    /// the official `ActionReferenceRequestList`, which omits the field when empty.
+    #[test]
+    fn runnerresolve_body_carries_dependencies_only_when_pinned() {
+        let actions = [("actions/checkout", "v4")];
+        let pinned =
+            runnerresolve_body(&actions, &["actions/checkout@v4:sha256-abc123".to_owned()]);
+        assert_eq!(
+            pinned["actions_dependencies"],
+            serde_json::json!(["actions/checkout@v4:sha256-abc123"])
+        );
+        let unpinned = runnerresolve_body(&actions, &[]);
+        assert!(unpinned.get("actions_dependencies").is_none());
+        assert_eq!(
+            unpinned["actions"],
+            serde_json::json!([{ "action": "actions/checkout", "version": "v4" }])
         );
     }
 }

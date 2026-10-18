@@ -827,6 +827,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         shared.state.static_github_pat().as_deref(),
     )
     .await?;
+    // The run's `actions.lock` files are parsed here, before anything is decided
+    // from them: a broken lockfile rejects the submission. The actions policy
+    // then judges the whole workflow tree the run expands: the top-level
+    // workflow and each reusable workflow resolved above.
+    let lockfiles = crate::actions::RunLockfiles::from_submission(&submission)?;
+    shared
+        .state
+        .actions_policy()
+        .evaluate(&crate::actions_policy::PolicyInputs {
+            workflow_path: &crate::actions::submission_workflow_path(&submission),
+            workflow: &workflow,
+            reusable_workflows: &submission.reusable_workflows,
+            reusable_workflow_shas: &submission.reusable_workflow_shas,
+            lock: lockfiles.root(),
+            remote_locks: lockfiles.remote(),
+        })
+        .map_err(|violations| ApiError::actions_policy(violations.to_string()))?;
     let remote_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
@@ -1155,10 +1172,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         })
         .to_string();
-    let workflow_path = submission
-        .workflow_path
-        .clone()
-        .unwrap_or_else(|| ".github/workflows/workflow.yml".to_owned());
+    let workflow_path = crate::actions::submission_workflow_path(&submission);
     let workflow_ref = format!(
         "{}/{}@{}",
         submission.repository, workflow_path, submission.git_ref
@@ -1800,6 +1814,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             &base_url,
             workspace_snapshot.as_ref(),
             &job,
+            &lockfiles,
         )?;
 
         prebuilt.push(PrebuiltJob {
@@ -2585,6 +2600,7 @@ pub(crate) fn build_job_artifacts(
     base_url: &str,
     workspace_snapshot: Option<&WorkspaceSnapshot>,
     job: &preloop_gha_protocol::JobPlan,
+    lockfiles: &crate::actions::RunLockfiles,
 ) -> Result<BuiltJobArtifacts, ApiError> {
     // One policy drives every job-facing authority decision for this tier:
     // stored secrets, the runner-visible `system.github.token.permissions`
@@ -2691,6 +2707,7 @@ pub(crate) fn build_job_artifacts(
 
     agent_msg.preloop_preserve_on_failure = submission.preserve_on_failure.then_some(true);
     agent_msg.preloop_debug_on_failure = submission.debug_on_failure.then_some(true);
+    agent_msg.dependencies = lockfiles.job_dependencies(submission, job);
 
     // The message builder already wrote the declared permission set into the
     // wire variable; for a fork-restricted job that set must be restated as
@@ -3955,14 +3972,34 @@ pub(crate) async fn rerun_run_with_mode(
         };
     };
 
+    // The policy may have changed since this run was accepted — an operator
+    // enables `require_sha_pinning` or `require_lockfile` and restarts — so the
+    // stored workflow is judged again before the new attempt is created. An
+    // ordinary in-place rerun reuses the stored job templates verbatim, so
+    // without this an earlier accepted, lockless or tag-pinned workflow would
+    // run again under the stricter policy.
+    let workflow = parse_workflow(&submission.workflow_yaml)?;
+    let lockfiles = crate::actions::RunLockfiles::from_submission(&submission)?;
+    shared
+        .state
+        .actions_policy()
+        .evaluate(&crate::actions_policy::PolicyInputs {
+            workflow_path: &crate::actions::submission_workflow_path(&submission),
+            workflow: &workflow,
+            reusable_workflows: &submission.reusable_workflows,
+            reusable_workflow_shas: &submission.reusable_workflow_shas,
+            lock: lockfiles.root(),
+            remote_locks: lockfiles.remote(),
+        })
+        .map_err(|violations| ApiError::actions_policy(violations.to_string()))?;
+
     // Workflow-level concurrency is re-evaluated for the new attempt off
     // the stored workflow, against the stored github context — the same
     // inputs submit evaluated (`inputs`, not `dispatch_inputs`, mirroring
     // submit's own merge where dispatch inputs sit on top).
     let mut workflow_concurrency = None;
     let mut templates = Vec::new();
-    if !plan.missing_templates.is_empty() || submission.workflow_yaml.contains("concurrency") {
-        let workflow = parse_workflow(&submission.workflow_yaml)?;
+    if !plan.missing_templates.is_empty() || workflow.concurrency.is_some() {
         if let Some(raw) = &workflow.concurrency {
             let eval_ctx = concurrency::ConcurrencyContext {
                 scope: concurrency::ConcurrencyScope::Workflow,
@@ -4050,6 +4087,7 @@ pub(crate) async fn rerun_run_with_mode(
                     &base_url,
                     record.workspace_snapshot.as_ref(),
                     job,
+                    &lockfiles,
                 )?;
                 let condition_context = build_context(
                     &record.github,
@@ -5133,7 +5171,15 @@ mod tests {
                 "/repos/{owner}/{repo}/contents/{*path}",
                 get({
                     let seen = seen_auth.clone();
-                    move |headers: HeaderMap| async move {
+                    move |headers: HeaderMap, uri: axum::http::Uri| async move {
+                        // The callee repository has no `actions.lock`.
+                        if uri.path().ends_with("/actions.lock") {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"message": "Not Found"})),
+                            )
+                                .into_response();
+                        }
                         let auth = headers
                             .get(header::AUTHORIZATION)
                             .and_then(|value| value.to_str().ok())

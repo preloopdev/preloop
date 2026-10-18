@@ -269,8 +269,20 @@ pub async fn run_steps(
                 setup_lines.push(proxy_setup_line(&ts, scheme, &proxy));
             }
         }
+        // Official JobExtension.InitializeJob prints the lockfile announcement after the
+        // proxy lines, before "Prepare workflow directory".
+        if let Some(text) =
+            super::action_preparation::lockfile_announcement(&job.actions_dependencies)
+        {
+            setup_lines.push(format!("{ts} {text}"));
+        }
         setup_lines.push(format!("{ts} Prepare workflow directory"));
         setup_lines.push(format!("{ts} Prepare all required actions"));
+        setup_lines.extend(
+            job.setup_action_lines
+                .iter()
+                .map(|line| format!("{ts} {line}")),
+        );
         setup_lines.push(format!("{ts} Complete job name: {}", job.job_name));
 
         let setup_content = setup_lines.join("\n");

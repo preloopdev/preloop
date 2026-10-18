@@ -727,9 +727,19 @@ pub async fn candidate_apps_for_repo_inner(
     shared: &crate::state::SharedState,
     repository: &str,
 ) -> Result<Vec<GitHubAppCredentials>, AppLookupError> {
-    let Some(registry) = shared.state.github_apps.as_ref() else {
+    candidate_apps_for_repo_inner_state(&shared.state, repository).await
+}
+
+/// [`candidate_apps_for_repo_inner`] over a bare [`AppState`]: the action
+/// resolution path holds the state, not the shared handle. App selection reads
+/// only the App registry, so the handle buys nothing here.
+pub async fn candidate_apps_for_repo_inner_state(
+    state: &crate::state::AppState,
+    repository: &str,
+) -> Result<Vec<GitHubAppCredentials>, AppLookupError> {
+    let Some(registry) = state.github_apps.as_ref() else {
         // No registry — the legacy field (tests, older callers) is the App.
-        return Ok(shared.state.github_app.clone().into_iter().collect());
+        return Ok(state.github_app.clone().into_iter().collect());
     };
     let owner = match split_repository(repository) {
         Ok((owner, _)) => owner.to_owned(),
@@ -784,6 +794,25 @@ pub async fn candidate_apps_for_repo_inner(
         );
     }
     Ok(candidates)
+}
+
+/// [`select_app_for_repo`] over a bare [`AppState`], with the same transient
+/// handling: a registry of exactly one App falls back to it, because the lone
+/// App is the only one minting can try and the mint failure policy — not
+/// selection — decides what a failed lookup means.
+pub async fn select_app_for_repo_in_state(
+    state: &crate::state::AppState,
+    repository: &str,
+) -> Option<GitHubAppCredentials> {
+    match candidate_apps_for_repo_inner_state(state, repository).await {
+        Ok(candidates) => candidates.into_iter().next(),
+        Err(AppLookupError::Transient(_)) => state
+            .github_apps
+            .as_ref()
+            .filter(|registry| registry.apps.len() == 1)
+            .map(|registry| registry.default_app().clone()),
+        Err(AppLookupError::NotInstalled) => None,
+    }
 }
 
 /// Whether `app`'s installation covers the exact `repository`.

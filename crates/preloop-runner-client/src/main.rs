@@ -180,6 +180,13 @@ async fn main() -> anyhow::Result<()> {
                     (k, json_val)
                 })
                 .collect();
+            // A lock travels with the repository-relative path it keys. Without one the
+            // submission carries neither field, as before.
+            let locked = lockfile_submission(&std::env::current_dir()?, &workflow).await?;
+            let (workflow_path, actions_lockfile) = match locked {
+                Some((path, lockfile)) => (Some(path), Some(lockfile)),
+                None => (None, None),
+            };
             let submission = SubmitWire {
                 workflow_yaml,
                 event,
@@ -193,6 +200,8 @@ async fn main() -> anyhow::Result<()> {
                     &workflow,
                 )
                 .await?,
+                workflow_path,
+                actions_lockfile,
                 enable_debugger: debug,
                 debugger_welcome_message,
                 inputs,
@@ -353,6 +362,13 @@ struct SubmitWire {
     vars: BTreeMap<String, String>,
     secrets: BTreeMap<String, String>,
     reusable_workflows: BTreeMap<String, String>,
+    /// The repository-relative path of the submitted workflow. Sent only with the
+    /// `actions_lockfile` it keys; omitted otherwise, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_path: Option<String>,
+    /// The `actions.lock` of the workflow's repository; sent only with its `workflow_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actions_lockfile: Option<String>,
     enable_debugger: bool,
     debugger_welcome_message: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -395,6 +411,95 @@ async fn collect_reusable_workflows(
         out.insert(relative, yaml);
     }
     Ok(out)
+}
+
+/// Largest `actions.lock` the client submits; the server applies the same cap.
+const MAX_ACTIONS_LOCKFILE_BYTES: u64 = 1024 * 1024;
+
+/// The repository's `actions.lock` text for submission, or `None` when the repository has no
+/// lockfile. The read is bounded, so an oversized file fails by name instead of truncating.
+async fn collect_actions_lockfile(root: &std::path::Path) -> anyhow::Result<Option<String>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let path = root.join(preloop_gha_parser::lockfile::LOCKFILE_PATH);
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    let mut text = String::new();
+    file.take(MAX_ACTIONS_LOCKFILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    anyhow::ensure!(
+        text.len() as u64 <= MAX_ACTIONS_LOCKFILE_BYTES,
+        "{} is larger than the {MAX_ACTIONS_LOCKFILE_BYTES}-byte limit for submitted lockfiles",
+        path.display()
+    );
+    Ok(Some(text))
+}
+
+/// The repository a workflow belongs to, found from the workflow's own location: the root is the
+/// nearest ancestor of the workflow's directory whose `.github/workflows` resolves to a directory
+/// that holds the workflow. Returns that root and the workflow's path relative to
+/// `<root>/.github/workflows`. A relative `workflow` resolves against `base`, as `-f` resolves
+/// against the working directory. Only the directory is canonicalized, so a symlinked workflow
+/// file still belongs to the repository it sits in. `None` when no ancestor is such a root.
+fn workflow_repository(
+    base: &std::path::Path,
+    workflow: &std::path::Path,
+) -> anyhow::Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
+    let workflow = base.join(workflow);
+    let directory = workflow.parent().context("the workflow has no directory")?;
+    let directory = std::fs::canonicalize(directory)
+        .with_context(|| format!("resolve {}", directory.display()))?;
+    let name = workflow
+        .file_name()
+        .context("the workflow has no file name")?;
+    let location = directory.join(name);
+    for root in location.ancestors().skip(1) {
+        let Ok(workflows) = std::fs::canonicalize(root.join(".github").join("workflows")) else {
+            continue;
+        };
+        let Ok(relative) = location.strip_prefix(&workflows) else {
+            continue;
+        };
+        return Ok(Some((root.to_path_buf(), relative.to_path_buf())));
+    }
+    Ok(None)
+}
+
+/// The repository-relative path and the `actions.lock` text to submit for a workflow, decided
+/// together: a lock is sent only with the path it keys. `None` when the workflow belongs to no
+/// repository or its repository has no lock; the caller then submits the workflow as before.
+async fn lockfile_submission(
+    base: &std::path::Path,
+    workflow: &std::path::Path,
+) -> anyhow::Result<Option<(String, String)>> {
+    let Some((root, relative)) = workflow_repository(base, workflow)? else {
+        return Ok(None);
+    };
+    let Some(lockfile) = collect_actions_lockfile(&root).await? else {
+        return Ok(None);
+    };
+    let names = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()
+        .with_context(|| {
+            format!(
+                "workflow {} has a name that is not UTF-8, so its actions.lock cannot name it",
+                relative.display()
+            )
+        })?;
+    Ok(Some((
+        format!(".github/workflows/{}", names.join("/")),
+        lockfile,
+    )))
 }
 
 fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -919,5 +1024,176 @@ mod tests {
             .await;
             assert!(result.is_err(), "`{uses}` must be refused");
         }
+    }
+
+    const ACTIONS_LOCK_TEXT: &str = "version: v0.0.3\n";
+    const NESTED_LOCK_TEXT: &str = "version: v0.0.3\n# nested repository\n";
+
+    /// A fresh directory under the system temp dir, unique to this test process and `name`.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "preloop-runner-client-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A scratch repository: a `ci.yml` workflow, and an `actions.lock` when `with_lock`.
+    fn scratch_repository(name: &str, with_lock: bool) -> std::path::PathBuf {
+        let root = scratch_dir(name);
+        let workflows = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "on: push\n").unwrap();
+        if with_lock {
+            std::fs::write(workflows.join("actions.lock"), ACTIONS_LOCK_TEXT).unwrap();
+        }
+        root
+    }
+
+    /// What a locked `ci.yml` of `scratch_repository(_, true)` submits.
+    fn locked_ci() -> Option<(String, String)> {
+        Some((
+            ".github/workflows/ci.yml".to_owned(),
+            ACTIONS_LOCK_TEXT.to_owned(),
+        ))
+    }
+
+    /// The submit body for the decided fields, as `submit` posts it.
+    fn submitted(workflow_path: Option<String>, actions_lockfile: Option<String>) -> Value {
+        serde_json::to_value(SubmitWire {
+            workflow_yaml: String::new(),
+            event: "push".to_owned(),
+            payload: Value::Null,
+            repository: "octo/app".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            vars: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+            reusable_workflows: BTreeMap::new(),
+            workflow_path,
+            actions_lockfile,
+            enable_debugger: false,
+            debugger_welcome_message: None,
+            inputs: BTreeMap::new(),
+        })
+        .unwrap()
+    }
+
+    /// An absolute spelling of a locked workflow is sent under its repository-relative path,
+    /// with the repository's lock. No workspace root is involved.
+    #[tokio::test]
+    async fn absolute_spelling_of_a_locked_workflow_is_sent_repository_relative() {
+        let root = scratch_repository("absolute", true);
+        let workflow = root.join(".github/workflows/ci.yml");
+        let locked = lockfile_submission(&root, &workflow).await.unwrap();
+        assert_eq!(locked, locked_ci());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `../.github/workflows/ci.yml` from `repo/sub` finds the repository's lock.
+    #[tokio::test]
+    async fn dot_dot_from_a_subdirectory_finds_the_repositorys_lock() {
+        let root = scratch_repository("subdirectory", true);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let relative = std::path::Path::new("../.github/workflows/ci.yml");
+        let locked = lockfile_submission(&sub, relative).await.unwrap();
+        assert_eq!(locked, locked_ci());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlinked spelling of a locked workflow is sent under its repository-relative path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_spelling_of_a_locked_workflow_is_sent_repository_relative() {
+        let root = scratch_repository("symlinked", true);
+        let alias = env::temp_dir().join(format!(
+            "preloop-runner-client-alias-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let workflow = alias.join(".github/workflows/ci.yml");
+        let locked = lockfile_submission(&root, &workflow).await.unwrap();
+        assert_eq!(locked, locked_ci());
+        let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repository without a lock has nothing to send.
+    #[tokio::test]
+    async fn workflow_in_a_repository_without_a_lock_has_no_lock() {
+        let root = scratch_repository("lockless", false);
+        let workflow = root.join(".github/workflows/ci.yml");
+        let locked = lockfile_submission(&root, &workflow).await.unwrap();
+        assert_eq!(locked, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A workflow outside every `.github/workflows` directory belongs to no repository.
+    #[tokio::test]
+    async fn workflow_outside_any_workflows_directory_has_no_lock() {
+        let plain = scratch_dir("plain");
+        let workflow = plain.join("ci.yml");
+        std::fs::write(&workflow, "on: push\n").unwrap();
+        let locked = lockfile_submission(&plain, &workflow).await.unwrap();
+        assert_eq!(locked, None);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    /// A workflow in a nested repository is governed by that repository's own lock.
+    #[tokio::test]
+    async fn nested_repository_is_governed_by_its_own_lock() {
+        let outer = scratch_repository("nested", true);
+        let inner = outer.join("vendor").join("inner");
+        let workflows = inner.join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "on: push\n").unwrap();
+        std::fs::write(workflows.join("actions.lock"), NESTED_LOCK_TEXT).unwrap();
+        let locked = lockfile_submission(&outer, &workflows.join("ci.yml"))
+            .await
+            .unwrap();
+        assert_eq!(
+            locked,
+            Some((
+                ".github/workflows/ci.yml".to_owned(),
+                NESTED_LOCK_TEXT.to_owned()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    /// A name that is not UTF-8 cannot be keyed in a lock: with a lock that is an error, and
+    /// without one the workflow is submitted as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_workflow_name_is_an_error_only_where_a_lock_must_name_it() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::OsStr::from_bytes(b"ci-\xff.yml");
+        let with_lock = scratch_repository("non-utf8-locked", true);
+        let workflow = with_lock.join(".github/workflows").join(name);
+        std::fs::write(&workflow, "on: push\n").unwrap();
+        assert!(lockfile_submission(&with_lock, &workflow).await.is_err());
+        let without_lock = scratch_repository("non-utf8-unlocked", false);
+        let workflow = without_lock.join(".github/workflows").join(name);
+        std::fs::write(&workflow, "on: push\n").unwrap();
+        let locked = lockfile_submission(&without_lock, &workflow).await.unwrap();
+        assert_eq!(locked, None);
+        let _ = std::fs::remove_dir_all(&with_lock);
+        let _ = std::fs::remove_dir_all(&without_lock);
+    }
+
+    /// A submission without a lock carries neither repository field; one with a lock carries
+    /// both, as the decision made them.
+    #[test]
+    fn repository_fields_travel_only_with_a_lock() {
+        let without = submitted(None, None);
+        assert!(without.get("workflow_path").is_none());
+        assert!(without.get("actions_lockfile").is_none());
+        let (path, lockfile) = locked_ci().unwrap();
+        let locked_wire = submitted(Some(path), Some(lockfile));
+        assert_eq!(locked_wire["workflow_path"], ".github/workflows/ci.yml");
+        assert_eq!(locked_wire["actions_lockfile"], ACTIONS_LOCK_TEXT);
     }
 }

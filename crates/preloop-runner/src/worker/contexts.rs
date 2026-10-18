@@ -41,6 +41,13 @@ pub struct JobContext {
     pub job_annotations: Vec<Annotation>,
     /// Resolved action directories keyed by the original `uses:` reference.
     pub action_paths: HashMap<String, String>,
+    /// Lockfile pins from the job message (official `dependencies`). Set Up job announces
+    /// them and every Launch resolve forwards them; empty when the workflow has no
+    /// `actions.lock` entry.
+    pub actions_dependencies: Vec<String>,
+    /// Set Up job lines from action preparation, unstamped; printed after
+    /// `Prepare all required actions`.
+    pub setup_action_lines: Vec<String>,
     /// Active problem matchers (cross-step, registered by actions like setup-node).
     pub matchers: MatcherRegistry,
     /// Container state for job/service containers (Phase 2).
@@ -179,6 +186,8 @@ impl JobContext {
             job_annotations: Vec::new(),
             state: HashMap::new(),
             action_paths: HashMap::new(),
+            actions_dependencies: Vec::new(),
+            setup_action_lines: Vec::new(),
             matchers: MatcherRegistry::new(),
             container_state: None,
             container_engine: None,

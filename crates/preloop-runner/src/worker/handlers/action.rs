@@ -237,6 +237,7 @@ pub(crate) async fn ensure_remote_action_staged(
                 plan_id,
                 job_id,
                 &[(action_name.as_str(), git_ref)],
+                &ctx.job.actions_dependencies,
             )
             .await
             .with_context(|| format!("runnerresolve nested action {uses}"))?;

@@ -2209,6 +2209,17 @@ where
     let base_url = crate::broker::runner_base_url();
     let normalized_github =
         preloop_gha_parser::job_builder::normalize_github_context(&ctx.github_json);
+    // The run's lockfiles were parsed and accepted at submit; a parse failure
+    // here fails the expansion rather than building messages without them.
+    let lockfiles =
+        crate::actions::RunLockfiles::from_submission(&ctx.submission).map_err(|error| {
+            tracing::warn!(
+                run_id = %ctx.run_id,
+                error = error.message(),
+                "actions.lock failed to parse at expansion"
+            );
+            ExecutionStatus::Failure
+        })?;
     let mut built = Vec::with_capacity(plans.len());
     for plan in plans {
         let artifacts = crate::runs::build_job_artifacts(
@@ -2222,6 +2233,7 @@ where
             &base_url,
             ctx.snapshot.as_ref(),
             plan,
+            &lockfiles,
         )
         .map_err(|error| {
             tracing::warn!(

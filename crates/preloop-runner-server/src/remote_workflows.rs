@@ -102,19 +102,131 @@ pub async fn resolve_remote_workflows(
                 None => submission.reusable_workflows.get(&reference),
             };
             if let Some(contents) = supplied.cloned() {
-                if visited.insert(reference.clone()) {
-                    let next = (!same_repository).then(|| {
-                        (
-                            reference.clone(),
-                            pinned_commit(&reference, &submission.reusable_workflow_shas),
-                        )
-                    });
-                    queue.push((
-                        preloop_gha_parser::parse_workflow(&contents)?,
-                        depth + 1,
-                        next,
-                    ));
+                if !visited.insert(reference.clone()) {
+                    continue;
                 }
+                let next = if same_repository_path.is_some() {
+                    None
+                } else {
+                    let Some((owner, repo, _path, git_ref)) = parse_remote_reference(&reference)
+                    else {
+                        return Err(ApiError::bad_request(format!(
+                            "unsupported reusable workflow reference `{reference}`"
+                        )));
+                    };
+                    let client = client.get_or_insert(
+                        crate::shared_http::github_client_builder()
+                            .build()
+                            .map_err(|error| {
+                                ApiError::internal(format!("build GitHub client: {error}"))
+                            })?,
+                    );
+                    let bucket = if token.is_some() {
+                        crate::github_breaker::GithubCredentialBucket::Pat
+                    } else {
+                        crate::github_breaker::GithubCredentialBucket::Anonymous
+                    };
+                    if preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
+                        let subject = format!("reusable workflow `{reference}`");
+                        crate::actions::verify_plain_commit(
+                            &shared.state,
+                            owner,
+                            repo,
+                            git_ref,
+                            &subject,
+                        )
+                        .await?;
+                    }
+                    // A client may state the callee's commit itself. It is used
+                    // as-is only when it is a full commit: any other value would
+                    // be interpolated into the contents API query, and a commit
+                    // the callee's repository never had would put the lockfile
+                    // read at a revision the callee never ran.
+                    let sha = match submission.reusable_workflow_shas.get(&reference) {
+                        Some(sha) => {
+                            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
+                                return Err(ApiError::bad_request(format!(
+                                    "reusable workflow `{reference}` was submitted with {sha:?}, which is not a commit SHA. Submit the commit that reference resolved to"
+                                )));
+                            }
+                            sha.clone()
+                        }
+                        None => {
+                            let sha = resolve_remote_sha(
+                                shared, client, bucket, token, &api_base, &reference, owner, repo,
+                                git_ref,
+                            )
+                            .await?;
+                            submission
+                                .reusable_workflow_shas
+                                .insert(reference.clone(), sha.clone());
+                            sha
+                        }
+                    };
+                    // Whatever the commit came from, it is held to the same
+                    // impostor-commit check a `uses:` that names a commit gets:
+                    // a commit that exists only in a fork is refused.
+                    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
+                        let subject = format!("reusable workflow `{reference}`");
+                        crate::actions::verify_plain_commit(
+                            &shared.state,
+                            owner,
+                            repo,
+                            &sha,
+                            &subject,
+                        )
+                        .await?;
+                    }
+                    // GitHub is authoritative for the callee's lockfile: its
+                    // answer replaces any entry the submission carried, so a
+                    // stale or fabricated lock cannot govern the callee.
+                    let fetched = crate::github::fetch_repository_actions_lockfile(
+                        shared,
+                        bucket,
+                        token,
+                        &format!("{owner}/{repo}"),
+                        &sha,
+                        &api_base,
+                    )
+                    .await;
+                    match fetched {
+                        Ok(Some(lockfile)) => {
+                            submission
+                                .reusable_workflow_lockfiles
+                                .insert(reference.clone(), lockfile);
+                        }
+                        Ok(None) => {
+                            submission.reusable_workflow_lockfiles.remove(&reference);
+                        }
+                        // GitHub could not answer. A lockfile that the
+                        // submission already carries for this callee is the
+                        // client's own statement of its pins — the only place
+                        // offline pins can come from — so it is kept instead of
+                        // failing an otherwise valid submission.
+                        Err(error)
+                            if submission
+                                .reusable_workflow_lockfiles
+                                .contains_key(&reference) =>
+                        {
+                            warn!(
+                                reference = %reference,
+                                %error,
+                                "reusable workflow actions.lock unreadable; keeping the submitted lockfile"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(ApiError::bad_gateway(format!(
+                                "fetch actions.lock of reusable workflow `{reference}`: {error}"
+                            )));
+                        }
+                    }
+                    Some((reference.clone(), sha))
+                };
+                queue.push((
+                    preloop_gha_parser::parse_workflow(&contents)?,
+                    depth + 1,
+                    next,
+                ));
                 continue;
             }
             // A same-repository reference names the submitted repository at the
@@ -166,53 +278,36 @@ pub async fn resolve_remote_workflows(
             } else {
                 crate::github_breaker::GithubCredentialBucket::Anonymous
             };
+            // A full commit SHA in a remote `uses:` names a commit that must be
+            // reachable from the named repository's branches or tags: the
+            // impostor-commit check, which refuses a commit that exists only in a
+            // fork.
+            if same_repository_path.is_none()
+                && preloop_gha_protocol::git_ref::is_commit_sha_not_zero(&git_ref)
+            {
+                let subject = format!("reusable workflow `{reference}`");
+                crate::actions::verify_plain_commit(
+                    &shared.state,
+                    &owner,
+                    &repo,
+                    &git_ref,
+                    &subject,
+                )
+                .await?;
+            }
             // Resolve the mutable ref to a commit SHA first, then fetch the
             // workflow content pinned to that exact SHA. Fetching content with
             // the mutable ref and resolving the SHA afterwards would let a
             // retargeted branch/tag store content from commit A under the
             // identity of commit B (TOCTOU); `?ref=<sha>` binds both values
             // to the same revision.
-            let mut commit_request =
-                client.get(format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}"));
-            if let Some(token) = token {
-                commit_request = commit_request.bearer_auth(token);
-            }
-            let commit_response = crate::github_breaker::send_observed_labeled(
-                &shared.state.github_breakers,
-                bucket,
-                &shared.state.github_consumption,
-                crate::github_breaker::GithubSubsystem::Workflows,
-                commit_request,
+            let sha = resolve_remote_sha(
+                shared, client, bucket, token, &api_base, &reference, &owner, &repo, &git_ref,
             )
-            .await
-            .map_err(|error| {
-                ApiError::bad_gateway(format!(
-                    "resolve reusable workflow `{reference}` SHA: {error}"
-                ))
-            })?;
-            let commit_status = commit_response.status();
-            if !commit_status.is_success() {
-                return Err(ApiError::bad_gateway(format!(
-                    "GitHub returned {commit_status} while resolving reusable workflow `{reference}` SHA"
-                )));
-            }
-            let commit: GithubCommitResponse = commit_response.json().await.map_err(|error| {
-                ApiError::bad_gateway(format!("read reusable workflow `{reference}` SHA: {error}"))
-            })?;
-            // The recorded SHA is what later stages trust as this reusable
-            // workflow's pinned identity, so a malformed lookup response must
-            // not be stored as if it were a commit — and no content is
-            // fetched until the identity is validated.
-            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(&commit.sha) {
-                return Err(ApiError::bad_gateway(format!(
-                    "reusable workflow `{reference}` resolved to a non-commit SHA: {:?}",
-                    commit.sha
-                )));
-            }
+            .await?;
             let mut request = client
                 .get(format!(
-                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={}",
-                    commit.sha
+                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={sha}"
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github+json");
             if let Some(token) = token {
@@ -242,7 +337,39 @@ pub async fn resolve_remote_workflows(
             let contents = decode_github_contents(&content_response).map_err(|error| {
                 ApiError::bad_gateway(format!("decode reusable workflow `{reference}`: {error}"))
             })?;
-            let sha = commit.sha;
+            // `sha` was validated by `resolve_remote_sha` above.
+            // The callee repository's `actions.lock` at the commit the reference
+            // resolved to: the lock that governs the callee's jobs. A reference names
+            // its own repository, so this is never the run's lock.
+            if same_repository_path.is_none() {
+                let lockfile = crate::github::fetch_repository_actions_lockfile(
+                    shared,
+                    bucket,
+                    token,
+                    &format!("{owner}/{repo}"),
+                    &sha,
+                    &api_base,
+                )
+                .await
+                .map_err(|error| {
+                    ApiError::bad_gateway(format!(
+                        "fetch actions.lock of reusable workflow `{reference}`: {error}"
+                    ))
+                })?;
+                // GitHub's answer is authoritative here too: an absent lockfile
+                // at the callee's commit removes any earlier entry, so a stale
+                // lock cannot keep governing the callee.
+                match lockfile {
+                    Some(lockfile) => {
+                        submission
+                            .reusable_workflow_lockfiles
+                            .insert(reference.clone(), lockfile);
+                    }
+                    None => {
+                        submission.reusable_workflow_lockfiles.remove(&reference);
+                    }
+                }
+            }
             submission
                 .reusable_workflows
                 .insert(reference.clone(), contents.clone());
@@ -283,6 +410,56 @@ fn pinned_commit(reference: &str, shas: &BTreeMap<String, String>) -> String {
             .rsplit_once('@')
             .map_or_else(String::new, |(_, git_ref)| git_ref.to_owned())
     })
+}
+
+/// Resolve one remote reusable-workflow ref through the same breaker/client path
+/// used by the normal fetch branch. The response must contain a non-zero commit
+/// SHA; malformed identity fails closed.
+async fn resolve_remote_sha(
+    shared: &Arc<SharedState>,
+    client: &reqwest::Client,
+    bucket: crate::github_breaker::GithubCredentialBucket,
+    token: Option<&str>,
+    api_base: &str,
+    reference: &str,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Result<String, ApiError> {
+    let mut commit_request =
+        client.get(format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}"));
+    if let Some(token) = token {
+        commit_request = commit_request.bearer_auth(token);
+    }
+    let commit_response = crate::github_breaker::send_observed_labeled(
+        &shared.state.github_breakers,
+        bucket,
+        &shared.state.github_consumption,
+        crate::github_breaker::GithubSubsystem::Workflows,
+        commit_request,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::bad_gateway(format!(
+            "resolve reusable workflow `{reference}` SHA: {error}"
+        ))
+    })?;
+    let commit_status = commit_response.status();
+    if !commit_status.is_success() {
+        return Err(ApiError::bad_gateway(format!(
+            "GitHub returned {commit_status} while resolving reusable workflow `{reference}` SHA"
+        )));
+    }
+    let commit: GithubCommitResponse = commit_response.json().await.map_err(|error| {
+        ApiError::bad_gateway(format!("read reusable workflow `{reference}` SHA: {error}"))
+    })?;
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(&commit.sha) {
+        return Err(ApiError::bad_gateway(format!(
+            "reusable workflow `{reference}` resolved to a non-commit SHA: {:?}",
+            commit.sha
+        )));
+    }
+    Ok(commit.sha)
 }
 
 fn decode_github_contents(response: &GithubContentResponse) -> Result<String, String> {
@@ -373,8 +550,12 @@ mod observed_sender_tests {
                 async move {
                     hits_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let path = request.uri().path().to_owned();
+                    // A repository without an `actions.lock` answers 404 for it.
+                    let lockfile = path.ends_with("/actions.lock");
                     let body = if path.contains("/commits/") {
                         serde_json::json!({ "sha": sha_owned }).to_string()
+                    } else if lockfile {
+                        serde_json::json!({ "message": "Not Found" }).to_string()
                     } else {
                         serde_json::json!({
                             "content": content_b64,
@@ -383,6 +564,11 @@ mod observed_sender_tests {
                         .to_string()
                     };
                     axum::http::Response::builder()
+                        .status(if lockfile {
+                            axum::http::StatusCode::NOT_FOUND
+                        } else {
+                            axum::http::StatusCode::OK
+                        })
                         .header("content-type", "application/json")
                         .body(axum::body::Body::from(body))
                         .unwrap()
@@ -428,14 +614,18 @@ mod observed_sender_tests {
             Some(sha),
             "the resolved SHA must be pinned"
         );
+        assert!(
+            submission.reusable_workflow_lockfiles.is_empty(),
+            "a repository without actions.lock stores no lockfile"
+        );
 
         // Both fetches went through the labeled sender: the stub saw them,
         // the anonymous bucket's breaker observed them, and the workflows
         // subsystem accounts for them.
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "commit SHA + contents fetches"
+            3,
+            "commit SHA + contents + actions.lock fetches"
         );
         let usage = shared
             .state
@@ -444,7 +634,7 @@ mod observed_sender_tests {
             .into_iter()
             .find(|usage| usage.subsystem == GithubSubsystem::Workflows.as_str())
             .expect("workflows subsystem must be in the snapshot");
-        assert_eq!(usage.requests, 2);
+        assert_eq!(usage.requests, 3);
         assert!(
             shared
                 .state
@@ -508,6 +698,103 @@ mod observed_sender_tests {
             "must fail fast on the open breaker"
         );
         assert_eq!(usage.requests, 0, "no request may reach GitHub");
+    }
+
+    /// Native clients may supply remote callee YAML. The server still resolves
+    /// its identity and fetches the callee repository's lock at that commit,
+    /// without replacing the supplied YAML.
+    #[tokio::test]
+    async fn supplied_remote_callee_gets_sha_and_lock_metadata() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let sha = "b1b2c3d4b1b2c3d4b1b2c3d4b1b2c3d4b1b2c3d4";
+        let reference = "o/r/.github/workflows/reusable.yml@main";
+        let supplied_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo supplied\n";
+        let lockfile = format!(
+            "version: v0.0.3\nworkflows:\n  .github/workflows/reusable.yml:\n    - actions/checkout@v4\ndependencies:\n  actions/checkout@v4:\n    ref: v4\n    commit: sha1-{sha}\n    owner_id: 1\n    repo_id: 2\n"
+        );
+        let lock_size = lockfile.len();
+        let encoded_lock = BASE64_STANDARD.encode(lockfile.as_bytes());
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::get(move |request: axum::extract::Request| {
+                let encoded_lock = encoded_lock.clone();
+                async move {
+                    let path = request.uri().path();
+                    if path.ends_with("/commits/main") {
+                        return axum::http::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({ "sha": sha }).to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    if path.ends_with("/actions.lock") {
+                        return axum::http::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({
+                                    "content": encoded_lock,
+                                    "encoding": "base64",
+                                    "size": lock_size,
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::NOT_FOUND)
+                        .body(axum::body::Body::from("{}"))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().join("state").to_path_buf())
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let root_yaml = format!("on: push\njobs:\n  call:\n    uses: {reference}\n");
+        let root = preloop_gha_parser::parse_workflow(&root_yaml).unwrap();
+        let mut submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: root_yaml,
+            reusable_workflows: BTreeMap::from([(reference.to_owned(), supplied_yaml.to_owned())]),
+            ..Default::default()
+        };
+
+        resolve_remote_workflows(&shared, &mut submission, &root, None)
+            .await
+            .expect("supplied remote metadata must resolve");
+        assert_eq!(
+            submission
+                .reusable_workflows
+                .get(reference)
+                .map(String::as_str),
+            Some(supplied_yaml)
+        );
+        assert_eq!(
+            submission
+                .reusable_workflow_shas
+                .get(reference)
+                .map(String::as_str),
+            Some(sha)
+        );
+        assert_eq!(
+            submission
+                .reusable_workflow_lockfiles
+                .get(reference)
+                .map(String::as_str),
+            Some(lockfile.as_str())
+        );
     }
 }
 
