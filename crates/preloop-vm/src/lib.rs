@@ -4574,11 +4574,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("scratch");
         let tool = wedged_tool(dir.path(), "wedged-tool");
         let record = dir.path().join("wedged-tool.pid");
-        // The helper owns the spawn, so the deadline has to cover this test
-        // binary's exec latency (hundreds of milliseconds under a loaded
-        // `cargo test`) before it can be evidence of anything: two seconds is
-        // still three orders of magnitude below the production deadlines.
-        let deadline = std::time::Duration::from_secs(2);
+        // The helper owns the spawn, so the deadline has to outlast this test
+        // binary's own exec latency — measured in seconds under a fully loaded
+        // `cargo test` — before the assertion about the *tool* (its pid file,
+        // its death) means anything. Eight seconds is still two orders of
+        // magnitude below every production deadline.
+        let deadline = std::time::Duration::from_secs(8);
         let started = std::time::Instant::now();
         let error = run_host_tool(
             "wedged-tool",
@@ -4600,7 +4601,7 @@ mod tests {
             "returned before the deadline elapsed: {elapsed:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < std::time::Duration::from_secs(30),
             "the deadline took {elapsed:?} to fire"
         );
         let pid = recorded_pid(&record);

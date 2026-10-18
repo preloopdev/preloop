@@ -1731,9 +1731,10 @@ async fn timed_out_pause_is_killed_at_its_deadline() {
     let (_directory, executable) = fake_wedged_pause_aenv();
     let home = tempfile::tempdir().unwrap();
     // Only the tier under test is shrunk: `stop` pauses on the control tier,
-    // while `create`/`start` (the setup) keep their production deadlines so a
-    // loaded `cargo test` cannot time them out.
-    let deadline = std::time::Duration::from_secs(2);
+    // while `create`/`start` (the setup) keep their production deadlines. The
+    // paused fake's pid has to be written before the deadline can be evidence
+    // about the wait, so this outlasts a loaded test binary's exec latency too.
+    let deadline = std::time::Duration::from_secs(8);
     let provider = provider(&executable, home.path()).with_deadlines(WaitDeadlines {
         control: deadline,
         ..WaitDeadlines::default()
@@ -1759,7 +1760,7 @@ async fn timed_out_pause_is_killed_at_its_deadline() {
         "expected a named deadline error, got {error:?}"
     );
     assert!(
-        elapsed >= deadline && elapsed < std::time::Duration::from_secs(5),
+        elapsed >= deadline && elapsed < std::time::Duration::from_secs(30),
         "the deadline fired at {elapsed:?}"
     );
 

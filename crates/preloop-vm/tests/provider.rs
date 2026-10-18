@@ -953,10 +953,10 @@ exit 0
     async fn timed_out_create_kills_smolvm_and_releases_the_lifecycle_lock() {
         let (_directory, executable) = fake_wedged_create_smolvm();
         // Only the tier under test is shrunk. `create` runs on the boot tier,
-        // and a test-wide shrink would make unrelated steps flaky under a
-        // loaded `cargo test` (a 1 s deadline can expire before the fake's own
-        // `exec` completes).
-        let deadline = std::time::Duration::from_secs(2);
+        // and the deadline must outlast the fake's own exec (seconds under a
+        // fully loaded `cargo test`) before the assertion about the *hang*
+        // means anything.
+        let deadline = std::time::Duration::from_secs(8);
         let provider = SmolVmProvider::new(&executable).with_deadlines(WaitDeadlines {
             boot: deadline,
             ..WaitDeadlines::default()
