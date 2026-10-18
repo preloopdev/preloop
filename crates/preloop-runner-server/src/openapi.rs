@@ -993,13 +993,20 @@ fn github_callback() {}
 /// Open an engine-hosted GitHub App setup session (`preloop setup github
 /// --via app` with a public URL). Returns the session handle and the one-time
 /// setup link, which works once and expires ten minutes after it is opened.
+///
+/// The body takes `public_url` (required; the engine's own origin when it has
+/// `PRELOOP_PUBLIC_URL`, https unless loopback), `org`, `app_name`, `add`
+/// (create a second App when one is already configured), and `repos`
+/// (`owner/name` slugs to verify with the new credentials, at most 16).
 #[utoipa::path(
     post, path = "/api/v1/github/setup-sessions", tag = "GitHub",
     request_body = JsonValue,
     responses(
         (status = 201, description = "Session opened; `setup_url` carries the one-time link"),
-        (status = 400, description = "public_url, org, or app_name is invalid"),
-        (status = 401, description = "Missing or invalid system token")
+        (status = 400, description = "public_url, org, app_name, or repos is invalid, or the App duplicates one already configured"),
+        (status = 401, description = "Missing or invalid system token"),
+        (status = 409, description = "This engine already has an App configured (pass `add`), or a setup is still in flight"),
+        (status = 500, description = "The engine's config could not be read or its credential store could not be opened")
     ),
     security(("native_bearer" = []))
 )]
@@ -1011,7 +1018,7 @@ fn github_setup_session_open() {}
     get, path = "/api/v1/github/setup-sessions/{session_id}", tag = "GitHub",
     params(("session_id" = String, Path, description = "Session handle from the open response")),
     responses(
-        (status = 200, description = "Session status; carries no key material"),
+        (status = 200, description = "Session status; carries no key material, and the `--repo` check lines on completion"),
         (status = 401, description = "Missing or invalid system token"),
         (status = 404, description = "No such session; it was replaced or the engine restarted")
     ),

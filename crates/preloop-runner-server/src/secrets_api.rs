@@ -220,8 +220,12 @@ pub async fn set_secret(
     // base config would otherwise drop one another's entry from the file
     // while both landed in the in-memory store. Lock order is
     // `secret_mutation` → `secrets` write guard; the global `inner` mutex is
-    // never taken here.
+    // never taken here. `config_mutation` is the innermost lock: it is what
+    // stops a writer from another front (engine-hosted App setup,
+    // execution-protection rules) from publishing a document built from a
+    // stale read over this one, and it is held across synchronous work only.
     let _mutation = shared.state.secret_mutation.lock().await;
+    let _config_mutation = crate::config::config_mutation_lock().lock();
     let mut config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     match (&body.repo, &body.env) {
@@ -323,8 +327,10 @@ pub async fn delete_secret(
     }
     // Same serialization as `set_secret`: load → mutate → persist → publish
     // is one critical section, so a concurrent set cannot resurrect the
-    // deleted name in the file. Lock order: `secret_mutation` → `secrets`.
+    // deleted name in the file. Lock order: `secret_mutation` → `secrets`,
+    // with `config_mutation` innermost.
     let _mutation = shared.state.secret_mutation.lock().await;
+    let _config_mutation = crate::config::config_mutation_lock().lock();
     let config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     let memory = crate::config::store_memory(&config)

@@ -42,7 +42,9 @@ use tokio::sync::{Mutex, oneshot};
 
 /// Where the loopback flow creates Apps. The engine-hosted setup uses the
 /// engine's configured GitHub host instead.
-const GITHUB_WEB: &str = "https://github.com";
+/// GitHub's web root, for a manifest-driven App by default. GHES engines
+/// configure their own host in `github.server_url`.
+pub(crate) const GITHUB_WEB: &str = "https://github.com";
 
 /// How long to wait for the operator to finish in the browser.
 const BROWSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -132,15 +134,21 @@ where
         Some(text) => println!("{text}"),
         None => println!("Open this URL to create the GitHub App:\n  {base}"),
     }
-    if open_browser && open_in_browser(&base).is_err() {
-        println!("(could not open a browser automatically — open the URL above)");
-    }
-    println!("Waiting for GitHub to redirect back…");
     let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://api.github.com".to_owned());
-    register_on_with_persist(listener, name, org, &api_base, persist).await
+    // The listener is bound, but nothing answers on it until the server task
+    // starts inside `register_on_with_persist` — so the browser is opened from
+    // there. Otherwise a browser that connects immediately could wait on a
+    // socket no one is serving yet.
+    register_on_with_persist(listener, name, org, &api_base, persist, |base| {
+        if open_browser && open_in_browser(base).is_err() {
+            println!("(could not open a browser automatically — open the URL above)");
+        }
+        println!("Waiting for GitHub to redirect back…");
+    })
+    .await
 }
 
 /// [`register_with_persist`] against an already-bound listener, so a test can
@@ -153,20 +161,25 @@ async fn register_on(
     api_base: &str,
 ) -> Result<Registration> {
     let (registration, ()) =
-        register_on_with_persist(listener, name, org, api_base, |_| Ok(())).await?;
+        register_on_with_persist(listener, name, org, api_base, |_| Ok(()), |_| {}).await?;
     Ok(registration)
 }
 
 /// [`register_on`] with immediate persistence of the converted credentials.
-async fn register_on_with_persist<F, T>(
+///
+/// `announce` runs once the listener is actually being served, so a caller
+/// that opens a browser can do it after the page it asks for can be answered.
+async fn register_on_with_persist<F, T, A>(
     listener: tokio::net::TcpListener,
     name: &str,
     org: Option<&str>,
     api_base: &str,
     persist: F,
+    announce: A,
 ) -> Result<(Registration, T)>
 where
     F: FnOnce(&AppCredentials) -> Result<T>,
+    A: FnOnce(&str),
 {
     let local = listener
         .local_addr()
@@ -199,6 +212,8 @@ where
                 .await
         }
     });
+
+    announce(&base);
 
     let credentials = match tokio::time::timeout(BROWSER_TIMEOUT, credentials_rx).await {
         Ok(Ok(result)) => result?,
@@ -273,7 +288,7 @@ async fn page_callback(
     let install_url = converted
         .as_ref()
         .ok()
-        .and_then(AppCredentials::install_url);
+        .and_then(|credentials| credentials.install_url(GITHUB_WEB));
     let response = match &converted {
         Ok(_) => match &install_url {
             Some(url) => {
@@ -441,36 +456,43 @@ pub(crate) fn open_in_browser(url: &str) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let (program, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
 
-    let status = std::process::Command::new(program)
+    // Started, not waited on, for the same reason `$BROWSER` is: the opener
+    // may hold the terminal until the browser exits.
+    std::process::Command::new(program)
         .args(args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .with_context(|| format!("spawning {program}"))?;
-    anyhow::ensure!(status.success(), "{program} exited with {status}");
     Ok(())
 }
 
 /// Expand a `$BROWSER` value into argument vectors, one per colon-separated
-/// entry. Each entry is split on whitespace; `%s` in any word is replaced by
-/// the URL, and when no word has one the URL is appended. Blank entries are
-/// skipped. The URL is always a single argument, never shell-parsed.
+/// entry. Each entry is split into words the way a shell would, so a quoted
+/// path or argument stays one word (`"/opt/Remote Browser/bin/open" %s` names
+/// `/opt/Remote Browser/bin/open`, not `"/opt/Remote`); `%s` in any word is
+/// replaced by the URL, and when no word has one the URL is appended. Blank
+/// entries and entries with an unterminated quote are skipped. The URL is
+/// always a single argument, and no shell ever sees any of it.
 fn browser_commands(spec: &str, url: &str) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     for entry in spec.split(':') {
-        let words: Vec<&str> = entry.split_whitespace().collect();
+        let Some(words) = split_browser_words(entry) else {
+            continue;
+        };
         if words.is_empty() {
             continue;
         }
         let mut substituted = false;
         let mut argv: Vec<String> = words
-            .iter()
+            .into_iter()
             .map(|word| {
                 if word.contains("%s") {
                     substituted = true;
                     word.replace("%s", url)
                 } else {
-                    (*word).to_owned()
+                    word
                 }
             })
             .collect();
@@ -482,16 +504,73 @@ fn browser_commands(spec: &str, url: &str) -> Vec<Vec<String>> {
     commands
 }
 
+/// Split one `$BROWSER` entry into words, honouring single and double quotes
+/// and backslash escapes the way a shell does. `None` means the entry cannot
+/// be read (a trailing backslash or an unterminated quote): a helper whose
+/// command line cannot be reconstructed is not one to guess at, so it is
+/// skipped and the next entry — or the platform opener — is tried.
+fn split_browser_words(entry: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = entry.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => {
+                word.push(ch);
+                started = true;
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    word.push(escaped);
+                    started = true;
+                }
+                _ if ch.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                _ => {
+                    word.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// Start a browser command without waiting for it to exit.
+///
+/// A browser outlives the setup command by design, and `$BROWSER` in a remote
+/// terminal is a helper that keeps running. Waiting for its lifetime would
+/// stall the flow around it: in the loopback flow the setup page cannot be
+/// served while the CLI waits for the browser, and the browser waits for the
+/// page. What matters here is only whether the program could be started at
+/// all, which is what `spawn` reports.
 fn run_browser_command(argv: &[String]) -> Result<()> {
     let (program, args) = argv.split_first().context("empty BROWSER entry")?;
-    let status = std::process::Command::new(program)
+    std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .with_context(|| format!("spawning {program}"))?;
-    anyhow::ensure!(status.success(), "{program} exited with {status}");
     Ok(())
 }
 
@@ -623,13 +702,18 @@ mod tests {
         let registration = flow.await.unwrap().unwrap();
         assert_eq!(registration.credentials.id, 424242);
         assert_eq!(
-            registration.credentials.webhook_secret.as_deref(),
+            registration
+                .credentials
+                .webhook_secret
+                .as_ref()
+                .map(|secret| secret.expose()),
             Some("hook-secret")
         );
         assert!(
             registration
                 .credentials
                 .pem
+                .expose()
                 .contains("BEGIN RSA PRIVATE KEY")
         );
         assert_eq!(registration.installation_id, Some(99));
@@ -686,9 +770,14 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
         let error = flow.await.unwrap().unwrap_err();
+        let error = format!("{error:#}");
         assert!(
-            format!("{error:#}").contains("code expired"),
-            "GitHub's reason must reach the operator: {error:#}"
+            error.contains("422 Unprocessable Entity"),
+            "the operator learns GitHub refused, with its status: {error}"
+        );
+        assert!(
+            !error.contains("code expired"),
+            "GitHub's response body stays in the log, not in the operator's error: {error}"
         );
     }
 
@@ -724,6 +813,51 @@ mod tests {
                 "--url=http://h/?a=1&b=2".to_owned()
             ]],
             "the URL stays one argument, never shell-parsed"
+        );
+    }
+
+    #[test]
+    fn browser_spec_honours_quotes_and_escapes() {
+        let url = "http://127.0.0.1:8765";
+        assert_eq!(
+            browser_commands("\"/opt/Remote Browser/bin/open\" %s", url),
+            vec![vec![
+                "/opt/Remote Browser/bin/open".to_owned(),
+                url.to_owned()
+            ]],
+            "a quoted path with a space is one program, not a token with quotes in it"
+        );
+        assert_eq!(
+            browser_commands("helper.sh '--url %s':firefox", url),
+            vec![
+                vec!["helper.sh".to_owned(), format!("--url {url}")],
+                vec!["firefox".to_owned(), url.to_owned()],
+            ],
+            "single quotes group a flag and its value, so the URL stays in place"
+        );
+        assert_eq!(
+            browser_commands(r"my\ helper %s", url),
+            vec![vec!["my helper".to_owned(), url.to_owned()]],
+            "a backslash escape joins words"
+        );
+        assert_eq!(
+            browser_commands("open -a \"Safari\"", url),
+            vec![vec![
+                "open".to_owned(),
+                "-a".to_owned(),
+                "Safari".to_owned(),
+                url.to_owned()
+            ]],
+            "quotes are removed from the argument they group"
+        );
+        assert!(
+            browser_commands("unterminated \"quote %s:firefox", url).len() == 1,
+            "an entry that cannot be parsed is skipped, not guessed at"
+        );
+        assert_eq!(
+            browser_commands("unterminated \"quote %s:firefox", url),
+            vec![vec!["firefox".to_owned(), url.to_owned()]],
+            "the next entry still gets its chance"
         );
     }
 

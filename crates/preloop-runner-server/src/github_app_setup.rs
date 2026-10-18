@@ -17,6 +17,7 @@ use crate::credential_store::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
+use tracing::warn;
 
 /// Default permissions of the generated App.
 ///
@@ -35,7 +36,12 @@ pub const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
 ];
 
 /// Credentials GitHub returns from a manifest conversion.
-#[derive(Deserialize)]
+///
+/// The private key and webhook secret arrive once and are never shown again,
+/// so they are `SecretString` from the moment they are deserialized: every
+/// `Debug` and any accidental forwarding redacts them, and the plaintext
+/// exists only where a caller writes it to the credential store.
+#[derive(Debug, Deserialize)]
 pub struct AppCredentials {
     /// Numeric App id (the JWT `iss`).
     pub id: u64,
@@ -43,30 +49,13 @@ pub struct AppCredentials {
     #[serde(default)]
     pub slug: Option<String>,
     /// PKCS#1 private key.
-    pub pem: String,
+    pub pem: SecretString,
     /// `X-Hub-Signature-256` secret; absent when the manifest disabled hooks.
     #[serde(default)]
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretString>,
     /// Human-facing App page.
     #[serde(default)]
     pub html_url: Option<String>,
-}
-
-/// Manual `Debug`: this carries the App's private key and webhook secret,
-/// either of which a single `debug!(?credentials)` would otherwise disclose.
-impl std::fmt::Debug for AppCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppCredentials")
-            .field("id", &self.id)
-            .field("slug", &self.slug)
-            .field("pem", &"<redacted>")
-            .field(
-                "webhook_secret",
-                &self.webhook_secret.as_ref().map(|_| "<redacted>"),
-            )
-            .field("html_url", &self.html_url)
-            .finish()
-    }
 }
 
 impl AppCredentials {
@@ -74,10 +63,18 @@ impl AppCredentials {
     ///
     /// Prefers the slug-based path, which lands directly on the repository
     /// picker; falls back to the App page when GitHub omitted the slug.
-    pub fn install_url(&self) -> Option<String> {
+    /// `github` is the same web root the App was created on — a GHES App's
+    /// installation page is on its own server, never on `github.com`.
+    pub fn install_url(&self, github: &str) -> Option<String> {
         self.slug
             .as_ref()
-            .map(|slug| format!("https://github.com/apps/{slug}/installations/new"))
+            .map(|slug| {
+                format!(
+                    "{}/apps/{}/installations/new",
+                    github.trim_end_matches('/'),
+                    urlencode(slug)
+                )
+            })
             .or_else(|| self.html_url.clone())
     }
 }
@@ -227,11 +224,18 @@ pub async fn convert_manifest_code(api_base: &str, code: &str) -> Result<AppCred
         .context("calling GitHub's manifest conversion endpoint")?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    anyhow::ensure!(
-        status.is_success(),
-        "GitHub rejected the manifest conversion ({status}): {}",
-        body.trim()
-    );
+    if !status.is_success() {
+        // The body stays in the engine's log: callers surface this error to
+        // an operator (the CLI prints it, the loopback flow renders it in a
+        // page), and a rejection's full text is not theirs to read. The
+        // status is what tells them whether to retry or fix the App.
+        warn!(
+            status = %status,
+            response = %body.trim(),
+            "GitHub rejected the manifest conversion"
+        );
+        anyhow::bail!("GitHub rejected the manifest conversion ({status})");
+    }
     serde_json::from_str(&body).context("parsing GitHub's manifest conversion response")
 }
 
@@ -269,9 +273,13 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 pub fn save_app_credentials_at(
     path: &Path,
     app_id: &str,
-    pem: &str,
-    webhook_secret: Option<String>,
+    pem: &SecretString,
+    webhook_secret: Option<SecretString>,
 ) -> Result<Vec<String>> {
+    // Whole-file mutation: read, change, write back under the lock every
+    // other front that rewrites this file also takes, so a secrets or policy
+    // update landing mid-flight is not dropped by this older snapshot.
+    let _mutation = crate::config::config_mutation_lock().lock();
     let mut config = load_config_from(path)?;
     let mut writer = CredentialWriter::for_config(path, config.credential_store.as_deref())?;
     let notices = record_app_credentials(&mut config, &mut writer, app_id, pem, webhook_secret)?;
@@ -287,8 +295,8 @@ pub fn record_app_credentials(
     config: &mut ConfigFile,
     writer: &mut CredentialWriter,
     app_id: &str,
-    pem: &str,
-    webhook_secret: Option<String>,
+    pem: &SecretString,
+    webhook_secret: Option<SecretString>,
 ) -> Result<Vec<String>> {
     let mut notices = Vec::new();
     let host = config.github.server_url.clone();
@@ -298,11 +306,13 @@ pub fn record_app_credentials(
     }
 
     let pem_ref = github_reference_with_host("app-pem", host, Some(app_id))?;
-    notices.extend(persist_secret(writer, config, &pem_ref, pem)?);
+    // `expose()` here: this is the credential-store protocol boundary, the
+    // only place the plaintext leaves the typing that redacts it.
+    notices.extend(persist_secret(writer, config, &pem_ref, pem.expose())?);
     let webhook_ref = match &webhook_secret {
         Some(secret) => {
             let reference = github_reference_with_host("webhook", host, Some(app_id))?;
-            notices.extend(persist_secret(writer, config, &reference, secret)?);
+            notices.extend(persist_secret(writer, config, &reference, secret.expose())?);
             Some(reference.as_str().to_owned())
         }
         None => None,
@@ -508,25 +518,54 @@ mod tests {
     }
 
     #[test]
-    fn install_url_prefers_the_slug() {
+    fn install_url_prefers_the_slug_on_the_configured_host() {
         let credentials = AppCredentials {
             id: 7,
             slug: Some("my-app".to_owned()),
-            pem: String::new(),
+            pem: SecretString::new(""),
             webhook_secret: None,
             html_url: Some("https://github.com/apps/my-app".to_owned()),
         };
         assert_eq!(
-            credentials.install_url().as_deref(),
+            credentials.install_url("https://github.com").as_deref(),
             Some("https://github.com/apps/my-app/installations/new")
+        );
+        assert_eq!(
+            credentials
+                .install_url("https://ghe.example.com/")
+                .as_deref(),
+            Some("https://ghe.example.com/apps/my-app/installations/new"),
+            "a GHES App is installed on the server it was created on"
         );
         let without_slug = AppCredentials {
             slug: None,
             ..credentials
         };
         assert_eq!(
-            without_slug.install_url().as_deref(),
-            Some("https://github.com/apps/my-app")
+            without_slug
+                .install_url("https://ghe.example.com")
+                .as_deref(),
+            Some("https://github.com/apps/my-app"),
+            "without a slug the response's own App page is used verbatim"
+        );
+    }
+
+    #[test]
+    fn converted_credentials_redact_their_secrets() {
+        let credentials = AppCredentials {
+            id: 7,
+            slug: None,
+            pem: SecretString::new("-----BEGIN RSA PRIVATE KEY-----"),
+            webhook_secret: Some(SecretString::new("hook-secret")),
+            html_url: None,
+        };
+        let rendered = format!("{credentials:?}");
+        assert!(!rendered.contains("BEGIN RSA"), "{rendered}");
+        assert!(!rendered.contains("hook-secret"), "{rendered}");
+        assert_eq!(
+            credentials.pem.expose(),
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "the plaintext is still reachable where a store needs it"
         );
     }
 
@@ -613,8 +652,13 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "credential_store = \"file\"\n").unwrap();
 
-        let notices =
-            save_app_credentials_at(&path, "4242", PEM, Some("hook-secret".into())).unwrap();
+        let notices = save_app_credentials_at(
+            &path,
+            "4242",
+            &SecretString::new(PEM),
+            Some(SecretString::new("hook-secret")),
+        )
+        .unwrap();
         assert!(
             notices.is_empty(),
             "the file store needs no fallback: {notices:?}"

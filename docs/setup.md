@@ -285,6 +285,17 @@ run the command:
 | `--app-name NAME` | App name (GitHub requires global uniqueness). Default `preloop-local`. |
 | `--port N` | Listener port for the loopback and SSH flows. Default: a free port locally, `8765` over SSH. |
 | `--no-browser` | Print the URL instead of opening a browser. |
+| `--repo owner/name` | Verify the new App against that repository before the command succeeds. On the engine-hosted flow the engine runs the checks with the key it just stored, after waiting up to five minutes for the App to be installed on those repositories (the browser is on GitHub's install page at that point). The CLI prints one `✓`/`✗` line per repository and exits non-zero if any failed. Repeat for several repositories (up to 16). |
+| `--add` | Create an additional App when one is already configured. Without it, both flows refuse to create a second App: the local flow updates the configured App's webhook instead, and the engine-hosted flow stops with the App id and says how to proceed. |
+
+Two guardrails apply to the engine-hosted flow, because the setup link carries
+a one-time token and GitHub's redirect carries the App's one-time code:
+
+- The public URL has to be on the engine's own origin. When the engine has
+  `PRELOOP_PUBLIC_URL`, `--public-url` must name the same origin, so an API
+  token alone cannot redirect the App's private key to another host.
+- `http://` is accepted only for a loopback address; anything else has to be
+  `https`, so the token never travels in clear text.
 
 `PRELOOP_PUBLIC_URL` is read only when `--public-url` is not given. Set it for
 `preloop serve` and the same value selects the engine-hosted setup here.

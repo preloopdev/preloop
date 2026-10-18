@@ -51,9 +51,53 @@ Releases before v0.27.0 predate the changelog.
 - **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
   `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
   setup page on your laptop and forward its port. The platform opener remains
-  the fallback.
+  the fallback. Entries are parsed with shell-style quoting, so a helper whose
+  path or arguments contain spaces launches, and no entry is waited on — a
+  foreground browser can no longer hold the page it is waiting for.
+
+- **Engine-hosted App setup runs `--repo` checks.** The engine waits (up to
+  five minutes, shared across the list) for the App to be installed on each
+  requested repository, verifies the new credentials there, and reports one
+  `✓`/`✗` line per repository through the session status; the CLI prints them
+  and exits non-zero when a check failed, exactly like the loopback flow's
+  `doctor`. Up to 16 repositories per setup.
 
 ### Fixed
+
+- **Converted App credentials are `SecretString` end to end.** The private key
+  and webhook secret GitHub returns are deserialized into `SecretString`, so
+  formatting or logging either one redacts it; the plaintext is exposed only
+  where it is written through the credential store. A conversion that GitHub
+  rejects no longer puts the upstream response body into the error the CLI
+  prints.
+
+- **GitHub App installation links follow the configured GitHub host.** The
+  slug-based installation URL is built from the same web root the App was
+  created on, so a GitHub Enterprise Server engine no longer sends the operator
+  to `github.com`.
+
+- **Engine-hosted setup no longer races, clobbers, or duplicates.**
+  - A setup session that is converting, or holding a result its CLI has not
+    read yet, is no longer replaced by a second setup: the CLI that was waiting
+    gets its result instead of a 404 while its App exists on GitHub.
+  - App credential writes take the same whole-file config lock as the secrets
+    and execution-protection APIs, so an overlapping write can no longer erase
+    the other's change.
+  - The engine refuses to create a second App when its own config already has
+    one (the CLI's duplicate check cannot see a remote engine's config) and
+    reports the App id instead; `--add` still creates an additional App.
+  - The engine checks that its config loads and its credential store can hold
+    the key before GitHub creates anything, so a key that could not be stored
+    is reported before the App exists rather than after.
+  - A setup is refused when `--public-url` names an origin other than the
+    engine's own `PRELOOP_PUBLIC_URL`, and plain `http` is refused outside
+    loopback: the one-time link and GitHub's redirect carry the App's token and
+    code.
+
+- **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
+  effective public URL is resolved before the already-configured-App branch, so
+  setting it in the environment (without `--public-url`) points the configured
+  App's webhook at that address instead of printing only that it is configured.
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 

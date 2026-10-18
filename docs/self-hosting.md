@@ -403,6 +403,51 @@ link is open, and the link works once for ten minutes. Your browser must reach
 the URL to finish the setup, but GitHub also validates the webhook URL in the
 App manifest, so the address needs to be one GitHub can reach.
 
+The engine only accepts a setup for an origin it can vouch for: with
+`PRELOOP_PUBLIC_URL` set, `--public-url` (or the environment fallback) has to
+name that same origin, and a plain-`http` address is refused unless it is
+loopback. `POST /api/v1/github/setup-sessions` — which hands out the one-time
+setup link — needs no inbound route of its own: the CLI calls it on the
+engine's own address.
+
+If you publish only the webhook path (the pattern in §B), let the two browser
+routes through the same proxy while a setup runs, and nothing else:
+
+```caddy
+127.0.0.1:8080 {
+    @webhook path /api/v1/github/webhooks
+    handle @webhook {
+        reverse_proxy 127.0.0.1:9090
+    }
+    # Browser-facing App setup: the form and GitHub's redirect. Neither
+    # serves anything unless a setup link is open, and neither carries the
+    # engine's API surface.
+    @setup path /setup/github /setup/github/callback
+    handle @setup {
+        reverse_proxy 127.0.0.1:9090
+    }
+    handle {
+        respond 404
+    }
+}
+```
+
+Do not publish `/api/v1/github/setup-sessions`: it is the authenticated
+endpoint that mints the setup link, and the CLI reaches it over the engine's
+own address or your existing authenticated ingress.
+
+Two operational notes for the hosted flow:
+
+- The engine reads its own public address from `PRELOOP_PUBLIC_URL`, and
+  nothing a CLI sends can change a running process's environment. A setup
+  opened for another address therefore warns: the App's webhook points at the
+  CLI's URL while the delivery-drift check keeps expecting the engine's, so
+  `preloop status` reports drift until you set the same value for `preloop
+  serve`.
+- `--repo` checks wait up to five minutes for the App to be installed on those
+  repositories before checking them.
+  `PRELOOP_SETUP_INSTALL_WAIT_SECS` changes the wait (`0` checks immediately).
+
 ### A. No public inbound access
 
 The most locked-down option, and the only one with zero public attack surface.

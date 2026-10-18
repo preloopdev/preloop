@@ -12,7 +12,7 @@ use preloop_runner_server::config::{
     ConfigFile, config_path, load_config, store_memory, write_config,
 };
 use preloop_runner_server::credential_store::{
-    CredentialRef, CredentialWriter, github_reference_with_host,
+    CredentialRef, CredentialWriter, SecretString, github_reference_with_host,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -61,8 +61,9 @@ pub struct GithubSetupArgs {
     #[arg(long, default_value_t = 0)]
     pub port: u16,
 
-    /// Public HTTPS URL of this engine. Enables webhook delivery on the
-    /// created App; without it the App is created with webhooks off.
+    /// Public HTTPS URL of this engine. Selects the engine-hosted setup and
+    /// enables webhook delivery on the created App; without it the App is
+    /// created with webhooks off. Falls back to PRELOOP_PUBLIC_URL.
     #[arg(long)]
     pub public_url: Option<String>,
 
@@ -86,7 +87,8 @@ pub struct GithubSetupArgs {
     #[arg(long)]
     pub token: Option<String>,
 
-    /// Repository to verify the credential against (repeatable).
+    /// Repository to verify the credential against (repeatable). On the
+    /// engine-hosted flow the engine runs the checks with the stored key.
     #[arg(long = "repo")]
     pub repos: Vec<String>,
 
@@ -269,7 +271,12 @@ pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()
                     config.github.server_url.as_deref(),
                     Some(app_id.as_str()),
                 )?;
-                persist_secret(&mut writer, &mut config, &reference, secret)?;
+                persist_secret(
+                    &mut writer,
+                    &mut config,
+                    &reference,
+                    &SecretString::new(secret),
+                )?;
                 if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
                     existing.legacy_webhook_secret = None;
                     existing.webhook_secret_ref = Some(reference.as_str().to_owned());
@@ -307,6 +314,14 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     // would create a second App the operator did not ask for.
     let (app_id, pem, webhook_secret) = match (args.app_id.as_deref(), args.pem_file.as_deref()) {
         (None, None) => {
+            // The effective public URL, resolved once here: an App that is
+            // already configured takes the webhook-update branch on the same
+            // value the transport choice uses, so `PRELOOP_PUBLIC_URL` alone
+            // is enough to point an existing App at a reachable address.
+            let public_url = resolve_public_url(
+                args.public_url.as_deref(),
+                std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
+            );
             // An App is already configured: creating a second one would leave
             // the first installed and minting tokens, and the operator almost
             // certainly meant "point the one I have at this URL".
@@ -316,7 +331,7 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
             if has_configured_app && !args.add {
                 if let (Some(app_id), Some(pem)) = (existing.app_id.as_deref(), existing.app_pem())
                 {
-                    return match args.public_url.as_deref() {
+                    return match public_url.as_deref() {
                         Some(public_url) => {
                             let webhook_secret = existing.webhook_secret().map(str::to_owned);
                             enable_webhooks(app_id, pem, public_url, webhook_secret).await
@@ -347,12 +362,16 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            return setup_app_via_browser(args).await;
+            return setup_app_via_browser(args, public_url.as_deref()).await;
         }
         (Some(app_id), Some(pem_path)) => {
             let pem = std::fs::read_to_string(pem_path)
                 .with_context(|| format!("reading App private key {}", pem_path.display()))?;
-            (app_id.to_owned(), pem, args.webhook_secret.clone())
+            (
+                app_id.to_owned(),
+                pem,
+                args.webhook_secret.clone().map(SecretString::new),
+            )
         }
         (Some(_), None) => anyhow::bail!(
             "--pem-file is required alongside --app-id (omit both to create the App in a browser)"
@@ -362,7 +381,7 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
         ),
     };
 
-    let path = save_app_credentials(&app_id, &pem, webhook_secret)?;
+    let path = save_app_credentials(&app_id, &SecretString::new(pem.as_str()), webhook_secret)?;
     println!("Wrote {}", path.display());
     println!(
         "App {app_id} configured. If the App is not yet installed on your repositories:\n\
@@ -386,8 +405,8 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
 /// otherwise, which keeps a manual re-run from clearing a working secret.
 fn save_app_credentials(
     app_id: &str,
-    pem: &str,
-    webhook_secret: Option<String>,
+    pem: &SecretString,
+    webhook_secret: Option<SecretString>,
 ) -> anyhow::Result<PathBuf> {
     let path = config_path();
     let notices = preloop_runner_server::github_app_setup::save_app_credentials_at(
@@ -408,11 +427,14 @@ fn persist_secret(
     writer: &mut CredentialWriter,
     config: &mut ConfigFile,
     reference: &CredentialRef,
-    value: &str,
+    value: &SecretString,
 ) -> anyhow::Result<()> {
-    if let Some(notice) =
-        preloop_runner_server::github_app_setup::persist_secret(writer, config, reference, value)?
-    {
+    if let Some(notice) = preloop_runner_server::github_app_setup::persist_secret(
+        writer,
+        config,
+        reference,
+        value.expose(),
+    )? {
         println!("{notice}");
     }
     Ok(())
@@ -460,14 +482,14 @@ pub(crate) fn resolve_public_url(flag: Option<&str>, env: Option<&str>) -> Optio
 ///
 /// The transport follows [`choose_app_setup_transport`]: the engine hosts the
 /// form when a public URL is set; over SSH the listener is reached through a
-/// port forward; otherwise it is local.
-async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
-    let public_url = resolve_public_url(
-        args.public_url.as_deref(),
-        std::env::var("PRELOOP_PUBLIC_URL").ok().as_deref(),
-    );
+/// port forward; otherwise it is local. `public_url` is the already resolved
+/// value from [`resolve_public_url`].
+async fn setup_app_via_browser(
+    args: &GithubSetupArgs,
+    public_url: Option<&str>,
+) -> anyhow::Result<()> {
     let ssh = crate::app_manifest::ssh_session_from_env(|key| std::env::var(key).ok());
-    match choose_app_setup_transport(public_url.as_deref(), ssh) {
+    match choose_app_setup_transport(public_url, ssh) {
         AppSetupTransport::Engine { public_url } => {
             crate::engine_app_setup::setup_app_via_engine(args, &public_url).await
         }
@@ -544,7 +566,7 @@ async fn setup_app_via_loopback(
     match registration.installation_id {
         Some(id) => println!("Installed (installation {id})."),
         None => {
-            if let Some(url) = credentials.install_url() {
+            if let Some(url) = credentials.install_url(crate::app_manifest::GITHUB_WEB) {
                 println!("Install it on your repositories to finish:\n  {url}");
             }
         }
@@ -554,7 +576,7 @@ async fn setup_app_via_loopback(
         println!("Tip: verify with `preloop doctor --repo owner/name`.");
         return Ok(());
     }
-    doctor_app(&app_id, &credentials.pem, &args.repos).await
+    doctor_app(&app_id, credentials.pem.expose(), &args.repos).await
 }
 
 /// Point an already-configured App's webhook at a reachable URL.
@@ -586,7 +608,12 @@ async fn enable_webhooks(
         CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let webhook_ref =
         github_reference_with_host("webhook", config.github.server_url.as_deref(), Some(app_id))?;
-    persist_secret(&mut writer, &mut config, &webhook_ref, &secret)?;
+    persist_secret(
+        &mut writer,
+        &mut config,
+        &webhook_ref,
+        &SecretString::new(&secret),
+    )?;
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
         existing.legacy_webhook_secret = None;
         existing.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
@@ -700,7 +727,12 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
     let mut writer =
         CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let pat_ref = github_reference_with_host("pat", config.github.server_url.as_deref(), None)?;
-    persist_secret(&mut writer, &mut config, &pat_ref, &token)?;
+    persist_secret(
+        &mut writer,
+        &mut config,
+        &pat_ref,
+        &SecretString::new(&token),
+    )?;
     config.github.legacy_pat = None;
     config.github.pat_ref = Some(pat_ref.as_str().to_owned());
     println!("Stored PAT in {}.", writer.destination());
@@ -1497,8 +1529,8 @@ mod tests {
             &mut config,
             &mut writer,
             "4242",
-            pem,
-            Some("hook-secret".into()),
+            &SecretString::new(pem),
+            Some(SecretString::new("hook-secret")),
         )
         .unwrap();
         preloop_runner_server::config::write_config_to(&config_path, &config).unwrap();
@@ -1556,7 +1588,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                save_app_credentials("9876", pem, None)?;
+                save_app_credentials("9876", &SecretString::new(pem), None)?;
                 setup_pat(&GithubSetupArgs {
                     via: Some(Via::Pat),
                     app_id: None,

@@ -207,6 +207,7 @@ Known limitations:
 | `webhook_health.rs`     | Periodic App subscription / delivery-URL drift checks                  |
 | `webhook_status.rs`     | Live repair-layer status behind one lock                               |
 | `webhook_api.rs`        | `/api/v1/webhooks` listing, replay, health                             |
+| `github_app_setup.rs`, `github_app_setup/session.rs` | GitHub App creation through the manifest flow, shared by the CLI loopback flow and engine-hosted setup: the manifest, the HTML form, code conversion, and the credential write. The session in `session.rs` is node-local — one live setup at a time, its one-time token and state nonce in memory, and the two `/setup/github` browser routes 404 unless a setup is awaiting them        |
 | `control/`              | Database-authoritative control plane: the `ControlBackend` trait (`backend.rs`), backend-neutral domain types (`types.rs`), shared decision functions (`logic.rs`), wake-ups (`wake.rs`), transaction timings (`txn_stats.rs`), and the SQLite (`lite/`) and Postgres (`pg/`) implementations |
 | `runtime_scheduling.rs` | Pure dependency/need and runner-matching helpers reused by `control/logic.rs` |
 | `broker.rs`             | Broker protocol: session, message, acquire/renew/complete job           |

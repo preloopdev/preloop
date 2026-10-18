@@ -326,13 +326,14 @@ Configure GitHub credentials.
 | `--app-id <ID>` | GitHub App ID (with `--via app`) |
 | `--pem-file <PATH>` | Path to the GitHub App private key PEM (with `--via app`) |
 | `--org <NAME>` | Create the App under an organization instead of your account |
-| `--public-url <URL>` | Selects engine-hosted App setup (the running engine serves the form and receives GitHub's redirect), and enables webhook delivery to this URL. Falls back to `PRELOOP_PUBLIC_URL`. On an already-configured App, updates its webhook instead of creating a second App |
+| `--public-url <URL>` | Selects engine-hosted App setup (the running engine serves the form and receives GitHub's redirect), and enables webhook delivery to this URL. Falls back to `PRELOOP_PUBLIC_URL`. Must be on the engine's own origin when the engine has `PRELOOP_PUBLIC_URL` set, and must be `https` unless it is loopback. On an already-configured App, updates its webhook instead of creating a second App |
 | `--app-name <NAME>` | Name of the created App (default `preloop-local`; GitHub requires global uniqueness) |
 | `--port <N>` | Listener port for the local and SSH flows (default: a free port locally, `8765` over SSH, so the `ssh -L` forward has a known port) |
 | `--no-browser` | Print the URL instead of opening a browser |
 | `--webhook-secret <SECRET>` | Store a webhook secret you created yourself (the App flow gets one from GitHub automatically) |
 | `--token <TOKEN>` | PAT to store (with `--via pat`). Falls back to `PRELOOP_GITHUB_PAT`, then an interactive prompt |
-| `--repo <REPOS>` | Repository to verify the credential against (repeatable) |
+| `--repo <REPOS>` | Repository to verify the credential against (repeatable). On the engine-hosted flow the engine runs the checks with the key it just stored, after waiting up to five minutes for the App to be installed there; the CLI prints one `✓`/`✗` line per repository and exits non-zero if any failed (up to 16) |
+| `--add` | Create an additional App when one is already configured. Without it, an already-configured App is updated instead (webhook) or reported rather than duplicated |
 | `--workspace <WORKSPACE>` | Workspace whose workflows should drive the permission checklist |
 
 ## `preloop doctor [OPTIONS]`
