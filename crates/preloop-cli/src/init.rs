@@ -1349,7 +1349,7 @@ impl Session {
         golden: &GoldenDecision,
     ) -> anyhow::Result<()> {
         self.section("3/5 Workflows: secrets and runner labels");
-        let config = load_config().context("reading the engine config")?;
+        let config = load_config_from(&self.config_path).context("reading the engine config")?;
         let checkout = workflows::checkout_root();
         let origin = checkout
             .as_ref()
@@ -1384,7 +1384,7 @@ impl Session {
         }
         self.workflow_secrets(args, &config, &scans).await?;
         let pool = workflows::Pool::new(
-            crate::runner_pool_labels(),
+            crate::runner_pool_labels(std::env::var("PRELOOP_RUNNER_LABELS").ok().as_deref()),
             std::env::consts::ARCH,
             golden.base_image.as_deref().unwrap_or(OFFICIAL_GOLDEN),
         );
@@ -1466,7 +1466,12 @@ impl Session {
                     repo: repo.clone(),
                     env: None,
                 };
-                match github_setup::cmd_secret(github_setup::SecretArgs { command }).await {
+                match github_setup::cmd_secret(
+                    github_setup::SecretArgs { command },
+                    &self.config_path,
+                )
+                .await
+                {
                     Ok(()) => stored_now.push(pair.clone()),
                     Err(error) => self.note(&format!("not set: {error:#}")),
                 }
@@ -1555,9 +1560,13 @@ impl Session {
     /// The secret names the engine holds: the running engine's when it
     /// answers, else the config file's, as `preloop secret list` reads them.
     async fn stored_secret_names(config: &ConfigFile) -> (workflows::Stored, &'static str) {
+        // Resolved once at this boundary: the same transport and API token
+        // `preloop secret list` uses against the running engine.
+        let base = crate::server_url();
+        let token = crate::api_token();
         match tokio::time::timeout(
             Duration::from_secs(2),
-            github_setup::api_list_secrets(None, None),
+            github_setup::api_list_secrets(&base, token.as_deref(), None, None),
         )
         .await
         {
@@ -2669,6 +2678,7 @@ mod tests {
     #[test]
     fn non_interactive_run_requires_every_step_flag() {
         let session = Session {
+            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: true,
             yes: true,
@@ -2690,6 +2700,7 @@ mod tests {
     #[test]
     fn non_interactive_oci_without_a_reference_names_the_flag() {
         let session = Session {
+            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: false,
             yes: false,
@@ -2710,6 +2721,7 @@ mod tests {
     #[test]
     fn a_flag_from_another_kind_is_a_usage_error() {
         let session = Session {
+            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: false,
             yes: false,
@@ -2941,6 +2953,7 @@ mod tests {
     #[test]
     fn the_public_url_question_never_prompts_without_a_terminal() {
         let mut session = Session {
+            config_path: std::path::PathBuf::from("config.toml"),
             interactive: false,
             json: true,
             yes: false,

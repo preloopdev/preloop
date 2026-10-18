@@ -7539,7 +7539,6 @@ mod tests {
         // (and this test's `.git/`) cannot leak into other tests.
         // The other cwd-changing test holds the same lock, so the two
         // cannot swap directories under each other.
-        let _cwd_lock = crate::TEST_ENV_LOCK.blocking_lock();
         struct CwdGuard(std::path::PathBuf);
         impl Drop for CwdGuard {
             fn drop(&mut self) {
@@ -7633,7 +7632,6 @@ mod tests {
     /// changed-path and filter-branch derivations actually run.
     #[tokio::test]
     async fn run_submits_every_flag_and_derived_fact_to_the_engine() {
-        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("checkout");
         let workflows = repo.join(".github/workflows");

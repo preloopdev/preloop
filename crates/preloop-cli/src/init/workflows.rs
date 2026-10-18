@@ -307,10 +307,14 @@ async fn fetch_repo(
 async fn github_token(config: &ConfigFile, repo: &str) -> Result<String, String> {
     let read_only = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
     let mut app_failure = None;
-    match github_app::load_from(config) {
+    // The startup configuration the credential sources are resolved from,
+    // read at this command boundary rather than below it.
+    let startup = preloop_runner_server::config::StartupConfig::from_env();
+    match github_app::load_from(config, &startup) {
         Ok(Some(apps)) => {
             for app in &apps.apps {
-                match github_app::get_or_mint_token(app, repo, &read_only).await {
+                match github_app::get_or_mint_token(&github_api_base(), app, repo, &read_only).await
+                {
                     Ok(token) => return Ok(token),
                     Err(error) => app_failure = Some(format!("{error:#}")),
                 }
