@@ -127,6 +127,7 @@ impl RecordingVmProvider {
             created_specs: state.created_specs.clone(),
             events: state.events.clone(),
             pack_calls: state.pack_calls,
+            run_calls: state.run_calls,
         }
     }
 
@@ -141,6 +142,8 @@ struct ProviderStateSnapshot {
     created_specs: Vec<MachineSpec>,
     events: Vec<Event>,
     pack_calls: usize,
+    /// Guest-runner `exec_stream` calls so far, cumulative across pool runs.
+    run_calls: usize,
 }
 
 fn output() -> ExecOutput {
@@ -422,6 +425,15 @@ impl Fixture {
         fs::create_dir(&bundle).unwrap();
         let externals_dir = root.join("host-externals");
         stage_fake_node_externals(&externals_dir.join("externals"));
+        // The bundle carries its own copy of the same trees — the release
+        // layout the pool mounts as-is, without the copy `ensure_host_externals`
+        // makes for an incomplete bundle. That copy runs as a child process
+        // with a regular deadline, and a test that pauses the clock drives that
+        // deadline to expiry the moment the runtime goes idle, so the copy would
+        // be killed and the pool would refuse to start. Staging both trees keeps
+        // paused-clock tests free of real process I/O; the copy path itself is
+        // covered by the crate's non-paused lifecycle tests.
+        stage_fake_node_externals(&bundle.join("externals"));
         let artifact_stem = root.join("runner-image");
         if payload_exists {
             fs::write(
@@ -655,8 +667,20 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
         1
     );
 
+    // The reuse pass must boot a runner of its own. Wait for one `run` call
+    // more than the first pass produced rather than for a fixed total: the
+    // first pass is cancelled the moment the pack lands, so whether it boots a
+    // runner first depends on where the pool yields between the pack and the
+    // slot's first shutdown check — not on what this test asserts.
+    let boots_before_reuse = provider.snapshot().await.run_calls;
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
-    run_until_cancelled(pool, &provider, CancellationToken::new(), 2).await;
+    run_until_cancelled(
+        pool,
+        &provider,
+        CancellationToken::new(),
+        boots_before_reuse + 1,
+    )
+    .await;
     let second = provider.snapshot().await;
     assert_eq!(second.pack_calls, 1);
     assert_eq!(
