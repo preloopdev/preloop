@@ -536,8 +536,11 @@ allowed_actions = []       # `owner/repo@ref`, wildcards, and `!` blocks
 `require_sha_pinning` accepts either a full commit SHA or coverage by an
 onboarded lockfile. `require_lockfile` requires each workflow to be onboarded.
 Allow entries and `!` block entries follow GitHub-style precedence, with blocks
-winning. Local (`./`, `../`, `$/`) and `docker://` references are outside the
-lockfile action policy.
+winning. Local (`./`, `../`, `$/`) and `docker://` references are exempt from
+SHA pinning and lockfile coverage. Local references are always allowed, but
+`docker://` cannot be named by an entry: while `allowed_actions` holds at least
+one allow entry, every `docker://` reference is blocked. A block-only list
+leaves them alone.
 
 Boolean policy keys can be overridden with
 `PRELOOP_ACTIONS_POLICY_REQUIRE_SHA_PINNING`,
