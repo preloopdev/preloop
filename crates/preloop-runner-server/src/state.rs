@@ -1057,9 +1057,12 @@ pub struct AppState {
     /// and bounds GitHub API pressure; entries expire after
     /// [`ACTION_SHA_CACHE_TTL`].
     pub action_sha_cache: Arc<ActionShaCache>,
-    /// Positive-only memo of GitHub verdicts for action pins (see
-    /// [`crate::action_verify`]): reachability entries last one hour, and whole
-    /// locked-pin verdicts last five minutes. Failures are never recorded.
+    /// Memo of GitHub verdicts for action pins (see
+    /// [`crate::action_verify`]): positive reachability entries last one hour,
+    /// definitive reachability failures five minutes (so a doomed commit costs
+    /// one search per window rather than one per job), and whole locked-pin
+    /// verdicts five minutes. `Unavailable` is never recorded, so an outage is
+    /// re-checked as soon as it lifts.
     pub action_verify_cache: Arc<crate::action_verify::VerifyCache>,
     /// Trust-on-first-use pins of action archive checksums
     /// (`owner`, `repo`, `sha`) → hex SHA-256 of the tarball bytes. The

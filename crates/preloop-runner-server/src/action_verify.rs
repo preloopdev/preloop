@@ -38,13 +38,18 @@
 //! - 16 annotated tag objects per tag chain;
 //! - 8 MiB per response body. A larger body is `Unavailable`.
 //!
-//! Caches. Only positive verdicts are cached, per `AppState`, keyed by API
-//! base, lowercased owner and repository, and the rest of the question.
-//! Reachability is reused for [`ACTION_VERIFY_CACHE_TTL`]. A whole locked-pin
-//! verdict from [`verify_locked_pin`] is reused for [`LOCKED_PIN_CACHE_TTL`],
-//! so a moved tag or a transferred repository is noticed within that window.
-//! Concurrent checks of one pin share a single verification (one gate per key),
-//! so a matrix fan-out cannot multiply the requests one lock costs.
+//! Caches. Verdicts are cached per `AppState`, keyed by API base, lowercased
+//! owner and repository, and the rest of the question. A reachability verdict
+//! is reused for [`ACTION_VERIFY_CACHE_TTL`] when positive and for
+//! [`ACTION_VERIFY_FAILURE_TTL`] when a definitive failure, so a doomed commit
+//! is searched for once per window instead of once per job — and stays refused
+//! either way. `Unavailable` is never cached: an outage is re-checked as soon
+//! as it lifts. A whole locked-pin verdict from [`verify_locked_pin`] is reused
+//! for [`LOCKED_PIN_CACHE_TTL`], so a moved tag or a transferred repository is
+//! noticed within that window. Concurrent checks of one pin, and concurrent
+//! searches for one commit, share a single verification (one gate per key), so
+//! a matrix fan-out cannot multiply the requests one lock or one doomed commit
+//! costs.
 //!
 //! Credentials. Each request carries an App installation token when an App
 //! covers the repository, else the static PAT, else none — the same ladder the
@@ -68,11 +73,16 @@ use crate::state::AppState;
 /// How long a positive reachability verdict is reused. A commit that stops
 /// being reachable (a force-push, say) stays accepted for at most this long.
 pub const ACTION_VERIFY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a definitive reachability failure is reused. Deliberately shorter
+/// than the positive window: a doomed lookup is paid for once per window
+/// instead of once per job, and a commit that a force-push or a late ref push
+/// makes reachable is re-checked within this window rather than an hour.
+pub const ACTION_VERIFY_FAILURE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a positive whole-pin verdict from [`verify_locked_pin`] is reused.
 /// Five minutes, the same window as live ref resolution, so a moved tag or a
 /// transferred repository is noticed within that window.
 pub const LOCKED_PIN_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-/// Positive verdicts held per cache map. The oldest is evicted beyond this.
+/// Verdicts held per cache map. The oldest is evicted beyond this.
 const VERIFY_CACHE_CAPACITY: usize = 4096;
 /// Entries per branch or tag listing page: GitHub's maximum.
 const LISTING_PAGE_SIZE: usize = 100;
@@ -106,7 +116,7 @@ impl RefScope {
 }
 
 /// Why a pin failed verification, or why it could not be verified.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum VerifyError {
     /// GitHub has no such commit in `owner/repo` (404 or 422 on the commit).
     CommitNotFound {
@@ -267,14 +277,14 @@ type ReachKey = (String, String, String, String, bool);
 /// is kept as written, because tag names are case-sensitive.
 type PinKey = (String, String, String, String, String, u64, u64);
 
-/// Positive verdicts, each with the instant it was recorded and the lifetime
-/// its map was built with.
-struct TtlMap<K> {
+/// Verdicts of one kind, each with the instant it was recorded and the
+/// lifetime its map was built with.
+struct TtlMap<K, V> {
     ttl: Duration,
-    entries: parking_lot::Mutex<HashMap<K, Instant>>,
+    entries: parking_lot::Mutex<HashMap<K, (Instant, V)>>,
 }
 
-impl<K: Eq + Hash + Clone> TtlMap<K> {
+impl<K: Eq + Hash + Clone, V: Clone> TtlMap<K, V> {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -282,40 +292,74 @@ impl<K: Eq + Hash + Clone> TtlMap<K> {
         }
     }
 
-    fn contains(&self, key: &K, now: Instant) -> bool {
+    /// The verdict recorded for `key`, when it is still inside the map's
+    /// lifetime.
+    fn get(&self, key: &K, now: Instant) -> Option<V> {
         self.entries
             .lock()
             .get(key)
-            .is_some_and(|recorded| now.saturating_duration_since(*recorded) < self.ttl)
+            .filter(|(recorded, _)| now.saturating_duration_since(*recorded) < self.ttl)
+            .map(|(_, value)| value.clone())
     }
 
-    fn insert(&self, key: K, now: Instant) {
+    fn insert(&self, key: K, value: V, now: Instant) {
         let mut entries = self.entries.lock();
-        entries.retain(|_, recorded| now.saturating_duration_since(*recorded) < self.ttl);
+        entries.retain(|_, (recorded, _)| now.saturating_duration_since(*recorded) < self.ttl);
         if entries.len() >= VERIFY_CACHE_CAPACITY && !entries.contains_key(&key) {
             let oldest = entries
                 .iter()
-                .min_by_key(|(_, recorded)| **recorded)
+                .min_by_key(|(_, (recorded, _))| *recorded)
                 .map(|(oldest, _)| oldest.clone());
             if let Some(oldest) = oldest {
                 entries.remove(&oldest);
             }
         }
-        entries.insert(key, now);
+        entries.insert(key, (now, value));
     }
 }
 
-/// Positive-only memo of GitHub verdicts for action pins, held in
-/// [`AppState`]. Failures are never recorded. Each lock is taken only inside a
+/// One async gate per key: concurrent callers holding the same key run one
+/// after another instead of in parallel, so a fan-out cannot multiply the
+/// requests one verdict costs.
+type Gates<K> = parking_lot::Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>;
+
+/// The gate for `key`. Callers that miss a cache together wait here and read
+/// the first verdict instead of paying for a second lookup.
+fn gate<K: Eq + Hash + Clone>(gates: &Gates<K>, key: K) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = gates.lock();
+    if gates.len() >= VERIFY_CACHE_CAPACITY && !gates.contains_key(&key) {
+        // Drop the gates no task is holding, so a long-lived server's map
+        // stays bounded by the keys in flight.
+        gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+    }
+    Arc::clone(
+        gates
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+/// Memo of GitHub verdicts for action pins, held in [`AppState`]. Reachability
+/// keeps positive verdicts for [`ACTION_VERIFY_CACHE_TTL`], definitive failures
+/// for [`ACTION_VERIFY_FAILURE_TTL`], and locked pins keep their positive
+/// verdict for [`LOCKED_PIN_CACHE_TTL`]. `Unavailable` is never recorded, so an
+/// outage is re-checked as soon as it lifts. Each lock is taken only inside a
 /// synchronous section, never across an await.
 pub struct VerifyCache {
     clock: Clock,
-    reachable: TtlMap<ReachKey>,
-    pinned: TtlMap<PinKey>,
+    reachable: TtlMap<ReachKey, ()>,
+    /// Definitive reachability failures. A doomed commit — fork-only, absent,
+    /// or beyond the search budget — is refused, but only the first job of the
+    /// window pays for the search that proves it.
+    reach_failures: TtlMap<ReachKey, VerifyError>,
+    pinned: TtlMap<PinKey, ()>,
     /// One async gate per pin key, so concurrent identical verifications run
     /// one after another instead of in parallel. An entry is dropped once
     /// nobody holds it, which keeps the map bounded by the pins in flight.
-    pin_gates: parking_lot::Mutex<HashMap<PinKey, Arc<tokio::sync::Mutex<()>>>>,
+    pin_gates: Gates<PinKey>,
+    /// One async gate per reachability key, so concurrent identical searches
+    /// (a batch that repeats an action, a matrix fan-out) share one search.
+    reach_gates: Gates<ReachKey>,
 }
 
 impl VerifyCache {
@@ -323,8 +367,10 @@ impl VerifyCache {
         Self {
             clock,
             reachable: TtlMap::new(ACTION_VERIFY_CACHE_TTL),
+            reach_failures: TtlMap::new(ACTION_VERIFY_FAILURE_TTL),
             pinned: TtlMap::new(LOCKED_PIN_CACHE_TTL),
             pin_gates: parking_lot::Mutex::new(HashMap::new()),
+            reach_gates: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -339,36 +385,40 @@ impl VerifyCache {
     }
 
     fn reachable_hit(&self, key: &ReachKey) -> bool {
-        self.reachable.contains(key, self.now())
+        self.reachable.get(key, self.now()).is_some()
     }
 
     fn remember_reachable(&self, key: ReachKey) {
-        self.reachable.insert(key, self.now());
+        self.reachable.insert(key, (), self.now());
+    }
+
+    /// The definitive failure already proven for this reachability question,
+    /// if it is still inside its window.
+    fn reach_failure(&self, key: &ReachKey) -> Option<VerifyError> {
+        self.reach_failures.get(key, self.now())
+    }
+
+    fn remember_reach_failure(&self, key: ReachKey, error: VerifyError) {
+        self.reach_failures.insert(key, error, self.now());
+    }
+
+    fn reach_gate(&self, key: ReachKey) -> Arc<tokio::sync::Mutex<()>> {
+        gate(&self.reach_gates, key)
     }
 
     fn pin_hit(&self, key: &PinKey) -> bool {
-        self.pinned.contains(key, self.now())
+        self.pinned.get(key, self.now()).is_some()
     }
 
     /// The gate that serializes verification of one pin. Shared by every
     /// caller holding the same key, so the first one verifies and the rest
     /// find its verdict in the cache.
     fn pin_gate(&self, key: PinKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.pin_gates.lock();
-        if gates.len() >= VERIFY_CACHE_CAPACITY && !gates.contains_key(&key) {
-            // Drop the gates no task is holding, so a long-lived server's map
-            // stays bounded by the pins in flight.
-            gates.retain(|_, gate| Arc::strong_count(gate) > 1);
-        }
-        Arc::clone(
-            gates
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+        gate(&self.pin_gates, key)
     }
 
     fn remember_pin(&self, key: PinKey) {
-        self.pinned.insert(key, self.now());
+        self.pinned.insert(key, (), self.now());
     }
 }
 
@@ -419,7 +469,10 @@ fn pin_key(api_base: &str, pin: &LockedPinCheck<'_>) -> PinKey {
 ///    commit ends the search for free;
 /// 5. compares against the remaining branches, within the shared budget.
 ///
-/// A positive result is cached. A failure never is.
+/// A positive result is cached for [`ACTION_VERIFY_CACHE_TTL`] and a
+/// definitive failure for [`ACTION_VERIFY_FAILURE_TTL`], so a commit that
+/// cannot pass is searched for once per window rather than once per job.
+/// Concurrent searches for one commit share a gate and the first verdict.
 pub async fn verify_commit_reachable(
     state: &AppState,
     owner: &str,
@@ -438,9 +491,36 @@ pub async fn verify_commit_reachable(
     if state.action_verify_cache.reachable_hit(&key) {
         return Ok(());
     }
-    reachable_uncached(state, owner, repo, &sha, scope).await?;
-    state.action_verify_cache.remember_reachable(key);
-    Ok(())
+    if let Some(failure) = state.action_verify_cache.reach_failure(&key) {
+        return Err(failure);
+    }
+    // One search per commit at a time: a batch that names the same commit
+    // twice, or a matrix fan-out, waits here and reads the first verdict
+    // instead of spending a second search — up to 100 compares — on it.
+    let gate = state.action_verify_cache.reach_gate(key.clone());
+    let _gate = gate.lock().await;
+    if state.action_verify_cache.reachable_hit(&key) {
+        return Ok(());
+    }
+    if let Some(failure) = state.action_verify_cache.reach_failure(&key) {
+        return Err(failure);
+    }
+    match reachable_uncached(state, owner, repo, &sha, scope).await {
+        Ok(()) => {
+            state.action_verify_cache.remember_reachable(key);
+            Ok(())
+        }
+        Err(error) => {
+            // A transient failure says nothing about the pin: never cached, so
+            // the next job re-asks GitHub, which is the point of retrying it.
+            if error.is_definitive() {
+                state
+                    .action_verify_cache
+                    .remember_reach_failure(key, error.clone());
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn reachable_uncached(
@@ -860,7 +940,10 @@ pub fn is_full_version_tag(reference: &str) -> bool {
 ///
 /// A positive whole-pin verdict is cached for [`LOCKED_PIN_CACHE_TTL`]. Within
 /// that window a repeated check makes no request, and concurrent checks of one
-/// pin share a single verification. A failure is never cached.
+/// pin share a single verification. A whole-pin failure is not cached, but the
+/// reachability step inside it caches its own definitive verdicts (see
+/// [`verify_commit_reachable`]), so a locked commit that cannot pass is not
+/// searched for again by every job of the run that pins it.
 pub async fn verify_locked_pin(
     state: &AppState,
     pin: &LockedPinCheck<'_>,
@@ -1995,7 +2078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn negative_verdicts_are_never_cached() {
+    async fn a_definitive_failure_is_reused_until_its_window_ends() {
         let fixed = Arc::new(AtomicBool::new(false));
         let flag = fixed.clone();
         let api = Api::serve(move |target: &str| {
@@ -2017,7 +2100,9 @@ mod tests {
             ])(target)
         })
         .await;
-        let (state, _temp) = state_for(&api).await;
+        let (mut state, _temp) = state_for(&api).await;
+        let clock = ManualClock::new();
+        state.action_verify_cache = Arc::new(clock.cache());
 
         let error = verify_commit_reachable(&state, "o", "r", LOCKED, RefScope::BranchesOnly)
             .await
@@ -2026,11 +2111,135 @@ mod tests {
             matches!(error, VerifyError::NotReachable { .. }),
             "{error:?}"
         );
+        let after_first = api.requests().len();
+        assert_eq!(after_first, 4, "repo, commit, listing, one compare");
 
+        // A second job pinning the same commit reads the verdict it already
+        // paid for instead of spending the search again.
+        let error = verify_commit_reachable(&state, "o", "r", LOCKED, RefScope::BranchesOnly)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, VerifyError::NotReachable { .. }),
+            "the failure is replayed: {error:?}"
+        );
+        assert_eq!(
+            api.requests().len(),
+            after_first,
+            "a definitive failure inside its window makes no request"
+        );
+
+        // Once the window ends GitHub is asked again, so a commit a later push
+        // made reachable is accepted rather than refused for the whole hour a
+        // positive verdict lasts.
+        clock.advance(ACTION_VERIFY_FAILURE_TTL + Duration::from_secs(1));
         fixed.store(true, Ordering::SeqCst);
         verify_commit_reachable(&state, "o", "r", LOCKED, RefScope::BranchesOnly)
             .await
             .unwrap();
+        assert!(
+            api.requests().len() > after_first,
+            "the window ended: the search ran again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_doomed_scan_is_paid_for_once_per_window() {
+        // 150 branches, more than the compare budget, and none contains the
+        // commit: without a negative verdict every job of every run that pins
+        // it would spend the full budget again.
+        let api = Api::serve(move |target: &str| match target {
+            REPO => (200, repo_json(2, 1, "main")),
+            _ if target == commit_target(FORK_ONLY) => (200, sha_json(FORK_ONLY)),
+            BRANCHES_1 => (200, listing_page(1, LISTING_PAGE_SIZE)),
+            BRANCHES_2 => (200, listing_page(1 + LISTING_PAGE_SIZE, 50)),
+            _ if target.starts_with("/repos/o/r/compare/") => (200, compare_json(OTHER)),
+            _ => (404, String::new()),
+        })
+        .await;
+        let (state, _temp) = state_for(&api).await;
+
+        let error = verify_commit_reachable(&state, "o", "r", FORK_ONLY, RefScope::BranchesOnly)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VerifyError::Unproven { .. }), "{error:?}");
+        assert_eq!(
+            api.count_prefix("/repos/o/r/compare/"),
+            MAX_REF_COMPARES,
+            "the exhaustive scan runs once"
+        );
+        let spent = api.requests().len();
+
+        // The rest of the run's jobs, and its reruns, read that verdict.
+        for _ in 0..3 {
+            let error =
+                verify_commit_reachable(&state, "o", "r", FORK_ONLY, RefScope::BranchesOnly)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(error, VerifyError::Unproven { .. }), "{error:?}");
+        }
+        assert_eq!(
+            api.requests().len(),
+            spent,
+            "a proven-doomed scan is not run again inside its window"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_searches_for_one_commit_share_one_scan() {
+        let api = Api::serve(move |target: &str| match target {
+            REPO => (200, repo_json(2, 1, "main")),
+            _ if target == commit_target(FORK_ONLY) => (200, sha_json(FORK_ONLY)),
+            BRANCHES_1 => (200, listing_page(1, LISTING_PAGE_SIZE)),
+            BRANCHES_2 => (200, listing_page(1 + LISTING_PAGE_SIZE, 50)),
+            _ if target.starts_with("/repos/o/r/compare/") => (200, compare_json(OTHER)),
+            _ => (404, String::new()),
+        })
+        .await;
+        let (state, _temp) = state_for(&api).await;
+        let state = Arc::new(state);
+
+        // Four callers that miss the cache together — a matrix fan-out, or a
+        // batch naming one commit in four places.
+        let mut calls = Vec::new();
+        for _ in 0..4 {
+            let state = state.clone();
+            calls.push(tokio::spawn(async move {
+                verify_commit_reachable(&state, "o", "r", FORK_ONLY, RefScope::BranchesOnly).await
+            }));
+        }
+        for call in calls {
+            let error = call.await.unwrap().unwrap_err();
+            assert!(matches!(error, VerifyError::Unproven { .. }), "{error:?}");
+        }
+        assert_eq!(
+            api.count_prefix("/repos/o/r/compare/"),
+            MAX_REF_COMPARES,
+            "four callers, one search"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_never_cached() {
+        // The listing is down. An outage says nothing about the pin, so every
+        // check must ask GitHub again — remembering it would hold the job
+        // refused after GitHub recovered.
+        let api = Api::serve(move |target: &str| match target {
+            REPO => (200, repo_json(2, 1, "main")),
+            _ if target == commit_target(LOCKED) => (200, sha_json(LOCKED)),
+            BRANCHES_1 => (503, String::new()),
+            _ => (404, String::new()),
+        })
+        .await;
+        let (state, _temp) = state_for(&api).await;
+
+        for _ in 0..2 {
+            let error = verify_commit_reachable(&state, "o", "r", LOCKED, RefScope::BranchesOnly)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, VerifyError::Unavailable(_)), "{error:?}");
+        }
+        assert_eq!(api.count(BRANCHES_1), 2, "an outage is re-checked");
     }
 
     #[tokio::test]
