@@ -34,6 +34,7 @@ Use the right template. Each one collects exactly the evidence a maintainer need
    - `just dogfood` — live E2E with the real runner
 3. **Wire-shape changes** to DTOs in `preloop-gha-protocol/src/azdo/` must preserve serde round-trip fidelity. Check golden captures in `.runner-watch/golden/`.
 4. Read the PR template ([`.github/pull_request_template.md`](.github/pull_request_template.md)) and fill in every gate that applies — protocol changes **require** the official-runner validation gate.
+5. **Dependency/policy isolation** — a PR may carry `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`, `supply-chain/**`, and any `Cargo.toml`/`Cargo.lock` in the tree together, and must not carry anything else. Code that needs a new dependency ships in a follow-up PR after that one merges: run `just supply-chain-guard` before pushing (rule and guard: [`supply-chain/README.md`](supply-chain/README.md)).
 
 ## Compatibility checklist
 

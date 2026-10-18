@@ -40,7 +40,34 @@ Releases before v0.27.0 predate the changelog.
   or deleted — and deletes it unless `--dry-run` is given. `prune` stays as the
   explicit one-shot for volumes that have no recorded age.
 
+- **`preloop init` workflow readiness checks.** The five-step wizard can ask for
+  a stable HTTPS App webhook URL, scan local and configured repositories for
+  missing workflow secrets, and report every `runs-on` label against the
+  engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
+  `--json` includes the URL, secret, and runner-label decisions.
+
 ### Changed
+
+- **SmolVM floor and golden pin move to 1.30.1** (`smolvm_min_version` and
+  `smolvm_golden_version` in `versions.toml`). The floor now also covers the
+  x86_64 virtio device budget SmolVM 1.23.0 raised to 19 MMIO IRQ lines, which
+  is what a packed golden with preloop's mounts needs; `preloop update
+  --ensure-runtime` upgrades any engine below it, and `install.sh` gates the
+  same release. The floor is compiled once, by `crates/preloop-vm/build.rs`,
+  and read by the updater. Raising the golden pin does not rebuild the
+  published golden: it is a digest-pinned OCI artifact, so a 1.30.1-baked
+  golden needs a bake, publish, and digest bump per `docs/build-goldens.md`.
+- **One dependency/policy PR, and nothing mixed into it.** A pull request may
+  ship `deny.toml`, `.cargo/audit.toml`, `.github/workflows/supply-chain.yml`,
+  `supply-chain/**`, and any `Cargo.toml` or `Cargo.lock` in the tree together —
+  one supply-chain CI run — but it fails if any of them is mixed with source,
+  docs, `CHANGELOG.md`, another workflow, the `justfile`, or any other file.
+  Code that needs a new dependency lands in a follow-up PR, rebased on `main`
+  after the dependency/policy PR merges. The rule now lives in
+  `supply-chain/guard-policy-files.sh` (same script CI runs), with the policy
+  and the reasoning in `supply-chain/README.md`; run it locally as
+  `just supply-chain-guard`, which compares the merge base of `origin/main` and
+  `HEAD`. There is no override: the verdict follows from the diff.
 
 - **The file credential store is the default.** The engine token, GitHub App
   private key, PAT, and webhook secrets are written to `0600` files under
@@ -68,7 +95,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **A microVM that runs out of IRQ lines says so.** When `machine start` fails
+  with libkrun's `no more IRQs are available` (the device budget x86_64
+  libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
+  engine now reports `VmError::IrqExhausted` instead of passing smolvm's bare
+  `-22 (EINVAL)` through: the message names the machine's declared volume and
+  socket mounts on top of the launcher's fixed device set, the SmolVM version
+  in use, both x86_64 ceilings, and the remedy (upgrade to the floor or start
+  with fewer mounts), with the raw smolvm output appended. Previously this was
+  indistinguishable from a held or corrupt disk image, and the pool restarted
+  forever without naming the cause.
+
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
+- **Job `env:` and reusable-call `secrets:` maps read the claim-minted `GITHUB_TOKEN`.**
+  Acquire resolved `${{ secrets.GITHUB_TOKEN }}` in a job's `env:` and in a
+  reusable call's `secrets:` map before the claim minted the token, so a job that
+  also read a stored secret received an empty value while `${{ github.token }}`
+  held the token. The claim now applies the minted token before the fill, so both
+  expressions read the same value. `secrets: inherit` is covered the same way.
 
 - **The GitHub App JWT breaker is partitioned by App id**: one App's rate
   limit or outage no longer skips the webhook-health and delivery-watchdog
