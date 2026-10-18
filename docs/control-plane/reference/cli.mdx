@@ -7,11 +7,15 @@ This reference lists every command and flag of the `preloop` binary. Run `preloo
 
 `preloop --version` and `preloop version` print the build version. Commands that talk to the engine use `PRELOOP_URL` (default `http://127.0.0.1:9090`) and the native API token.
 
+**Only `preloop serve` and `preloop init --mode foreground` start an engine** (`preloop engine` is `serve`'s former name, kept for existing supervisor units). Every command that talks to an engine — `run`, `rerun`, `status`, `logs`, `cancel`, `shell`, `debug`, `dap`, `push`, `webhooks` — requires one that is already running: it probes `PRELOOP_URL` and, when nothing answers, exits non-zero naming the probed endpoint and how to start one — `preloop serve` for the foreground, `preloop server install` for a supervised service. `preloop run` is included: it submits work to an engine, it does not boot one (issue #658).
+
+Local and administrative commands (`plan`, `store`, `setup`, `doctor`, `secret`, `update`, `version`, `build-golden`, `golden-path`, and `init` outside `--mode foreground`) neither probe nor start an engine, so `preloop store migrate` still prepares a database with no engine running. A loopback endpoint is probed with a tight budget (500 ms) so a silent local engine refuses at once; an endpoint that crosses a network gets 5 s, so a healthy but slow remote engine is not reported absent.
+
 ## Run and inspect workflows
 
 ### preloop run
 
-Submit a workflow, stream its events, and wait for the run to finish.
+Submit a workflow, stream its events, and wait for the run to finish. Requires a running engine (`preloop serve`); it does not start one.
 
 ```sh
 preloop run -f .github/workflows/ci.yml --event pull_request
@@ -190,18 +194,19 @@ The steps are credentials, golden, workflows, run mode, and preflight. The workf
 
 Its report lists every `secrets.NAME` / `secrets['NAME']` reference (excluding the engine-minted `GITHUB_TOKEN`), its file locations, and whether the name is configured globally, for the repository, or for an environment. In a terminal each missing UPPER_SNAKE name can be entered through a hidden prompt; otherwise the report prints the exact `preloop secret set NAME --repo OWNER/NAME` command. The `runs-on` table uses the engine's actual matching rules: base labels are `self-hosted`, `Linux`, and the host architecture; `ubuntu-latest`/`ubuntu-24.04` use the official golden, other `ubuntu-*` labels use the configured golden, and macOS/Windows labels require a matching external runner because the Linux pool cannot host them. Undeclared custom labels need a matching registered runner or an explicit `PRELOOP_RUNNER_LABELS` value.
 
-For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub can reach. Tailscale Funnel, a Cloudflare **named** Tunnel (not a quick Tunnel, whose URL changes on restart), or a domain/reverse proxy are suitable; expose only `/api/v1/github/webhooks`. An existing `--public-url` or `PRELOOP_PUBLIC_URL` is used without asking. Blank means local-only App webhooks: pushes and pull requests will not start runs and PR checks will not report.
+For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub can reach. Answer the prompt with the URL directly; when `tailscale` is on the host and reports a running tailnet, its own name for the machine (`https://<machine>.<tailnet>.ts.net`) is offered: Enter accepts it when `tailscale funnel status --json` shows the webhook path as the only route this node publishes, and it is shown as a hint (blank still skips) when it is not Funnel-published or the Funnel also has other mounts. Type `-` to skip. The prompt also prints the way there — a Tailscale Funnel on a hostname nothing else serves (`tailscale funnel --set-path=/api/v1/github/webhooks --bg http://127.0.0.1:9090/api/v1/github/webhooks`; Funnel applies to the host and port, so a root mount beside it would publish the runner-registration surface too — check with `tailscale funnel status`), a Cloudflare **named** Tunnel (not a quick Tunnel, whose URL changes on restart) behind a path-filtering proxy, or a domain/reverse proxy; the full guide is in [Deploy](/control-plane/operate/deploy#exposure-options). Skipping means the App is created with webhooks off: pushes and pull requests will not start runs and PR checks will not report. An existing `--public-url` or `PRELOOP_PUBLIC_URL` is used without asking.
+
+The URL resolved here is not written to the config file: it is handed to whatever run mode init starts — the foreground `serve` args, or a `PRELOOP_PUBLIC_URL` line in the installed service's environment file — so Check Run detail links and the webhook health check use the address GitHub was given. (A kept credential — the "kept" path — resolves it from `--public-url` or `PRELOOP_PUBLIC_URL`, since nothing is reconfigured there.)
 
 | Flag | Description |
 |---|---|
 | `--probe` | Print a host capability report as JSON and exit. Changes nothing. |
 | `--auth <app\|pat\|none>` | Credential step. `none` writes no credential and leaves an existing one alone. |
-| `--app-id <ID>` | Existing GitHub App ID, with `--auth app`. |
-| `--pem-file <PATH>` | Existing App private key, with `--auth app`. |
+| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials, with `--auth app`. Without them the browser flow creates one. With `--public-url`, this path points the App's webhook at the engine (`PATCH /app/hook/config`) instead of silently saving credentials whose hook stays inactive. |
 | `--token <TOKEN>` | Personal access token, with `--auth pat`. Falls back to `PRELOOP_GITHUB_PAT`. |
 | `--webhook-secret <SECRET>` | Webhook secret to store with the credential. |
 | `--org <NAME>` | Create the App under an organization, in the browser flow. |
-| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed. |
+| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed. Also handed to the mode this run starts — the foreground `serve` args, or the installed service's environment file — so Check Run links and the webhook health check use it. |
 | `--port <N>` | Loopback port for GitHub's redirect. `0` picks a free port. |
 | `--no-browser` | Print the App-creation URL instead of opening a browser. |
 | `--repo <OWNER/NAME>` | Repository to verify and scan. Repeatable; without it, the current checkout's origin is used. |
@@ -221,7 +226,7 @@ Exit codes: `2` a required flag is missing or invalid. `3` preflight failed (dis
 
 ### preloop setup github
 
-Configure GitHub credentials directly, without the other `init` steps.
+Configure GitHub credentials directly, without the other `init` steps. With no App credentials and a public URL, the engine hosts the App-creation form; over SSH the command listens on `127.0.0.1:8765` on the server and you reach it with `ssh -L 8765:127.0.0.1:8765 <host>`; otherwise it is a single-use local listener. [GitHub App](/control-plane/github/app#register-the-app) walks through all three.
 
 ```sh
 preloop setup github --via app
@@ -231,17 +236,18 @@ preloop setup github --via pat --repo owner/repo
 | Flag | Description |
 |---|---|
 | `--via <app\|pat>` | Credential type. `app` is recommended. |
+| *(no App flags)* | With `--via app` and no `--app-id`/`--pem-file`, creates the App through GitHub's manifest flow and stores everything. With a public URL the running engine hosts the form and stores the credentials; over SSH the listener is reached through a port forward; otherwise it is a local listener. See [GitHub App](/control-plane/github/app#register-the-app). |
 | `--app-id <ID>` | Existing App ID, with `--via app`. |
 | `--pem-file <PATH>` | Existing App private key, with `--via app`. |
-| `--add` | Create an additional App in the registry, in the browser. |
+| `--add` | Create an additional App when one is already configured. Without it, an already-configured App is updated instead (webhook) or reported rather than duplicated. |
 | `--org <NAME>` | Create the App under an organization. |
-| `--port <N>` | Loopback port for GitHub's redirect. `0` picks a free port. |
-| `--public-url <URL>` | Enable webhook delivery on the created App. |
+| `--port <N>` | Listener port for the local and SSH flows. Default: a free port locally, `8765` over SSH, so the `ssh -L` forward has a known port. |
+| `--public-url <URL>` | Selects engine-hosted App setup (the running engine serves the form and receives GitHub's redirect), and enables webhook delivery to this URL. Falls back to `PRELOOP_PUBLIC_URL`. Must be on the engine's own origin when the engine has `PRELOOP_PUBLIC_URL` set, and must be `https` unless it is loopback. On an already-configured App, updates its webhook instead of creating a second App. |
 | `--app-name <NAME>` | Name of the created App. Default `preloop-local`. GitHub requires it to be unique. |
 | `--no-browser` | Print the URL instead of opening a browser. |
 | `--webhook-secret <SECRET>` | Store a webhook secret you created yourself. |
 | `--token <TOKEN>` | Personal access token, with `--via pat`. Falls back to `PRELOOP_GITHUB_PAT`, then a hidden prompt. |
-| `--repo <OWNER/NAME>` | Repository to verify the credential against. Repeatable. |
+| `--repo <OWNER/NAME>` | Repository to verify the credential against. Repeatable. On the engine-hosted flow the engine runs the checks with the key it just stored, after waiting up to five minutes for the App to be installed there; the CLI prints one `✓`/`✗` line per repository and exits non-zero if any failed (up to 16). |
 | `--workspace <PATH>` | Workspace whose workflows set the permission checklist. |
 
 ### preloop doctor
@@ -281,6 +287,8 @@ The [configuration guide](/control-plane/configuration#secrets) explains the sco
 
 Run the control plane and the microVM pool in the foreground. This is the self-hosting entry point. It serves the GitHub webhook and Checks endpoints and starts microVMs for queued jobs.
 
+**The only foreground entry point that starts an engine** (`preloop init --mode foreground` runs this same mode): every command that talks to an engine requires one that is already running, while local and administrative commands never contact one. On a fresh `PRELOOP_HOME` it initializes the brand-new control database — the one `--store` / `PRELOOP_STORE_URL` selects, which is also the one the boot opens. An existing store is never migrated here; run `preloop store migrate` for that, and provision a Postgres store yourself.
+
 ```sh
 preloop serve
 preloop serve --listen 0.0.0.0:9090 --public-url https://ci.example.com
@@ -297,7 +305,7 @@ preloop serve --listen 0.0.0.0:9090 --public-url https://ci.example.com
 | `--save` | Persist the supplied GitHub credentials for later runs. |
 | `--store <URL>` | Durable-state backend: `sqlite://<path>`, a bare path, or `postgres://…`. Default: `PRELOOP_STORE_URL`, then SQLite in the state directory. |
 
-`serve` never migrates the database. See [Configuration](/control-plane/configuration#durable-state).
+`serve` initializes only a brand-new local store and never migrates an existing database. See [Configuration](/control-plane/configuration#durable-state) and [Storage](/control-plane/operate/storage#apply-schema-migrations).
 
 ### preloop server
 
@@ -340,6 +348,8 @@ preloop server uninstall --user --purge-data
 
 Manage the control database. These commands are offline. They never start the engine.
 
+`migrate` initializes or upgrades the schema. `preloop serve` initializes only a brand-new local store and otherwise never applies migrations; run this command explicitly to upgrade an existing store. SQLite migrations take a pre-migration backup by default when the database exists and has pending migrations.
+
 ```sh
 preloop store migrate --store postgres://…
 preloop store status
@@ -367,6 +377,44 @@ preloop webhooks health --json
 | `list` | `--state <received\|processing\|done\|failed>`: only deliveries in that state. `--limit <N>`: rows to print. Default `50`, maximum `500`. `--json`. |
 | `replay <DELIVERY_ID>` | The `X-GitHub-Delivery` GUID. Requeues the delivery from its stored payload. Processing is idempotent. |
 | `health` | `--json`. Shows queue depth, watchdog freshness, open repairs, the GitHub circuit-breaker state, and App webhook drift. |
+
+### preloop volumes
+
+Read-only volumes the engine mounts. Each holds one host tree — today the runner bundle, including the Node externals it carries — named `preloop-runner-<digest>` after the digest of the tree, so a new bundle is a new volume. The engine collects superseded volumes on its own (`gc`, and the [`PRELOOP_VOLUMES_*`](/control-plane/reference/environment#vm-backend) variables); these commands run that plan by hand, or reclaim volumes it deliberately leaves alone. They are offline: they talk to AgentENV (`PRELOOP_AENV_BINARY`, default `aenv`) and never bootstrap the engine.
+
+#### preloop volumes list
+
+Lists the volumes AgentENV holds, with kind, mode, size, status, and the runner/Node versions each one was populated from. AgentENV cannot be asked what is inside a volume, so the versions come from the index the engine writes when it populates one: a volume populated before that index existed, or by another host, reports `unknown (pre-manifest or created elsewhere)`.
+
+#### preloop volumes prune
+
+Deletes every volume that no sandbox mounts, except the tree the engine would mount. Without `--keep` that tree is the same selection the pool makes — `PRELOOP_RUNNER_BUNDLE` when it names a usable Linux runner bundle, otherwise the installed or development bundle beside the binary, including the engine's own mirror — plus the standalone Node externals (`PRELOOP_RUNNER_EXTERNALS`, else `$PRELOOP_HOME/externals`) when one is installed.
+
+AgentENV refuses to delete a mounted volume, and that is reported as `in use`, not as a failure. A dry run cannot tell which volumes a sandbox holds (the server only reveals a reservation when a delete is attempted), so it reports `candidate` instead of claiming a deletion.
+
+Pruning is safe while an engine is running: the provider re-checks that a remembered volume still exists before reusing it, and populates it again if it was deleted. It is not safe while a volume is being populated: one deleted between a populate's create and its first mount fails that populate.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable). |
+| `--dry-run` | Report candidates without deleting anything. |
+
+#### preloop volumes gc
+
+Collects the volumes nothing needs any more. It keeps the trees named with `--keep` (without that flag, the same tree selection `prune` keeps), every volume a sandbox mounts, every volume this engine published and remembers, every volume younger than the grace period or with no recorded creation time, the newest superseded volume per kind for a rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`, default 1), and any staging volume a populate is writing.
+
+Remembering a volume keeps it only while it can be mounted: a volume AgentENV reports as `failed` or `uploading` is kept until its grace period is over and then reclaimed as `unusable`, because this engine refuses to mount such a volume — keeping it would leave every start on that tree stuck.
+
+It deletes the rest and prints one row per volume — size, kind, age and the reason it is kept or deleted — so `--dry-run` shows exactly what a real run does. The reasons are `live`, `mounted`, `populating`, `young`, `unknown-age`, `previous` and `unmanaged` for kept volumes, and `superseded`, `abandoned` (a staging volume whose populate is gone) and `unusable` for deleted ones. A volume whose age nothing recorded — populated by an older build, or by another host — is kept, which is what `prune` is for.
+
+A planned deletion that something claimed between the plan and the deletion — a populate that started while the listing ran, or a volume this engine published for a start that is about to mount it — is printed as `left` and left for the next pass. A deletion the server refused for any reason other than a mounted volume exits nonzero, as `prune` does, so a caller can tell that the cleanup it asked for did not happen.
+
+The engine runs the same plan in the background after it populates a volume and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600 seconds), so a bundle change reclaims the bundle it replaced once the grace period is over. The timer starts with the engine, so an engine that only resumes sandboxes it already has still collects. `PRELOOP_VOLUMES_GC=off` stops those automatic passes and leaves this command.
+
+| Flag | Description |
+|---|---|
+| `--keep <DIR>` | Host tree whose volume is kept (repeatable). |
+| `--dry-run` | Print the plan without deleting anything. |
 
 ### preloop update
 

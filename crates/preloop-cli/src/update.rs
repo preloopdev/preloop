@@ -135,7 +135,7 @@ struct SelectedAsset<'a> {
 }
 
 pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
-    let client = Client::builder()
+    let client = preloop_runner_server::shared_http::with_tls_roots(Client::builder())
         .user_agent(USER_AGENT)
         .redirect(updater_redirect_policy())
         .build()
@@ -1389,7 +1389,9 @@ mod tests {
             browser_download_url: "https://example.com/preloop.tar.gz".into(),
             digest: None,
         };
-        let client = Client::builder().build().unwrap();
+        let client = preloop_runner_server::shared_http::with_tls_roots(Client::builder())
+            .build()
+            .unwrap();
         let error = verify_release_signature(&client, &archive, None, &archive_path)
             .await
             .expect_err("missing signature must fail closed");

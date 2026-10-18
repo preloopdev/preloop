@@ -18,7 +18,7 @@ Postgres uses 16 writer and 16 reader connections by default, plus one dedicated
 
 ## Apply schema migrations
 
-The server verifies the schema but does not upgrade it. Initialize or upgrade explicitly:
+The control schema uses embedded, forward-only refinery migrations. A fresh local SQLite store is initialized by the supported setup paths (`preloop serve` on a fresh `$PRELOOP_HOME`, `preloop init`, `preloop server install`); existing stores are upgraded explicitly:
 
 ```sh
 export PRELOOP_STORE_URL='postgres://preloop@db.example/preloop?sslmode=verify-full'
@@ -36,7 +36,7 @@ preloop store migrate [--store URL] [--adopt-baseline] [--no-backup] [--dry-run]
 preloop store status [--store URL]
 ```
 
-The migration ledger is `refinery_schema_history`; it, not `schema_meta`, is the version authority. `schema_meta` retains the key fingerprint used to reject an incompatible state key. `preloop serve` refuses an uninitialized, legacy, older, newer, incomplete, or divergent schema and points to `preloop store migrate`.
+The migration ledger is `refinery_schema_history`; it, not `schema_meta`, is the version authority. `schema_meta` retains the key fingerprint used to reject an incompatible state key. `preloop serve` initializes a brand-new local store (absent or empty) and otherwise refuses an uninitialized, legacy, older, newer, incomplete, or divergent schema rather than migrating it, and points to `preloop store migrate`. A Postgres store is the operator's to provision.
 
 ### Import a legacy database
 

@@ -75,7 +75,7 @@ preloop logs -f --job <job-key>
 ```
 
 <Note>
-If no engine is running and `PRELOOP_URL` is unset, `preloop run` starts one in the background. Its log is `~/.preloop/engine.log`, and its process ID is in `~/.preloop/preloop.pid`.
+`preloop run` does not start an engine: only `preloop serve` and `preloop init --mode foreground` do. If no engine answers at `PRELOOP_URL`, the command exits non-zero naming the endpoint it probed — start `preloop serve` in another terminal first.
 </Note>
 
 If a step fails in an interactive terminal, the job pauses instead of being torn down. Attach to it with `preloop debug`. The [debugging guide](/control-plane/guides/debugging) covers the verdicts you can issue.

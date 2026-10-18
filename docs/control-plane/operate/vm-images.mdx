@@ -81,6 +81,8 @@ The bundle must be a Linux ELF binary even when the host is Linux. `install.sh` 
 
 If the bundle is absent, the engine logs that there is no runner pool and jobs fail after the queue grace window. Install the bundle with `preloop update` or set `PRELOOP_RUNNER_BUNDLE` to its directory.
 
+On the AgentENV backend the bundle is not copied into each golden: the host tree is archived into a content-addressed read-only volume named `preloop-runner-<digest>`, so a bundle update publishes a new volume instead of requiring a golden rebuild. `preloop volumes list` shows what is held and the versions each volume was populated from; `preloop volumes prune` and `preloop volumes gc` reclaim what nothing needs (the engine also collects superseded volumes on its own). See [AgentENV read-only volumes](/control-plane/architecture/sandboxes#agentenv-read-only-volumes) for the retention rules.
+
 ## Version pins
 
 `versions.toml` controls the runner, SmolVM, and Node external pins:

@@ -50,6 +50,7 @@ refinery.workspace = true
 postgres_rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
+webpki-root-certs.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 libc = { workspace = true }

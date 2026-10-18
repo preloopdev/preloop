@@ -84,7 +84,7 @@ preloop init --probe --json
 
 The report includes `arch`, `os`, `disk_free_bytes`, `data_root`, `hypervisor`, `smolvm`, and the golden that `serve` would use. Then run [`preloop init`](/control-plane/quickstart#2-configure-the-engine) to write the configuration.
 
-Once you have configured a GitHub credential, `preloop doctor` checks it against GitHub:
+Once you have configured a GitHub credential — [GitHub App](/control-plane/github/app) covers the manifest flow, engine-hosted and over SSH — `preloop doctor` checks it against GitHub:
 
 ```sh
 preloop doctor --repo owner/repo

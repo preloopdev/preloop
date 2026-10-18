@@ -341,12 +341,33 @@ impl VmProvider for RecordingVmProvider {
 }
 
 struct Fixture {
-    _env_guard: std::sync::MutexGuard<'static, ()>,
+    // Fields drop in declaration order, so the pins go back while the lock is
+    // still held: releasing it first lets the next test repin and then have its
+    // pins clobbered by this fixture's late restore.
     _hermetic_env: HermeticEnvGuard,
+    _lock_still_held: EnvLockStillHeld,
+    _env_guard: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
     token: String,
+}
+
+/// Asserts, on drop, that `TEST_ENV_LOCK` is still held.
+///
+/// `Fixture` drops it between `HermeticEnvGuard` and the lock guard, so releasing
+/// the lock first — the order this fixture had before the fix — fails here
+/// instead of letting the next test repin under the lock and then have its pins
+/// clobbered by this fixture's late restore.
+struct EnvLockStillHeld;
+
+impl Drop for EnvLockStillHeld {
+    fn drop(&mut self) {
+        assert!(
+            TEST_ENV_LOCK.try_lock().is_err(),
+            "Fixture released TEST_ENV_LOCK before HermeticEnvGuard restored the environment"
+        );
+    }
 }
 
 /// Pins the host-sensitive environment for the fixture's lifetime and
@@ -474,8 +495,9 @@ impl Fixture {
             observability: None,
         };
         Self {
-            _env_guard: env_guard,
             _hermetic_env: HermeticEnvGuard::new(&root),
+            _lock_still_held: EnvLockStillHeld,
+            _env_guard: env_guard,
             root,
             config,
             token_env,

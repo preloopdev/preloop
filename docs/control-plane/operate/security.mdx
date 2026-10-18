@@ -18,7 +18,10 @@ Do not publish the whole listener. In particular, protect:
 - `/api/v1/*` native management routes and run logs;
 - `/api/v3/actions/runner-registration` and registration-token routes;
 - `/api/v1/github/register` and `/api/v1/github/callback` while App registration is in progress—the callback displays a private key and webhook secret, and both routes return `404` unless `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on`;
+- `/setup/github` and `/setup/github/callback`, which serve the engine-hosted App-creation form and GitHub's redirect; both return `404` unless a setup link is open, and `/api/v1/github/setup-sessions`—the authenticated endpoint that mints that link—is never a public route;
 - runner protocol, broker, artifact, cache, OIDC, and signed blob URLs.
+
+Restrict your proxy or tunnel to `/api/v1/github/webhooks`: a path-filtering proxy or a Cloudflare ingress rule does that by path, while Tailscale Funnel does it by giving the webhook a hostname with nothing else mounted on its port (Funnel publishes the host and port, not just the path). The reason is `POST /api/v3/actions/runner-registration`: the official GitHub runner authenticates there with a registration token **GitHub** issued, which a self-hosted control plane cannot validate, so the safe default (`PRELOOP_REGISTRATION_POLICY=strict`) is what keeps the surface closed.
 
 Native management routes use the system bearer, but the namespace is not uniform: webhooks use `X-Hub-Signature-256`, signed download URLs carry their own credential, and runner protocol routes use job or runner tokens. Do not rely on one blanket `/api/v1` rule in a proxy.
 

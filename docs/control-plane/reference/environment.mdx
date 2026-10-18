@@ -13,13 +13,13 @@ Runner-only variables such as `PRELOOP_BRIDGE_*` and `PRELOOP_DISABLE_ACTIONS_PR
 |---|---|---|
 | `PRELOOP_HOME` | `$HOME/.preloop` (or `.preloop` when `HOME` is unavailable) | Persistent state, credentials, sockets, and VM data directory. |
 | `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` when launched through the CLI; otherwise `$HOME/.preloop/config.toml` | TOML configuration path. |
-| `PRELOOP_URL` | `http://127.0.0.1:9090` | Engine URL used by CLI requests. Setting it disables local-engine autostart. |
+| `PRELOOP_URL` | `http://127.0.0.1:9090` | Engine URL used by CLI requests. A command that needs an engine probes it and exits non-zero when nothing answers; no command starts an engine on its own (only `preloop serve` and `preloop init --mode foreground` do). |
 | `PRELOOP_SERVER` | `http://127.0.0.1:8080` | Default server URL for `preloop-runner-client`. |
 | `PRELOOP_CLIENT_TIMEOUT_SECONDS` | `30` | HTTP timeout for `preloop-runner-client`. Invalid or non-positive values use `30`. |
 | `PRELOOP_TOKEN` | Falls back to `PRELOOP_SYSTEM_TOKEN`, then the managed engine token | Native API bearer token used by CLI requests. |
 | `PRELOOP_SYSTEM_TOKEN` | Generated and stored when absent | Native API and runner-registration bearer token. Treat it as an administrator credential. |
 | `PRELOOP_LISTEN` | `127.0.0.1:9090` | TCP address where `serve` listens. Must be a socket address. |
-| `PRELOOP_PUBLIC_URL` | `http://127.0.0.1:<listen-port>` | GitHub-facing base URL for webhook delivery and Check links. |
+| `PRELOOP_PUBLIC_URL` | `http://127.0.0.1:<listen-port>` | GitHub-facing base URL for webhook delivery and Check links. Also selects engine-hosted App setup for `preloop setup github` (the engine reads its own address from here; a CLI value must name the same origin). |
 | `PRELOOP_STORE_URL` | `$PRELOOP_HOME/state/preloop.db` | SQLite path or a `postgres://`/`postgresql://` durable store URL. |
 | `PRELOOP_UNIX_SOCKET` | Unset for a standalone server; the CLI engine uses `$PRELOOP_HOME/preloop.sock` | Optional native server Unix-socket listener. |
 | `PRELOOP_LOG_FORMAT` | `auto` | `auto`, `pretty`, or `json` process logs. Values are case-insensitive; invalid values use `auto`. |
@@ -69,6 +69,7 @@ The generated pre-push hook reads these variables:
 | `PRELOOP_GITHUB_PR_DRAFT` | `true` | Whether automatically created pull requests start as drafts. Boolean values are `1`, `true`, `yes`, `0`, `false`, or `no`, case-insensitive. |
 | `PRELOOP_GITHUB_PR_EXCLUDE` | Empty | Comma-separated gitignore-style branch patterns excluded from automatic PR creation. |
 | `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | `push,pull_request,check_run` | Comma-separated events requested by the default App manifest. An empty value restores this default. |
+| `PRELOOP_SETUP_INSTALL_WAIT_SECS` | `300` | How long an engine-hosted App setup waits for the App to be installed on the `--repo` repositories before running the checks. `0` checks immediately. |
 | `PRELOOP_ENABLE_APP_REGISTRATION` | Off | `1`, `true`, or `on` serves the App-manifest pages at `/api/v1/github/register` and `/api/v1/github/callback`. Both routes return `404` otherwise. Register Apps with `preloop setup github --via app` and leave this off; enable it only for a browser-driven registration on a remote engine, then unset it. |
 
 ## Retention, limits, and caches
@@ -131,7 +132,7 @@ Numeric values in this group are decimal integers. Retention, cache, and job-lim
 | `PRELOOP_RUNNER_DNS` | `8.8.8.8` | DNS resolver presented to guest networking. |
 | `PRELOOP_RUNNER_PACK_PROXY` | Falls back to `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` | HTTP proxy for packed-golden export traffic. |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Falls back to `NO_PROXY`, `no_proxy` | Proxy bypass list for packed-golden export traffic. |
-| `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. |
+| `PRELOOP_RUNNER_BUNDLE` | Auto-discovered Linux `preloop-runner` bundle | Directory containing the Linux guest runner. Invalid paths fall through discovery and then fail startup if no bundle is found. On the AgentENV backend the host tree is archived into a content-addressed read-only volume, so a bundle change publishes a new volume. |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` for `serve` | Shared read-only Node runtime externals. |
 | `PRELOOP_SMOLVM_NET_BACKEND` | `virtio-net` | SmolVM public-only network backend. Exact lowercase `tsi` selects TSI; any other value selects `virtio-net`. |
 | `PRELOOP_RUNNER_URL` | `http://127.0.0.1:<listen-port>` | Runner-facing engine URL. Set a host-reachable URL for runners on another machine. |
@@ -160,6 +161,10 @@ The engine boots each job in a microVM through one provider. SmolVM is the defau
     | `PRELOOP_AENV_MANAGE_EGRESS` | `on` | `0`, `false`, `no`, or `off` skips the engine-egress reconciliation with a warning; `dry-run` logs the planned actions and changes nothing. |
     | `PRELOOP_AENV_ENGINE_IP` | Read from the runner URL | Engine IPv4 address, when the runner URL does not name one and the guest must still reach the engine. |
     | `PRELOOP_AENV_CONFIG` | `/var/lib/aenv/config/config.toml` | AgentENV node configuration the egress reconciliation reads. |
+    | `PRELOOP_VOLUMES_GC` | `auto` | `auto` or `off`: whether the engine collects superseded runner volumes on its own, after it populates one and every `PRELOOP_VOLUMES_GC_INTERVAL_SECS`. `off` stops those passes and leaves `preloop volumes gc` for manual runs. |
+    | `PRELOOP_VOLUMES_KEEP_PREVIOUS` | `1` | Superseded volumes kept per kind for a rollback. `0` reclaims every superseded volume. |
+    | `PRELOOP_VOLUMES_GC_GRACE_SECS` | `3600` | How long a volume is left alone after it was created. |
+    | `PRELOOP_VOLUMES_GC_INTERVAL_SECS` | `21600` | Period between automatic collection passes; `0` disables the periodic pass. |
 
     AgentENV sandboxes cannot reach a private engine until the node deny-list and host firewall admit exactly the engine's address and port. The engine reconciles both itself and needs passwordless `sudo` for `iptables` and `systemctl`; set `PRELOOP_AENV_MANAGE_EGRESS=0` to keep the defaults and open them by hand.
   </Accordion>
@@ -184,7 +189,7 @@ The engine boots each job in a microVM through one provider. SmolVM is the defau
 
     | Variable | Default | Purpose |
     |---|---|---|
-    | `PRELOOP_ENGINE_ORIGIN` | Foreground detection | Marks an engine as background-started or systemd-managed for lifecycle handling. |
+    | `PRELOOP_ENGINE_ORIGIN` | Foreground detection | Marks an engine as background-started or systemd-managed for lifecycle handling. No preloop command starts an engine on its own, so a background launcher sets this. |
     | `PRELOOP_CONTROL_UPSTREAM` | Unset | TCP fallback for a guest control bridge when a Unix socket is unavailable. |
     | `PRELOOP_CONTROL_ORIGIN` | Unset | Guest runner's advertised control-plane origin. |
     | `PRELOOP_CONTROL_SOCKET` | Unset | Mounted Unix socket used by a guest to reach the engine. |

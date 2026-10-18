@@ -16,7 +16,28 @@ On the machine that runs the control plane, run:
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
-The command opens a single-use loopback listener and GitHub's App-creation page, so the private key and webhook secret never leave the machine. Use `--org ORG` to create the App in an organization, and `--no-browser` to print the URL instead of opening it. Without `--public-url`, the App is created without webhooks; that suits `preloop run` and API dispatches, but GitHub cannot send event deliveries.
+The command creates the App through GitHub's manifest flow and stores what comes back: the App id, private key, and webhook secret go into the credential store (private `0600` files under `$PRELOOP_HOME/credentials` by default), and the config file keeps only non-secret references, mode 0600. Which page hosts the App-creation form, and where GitHub's redirect lands, depends on where you run the command:
+
+- **A public URL is set** (`--public-url` or `PRELOOP_PUBLIC_URL`). The running engine hosts the form. The CLI asks the engine for a setup session and prints a one-time link, `{public-url}/setup/github?t=…`. Open it in a browser that can reach the engine; it works once and expires in ten minutes. GitHub then redirects back to the engine, which converts the code and stores the credentials itself. The CLI prints the result. Restart the engine (`preloop serve`) to load them. The engine must be running, and the CLI reaches it at `PRELOOP_URL` (default `http://127.0.0.1:9090`) with the system token.
+- **You are on an SSH session** and no public URL is set. The command listens on `127.0.0.1:8765` on the server (`--port` changes it) and prints the command to run in a second terminal on your laptop:
+
+  ```sh
+  ssh -L 8765:127.0.0.1:8765 alice@build-box
+  ```
+
+  Use the name you normally connect with if it differs, for example an `~/.ssh/config` alias. Keep that terminal open, then open `http://127.0.0.1:8765` in your laptop's browser. The forward carries both trips: the form page and GitHub's redirect back. The private key stays on the server.
+
+  `$BROWSER` is tried first when the command opens a page. VS Code and Cursor set it in remote terminals to a helper that opens the URL on your laptop and forwards the port, so there is nothing to type.
+- **Otherwise**, the command binds a single-use listener on loopback on a free port (`--port` pins it), opens it in your browser, and uses it as the redirect target. Nothing leaves the machine.
+
+Use `--org ORG` to create the App in an organization, and `--no-browser` to print the URL instead of opening it. Without `--public-url`, the App is created without webhooks; that suits `preloop run` and API dispatches, but GitHub cannot send event deliveries.
+
+Two guardrails apply to the engine-hosted flow, because the setup link carries a one-time token and GitHub's redirect carries the App's one-time code:
+
+- The public URL has to be on the engine's own origin. When the engine has `PRELOOP_PUBLIC_URL`, `--public-url` must name the same origin, so an API token alone cannot redirect the App's private key to another host.
+- `http://` is accepted only for a loopback address; anything else has to be `https`, so the token never travels in clear text.
+
+`PRELOOP_PUBLIC_URL` is read only when `--public-url` is not given. Set it for `preloop serve` and the same value selects the engine-hosted setup here. GitHub validates the webhook URL when it creates the App, so use an address GitHub can reach; a tailnet-only address makes App creation fail.
 
 To attach an existing App, pass its credentials instead of creating another one:
 
@@ -27,6 +48,14 @@ preloop setup github --via app \
   --webhook-secret "$WEBHOOK_SECRET" \
   --public-url https://ci.example.com
 ```
+
+With `--public-url`, this path points the App's webhook at the engine (`PATCH /app/hook/config`) instead of silently saving credentials whose hook stays inactive.
+
+Use `--repo owner/name` to verify the new App against a repository before the command succeeds. On the engine-hosted flow the engine runs the checks with the key it just stored, after waiting up to five minutes for the App to be installed on those repositories (the browser is on GitHub's install page at that point); `PRELOOP_SETUP_INSTALL_WAIT_SECS` changes the wait (`0` checks immediately). The CLI prints one `✓`/`✗` line per repository and exits non-zero if any failed. Repeat the flag for several repositories (up to 16).
+
+`--add` creates an additional App when one is already configured. Without it, both flows refuse to create a second App: the local flow updates the configured App's webhook instead, and the engine-hosted flow stops with the App id and says how to proceed.
+
+GitHub exposes no API for the webhook **Active** checkbox, so after the App is created, confirm it is ticked under the App's Webhook settings — otherwise the hook never fires.
 
 </Step>
 <Step title="Install the App">

@@ -17,6 +17,16 @@ description: Where Preloop keeps its configuration, how GitHub credentials and s
 
 Set `credential_store = "os"` to use the macOS Keychain, Windows Credential Manager, or Linux Secret Service for engine and GitHub credentials. The file store remains the fallback when the OS store is unavailable.
 
+Every call into the OS credential store is bounded. A keychain or Secret Service that does not answer within 10 seconds (it is waiting on an unlock prompt nobody will see, or its daemon is hung) fails that call with an error saying so, and preloop treats the OS store as unavailable for the rest of the process instead of waiting again. Outbound TLS never asks the OS at handshake time: preloop trusts the bundled Mozilla roots, the certificates in the OS store (read once at startup, for at most 5 seconds), and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`. A CA added to the OS store while the engine runs is picked up on the next restart.
+
+On a headless macOS host, keep the login keychain from re-locking itself, or the next program that reads it raises an unlock dialog on the unattended console and `securityd` blocks every other keychain client behind it:
+
+```sh
+security set-keychain-settings ~/Library/Keychains/login.keychain-db
+```
+
+With no flags this removes the idle timeout and the lock-on-sleep setting.
+
 `PRELOOP_CONFIG` moves only the configuration file. The credential directory then sits next to that file.
 
 ## Configuration file
@@ -133,7 +143,7 @@ The engine keeps run history, queued jobs, runners, sessions, and logs. They sur
 - **SQLite** is the default. The database is `$PRELOOP_HOME/state/preloop.db`, and the engine needs no setup.
 - **Postgres** is optional. Set `PRELOOP_STORE_URL` or pass `--store postgres://…` to `preloop serve`, after running `preloop store migrate`.
 
-`preloop serve` never changes the schema. It refuses to start on a schema it does not expect, and `preloop store migrate` is the explicit upgrade. [Storage](/control-plane/operate/storage) covers backups, retention, and moving from an older database.
+A fresh local SQLite store is prepared by the supported first-run paths (`preloop serve`, `preloop init`, `preloop server install`). A serving process never initializes or upgrades a store that already exists; use `preloop store migrate` for existing or mismatched schemas, and provision a Postgres store yourself. [Storage](/control-plane/operate/storage) covers backups, retention, and moving from an older database.
 
 ## Limitations
 
