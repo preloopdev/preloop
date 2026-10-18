@@ -4191,13 +4191,15 @@ const PARITY_MINTED_TOKEN: &str = "ghs_ParityMintedInstallationTokenAAAAAAAA";
 
 /// A broker whose GitHub App mints [`PARITY_MINTED_TOKEN`] for `owner/repo`.
 /// The guards hold the process-wide GitHub env lock and restore the env on drop.
+/// The lock guard is the LAST tuple field on purpose: tuple fields drop in
+/// declaration order, so the env vars are restored before the lock is released.
 struct MintingBroker {
     state: AppState,
     app: Router,
     _env: (
+        crate::state::TestEnvVar,
+        crate::state::TestEnvVar,
         tokio::sync::MutexGuard<'static, ()>,
-        crate::state::TestEnvVar,
-        crate::state::TestEnvVar,
     ),
 }
 
@@ -4234,7 +4236,7 @@ async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
     MintingBroker {
         state,
         app,
-        _env: (env_lock, api_url, pat),
+        _env: (api_url, pat, env_lock),
     }
 }
 
