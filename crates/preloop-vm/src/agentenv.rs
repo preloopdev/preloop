@@ -24,7 +24,7 @@
 //! | `status` | `aenv ls --output json`, matched on the recorded sandbox id |
 //! | `list` | the local registry (AgentENV has no notion of preloop machine names) |
 //! | `exec` / `exec_stream` | `aenv exec <id> -- argv` |
-//! | `exec_with_secret_env` | secret file uploaded 0600, sourced by a wrapper shell, then unlinked |
+//! | `exec_with_secret_env` | secret file uploaded 0600; a root-or-sudo step reads and unlinks it, then the payload runs as the exec user |
 //! | `copy` | `aenv upload` / `aenv download` |
 //! | `pack` | `aenv snapshot create --name`, plus a JSON descriptor at the output path |
 //! | `rearm_fork_base` | always available: AgentENV snapshots are persistent and re-forkable |
@@ -55,7 +55,13 @@
 //!   300 s upstream). A CI job outliving it would be killed mid-run, so each
 //!   running sandbox gets a keepalive task that re-arms the TTL at a third of
 //!   its length.
+//! * **Exec user is the image's.** `aenv exec` has no user flag, so commands run as
+//!   the image's `USER` (uid 1001 on the official runner image). The provider's own
+//!   root-only steps (guest scratch directories, volume extraction, secret-file reads
+//!   and removal) run through [`crate::guest_privilege`], which uses `sudo -n` when the
+//!   exec user is not root. Payloads keep the exec user, as a plain `exec` does.
 
+use crate::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use crate::{
     DEFAULT_CAPTURE_LIMIT, ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy,
     OutputChunk, SecretSource, VmError, VmProvider, VolumeMount, read_bounded, stream_output,
@@ -621,6 +627,68 @@ impl AgentEnvProvider {
         })
     }
 
+    /// Resume `sandbox` if AgentENV has it paused, and report whether it did.
+    ///
+    /// AgentENV snapshots only running sandboxes, but `stop` pauses rather than
+    /// stopping, and the orchestrator packs a golden right after stopping it. A
+    /// paused sandbox is therefore resumed before it is snapshotted, so the
+    /// snapshot captures the machine the same way it would have while running.
+    async fn resume_if_paused(&self, sandbox: &str) -> Result<bool, VmError> {
+        let states = self.live_sandboxes().await?;
+        let paused = states
+            .get(sandbox)
+            .is_some_and(|state| state.as_str() != "running");
+        if !paused {
+            return Ok(false);
+        }
+        self.checked(
+            "resume",
+            &[
+                "resume".into(),
+                sandbox.to_owned(),
+                "--timeout".into(),
+                self.ttl_secs.to_string(),
+            ],
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Take a snapshot of `sandbox` with `args`. AgentENV takes snapshots only
+    /// of running sandboxes, so a paused one is resumed first.
+    ///
+    /// A sandbox resumed for the snapshot is paused again afterwards, on success
+    /// and on error alike: the orchestrator recorded it as stopped, and a
+    /// running sandbox with no keepalive would be deleted by its TTL. A failed
+    /// pause is logged and does not replace the snapshot's own outcome.
+    async fn snapshot_running(
+        &self,
+        sandbox: &str,
+        operation: &'static str,
+        args: &[String],
+    ) -> Result<(), VmError> {
+        let resumed = self.resume_if_paused(sandbox).await?;
+        let outcome: Result<(), VmError> = async {
+            if resumed {
+                self.await_guest(sandbox).await?;
+            }
+            self.checked(operation, args).await.map(|_| ())
+        }
+        .await;
+        if resumed
+            && let Err(error) = self
+                .checked("stop", &["pause".into(), sandbox.to_owned()])
+                .await
+        {
+            warn!(
+                sandbox,
+                %error,
+                "could not pause the sandbox again after its snapshot; it stays running until its TTL expires"
+            );
+        }
+        outcome
+    }
+
     /// Re-arm the sandbox TTL for as long as the machine is running.
     ///
     /// Without this a job outliving the TTL would have its VM deleted
@@ -724,8 +792,13 @@ impl AgentEnvProvider {
                 VmError::Command { .. } => error,
                 other => other,
             })?;
+            // Extraction and cleanup need root: the staging and volume paths are
+            // root-owned. `--no-same-owner` keeps the archive's host uid out of the
+            // guest, and the chown hands the tree to the invoking user (`SUDO_UID`,
+            // or root itself), as the exec user would have owned it.
             let script = format!(
-                "set -eu; mkdir -p {dir}; tar -xf {archive} -C {dir}; rm -f {archive}{ro}",
+                "set -eu; mkdir -p {dir}; tar --no-same-owner -xf {archive} -C {dir}; \
+                 chown -R \"${{SUDO_UID:-0}}:${{SUDO_GID:-0}}\" {dir}; rm -f {archive}{ro}",
                 dir = shell_quote(&guest_dir),
                 archive = shell_quote(&guest_archive),
                 ro = if volume.read_only {
@@ -734,18 +807,11 @@ impl AgentEnvProvider {
                     String::new()
                 },
             );
-            let output = self
-                .capture(&[
-                    "exec".into(),
-                    sandbox.to_owned(),
-                    "--".into(),
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    script,
-                ])
-                .await?;
+            let output = self.capture(&guest_root_argv(sandbox, &script)).await?;
             if output.exit_code != 0 {
-                return Err(self.command_error("materialize_volume", &output));
+                return Err(guest_privilege_error(
+                    self.command_error("materialize_volume", &output),
+                ));
             }
             debug!(sandbox, guest = %guest_dir, "materialized host volume into guest");
         }
@@ -753,22 +819,16 @@ impl AgentEnvProvider {
     }
 
     /// Create the guest scratch directories the provider uploads into.
+    ///
+    /// `/run` is root-owned, so this runs through the root-or-sudo wrapper.
     async fn prepare_guest_dirs(&self, sandbox: &str) -> Result<(), VmError> {
-        self.checked(
-            "prepare_guest_dirs",
-            &[
-                "exec".into(),
-                sandbox.to_owned(),
-                "--".into(),
-                "/bin/sh".into(),
-                "-c".into(),
-                format!(
-                    "mkdir -p {GUEST_STAGING_DIR} {GUEST_SECRET_DIR} && chmod 700 {GUEST_SECRET_DIR}"
-                ),
-            ],
-        )
-        .await
-        .map(|_| ())
+        let script = format!(
+            "mkdir -p {GUEST_STAGING_DIR} {GUEST_SECRET_DIR} && chmod 700 {GUEST_SECRET_DIR}"
+        );
+        self.checked("prepare_guest_dirs", &guest_root_argv(sandbox, &script))
+            .await
+            .map_err(guest_privilege_error)
+            .map(|_| ())
     }
 
     /// Materialize volume mounts unless a previous start already did.
@@ -794,6 +854,43 @@ impl AgentEnvProvider {
 /// Quote `value` for POSIX `sh`.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `aenv exec` argv for a provider-internal step that needs root.
+///
+/// The script goes through [`run_as_root_or_sudo_strict`]: a root exec runs it
+/// directly, and the image user runs it under `sudo -n`.
+fn guest_root_argv(sandbox: &str, script: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        sandbox.to_owned(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        run_as_root_or_sudo_strict(script),
+    ]
+}
+
+/// Name the prerequisite when a root step fails because sudo refused.
+///
+/// Without this, a missing passwordless sudo surfaces as a bare sudo message
+/// from deep inside a provisioning step.
+fn guest_privilege_error(error: VmError) -> VmError {
+    match error {
+        VmError::Command {
+            operation,
+            exit_code,
+            message,
+        } if message.contains("sudo") => VmError::Command {
+            operation,
+            exit_code,
+            message: format!(
+                "{message} (provider steps that need root run through `sudo -n`: \
+                 the guest's exec user must have passwordless sudo)"
+            ),
+        },
+        other => other,
+    }
 }
 
 /// Tar `directory` into a temporary host file, preserving modes and symlinks.
@@ -1060,7 +1157,8 @@ impl VmProvider for AgentEnvProvider {
                             golden.as_str(),
                             &uuid::Uuid::new_v4().simple().to_string()[..8]
                         );
-                        self.checked(
+                        self.snapshot_running(
+                            &golden_sandbox,
                             "snapshot",
                             &[
                                 "snapshot".into(),
@@ -1362,10 +1460,13 @@ impl VmProvider for AgentEnvProvider {
             .map(|argument| shell_quote(argument))
             .collect::<Vec<_>>()
             .join(" ");
-        let wrapper = format!(
-            "set -eu; . {file}; rm -f {file}; exec {payload}",
-            file = shell_quote(&guest_file),
-        );
+        // The secret directory is root-only, so reading and unlinking the file
+        // run through the root-or-sudo wrapper. The payload keeps the exec
+        // user's identity, as a plain `exec` does.
+        let read = run_as_root_or_sudo_strict(&format!("cat {}", shell_quote(&guest_file)));
+        let unlink = run_as_root_or_sudo_strict(&format!("rm -f {}", shell_quote(&guest_file)));
+        let wrapper =
+            format!("set -eu; SECRETS=$({read}); {unlink}; eval \"$SECRETS\"; exec {payload}");
         let wrapper_args = [
             "exec".into(),
             sandbox.clone(),
@@ -1378,11 +1479,16 @@ impl VmProvider for AgentEnvProvider {
         // not run to success" — a failed `configure` must fail the
         // provisioning, exactly as it does through SmolVmProvider, whose
         // exec path is `checked` as well.
+        // Sudo for the privileged read and unlink is verified by the
+        // `prepare_guest_dirs` call above, which names the prerequisite; the
+        // payload's own errors are not rewritten here.
         let result = self.checked("exec", &wrapper_args).await;
-        // The wrapper unlinks the file itself, but a failure before the
-        // wrapper's `rm -f` ran would leave it behind with a live secret in
-        // it, so clean up on every failure shape.
+        // The wrapper unlinks the file itself, but a failure before its removal
+        // ran would leave a live secret behind, so clean up on every failure
+        // shape. Best-effort: the removal may be refused and must not mask the
+        // payload's own error.
         if result.is_err() {
+            let cleanup = run_as_root_or_sudo(&format!("rm -f {}", shell_quote(&guest_file)));
             let _ = self
                 .capture(&[
                     "exec".into(),
@@ -1390,7 +1496,7 @@ impl VmProvider for AgentEnvProvider {
                     "--".into(),
                     "/bin/sh".into(),
                     "-c".into(),
-                    format!("rm -f {}", shell_quote(&guest_file)),
+                    cleanup,
                 ])
                 .await;
         }
@@ -1490,12 +1596,13 @@ impl VmProvider for AgentEnvProvider {
             name.as_str(),
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
-        self.checked(
+        self.snapshot_running(
+            &sandbox,
             "pack",
             &[
                 "snapshot".into(),
                 "create".into(),
-                sandbox,
+                sandbox.clone(),
                 "--name".into(),
                 snapshot.clone(),
             ],

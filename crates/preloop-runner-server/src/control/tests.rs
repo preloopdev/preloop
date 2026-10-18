@@ -503,6 +503,28 @@ pub(crate) mod suite {
             "a session-backed runner with no active request is idle"
         );
         assert_eq!((inputs.runner_busy, inputs.runner_stale), (0, 0));
+        // The ages are reported rather than left blank, and staleness
+        // follows the caller's window: the same session is idle capacity
+        // under the liveness window and gone under a zero-length one. That
+        // pair is what tells a busy pool apart from a dead one.
+        assert!(
+            inputs.max_poll_age_seconds.is_some_and(|age| age < 5),
+            "a session that just polled reports a small poll age, got {:?}",
+            inputs.max_poll_age_seconds
+        );
+        assert_eq!(
+            inputs.max_lease_age_seconds, None,
+            "nothing has been claimed, so no lease is held"
+        );
+        let zero_window = backend
+            .status_inputs(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_window.runner_stale, 1,
+            "a zero-length window makes a session that has polled stale"
+        );
+        assert_eq!(zero_window.runner_idle, 0);
     }
 
     /// The pool's busy gauge counts only busy runners the pool proved: a
@@ -4100,8 +4122,11 @@ pub(crate) mod suite {
         // row the count missed can surface after the prune; rows never
         // vanish except by pruning. Hence `>=`: prune removed no more than it
         // reported.
+        // The count and the prune are separate snapshots on one cluster, so a
+        // row the count could not see (above the cluster-wide `xmin`) may be
+        // removed by the prune: `pruned` can legitimately exceed `before`.
         assert!(
-            outbox_len(backend).await >= before - pruned as usize,
+            outbox_len(backend).await >= before.saturating_sub(pruned as usize),
             "prune removes no more rows than it counted"
         );
 
@@ -10226,6 +10251,13 @@ mod lite {
     #[tokio::test]
     async fn webhook_replay_is_idempotent() {
         suite::webhook_replay_is_idempotent(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    /// SQLite is one node: nothing else enqueues, so there is no hint stream.
+    #[test]
+    fn webhook_wakes_are_local_only() {
+        let backend = crate::control::Backend::Sqlite(LiteBackend::in_memory().unwrap());
+        assert!(backend.subscribe_webhook_wakes().is_none());
     }
 
     #[tokio::test]

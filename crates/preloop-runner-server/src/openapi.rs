@@ -958,17 +958,31 @@ fn webhook_health() {}
 /// GitHub App manifest registration page (browser-facing).
 #[utoipa::path(
     get, path = "/api/v1/github/register", tag = "GitHub",
-    responses((status = 200, content_type = "text/html", description = "Registration form", body = String))
+    responses(
+        (status = 200, content_type = "text/html", description = "Registration form", body = String),
+        (status = 404, description = "App registration is disabled")
+    )
 )]
 fn github_register() {}
 
 /// GitHub App manifest callback (browser-facing).
 ///
-/// Exchanges the one-time code from GitHub for App credentials.
+/// Exchanges the one-time code from GitHub for App credentials. Only served
+/// when `PRELOOP_ENABLE_APP_REGISTRATION` is on (404 otherwise); the `state`
+/// query value must match the cookie set by `/api/v1/github/register`
+/// (400 otherwise, before any request to GitHub).
 #[utoipa::path(
     get, path = "/api/v1/github/callback", tag = "GitHub",
-    params(("code" = String, Query, description = "GitHub manifest conversion code")),
-    responses((status = 200, content_type = "text/html", description = "App credentials page", body = String))
+    params(
+        ("code" = String, Query, description = "GitHub manifest conversion code"),
+        ("state" = String, Query, description = "Signed state issued by /api/v1/github/register")
+    ),
+    responses(
+        (status = 200, content_type = "text/html", description = "App credentials page", body = String),
+        (status = 400, description = "Missing, mismatched, or expired state, or a malformed query"),
+        (status = 404, description = "App registration is disabled"),
+        (status = 500, description = "GitHub did not return the App credentials")
+    )
 )]
 fn github_callback() {}
 

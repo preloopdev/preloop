@@ -1,0 +1,629 @@
+name: mutation-testing
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: mutation-testing
+  cancel-in-progress: false
+
+env:
+  CARGO_HOME: /home/runner/.cargo
+  RUSTUP_HOME: /home/runner/.rustup
+
+jobs:
+  mutants-T1-job-binding-lifecycle:
+    name: mutants-T1-job-binding-lifecycle-${{ matrix.shard }}-of-8
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/8
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: |
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name "$PG_NAME" --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs "$PG_NAME" --tail 50 >&2 || true
+          exit 1
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T1 (job/binding lifecycle)
+        env:
+          JEV_API_KEY: ${{ github.ref_protected && secrets.JEV_API_KEY || '' }}
+        run: |
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
+            --ignored --exact t1_job_binding_lifecycle --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T1/mutants.out
+          {
+            echo "## T1 job/binding lifecycle (shard $PRELOOP_MUTANTS_SHARD)"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T1-job-binding-lifecycle-${{ matrix.shard }}-of-8
+          path: mutants.out/T1
+      - name: Remove PostgreSQL container
+        if: always()
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
+
+  mutants-T2-webhook-signature:
+    name: mutants-T2-webhook-signature-${{ matrix.shard }}-of-6
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: |
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name "$PG_NAME" --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs "$PG_NAME" --tail 50 >&2 || true
+          exit 1
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T2 (webhook signature)
+        env:
+          JEV_API_KEY: ${{ github.ref_protected && secrets.JEV_API_KEY || '' }}
+        run: |
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
+            --ignored --exact t2_webhook_signature --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T2/mutants.out
+          {
+            echo "## T2 webhook signature verification and event dispatch (shard $PRELOOP_MUTANTS_SHARD)"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T2-webhook-signature-${{ matrix.shard }}-of-6
+          path: mutants.out/T2
+      - name: Remove PostgreSQL container
+        if: always()
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
+
+  mutants-T3-pool-warm-sizing:
+    name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-6
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/6
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: |
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name "$PG_NAME" --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs "$PG_NAME" --tail 50 >&2 || true
+          exit 1
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T3 (pool/warm sizing)
+        env:
+          JEV_API_KEY: ${{ github.ref_protected && secrets.JEV_API_KEY || '' }}
+        run: |
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
+            --ignored --exact t3_pool_warm_sizing --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T3/mutants.out
+          {
+            echo "## T3 pool/waitlist ordering and warm-pool sizing (shard $PRELOOP_MUTANTS_SHARD)"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T3-pool-warm-sizing-${{ matrix.shard }}-of-6
+          path: |
+            mutants.out/T3
+            mutants.out/T3a
+            mutants.out/T3b
+            mutants.out/T3c
+      - name: Remove PostgreSQL container
+        if: always()
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
+
+  mutants-T4-queue-status:
+    name: mutants-T4-queue-status-${{ matrix.shard }}-of-8
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      CARGO_BUILD_JOBS: "4"
+      PRELOOP_MUTANTS_SHARD: ${{ matrix.shard }}/8
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: |
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name "$PG_NAME" --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs "$PG_NAME" --tail 50 >&2 || true
+          exit 1
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T4 (queue/status aggregation)
+        env:
+          JEV_API_KEY: ${{ github.ref_protected && secrets.JEV_API_KEY || '' }}
+        run: |
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
+            --ignored --exact t4_queue_status_aggregation --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T4/mutants.out
+          {
+            echo "## T4 queue depth and run status aggregation (shard $PRELOOP_MUTANTS_SHARD)"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T4-queue-status-${{ matrix.shard }}-of-8
+          path: mutants.out/T4
+      - name: Remove PostgreSQL container
+        if: always()
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true
+
+  mutants-T5-cli-parsing:
+    name: mutants-T5-cli-parsing
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "4"
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+      PRELOOP_TEST_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            /home/runner/.rustup/toolchains
+            /home/runner/.rustup/settings.toml
+          key: rustup-1.99-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.99"
+      - name: Select Rust toolchain binaries
+        run: |
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
+      - name: Start PostgreSQL (container)
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: |
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+          image="mirror.gcr.io/library/postgres:18"
+          for attempt in 1 2 3; do
+            if docker pull -q "$image"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "could not pull $image" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          docker run -d --name "$PG_NAME" --network host \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "$image" -c max_connections=400
+          for _ in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs "$PG_NAME" --tail 50 >&2 || true
+          exit 1
+      - name: Install cargo-mutants
+        run: |
+          set -euo pipefail
+          version=27.1.0
+          if [ "$(uname -m)" = x86_64 ]; then
+            archive="$RUNNER_TEMP/cargo-mutants.tar.gz"
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz"
+            echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  ${archive}" | sha256sum -c -
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$archive" -C "$HOME/.local/bin" cargo-mutants
+            "$HOME/.local/bin/cargo-mutants" --version
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          else
+            cargo install cargo-mutants --version "$version" --locked
+            cargo-mutants --version
+          fi
+      - name: Run mutation test T5 (CLI parsing)
+        env:
+          JEV_API_KEY: ${{ github.ref_protected && secrets.JEV_API_KEY || '' }}
+        run: |
+          cargo test --locked -p preloop-runner-server --features test-support --test mutation_targets -- \
+            --ignored --exact t5_cli_parsing --nocapture
+      - name: Report survivors
+        if: always()
+        run: |
+          out=mutants.out/T5/mutants.out
+          {
+            echo "## T5 CLI argument parsing"
+            echo ""
+            echo "| outcome | mutants |"
+            echo "| --- | --- |"
+            for f in caught missed timeout unviable; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "| $f | $n |"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo ""
+              echo "### Surviving mutants"
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+            if [ -s "$(dirname "$out")/triage.md" ]; then
+              echo ""
+              echo "### Jev triage"
+              cat "$(dirname "$out")/triage.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-T5-cli-parsing
+          path: mutants.out/T5
+      - name: Remove PostgreSQL container
+        if: always()
+        env:
+          PG_NAME: postgres-${{ github.job }}-${{ github.run_id }}
+        run: docker rm -f "$PG_NAME" || true

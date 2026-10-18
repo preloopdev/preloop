@@ -19,3 +19,11 @@ rules:
   dangerous-triggers:
     ignore:
       - pullfrog.yml
+
+  # docs.yml installs the Mintlify CLI with `npm install mint@4.2.1046` in
+  # a throwaway $RUNNER_TEMP prefix: the package is exact-version-pinned,
+  # never committed, and not part of the workspace's lockfile. A lockfile
+  # for a single tool installed per run buys nothing here.
+  adhoc-packages:
+    ignore:
+      - docs.yml

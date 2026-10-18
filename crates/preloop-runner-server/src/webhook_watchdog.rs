@@ -45,9 +45,9 @@
 //! * Nothing is redelivered while the local store is unhealthy — replaying a
 //!   payload into a broken store loses it a second time, and burns one of
 //!   the finite redelivery opportunities doing it.
-//! * The breaker gates the poll: during a GitHub outage a poll would fail
-//!   anyway, and hammering a failing dependency is what the breaker exists
-//!   to prevent.
+//! * The breaker gates each App's poll: during a GitHub outage a poll would fail
+//!   anyway, and hammering a failing dependency is what the breaker exists to
+//!   prevent. Every App has its own breaker bucket.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -259,18 +259,28 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
         status.last_poll_at_us = Some(now);
     });
 
-    if let Some(retry_after) = shared
-        .state
-        .github_breakers
-        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
-    {
+    // Each App's history is polled behind its own breaker bucket, so one App's
+    // rate limit does not stall the others. Only a pass where every App is held
+    // back stops here.
+    let mut pollable = Vec::with_capacity(apps.len());
+    let mut held_back: Vec<String> = Vec::new();
+    for app in apps {
+        let bucket = crate::github_breaker::GithubCredentialBucket::for_app(&app.app_id);
+        if let Some(retry_after) = shared.state.github_breakers.retry_after_for(bucket) {
+            tracing::debug!(
+                app_id = %app.app_id,
+                retry_in_secs = retry_after.as_secs(),
+                "GitHub breaker open; skipping this App's delivery watchdog poll"
+            );
+            held_back.push(app.app_id.clone());
+            continue;
+        }
+        pollable.push(app);
+    }
+    if pollable.is_empty() {
         // Deliberately not an error, and deliberately does not touch
         // `last_success_at_us`: the poll did not happen, and staleness must
         // keep growing until one does.
-        tracing::debug!(
-            retry_in_secs = retry_after.as_secs(),
-            "GitHub breaker open; skipping delivery watchdog poll"
-        );
         return Ok(WatchdogPollOutcome::default());
     }
 
@@ -282,7 +292,7 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
 
     let mut total = WatchdogPollOutcome::default();
     let mut errors: Vec<String> = Vec::new();
-    for app in apps {
+    for app in pollable {
         match poll_app(shared, &app, store_healthy).await {
             Ok(outcome) => total.merge(&outcome),
             Err(error) => {
@@ -299,7 +309,10 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
         .await
         .map(|repairs| repairs.len() as u64)
         .unwrap_or_default();
-    let succeeded = errors.is_empty();
+    // Global success means every configured App's history was polled this
+    // pass: a partial pass must not clear staleness for the Apps that were
+    // skipped, whose deliveries are still going unwatched.
+    let succeeded = errors.is_empty() && held_back.is_empty();
     let redelivered = total.redelivered;
     let examined = total.examined;
     shared.state.webhook_status.update_watchdog(|status| {
@@ -311,7 +324,17 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
             status.last_examined = examined;
             status.last_error = None;
         } else {
-            status.last_error = Some(errors.join("; "));
+            let mut reason = errors.join("; ");
+            if !held_back.is_empty() {
+                if !reason.is_empty() {
+                    reason.push_str("; ");
+                }
+                reason.push_str(&format!(
+                    "GitHub breaker held back {} this pass; their delivery histories went unpolled",
+                    held_back.join(", ")
+                ));
+            }
+            status.last_error = Some(reason);
         }
     });
     if !errors.is_empty() {
@@ -392,7 +415,7 @@ async fn poll_app(
     let mut reached_watermark = false;
     let mut has_more_pages = false;
     for _page in 0..max_pages().max(1) {
-        let (items, next_cursor) = list_deliveries(shared, &api_base, &jwt, cursor.as_deref())
+        let (items, next_cursor) = list_deliveries(shared, app, &api_base, &jwt, cursor.as_deref())
             .await
             .map_err(|error| anyhow::anyhow!("listing deliveries: {error}"))?;
         if items.is_empty() {
@@ -704,7 +727,7 @@ async fn repair_delivery(
     );
     let response = crate::github_breaker::send_observed_labeled(
         &shared.state.github_breakers,
-        crate::github_breaker::GithubCredentialBucket::App,
+        crate::github_breaker::GithubCredentialBucket::for_app(&app.app_id),
         &shared.state.github_consumption,
         crate::github_breaker::GithubSubsystem::Webhooks,
         crate::shared_http::CLIENT
@@ -716,6 +739,12 @@ async fn repair_delivery(
             .header("X-GitHub-Api-Version", "2022-11-28"),
     )
     .await;
+    if let Ok(response) = &response {
+        shared
+            .state
+            .github_consumption
+            .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Webhooks, response);
+    }
 
     // The claim already charged this attempt, moved the last-attempt clock
     // and cleared the previous attempt's error, so a request that went
@@ -757,6 +786,7 @@ async fn repair_delivery(
 /// One page of delivery history plus the cursor for the next page.
 async fn list_deliveries(
     shared: &Arc<SharedState>,
+    app: &GitHubAppCredentials,
     api_base: &str,
     jwt: &str,
     cursor: Option<&str>,
@@ -770,7 +800,7 @@ async fn list_deliveries(
     }
     let response = crate::github_breaker::send_observed_labeled(
         &shared.state.github_breakers,
-        crate::github_breaker::GithubCredentialBucket::App,
+        crate::github_breaker::GithubCredentialBucket::for_app(&app.app_id),
         &shared.state.github_consumption,
         crate::github_breaker::GithubSubsystem::Webhooks,
         crate::shared_http::CLIENT
@@ -782,6 +812,10 @@ async fn list_deliveries(
             .header("X-GitHub-Api-Version", "2022-11-28"),
     )
     .await?;
+    shared
+        .state
+        .github_consumption
+        .record_advertised_bytes(crate::github_breaker::GithubSubsystem::Webhooks, &response);
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -1196,6 +1230,85 @@ mod tests {
         let status = shared.state.webhook_status.watchdog();
         assert!(status.last_error.is_some());
         assert!(status.last_success_at_us.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_app_behind_an_open_breaker_is_skipped_while_the_others_are_polled() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let (api_base, _attempts) = stub_github(Vec::new(), axum::http::StatusCode::OK).await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![
+                GitHubAppCredentials::for_tests(
+                    "424",
+                    TEST_KEY.clone(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+                GitHubAppCredentials::for_tests(
+                    "525",
+                    TEST_KEY.clone(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+            ],
+            default_index: 0,
+        });
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        // App 424 is rate limited: its own budget is parked, 525's is not.
+        shared
+            .state
+            .github_breakers
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app(
+                "424",
+            ))
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(std::time::Duration::from_secs(60)),
+                },
+                "429",
+            );
+
+        watchdog_poll_once(&shared).await.unwrap();
+
+        assert!(
+            shared
+                .state
+                .backend
+                .load_webhook_watchdog_cursor("424")
+                .await
+                .unwrap()
+                .is_none(),
+            "App 424 is behind an open breaker and must not be polled"
+        );
+        assert!(
+            shared
+                .state
+                .backend
+                .load_webhook_watchdog_cursor("525")
+                .await
+                .unwrap()
+                .is_some(),
+            "App 525 must still be polled"
+        );
+        let status = shared.state.webhook_status.watchdog();
+        assert!(
+            status.last_success_at_us.is_none(),
+            "a pass that left an App unpolled must not report global watchdog success"
+        );
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("424"),
+            "the held-back App must be named so staleness stays explainable: {status:?}"
+        );
     }
 
     #[tokio::test]
