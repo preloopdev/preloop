@@ -3,12 +3,46 @@
 //! libpq→tokio-postgres `sslmode` rewrite. The `PgStore` snapshot backend is
 //! gone — `control/pg` owns all scheduling state now.
 use postgres_rustls::MakeTlsConnector;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// rustls config for every Postgres connection, built once per process from
+/// the shared root set ([`crate::shared_http::tls_roots`]) so connecting
+/// never reads the OS trust store on the runtime thread.
+static TLS_CONFIG: LazyLock<Result<Arc<rustls::ClientConfig>, String>> =
+    LazyLock::new(build_tls_config);
+
+fn build_tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
+    // rustls 0.23 needs a process-level crypto provider. The server
+    // binaries install one at startup; installing here makes the library
+    // self-sufficient (tests, embedded use) without breaking an
+    // already-installed provider. The config itself is built with an explicit
+    // provider because several are compiled in (ring via this crate's
+    // rustls feature, aws-lc-rs via reqwest), which makes the implicit
+    // `ClientConfig::builder()` ambiguous.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in crate::shared_http::tls_roots() {
+        roots
+            .add(cert.clone())
+            .map_err(|error| format!("adding TLS root cert: {error}"))?;
+    }
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| format!("TLS protocol versions: {error}"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    postgres_rustls::set_postgresql_alpn(&mut config);
+    Ok(Arc::new(config))
+}
 
 /// Build a rustls connector when the URL asks for TLS (`sslmode=require`,
 /// `verify-ca`, or `verify-full`); `None` for `sslmode=disable` or when no
-/// `sslmode` is present. Chain + hostname verification always use the system
-/// root store, so `verify-full` semantics apply to every TLS mode.
+/// `sslmode` is present. Chain + hostname verification always use the shared
+/// in-process root set, so `verify-full` semantics apply to every TLS mode.
 pub fn tls_connector(url: &str) -> anyhow::Result<Option<MakeTlsConnector>> {
     let query = url.split('?').nth(1).unwrap_or("");
     let sslmode = query
@@ -16,25 +50,11 @@ pub fn tls_connector(url: &str) -> anyhow::Result<Option<MakeTlsConnector>> {
         .find_map(|part| part.strip_prefix("sslmode="));
     match sslmode {
         Some("require" | "verify-ca" | "verify-full") => {
-            // rustls 0.23 needs a process-level crypto provider. The server
-            // binaries install one at startup; installing here makes the
-            // library self-sufficient (tests, embedded use) without breaking
-            // an already-installed provider.
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .ok();
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs().certs {
-                roots
-                    .add(cert)
-                    .map_err(|error| anyhow::anyhow!("adding native root cert: {error}"))?;
-            }
-            let mut config = rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            postgres_rustls::set_postgresql_alpn(&mut config);
+            let config = TLS_CONFIG
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
             Ok(Some(MakeTlsConnector::new(
-                tokio_rustls::TlsConnector::from(Arc::new(config)),
+                tokio_rustls::TlsConnector::from(config.clone()),
             )))
         }
         _ => Ok(None),

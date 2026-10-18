@@ -986,7 +986,9 @@ fn debug_session_member(path: &str, suffix: &str) -> bool {
 /// refused there. Native management and GUI API prefixes have no legitimate
 /// use from a guest.
 pub async fn runner_surface_only(mut request: Request, next: Next) -> Result<Response, ApiError> {
-    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/"];
+    // `/setup/*` is the operator's browser-facing App setup. A job VM that
+    // reached it could only ever see 404s, but the socket stays fail-closed.
+    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/", "/setup/"];
     let path = request.uri().path();
     let worker_debug_route = is_worker_debug_route(request.method(), path);
     let denied = DENIED_PREFIXES
@@ -1283,5 +1285,60 @@ mod job_scoped_repo_read_tests {
             &axum::http::Method::POST,
             "/api/v3/repos/o/r/tarball/main"
         ));
+    }
+}
+
+#[cfg(test)]
+mod runner_surface_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn the_guest_socket_refuses_the_browser_setup_pages() {
+        let app = axum::Router::new()
+            .route("/setup/github", axum::routing::get(|| async { "form" }))
+            .route(
+                "/setup/github/callback",
+                axum::routing::get(|| async { "callback" }),
+            )
+            .route(
+                "/runner/message",
+                axum::routing::get(|| async { "message" }),
+            )
+            .layer(axum::middleware::from_fn(runner_surface_only));
+        for path in ["/setup/github", "/setup/github/callback"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable from a job VM"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/runner/message")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the runner protocol still passes"
+        );
     }
 }

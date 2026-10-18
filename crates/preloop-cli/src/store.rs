@@ -3,9 +3,9 @@
 //! Schema administration (`migrate`/`status`) lives in
 //! `preloop_runner_server::store_admin` (that crate owns the database drivers
 //! and the embedded migrations); this module owns only the CLI surface and
-//! its output. `preloop serve` never migrates: a missing/older/newer control
-//! schema refuses at boot and names `preloop store migrate` as the explicit
-//! recovery.
+//! its output. `preloop serve` initializes only a brand-new local store and
+//! otherwise never migrates: an older/newer/divergent control schema refuses
+//! at boot and names `preloop store migrate` as the explicit recovery.
 //!
 //! `import-legacy` is the one-time, explicit move from a released v11
 //! `preloop.db` (the durable-state store the control backend replaced) to a
@@ -126,10 +126,14 @@ pub(crate) async fn run(args: StoreArgs) -> anyhow::Result<()> {
 /// preparation step for both a fresh and a repeated install.
 fn init_local() -> anyhow::Result<()> {
     let state_dir = crate::preloop_home().join("state");
-    if store_admin::prepare_brand_new_local(&state_dir)? {
+    if store_admin::prepare_brand_new_local(&state_dir, None)? {
+        // Name the database that was actually created: an explicit
+        // `PRELOOP_STORE_URL` (this command has no `--store`; the installer
+        // passes the operator's override through the environment) moves the
+        // store off the state-dir default.
         eprintln!(
             "[preloop] initialized the control database at {}",
-            state_dir.join("preloop.db").display()
+            StoreTarget::resolve(None, &state_dir)?.describe()
         );
     }
     Ok(())
