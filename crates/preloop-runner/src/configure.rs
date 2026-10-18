@@ -11,8 +11,10 @@ use std::future::Future;
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
+use reqwest::header::ACCEPT;
+
 use crate::cli::{ConfigureArgs, GlobalArgs, RemoveArgs};
-use crate::client::http::HttpClient;
+use crate::client::http::{HttpClient, HttpError};
 use crate::node_externals;
 use crate::settings::{CredentialData, RsaParameters, RunnerConfig, RunnerSettings};
 
@@ -21,6 +23,11 @@ const DISTTASK_AGENT_ACCEPT: &str = "application/json; api-version=6.0-preview.2
 const DISTTASK_AGENT_CONTENT_TYPE: &str =
     "application/json; charset=utf-8; api-version=6.0-preview.2";
 
+/// Pool ID meaning "search every pool". The official runner looks an agent
+/// up by name and deletes it through `pools/0` — the pool segment is ignored
+/// server-side by both GitHub and our engine (golden capture
+/// `v2.336.0/01-register-and-idle` deletes `pools/0/agents/{id}`).
+const ALL_POOLS: i64 = 0;
 /// Environment variable carrying a pre-generated keypair as `RSAParameters` JSON.
 ///
 /// Generating a 2048-bit RSA key costs 70-180 ms, and for a pool of
@@ -69,7 +76,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     let http = HttpClient::new(global.ca_bundle.as_deref())?;
 
     // Step 1: Runner registration — get OAuth token and service URL
-    let mut registration = register_runner(&http, &args.url, &args.token).await?;
+    let mut registration = register_runner(&http, &args.url, &args.token, "register").await?;
     // In TCP upstream mode the server returns loopback URLs in the service_url
     // but the runner must reach it via the upstream LAN address during
     // configure (the loopback bridge is not yet running). Rewrite transparently.
@@ -124,7 +131,6 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache)?)
             .with_context(|| format!("writing {}", cache_path.display()))?;
     }
-
     // Step 3: Obtain the RSA keypair
     let keypair = supplied_keypair()?.map_or_else(
         || {
@@ -143,21 +149,32 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             .unwrap_or_else(|| "preloop-runner".to_string())
     });
 
-    // Step 5: Discover pool
-    let pool_id =
-        discover_pool(&http, &registration.service_url, &registration.oauth_token).await?;
-    info!("Discovered pool ID: {pool_id}");
-
-    // Step 5b: Check for existing agent
-    if let Some(existing_id) = check_existing_agent(
+    // Step 5: Resolve the runner group (--runner-group) to its agent pool,
+    // matching the official runner's group-name lookup over the self-hosted
+    // pools (`!IsHosted`, case-insensitive name match, `IsInternal` default).
+    let (pool_id, pool_name) = discover_pool(
         &http,
         &registration.service_url,
         &registration.oauth_token,
-        pool_id,
+        args.runner_group.as_deref(),
+    )
+    .await?;
+    info!("Discovered pool '{pool_name}' (ID: {pool_id})");
+
+    // Step 5b: Check for existing agent. The lookup happens before anything is
+    // destroyed, and the deletion it authorises is deferred until every
+    // fallible local step is done (step 6b): a failed download must not leave a
+    // previously working runner unregistered while `.runner` still points at
+    // the identity we just deleted.
+    let existing_agent = check_existing_agent(
+        &http,
+        &registration.service_url,
+        &registration.oauth_token,
+        ALL_POOLS,
         &runner_name,
     )
-    .await?
-    {
+    .await?;
+    if let Some(existing_id) = existing_agent {
         if !args.replace {
             anyhow::bail!(
                 "Runner '{}' already exists (agent ID: {}). Use --replace.",
@@ -165,18 +182,7 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
                 existing_id
             );
         }
-        info!("Replacing existing agent {existing_id}");
-        let delete_url = format!(
-            "{}/_apis/v1/pools/{}/agents/{}",
-            registration.service_url, pool_id, existing_id
-        );
-        match http
-            .delete_with_token(&delete_url, &registration.oauth_token)
-            .await
-        {
-            Ok(_) => info!("Deleted existing agent {existing_id}"),
-            Err(e) => warn!("Failed to delete existing agent {existing_id}: {e:#}"),
-        }
+        info!("Replacing agent {existing_id}");
     }
 
     // Step 6: Download Node.js externals (unless --no-externals).
@@ -189,6 +195,20 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         download_externals(&http, &root)
             .await
             .context("downloading Node.js externals")?;
+    }
+
+    // Step 6b: Retire the agent being replaced, now that the local assets it
+    // needs are in place.
+    if let Some(existing_id) = existing_agent {
+        delete_agent(
+            &http,
+            &registration.service_url,
+            &registration.oauth_token,
+            existing_id,
+        )
+        .await
+        .with_context(|| format!("deleting existing agent {existing_id} during --replace"))?;
+        info!("Deleted existing agent {existing_id}");
     }
 
     // Step 7: Register agent with the server (correct endpoint)
@@ -229,27 +249,27 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
     // Extract agent response properties (used for FIPS, auth migration, broker URL)
     let props = agent_response.get("properties");
 
-    // Read requireFipsCryptography from agent response properties
-    // instead of hardcoding "True". Official reads properties.RequireFipsCryptography.
-    // Default to "True" if not present (matches prior behavior).
+    // Read RequireFipsCryptography from agent response properties. Both our
+    // engine and real GitHub serialize it as `{"$type":"System.Boolean",
+    // "$value":<bool>}`; the official runner persists
+    // `value.ToString()` — "True"/"False" — into .credentials
+    // (ConfigurationManager.cs writes
+    // `agent.Properties.GetValue("RequireFipsCryptography", true).ToString()`).
     let require_fips = props
         .and_then(|p| p.get("RequireFipsCryptography"))
         .and_then(|v| v.get("$value").or(Some(v)))
-        .and_then(|v| v.as_str())
-        .unwrap_or("True");
+        .and_then(wire_bool)
+        .unwrap_or(true);
     cred_data.insert(
         "requireFipsCryptography".to_string(),
-        serde_json::json!(require_fips),
+        serde_json::json!(if require_fips { "True" } else { "False" }),
     );
 
     // Extract auth migration fields from agent response properties
     let enable_auth_migration = props
         .and_then(|p| p.get("EnableAuthMigrationByDefault"))
         .and_then(|v| v.get("$value").or(Some(v)))
-        .and_then(|v| {
-            v.as_bool()
-                .or_else(|| v.as_str().map(|s| s == "true" || s == "True"))
-        })
+        .and_then(wire_bool)
         .unwrap_or(false);
     let auth_url_v2 = props
         .and_then(|p| p.get("AuthorizationUrlV2"))
@@ -281,13 +301,13 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
             agent_id,
             agent_name: runner_name.clone(),
             pool_id,
-            pool_name: "Default".to_string(),
+            pool_name: pool_name.clone(),
             server_url: registration.service_url.clone(),
             git_hub_url: args.url.clone(),
             work_folder: args.work.clone(),
             is_hosted: false,
             runner_group_id: None,
-            runner_group_name: Some(args.runner_group.clone()),
+            runner_group_name: Some(pool_name.clone()),
             ephemeral: args.ephemeral,
             // new fields
             is_hosted_server: false,
@@ -316,6 +336,13 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
 }
 
 /// Run the `remove` subcommand.
+///
+/// Mirrors the official `UnconfigureAsync`: request a *remove-scoped*
+/// credential (`runner_event: "remove"`), look the runner up by name, and skip
+/// the delete when it is already gone. Local files are removed only once the
+/// server no longer has the registration — they are the retry's credentials —
+/// and a delete failure is reported as an error so a ghost registration is
+/// never mistaken for a clean removal.
 pub async fn run_remove(args: RemoveArgs, global: &GlobalArgs) -> Result<()> {
     let root = global.runner_root();
 
@@ -326,25 +353,45 @@ pub async fn run_remove(args: RemoveArgs, global: &GlobalArgs) -> Result<()> {
     let config = RunnerConfig::load(&root)?;
     let http = HttpClient::new(global.ca_bundle.as_deref())?;
 
-    // Deregister with the server
-    let delete_url = format!(
-        "{}/_apis/v1/pools/{}/agents/{}",
-        config.settings.server_url, config.settings.pool_id, config.settings.agent_id
-    );
+    // Remove-scoped tenant credential: the official runner requests token
+    // type "remove" and posts runner_event "remove"
+    // (ConfigurationManager.cs GetRunnerTokenAsync + GetTenantCredential).
+    let registration =
+        register_runner(&http, &config.settings.git_hub_url, &args.token, "remove").await?;
+    let service_url = http.rewrite_url(&registration.service_url).into_owned();
 
-    // Get a fresh token for deletion
-    let registration = register_runner(&http, &config.settings.git_hub_url, &args.token).await?;
+    // The official runner looks the agent up by name before deleting it and
+    // prints "Does not exist. Skipping Removing runner from the server." when
+    // it is gone, so a registration retired through the UI or by
+    // stale-runner cleanup still cleans up locally.
+    let existing_agent = check_existing_agent(
+        &http,
+        &service_url,
+        &registration.oauth_token,
+        ALL_POOLS,
+        &config.settings.agent_name,
+    )
+    .await?;
 
-    match http
-        .delete_with_token(&delete_url, &registration.oauth_token)
-        .await
-    {
-        Ok(_) => info!("Runner deregistered from server"),
-        Err(e) => warn!("Failed to deregister runner: {e:#}. Removing local files anyway."),
+    // A server-side failure returns before the local files are touched: the
+    // official runner throws ahead of `DeleteLocalRunnerConfig()`, so the
+    // agent id and repository URL stay behind for the retry instead of
+    // orphaning the registration with no local identity left to remove it.
+    match existing_agent {
+        Some(agent_id) => {
+            delete_agent(&http, &service_url, &registration.oauth_token, agent_id)
+                .await
+                .with_context(|| format!("deregistering agent {agent_id}"))?;
+            info!("Runner deregistered from server");
+        }
+        None => info!(
+            "Runner '{}' does not exist on the server; removing local configuration",
+            config.settings.agent_name
+        ),
     }
 
     RunnerConfig::remove_files(&root)?;
-    info!("Runner configuration removed");
+    info!("Runner removed");
     Ok(())
 }
 
@@ -363,7 +410,17 @@ struct RegistrationResult {
 }
 
 /// POST to the runner-registration endpoint to get OAuth token and service URL.
-async fn register_runner(http: &HttpClient, url: &str, token: &str) -> Result<RegistrationResult> {
+///
+/// `runner_event` selects the credential scope GitHub mints: `"register"` for
+/// `configure`, `"remove"` for `remove` — the two token types are
+/// distinguished on the real service (`GetTenantCredential`,
+/// ConfigurationManager.cs).
+async fn register_runner(
+    http: &HttpClient,
+    url: &str,
+    token: &str,
+    runner_event: &str,
+) -> Result<RegistrationResult> {
     // Determine the registration URL:
     // For GitHub: POST https://api.github.com/actions/runner-registration
     // For local aksh: POST {base}/api/v3/actions/runner-registration
@@ -375,10 +432,7 @@ async fn register_runner(http: &HttpClient, url: &str, token: &str) -> Result<Re
         format!("{base}/api/v3/actions/runner-registration")
     };
 
-    let body = serde_json::json!({
-        "url": url,
-        "runner_event": "register"
-    });
+    let body = registration_body(url, runner_event);
 
     let resp: serde_json::Value = http
         .post_json_with_auth(&reg_url, &body, &format!("RemoteAuth {token}"))
@@ -421,12 +475,74 @@ async fn register_runner(http: &HttpClient, url: &str, token: &str) -> Result<Re
     })
 }
 
-/// Discover the pool ID by querying the pools endpoint.
-async fn discover_pool(http: &HttpClient, service_url: &str, token: &str) -> Result<i64> {
-    let url = format!(
-        "{}/_apis/distributedtask/pools?poolType=Automation",
-        service_url
-    );
+/// Body for `POST …/actions/runner-registration` (`GitHubAuthResult` request).
+fn registration_body(url: &str, runner_event: &str) -> serde_json::Value {
+    serde_json::json!({
+        "url": url,
+        "runner_event": runner_event
+    })
+}
+
+/// `DELETE {service_url}/_apis/distributedtask/pools/{pool}/agents/{id}`.
+///
+/// The official runner passes pool `0` (`RunnerServer.DeleteAgentAsync`:
+/// "agentPool is ignored server side") and the real GitHub endpoint answers
+/// 204 on exactly this path. Pool `0` is used verbatim so the wire request
+/// matches the captured official sequence.
+fn agent_delete_url(service_url: &str, agent_id: i64) -> String {
+    format!("{service_url}/_apis/distributedtask/pools/{ALL_POOLS}/agents/{agent_id}")
+}
+
+/// Delete an agent through the distributed-task endpoint.
+///
+/// A `404` is the desired end state already holding — the registration is
+/// gone — so it is not an error, and a `remove` whose only remaining work is
+/// local cleanup still finishes.
+async fn delete_agent(
+    http: &HttpClient,
+    service_url: &str,
+    token: &str,
+    agent_id: i64,
+) -> Result<()> {
+    let url = agent_delete_url(service_url, agent_id);
+    match http
+        .delete_with_token_header(&url, token, ACCEPT.as_str(), DISTTASK_AGENT_ACCEPT)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if is_not_found(&error) => {
+            info!("Agent {agent_id} is already gone from the server");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether an error carries an HTTP `404 Not Found`.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<HttpError>())
+        .is_some_and(|error| {
+            matches!(error, HttpError::Status { status, .. } if *status == reqwest::StatusCode::NOT_FOUND)
+        })
+}
+
+/// Resolve the runner group (`--runner-group`) to `(pool_id, pool_name)` by
+/// querying the pools endpoint.
+///
+/// Matches the official `ConfigureAsync` group resolution: the first internal
+/// (`isInternal`) pool is the default, the requested group name is matched
+/// case-insensitively among the self-hosted (`!isHosted`) pools, and an
+/// omitted name falls back to the internal group's name. A name that hits no
+/// group, or more than one, is an error listing what the server reported.
+async fn discover_pool(
+    http: &HttpClient,
+    service_url: &str,
+    token: &str,
+    runner_group: Option<&str>,
+) -> Result<(i64, String)> {
+    let url = format!("{service_url}/_apis/distributedtask/pools?poolType=Automation");
     let resp: serde_json::Value = http
         .get_json_with_auth_accept(&url, &format!("Bearer {token}"), DISTTASK_POOLS_ACCEPT)
         .await
@@ -436,12 +552,108 @@ async fn discover_pool(http: &HttpClient, service_url: &str, token: &str) -> Res
         .get("value")
         .and_then(|v| v.as_array())
         .context("pools response missing 'value' array")?;
+    select_pool(pools, runner_group)
+}
 
-    let pool = pools.first().context("no pools returned by server")?;
+fn pool_is_hosted(pool: &serde_json::Value) -> bool {
+    pool.get("isHosted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
 
-    pool.get("id")
-        .and_then(|v| v.as_i64())
-        .context("pool missing 'id' field")
+fn pool_is_internal(pool: &serde_json::Value) -> bool {
+    pool.get("isInternal")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn pool_name(pool: &serde_json::Value) -> Option<&str> {
+    pool.get("name").and_then(serde_json::Value::as_str)
+}
+
+fn pool_id(pool: &serde_json::Value) -> Option<i64> {
+    pool.get("id").and_then(serde_json::Value::as_i64)
+}
+
+/// `(id, name)` of a pool, erroring when either field is absent.
+fn pool_identity(pool: &serde_json::Value) -> Result<(i64, String)> {
+    let id = pool_id(pool).context("pool missing 'id' field")?;
+    let name = pool_name(pool).context("pool missing 'name' field")?;
+    Ok((id, name.to_owned()))
+}
+
+/// Select a self-hosted pool by runner-group name.
+///
+/// Mirrors `ConfigurationManager.ConfigureAsync`: the first internal
+/// (`isInternal`) pool is the default; a server that advertises no self-hosted
+/// group at all is used through it directly, and otherwise the requested name
+/// — defaulted to the internal group's name, as the official
+/// `command.GetRunnerGroupName(defaultPool?.Name)` does — is matched
+/// case-insensitively among the self-hosted (`!isHosted`) pools. Defaulting to
+/// the *discovered* name is what keeps an omitted `--runner-group` working
+/// when the default group has been renamed on the server.
+fn select_pool(pools: &[serde_json::Value], runner_group: Option<&str>) -> Result<(i64, String)> {
+    const NO_SELF_HOSTED_GROUPS: &str =
+        "Could not find any self-hosted runner groups. Contact support.";
+
+    let self_hosted: Vec<&serde_json::Value> =
+        pools.iter().filter(|pool| !pool_is_hosted(pool)).collect();
+    let internal = pools.iter().find(|pool| pool_is_internal(pool));
+
+    if self_hosted.is_empty() {
+        let default = internal.context(NO_SELF_HOSTED_GROUPS)?;
+        return pool_identity(default);
+    }
+
+    let requested = match runner_group.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => name,
+        // `GetRunnerGroupName(defaultPool?.Name)`: the discovered internal
+        // group's name is the argument default, or the literal `"default"`
+        // when the server reports no internal pool.
+        None => internal.and_then(pool_name).unwrap_or("default"),
+    };
+
+    let matches: Vec<&serde_json::Value> = self_hosted
+        .iter()
+        .copied()
+        .filter(|pool| pool_name(pool).is_some_and(|name| name.eq_ignore_ascii_case(requested)))
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            let groups = self_hosted
+                .iter()
+                .filter_map(|pool| pool_name(pool))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Could not find any self-hosted runner group named \"{requested}\". \
+                 Available self-hosted groups: {groups}"
+            );
+        }
+        [pool] => pool_identity(pool),
+        _ => {
+            let groups = matches
+                .iter()
+                .filter_map(|pool| pool_name(pool).zip(pool_id(pool)))
+                .map(|(name, id)| format!("{name} (id {id})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("More than one self-hosted runner group is named \"{requested}\": {groups}");
+        }
+    }
+}
+
+/// Decode a VSS-typed JSON scalar to a bool. Agent properties arrive as
+/// `{"$type": "System.Boolean", "$value": <bool>}`; accept bare bools and
+/// case-insensitive "true"/"false" strings as fallbacks. Anything else is
+/// `None` so the caller decides the default.
+fn wire_bool(v: &serde_json::Value) -> Option<bool> {
+    v.as_bool().or_else(|| match v.as_str() {
+        Some(s) if s.eq_ignore_ascii_case("true") => Some(true),
+        Some(s) if s.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    })
 }
 
 /// Check if an agent with this name already exists.
@@ -1032,5 +1244,136 @@ mod node_externals_tests {
             "missing all checksum sources must fail closed"
         );
         assert!(!externals_dir.join("node24/bin/node").exists());
+    }
+}
+
+#[cfg(test)]
+mod registration_parity_tests {
+    use super::*;
+
+    #[test]
+    fn registration_body_uses_remove_event() {
+        assert_eq!(
+            registration_body("https://github.com/preloopdev/preloop", "remove",),
+            serde_json::json!({
+                "url": "https://github.com/preloopdev/preloop",
+                "runner_event": "remove",
+            })
+        );
+    }
+
+    #[test]
+    fn agent_delete_url_matches_distributedtask_endpoint() {
+        assert_eq!(
+            agent_delete_url(
+                "https://pipelinesghubeus24.actions.githubusercontent.com/tenant",
+                1071,
+            ),
+            "https://pipelinesghubeus24.actions.githubusercontent.com/tenant/_apis/distributedtask/pools/0/agents/1071",
+        );
+    }
+
+    #[test]
+    fn fips_property_accepts_vss_boolean_value() {
+        let property = serde_json::json!({
+            "$type": "System.Boolean",
+            "$value": false,
+        });
+        let value = property.get("$value").and_then(wire_bool).unwrap_or(true);
+        assert!(!value);
+        assert_eq!(if value { "True" } else { "False" }, "False",);
+    }
+
+    #[test]
+    fn wire_bool_rejects_unknown_strings() {
+        assert_eq!(wire_bool(&serde_json::json!("TRUE")), Some(true));
+        assert_eq!(wire_bool(&serde_json::json!("false")), Some(false));
+        assert_eq!(wire_bool(&serde_json::json!("not-a-bool")), None);
+        assert_eq!(wire_bool(&serde_json::json!(null)), None);
+    }
+    #[test]
+    fn runner_group_selects_matching_self_hosted_pool() {
+        let pools = serde_json::json!([
+            {"id": 1, "name": "Default", "isHosted": false, "isInternal": true},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true, "isInternal": false},
+            {"id": 3, "name": "GPU", "isHosted": false, "isInternal": false},
+        ]);
+        assert_eq!(
+            select_pool(pools.as_array().unwrap(), Some("gpu")).unwrap(),
+            (3, "GPU".to_owned()),
+        );
+    }
+
+    /// The pools response the official runner recorded against GitHub
+    /// (`.runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl`):
+    /// `Default` (1, internal, self-hosted) and `GitHub Actions` (2, hosted).
+    #[test]
+    fn runner_group_defaults_to_the_discovered_internal_pool() {
+        let pools = serde_json::json!([
+            {"id": 1, "name": "Renamed Default", "isHosted": false, "isInternal": true},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true, "isInternal": false},
+        ]);
+        // Omitted --runner-group: `command.GetRunnerGroupName(defaultPool?.Name)`
+        // supplies the name, so a renamed internal group still resolves instead
+        // of failing on the literal "default".
+        assert_eq!(
+            select_pool(pools.as_array().unwrap(), None).unwrap(),
+            (1, "Renamed Default".to_owned()),
+        );
+        // An explicit name is matched against the server's names only.
+        assert_eq!(
+            select_pool(pools.as_array().unwrap(), Some("renamed default")).unwrap(),
+            (1, "Renamed Default".to_owned()),
+        );
+        let error = select_pool(pools.as_array().unwrap(), Some("default")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Available self-hosted groups: Renamed Default")
+        );
+    }
+
+    #[test]
+    fn runner_group_ambiguity_lists_matching_groups() {
+        let pools = serde_json::json!([
+            {"id": 1, "name": "GPU", "isHosted": false},
+            {"id": 2, "name": "gpu", "isHosted": false},
+        ]);
+        let error = select_pool(pools.as_array().unwrap(), Some("Gpu")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("GPU (id 1)"));
+        assert!(message.contains("gpu (id 2)"));
+    }
+
+    #[test]
+    fn runner_group_absent_from_the_pool_list_lists_the_candidates() {
+        let pools = serde_json::json!([
+            {"id": 1, "name": "Default", "isHosted": false, "isInternal": true},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true},
+        ]);
+        let error = select_pool(pools.as_array().unwrap(), Some("GPU")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Available self-hosted groups: Default")
+        );
+
+        // No self-hosted group at all: the internal pool decides, or the
+        // server is reported as unusable exactly like the official runner.
+        let only_hosted =
+            serde_json::json!([{"id": 2, "name": "GitHub Actions", "isHosted": true}]);
+        let error = select_pool(only_hosted.as_array().unwrap(), None).unwrap_err();
+        assert!(error.to_string().contains("Contact support."));
+
+        // No internal pool reported: the literal `"default"` is the argument
+        // default (`defaultPoolName ?? "default"`) and is still name-matched.
+        let unmarked = serde_json::json!([
+            {"id": 4, "name": "Default", "isHosted": false},
+            {"id": 2, "name": "GitHub Actions", "isHosted": true},
+        ]);
+        assert_eq!(
+            select_pool(unmarked.as_array().unwrap(), None).unwrap(),
+            (4, "Default".to_owned()),
+        );
     }
 }

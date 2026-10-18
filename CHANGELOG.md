@@ -62,6 +62,17 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Runner configure/remove match GitHub registration APIs** (#627):
+  runner-group names resolve to their self-hosted pools, an omitted
+  `--runner-group` takes the discovered internal group so a renamed default
+  still works, and removal uses a remove-scoped credential and the
+  distributed-task agent endpoint. `remove` skips the delete when the runner is
+  already gone and leaves the local configuration in place when the server
+  delete fails, so the removal can be retried instead of orphaning the
+  registration; `--replace` downloads the Node runtimes before retiring the
+  agent it replaces, and the server's FIPS property is persisted with its
+  actual boolean value.
+
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
