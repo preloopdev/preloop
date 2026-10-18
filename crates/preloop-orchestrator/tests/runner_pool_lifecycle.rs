@@ -341,8 +341,11 @@ impl VmProvider for RecordingVmProvider {
 }
 
 struct Fixture {
-    _env_guard: std::sync::MutexGuard<'static, ()>,
+    // Fields drop in declaration order, so the pins go back while the lock is
+    // still held: releasing it first lets the next test repin and then have its
+    // pins clobbered by this fixture's late restore.
     _hermetic_env: HermeticEnvGuard,
+    _env_guard: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
@@ -474,8 +477,8 @@ impl Fixture {
             observability: None,
         };
         Self {
-            _env_guard: env_guard,
             _hermetic_env: HermeticEnvGuard::new(&root),
+            _env_guard: env_guard,
             root,
             config,
             token_env,
