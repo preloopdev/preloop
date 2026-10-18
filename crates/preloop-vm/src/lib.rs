@@ -20,6 +20,133 @@ pub mod telemetry;
 
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
+/// SmolVM runtime floor, compiled from `smolvm_min_version` in the workspace
+/// `versions.toml` by this crate's `build.rs`.
+///
+/// The first release that satisfies every runtime invariant preloop needs:
+/// packed-machine ownership preservation (v1.8.1), `machine fork
+/// --freeze-source` (v1.18.1), and the x86_64 virtio device budget (v1.23.0) —
+/// see [`X86_64_VIRTIO_DEVICE_CEILING`]. `preloop update --ensure-runtime`
+/// accepts any stable release >= this and installs the latest stable when the
+/// local runtime is below it or lacks the required socket capability.
+pub const SMOLVM_MIN_VERSION: &str = env!("PRELOOP_SMOLVM_MIN_VERSION");
+
+/// Virtio devices x86_64 libkrun can address, i.e. the MMIO IRQ lines 5..=23
+/// it allocates, one line per device.
+///
+/// The 20th device fails the boot with `build microVM: ... no more IRQs are
+/// available` (SmolVM 1.23.0 raised this from [`X86_64_VIRTIO_DEVICE_CEILING_BEFORE_1_23`];
+/// smolvm PR #1521). Measured on x86_64 Linux at SmolVM 1.30.1 with a device
+/// ladder: the ceiling is 19 devices.
+pub const X86_64_VIRTIO_DEVICE_CEILING: usize = 19;
+
+/// Virtio devices x86_64 libkrun could address before SmolVM 1.23.0, when the
+/// allocation still started at IRQ 5 with 7 lines of headroom for the
+/// platform.
+pub const X86_64_VIRTIO_DEVICE_CEILING_BEFORE_1_23: usize = 11;
+
+/// Devices SmolVM's launcher builds for a machine before any `--volume`,
+/// `--mount-socket` or extra `--disk` counts against the budget.
+///
+/// Measured at SmolVM 1.30.1 on x86_64 Linux for an image machine created with
+/// `--storage 1 --overlay 1`: 9 devices (the rootfs and layer virtiofs
+/// exports, the storage and overlay disks, vsock, net, console and their
+/// console/agent peers). A machine built from a `.smolmachine` pack carries
+/// its own launcher set; each additional device costs exactly one MMIO IRQ
+/// line.
+pub const SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES: usize = 9;
+
+/// The virtio devices a [`MachineSpec`] declares on top of SmolVM's fixed
+/// launcher set.
+///
+/// `machine start` carries no device flags and SmolVM does not report the
+/// inventory it is about to boot with, so the only place preloop can count
+/// what a machine asked for is the spec it was created from. One device per
+/// `--volume` (virtiofs), per `--mount-socket` (virtio-vsock), and per extra
+/// `--disk`; [`MachineSpec`] cannot express an extra disk yet, so only the
+/// first two are counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeclaredDevices {
+    /// `--volume` host mounts, one virtiofs device each.
+    pub volumes: usize,
+    /// `--mount-socket` host sockets, one vsock device each.
+    pub sockets: usize,
+}
+
+impl DeclaredDevices {
+    /// Devices this inventory adds to SmolVM's fixed launcher set.
+    pub fn total(&self) -> usize {
+        self.volumes + self.sockets
+    }
+}
+
+/// Whether `stderr` carries libkrun's IRQ-exhaustion signature.
+///
+/// Both spellings upstream reports are matched: libkrun's own text on the
+/// `machine start` path, and the `IrqsExhausted` variant the preloop log
+/// surfaces when the failure comes back through the launcher's structured
+/// error. Nothing else in a boot failure carries either string, so an
+/// unrelated `EINVAL` — a disk image another hypervisor still holds, a
+/// foreign-owned or corrupt image, a rejected device option — is not
+/// classified as a device-budget failure.
+pub fn is_irq_exhaustion(stderr: &str) -> bool {
+    stderr.contains("no more IRQs are available") || stderr.contains("IrqsExhausted")
+}
+
+/// The operator-facing explanation for a boot that ran out of virtio IRQ
+/// lines, with the raw SmolVM output appended.
+///
+/// Pure, so the wording and the classification are unit-testable without a
+/// provider: `declared` is `None` for a machine this engine process did not
+/// create (an adopted golden), and `smolvm_version` is `None` when the
+/// `smolvm --version` probe failed.
+pub fn irq_exhaustion_message(
+    machine: &str,
+    operation: &str,
+    declared: Option<DeclaredDevices>,
+    smolvm_version: Option<&str>,
+    stderr: &str,
+) -> String {
+    let version = match smolvm_version {
+        Some(version) => format!("`smolvm --version` on this host reports {version}"),
+        None => {
+            "the host's smolvm version could not be read (`smolvm --version` failed)".to_owned()
+        }
+    };
+    let inventory = match declared {
+        Some(declared) => format!(
+            "This machine's spec declared {} volume mount(s), {} socket mount(s) and no extra \
+             disk(s): {} device(s) on top of the {baseline}-device launcher set SmolVM builds for \
+             an image machine (rootfs and layer virtiofs, the `--storage` and `--overlay` disks, \
+             vsock, net, console), and each `--volume`, `--mount-socket` or extra `--disk` costs \
+             exactly one device.",
+            declared.volumes,
+            declared.sockets,
+            declared.total(),
+            baseline = SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES,
+        ),
+        None => format!(
+            "The spec this machine was created from is not recorded in this process (an earlier \
+             engine run created or adopted it), so its device counts cannot be listed here. The \
+             budget it drew on is the {baseline}-device launcher set SmolVM builds for an image \
+             machine plus one device per `--volume`, `--mount-socket` or extra `--disk`.",
+            baseline = SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES,
+        ),
+    };
+    format!(
+        "smolvm `{operation}` for `{machine}` failed: the machine needs more virtio devices than \
+         this host's SmolVM provides, so libkrun could not get an MMIO IRQ line for one of them. \
+         x86_64 libkrun allocates {ceiling} IRQ lines (5-23) to virtio devices on SmolVM >= 1.23.0 \
+         and {before} before that; the arm64/macOS ceiling has not been measured. {inventory} \
+         {version}. Upgrade SmolVM to >= {floor} (`preloop update --ensure-runtime`) or start this \
+         machine with fewer mounts; a host that exhausts its device budget cannot be fixed by \
+         restarting the pool.\nRaw smolvm output:\n{stderr}",
+        ceiling = X86_64_VIRTIO_DEVICE_CEILING,
+        before = X86_64_VIRTIO_DEVICE_CEILING_BEFORE_1_23,
+        floor = SMOLVM_MIN_VERSION,
+    )
+}
+
 /// A validated persistent SmolVM machine name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -170,6 +297,19 @@ pub struct MachineSpec {
     pub rosetta: bool,
 }
 
+impl MachineSpec {
+    /// The devices this spec adds to SmolVM's fixed launcher set.
+    ///
+    /// Counted from the spec because `machine start` carries no device flags:
+    /// see [`DeclaredDevices`].
+    pub fn declared_devices(&self) -> DeclaredDevices {
+        DeclaredDevices {
+            volumes: self.volumes.len(),
+            sockets: self.sockets.len(),
+        }
+    }
+}
+
 /// Observable VM state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MachineState {
@@ -253,6 +393,30 @@ pub enum VmError {
     /// Invalid SmolVM JSON output.
     #[error("invalid smolvm response: {0}")]
     Protocol(String),
+    /// The host ran out of MMIO IRQ lines for the machine's virtio devices.
+    ///
+    /// libkrun allocates one IRQ line per virtio device and fails the whole
+    /// boot once they are gone, reporting only `build microVM: ... no more
+    /// IRQs are available`. On the host that reads exactly like the other
+    /// `EINVAL` start failures (a disk image another hypervisor still holds, a
+    /// corrupt or foreign-owned image), so the pool restarts forever without
+    /// naming the real cause or a remedy. This variant is produced only when
+    /// the stderr carries that signature ([`is_irq_exhaustion`]) and carries
+    /// the counted device inventory, the `smolvm --version` reading, and the
+    /// ceilings with the raw output in [`Self::message`].
+    #[error("{message}")]
+    IrqExhausted {
+        /// Machine that failed to start.
+        machine: String,
+        /// Logical operation that failed (`start`, `start_forkable`).
+        operation: &'static str,
+        /// Devices the machine's spec declared, when this process created it.
+        declared: Option<DeclaredDevices>,
+        /// What the resolved `smolvm` reported for `--version`, when readable.
+        smolvm_version: Option<String>,
+        /// Operator-facing explanation, raw SmolVM stderr appended.
+        message: String,
+    },
     /// The guest agent stopped answering while a command was streaming.
     ///
     /// A wedged guest never closes its exec stream, so without this the
@@ -560,6 +724,19 @@ pub struct SmolVmProvider {
     /// Whether the resolved binary's `machine create` accepts
     /// `--mount-socket`, probed once per provider.
     socket_mount_supported: Arc<tokio::sync::OnceCell<bool>>,
+    /// Devices each machine's `create` declared, so a start that runs out of
+    /// MMIO IRQ lines can name the inventory it was asked to boot.
+    ///
+    /// `machine start` carries no device flags, and SmolVM reports only the
+    /// count it is about to use — never what the caller asked for — so the
+    /// spec passed to [`VmProvider::create`] is the only source for the
+    /// breakdown. Per provider instance: a machine an earlier engine
+    /// generation created (an adopted golden) has no entry, and the
+    /// diagnostic says so instead of guessing.
+    declared_devices: Arc<tokio::sync::Mutex<HashMap<String, DeclaredDevices>>>,
+    /// What the resolved binary reports for `--version`, probed at most once
+    /// and only on a diagnostic path.
+    reported_version: Arc<tokio::sync::OnceCell<Option<String>>>,
     /// Where this provider reads host environment overrides from (the sandbox
     /// modes and the network backend). Production is always the process
     /// environment; unit tests substitute a pure lookup so the policy can be
@@ -612,6 +789,8 @@ impl SmolVmProvider {
             fork_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
+            declared_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            reported_version: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
         }
     }
@@ -779,6 +958,80 @@ impl SmolVmProvider {
             return Ok(false);
         };
         Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
+    }
+
+    /// What the resolved binary reports for `--version`, probed once.
+    ///
+    /// Used for diagnostics only. SmolVM's wrapper scripts can report a newer
+    /// version than the binary they exec (see [`VmError::UnsupportedSocketMount`]),
+    /// so callers quote this as the *reported* version rather than trusting it
+    /// for a capability decision. The probe runs through
+    /// [`Self::recovery_command`]: it can never boot a VMM, and it must still
+    /// answer while a bad sandbox override is being diagnosed.
+    async fn reported_version(&self) -> Option<String> {
+        self.reported_version
+            .get_or_init(|| async {
+                let mut command = self.recovery_command().ok()?;
+                let output = command
+                    .arg("--version")
+                    .stdin(Stdio::null())
+                    .output()
+                    .await
+                    .ok()?;
+                let text = String::from_utf8_lossy(&output.stdout);
+                let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+                Some(line.to_owned())
+            })
+            .await
+            .clone()
+    }
+
+    /// Record the devices a `create` asked SmolVM to build.
+    async fn note_declared_devices(&self, name: &MachineName, declared: DeclaredDevices) {
+        self.declared_devices
+            .lock()
+            .await
+            .insert(name.as_str().to_owned(), declared);
+    }
+
+    /// Reinterpret a boot failure as the device-budget exhaustion it is.
+    ///
+    /// Anything that does not carry libkrun's IRQ-exhaustion signature is
+    /// returned unchanged: a corrupt image, a disk another hypervisor still
+    /// holds, and a rejected device option all surface as `EINVAL` and must
+    /// keep their own message.
+    async fn explain_boot_failure(
+        &self,
+        name: &MachineName,
+        operation: &'static str,
+        error: VmError,
+    ) -> VmError {
+        let VmError::Command { message, .. } = &error else {
+            return error;
+        };
+        if !is_irq_exhaustion(message) {
+            return error;
+        }
+        let declared = self
+            .declared_devices
+            .lock()
+            .await
+            .get(name.as_str())
+            .copied();
+        let smolvm_version = self.reported_version().await;
+        VmError::IrqExhausted {
+            machine: name.as_str().to_owned(),
+            operation,
+            declared,
+            smolvm_version: smolvm_version.clone(),
+            message: irq_exhaustion_message(
+                name.as_str(),
+                operation,
+                declared,
+                smolvm_version.as_deref(),
+                message,
+            ),
+        }
     }
 
     async fn checked(
@@ -1224,6 +1477,10 @@ impl VmProvider for SmolVmProvider {
         }
         self.exclusive_with_network("create", &args, &spec.network)
             .await?;
+        // Recorded after a successful create: the spec is the only place the
+        // device inventory a `start` failure has to explain is still known.
+        self.note_declared_devices(&spec.name, spec.declared_devices())
+            .await;
         if spec.rosetta {
             let update_args = vec![
                 "machine".into(),
@@ -1255,33 +1512,47 @@ impl VmProvider for SmolVmProvider {
     /// runs alongside forks. Holding the write lock here stalled the whole
     /// pool: a direct-created runner's cold boot (minutes on macOS while the
     /// guest unpacks its layers) blocked every fork until it finished.
+    ///
+    /// A boot that runs out of virtio IRQ lines comes back as
+    /// [`VmError::IrqExhausted`] instead of the bare `EINVAL` smolvm prints:
+    /// see [`SmolVmProvider::explain_boot_failure`].
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
-        self.concurrent(
-            "start",
-            &[
-                "machine".into(),
-                "start".into(),
-                "--name".into(),
-                name.as_str().into(),
-            ],
-        )
-        .await
-        .map(|_| ())
+        match self
+            .concurrent(
+                "start",
+                &[
+                    "machine".into(),
+                    "start".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.explain_boot_failure(name, "start", error).await),
+        }
     }
 
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
-        self.exclusive(
-            "start_forkable",
-            &[
-                "machine".into(),
-                "start".into(),
-                "--name".into(),
-                name.as_str().into(),
-                "--forkable".into(),
-            ],
-        )
-        .await
-        .map(|_| ())
+        match self
+            .exclusive(
+                "start_forkable",
+                &[
+                    "machine".into(),
+                    "start".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                    "--forkable".into(),
+                ],
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self
+                .explain_boot_failure(name, "start_forkable", error)
+                .await),
+        }
     }
 
     /// Fork one clone from a golden, one fork per golden at a time.
@@ -1531,6 +1802,10 @@ impl VmProvider for SmolVmProvider {
             // this, a rebaked or recreated golden name would report live
             // clones forever, silently disabling the re-arm recovery.
             forked.retain(|_, owner| owner != name.as_str());
+            // The device ledger is diagnostics for a machine that exists: a
+            // deleted name must not keep its inventory (or its memory) around,
+            // and a later machine created under the same name records its own.
+            self.declared_devices.lock().await.remove(name.as_str());
         }
         result
     }
@@ -2413,48 +2688,53 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
         if roots.is_empty() {
             return Ok(0);
         }
-        let ps = std::process::Command::new("ps")
-            .args(["ax", "-o", "pid=,command="])
+        // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
+        let mounts = std::process::Command::new("/sbin/mount")
             .output()
             .map_err(|source| VmError::Launch {
-                program: "ps".to_owned(),
+                program: "/sbin/mount".to_owned(),
                 source,
             })?;
-        let mounts = std::process::Command::new("mount")
-            .output()
-            .map_err(|source| VmError::Launch {
-                program: "mount".to_owned(),
-                source,
-            })?;
-        let mut detached = 0usize;
-        for mount in orphan_layer_store_mounts(
-            &roots,
-            &String::from_utf8_lossy(&ps.stdout),
-            &String::from_utf8_lossy(&mounts.stdout),
-        ) {
-            match std::process::Command::new("hdiutil")
-                .args(["detach", "-quiet"])
-                .arg(&mount)
-                .status()
-            {
-                Ok(status) if status.success() => {
-                    detached += 1;
-                    info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
-                }
-                Ok(status) => warn!(
-                    mount = %mount.display(),
-                    %status,
-                    "hdiutil detach refused; leaving the layer mount in place"
-                ),
-                Err(error) => warn!(
-                    mount = %mount.display(),
-                    %error,
-                    "hdiutil detach failed to start"
-                ),
-            }
-        }
-        Ok(detached)
+        detach_orphaned_layer_mounts_in(&roots, &String::from_utf8_lossy(&mounts.stdout))
     }
+}
+
+/// The scan → decide → detach pass over one `mount` table, split from the
+/// shell-out above so a test can drive it with a fixture table.
+#[cfg(target_os = "macos")]
+fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
+    let ps = std::process::Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .output()
+        .map_err(|source| VmError::Launch {
+            program: "ps".to_owned(),
+            source,
+        })?;
+    let mut detached = 0usize;
+    for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
+    {
+        match std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet"])
+            .arg(&mount)
+            .status()
+        {
+            Ok(status) if status.success() => {
+                detached += 1;
+                info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
+            }
+            Ok(status) => warn!(
+                mount = %mount.display(),
+                %status,
+                "hdiutil detach refused; leaving the layer mount in place"
+            ),
+            Err(error) => warn!(
+                mount = %mount.display(),
+                %error,
+                "hdiutil detach failed to start"
+            ),
+        }
+    }
+    Ok(detached)
 }
 
 /// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
@@ -3732,9 +4012,11 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// The detach pass shells out to `mount` and `hdiutil`; a fake pair on
-    /// `PATH` records the exact argv, so the whole scan → decide → detach
-    /// path is covered without attaching a disk image.
+    /// The detach pass reads the `mount` table it is handed and shells out to
+    /// `hdiutil`; a fake `hdiutil` on `PATH` records the exact argv, so the
+    /// whole scan → decide → detach path is covered without attaching a disk
+    /// image. The table is passed in because `mount` is named absolutely
+    /// (`/sbin/mount`), so it cannot be faked on `PATH`.
     #[cfg(target_os = "macos")]
     #[test]
     fn detach_orphaned_layer_mounts_detaches_each_mount_without_a_hypervisor() {
@@ -3750,15 +4032,11 @@ mod tests {
         let bin = home.join("fake-bin");
         std::fs::create_dir_all(&bin).unwrap();
         let canonical = std::fs::canonicalize(&orphan).unwrap();
-        let mount = bin.join("mount");
-        std::fs::write(
-            &mount,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \\\n  '/dev/disk3s5 on / (apfs, local, read-only, sealed)' \\\n  '/dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)'\n",
-                canonical.display()
-            ),
-        )
-        .unwrap();
+        let mount_table = format!(
+            "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
+             /dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)\n",
+            canonical.display()
+        );
         let hdiutil = bin.join("hdiutil");
         std::fs::write(
             &hdiutil,
@@ -3766,14 +4044,13 @@ mod tests {
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        for tool in [&mount, &hdiutil] {
-            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        std::fs::set_permissions(&hdiutil, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path = PathPrependGuard::prepend(&bin);
 
         // The real `ps` runs: no `_boot-vm` names this fixture home, so the
         // mount is provably orphaned.
-        let detached = detach_orphaned_layer_mounts().expect("detach");
+        let detached =
+            detach_orphaned_layer_mounts_in(&machine_data_roots(), &mount_table).expect("detach");
         assert_eq!(detached, 1, "the orphaned layer mount must be detached");
         assert_eq!(
             std::fs::read_to_string(&log).expect("fake hdiutil log"),
@@ -4330,6 +4607,371 @@ mod tests {
             .create(&spec)
             .await
             .unwrap();
+    }
+
+    /// The text an x86_64 pool actually produced (audit: `preloop serve`
+    /// golden start on cpane, smolvm 1.22.2/1.30.1): libkrun reports the MMIO
+    /// bus running out of IRQ lines, wrapped in the `EINVAL` smolvm prints for
+    /// every rejected boot configuration.
+    const REAL_IRQ_FAILURE: &str = "Starting machine 'cpane-runner-golden' with 2 mount(s)...\n\
+         Error: agent operation failed: monitor agent: start vm: krun_start_enter returned: -22 \
+         (EINVAL — libkrun rejected the VM configuration usually a disk/overlay that could not be \
+         opened (still held by another VM that has not fully exited, or a corrupt/foreign-owned \
+         image) or an unsupported device option)\n\
+         libkrun detail: build microVM: Cannot initialize a MMIO Network Device or add a device to \
+         the MMIO Bus. no more IRQs are available\n\
+         (boot process exited (code 1) before the agent was ready)";
+
+    /// The real failure text is classified, in both spellings upstream uses.
+    #[test]
+    fn irq_exhaustion_signature_matches_the_reported_failure() {
+        assert!(super::is_irq_exhaustion(REAL_IRQ_FAILURE));
+        assert!(super::is_irq_exhaustion(
+            "smolvm start failed with exit code 1: RegisterNetDevice(IrqsExhausted)"
+        ));
+        // Truncated at the capture limit, the signature still has to match.
+        assert!(super::is_irq_exhaustion("no more IRQs are available"));
+    }
+
+    /// Every other start failure keeps its own message: the same `EINVAL` for
+    /// a held or corrupt disk is the documented look-alike, and a misclassified
+    /// device budget would send the operator chasing mounts instead of disks.
+    #[test]
+    fn unrelated_boot_failures_are_not_irq_exhaustion() {
+        for stderr in [
+            "Error: agent operation failed: monitor agent: start vm: krun_start_enter returned: \
+             -22 (EINVAL — libkrun rejected the VM configuration usually a disk/overlay that could \
+             not be opened (still held by another VM that has not fully exited, or a \
+             corrupt/foreign-owned image) or an unsupported device option)",
+            "Error: krun_start_enter returned: -22 (EINVAL)",
+            "Error: agent operation failed: fork: golden 'preloop-runner-golden' is already \
+             paused; a valid retained checkpoint is required",
+            "Error: running guest agent does not support safe shutdown; VM left unchanged; update \
+             the guest agent before retrying",
+            "Cannot access /dev/kvm (permission denied)",
+            "Error: tar error: No space left on device",
+            "error: unrecognized option '--mount-socket'",
+            // Names the MMIO bus and an IRQ line, but reports no exhaustion.
+            "build microVM: cannot add IRQ line 12 to the MMIO bus: address already in use",
+        ] {
+            assert!(
+                !super::is_irq_exhaustion(stderr),
+                "must not classify as IRQ exhaustion: {stderr}"
+            );
+        }
+    }
+
+    /// The message the operator reads: what happened, the inventory the spec
+    /// declared, the version in use, both x86_64 ceilings, the remedy — and the
+    /// raw smolvm output after it.
+    #[test]
+    fn irq_exhaustion_message_names_the_inventory_version_ceilings_and_remedy() {
+        let message = super::irq_exhaustion_message(
+            "preloop-runner-golden",
+            "start",
+            Some(super::DeclaredDevices {
+                volumes: 3,
+                sockets: 1,
+            }),
+            Some("smolvm 1.18.2"),
+            REAL_IRQ_FAILURE,
+        );
+        for expected in [
+            "needs more virtio devices than this host's SmolVM provides",
+            "3 volume mount(s), 1 socket mount(s)",
+            "4 device(s) on top of the 9-device launcher set",
+            "x86_64 libkrun allocates 19 IRQ lines (5-23) to virtio devices on SmolVM >= 1.23.0 \
+             and 11 before that",
+            "the arm64/macOS ceiling has not been measured",
+            "`smolvm --version` on this host reports smolvm 1.18.2",
+            "Upgrade SmolVM to >= 1.30.1 (`preloop update --ensure-runtime`) or start this machine \
+             with fewer mounts",
+        ] {
+            assert!(
+                message.contains(expected),
+                "`{expected}` missing from:\n{message}"
+            );
+        }
+        assert!(
+            message.ends_with(REAL_IRQ_FAILURE),
+            "the raw smolvm output must be appended:\n{message}"
+        );
+
+        // An adopted machine has no recorded spec: the diagnostic says so and
+        // still names the budget, instead of inventing a count.
+        let adopted = super::irq_exhaustion_message(
+            "preloop-runner-golden",
+            "start_forkable",
+            None,
+            None,
+            REAL_IRQ_FAILURE,
+        );
+        assert!(
+            adopted.contains("not recorded in this process"),
+            "an unknown inventory must be reported as unknown:\n{adopted}"
+        );
+        assert!(adopted.contains("9-device launcher set"));
+        assert!(adopted.contains("could not be read"));
+        assert!(adopted.ends_with(REAL_IRQ_FAILURE));
+    }
+
+    /// The declared inventory counts the spec's mounts, and only those: the
+    /// disks every machine carries are the documented baseline.
+    #[test]
+    fn declared_devices_counts_volumes_and_sockets_from_the_spec() {
+        let mut spec = MachineSpec {
+            name: MachineName::new("runner-0").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: Some(10),
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        };
+        assert_eq!(super::DeclaredDevices::default().total(), 0);
+        spec.volumes = vec![
+            VolumeMount {
+                host: PathBuf::from("/host/bundle"),
+                guest: PathBuf::from("/opt/preloop/bin"),
+                read_only: true,
+            },
+            VolumeMount {
+                host: PathBuf::from("/host/control"),
+                guest: PathBuf::from("/run/preloop-control"),
+                read_only: false,
+            },
+        ];
+        spec.sockets = vec![SocketMount {
+            host: PathBuf::from("/host/engine.sock"),
+            guest: PathBuf::from("/run/preloop-engine.sock"),
+        }];
+        assert_eq!(
+            spec.declared_devices(),
+            super::DeclaredDevices {
+                volumes: 2,
+                sockets: 1
+            }
+        );
+        assert_eq!(spec.declared_devices().total(), 3);
+    }
+
+    /// End to end through the provider: a `machine start` that reports IRQ
+    /// exhaustion comes back as [`VmError::IrqExhausted`] carrying the spec's
+    /// inventory and the reported smolvm version, and its `Display` is the
+    /// actionable message rather than smolvm's bare `EINVAL`.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The PRELOOP_HOME guard must stay held across the awaits: `create` and
+    // `start` resolve the runtime environment through `effective_preloop_home`.
+    // Sync locking across awaits is the established pattern for the
+    // env-mutating suite.
+    #[allow(clippy::await_holding_lock)]
+    async fn start_failure_with_the_irq_signature_becomes_the_dedicated_variant() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        // The failure text lives in a file: it carries quotes of its own, so
+        // it cannot be inlined into the fake's shell script safely.
+        let failure = scratch.path().join("irq-failure.txt");
+        std::fs::write(&failure, REAL_IRQ_FAILURE).expect("failure fixture");
+        let binary = fake_smolvm(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --version) echo 'smolvm 1.18.2' ;;\n\
+                 esac\n\
+                 case \"$1 $2\" in\n\
+                 \"machine create\") echo 'created' ;;\n\
+                 \"machine start\") cat '{failure}' >&2; exit 1 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                failure = failure.display()
+            ),
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        let bundle = scratch.path().join("bundle");
+        let control = scratch.path().join("control");
+        for dir in [&bundle, &control] {
+            std::fs::create_dir_all(dir).expect("mount source");
+        }
+        let spec = MachineSpec {
+            name: MachineName::new("runner-0").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: vec![
+                VolumeMount {
+                    host: bundle,
+                    guest: PathBuf::from("/opt/preloop/bin"),
+                    read_only: true,
+                },
+                VolumeMount {
+                    host: control,
+                    guest: PathBuf::from("/run/preloop-control"),
+                    read_only: false,
+                },
+            ],
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        };
+        provider.create(&spec).await.expect("create");
+
+        let error = provider
+            .start(&spec.name)
+            .await
+            .expect_err("start must fail");
+        let VmError::IrqExhausted {
+            machine,
+            operation,
+            declared,
+            smolvm_version,
+            message,
+        } = &error
+        else {
+            panic!("expected IrqExhausted, got {error}");
+        };
+        assert_eq!(machine, "runner-0");
+        assert_eq!(*operation, "start");
+        assert_eq!(
+            *declared,
+            Some(super::DeclaredDevices {
+                volumes: 2,
+                sockets: 0
+            })
+        );
+        assert_eq!(smolvm_version.as_deref(), Some("smolvm 1.18.2"));
+        let rendered = error.to_string();
+        assert_eq!(&rendered, message);
+        assert!(rendered.contains("2 volume mount(s), 0 socket mount(s)"));
+        assert!(rendered.contains("Upgrade SmolVM to >= 1.30.1"));
+        assert!(rendered.contains("no more IRQs are available"));
+        // The ledger is per machine: an adopted machine has no entry, and the
+        // message must say that instead of borrowing another machine's count.
+        let adopted = provider
+            .start(&MachineName::new("adopted-golden").unwrap())
+            .await
+            .expect_err("start must fail");
+        assert!(
+            matches!(adopted, VmError::IrqExhausted { declared: None, .. }),
+            "expected an unknown inventory, got {adopted}"
+        );
+        // A deleted machine's inventory goes with it, so a name reused later
+        // cannot report the previous machine's devices.
+        provider.delete(&spec.name).await.expect("delete");
+        let reused = provider
+            .start(&spec.name)
+            .await
+            .expect_err("start must fail");
+        assert!(
+            matches!(reused, VmError::IrqExhausted { declared: None, .. }),
+            "a deleted machine must not keep its inventory, got {reused}"
+        );
+    }
+
+    /// The other half of the classification: a start failure without the
+    /// signature keeps its `Command` error, so the pool's existing
+    /// held-disk/corrupt-image diagnosis is untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_failure_without_the_signature_keeps_its_command_error() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let held_disk = scratch.path().join("held-disk.txt");
+        std::fs::write(
+            &held_disk,
+            "Error: agent operation failed: monitor agent: start vm: krun_start_enter returned: \
+             -22 (EINVAL — libkrun rejected the VM configuration usually a disk/overlay that could \
+             not be opened (still held by another VM that has not fully exited, or a \
+             corrupt/foreign-owned image) or an unsupported device option)",
+        )
+        .expect("failure fixture");
+        let binary = fake_smolvm(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --version) echo 'smolvm 1.30.1' ;;\n\
+                 esac\n\
+                 case \"$1 $2\" in\n\
+                 \"machine create\") echo 'created' ;;\n\
+                 \"machine start\") cat '{held_disk}' >&2; exit 1 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                held_disk = held_disk.display()
+            ),
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        let error = provider
+            .start(&MachineName::new("runner-0").unwrap())
+            .await
+            .expect_err("start must fail");
+        assert!(
+            matches!(
+                error,
+                VmError::Command {
+                    operation: "start",
+                    exit_code: 1,
+                    ..
+                }
+            ),
+            "a held-disk EINVAL must keep its Command error, got {error}"
+        );
+        assert!(
+            !error.to_string().contains("virtio devices"),
+            "must not claim a device budget: {error}"
+        );
+    }
+
+    /// `start_forkable` is the rearm path a pool takes after a graceful
+    /// shutdown; it boots the same launcher and must classify identically.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_forkable_failures_are_classified_too() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let binary = fake_smolvm(
+            scratch.path(),
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) echo 'smolvm 1.30.1' ;;\n\
+             esac\n\
+             echo 'libkrun detail: build microVM: no more IRQs are available' >&2\n\
+             exit 1\n",
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        let error = provider
+            .start_forkable(&MachineName::new("preloop-runner-golden").unwrap())
+            .await
+            .expect_err("start_forkable must fail");
+        assert!(
+            matches!(
+                error,
+                VmError::IrqExhausted {
+                    operation: "start_forkable",
+                    ..
+                }
+            ),
+            "expected IrqExhausted, got {error}"
+        );
+        // The floor the message tells the operator to upgrade to is compiled
+        // from versions.toml, never a literal in this file.
+        assert!(error.to_string().contains(super::SMOLVM_MIN_VERSION));
     }
 
     /// The egress-floor policy needs a backend that carries it, so

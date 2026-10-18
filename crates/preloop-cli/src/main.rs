@@ -2008,6 +2008,20 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     Ok(())
 }
 
+/// The pool snapshot an engine starts from. `mode` is the one field with no
+/// per-field setter, and its default is `Warm`, so an on-demand engine must
+/// set it here or `preloop status` advertises a warm pool that does not exist.
+fn initial_pool_snapshot(pool_enabled: bool) -> preloop_observability::status::PoolSnapshot {
+    preloop_observability::status::PoolSnapshot {
+        mode: if pool_enabled {
+            preloop_observability::status::PoolMode::Warm
+        } else {
+            preloop_observability::status::PoolMode::OnDemand
+        },
+        ..Default::default()
+    }
+}
+
 async fn cmd_engine(
     args: ServeArgs,
     observability: preloop_observability::Observability,
@@ -2098,14 +2112,7 @@ async fn cmd_engine(
     // never shows a warm pool that is not configured; `desired` is filled
     // from the resolved config below.
     let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
-        preloop_observability::status::PoolSnapshot {
-            mode: if pool_enabled {
-                preloop_observability::status::PoolMode::Warm
-            } else {
-                preloop_observability::status::PoolMode::OnDemand
-            },
-            ..Default::default()
-        },
+        initial_pool_snapshot(pool_enabled),
     ));
     let pool_config = local_runner_pool_config(
         &home,
@@ -3434,6 +3441,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // A hook that fails to install after the user accepted is a real
     // failure: report it instead of silently running ungated.
     maybe_offer_hook()?;
+    run_workflow(args).await
+}
+
+/// Everything `preloop run` does after the interactive hook offer: build the
+/// submission from the flags and the checkout, send it, and follow the run.
+async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -3533,7 +3546,6 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         repository: detect_repository(),
         git_ref: detect_git_ref(),
         workflow_path: Some(workflow_path.display().to_string()),
-        local_workspace: None,
         secrets,
         reusable_workflows,
         selected_jobs: args.job.into_iter().collect(),
@@ -7312,6 +7324,9 @@ mod tests {
         // All tests in this binary share one process working directory and
         // run in parallel threads; restore the original cwd so the tempdir
         // (and this test's `.git/`) cannot leak into other tests.
+        // The other cwd-changing test holds the same lock, so the two
+        // cannot swap directories under each other.
+        let _cwd_lock = crate::TEST_ENV_LOCK.blocking_lock();
         struct CwdGuard(std::path::PathBuf);
         impl Drop for CwdGuard {
             fn drop(&mut self) {
@@ -7394,6 +7409,141 @@ mod tests {
         std::fs::remove_file(".git/hooks/pre-push").unwrap();
         mark_hook_declined();
         assert!(hook_decided(), "should be decided after declining");
+    }
+
+    /// `preloop run` hands every flag, and every fact it derives from the
+    /// checkout, to the engine. Each field has a protocol default the engine
+    /// accepts without complaint, so a flag dropped while building the
+    /// submission (`--job`, `--secret`, `--no-merge`, …) still submits a run,
+    /// just the wrong one. The fake engine records the request body; the
+    /// checkout's `feature` branch is one commit past `main`, so the
+    /// changed-path and filter-branch derivations actually run.
+    #[tokio::test]
+    async fn run_submits_every_flag_and_derived_fact_to_the_engine() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("checkout");
+        let workflows = repo.join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let workflow_yaml = "name: ci\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let reusable_yaml = "on: workflow_call\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n";
+        std::fs::write(workflows.join("ci.yml"), workflow_yaml).unwrap();
+        std::fs::write(workflows.join("reusable.yml"), reusable_yaml).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "--no-verify", "-m", "base"]);
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.join("change.txt"), "feature\n").unwrap();
+        git(&["add", "change.txt"]);
+        git(&["commit", "-q", "--no-verify", "-m", "feature"]);
+        let payload = tmp.path().join("payload.json");
+        std::fs::write(&payload, r#"{"pull_request":{"number":7}}"#).unwrap();
+
+        let submitted = std::sync::Arc::new(std::sync::OnceLock::<serde_json::Value>::new());
+        let recorder = std::sync::Arc::clone(&submitted);
+        let app = axum::Router::new().route(
+            "/api/v1/runs",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    let _ = recorder.set(body);
+                    axum::Json(serde_json::json!({
+                        "run_id": "11111111-1111-1111-1111-111111111111",
+                        "run_number": 1,
+                        "queued_jobs": 1,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let previous_url = std::env::var_os("PRELOOP_URL");
+        unsafe { std::env::set_var("PRELOOP_URL", &base) };
+        let cwd_guard = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&repo).unwrap();
+        let result = run_workflow(RunArgs {
+            file: Some(std::path::PathBuf::from("ci.yml")),
+            job: Some("build".to_owned()),
+            event: Some("pull_request".to_owned()),
+            payload: Some(payload),
+            base: Some("main".to_owned()),
+            message: None,
+            debug: true,
+            no_debug: false,
+            preserve_on_failure: false,
+            secrets: vec!["TOKEN=s3cret".to_owned()],
+            strict_secrets: false,
+            detach: true,
+            push: false,
+            create_pr: false,
+            pr_draft: true,
+            no_merge: true,
+        })
+        .await;
+        drop(cwd_guard);
+        match previous_url {
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_URL", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_URL") },
+        }
+        result.expect("the run is submitted");
+
+        let body = submitted.get().expect("the engine received a submission");
+        let expected = serde_json::json!({
+            "workflow_yaml": workflow_yaml,
+            "event": "pull_request",
+            "payload": {"pull_request": {"number": 7}},
+            "repository": "local/checkout",
+            "git_ref": "refs/heads/feature",
+            "workflow_path": ".github/workflows/ci.yml",
+            "secrets": {"TOKEN": "s3cret"},
+            "reusable_workflows": {".github/workflows/reusable.yml": reusable_yaml},
+            "selected_jobs": ["build"],
+            "base_ref": "main",
+            "activity_type": "synchronize",
+            "changed_paths": ["change.txt"],
+            "changed_paths_known": true,
+            "filter_branch": "main",
+            "no_merge": true,
+            "preserve_on_failure": true,
+            "debug_on_failure": true,
+        });
+        for (field, want) in expected.as_object().unwrap() {
+            assert_eq!(body.get(field), Some(want), "submission field `{field}`");
+        }
+    }
+
+    /// An engine with the warm pool switched off reports `on_demand` from its
+    /// first status snapshot; the snapshot default is `warm`, which would
+    /// advertise idle capacity that does not exist.
+    #[test]
+    fn on_demand_engine_does_not_advertise_a_warm_pool() {
+        use preloop_observability::status::PoolMode;
+        assert!(matches!(
+            initial_pool_snapshot(false).mode,
+            PoolMode::OnDemand
+        ));
+        assert!(matches!(initial_pool_snapshot(true).mode, PoolMode::Warm));
     }
 
     /// A throwaway repository on `main` with a fixed identity, one tracked

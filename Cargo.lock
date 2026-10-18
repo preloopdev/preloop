@@ -2913,11 +2913,13 @@ version = "0.21.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "hex",
  "parking_lot",
  "preloop-gha-protocol",
  "preloop-observability",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "thiserror",
