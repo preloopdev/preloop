@@ -20,7 +20,7 @@ supports (`src/events/mod.rs`, `adapter_for`):
 
 | Tier                        | Events                                                                                                                                                                                      |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A — CI-critical             | `push`, `pull_request`, `pull_request_target`, `pull_request_review`, `workflow_dispatch`, `workflow_run`, `workflow_job`, `check_run`, `check_suite`, `repository_dispatch`, `create`, `delete`, `release` |
+| A — CI-critical             | `push`, `pull_request`, `pull_request_target`, `pull_request_review`, `workflow_dispatch`, `workflow_run`, `check_run`, `check_suite`, `repository_dispatch`, `create`, `delete`, `release` |
 | B — issue/PR/social         | `issues`, `issue_comment`, `discussion`, `discussion_comment`, `label`, `milestone`                                                                                                         |
 | C — release/admin/fork/wiki | `watch`, `fork`, `deployment`, `deployment_status`, `member`, `public`, `gollum`, `page_build`                                                                                              |
 | Internal                    | `schedule` (synthesized by the cron scheduler, never delivered as a webhook)                                                                                                                |
@@ -32,10 +32,17 @@ Override the creation-time event list
 with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` (comma-separated) when the App needs
 additional or different events. GitHub cannot change an App's event
 subscriptions through its API after creation; add later events manually under
-the App's settings → Webhooks → Edit. Apps created before `workflow_job` was
-a default need it added exactly that way — and its checkbox only renders once
-the App holds `Actions: read` (the installation must accept the widened
-permission before delivery starts).
+the App's settings → Permissions & events → **Subscribe to events**. Apps
+created before `workflow_job` was a default need it added exactly that way —
+and its checkbox only renders once the App holds `Actions: read` (the
+installation must accept the widened permission before delivery starts).
+
+`workflow_job` is subscribed for the runner-autoscaling signal, not for run
+triggers: no adapter projects it into a run yet, so the delivery worker logs
+`No adapter for event: workflow_job` and acknowledges the delivery without
+acting on it (`crates/preloop-runner-server/src/github.rs:4563`). Turning
+`queued` into pool demand is tracked in
+[#625](https://github.com/preloopdev/preloop/issues/625).
 
 At startup preloop reads an existing App's subscription back from GitHub
 (`GET /app`, App-JWT auth) and **warns loudly** when the trigger events it
@@ -200,7 +207,8 @@ run while Check Run publication fails or is unavailable.
    a new App, set
    `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` to a comma-separated list when additional
    events are required. For an existing App, tick additional events manually
-   under the App's settings → Webhooks → Edit.
+   under the App's settings → Permissions & events → **Subscribe to events**
+   (the webhook edit screen only holds the URL, secret, and Active toggle).
  At minimum, tick the trigger events: `push`, `pull_request`,
  `pull_request_review`, `workflow_dispatch`, `workflow_run`, `workflow_job`,
  `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
