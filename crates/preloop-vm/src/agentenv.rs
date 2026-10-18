@@ -67,7 +67,7 @@ use crate::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use crate::{
     DEFAULT_CAPTURE_LIMIT, ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy,
     OutputChunk, SecretSource, VmError, VmProvider, VolumeMount, WaitDeadlines,
-    run_child_to_deadline, stream_output, wait_for_child,
+    run_runtime_command, run_runtime_status, stream_output,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -504,21 +504,12 @@ impl AgentEnvProvider {
         args: &[String],
         deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
-        let mut child = Command::new(&self.binary)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| VmError::Launch {
-                program: self.binary.display().to_string(),
-                source,
-            })?;
-        run_child_to_deadline(
+        let mut command = Command::new(&self.binary);
+        command.args(args);
+        run_runtime_command(
             operation,
             &self.binary,
-            &mut child,
+            command,
             self.capture_limit,
             deadline,
         )
@@ -966,17 +957,10 @@ impl AgentEnvProvider {
                     .args(["timeout", &sandbox, &ttl])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true);
-                let result = match command.spawn() {
-                    Ok(mut child) => wait_for_child("timeout", &binary, &mut child, deadline)
-                        .await
-                        .map(|status| status.success()),
-                    Err(error) => Err(VmError::Launch {
-                        program: binary.display().to_string(),
-                        source: error,
-                    }),
-                };
+                    .stderr(Stdio::null());
+                let result = run_runtime_status("timeout", &binary, command, deadline)
+                    .await
+                    .map(|status| status.success());
                 match &result {
                     Ok(true) => {
                         consecutive_failures = 0;

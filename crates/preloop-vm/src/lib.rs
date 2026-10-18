@@ -1,6 +1,7 @@
 //! Typed SmolVM lifecycle primitives for Preloop CI.
 
 use async_trait::async_trait;
+use preloop_observability::deadline;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -8,7 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -823,36 +824,20 @@ const PACK_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// covered — their duration is the job's.
 const EXEC_DEADLINE: Duration = Duration::from_secs(40 * 60);
 
-/// How long the deadline path waits for a SIGKILLed child to be reaped.
+/// Bytes retained from each host tool's streams by [`run_host_tool`].
 ///
-/// SIGKILL is immediate for a runnable process, so this only matters for one
-/// stuck in an uninterruptible syscall: two seconds collects the ordinary case
-/// (no zombie left behind) while the caller's error still arrives promptly.
-/// A child that outlives the reap window is left to `kill_on_drop` and tokio's
-/// orphan reaper rather than held onto.
-const KILL_REAP_DEADLINE: Duration = Duration::from_secs(2);
-
-/// Bytes retained from each host-tool stream (see [`run_host_tool`]).
-///
-/// `ps ax` on a large CI host and a mount table are well under this; a runaway
-/// tool is truncated rather than buffered without limit, and the drain keeps
-/// reading so the child cannot block on a full pipe.
+/// `ps ax` on a large CI host and a mount table are well under this; the shared
+/// runner keeps draining past the cap, so a runaway tool is truncated rather
+/// than buffered without limit and cannot block on a full pipe.
 const HOST_TOOL_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
-
-/// How often a host tool's exit is polled while it runs (see [`run_host_tool`]).
-///
-/// The tools are local and normally finish in milliseconds; polling every 20 ms
-/// costs nothing measurable and keeps the start-to-detection latency of a hang
-/// far below any deadline.
-const HOST_TOOL_POLL: Duration = Duration::from_millis(20);
 
 /// Child-wait deadlines for the external VM runtimes, one per class of work.
 ///
-/// Each provider kills the child at its deadline (see [`run_child_to_deadline`])
-/// and returns [`VmError::TimedOut`], which names the dependency and the
-/// deadline so an operator can tell a hang from a failure. Production uses
-/// [`Default`]; tests shrink every tier with
-/// [`SmolVmProvider::with_deadlines`] / [`agentenv::AgentEnvProvider::with_deadlines`].
+/// Each provider kills the child at its deadline (see [`deadline`]) and returns
+/// [`VmError::TimedOut`], which names the dependency and the deadline so an
+/// operator can tell a hang from a failure. Production uses [`Default`]; tests
+/// shrink every tier with [`SmolVmProvider::with_deadlines`] /
+/// [`agentenv::AgentEnvProvider::with_deadlines`].
 #[derive(Debug, Clone, Copy)]
 pub struct WaitDeadlines {
     /// [`PROBE_DEADLINE`]: reads that answer from local state.
@@ -1076,20 +1061,11 @@ impl SmolVmProvider {
         deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let mut command = self.recovery_command()?;
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let result = run_child_to_deadline(
+        command.args(args);
+        let result = run_runtime_command(
             operation,
             &self.binary,
-            &mut child,
+            command,
             self.capture_limit,
             deadline,
         )
@@ -1122,28 +1098,20 @@ impl SmolVmProvider {
     /// `Ok` answer, so the next caller re-probes.
     async fn supports_mount_socket(&self) -> Result<bool, VmError> {
         let mut command = self.sandboxed_command()?;
-        command
-            .args(["machine", "create", "--help"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let Ok(mut child) = command.spawn() else {
-            return Ok(false);
-        };
-        let output = match run_child_to_deadline(
+        command.args(["machine", "create", "--help"]);
+        let output = match run_runtime_command(
             "machine create --help",
             &self.binary,
-            &mut child,
+            command,
             self.capture_limit,
             self.deadlines.probe,
         )
         .await
         {
             Ok(output) => output,
-            // Any other plumbing failure (a pipe error) still answers `false`:
-            // it is the binary that failed to run, which is what the probe
-            // reports on.
+            // Any other plumbing failure (the binary could not run at all)
+            // still answers `false`: it is the binary that failed, which is
+            // what the probe reports on.
             Err(error @ VmError::TimedOut { .. }) => return Err(error),
             Err(_) => return Ok(false),
         };
@@ -1173,23 +1141,23 @@ impl SmolVmProvider {
                 let Ok(mut command) = self.recovery_command() else {
                     return Ok(None);
                 };
-                command
-                    .arg("--version")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
-                let Ok(mut child) = command.spawn() else {
-                    return Ok(None);
-                };
-                let output = run_child_to_deadline(
+                command.arg("--version");
+                let output = match run_runtime_command(
                     "--version",
                     &self.binary,
-                    &mut child,
+                    command,
                     self.capture_limit,
                     self.deadlines.probe,
                 )
-                .await?;
+                .await
+                {
+                    Ok(output) => output,
+                    // A probe that ran out of time must not be cached as "no
+                    // version" (see above): propagate it so the cell stays
+                    // uninitialized and the next diagnostic asks again.
+                    Err(error @ VmError::TimedOut { .. }) => return Err(error),
+                    Err(_) => return Ok(None),
+                };
                 let text = String::from_utf8_lossy(&output.stdout);
                 Ok::<Option<String>, VmError>(
                     text.lines()
@@ -1290,20 +1258,11 @@ impl SmolVmProvider {
             // file-transfer cap would abort a large golden pack.
             command.env("SMOLVM_FILE_TRANSFER_MAX_BYTES", "64GiB");
         }
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let result = run_child_to_deadline(
+        command.args(args);
+        let result = run_runtime_command(
             operation,
             &self.binary,
-            &mut child,
+            command,
             self.capture_limit,
             deadline,
         )
@@ -3618,117 +3577,71 @@ fn validate_socket_source(host: &Path) -> Result<(), VmError> {
     )))
 }
 
-async fn read_bounded(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::with_capacity(limit.min(64 * 1024));
-    let mut chunk = [0_u8; 16 * 1024];
-    let mut truncated = false;
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        let available = limit.saturating_sub(retained.len());
-        retained.extend_from_slice(&chunk[..read.min(available)]);
-        truncated |= read > available;
-    }
-    Ok((retained, truncated))
-}
-
-/// Run a spawned child to completion under `deadline`, capturing both streams.
+/// Map a shared [`deadline`] failure onto [`VmError`].
 ///
-/// Both pipes are drained concurrently with the wait, so a child that fills one
-/// while the other stays idle cannot deadlock. At `deadline` the child is
-/// SIGKILLed and reaped — bounded by [`KILL_REAP_DEADLINE`], so even a process
-/// stuck in an uninterruptible syscall cannot keep the caller waiting — and the
-/// call fails with [`VmError::TimedOut`].
-///
-/// This is the whole point of the deadline: callers run under the provider's
-/// lifecycle lock, and a runtime that never answers must not hold that lock.
-/// `kill_on_drop` on the command covers the drop path; the explicit kill covers
-/// the deadline.
-async fn run_child_to_deadline(
+/// The single place a `smolvm`/`aenv`/host-tool wait becomes a provider error,
+/// so every caller names the same dependency and the same deadline: a timeout
+/// keeps [`VmError::TimedOut`] — the operator has to know nothing answered —
+/// and anything else is the launch failure it is.
+fn vm_error_from_command(
     operation: &'static str,
     program: &Path,
-    child: &mut tokio::process::Child,
+    error: deadline::CommandError,
+) -> VmError {
+    match error {
+        deadline::CommandError::TimedOut { exceeded, program } => VmError::TimedOut {
+            operation,
+            program,
+            deadline: exceeded.deadline(),
+        },
+        deadline::CommandError::Spawn { source, .. }
+        | deadline::CommandError::Io { source, .. } => VmError::Launch {
+            program: program.display().to_string(),
+            source,
+        },
+    }
+}
+
+/// Run a runtime command to completion under `deadline`, capturing both streams
+/// bounded by `capture_limit`.
+///
+/// A thin adapter over [`deadline::run_command_capped`], which owns the
+/// mechanics: the pipes are drained with the wait (so a chatty child cannot
+/// block on a full pipe and look hung), the child is SIGKILLed and reaped at the
+/// deadline, and the capture keeps the provider's bound. Callers run under the
+/// lifecycle lock, and a runtime that never answers must not hold it.
+async fn run_runtime_command(
+    operation: &'static str,
+    program: &Path,
+    command: Command,
     capture_limit: usize,
     deadline: Duration,
 ) -> Result<ExecOutput, VmError> {
-    let launch = |source: std::io::Error| VmError::Launch {
-        program: program.display().to_string(),
-        source,
-    };
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let joined = async {
-        tokio::join!(
-            read_bounded(stdout, capture_limit),
-            read_bounded(stderr, capture_limit),
-            child.wait(),
-        )
-    };
-    match tokio::time::timeout(deadline, joined).await {
-        Ok((stdout, stderr, status)) => {
-            let (stdout, stdout_truncated) = stdout.map_err(launch)?;
-            let (stderr, stderr_truncated) = stderr.map_err(launch)?;
-            let status = status.map_err(launch)?;
-            Ok(ExecOutput {
-                exit_code: status.code().unwrap_or(-1),
-                stdout,
-                stderr,
-                truncated: stdout_truncated || stderr_truncated,
-            })
-        }
-        Err(_expired) => {
-            kill_and_reap(child).await;
-            Err(VmError::TimedOut {
-                operation,
-                program: program.display().to_string(),
-                deadline,
-            })
-        }
+    let what = format!("{operation} ({})", program.display());
+    match deadline::run_command_capped(command, deadline, &what, capture_limit).await {
+        Ok((output, truncated)) => Ok(ExecOutput {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            truncated,
+        }),
+        Err(error) => Err(vm_error_from_command(operation, program, error)),
     }
 }
 
-/// Wait for a child to exit under `deadline`, killing it on expiry, without
-/// capturing its streams.
-///
-/// For children whose output is not wanted (a keepalive renewal): their stdio
-/// must not be piped, because nothing drains it. Callers that want the output
-/// use [`run_child_to_deadline`].
-async fn wait_for_child(
+/// Run a runtime command to completion under `deadline` without capturing its
+/// output (a keepalive renewal). Stdio stays the caller's — null in every call
+/// here — so nothing has to drain it.
+async fn run_runtime_status(
     operation: &'static str,
     program: &Path,
-    child: &mut tokio::process::Child,
+    command: Command,
     deadline: Duration,
 ) -> Result<std::process::ExitStatus, VmError> {
-    match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(Ok(status)) => Ok(status),
-        Ok(Err(source)) => Err(VmError::Launch {
-            program: program.display().to_string(),
-            source,
-        }),
-        Err(_expired) => {
-            kill_and_reap(child).await;
-            Err(VmError::TimedOut {
-                operation,
-                program: program.display().to_string(),
-                deadline,
-            })
-        }
-    }
-}
-
-/// SIGKILL `child` and wait out its reaping, bounded by [`KILL_REAP_DEADLINE`].
-///
-/// Shared by every deadline path, so a child that outlives its budget is always
-/// ended the same way: killed now, reaped within the window if the kernel lets
-/// it be, and otherwise handed to `kill_on_drop` and tokio's orphan reaper.
-async fn kill_and_reap(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(KILL_REAP_DEADLINE, child.wait()).await;
+    let what = format!("{operation} ({})", program.display());
+    deadline::run_command_status(command, deadline, &what)
+        .await
+        .map_err(|error| vm_error_from_command(operation, program, error))
 }
 
 /// A host tool's captured output (see [`run_host_tool`]).
@@ -3746,84 +3659,34 @@ struct HostToolOutput {
 
 /// Run a host tool to completion under `deadline`, blocking.
 ///
+/// A thin adapter over [`deadline::run_command_blocking_capped`], which owns the
+/// mechanics: a reader thread per pipe (so a chatty `ps ax` on a busy host
+/// cannot block on a full pipe and masquerade as a hang), the drain past the
+/// capture cap, and the SIGKILL + bounded reap at the deadline.
+///
 /// `std::process`, not the tokio API: this backs the orphan sweeps
 /// ([`detach_orphaned_layer_mounts`], [`purge_orphaned_vms`],
 /// [`filesystem_available_bytes`]), which the CLI calls from a `Drop` handler
 /// where no runtime exists. Engine callers run them on a blocking thread
 /// ([`tokio::task::spawn_blocking`]), never on a worker.
-///
-/// Both pipes are drained on their own threads while the child runs, so a
-/// chatty child (`ps ax` on a busy host, well over the 64 KiB pipe buffer)
-/// cannot block on a full pipe and masquerade as a hang; retained output is
-/// capped at [`HOST_TOOL_CAPTURE_LIMIT`] while the drain keeps reading. At
-/// `deadline` the child is killed and reaped, and the error names the tool and
-/// the deadline. A timed-out tool's reader threads exit at EOF once it dies and
-/// are left to do so rather than joined: the caller's deadline governs.
 fn run_host_tool(
     operation: &'static str,
     program: &str,
     args: &[&str],
     deadline: Duration,
 ) -> Result<HostToolOutput, VmError> {
-    let launch = |source: std::io::Error| VmError::Launch {
-        program: program.to_owned(),
-        source,
-    };
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(launch)?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let stdout = std::thread::spawn(move || drain_capped(stdout));
-    let stderr = std::thread::spawn(move || drain_capped(stderr));
-    let expires = Instant::now() + deadline;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= expires {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(VmError::TimedOut {
-                        operation,
-                        program: program.to_owned(),
-                        deadline,
-                    });
-                }
-                std::thread::sleep(HOST_TOOL_POLL);
-            }
-            Err(source) => return Err(launch(source)),
-        }
-    };
-    Ok(HostToolOutput {
-        // The reader threads finish at EOF, which the reaped child's closed
-        // pipes have already delivered.
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-        success: status.success(),
-        exit_code: status.code().unwrap_or(-1),
-    })
-}
-
-/// Read `reader` to end of stream, retaining at most [`HOST_TOOL_CAPTURE_LIMIT`]
-/// bytes but always draining (see [`run_host_tool`]).
-fn drain_capped(mut reader: impl Read) -> Vec<u8> {
-    let mut retained = Vec::new();
-    let mut chunk = [0_u8; 16 * 1024];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                let available = HOST_TOOL_CAPTURE_LIMIT.saturating_sub(retained.len());
-                retained.extend_from_slice(&chunk[..read.min(available)]);
-            }
-        }
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let what = format!("{operation} ({program})");
+    match deadline::run_command_blocking_capped(command, deadline, &what, HOST_TOOL_CAPTURE_LIMIT) {
+        Ok((output, _truncated)) => Ok(HostToolOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            success: output.status.success(),
+            exit_code: output.status.code().unwrap_or(-1),
+        }),
+        Err(error) => Err(vm_error_from_command(operation, Path::new(program), error)),
     }
-    retained
 }
 
 async fn forward(
@@ -4638,33 +4501,24 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).starts_with("line 0 "));
     }
 
-    /// The async deadline path: a provider child that never exits is SIGKILLed
-    /// at the deadline, which is what releases the lifecycle lock its caller
-    /// holds (see the provider-level test in `tests/provider.rs`).
+    /// The async deadline path: a provider command whose child never exits is
+    /// killed at the deadline, which is what releases the lifecycle lock its
+    /// caller holds (see the provider-level test in `tests/provider.rs`).
     #[tokio::test]
     async fn child_deadline_kills_a_wedged_runtime() {
         let dir = tempfile::tempdir().expect("scratch");
         let tool = wedged_tool(dir.path(), "wedged-runtime");
         let record = dir.path().join("wedged-runtime.pid");
-        let mut child = Command::new(&tool)
-            .arg(&record)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn wedged runtime");
-        // Wait for the runtime to record its pid before the deadline starts:
-        // `exec` under a loaded test binary takes longer than the test's
-        // deadline, and this test is about the *wait* ending, not about spawn
-        // latency.
-        let pid = recorded_pid(&record);
-        let deadline = std::time::Duration::from_millis(200);
+        // The shared runner owns the spawn, so the deadline has to outlast this
+        // test binary's own exec latency (seconds under a fully loaded
+        // `cargo test`) before the assertion about the *tool* means anything.
+        let deadline = std::time::Duration::from_secs(8);
+        let mut command = Command::new(&tool);
+        command.arg(&record);
         let started = std::time::Instant::now();
-        let error =
-            run_child_to_deadline("exec", &tool, &mut child, DEFAULT_CAPTURE_LIMIT, deadline)
-                .await
-                .expect_err("a runtime that never exits must hit its deadline");
+        let error = run_runtime_command("exec", &tool, command, DEFAULT_CAPTURE_LIMIT, deadline)
+            .await
+            .expect_err("a runtime that never exits must hit its deadline");
         let elapsed = started.elapsed();
         assert!(
             matches!(&error, VmError::TimedOut { operation, deadline: named, .. }
@@ -4672,9 +4526,10 @@ mod tests {
             "expected a named deadline error, got {error:?}"
         );
         assert!(
-            elapsed >= deadline && elapsed < std::time::Duration::from_secs(5),
+            elapsed >= deadline && elapsed < std::time::Duration::from_secs(30),
             "deadline fired at {elapsed:?}"
         );
+        let pid = recorded_pid(&record);
         assert!(
             await_process_gone(pid, std::time::Duration::from_secs(10)),
             "the runtime must be SIGKILLed at its deadline"
