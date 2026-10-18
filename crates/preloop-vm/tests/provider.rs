@@ -28,7 +28,7 @@ mod unix {
     use super::*;
     use preloop_vm::{
         ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount,
-        VmProvider, VolumeMount,
+        VmProvider, VolumeMount, WaitDeadlines,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -863,6 +863,176 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         fs::write(executable.with_extension("release"), "").unwrap();
         one.await.unwrap().unwrap();
         two.await.unwrap().unwrap();
+    }
+
+    /// Every deadline tier shrunk to `deadline`, so a fake runtime that never
+    /// exits is proved to be cut off in milliseconds.
+    fn short_deadlines(deadline: std::time::Duration) -> WaitDeadlines {
+        WaitDeadlines {
+            probe: deadline,
+            control: deadline,
+            boot: deadline,
+            pack: deadline,
+            exec: deadline,
+        }
+    }
+
+    /// A smolvm whose first `machine create` records its pid and never exits;
+    /// later ones succeed, so a second create can prove it was not blocked.
+    fn fake_wedged_create_smolvm() -> (TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            r##"#!/bin/sh
+set -eu
+if [ "${1-}:${2-}" = "machine:create" ] && [ ! -f "$0.created" ]; then
+  : > "$0.created"
+  echo $$ > "$0.pid"
+  exec sleep 300
+fi
+exit 0
+"##,
+        );
+        (directory, executable)
+    }
+
+    /// A smolvm whose `machine create --help` probe hangs while the
+    /// `hang-help` marker exists, and answers correctly once it is removed.
+    fn fake_slow_help_smolvm() -> (TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("smolvm");
+        write_executable(
+            &executable,
+            r##"#!/bin/sh
+set -eu
+if [ "${1-}:${2-}:${3-}" = "machine:create:--help" ]; then
+  if [ -f "$0.hang-help" ]; then
+    echo $$ > "$0.pid"
+    exec sleep 300
+  fi
+  printf '%s\n' "Usage: smolvm machine create --name <NAME> --mount-socket <HOST:GUEST>"
+  exit 0
+fi
+exit 0
+"##,
+        );
+        (directory, executable)
+    }
+
+    /// The pid a wedged fake recorded, once it is there.
+    fn recorded_pid(executable: &Path) -> i32 {
+        let path = executable.with_extension("pid");
+        for _ in 0..500 {
+            if let Ok(text) = fs::read_to_string(&path)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("{} never recorded its pid", executable.display());
+    }
+
+    /// Whether `pid` exited within `budget`.
+    fn process_gone(pid: i32, budget: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            // A dead pid makes `kill` print "No such process"; the status is
+            // the answer, so keep its stderr out of the test output.
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("probe process")
+                .success();
+            if !alive {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A runtime that never returns from a lifecycle operation must not park
+    /// the caller, and must not keep the lifecycle lock it took: the second
+    /// create — which the first one's write guard blocks — has to proceed.
+    ///
+    /// Without a deadline (this test with every tier raised above the outer
+    /// budget) the first create hangs on `sleep 300` and the second never gets
+    /// the lock, which is the 10-hour engine freeze the fix addresses.
+    #[tokio::test]
+    async fn timed_out_create_kills_smolvm_and_releases_the_lifecycle_lock() {
+        let (_directory, executable) = fake_wedged_create_smolvm();
+        // One second, not the smallest possible value: the fake has to reach
+        // `exec sleep` inside a loaded test binary before the deadline can be
+        // evidence that the *wait* is what ended. Production deadlines are
+        // three orders of magnitude larger.
+        let deadline = std::time::Duration::from_secs(1);
+        let provider = SmolVmProvider::new(&executable).with_deadlines(short_deadlines(deadline));
+        let wedged = valid_spec(MachineName::new("runner-wedged").unwrap());
+        let next = valid_spec(MachineName::new("runner-next").unwrap());
+
+        let (wedged, next) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(provider.create(&wedged), provider.create(&next))
+        })
+        .await
+        .expect("a wedged smolvm must not park the caller forever");
+
+        assert!(
+            matches!(&wedged, Err(VmError::TimedOut { operation, deadline: named, .. })
+                if *operation == "create" && *named == deadline),
+            "expected the create to be killed at its deadline, got {wedged:?}"
+        );
+        assert!(
+            next.is_ok(),
+            "the queued create must proceed once the timed-out create drops its guard: {next:?}"
+        );
+
+        let pid = recorded_pid(&executable);
+        assert!(
+            process_gone(pid, std::time::Duration::from_secs(10)),
+            "the wedged smolvm must be killed at the deadline, not left running"
+        );
+    }
+
+    /// A capability probe that runs out of time must not be cached as "this
+    /// smolvm cannot mount sockets": the create fails, and a later create
+    /// re-probes — reaching the binary that answers — instead of failing
+    /// forever with a wrong capability answer.
+    #[tokio::test]
+    async fn timed_out_socket_probe_is_not_cached_as_unsupported() {
+        let (directory, executable) = fake_slow_help_smolvm();
+        let host_socket = directory.path().join("engine.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
+        // See `timed_out_create_...`: the deadline must outlast the fake's own
+        // startup to be evidence about the wait.
+        let deadline = std::time::Duration::from_secs(1);
+        let provider = SmolVmProvider::new(&executable).with_deadlines(short_deadlines(deadline));
+        let mut spec = valid_spec(MachineName::new("ci-01").unwrap());
+        spec.sockets.push(SocketMount {
+            host: host_socket,
+            guest: PathBuf::from("/run/preloop-engine.sock"),
+        });
+        fs::write(executable.with_extension("hang-help"), "").unwrap();
+
+        let error = provider
+            .create(&spec)
+            .await
+            .expect_err("a wedged capability probe must fail the create");
+        assert!(
+            matches!(&error, VmError::TimedOut { operation, deadline: named, .. }
+                if operation.contains("--help") && *named == deadline),
+            "expected the probe to be killed at its deadline, got {error:?}"
+        );
+
+        // Let the probe answer. A cached `false` (or a poisoned cell) would
+        // make this fail with `UnsupportedSocketMount` instead.
+        fs::remove_file(executable.with_extension("hang-help")).unwrap();
+        provider
+            .create(&spec)
+            .await
+            .expect("the next create must re-probe instead of trusting a timed-out answer");
     }
 
     #[cfg(target_os = "linux")]

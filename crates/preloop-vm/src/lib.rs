@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -393,6 +394,26 @@ pub enum VmError {
     /// Invalid SmolVM JSON output.
     #[error("invalid smolvm response: {0}")]
     Protocol(String),
+    /// A provider call did not answer within its deadline and was killed.
+    ///
+    /// Distinct from [`Self::Command`], which carries a real exit status: this
+    /// means nothing came back at all. The message names the dependency and the
+    /// deadline, so an operator can tell a hang (no answer) from a failure (a
+    /// wrong answer) and knows the runtime — or the daemon behind it — is what
+    /// needs looking at.
+    #[error(
+        "`{program}` did not finish {operation} within {deadline:?} and was killed; \
+         the VM runtime stopped answering — check that it runs (`{program} --version`) \
+         and that its daemon is healthy before retrying"
+    )]
+    TimedOut {
+        /// Logical operation that ran out of time (`exec`, `create`, ...).
+        operation: &'static str,
+        /// Program that was killed.
+        program: String,
+        /// Deadline that expired.
+        deadline: Duration,
+    },
     /// The host ran out of MMIO IRQ lines for the machine's virtio devices.
     ///
     /// libkrun allocates one IRQ line per virtio device and fails the whole
@@ -748,6 +769,116 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
 /// streaming execs (the runner itself) are unaffected.
 const EXEC_TIMEOUT: &str = "30m";
 
+/// Deadline for a provider call that only reads local state: `smolvm
+/// --version`, `machine create --help`, `machine status`, `machine ls`,
+/// `machine data-dir`, and the `aenv` reads reached from the same paths
+/// (`aenv ls`, `aenv --version`, the TTL keepalive).
+///
+/// A healthy runtime answers all of these in milliseconds — they read a local
+/// registry or print help text — so this is headroom for a loaded host, not a
+/// budget to spend. Nothing legitimate runs for 30 s here, and everything
+/// queued behind the call (the provider's lifecycle lock included) needs the
+/// hang turned into an error instead of an indefinite wait.
+const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Deadline for a provider call that changes local state without building,
+/// booting, or transferring a machine: `machine stop`/`delete`/`update`,
+/// `aenv delete`/`pause`, guest directory preparation, secret upload.
+///
+/// The slowest of these removes a machine's data directory — tens of GiB of
+/// unlinked files, seconds on a healthy host — and the delete path retries it.
+/// Five minutes keeps that work safe while a wedged runtime still releases the
+/// caller, and any lock it holds, in five minutes instead of hours.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(5 * 60);
+
+/// Deadline for a call that builds, boots, clones, or transfers a machine:
+/// `machine create`, `machine start`, `machine fork`, `machine cp`, `aenv
+/// start`/`resume`/`upload`/`download`.
+///
+/// Every one of these is legitimately slow: a macOS cold boot alone takes
+/// minutes while the guest unpacks its layers, a fork copies a multi-GiB
+/// copy-on-write disk, and a transfer moves a whole image in one call. Thirty
+/// minutes is deliberately far above any duration observed in production: it is
+/// the point at which "slow" has become "wedged", not a scheduling budget.
+const BOOT_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Deadline for exporting a whole machine: `smolvm pack create` and `aenv
+/// snapshot create`.
+///
+/// `pack create` re-pulls the base image inside its own export VM and flushes
+/// tens of GiB of layers through a staging directory, so it is the longest
+/// legitimate operation in the provider. The orchestrator already allows a
+/// golden download an hour (`GOLDEN_DOWNLOAD_TIMEOUT`); the export gets the
+/// same, and no more.
+const PACK_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+/// Deadline for one guest command run through `smolvm machine exec` (or `aenv
+/// exec`): [`EXEC_TIMEOUT`] (30 minutes) plus a ten-minute margin.
+///
+/// SmolVM enforces its own `--timeout` client-side, but the wait must be
+/// bounded independently: a runtime that ignores its own timeout, or a
+/// `_boot-vm` that never returns from the exec, would otherwise pin the caller
+/// (and, for provisioning steps, the caller's whole slot) forever. Streaming
+/// execs ([`VmProvider::exec_stream`], the runner itself) are deliberately not
+/// covered — their duration is the job's.
+const EXEC_DEADLINE: Duration = Duration::from_secs(40 * 60);
+
+/// How long the deadline path waits for a SIGKILLed child to be reaped.
+///
+/// SIGKILL is immediate for a runnable process, so this only matters for one
+/// stuck in an uninterruptible syscall: two seconds collects the ordinary case
+/// (no zombie left behind) while the caller's error still arrives promptly.
+/// A child that outlives the reap window is left to `kill_on_drop` and tokio's
+/// orphan reaper rather than held onto.
+const KILL_REAP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Bytes retained from each host-tool stream (see [`run_host_tool`]).
+///
+/// `ps ax` on a large CI host and a mount table are well under this; a runaway
+/// tool is truncated rather than buffered without limit, and the drain keeps
+/// reading so the child cannot block on a full pipe.
+const HOST_TOOL_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// How often a host tool's exit is polled while it runs (see [`run_host_tool`]).
+///
+/// The tools are local and normally finish in milliseconds; polling every 20 ms
+/// costs nothing measurable and keeps the start-to-detection latency of a hang
+/// far below any deadline.
+const HOST_TOOL_POLL: Duration = Duration::from_millis(20);
+
+/// Child-wait deadlines for the external VM runtimes, one per class of work.
+///
+/// Each provider kills the child at its deadline (see [`run_child_to_deadline`])
+/// and returns [`VmError::TimedOut`], which names the dependency and the
+/// deadline so an operator can tell a hang from a failure. Production uses
+/// [`Default`]; tests shrink every tier with
+/// [`SmolVmProvider::with_deadlines`] / [`agentenv::AgentEnvProvider::with_deadlines`].
+#[derive(Debug, Clone, Copy)]
+pub struct WaitDeadlines {
+    /// [`PROBE_DEADLINE`]: reads that answer from local state.
+    pub probe: Duration,
+    /// [`CONTROL_DEADLINE`]: local state changes that boot nothing.
+    pub control: Duration,
+    /// [`BOOT_DEADLINE`]: build, boot, clone, or transfer a machine.
+    pub boot: Duration,
+    /// [`PACK_DEADLINE`]: export a whole machine.
+    pub pack: Duration,
+    /// [`EXEC_DEADLINE`]: one guest command.
+    pub exec: Duration,
+}
+
+impl Default for WaitDeadlines {
+    fn default() -> Self {
+        Self {
+            probe: PROBE_DEADLINE,
+            control: CONTROL_DEADLINE,
+            boot: BOOT_DEADLINE,
+            pack: PACK_DEADLINE,
+            exec: EXEC_DEADLINE,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SmolVmProvider {
     binary: PathBuf,
@@ -788,6 +919,10 @@ pub struct SmolVmProvider {
     /// environment; unit tests substitute a pure lookup so the policy can be
     /// exercised without mutating global state.
     env_lookup: EnvLookup,
+    /// Child-wait deadlines. Production is [`WaitDeadlines::default`]; tests
+    /// shrink them through [`SmolVmProvider::with_deadlines`] so a fake runtime
+    /// that never exits is proved to be killed in milliseconds.
+    deadlines: WaitDeadlines,
 }
 
 impl Default for SmolVmProvider {
@@ -838,12 +973,23 @@ impl SmolVmProvider {
             declared_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             reported_version: Arc::new(tokio::sync::OnceCell::new()),
             env_lookup: process_env,
+            deadlines: WaitDeadlines::default(),
         }
     }
 
     /// Override the maximum bytes retained from each process stream.
     pub fn with_capture_limit(mut self, bytes: usize) -> Self {
         self.capture_limit = bytes.max(1024);
+        self
+    }
+
+    /// Override the child-wait deadlines (see [`WaitDeadlines`]).
+    ///
+    /// Every runtime call kills its child at the matching deadline, so this is
+    /// the seam tests use to watch a hang end in milliseconds instead of
+    /// half an hour. Production never calls it.
+    pub fn with_deadlines(mut self, deadlines: WaitDeadlines) -> Self {
+        self.deadlines = deadlines;
         self
     }
 
@@ -920,11 +1066,14 @@ impl SmolVmProvider {
 
     /// Run an operation that can never boot or restart a VMM, using
     /// [`Self::recovery_command`] so a bad sandbox override cannot wedge the
-    /// recovery paths. Mirrors [`Self::checked`]'s plumbing.
+    /// recovery paths. Mirrors [`Self::checked`]'s plumbing, including the
+    /// deadline: recovery operations are the ones an operator reaches for when
+    /// the runtime is already misbehaving, so they must be the last to hang.
     async fn recovery(
         &self,
         operation: &'static str,
         args: &[String],
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let mut command = self.recovery_command()?;
         command
@@ -937,32 +1086,15 @@ impl SmolVmProvider {
             program: self.binary.display().to_string(),
             source,
         })?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (stdout, stderr, status) = tokio::join!(
-            read_bounded(stdout, self.capture_limit),
-            read_bounded(stderr, self.capture_limit),
-            child.wait(),
-        );
-        let (stdout, stdout_truncated) = stdout.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let (stderr, stderr_truncated) = stderr.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let status = status.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let result = ExecOutput {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-            truncated: stdout_truncated || stderr_truncated,
-        };
-        if !status.success() {
+        let result = run_child_to_deadline(
+            operation,
+            &self.binary,
+            &mut child,
+            self.capture_limit,
+            deadline,
+        )
+        .await?;
+        if result.exit_code != 0 {
             let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
             return Err(VmError::Command {
                 operation,
@@ -982,6 +1114,12 @@ impl SmolVmProvider {
     /// folded into a `false` answer: the caller caches the probe result for
     /// the provider's lifetime, and a rejected environment says nothing
     /// about the binary's capabilities.
+    ///
+    /// A probe that runs out of time is an error, not a `false`, for the same
+    /// reason: caching "this binary cannot mount sockets" because smolvm
+    /// happened to be wedged would disable the capability for the process's
+    /// whole life. [`tokio::sync::OnceCell::get_or_try_init`] only stores the
+    /// `Ok` answer, so the next caller re-probes.
     async fn supports_mount_socket(&self) -> Result<bool, VmError> {
         let mut command = self.sandboxed_command()?;
         command
@@ -993,17 +1131,24 @@ impl SmolVmProvider {
         let Ok(mut child) = command.spawn() else {
             return Ok(false);
         };
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (stdout, stderr, status) = tokio::join!(
-            read_bounded(stdout, self.capture_limit),
-            read_bounded(stderr, self.capture_limit),
-            child.wait(),
-        );
-        let (Ok((stdout, _)), Ok(_), Ok(status)) = (stdout, stderr, status) else {
-            return Ok(false);
+        let output = match run_child_to_deadline(
+            "machine create --help",
+            &self.binary,
+            &mut child,
+            self.capture_limit,
+            self.deadlines.probe,
+        )
+        .await
+        {
+            Ok(output) => output,
+            // Any other plumbing failure (a pipe error) still answers `false`:
+            // it is the binary that failed to run, which is what the probe
+            // reports on.
+            Err(error @ VmError::TimedOut { .. }) => return Err(error),
+            Err(_) => return Ok(false),
         };
-        Ok(status.success() && String::from_utf8_lossy(&stdout).contains("--mount-socket"))
+        Ok(output.exit_code == 0
+            && String::from_utf8_lossy(&output.stdout).contains("--mount-socket"))
     }
 
     /// What the resolved binary reports for `--version`, probed once.
@@ -1014,22 +1159,49 @@ impl SmolVmProvider {
     /// for a capability decision. The probe runs through
     /// [`Self::recovery_command`]: it can never boot a VMM, and it must still
     /// answer while a bad sandbox override is being diagnosed.
+    ///
+    /// A probe that runs out of time is not cached: the cell is the
+    /// process-wide answer to "what does this binary report", and `None`
+    /// because smolvm was momentarily wedged would be wrong for the rest of the
+    /// process's life (and would hide the recovered answer from a later
+    /// diagnostic). [`tokio::sync::OnceCell::get_or_try_init`] stores only the
+    /// `Ok` answer, so a timeout leaves it to be asked again; the caller still
+    /// gets `None` now.
     async fn reported_version(&self) -> Option<String> {
         self.reported_version
-            .get_or_init(|| async {
-                let mut command = self.recovery_command().ok()?;
-                let output = command
+            .get_or_try_init(|| async {
+                let Ok(mut command) = self.recovery_command() else {
+                    return Ok(None);
+                };
+                command
                     .arg("--version")
                     .stdin(Stdio::null())
-                    .output()
-                    .await
-                    .ok()?;
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                let Ok(mut child) = command.spawn() else {
+                    return Ok(None);
+                };
+                let output = run_child_to_deadline(
+                    "--version",
+                    &self.binary,
+                    &mut child,
+                    self.capture_limit,
+                    self.deadlines.probe,
+                )
+                .await?;
                 let text = String::from_utf8_lossy(&output.stdout);
-                let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
-                Some(line.to_owned())
+                Ok::<Option<String>, VmError>(
+                    text.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_owned),
+                )
             })
             .await
-            .clone()
+            .ok()
+            .cloned()
+            .flatten()
     }
 
     /// Record the devices a `create` asked SmolVM to build.
@@ -1084,8 +1256,10 @@ impl SmolVmProvider {
         &self,
         operation: &'static str,
         args: &[String],
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
-        self.checked_with_network(operation, args, None, None).await
+        self.checked_with_network(operation, args, None, None, deadline)
+            .await
     }
 
     async fn checked_with_network(
@@ -1094,6 +1268,7 @@ impl SmolVmProvider {
         args: &[String],
         network: Option<&NetworkPolicy>,
         staging_dir: Option<&Path>,
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let mut command = self.sandboxed_command()?;
         match network {
@@ -1125,32 +1300,15 @@ impl SmolVmProvider {
             program: self.binary.display().to_string(),
             source,
         })?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (stdout, stderr, status) = tokio::join!(
-            read_bounded(stdout, self.capture_limit),
-            read_bounded(stderr, self.capture_limit),
-            child.wait(),
-        );
-        let (stdout, stdout_truncated) = stdout.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let (stderr, stderr_truncated) = stderr.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let status = status.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let result = ExecOutput {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-            truncated: stdout_truncated || stderr_truncated,
-        };
-        if !status.success() {
+        let result = run_child_to_deadline(
+            operation,
+            &self.binary,
+            &mut child,
+            self.capture_limit,
+            deadline,
+        )
+        .await?;
+        if result.exit_code != 0 {
             let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
             return Err(VmError::Command {
                 operation,
@@ -1167,9 +1325,10 @@ impl SmolVmProvider {
         &self,
         operation: &'static str,
         args: &[String],
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked(operation, args).await
+        self.checked(operation, args, deadline).await
     }
 
     async fn exclusive_with_staging(
@@ -1177,9 +1336,10 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
         staging_dir: &Path,
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, None, Some(staging_dir))
+        self.checked_with_network(operation, args, None, Some(staging_dir), deadline)
             .await
     }
 
@@ -1188,9 +1348,10 @@ impl SmolVmProvider {
         operation: &'static str,
         args: &[String],
         network: &NetworkPolicy,
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.write().await;
-        self.checked_with_network(operation, args, Some(network), None)
+        self.checked_with_network(operation, args, Some(network), None, deadline)
             .await
     }
 
@@ -1204,13 +1365,18 @@ impl SmolVmProvider {
     ///
     /// Forks additionally serialize per golden: see [`SmolVmProvider::fork`]
     /// for the checkpoint invariant that requires it.
+    ///
+    /// The deadline is what keeps the read side honest: a runtime that never
+    /// answers would otherwise hold the read guard forever, and every queued
+    /// writer — a whole pool replenishment — behind it.
     async fn concurrent(
         &self,
         operation: &'static str,
         args: &[String],
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
         let _guard = self.lifecycle_lock.read().await;
-        self.checked(operation, args).await
+        self.checked(operation, args, deadline).await
     }
 
     /// The mutex guarding forks from one golden, created on first use.
@@ -1257,6 +1423,7 @@ impl SmolVmProvider {
                     "--name".into(),
                     name.as_str().into(),
                 ],
+                self.deadlines.probe,
             )
             .await?;
         let dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -1521,7 +1688,7 @@ impl VmProvider for SmolVmProvider {
                 ]);
             }
         }
-        self.exclusive_with_network("create", &args, &spec.network)
+        self.exclusive_with_network("create", &args, &spec.network, self.deadlines.boot)
             .await?;
         // Recorded after a successful create: the spec is the only place the
         // device inventory a `start` failure has to explain is still known.
@@ -1535,7 +1702,10 @@ impl VmProvider for SmolVmProvider {
                 spec.name.as_str().into(),
                 "--rosetta".into(),
             ];
-            if let Err(error) = self.exclusive("update", &update_args).await {
+            if let Err(error) = self
+                .exclusive("update", &update_args, self.deadlines.control)
+                .await
+            {
                 let _ = self
                     .concurrent(
                         "delete",
@@ -1546,6 +1716,7 @@ impl VmProvider for SmolVmProvider {
                             spec.name.as_str().into(),
                             "-f".into(),
                         ],
+                        self.deadlines.control,
                     )
                     .await;
                 return Err(error);
@@ -1572,6 +1743,7 @@ impl VmProvider for SmolVmProvider {
                     "--name".into(),
                     name.as_str().into(),
                 ],
+                self.deadlines.boot,
             )
             .await
         {
@@ -1591,6 +1763,7 @@ impl VmProvider for SmolVmProvider {
                     name.as_str().into(),
                     "--forkable".into(),
                 ],
+                self.deadlines.boot,
             )
             .await
         {
@@ -1637,6 +1810,7 @@ impl VmProvider for SmolVmProvider {
                     clone.as_str().into(),
                     "--freeze-source".into(),
                 ],
+                self.deadlines.boot,
             )
             .await;
         if result.is_ok() {
@@ -1739,6 +1913,7 @@ impl VmProvider for SmolVmProvider {
                 "--name".into(),
                 name.as_str().into(),
             ],
+            self.deadlines.control,
         )
         .await
         .map(|_| ())
@@ -1755,7 +1930,7 @@ impl VmProvider for SmolVmProvider {
         let mut attempts = 0;
         let result = loop {
             attempts += 1;
-            match self.recovery("delete", &args).await {
+            match self.recovery("delete", &args, self.deadlines.control).await {
                 Ok(_) => break Ok(()),
                 // Delete is idempotent. SmolVM may remove its registry entry
                 // before a retry observes the partially cleaned directory.
@@ -1801,10 +1976,21 @@ impl VmProvider for SmolVmProvider {
             Err(delete_error) => {
                 let data_dir = self.machine_data_dir(name).await.ok();
                 let killed = match data_dir {
-                    Some(dir) => kill_vm_processes_in(&dir).unwrap_or_else(|error| {
-                        warn!(%error, "hypervisor scan before forced delete failed");
-                        0
-                    }),
+                    Some(dir) => {
+                        // `ps` and `kill` are synchronous host tools; keep them
+                        // off the worker, and each is bounded inside.
+                        match tokio::task::spawn_blocking(move || kill_vm_processes_in(&dir)).await
+                        {
+                            Ok(outcome) => outcome.unwrap_or_else(|error| {
+                                warn!(%error, "hypervisor scan before forced delete failed");
+                                0
+                            }),
+                            Err(error) => {
+                                warn!(%error, "hypervisor scan task failed before forced delete");
+                                0
+                            }
+                        }
+                    }
                     None => 0,
                 };
                 if killed == 0 {
@@ -1814,7 +2000,8 @@ impl VmProvider for SmolVmProvider {
                         machine = name.as_str(),
                         killed, "killed hypervisor left alive by refused delete; retrying"
                     );
-                    let retried = match self.recovery("delete", &args).await {
+                    let retried = match self.recovery("delete", &args, self.deadlines.control).await
+                    {
                         Ok(_) => Ok(()),
                         Err(VmError::Command { message, .. })
                             if message.to_ascii_lowercase().contains("not found") =>
@@ -1825,14 +2012,22 @@ impl VmProvider for SmolVmProvider {
                     };
                     if retried.is_ok() {
                         // The dead hypervisor can leave the layer store
-                        // mounted under the now-removed data directory.
-                        match detach_orphaned_layer_mounts() {
-                            Ok(detached) if detached > 0 => {
+                        // mounted under the now-removed data directory. The
+                        // sweep shells out to `mount`, `ps`, and `hdiutil`
+                        // synchronously (its CLI caller runs it from `Drop`,
+                        // where no runtime exists), so run it on a blocking
+                        // thread: each call is bounded, and a wedged `hdiutil`
+                        // must not hold a worker either.
+                        match tokio::task::spawn_blocking(detach_orphaned_layer_mounts).await {
+                            Ok(Ok(detached)) if detached > 0 => {
                                 info!(detached, "detached layer mounts after forced delete")
                             }
-                            Ok(_) => {}
-                            Err(error) => {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
                                 warn!(%error, "layer-mount detach after forced delete failed")
+                            }
+                            Err(error) => {
+                                warn!(%error, "layer-mount detach task failed after forced delete")
                             }
                         }
                     }
@@ -1863,7 +2058,7 @@ impl VmProvider for SmolVmProvider {
             "--name".into(),
             name.as_str().into(),
         ];
-        match self.recovery("status", &args).await {
+        match self.recovery("status", &args, self.deadlines.probe).await {
             Ok(output) => {
                 let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
                 Ok(if text.contains("running") {
@@ -1885,7 +2080,11 @@ impl VmProvider for SmolVmProvider {
 
     async fn list(&self) -> Result<Vec<MachineName>, VmError> {
         let output = self
-            .recovery("list", &["machine".into(), "ls".into(), "--json".into()])
+            .recovery(
+                "list",
+                &["machine".into(), "ls".into(), "--json".into()],
+                self.deadlines.probe,
+            )
             .await?;
         let values: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(error.to_string()))?;
@@ -1912,7 +2111,7 @@ impl VmProvider for SmolVmProvider {
             "--".into(),
         ];
         args.extend_from_slice(argv);
-        self.checked("exec", &args).await
+        self.checked("exec", &args, self.deadlines.exec).await
     }
 
     async fn exec_with_secret_env(
@@ -1964,7 +2163,7 @@ impl VmProvider for SmolVmProvider {
         }
         args.push("--".into());
         args.extend_from_slice(argv);
-        self.checked("exec", &args).await
+        self.checked("exec", &args, self.deadlines.exec).await
     }
 
     async fn exec_stream(
@@ -2008,6 +2207,7 @@ impl VmProvider for SmolVmProvider {
                 source.into(),
                 destination.into(),
             ],
+            self.deadlines.boot,
         )
         .await
         .map(|_| ())
@@ -2053,7 +2253,7 @@ impl VmProvider for SmolVmProvider {
         // below does not cover it; smolvm honours `--staging-dir` only.
         args.extend(["--staging-dir".into(), staging_dir.display().to_string()]);
         args.extend(["-o".into(), output.display().to_string()]);
-        self.exclusive_with_staging("pack", &args, staging_dir)
+        self.exclusive_with_staging("pack", &args, staging_dir, self.deadlines.pack)
             .await
             .map(|_| ())
     }
@@ -2091,6 +2291,7 @@ impl VmProvider for SmolVmProvider {
                     "--name".into(),
                     golden.as_str().into(),
                 ],
+                self.deadlines.control,
             )
             .await
         {
@@ -2121,6 +2322,7 @@ impl VmProvider for SmolVmProvider {
                         "--name".into(),
                         golden.as_str().into(),
                     ],
+                    self.deadlines.control,
                 )
                 .await?;
             }
@@ -2135,6 +2337,7 @@ impl VmProvider for SmolVmProvider {
                 golden.as_str().into(),
                 "--forkable".into(),
             ],
+            self.deadlines.boot,
         )
         .await?;
         Ok(true)
@@ -2465,7 +2668,9 @@ pub fn machine_data_root() -> Option<PathBuf> {
 /// Bytes available to an unprivileged writer on the filesystem holding
 /// `path`, measured at its nearest existing ancestor (the target directory may
 /// not exist yet). Uses POSIX `df -Pk`, which every supported host ships, so
-/// no FFI dependency is needed for a `statvfs` call.
+/// no FFI dependency is needed for a `statvfs` call. The tool is killed at
+/// [`PROBE_DEADLINE`]: a wedged mount (a stale network filesystem) must make
+/// the measurement fail, not hang the caller that was only asking for a number.
 pub fn filesystem_available_bytes(path: &Path) -> Result<u64, VmError> {
     let mut probe = path;
     while !probe.exists() {
@@ -2473,16 +2678,20 @@ pub fn filesystem_available_bytes(path: &Path) -> Result<u64, VmError> {
             VmError::Protocol(format!("no existing ancestor for {}", path.display()))
         })?;
     }
-    let output = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(probe)
-        .output()
-        .map_err(|error| VmError::Protocol(format!("df failed to start: {error}")))?;
-    if !output.status.success() {
+    let probe_arg = probe.display().to_string();
+    let output = match run_host_tool("df", "df", &["-Pk", &probe_arg], PROBE_DEADLINE) {
+        Ok(output) => output,
+        // The deadline answer names the tool and the deadline; keep it.
+        Err(error @ VmError::TimedOut { .. }) => return Err(error),
+        Err(error) => {
+            return Err(VmError::Protocol(format!("df failed to start: {error}")));
+        }
+    };
+    if !output.success {
         return Err(VmError::Protocol(format!(
             "df -Pk {} exited with {}",
             probe.display(),
-            output.status
+            output.exit_code
         )));
     }
     parse_df_available_kib(&String::from_utf8_lossy(&output.stdout))
@@ -2723,6 +2932,13 @@ fn orphan_layer_store_mounts(
 /// machine is never disturbed. A mount `hdiutil` refuses is left in place
 /// (its hypervisor may have started between the scan and the detach). No-op
 /// where the layer store is not a host mount.
+///
+/// Every tool it runs (`/sbin/mount`, `ps`, `hdiutil`) is bounded by
+/// [`PROBE_DEADLINE`] through [`run_host_tool`]: `hdiutil` sits in the kernel
+/// waiting on a volume that may never answer, and this runs from `delete` and
+/// from teardown paths (an engine exit, a CLI `Drop`) where a hang is the one
+/// outcome nobody can recover from. It stays synchronous because those callers
+/// have no runtime to await on; the engine calls it on a blocking thread.
 pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -2735,12 +2951,7 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
             return Ok(0);
         }
         // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
-        let mounts = std::process::Command::new("/sbin/mount")
-            .output()
-            .map_err(|source| VmError::Launch {
-                program: "/sbin/mount".to_owned(),
-                source,
-            })?;
+        let mounts = run_host_tool("mount", "/sbin/mount", &[], PROBE_DEADLINE)?;
         detach_orphaned_layer_mounts_in(&roots, &String::from_utf8_lossy(&mounts.stdout))
     }
 }
@@ -2749,29 +2960,31 @@ pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
 /// shell-out above so a test can drive it with a fixture table.
 #[cfg(target_os = "macos")]
 fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
-    let ps = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let ps = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
     let mut detached = 0usize;
     for mount in orphan_layer_store_mounts(roots, &String::from_utf8_lossy(&ps.stdout), mount_table)
     {
-        match std::process::Command::new("hdiutil")
-            .args(["detach", "-quiet"])
-            .arg(&mount)
-            .status()
-        {
-            Ok(status) if status.success() => {
+        let mount_arg = mount.display().to_string();
+        match run_host_tool(
+            "hdiutil detach",
+            "hdiutil",
+            &["detach", "-quiet", &mount_arg],
+            PROBE_DEADLINE,
+        ) {
+            Ok(status) if status.success => {
                 detached += 1;
                 info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
             }
             Ok(status) => warn!(
                 mount = %mount.display(),
-                %status,
+                exit_code = status.exit_code,
+                stderr = %String::from_utf8_lossy(&status.stderr).trim(),
                 "hdiutil detach refused; leaving the layer mount in place"
+            ),
+            Err(error @ VmError::TimedOut { .. }) => warn!(
+                mount = %mount.display(),
+                %error,
+                "hdiutil detach did not answer; leaving the layer mount in place"
             ),
             Err(error) => warn!(
                 mount = %mount.display(),
@@ -2824,18 +3037,17 @@ pub enum OrphanPurge {
 /// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
 /// interval while the pool serves (`RemovedDataDir`). Returns the number of
 /// processes killed.
+///
+/// Both host tools it runs (`ps`, `kill`) are bounded by [`PROBE_DEADLINE`]:
+/// this is called from the pool's reconcile loop, where a wedged `ps` on a
+/// thrashing host must not stall the tick that also sweeps data dirs. A tool
+/// that runs out of time is reported; the next tick retries.
 pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     let roots = machine_data_roots();
     if roots.is_empty() {
         return Ok(0);
     }
-    let output = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut killed = 0usize;
     for line in text.lines() {
@@ -2863,10 +3075,9 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
         // SIGKILL: the machine is unreachable through smolvm (no record, or
         // an unresponsive agent) — the hypervisor process must die to
         // release the storage fds.
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+        let pid_arg = pid.to_string();
+        let status = run_host_tool("kill", "kill", &["-9", &pid_arg], PROBE_DEADLINE);
+        if matches!(status, Ok(status) if status.success) {
             killed += 1;
         }
     }
@@ -2890,13 +3101,7 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
         return Ok(0);
     }
     let target = canonical_path(data_dir);
-    let output = std::process::Command::new("ps")
-        .args(["ax", "-o", "pid=,command="])
-        .output()
-        .map_err(|source| VmError::Launch {
-            program: "ps".to_owned(),
-            source,
-        })?;
+    let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
     let text = String::from_utf8_lossy(&output.stdout);
     // Attribute by the boot-config path as written in argv, not by splitting
     // argv on whitespace: `ps` prints the command verbatim, so a data root
@@ -2933,10 +3138,9 @@ fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
         if pid <= 0 {
             continue;
         }
-        let status = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+        let pid_arg = pid.to_string();
+        let status = run_host_tool("kill", "kill", &["-9", &pid_arg], PROBE_DEADLINE);
+        if matches!(status, Ok(status) if status.success) {
             killed += 1;
         }
     }
@@ -3431,6 +3635,195 @@ async fn read_bounded(
         truncated |= read > available;
     }
     Ok((retained, truncated))
+}
+
+/// Run a spawned child to completion under `deadline`, capturing both streams.
+///
+/// Both pipes are drained concurrently with the wait, so a child that fills one
+/// while the other stays idle cannot deadlock. At `deadline` the child is
+/// SIGKILLed and reaped — bounded by [`KILL_REAP_DEADLINE`], so even a process
+/// stuck in an uninterruptible syscall cannot keep the caller waiting — and the
+/// call fails with [`VmError::TimedOut`].
+///
+/// This is the whole point of the deadline: callers run under the provider's
+/// lifecycle lock, and a runtime that never answers must not hold that lock.
+/// `kill_on_drop` on the command covers the drop path; the explicit kill covers
+/// the deadline.
+async fn run_child_to_deadline(
+    operation: &'static str,
+    program: &Path,
+    child: &mut tokio::process::Child,
+    capture_limit: usize,
+    deadline: Duration,
+) -> Result<ExecOutput, VmError> {
+    let launch = |source: std::io::Error| VmError::Launch {
+        program: program.display().to_string(),
+        source,
+    };
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let joined = async {
+        tokio::join!(
+            read_bounded(stdout, capture_limit),
+            read_bounded(stderr, capture_limit),
+            child.wait(),
+        )
+    };
+    match tokio::time::timeout(deadline, joined).await {
+        Ok((stdout, stderr, status)) => {
+            let (stdout, stdout_truncated) = stdout.map_err(launch)?;
+            let (stderr, stderr_truncated) = stderr.map_err(launch)?;
+            let status = status.map_err(launch)?;
+            Ok(ExecOutput {
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+                truncated: stdout_truncated || stderr_truncated,
+            })
+        }
+        Err(_expired) => {
+            kill_and_reap(child).await;
+            Err(VmError::TimedOut {
+                operation,
+                program: program.display().to_string(),
+                deadline,
+            })
+        }
+    }
+}
+
+/// Wait for a child to exit under `deadline`, killing it on expiry, without
+/// capturing its streams.
+///
+/// For children whose output is not wanted (a keepalive renewal): their stdio
+/// must not be piped, because nothing drains it. Callers that want the output
+/// use [`run_child_to_deadline`].
+async fn wait_for_child(
+    operation: &'static str,
+    program: &Path,
+    child: &mut tokio::process::Child,
+    deadline: Duration,
+) -> Result<std::process::ExitStatus, VmError> {
+    match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(source)) => Err(VmError::Launch {
+            program: program.display().to_string(),
+            source,
+        }),
+        Err(_expired) => {
+            kill_and_reap(child).await;
+            Err(VmError::TimedOut {
+                operation,
+                program: program.display().to_string(),
+                deadline,
+            })
+        }
+    }
+}
+
+/// SIGKILL `child` and wait out its reaping, bounded by [`KILL_REAP_DEADLINE`].
+///
+/// Shared by every deadline path, so a child that outlives its budget is always
+/// ended the same way: killed now, reaped within the window if the kernel lets
+/// it be, and otherwise handed to `kill_on_drop` and tokio's orphan reaper.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(KILL_REAP_DEADLINE, child.wait()).await;
+}
+
+/// A host tool's captured output (see [`run_host_tool`]).
+#[derive(Debug)]
+struct HostToolOutput {
+    /// Captured standard output.
+    stdout: Vec<u8>,
+    /// Captured standard error.
+    stderr: Vec<u8>,
+    /// Whether the tool exited zero.
+    success: bool,
+    /// Exit code, or `-1` when the tool died to a signal.
+    exit_code: i32,
+}
+
+/// Run a host tool to completion under `deadline`, blocking.
+///
+/// `std::process`, not the tokio API: this backs the orphan sweeps
+/// ([`detach_orphaned_layer_mounts`], [`purge_orphaned_vms`],
+/// [`filesystem_available_bytes`]), which the CLI calls from a `Drop` handler
+/// where no runtime exists. Engine callers run them on a blocking thread
+/// ([`tokio::task::spawn_blocking`]), never on a worker.
+///
+/// Both pipes are drained on their own threads while the child runs, so a
+/// chatty child (`ps ax` on a busy host, well over the 64 KiB pipe buffer)
+/// cannot block on a full pipe and masquerade as a hang; retained output is
+/// capped at [`HOST_TOOL_CAPTURE_LIMIT`] while the drain keeps reading. At
+/// `deadline` the child is killed and reaped, and the error names the tool and
+/// the deadline. A timed-out tool's reader threads exit at EOF once it dies and
+/// are left to do so rather than joined: the caller's deadline governs.
+fn run_host_tool(
+    operation: &'static str,
+    program: &str,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<HostToolOutput, VmError> {
+    let launch = |source: std::io::Error| VmError::Launch {
+        program: program.to_owned(),
+        source,
+    };
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(launch)?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout = std::thread::spawn(move || drain_capped(stdout));
+    let stderr = std::thread::spawn(move || drain_capped(stderr));
+    let expires = Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= expires {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(VmError::TimedOut {
+                        operation,
+                        program: program.to_owned(),
+                        deadline,
+                    });
+                }
+                std::thread::sleep(HOST_TOOL_POLL);
+            }
+            Err(source) => return Err(launch(source)),
+        }
+    };
+    Ok(HostToolOutput {
+        // The reader threads finish at EOF, which the reaped child's closed
+        // pipes have already delivered.
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+        success: status.success(),
+        exit_code: status.code().unwrap_or(-1),
+    })
+}
+
+/// Read `reader` to end of stream, retaining at most [`HOST_TOOL_CAPTURE_LIMIT`]
+/// bytes but always draining (see [`run_host_tool`]).
+fn drain_capped(mut reader: impl Read) -> Vec<u8> {
+    let mut retained = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let available = HOST_TOOL_CAPTURE_LIMIT.saturating_sub(retained.len());
+                retained.extend_from_slice(&chunk[..read.min(available)]);
+            }
+        }
+    }
+    retained
 }
 
 async fn forward(
@@ -4113,6 +4506,178 @@ mod tests {
             .expect("open dir")
             .set_times(std::fs::FileTimes::new().set_modified(old))
             .expect("backdate dir");
+    }
+
+    /// Write an executable stand-in for a host tool that records its pid in the
+    /// file named by its first argument and then sleeps forever.
+    fn wedged_tool(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join(name);
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'pid=%s\\n' \"$$\" > \"$1\"\nexec sleep 300\n",
+        )
+        .expect("write wedged tool");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wedged tool");
+        binary
+    }
+
+    /// The pid the wedged tool recorded in `record`, once it is there.
+    fn recorded_pid(record: &std::path::Path) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(record)
+                && let Some(pid) = text
+                    .trim()
+                    .strip_prefix("pid=")
+                    .and_then(|pid| pid.parse::<i32>().ok())
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let listing: Vec<String> = record
+            .parent()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        panic!(
+            "{} was never written (dir holds {listing:?})",
+            record.display()
+        );
+    }
+
+    /// Poll until `pid` is gone, up to `budget`.
+    fn await_process_gone(pid: i32, budget: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if !process_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A host tool that never exits must be killed at its deadline, and the
+    /// error must name the tool and the deadline: this is what keeps
+    /// `hdiutil`/`ps`/`mount` from wedging the sweep that runs them, and what
+    /// lets an operator tell a hang from a failure.
+    #[test]
+    fn host_tool_deadline_kills_a_wedged_tool() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let tool = wedged_tool(dir.path(), "wedged-tool");
+        let record = dir.path().join("wedged-tool.pid");
+        // The helper owns the spawn, so the deadline has to cover this test
+        // binary's exec latency (hundreds of milliseconds under a loaded
+        // `cargo test`) before it can be evidence of anything: two seconds is
+        // still three orders of magnitude below the production deadlines.
+        let deadline = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let error = run_host_tool(
+            "wedged-tool",
+            tool.to_str().unwrap(),
+            &[record.to_str().unwrap()],
+            deadline,
+        )
+        .expect_err("a tool that never exits must hit its deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, VmError::TimedOut { operation, deadline: named, program }
+                if *operation == "wedged-tool"
+                    && *named == deadline
+                    && program == tool.to_str().unwrap()),
+            "expected a named deadline error, got {error:?}"
+        );
+        assert!(
+            elapsed >= deadline,
+            "returned before the deadline elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the deadline took {elapsed:?} to fire"
+        );
+        let pid = recorded_pid(&record);
+        assert!(
+            await_process_gone(pid, std::time::Duration::from_secs(10)),
+            "the tool must be SIGKILLed at its deadline, not left running"
+        );
+    }
+
+    /// A tool that writes more than the 64 KiB pipe buffer before exiting must
+    /// still complete: the drain threads are what keep a chatty `ps ax` from
+    /// blocking on a full pipe, which would look exactly like a hang and (with
+    /// this deadline) be reported as one.
+    #[test]
+    fn host_tool_drains_more_than_a_pipe_buffer() {
+        let output = run_host_tool(
+            "chatty",
+            "sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 6000 ]; do \
+                 printf 'line %s aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' \"$i\"; \
+                 i=$((i+1)); done",
+            ],
+            std::time::Duration::from_secs(30),
+        )
+        .expect("a chatty tool that exits must not be reported as a hang");
+        assert!(output.success, "chatty tool must exit zero");
+        assert!(
+            output.stdout.len() > 64 * 1024,
+            "expected more than one pipe buffer, captured {} bytes",
+            output.stdout.len()
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("line 0 "));
+    }
+
+    /// The async deadline path: a provider child that never exits is SIGKILLed
+    /// at the deadline, which is what releases the lifecycle lock its caller
+    /// holds (see the provider-level test in `tests/provider.rs`).
+    #[tokio::test]
+    async fn child_deadline_kills_a_wedged_runtime() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let tool = wedged_tool(dir.path(), "wedged-runtime");
+        let record = dir.path().join("wedged-runtime.pid");
+        let mut child = Command::new(&tool)
+            .arg(&record)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn wedged runtime");
+        // Wait for the runtime to record its pid before the deadline starts:
+        // `exec` under a loaded test binary takes longer than the test's
+        // deadline, and this test is about the *wait* ending, not about spawn
+        // latency.
+        let pid = recorded_pid(&record);
+        let deadline = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let error =
+            run_child_to_deadline("exec", &tool, &mut child, DEFAULT_CAPTURE_LIMIT, deadline)
+                .await
+                .expect_err("a runtime that never exits must hit its deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, VmError::TimedOut { operation, deadline: named, .. }
+                if *operation == "exec" && *named == deadline),
+            "expected a named deadline error, got {error:?}"
+        );
+        assert!(
+            elapsed >= deadline && elapsed < std::time::Duration::from_secs(5),
+            "deadline fired at {elapsed:?}"
+        );
+        assert!(
+            await_process_gone(pid, std::time::Duration::from_secs(10)),
+            "the runtime must be SIGKILLed at its deadline"
+        );
     }
 
     /// Write an executable stand-in for `smolvm` into `dir` and return it.

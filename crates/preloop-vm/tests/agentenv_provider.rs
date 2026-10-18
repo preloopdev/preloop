@@ -14,7 +14,7 @@
 use preloop_vm::agentenv::AgentEnvProvider;
 use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, SocketMount, VmError, VmProvider,
-    VolumeMount,
+    VolumeMount, WaitDeadlines,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1660,5 +1660,114 @@ async fn fork_pauses_the_golden_again_after_snapshotting_it() {
         ordered.get(snapshot_at + 1).map(String::as_str),
         Some("pause|sb-0001"),
         "{ordered:?}"
+    );
+}
+
+/// A fake `aenv` whose `pause` records its pid and never exits, so the
+/// provider's `stop` meets a runtime that stopped answering; every other verb
+/// answers like the real CLI.
+fn fake_wedged_pause_aenv() -> (TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("aenv");
+    write_executable(
+        &executable,
+        r##"#!/bin/sh
+set -eu
+case "${1-}" in
+  start) printf 'sb-0001\n' ;;
+  ls)
+    printf '[{"sandboxID":"sb-0001","templateID":"t","alias":null,"state":"running","cpuCount":4,"memoryMB":4096,"diskSizeMB":65536,"startedAt":"now","endAt":"later"}]\n'
+    ;;
+  pause)
+    echo $$ > "$0.pid"
+    exec sleep 300
+    ;;
+  *) exit 0 ;;
+esac
+"##,
+    );
+    (directory, executable)
+}
+
+/// The pid the wedged fake recorded, once it is there.
+fn recorded_pid(executable: &Path) -> i32 {
+    let path = executable.with_extension("pid");
+    for _ in 0..500 {
+        if let Ok(text) = fs::read_to_string(&path)
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("{} never recorded its pid", executable.display());
+}
+
+/// Whether `pid` exited within `budget`.
+fn process_gone(pid: i32, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        // A dead pid makes `kill` print "No such process"; the status is the
+        // answer, so keep its stderr out of the test output.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe process")
+            .success();
+        if !alive {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// An `aenv` that never answers a lifecycle call must not park the caller: the
+/// wait is bounded, the error names the dependency and the deadline, and the
+/// child is killed rather than left holding the sandbox.
+#[tokio::test]
+async fn timed_out_pause_is_killed_at_its_deadline() {
+    let (_directory, executable) = fake_wedged_pause_aenv();
+    let home = tempfile::tempdir().unwrap();
+    // One second, not the smallest possible value: the fake `aenv` has to
+    // finish its own startup before the deadline is evidence about the wait.
+    let deadline = std::time::Duration::from_secs(1);
+    let provider = provider(&executable, home.path()).with_deadlines(WaitDeadlines {
+        probe: deadline,
+        control: deadline,
+        boot: deadline,
+        pack: deadline,
+        exec: deadline,
+    });
+    let name = MachineName::new("runner-wedged").unwrap();
+    provider
+        .create(&spec("runner-wedged", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let error = provider
+        .stop(&name)
+        .await
+        .expect_err("an aenv that never answers must hit its deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(&error, VmError::TimedOut { operation, deadline: named, program }
+            if *operation == "stop"
+                && *named == deadline
+                && program.ends_with("aenv")),
+        "expected a named deadline error, got {error:?}"
+    );
+    assert!(
+        elapsed >= deadline && elapsed < std::time::Duration::from_secs(5),
+        "the deadline fired at {elapsed:?}"
+    );
+
+    let pid = recorded_pid(&executable);
+    assert!(
+        process_gone(pid, std::time::Duration::from_secs(10)),
+        "the wedged aenv must be killed at its deadline, not left running"
     );
 }

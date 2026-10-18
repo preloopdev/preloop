@@ -66,7 +66,8 @@ pub mod volume;
 use crate::guest_privilege::{run_as_root_or_sudo, run_as_root_or_sudo_strict};
 use crate::{
     DEFAULT_CAPTURE_LIMIT, ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy,
-    OutputChunk, SecretSource, VmError, VmProvider, VolumeMount, read_bounded, stream_output,
+    OutputChunk, SecretSource, VmError, VmProvider, VolumeMount, WaitDeadlines,
+    run_child_to_deadline, stream_output, wait_for_child,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -310,6 +311,10 @@ pub struct AgentEnvProvider {
     /// the staging volumes a populate in this process is writing, and the
     /// scheduler's own bookkeeping. Nothing is deleted without it.
     volume_gc: Arc<gc::GcState>,
+    /// Child-wait deadlines. Production is [`WaitDeadlines::default`]; tests
+    /// shrink them through [`AgentEnvProvider::with_deadlines`] so an `aenv`
+    /// that never exits is proved to be killed in milliseconds.
+    deadlines: WaitDeadlines,
 }
 
 impl Default for AgentEnvProvider {
@@ -335,6 +340,7 @@ impl AgentEnvProvider {
             volume_index: Arc::new(Mutex::new(VolumeIndex::default())),
             volume_index_path: None,
             volume_gc: Arc::new(gc::GcState::disabled()),
+            deadlines: WaitDeadlines::default(),
         }
     }
 
@@ -460,15 +466,31 @@ impl AgentEnvProvider {
         self
     }
 
+    /// Override the child-wait deadlines (see [`WaitDeadlines`]).
+    ///
+    /// Every `aenv` call kills its child at the matching deadline, so this is
+    /// the seam tests use to watch a hang end in milliseconds instead of half an
+    /// hour. Production never calls it.
+    pub fn with_deadlines(mut self, deadlines: WaitDeadlines) -> Self {
+        self.deadlines = deadlines;
+        self
+    }
+
     // -- process plumbing ---------------------------------------------------
 
     /// Run `aenv` with `args`, capturing bounded output, and fail on nonzero.
+    ///
+    /// `deadline` bounds the child wait (see [`WaitDeadlines`]): a slow
+    /// operation is given a matching tier by its caller, and a call that never
+    /// returns is killed and reported as [`VmError::TimedOut`] naming `aenv` and
+    /// the deadline.
     async fn checked(
         &self,
         operation: &'static str,
         args: &[String],
+        deadline: Duration,
     ) -> Result<ExecOutput, VmError> {
-        let output = self.capture(args).await?;
+        let output = self.capture(operation, args, deadline).await?;
         if output.exit_code != 0 {
             return Err(self.command_error(operation, &output));
         }
@@ -476,11 +498,12 @@ impl AgentEnvProvider {
     }
 
     /// Run `aenv` with `args`, capturing bounded output, without judging it.
-    async fn capture(&self, args: &[String]) -> Result<ExecOutput, VmError> {
-        let launch = |source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        };
+    async fn capture(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
         let mut child = Command::new(&self.binary)
             .args(args)
             .stdin(Stdio::null())
@@ -488,23 +511,18 @@ impl AgentEnvProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(launch)?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (stdout, stderr, status) = tokio::join!(
-            read_bounded(stdout, self.capture_limit),
-            read_bounded(stderr, self.capture_limit),
-            child.wait(),
-        );
-        let (stdout, stdout_truncated) = stdout.map_err(launch)?;
-        let (stderr, stderr_truncated) = stderr.map_err(launch)?;
-        let status = status.map_err(launch)?;
-        Ok(ExecOutput {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-            truncated: stdout_truncated || stderr_truncated,
-        })
+            .map_err(|source| VmError::Launch {
+                program: self.binary.display().to_string(),
+                source,
+            })?;
+        run_child_to_deadline(
+            operation,
+            &self.binary,
+            &mut child,
+            self.capture_limit,
+            deadline,
+        )
+        .await
     }
 
     /// The error for a failed `aenv` invocation.
@@ -625,7 +643,11 @@ impl AgentEnvProvider {
     /// Live sandbox states, keyed by sandbox id.
     async fn live_sandboxes(&self) -> Result<HashMap<String, String>, VmError> {
         let output = self
-            .checked("list", &["ls".into(), "--output".into(), "json".into()])
+            .checked(
+                "list",
+                &["ls".into(), "--output".into(), "json".into()],
+                self.deadlines.probe,
+            )
             .await?;
         let rows: Vec<ListedSandbox> = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(format!("aenv ls: {error}")))?;
@@ -688,14 +710,18 @@ impl AgentEnvProvider {
             args.push("-d".into());
             args
         };
-        let output = match self.checked(operation, &build(true)).await {
+        let output = match self
+            .checked(operation, &build(true), self.deadlines.boot)
+            .await
+        {
             Ok(output) => output,
             Err(VmError::Command { message, .. }) if is_disk_too_small(&message) => {
                 debug!(
                     target,
                     message, "AgentENV base image is larger than the requested disk; inheriting it"
                 );
-                self.checked(operation, &build(false)).await?
+                self.checked(operation, &build(false), self.deadlines.boot)
+                    .await?
             }
             Err(error) => return Err(error),
         };
@@ -786,7 +812,11 @@ impl AgentEnvProvider {
             sandbox, "machine was torn down while its start ran; deleting the unrecorded sandbox"
         );
         if let Err(error) = self
-            .checked("delete", &["delete".into(), sandbox.to_owned()])
+            .checked(
+                "delete",
+                &["delete".into(), sandbox.to_owned()],
+                self.deadlines.control,
+            )
             .await
             && !matches!(&error, VmError::Command { message, .. } if is_absent(message))
         {
@@ -815,7 +845,11 @@ impl AgentEnvProvider {
         ];
         let mut last: Option<ExecOutput> = None;
         while tokio::time::Instant::now() < deadline {
-            let output = self.capture(&args).await?;
+            // One probe is bounded at the probe tier; the loop above bounds the
+            // total wait, so a wedged `aenv exec` cannot outlive either.
+            let output = self
+                .capture("await_guest", &args, self.deadlines.probe)
+                .await?;
             if output.exit_code == 0 {
                 return Ok(());
             }
@@ -854,6 +888,7 @@ impl AgentEnvProvider {
                 "--timeout".into(),
                 self.ttl_secs.to_string(),
             ],
+            self.deadlines.boot,
         )
         .await?;
         Ok(true)
@@ -877,12 +912,20 @@ impl AgentEnvProvider {
             if resumed {
                 self.await_guest(sandbox).await?;
             }
-            self.checked(operation, args).await.map(|_| ())
+            // `snapshot create` is this provider's pack: it captures the whole
+            // machine server-side, so it gets the pack tier.
+            self.checked(operation, args, self.deadlines.pack)
+                .await
+                .map(|_| ())
         }
         .await;
         if resumed
             && let Err(error) = self
-                .checked("stop", &["pause".into(), sandbox.to_owned()])
+                .checked(
+                    "stop",
+                    &["pause".into(), sandbox.to_owned()],
+                    self.deadlines.control,
+                )
                 .await
         {
             warn!(
@@ -905,6 +948,7 @@ impl AgentEnvProvider {
         let binary = self.binary.clone();
         let sandbox = sandbox.to_owned();
         let ttl = self.ttl_secs.to_string();
+        let deadline = self.deadlines.probe;
         let handle = tokio::spawn(async move {
             // Consecutive renewal failures. A missing sandbox fails every
             // probe, so it still exits quickly; a transient daemon hiccup
@@ -912,16 +956,29 @@ impl AgentEnvProvider {
             let mut consecutive_failures = 0u32;
             loop {
                 tokio::time::sleep(interval).await;
-                let result = Command::new(&binary)
+                // A renewal is a local control call, and its child is bounded:
+                // an `aenv` that never answers would otherwise park this task
+                // forever, so the loop would neither renew the TTL nor ever
+                // reach its three-strikes exit — the sandbox would be deleted
+                // underneath a running job with the failure never logged.
+                let mut command = Command::new(&binary);
+                command
                     .args(["timeout", &sandbox, &ttl])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .kill_on_drop(true)
-                    .status()
-                    .await;
+                    .kill_on_drop(true);
+                let result = match command.spawn() {
+                    Ok(mut child) => wait_for_child("timeout", &binary, &mut child, deadline)
+                        .await
+                        .map(|status| status.success()),
+                    Err(error) => Err(VmError::Launch {
+                        program: binary.display().to_string(),
+                        source: error,
+                    }),
+                };
                 match &result {
-                    Ok(status) if status.success() => {
+                    Ok(true) => {
                         consecutive_failures = 0;
                     }
                     outcome => {
@@ -1174,6 +1231,7 @@ impl AgentEnvProvider {
                 "--size-mb".into(),
                 size.clone(),
             ],
+            self.deadlines.boot,
         )
         .await?;
         if let Err(error) = self.write_staging(&staging, tree, target, cold).await {
@@ -1194,6 +1252,7 @@ impl AgentEnvProvider {
                     "--size-mb".into(),
                     size,
                 ],
+                self.deadlines.boot,
             )
             .await;
         match frozen {
@@ -1243,7 +1302,11 @@ impl AgentEnvProvider {
         // Deleting the sandbox is what commits its writes to the volume, so it runs
         // even after a failed unpack, and its own failure fails the populate.
         let deleted = self
-            .checked("delete", &["delete".into(), sandbox.clone()])
+            .checked(
+                "delete",
+                &["delete".into(), sandbox.clone()],
+                self.deadlines.control,
+            )
             .await
             .map(|_| ());
         unpacked.and(deleted)
@@ -1271,6 +1334,7 @@ impl AgentEnvProvider {
                 tree.archive.path().display().to_string(),
                 guest_archive.clone(),
             ],
+            self.deadlines.boot,
         )
         .await?;
         let script = format!(
@@ -1281,7 +1345,13 @@ impl AgentEnvProvider {
             archive = shell_quote(&guest_archive),
             mount = shell_quote(POPULATE_MOUNT),
         );
-        let output = self.capture(&guest_root_argv(sandbox, &script)).await?;
+        let output = self
+            .capture(
+                "populate_volume",
+                &guest_root_argv(sandbox, &script),
+                self.deadlines.boot,
+            )
+            .await?;
         if output.exit_code != 0 {
             return Err(guest_privilege_error(
                 self.command_error("populate_volume", &output),
@@ -1296,7 +1366,11 @@ impl AgentEnvProvider {
     /// again: its owner may still be writing it.
     async fn volume_is_ready(&self, name: &str) -> Result<bool, VmError> {
         let output = self
-            .capture(&["volume".into(), "inspect".into(), name.to_owned()])
+            .capture(
+                "volume_inspect",
+                &["volume".into(), "inspect".into(), name.to_owned()],
+                self.deadlines.probe,
+            )
             .await?;
         if output.exit_code != 0 {
             return match self.command_error("runner_volume", &output) {
@@ -1335,7 +1409,11 @@ impl AgentEnvProvider {
     /// leftovers alike.
     pub async fn list_volumes(&self) -> Result<Vec<AgentEnvVolume>, VmError> {
         let output = self
-            .checked("volume_list", &["volume".into(), "list".into()])
+            .checked(
+                "volume_list",
+                &["volume".into(), "list".into()],
+                self.deadlines.probe,
+            )
             .await?;
         let volumes: Vec<AgentEnvVolume> = serde_json::from_slice(&output.stdout)
             .map_err(|error| VmError::Protocol(format!("aenv volume list: {error}")))?;
@@ -1363,6 +1441,7 @@ impl AgentEnvProvider {
                 .checked(
                     "volume_delete",
                     &["volume".into(), "delete".into(), name.clone()],
+                    self.deadlines.control,
                 )
                 .await;
             match deletion {
@@ -1425,6 +1504,7 @@ impl AgentEnvProvider {
             .checked(
                 "runner_volume",
                 &["volume".into(), "delete".into(), name.to_owned()],
+                self.deadlines.control,
             )
             .await
         {
@@ -1441,10 +1521,14 @@ impl AgentEnvProvider {
     /// `/run` is root-owned, so this runs through the root-or-sudo wrapper.
     async fn prepare_guest_dirs(&self, sandbox: &str) -> Result<(), VmError> {
         let script = format!("mkdir -p {GUEST_SECRET_DIR} && chmod 700 {GUEST_SECRET_DIR}");
-        self.checked("prepare_guest_dirs", &guest_root_argv(sandbox, &script))
-            .await
-            .map_err(guest_privilege_error)
-            .map(|_| ())
+        self.checked(
+            "prepare_guest_dirs",
+            &guest_root_argv(sandbox, &script),
+            self.deadlines.control,
+        )
+        .await
+        .map_err(guest_privilege_error)
+        .map(|_| ())
     }
 }
 
@@ -1671,6 +1755,7 @@ impl VmProvider for AgentEnvProvider {
                             "--timeout".into(),
                             self.ttl_secs.to_string(),
                         ],
+                        self.deadlines.boot,
                     )
                     .await?;
                     self.await_guest(sandbox).await?;
@@ -1853,7 +1938,11 @@ impl VmProvider for AgentEnvProvider {
             return Ok(());
         };
         match self
-            .checked("stop", &["pause".into(), sandbox.clone()])
+            .checked(
+                "stop",
+                &["pause".into(), sandbox.clone()],
+                self.deadlines.control,
+            )
             .await
         {
             Ok(_) => {
@@ -1880,7 +1969,11 @@ impl VmProvider for AgentEnvProvider {
         };
         if let Some(sandbox) = &record.sandbox {
             match self
-                .checked("delete", &["delete".into(), sandbox.clone()])
+                .checked(
+                    "delete",
+                    &["delete".into(), sandbox.clone()],
+                    self.deadlines.control,
+                )
                 .await
             {
                 Ok(_) => {}
@@ -1912,7 +2005,11 @@ impl VmProvider for AgentEnvProvider {
         drop(registry);
         if let Some(sandbox) = late
             && let Err(error) = self
-                .checked("delete", &["delete".into(), sandbox.clone()])
+                .checked(
+                    "delete",
+                    &["delete".into(), sandbox.clone()],
+                    self.deadlines.control,
+                )
                 .await
             && !matches!(&error, VmError::Command { message, .. } if is_absent(message))
         {
@@ -1985,7 +2082,7 @@ impl VmProvider for AgentEnvProvider {
         // Match SmolVM: a guest command's non-zero status is a VM error;
         // callers that intentionally need the status can use a shell command
         // that converts it to output (for example, `cmd; printf '%s' "$?"`).
-        self.checked("exec", &args).await
+        self.checked("exec", &args, self.deadlines.exec).await
     }
 
     /// Execute with guest environment values resolved from the host.
@@ -2062,6 +2159,7 @@ impl VmProvider for AgentEnvProvider {
                 host_file.path().display().to_string(),
                 guest_file.clone(),
             ],
+            self.deadlines.control,
         )
         .await?;
         let payload = argv
@@ -2091,7 +2189,9 @@ impl VmProvider for AgentEnvProvider {
         // Sudo for the privileged read and unlink is verified by the
         // `prepare_guest_dirs` call above, which names the prerequisite; the
         // payload's own errors are not rewritten here.
-        let result = self.checked("exec", &wrapper_args).await;
+        let result = self
+            .checked("exec", &wrapper_args, self.deadlines.exec)
+            .await;
         // The wrapper unlinks the file itself, but a failure before its removal
         // ran would leave a live secret behind, so clean up on every failure
         // shape. Best-effort: the removal may be refused and must not mask the
@@ -2099,14 +2199,18 @@ impl VmProvider for AgentEnvProvider {
         if result.is_err() {
             let cleanup = run_as_root_or_sudo(&format!("rm -f {}", shell_quote(&guest_file)));
             let _ = self
-                .capture(&[
-                    "exec".into(),
-                    sandbox,
-                    "--".into(),
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    cleanup,
-                ])
+                .capture(
+                    "cleanup_secret",
+                    &[
+                        "exec".into(),
+                        sandbox,
+                        "--".into(),
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        cleanup,
+                    ],
+                    self.deadlines.control,
+                )
                 .await;
         }
         result
@@ -2157,6 +2261,7 @@ impl VmProvider for AgentEnvProvider {
                         source.to_owned(),
                         guest.to_owned(),
                     ],
+                    self.deadlines.boot,
                 )
                 .await
                 .map(|_| ())
@@ -2172,6 +2277,7 @@ impl VmProvider for AgentEnvProvider {
                         destination.to_owned(),
                         "--force".into(),
                     ],
+                    self.deadlines.boot,
                 )
                 .await
                 .map(|_| ())

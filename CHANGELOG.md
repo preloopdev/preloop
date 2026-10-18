@@ -225,6 +225,26 @@ Releases before v0.27.0 predate the changelog.
   effective public URL is resolved before the already-configured-App branch, so
   setting it in the environment (without `--public-url`) points the configured
   App's webhook at that address instead of printing only that it is configured.
+- **A hung `smolvm` or `aenv` no longer freezes the VM provider.** Every
+  provider call that waits on the runtime was unbounded, and the lifecycle
+  operations took it while holding the provider's read/write lock: a `smolvm`
+  that never exited from `machine create --help`, `machine create`, `start`,
+  `fork`, `status`, or `machine exec` parked every VM operation behind it for
+  good. Each child wait now has a deadline, and the child is killed and reaped
+  at it: 30 s for capability and registry reads (`--version`, help, `status`,
+  `ls`, `data-dir`), 5 min for local state changes (`stop`, `delete`,
+  `update`, `cp`), 30 min for build/boot/clone/transfer (`create`, `start`,
+  `fork`), 60 min for `pack create`/`snapshot create`, and 40 min for a guest
+  command (smolvm's own `--timeout 30m` plus a margin). An expired call fails
+  with `VmError::TimedOut`, naming the program and the deadline, instead of
+  waiting: a timed-out capability probe is not cached as "this binary cannot
+  mount sockets", so the next attempt asks again. The orphan sweeps
+  (`detach_orphaned_layer_mounts`, `purge_orphaned_vms`,
+  `filesystem_available_bytes`) bound their `/sbin/mount`, `ps`, `kill`,
+  `hdiutil`, and `df` children the same way, and the provider runs them on a
+  blocking thread rather than on an async worker. Streaming execs — the job
+  itself — are unchanged.
+
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
