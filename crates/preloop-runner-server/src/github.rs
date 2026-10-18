@@ -5096,16 +5096,28 @@ async fn process_delivery_payload_with_lease(
                 ));
             }
         };
+        // A self-built merge does not exist on GitHub, so its workflow
+        // inventory is read at the pull request's head commit — the tree
+        // whose workflows a run on the merge executes — and its `actions.lock`
+        // is read at that same commit, so the pins and the workflow files
+        // describe one revision.
+        let inventory_sha = match (&engine_built_merge, is_pull_request_run_event(effective)) {
+            (Some(_), true) => effective
+                .status_check_sha
+                .clone()
+                .unwrap_or_else(|| resolved_sha.clone()),
+            _ => resolved_sha.clone(),
+        };
         // The run's `actions.lock`, read at the same commit as the workflows so
         // the lockfile and the workflow files come from one revision. A failed
         // read fails the delivery, exactly as a failed workflow read does.
         let actions_lockfile =
-            match fetch_actions_lockfile(shared, &repo_full_name, &resolved_sha).await {
+            match fetch_actions_lockfile(shared, &repo_full_name, &inventory_sha).await {
                 Ok(lockfile) => lockfile,
                 Err(error) => {
                     error!(
                         event = %effective.event,
-                        sha = %resolved_sha,
+                        sha = %inventory_sha,
                         source_ref = %workflow_ref,
                         ?error,
                         "Failed to fetch actions.lock at the event commit"
