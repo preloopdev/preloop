@@ -80,6 +80,8 @@ preloop debug SESSION_ID --export --patch-only
 
 `--revert` accepts `none`, `untracked`, or `all`. A retry restores runner-managed state such as step outcomes and file-command contexts. It does not undo external API calls, processes outside the workspace, or other external side effects. A step accepts at most 25 attempts.
 
+A verdict finishes the session: `:continue` and `:abort` take effect as soon as they are issued, and operations against a finished session are rejected (`400`), though repeating a request ID that already succeeded still returns its recorded response. To decide again, pause a new failure — a retained finished session is not reopened, and a session the worker has closed stops answering the verdict poll, which is what lets the held job resume. An issued `continue` or `abort` is redelivered until the worker closes the session, so a dropped response cannot lose the decision; a `retry` verdict is consumed once.
+
 ## Preserve a VM for a shell
 
 Use this path when a completed failure is easier to diagnose from a normal shell than from a paused step:
@@ -134,6 +136,8 @@ vars REF   eval EXPR   continue   quit
 The adapter exposes `github`, `env`, `runner`, `job`, `steps`, and `secrets` scopes. Secret values are masked. `next`, `stepIn`, and `stepOut` resume like `continue`; execution stops at job step boundaries rather than inside a shell command. The client can inspect the final state after job completion before the DAP transport closes.
 
 `preloop dap RUN_ID` accepts `--url URL` and `--token TOKEN`. The endpoint is standard DAP over a WebSocket route, so a DAP-capable editor such as VS Code can use the same run endpoint with a WebSocket-capable adapter. The recorded omp workflow uses the small `dapctl` reference client; the same sequence is shown below.
+
+A runner publishes the port the proxy dials by registering it with its runner listen token at `POST /api/v1/runs/RUN_ID/debug`. That registration is bound to the current job owner: a runner that does not serve the job gets `403`. A registration is replaced when it is for the same job or when the registered job is no longer in progress, so a reclaimed or handed-off attempt can point the proxy at its own bridge; a registration for a different job that is still in progress is refused with `409`. This binds listen-token registrations only; when nothing is registered, the proxy dials the fixed engine-local port `127.0.0.1:4711` as before.
 
 ![An agent attaches to a failing run, inspects DAP context, and reruns it](/demo/dap/demo-highlight.gif)
 

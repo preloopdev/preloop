@@ -27,7 +27,7 @@ use preloop_gha_protocol::debug_session::{
     DebugSession, OpenSessionRequest, OpenSessionResponse, SessionAuditEntry, SessionEvent,
     SessionEventsResponse, SessionLeaseRequest, SessionLeaseResponse, SessionOperation,
     SessionOperationRequest, SessionOperationResponse, SessionState, Verdict, VerdictResponse,
-    WorkerTokenRequest, WorkerTokenResponse,
+    WorkerTokenRequest, WorkerTokenResponse, plausible_machine_name,
 };
 
 use crate::auth::{JobRuntimeIdentity, WorkerJob};
@@ -286,11 +286,24 @@ impl DebugSessionRegistry {
             attempts: req.attempts,
             attempt_changes: req.attempt_changes,
             job_steps: req.job_steps,
-            machine: req.machine,
             // Reaches a controller's shell as a `cd` target. Rejecting a
             // relative or shell-active path here means no consumer has to
             // remember to sanitize it.
             workspace: req.workspace.filter(|path| plausible_workspace(path)),
+            // Reaches a controller's host filesystem (`$PRELOOP_HOME/state/debug/<machine>`)
+            // and the guest tooling's argument vector; see
+            // `preloop_gha_protocol::debug_session::plausible_machine_name`.
+            machine: req.machine.filter(|name| {
+                let accepted = plausible_machine_name(name);
+                if !accepted {
+                    warn!(
+                        session = %session_id,
+                        machine = ?name,
+                        "refused an unusable machine name from the worker"
+                    );
+                }
+                accepted
+            }),
             snapshot_commit: req.snapshot_commit,
             source_revision,
             controller: None,
@@ -301,6 +314,10 @@ impl DebugSessionRegistry {
             paused_seconds: banked,
         };
 
+        // History and lease carry over, verdict state does not: a new pause
+        // must not inherit a `continue`/`abort` that was issued (and possibly
+        // never picked up) during the previous one, or the worker's first poll
+        // would resume the job the operator has not answered for.
         let mut record = SessionRecord {
             session: session.clone(),
             request_id,
@@ -439,6 +456,20 @@ impl DebugSessionRegistry {
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if let Some(previous) = record.completed_ops.get(&req.request_id) {
             return Ok(previous.clone());
+        }
+        // A session that reached a terminal state stays terminal. `close`
+        // deliberately keeps a `resumed` record (with its lease) so a
+        // reconnecting controller can still read what happened, which leaves
+        // that record reachable through this mutation path. Without the guard
+        // a controller could rewrite the outcome of a finished session: flip a
+        // `resumed` or `aborted` session back to `retrying`, publish a verdict
+        // no worker will ever consume, and re-enter the open-session set that
+        // `list` and the reaper read.
+        if !record.session.state.is_open() {
+            return Err(format!(
+                "session is already {} and can no longer be mutated",
+                record.session.state.as_str()
+            ));
         }
         let (lease_id, controller, capabilities) = record
             .controller_lease
@@ -588,14 +619,43 @@ impl DebugSessionRegistry {
         Ok(response)
     }
 
-    /// Deliver a pending verdict to the worker, closing the paused interval.
+    /// Deliver the session's pending verdict to the worker.
     ///
-    /// Consuming the verdict is what banks the paused duration — the job
-    /// resumes executing at this instant, so timeout accounting resumes too.
+    /// The first delivery of a verdict closes the paused interval — the job
+    /// resumes executing at that instant, so timeout accounting resumes too —
+    /// and `paused_since` is consumed there, so later polls cannot bank the
+    /// same interval twice.
+    ///
+    /// Delivery is not take-and-forget for every verdict. A `retry` is consumed
+    /// by pickup: replaying it would re-run steps the controller asked to run
+    /// once. `continue` and `abort` stay pending and are delivered on every poll
+    /// until the worker closes the session (which it does after acting on the
+    /// verdict, making a redelivery idempotent); a lost HTTP response then costs
+    /// a repeat, rather than turning an issued verdict into "no decision" —
+    /// which would keep the failed conclusion, or pause again on the next
+    /// failure. `close` drops whatever is left.
+    ///
+    /// A session that reached a terminal state without a verdict answers `None`,
+    /// exactly like one that no longer exists: the worker treats that as "the
+    /// server dropped the session" and resumes, which is the only signal that
+    /// ends its long poll. `close` deliberately keeps a terminal record (with
+    /// its lease) so a reconnecting controller can read the outcome, but a
+    /// *poll* against that record would hold the worker — and the job — forever,
+    /// because a verdict for it can never arrive. A pending verdict is delivered
+    /// whatever the state says: `continue` and `abort` move the session to the
+    /// state their verdict implies (`resumed`, `aborted`) before the worker has
+    /// collected it.
     pub fn take_verdict(&mut self, session_id: &str, now: SystemTime) -> Option<VerdictResponse> {
         let record = self.sessions.get_mut(session_id)?;
+        if record.pending_verdict.is_none() && !record.session.state.is_open() {
+            return None;
+        }
         record.worker_seen_at = now;
-        let verdict = record.pending_verdict.take();
+        let verdict = match record.pending_verdict {
+            Some(Verdict::Retry) => record.pending_verdict.take(),
+            Some(pending @ (Verdict::Continue | Verdict::Abort)) => Some(pending),
+            None => None,
+        };
         if verdict.is_some() {
             record.bank_paused(now);
         }
@@ -620,6 +680,11 @@ impl DebugSessionRegistry {
                 .is_some();
         if let Some(record) = self.sessions.get_mut(session_id) {
             record.bank_paused(now);
+            // The worker has acted on whatever was pending (or the session
+            // ended for another reason): nothing may be redelivered to a later
+            // poll, and nothing may leak into the next pause of this job.
+            record.pending_verdict = None;
+            record.pending_retry_from_step = None;
             record.session.state = state;
             record.session.version += 1;
             record.push_event("session_closed", None, Some(state.as_str().to_owned()));
@@ -1627,6 +1692,254 @@ mod tests {
         assert_eq!(
             registry.open(8, ok, at(0)).workspace.as_deref(),
             Some("/home/runner/work/repo/repo")
+        );
+    }
+
+    #[test]
+    fn a_machine_name_that_is_not_a_name_is_refused() {
+        let mut registry = DebugSessionRegistry::default();
+        // A controller joins this into `$PRELOOP_HOME/state/debug/<machine>`
+        // and passes it to the guest tooling as an argument, so a traversal,
+        // an absolute path, a flag, a control character, a separator and a
+        // leading dot are all refused.
+        let long_name = "a".repeat(64);
+        for hostile in [
+            "../../../../.zshrc",
+            "/tmp/elsewhere",
+            "..",
+            ".",
+            "-name",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "with space",
+            "line\nbreak",
+            "nul\0byte",
+            "host:/x",
+            "a:b",
+            ".hidden",
+            long_name.as_str(),
+        ] {
+            let mut request = test_open_request(RunId::new(), JobId(hostile.to_owned()));
+            request.machine = Some(hostile.to_owned());
+            let session = registry.open(7, request, at(0));
+            assert_eq!(
+                session.machine, None,
+                "machine name {hostile:?} must not survive the session door"
+            );
+        }
+
+        // The names that must pass: what the VM layer mints, an external
+        // runner's hostname, and a 63-byte name (the length ceiling itself).
+        let longest = "a".repeat(63);
+        for (index, acceptable) in [
+            "preloop-runner-0",
+            "preloop-runner-0-1",
+            "my_runner",
+            "box.local",
+            longest.as_str(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut ok = test_open_request(RunId::new(), JobId(acceptable.to_owned()));
+            ok.machine = Some(acceptable.to_owned());
+            assert_eq!(
+                registry
+                    .open(index as i64 + 8, ok, at(0))
+                    .machine
+                    .as_deref(),
+                Some(acceptable),
+                "machine name {acceptable:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_session_refuses_operations_and_stops_the_poll() {
+        // A controller holds the lease across the worker's close, which is what
+        // retains the record for a reconnecting reader.
+        let (mut registry, id) = registry_with_session();
+        ctrl(&mut registry, &id, SessionOperation::Continue);
+        // The worker collects the verdict and only then reports the close, in
+        // that order, exactly as `pause` does.
+        assert_eq!(
+            registry.take_verdict(&id, at(2)).expect("verdict").verdict,
+            Some(Verdict::Continue)
+        );
+        let lease = registry
+            .acquire_controller_lease(
+                &id,
+                &SessionLeaseRequest {
+                    controller: "reader".to_owned(),
+                    capabilities: Vec::new(),
+                },
+            )
+            .expect("lease");
+        registry.close(&id, SessionState::Resumed, at(10));
+        let version = registry.get(&id).expect("retained").session.version;
+        assert_eq!(registry.list().len(), 0, "a closed session is not open");
+        let audit_before = registry.session_audit(&id).expect("audit").len();
+
+        let refused = registry.session_operation(
+            &id,
+            SessionOperationRequest {
+                request_id: "after-close".to_owned(),
+                expected_version: version,
+                lease_id: lease.lease_id,
+                operation: SessionOperation::Retry {
+                    revert: Default::default(),
+                    source_revision: None,
+                },
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "a resumed session must refuse a retry, got {refused:?}"
+        );
+        assert_eq!(
+            registry.get(&id).expect("retained").session.version,
+            version
+        );
+        assert!(registry.list().is_empty(), "no phantom open session");
+        assert_eq!(
+            registry.session_audit(&id).expect("audit").len(),
+            audit_before,
+            "a refused operation is not a mutation"
+        );
+
+        // The worker's poll must end too: it is the only signal that resumes
+        // the job, and a verdict for a closed session can never arrive.
+        assert!(
+            registry.take_verdict(&id, at(11)).is_none(),
+            "a closed session must not hold the worker's poll open"
+        );
+    }
+
+    #[test]
+    fn a_pending_verdict_survives_the_terminal_state_it_implies() {
+        // `continue` and `abort` move the session to a terminal state before
+        // the worker collects the verdict, so delivery cannot be gated on the
+        // session still being open.
+        for (operation, state, verdict) in [
+            (SessionOperation::Continue, "resumed", Verdict::Continue),
+            (SessionOperation::Abort, "aborted", Verdict::Abort),
+        ] {
+            let (mut registry, id) = registry_with_session();
+            ctrl(&mut registry, &id, operation);
+            assert_eq!(
+                registry.get(&id).expect("session").session.state.as_str(),
+                state
+            );
+            let delivered = registry
+                .take_verdict(&id, at(5))
+                .expect("a pending verdict is delivered");
+            assert_eq!(delivered.verdict, Some(verdict));
+        }
+    }
+
+    #[test]
+    fn a_terminal_verdict_is_redelivered_until_the_worker_closes() {
+        for (operation, expected, closed_as) in [
+            (
+                SessionOperation::Continue,
+                Verdict::Continue,
+                SessionState::Resumed,
+            ),
+            (
+                SessionOperation::Abort,
+                Verdict::Abort,
+                SessionState::Aborted,
+            ),
+        ] {
+            let (mut registry, id) = registry_with_session();
+            // A reader holds the lease across the close, which is what keeps
+            // the record after it.
+            let lease = registry
+                .acquire_controller_lease(
+                    &id,
+                    &SessionLeaseRequest {
+                        controller: "reader".to_owned(),
+                        capabilities: Vec::new(),
+                    },
+                )
+                .expect("lease");
+            registry
+                .session_operation(
+                    &id,
+                    SessionOperationRequest {
+                        request_id: "verdict-1".to_owned(),
+                        expected_version: lease.session_version,
+                        lease_id: lease.lease_id,
+                        operation,
+                    },
+                )
+                .expect("operation");
+
+            // The worker may have missed the first response (the connection
+            // died after the server recorded the delivery): the verdict has to
+            // come back on the next poll, because "no decision" keeps the
+            // failed conclusion instead of accepting it — or, for `abort`,
+            // pauses again on the next failure.
+            let first = registry.take_verdict(&id, at(10)).expect("poll");
+            assert_eq!(first.verdict, Some(expected));
+            let second = registry.take_verdict(&id, at(20)).expect("poll");
+            assert_eq!(second.verdict, Some(expected));
+            // Redelivery must not re-bank the pause: the clock stopped at the
+            // first delivery.
+            assert_eq!(registry.paused_for_request(7, at(60)).as_secs(), 10);
+
+            // The worker acts on the verdict and reports the close; the next
+            // poll has no session to wait on any more.
+            registry.close(&id, closed_as, at(30));
+            assert!(
+                registry.take_verdict(&id, at(40)).is_none(),
+                "close must clear the verdict so the next poll sees a closed session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retry_verdict_is_consumed_by_its_first_pickup() {
+        let (mut registry, id) = registry_with_session();
+        ctrl(
+            &mut registry,
+            &id,
+            SessionOperation::Retry {
+                revert: Default::default(),
+                source_revision: None,
+            },
+        );
+        let delivered = registry.take_verdict(&id, at(10)).expect("poll");
+        assert_eq!(delivered.verdict, Some(Verdict::Retry));
+        // Replaying a retry would re-run the failed step, so it is consumed by
+        // the pickup; the session is still open (retrying) and the worker's
+        // next poll is an ordinary empty poll.
+        let second = registry.take_verdict(&id, at(20)).expect("poll");
+        assert_eq!(second.verdict, None);
+    }
+
+    #[test]
+    fn a_reopened_session_does_not_inherit_the_previous_verdict() {
+        let mut registry = DebugSessionRegistry::default();
+        let run_id = RunId::new();
+        let job_id = JobId("build".to_owned());
+        let first = registry.open(7, test_open_request(run_id, job_id.clone()), at(0));
+        // The controller continues while the worker is between polls, so the
+        // verdict is still pending when the next failure arrives.
+        ctrl(&mut registry, &first.session_id, SessionOperation::Continue);
+
+        // The job fails again and the worker opens the next pause on the same
+        // record. The retained verdict belongs to the previous pause.
+        let second = registry.open(7, test_open_request(run_id, job_id), at(30));
+        assert_eq!(second.session_id, first.session_id);
+        assert_eq!(second.state, SessionState::Paused);
+        let poll = registry
+            .take_verdict(&second.session_id, at(40))
+            .expect("an open session answers a poll");
+        assert_eq!(
+            poll.verdict, None,
+            "a new pause must not resume on the previous pause's verdict"
         );
     }
 

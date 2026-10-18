@@ -1,14 +1,38 @@
 use super::*;
 
+use axum::Extension;
+
 #[derive(serde::Deserialize)]
 pub struct RegisterDapPortRequest {
     port: u16,
     job_id: JobId,
 }
 
+/// Publish the local port a run's DAP bridge listens on.
+///
+/// The registration is the *whole* authorization for the proxy that follows:
+/// `handle_dap_debug_socket` dials `127.0.0.1:{port}` on the engine host, so
+/// whatever registered it receives the operator's debug traffic and answers
+/// it. Two things therefore have to hold, and the runner bearer alone proves
+/// neither:
+///
+/// 1. the caller's runner must be the one serving this job — otherwise any
+///    registered runner could redirect another run's debug channel to itself,
+///    reading the debugged process's source, expressions and variable values
+///    and impersonating its debug adapter;
+/// 2. one run has one debug channel, so a registration for a different job of
+///    the same run is refused while that job is still in progress, instead of
+///    silently redirecting the channel away from the job already being
+///    debugged.
+///
+/// A registration for the *same* job always replaces: the job is handed off
+/// between runners (reclaim after runner loss) while the map still holds the
+/// old runner's entry, and only the current owner may register. A registration
+/// whose job already finished is stale and is replaced too.
 pub async fn register_dap_port(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
+    Extension(caller): Extension<RunnerIdentity>,
     Json(payload): Json<RegisterDapPortRequest>,
 ) -> Result<StatusCode, ApiError> {
     if payload.port < 1024 {
@@ -16,6 +40,9 @@ pub async fn register_dap_port(
             "DAP port must be an unprivileged local port",
         ));
     }
+    let caller_runner_id = caller
+        .runner_id
+        .ok_or_else(|| ApiError::forbidden("runner identity is required to register a DAP port"))?;
     // Backend: run + job status. Node-local: `dap_ports` registration.
     let statuses = shared
         .state
@@ -23,25 +50,53 @@ pub async fn register_dap_port(
         .run_job_statuses(run_id)
         .await
         .map_err(ApiError::from)?;
-    let (run_exists, status) = match statuses {
-        None => (false, None),
-        Some(jobs) => (
-            true,
-            jobs.into_iter()
-                .find(|(job_id, _)| *job_id == payload.job_id)
-                .map(|(_, status)| status),
-        ),
-    };
-    if !run_exists {
-        return Err(ApiError::not_found("run not found"));
-    }
-    let status = status.ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
+    let jobs = statuses.ok_or_else(|| ApiError::not_found("run not found"))?;
+    let status = jobs
+        .iter()
+        .find(|(job_id, _)| *job_id == payload.job_id)
+        .map(|(_, status)| *status)
+        .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
     if !matches!(status, ExecutionStatus::InProgress) {
         return Err(ApiError::bad_request(
             "DAP port can only be registered for an in-progress job",
         ));
     }
+    // The attempt records which runner claimed it; that is the machine whose
+    // DAP bridge may publish a port for this job.
+    let request = shared
+        .state
+        .backend
+        .request(crate::control::backend::RequestKey::Job(
+            run_id,
+            payload.job_id.clone(),
+        ))
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => {
+                ApiError::bad_request("job does not belong to run")
+            }
+            other => ApiError::from(other),
+        })?;
+    if request.owner_runner_id != Some(caller_runner_id) {
+        return Err(ApiError::forbidden(
+            "only the runner serving this job may register its DAP port",
+        ));
+    }
     let mut inner = shared.state.inner.lock().await;
+    // Refuse only what would take the channel away from a debug target that
+    // is still live: another job of this run whose status above says it is
+    // still running. Everything else is a replacement — the same job from a
+    // new owner, or a registration whose job is over.
+    if let Some(existing) = inner.dap_ports.get(&run_id)
+        && existing.job_id != payload.job_id
+        && jobs.iter().any(|(job_id, status)| {
+            *job_id == existing.job_id && *status == ExecutionStatus::InProgress
+        })
+    {
+        return Err(ApiError::conflict(
+            "another job of this run is already being debugged",
+        ));
+    }
     inner.dap_ports.insert(
         run_id,
         DapPortRegistration {
@@ -49,7 +104,13 @@ pub async fn register_dap_port(
             job_id: payload.job_id.clone(),
         },
     );
-    info!(%run_id, job_id = %payload.job_id, port = payload.port, "Registered DAP port");
+    info!(
+        %run_id,
+        job_id = %payload.job_id,
+        runner_id = caller_runner_id,
+        port = payload.port,
+        "Registered DAP port"
+    );
     Ok(StatusCode::OK)
 }
 

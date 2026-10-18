@@ -509,12 +509,18 @@ pub async fn require_native_bearer(
 
 pub async fn require_runner_bearer(
     State(shared): State<Arc<SharedState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     if let Some(token) = bearer_token(&request)
-        && registered_runner_id(&shared, token).await.is_some()
+        && let Some(runner_id) = registered_runner_id(&shared, token).await
     {
+        // Handlers need the proven runner id, not just a boolean: a route that
+        // publishes or consumes per-run state must be able to bind that state
+        // to the runner that owns the run (`register_dap_port`).
+        request.extensions_mut().insert(RunnerIdentity {
+            runner_id: Some(runner_id),
+        });
         return Ok(next.run(request).await);
     }
     Err(ApiError::unauthorized("runner listen token required"))

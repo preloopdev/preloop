@@ -8,6 +8,10 @@ A failed job can open one session in the same microVM. The worker owns the pause
 
 The session moves through `paused`, `attached`, and `retrying`, then ends as `resumed`, `aborted`, or `abandoned`. A single controller lease gates mutations. Observers can read the session, but only the lease holder can issue a retry, retry-from, continue, or abort operation. Every mutation carries an expected session version and a caller-generated request ID. A duplicate request ID returns the recorded response instead of executing the operation again.
 
+Continue and abort reject new operations the moment they are issued, and a session that has left the open states — `resumed`, `aborted`, or `abandoned` — answers any further operation with `400`. A rejected operation is not recorded, so its request ID can be reused; a successful one still replays its recorded response. Terminal is a state, not an immutable record: the worker's own `open` can reuse the session.
+
+Verdict delivery is at-least-once for `continue` and `abort` and consume-once for `retry`. A terminal session that holds no outstanding verdict ends the worker's poll — the poll answers `404`, which the worker reads as "resume the job" — while an issued `continue` or `abort` is redelivered on every poll until the worker reports `close`, so a lost HTTP response cannot turn the decision into "no decision". A `retry` verdict is consumed by the first poll, because replaying it would re-run steps. `close` and a re-opened session clear any retained verdict.
+
 The native controller surface is:
 
 - `GET /api/v1/debug/sessions` and `GET .../sessions/:id` for discovery;
@@ -45,7 +49,7 @@ Guest-to-host export writes a patch and applies it by default. `--patch-only` le
 
 ## Lifetime and timeout boundaries
 
-The worker must continue polling while a session is open. The server's worker-liveness window is 90 seconds. Paused duration is credited separately from ordinary job timeout accounting, with a four-hour maximum pause credit per job request. Once that credit is exhausted, normal timeout handling applies.
+The worker must continue polling while a session is open; once the session reaches a terminal state with no verdict outstanding, the poll ends and the job resumes. The server's worker-liveness window is 90 seconds. Paused duration is credited separately from ordinary job timeout accounting, with a four-hour maximum pause credit per job request. Once that credit is exhausted, normal timeout handling applies.
 
 A preserved post-mortem VM has a ten-minute idle hold after a shell or debug attachment releases it. A controller heartbeat marks an active attachment; a state-preserving backend can suspend an unattached paused guest and resume it when a controller returns. A backend that cannot preserve the live guest keeps the machine in place instead. The host-side marker remains usable even when the guest is suspended.
 
@@ -62,5 +66,7 @@ The VM is never copied wholesale into a later run. Such a copy would include cre
 Worker routes authenticate the job named by the token and return `404` for a session that belongs to another job, avoiding session-ID probing. The worker obtains its debug credential during job setup through the job runtime credential; the credential is not exposed as a workflow secret. Issuance is one-shot for a live job that requested failure preservation.
 
 Controller output uses masked logs and structured diagnostics rather than an unrestricted environment dump. Guest shell paths are validated as absolute paths without shell-active characters before interpolation. Revert paths reject absolute escapes and `..`, then canonicalize the target parent so a symlink cannot redirect removal outside the workspace. The leaf itself is removed as a link rather than resolved.
+
+Machine names are worker-asserted, and a controller uses one as a single path component under `$PRELOOP_HOME/state/debug/` and as a guest tool's `--name` or `<machine>:<path>` operand. Only `plausible_machine_name` (`preloop_gha_protocol::debug_session`) passes: ASCII letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, at most 63 bytes. The server drops a non-conforming name at the session door and logs it escaped; the CLI refuses one before any path join or guest-tool argument. The residual is shape, not identity: a worker can still assert a different, valid machine name that is not bound to the job's runner, so the name does not yet prove which machine served the job.
 
 The resulting boundary is deliberate: a controller can inspect and retry the selected job, but logs, repository files, and dependency diagnostics do not grant additional authority. The session audit records controller identity, operation, version, and result within bounded storage.

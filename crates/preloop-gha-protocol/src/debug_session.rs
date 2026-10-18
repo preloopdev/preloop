@@ -14,6 +14,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::{JobId, RunId};
 
+/// Whether `name` may serve as a guest machine name in a controller.
+///
+/// The name is worker-asserted: the worker reads it from its own environment
+/// and the server hands it back on the session projection. A controller uses
+/// it as one path component under `$PRELOOP_HOME/state/debug/` (written and
+/// heartbeated while attached) and as a guest tool's `--name` or
+/// `<machine>:<path>` operand, so only one token shape passes: ASCII letters,
+/// digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, at most
+/// 63 bytes. Every name that `preloop_vm::MachineName` produces passes; a dotted
+/// external-runner hostname passes too. Separators (`/`, `\`, `:`), a leading
+/// `-` or `.`, whitespace, control characters and anything non-ASCII do not.
+///
+/// This is the single definition: the server filters with it when a session
+/// opens and the CLI re-checks before every path join and argv use, so a rule
+/// change lands in both at once.
+pub fn plausible_machine_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && !name.contains("..")
+        && bytes
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 /// Where a session is in its lifecycle.
 ///
 /// The worker only ever observes `Paused` (it is blocked) and the terminal
@@ -614,6 +639,54 @@ impl WorkspaceDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_name_rule_accepts_and_refuses_the_right_names() {
+        // The name is worker-asserted and reaches a host path join and a guest
+        // tool's argument vector, so exactly one token shape passes: ASCII
+        // letters, digits, `-`, `_` and `.`, starting with a letter or digit,
+        // no `..`, at most 63 bytes.
+        for accepted in [
+            "a".to_owned(),
+            "A1".to_owned(),
+            "preloop-runner-0-1".to_owned(),
+            "box.local".to_owned(),
+            "my_runner".to_owned(),
+            "a-b_c.d".to_owned(),
+            "a".repeat(63),
+        ] {
+            assert!(
+                plausible_machine_name(&accepted),
+                "{accepted:?} must be usable"
+            );
+        }
+
+        for refused in [
+            String::new(),
+            "a".repeat(64),
+            "-x".to_owned(),
+            ".x".to_owned(),
+            "_x".to_owned(),
+            "a/b".to_owned(),
+            "a\\b".to_owned(),
+            "a:b".to_owned(),
+            "host:/x".to_owned(),
+            "a b".to_owned(),
+            "a\tb".to_owned(),
+            "line\nbreak".to_owned(),
+            "nul\0byte".to_owned(),
+            "a..b".to_owned(),
+            "..".to_owned(),
+            ".".to_owned(),
+            "ü".to_owned(),
+            "a\u{202e}b".to_owned(),
+        ] {
+            assert!(
+                !plausible_machine_name(&refused),
+                "{refused:?} must not be usable"
+            );
+        }
+    }
 
     #[test]
     fn open_states_hold_the_job() {

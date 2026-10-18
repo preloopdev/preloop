@@ -159,7 +159,7 @@ Acquire a lease with a caller identity, then send an operation with a request ID
 }
 ```
 
-Use `retry_from` with a zero-based `step_index`, or use `continue` and `abort`. Repeating a request ID returns its original result; a stale `expected_version` is rejected.
+Use `retry_from` with a zero-based `step_index`, or use `continue` and `abort`. Repeating a request ID returns its original result; a stale `expected_version` is rejected. Operations against a finished session (`resumed`, `aborted`, or `abandoned`) are rejected with `400`, and a new verdict needs a new pause: a closed session also stops the worker's verdict poll, so the job resumes.
 
 ## DAP prompt for an agent
 

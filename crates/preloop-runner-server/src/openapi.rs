@@ -515,12 +515,26 @@ fn run_events() {}
 
 /// Register a DAP debug port (runner-facing).
 ///
-/// Called by the runner to announce its locally-bound DAP port.
+/// Called by the runner to announce the locally-bound port of the job it is
+/// serving. Only the runner that currently owns the job attempt may register:
+/// a request from any other registered runner is refused with 403, because the
+/// registration decides which local process receives the operator's debug
+/// traffic and answers for the debug adapter.
+///
+/// One run has one DAP channel, so a registration for a different job of the
+/// same run is refused with 409 while that job is still in progress. A
+/// registration for the same job always replaces the previous one — including
+/// after the job is handed to a new runner — and a registration whose job has
+/// already finished is stale and is replaced too.
 #[utoipa::path(
     post, path = "/api/v1/runs/{run_id}/debug", tag = "Runs",
     params(("run_id" = String, Path, description = "Run UUID")),
     request_body = JsonValue,
-    responses((status = 204, description = "Port registered")),
+    responses(
+        (status = 200, description = "Port registered or replaced"),
+        (status = 403, description = "The caller is not the runner serving this job", body = ApiErrorResponse),
+        (status = 409, description = "Another job of this run is still in progress and already holds the run's DAP registration", body = ApiErrorResponse)
+    ),
     security(("runner_bearer" = []))
 )]
 fn register_dap_port() {}
