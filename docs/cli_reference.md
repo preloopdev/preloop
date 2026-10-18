@@ -292,11 +292,29 @@ allows it. It never fails init because a repository cannot be read or a secret
 is missing.
 
 For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub
-can reach. Tailscale Funnel, a Cloudflare **named** Tunnel (not a quick Tunnel,
-whose URL changes on restart), or a domain/reverse proxy are suitable; expose
-only `/api/v1/github/webhooks`. Blank means local-only App webhooks: pushes and
-pull requests will not start runs and PR checks will not report. An existing
+can reach. Answer the prompt with the URL directly; when `tailscale` is on the
+host and reports a running tailnet, its own name for the machine
+(`https://<machine>.<tailnet>.ts.net`) is offered: Enter accepts it when
+`tailscale funnel status --json` shows the webhook path as the only route this
+node publishes, and it is shown as a hint (blank still skips) when it is not
+Funnel-published or the Funnel also has other mounts. Type `-` to skip. The
+prompt also prints the way there — a Tailscale Funnel on a hostname nothing else
+serves (`tailscale funnel --set-path=/api/v1/github/webhooks --bg
+http://127.0.0.1:9090/api/v1/github/webhooks`; Funnel applies to the host and
+port, so a root mount beside it would publish the runner-registration surface
+too — check with `tailscale funnel status`), a Cloudflare **named** Tunnel (not
+a quick Tunnel, whose URL changes on restart) behind a path-filtering proxy, or
+a domain/reverse proxy; the full guide is in `docs/self-hosting.md` ("Exposure
+options"). Skipping means the App is created with webhooks off: pushes and pull
+requests will not start runs and PR checks will not report. An existing
 `--public-url` or `PRELOOP_PUBLIC_URL` is used without asking.
+
+The URL resolved here is not written to the config file: it is handed to
+whatever run mode init starts — the foreground `serve` args, or a
+`PRELOOP_PUBLIC_URL` line in the installed service's environment file — so
+Check Run detail links and the webhook health check use the address GitHub was
+given. (A kept credential — the "kept" path — resolves it from `--public-url` or
+`PRELOOP_PUBLIC_URL`, since nothing is reconfigured there.)
 
 The workflow report lists every `secrets.NAME` / `secrets['NAME']` reference
 (excluding engine-minted `GITHUB_TOKEN`), its file locations, and whether the
@@ -315,10 +333,10 @@ value.
 |---|---|
 | `--probe` | Print a side-effect-free capability report as JSON and exit (`arch`, `os`, `disk_free_bytes`, `data_root`, `hypervisor`, `docker`, `dockerfile_detected`, `smolvm`, `existing_config`, `credentials_configured`, `ghcr_reachable`, plus the base image `serve` would use) |
 | `--auth <app\|pat\|none>` | Credential step. `none` writes no credential (local-only engine) and leaves existing ones alone |
-| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials (with `--auth app`); without them the browser flow creates one |
+| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials (with `--auth app`); without them the browser flow creates one. With `--public-url`, this path points the App's webhook at the engine (`PATCH /app/hook/config`) instead of silently saving credentials whose hook stays inactive |
 | `--token <TOKEN>` | PAT (with `--auth pat`); falls back to `PRELOOP_GITHUB_PAT` |
 | `--org <NAME>` | Create the App under this organization |
-| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed |
+| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed. Also handed to the mode this run starts (foreground `serve`, or the installed service's environment), so Check Run links and the webhook health check use it |
 | `--port <N>`, `--no-browser`, `--webhook-secret <SECRET>` | As in `preloop setup github` |
 | `--repo <OWNER/NAME>` | Repository to verify and scan (repeatable); without it, the current checkout's origin is used |
 | `--no-secrets-scan` | Skip the workflow secret scan; the `runs-on` label report still runs |
@@ -351,17 +369,18 @@ Configure GitHub credentials.
 | Flag | Description |
 |---|---|
 | `--via <app\|pat>` | Credential type. `app` (recommended) or `pat` (fine-grained PAT, for orgs that gate App installations) |
-| *(no App flags)* | With `--via app` and no `--app-id`/`--pem-file`, creates the App through GitHub's manifest flow in your browser and stores everything |
+| *(no App flags)* | With `--via app` and no `--app-id`/`--pem-file`, creates the App through GitHub's manifest flow and stores everything. With a public URL the running engine hosts the form and stores the credentials; over SSH the listener is reached through a port forward; otherwise it is a local listener. See [setup](setup.md#option-a--github-app) |
 | `--app-id <ID>` | GitHub App ID (with `--via app`) |
 | `--pem-file <PATH>` | Path to the GitHub App private key PEM (with `--via app`) |
 | `--org <NAME>` | Create the App under an organization instead of your account |
-| `--public-url <URL>` | Enable webhook delivery to this URL. On an already-configured App, updates its webhook instead of creating a second App |
+| `--public-url <URL>` | Selects engine-hosted App setup (the running engine serves the form and receives GitHub's redirect), and enables webhook delivery to this URL. Falls back to `PRELOOP_PUBLIC_URL`. Must be on the engine's own origin when the engine has `PRELOOP_PUBLIC_URL` set, and must be `https` unless it is loopback. On an already-configured App, updates its webhook instead of creating a second App |
 | `--app-name <NAME>` | Name of the created App (default `preloop-local`; GitHub requires global uniqueness) |
-| `--port <N>` | Pin the loopback port GitHub redirects back to (default: a free port) |
+| `--port <N>` | Listener port for the local and SSH flows (default: a free port locally, `8765` over SSH, so the `ssh -L` forward has a known port) |
 | `--no-browser` | Print the URL instead of opening a browser |
 | `--webhook-secret <SECRET>` | Store a webhook secret you created yourself (the App flow gets one from GitHub automatically) |
 | `--token <TOKEN>` | PAT to store (with `--via pat`). Falls back to `PRELOOP_GITHUB_PAT`, then an interactive prompt |
-| `--repo <REPOS>` | Repository to verify the credential against (repeatable) |
+| `--repo <REPOS>` | Repository to verify the credential against (repeatable). On the engine-hosted flow the engine runs the checks with the key it just stored, after waiting up to five minutes for the App to be installed there; the CLI prints one `✓`/`✗` line per repository and exits non-zero if any failed (up to 16) |
+| `--add` | Create an additional App when one is already configured. Without it, an already-configured App is updated instead (webhook) or reported rather than duplicated |
 | `--workspace <WORKSPACE>` | Workspace whose workflows should drive the permission checklist |
 
 ## `preloop doctor [OPTIONS]`

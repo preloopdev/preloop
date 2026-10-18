@@ -4191,14 +4191,36 @@ const PARITY_MINTED_TOKEN: &str = "ghs_ParityMintedInstallationTokenAAAAAAAA";
 
 /// A broker whose GitHub App mints [`PARITY_MINTED_TOKEN`] for `owner/repo`.
 /// The guards hold the process-wide GitHub env lock and restore the env on drop.
+/// Tuple fields drop in declaration order, so the lock guard is last and
+/// [`EnvLockStillHeld`] sits between them: the env vars are restored before the
+/// lock is released.
 struct MintingBroker {
     state: AppState,
     app: Router,
     _env: (
+        crate::state::TestEnvVar,
+        crate::state::TestEnvVar,
+        EnvLockStillHeld,
         tokio::sync::MutexGuard<'static, ()>,
-        crate::state::TestEnvVar,
-        crate::state::TestEnvVar,
     ),
+}
+
+/// Asserts, on drop, that the process-wide GitHub env lock is still held.
+///
+/// [`MintingBroker`] drops it between its env guards and its lock guard, so
+/// releasing `GITHUB_ENV_LOCK` first — the order this fixture had before the fix
+/// — fails here instead of letting a concurrently scheduled test set its own
+/// base and then have it clobbered by this fixture's late restore.
+struct EnvLockStillHeld;
+
+impl Drop for EnvLockStillHeld {
+    fn drop(&mut self) {
+        assert!(
+            crate::state::GITHUB_ENV_LOCK.try_lock().is_err(),
+            "MintingBroker released GITHUB_ENV_LOCK before its TestEnvVar guards \
+             restored the environment"
+        );
+    }
 }
 
 async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
@@ -4234,7 +4256,7 @@ async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
     MintingBroker {
         state,
         app,
-        _env: (env_lock, api_url, pat),
+        _env: (api_url, pat, EnvLockStillHeld, env_lock),
     }
 }
 

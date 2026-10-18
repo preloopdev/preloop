@@ -1373,9 +1373,10 @@ async fn download_prebaked_golden_with_space(
         }
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(GOLDEN_DOWNLOAD_TIMEOUT),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(error) => {
@@ -1720,9 +1721,10 @@ async fn download_oci_golden(
         warn!(reference, "invalid OCI golden reference");
         return Ok(false);
     };
-    let client = match reqwest::Client::builder()
-        .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(GOLDEN_DOWNLOAD_TIMEOUT),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(error) => {
@@ -5052,9 +5054,10 @@ async fn notify_runner_gone(config: &RunnerPoolConfig, name: &MachineName) {
         "{}/api/v1/runners/purge",
         config.server_url.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
-        .build()
+    let client = match preloop_runner_server::shared_http::with_tls_roots(
+        reqwest::Client::builder().timeout(std::time::Duration::from_millis(1500)),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(_) => return,
@@ -13633,7 +13636,13 @@ mod golden_download_tests {
         .await;
         let api_base = url.trim_end_matches("/golden").to_owned();
 
-        let tag = resolve_latest_golden_tag(&reqwest::Client::new(), &api_base).await;
+        let tag = resolve_latest_golden_tag(
+            &preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+                .build()
+                .unwrap(),
+            &api_base,
+        )
+        .await;
 
         assert_eq!(
             tag.as_deref(),
@@ -13674,7 +13683,12 @@ mod golden_download_tests {
             move |offset| {
                 let url = url.clone();
                 Box::pin(async move {
-                    let mut request = reqwest::Client::new().get(&url);
+                    let mut request = preloop_runner_server::shared_http::with_tls_roots(
+                        reqwest::Client::builder(),
+                    )
+                    .build()
+                    .unwrap()
+                    .get(&url);
                     if offset > 0 {
                         request =
                             request.header(reqwest::header::RANGE, format!("bytes={offset}-"));

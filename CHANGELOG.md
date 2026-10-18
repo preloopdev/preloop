@@ -10,6 +10,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or
+  `PRELOOP_PUBLIC_URL`), `preloop setup github --via app` asks the running
+  engine to host the App-creation form. The CLI prints a single-use setup link
+  that expires in ten minutes. The engine serves the form at `/setup/github`,
+  converts GitHub's code at `/setup/github/callback`, and stores the credentials
+  the same way the CLI does, so the browser never needs a route back to a
+  laptop. The routes answer 404 unless a setup is in progress. New endpoints:
+  `POST /api/v1/github/setup-sessions` and
+  `GET /api/v1/github/setup-sessions/{id}`, both with the system token.
+
+- **App setup over SSH.** Without a public URL, an SSH session binds the
+  loopback listener on port 8765 (or `--port`) and prints the `ssh -L` command
+  to run on your laptop, then the address to open. The redirect path is the
+  same as the local flow.
+
 - **Install preloop with mise.** `mise use -g github:preloopdev/preloop` installs
   the release CLI for macOS and Linux (x86_64 and aarch64). mise checks the
   release digest and GitHub artifact attestation. Pin a release with
@@ -25,6 +40,11 @@ Releases before v0.27.0 predate the changelog.
   missing workflow secrets, and report every `runs-on` label against the
   engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
   `--json` includes the URL, secret, and runner-label decisions.
+  It accepts the tailnet name it detects on the host when a Funnel publishes
+  only the webhook path there (showing the Tailscale Funnel / named Cloudflare
+  Tunnel setup, and checking `tailscale funnel status`), and carries the URL
+  into the run mode it starts — foreground `serve`, or the installed service's
+  environment — so Check Run links and the webhook health check use it.
 
 ### Changed
 
@@ -60,7 +80,89 @@ Releases before v0.27.0 predate the changelog.
   kept in the keychain are copied into the file store the first time they are
   read; the keychain entry is left in place.
 
+- **`$BROWSER` is honored when the CLI opens a page.** It is tried first, as
+  `xdg-open` reads it, so VS Code and Cursor remote terminals open GitHub's
+  setup page on your laptop and forward its port. The platform opener remains
+  the fallback. Entries are parsed with shell-style quoting, so a helper whose
+  path or arguments contain spaces launches, and no entry is waited on — a
+  foreground browser can no longer hold the page it is waiting for.
+
+- **Engine-hosted App setup runs `--repo` checks.** The engine waits (up to
+  five minutes, shared across the list) for the App to be installed on each
+  requested repository, verifies the new credentials there, and reports one
+  `✓`/`✗` line per repository through the session status; the CLI prints them
+  and exits non-zero when a check failed, exactly like the loopback flow's
+  `doctor`. Up to 16 repositories per setup.
+
 ### Fixed
+
+- **Converted App credentials are `SecretString` end to end.** The private key
+  and webhook secret GitHub returns are deserialized into `SecretString`, so
+  formatting or logging either one redacts it; the plaintext is exposed only
+  where it is written through the credential store. A conversion that GitHub
+  rejects no longer puts the upstream response body into the error the CLI
+  prints.
+
+- **GitHub App installation links follow the configured GitHub host.** The
+  slug-based installation URL is built from the same web root the App was
+  created on, so a GitHub Enterprise Server engine no longer sends the operator
+  to `github.com`.
+
+- **Engine-hosted setup no longer races, clobbers, or duplicates.**
+  - A setup session that is converting, or holding a result its CLI has not
+    read yet, is no longer replaced by a second setup: the CLI that was waiting
+    gets its result instead of a 404 while its App exists on GitHub.
+  - App credential writes take the same whole-file config lock as the secrets
+    and execution-protection APIs, so an overlapping write can no longer erase
+    the other's change.
+  - The engine refuses to create a second App when its own config already has
+    one (the CLI's duplicate check cannot see a remote engine's config) and
+    reports the App id instead; `--add` still creates an additional App.
+  - The engine checks that its config loads and its credential store can hold
+    the key before GitHub creates anything, so a key that could not be stored
+    is reported before the App exists rather than after. A store selected with
+    `PRELOOP_CREDENTIAL_STORE=memory` is refused outright: it holds the key for
+    this process only, while the flow's next step is the restart that would
+    lose it.
+  - A setup is refused when `--public-url` names an origin other than the
+    engine's own `PRELOOP_PUBLIC_URL`, and plain `http` is refused outside
+    loopback: the one-time link and GitHub's redirect carry the App's token and
+    code.
+
+- **Refused setup guesses no longer end a live App setup.** The browser-facing
+  `/setup/github` route is unauthenticated, and five wrong tokens used to fail
+  the session outright — which made an onlooker's guesses a way to cancel a
+  setup that was in progress. A mismatch is now refused and logged without
+  touching the session; the one-time token is still burned the moment it is
+  used, and the request budget still caps how fast anyone can guess.
+
+- **A spent setup budget no longer gates the operator's own request.** The
+  browser-facing setup routes billed every request to one shared window before
+  the token or state was checked, so any unauthenticated caller could spend it
+  guessing and the operator's own setup link — or GitHub's redirect with the
+  App's code — was answered 429 while a setup was open. The token and state
+  checks now run first and only a refusal is charged, so the operator's request
+  is never gated; the form and the callback each have their own window, so
+  neither route's guessing can spend the other's. A burst of invalid requests
+  still reads 404 (or 400 for a forged callback) up to the window's limit and
+  429 after it, and an inactive session still reads 404.
+
+- **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
+  effective public URL is resolved before the already-configured-App branch, so
+  setting it in the environment (without `--public-url`) points the configured
+  App's webhook at that address instead of printing only that it is configured.
+- **A hung OS keychain or trust daemon no longer freezes the engine.** On
+  macOS, outbound TLS verified every new connection through
+  `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked
+  behind an unanswered keychain unlock dialog, every engine thread blocked with
+  it, `/healthz` included, until someone dismissed the dialog. Outbound TLS
+  (GitHub, downloads, Postgres) now verifies in-process against a root set read
+  once per process: the bundled Mozilla roots, the OS store's certificates
+  (read with a 5 s deadline), and `PRELOOP_GITHUB_CA_FILE` / `SSL_CERT_FILE`.
+  Every OS credential-store call (Keychain, Secret Service, Credential Manager)
+  gets a 10 s deadline, and after one unanswered call the store is treated as
+  unavailable for the rest of the process. Platform revocation checks no longer
+  apply; a CA added to the OS store is picked up on restart.
 
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
@@ -72,6 +174,14 @@ Releases before v0.27.0 predate the changelog.
   with fewer mounts), with the raw smolvm output appended. Previously this was
   indistinguishable from a held or corrupt disk image, and the pool restarted
   forever without naming the cause.
+- **`preloop setup github --app-id --pem-file` enables the App webhook.** The
+  manual App path saved credentials and stopped there, so an App configured
+  with `--public-url` kept a webhook that delivered nowhere: pushes and pull
+  requests never started runs. It now points the hook at the engine (reusing
+  the stored webhook secret), and a GitHub refusal is fatal and says plainly
+  that the credentials were saved but the hook still delivers nowhere. Setup
+  also says the App's webhook must be **Active** for pushes and pull requests
+  to arrive, and where to tick it: GitHub's API cannot set that flag.
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 - **Job `env:` and reusable-call `secrets:` maps read the claim-minted `GITHUB_TOKEN`.**
