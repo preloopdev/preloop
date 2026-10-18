@@ -6,3 +6,4 @@ pub mod broker;
 pub mod http;
 pub mod results;
 pub mod run_service;
+pub mod tls;

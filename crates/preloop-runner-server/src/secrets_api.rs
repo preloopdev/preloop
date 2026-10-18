@@ -249,10 +249,39 @@ pub async fn set_secret(
     // execution-protection rules) from publishing a document built from a
     // stale read over this one, and it is held across synchronous work only.
     let _mutation = shared.state.secret_mutation.lock().await;
+    let shared_for_section = shared.clone();
+    let repo = body.repo.clone();
+    let env = body.env.clone();
+    // The load reaches the OS credential store for the `[secrets]` sealing key
+    // and the write may seal values there; both are bounded by
+    // `credential_store`'s 10 s guard, so the whole locked section runs on the
+    // blocking pool (`config_mutation` cannot span an await) instead of
+    // parking an async worker.
+    crate::config_blocking::run_section(
+        "secret set (config file / OS credential store)",
+        move || set_secret_locked(&shared_for_section, repo, env, name, value),
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("{error:#}")))??;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The synchronous critical section of [`set_secret`].
+///
+/// Runs under the caller's `secret_mutation` guard and takes `config_mutation`
+/// itself, so the load → mutate → persist → publish sequence is one critical
+/// section even though it is executed on the blocking pool.
+fn set_secret_locked(
+    shared: &Arc<SharedState>,
+    repo: Option<String>,
+    env: Option<String>,
+    name: String,
+    value: String,
+) -> Result<(), ApiError> {
     let _config_mutation = crate::config::config_mutation_lock().lock();
     let mut config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
-    match (&body.repo, &body.env) {
+    match (&repo, &env) {
         (Some(repo), Some(env)) => {
             config
                 .env_secrets
@@ -261,9 +290,6 @@ pub async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name.clone(), value.clone());
-            // No environment registry to update: environments are created
-            // on demand by `environment:` (GitHub semantics), so storing a
-            // secret for one only defines that environment's secret tier.
         }
         (Some(repo), None) => {
             config
@@ -285,7 +311,7 @@ pub async fn set_secret(
     }
 
     let mut store = shared.state.secrets.write();
-    match (&body.repo, &body.env) {
+    match (&repo, &env) {
         (Some(repo), Some(env)) => {
             store
                 .env
@@ -307,7 +333,7 @@ pub async fn set_secret(
         }
         (None, Some(_)) => unreachable!("env without repo rejected above"),
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }
 
 /// Remove a stored secret. 404 when the name is not stored in that scope.
@@ -354,6 +380,30 @@ pub async fn delete_secret(
     // deleted name in the file. Lock order: `secret_mutation` → `secrets`,
     // with `config_mutation` innermost.
     let _mutation = shared.state.secret_mutation.lock().await;
+    let shared_for_section = shared.clone();
+    let repo = query.repo.clone();
+    let env = query.env.clone();
+    // Same blocking-pool rationale as `set_secret`: the load may read the OS
+    // credential store for the sealing key, and `config_mutation` cannot span
+    // an await, so the whole locked section runs on the blocking pool.
+    crate::config_blocking::run_section(
+        "secret delete (config file / OS credential store)",
+        move || delete_secret_locked(&shared_for_section, repo, env, name),
+    )
+    .await
+    .map_err(|error| ApiError::internal(format!("{error:#}")))??;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The synchronous critical section of [`delete_secret`]. `NotFound` is
+/// returned as an [`ApiError`] so the handler keeps its 404 behaviour.
+fn delete_secret_locked(
+    shared: &Arc<SharedState>,
+    repo: Option<String>,
+    env: Option<String>,
+    name: String,
+) -> Result<(), ApiError> {
+    let query = SecretQuery { repo, env };
     let _config_mutation = crate::config::config_mutation_lock().lock();
     let config = crate::config::load_config_from(&shared.state.config_path)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
@@ -370,7 +420,7 @@ pub async fn delete_secret(
         if !remove_from_store(&mut store, &query, &name) {
             return Err(not_found_error(&name, &query));
         }
-        return Ok(Json(serde_json::json!({ "ok": true })));
+        return Ok(());
     }
 
     let mut config = config;
@@ -425,7 +475,7 @@ pub async fn delete_secret(
     let mut store = shared.state.secrets.write();
     let _ = scope_key;
     let _ = remove_from_store(&mut store, &query, &name);
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }
 
 /// Remove a secret from the runtime store by scope, pruning empty maps.

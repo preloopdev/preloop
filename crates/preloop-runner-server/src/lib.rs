@@ -11,6 +11,7 @@ use std::sync::Arc;
 mod check_run_outbox;
 pub mod concurrency;
 pub mod config;
+mod config_blocking;
 pub mod credential_store;
 pub mod environment_resolver;
 pub mod errors;
