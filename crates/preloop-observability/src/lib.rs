@@ -19,6 +19,7 @@
 //! - Always retain `stderr`/`journald` even when OTLP is configured.
 //! - `Debug` on config never reveals headers or credential-bearing endpoint parts.
 
+pub mod deadline;
 pub mod metrics;
 pub mod prometheus;
 pub mod status;
