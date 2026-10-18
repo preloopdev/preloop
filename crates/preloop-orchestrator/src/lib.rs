@@ -12,6 +12,9 @@ use crate::keys::{KeyPool, StagedKey};
 use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 use preloop_observability::deadline;
+use preloop_runner_server::github_breaker::{
+    BreakerOpen, GithubCredentialBucket, GithubFunnel, GithubSubsystem, send_observed_labeled,
+};
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
 /// `VmProvider` implementation can model the handshake this pool relies on.
@@ -679,6 +682,37 @@ struct GitHubRelease {
     assets: Vec<GitHubReleaseAsset>,
 }
 
+/// Send one golden-path request through the engine's GitHub funnel: the
+/// anonymous bucket (every golden lookup and transfer is unauthenticated) and
+/// the `golden` subsystem label.
+///
+/// An open breaker refuses the request here, with [`BreakerOpen`] naming the
+/// wait, and nothing reaches the network — a golden lookup must not spend its
+/// own 30 s deadline rediscovering an outage the engine already knows about.
+/// Every golden request goes through this one function so the funnel sees the
+/// whole dependency, not the one endpoint someone remembered to instrument.
+async fn golden_send(
+    github: &GithubFunnel,
+    request: reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    send_observed_labeled(
+        &github.breakers,
+        GithubCredentialBucket::Anonymous,
+        &github.consumption,
+        GithubSubsystem::Golden,
+        request,
+    )
+    .await
+}
+
+/// Whether `error` is the breaker refusing a call, rather than a call that
+/// happened and failed. Distinguishing the two is what keeps a refusal out of
+/// the tag cache: the refusal is not a verdict about the release, it expires
+/// with the breaker's own window.
+fn refused_by_breaker(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BreakerOpen>().is_some()
+}
+
 /// Newest published release whose assets carry the packed golden for this
 /// architecture.
 ///
@@ -689,7 +723,11 @@ struct GitHubRelease {
 /// Best effort: any failure returns `None` and the caller falls through to the
 /// `latest` redirect. `client` must carry [`GOLDEN_METADATA_TIMEOUT`]; a listing
 /// under the download budget would let a stalled API hold start for an hour.
-async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> Option<String> {
+async fn resolve_latest_golden_tag(
+    client: &reqwest::Client,
+    api_base: &str,
+    github: &GithubFunnel,
+) -> Option<String> {
     static CACHE: std::sync::OnceLock<GoldenTagCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some((fetched_at, tag)) = cache.lock().await.get(api_base)
@@ -699,11 +737,13 @@ async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> 
     }
 
     let url = format!("{api_base}/repos/preloopdev/preloop/releases?per_page=30");
-    let releases = match client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
+    let releases = match golden_send(
+        github,
+        client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json"),
+    )
+    .await
     {
         Ok(response) if response.status().is_success() => {
             match response.json::<Vec<GitHubRelease>>().await {
@@ -717,6 +757,16 @@ async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> 
         Ok(response) => {
             info!(status = %response.status(), "golden release lookup unavailable");
             Vec::new()
+        }
+        Err(error) if refused_by_breaker(&error) => {
+            // The breaker already proved GitHub is down and nothing was sent:
+            // report the refusal, and do not cache it — a negative entry would
+            // outlive the breaker's own window (five minutes against a base
+            // open of thirty seconds) and park the lookup after recovery. The
+            // caller still falls through to the `latest` redirect for the
+            // transfer itself.
+            warn!(%error, "golden release lookup skipped: GitHub circuit breaker is open");
+            return None;
         }
         Err(error) => {
             info!(%error, "golden release lookup failed");
@@ -1439,14 +1489,22 @@ pub(crate) fn official_boot_image() -> Option<&'static str> {
 async fn download_prebaked_golden(
     payload: &Path,
     release_version: &str,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
-    download_prebaked_golden_with_space(payload, release_version, filesystem_available_space).await
+    download_prebaked_golden_with_space(
+        payload,
+        release_version,
+        filesystem_available_space,
+        github,
+    )
+    .await
 }
 
 async fn download_prebaked_golden_with_space(
     payload: &Path,
     release_version: &str,
     available_space: AvailableSpace,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     // An exported-but-blank `PRELOOP_GOLDEN_URL` must behave like an unset
     // one in both places below: the operator otherwise gets neither the OCI
@@ -1464,7 +1522,7 @@ async fn download_prebaked_golden_with_space(
             .filter(|value| !value.trim().is_empty())
             .or_else(|| default_golden_oci_ref().map(str::to_owned));
         if let Some(reference) = reference {
-            if download_oci_golden(payload, &reference, available_space).await? {
+            if download_oci_golden(payload, &reference, available_space, github).await? {
                 return Ok(true);
             }
             info!(reference, "OCI golden unavailable; trying release asset");
@@ -1490,7 +1548,7 @@ async fn download_prebaked_golden_with_space(
     // common case needs no API call, and an unauthenticated lookup is rate
     // limited.
     let resolved_tag = if forced_url.is_none() {
-        resolve_latest_golden_tag(&metadata, GITHUB_API_BASE).await
+        resolve_latest_golden_tag(&metadata, GITHUB_API_BASE, github).await
     } else {
         None
     };
@@ -1508,8 +1566,16 @@ async fn download_prebaked_golden_with_space(
         // `linux-amd64`/`linux-arm64` assets we release ourselves are the only
         // source allowed to skip verification (a missing sidecar there is an
         // accident, and refusing would strand every host that updates first).
-        if download_release_asset(&client, &metadata, &url, payload, available_space, mirror)
-            .await?
+        if download_release_asset(
+            &client,
+            &metadata,
+            &url,
+            payload,
+            available_space,
+            mirror,
+            github,
+        )
+        .await?
         {
             return Ok(true);
         }
@@ -1528,6 +1594,7 @@ async fn download_release_asset(
     payload: &Path,
     available_space: AvailableSpace,
     require_checksum: bool,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     // Fetch the companion checksum before committing bandwidth to the body.
     // A truncated or corrupted golden only fails much later, when a VM tries
@@ -1545,7 +1612,7 @@ async fn download_release_asset(
         Some(sha256) => Some(sha256),
         None => match tokio::time::timeout(
             Duration::from_secs(15),
-            metadata.get(format!("{url}.sha256")).send(),
+            golden_send(github, metadata.get(format!("{url}.sha256"))),
         )
         .await
         {
@@ -1568,7 +1635,7 @@ async fn download_release_asset(
         }
         warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
     }
-    let probe = match client.get(url).send().await {
+    let probe = match golden_send(github, client.get(url)).await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             info!(
@@ -1590,16 +1657,17 @@ async fn download_release_asset(
     let downloaded_bytes = {
         let client = client.clone();
         let url = url.to_owned();
+        let github = github.clone();
         download_golden_with_resume(&partial, "release", None, Some(probe), move |offset| {
             let client = client.clone();
             let url = url.clone();
+            let github = github.clone();
             Box::pin(async move {
                 let mut request = client.get(&url);
                 if offset > 0 {
                     request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
                 }
-                request
-                    .send()
+                golden_send(&github, request)
                     .await
                     .map_err(|error| format!("request failed: {error}"))
             }) as BoxFuture<'static, Result<reqwest::Response, String>>
@@ -1820,6 +1888,7 @@ async fn download_oci_golden(
     payload: &Path,
     reference: &str,
     available_space: AvailableSpace,
+    github: &GithubFunnel,
 ) -> Result<bool, OrchestratorError> {
     let Ok(oci) = OciReference::parse(reference) else {
         warn!(reference, "invalid OCI golden reference");
@@ -1845,7 +1914,7 @@ async fn download_oci_golden(
     // under an OCI index, so the digest/tags resolve to one indirection. The
     // shared client follows that one level, taking the first listed manifest
     // (our packs publish exactly one platform entry).
-    let resolved = match get_manifest(&metadata, &oci, MANIFEST_ACCEPT, None).await {
+    let resolved = match get_manifest(&metadata, &oci, MANIFEST_ACCEPT, None, Some(github)).await {
         Ok(resolved) => resolved,
         Err(error) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
@@ -1891,10 +1960,12 @@ async fn download_oci_golden(
         let client = client.clone();
         let blob_url = blob_url.clone();
         let repository = oci.repository.clone();
+        let github = github.clone();
         download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
             let client = client.clone();
             let url = blob_url.clone();
             let repository = repository.clone();
+            let github = github.clone();
             Box::pin(async move {
                 crate::oci::registry_get(
                     &client,
@@ -1903,6 +1974,7 @@ async fn download_oci_golden(
                     "*/*",
                     None,
                     (offset > 0).then_some(offset),
+                    Some(&github),
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -3207,6 +3279,18 @@ pub struct RunnerPoolConfig {
     /// deregisters them at teardown; `None` (tests, legacy callers) skips
     /// the wiring.
     pub observability: Option<preloop_observability::Observability>,
+    /// The engine's outbound-GitHub funnel (breaker registry + accounting).
+    ///
+    /// The embedding engine (`bootstrap::serve` via the CLI) supplies its own,
+    /// so the golden release listing, the OCI manifest/token lookups, the
+    /// `.sha256` sidecars and the golden transfers themselves resolve through
+    /// the same per-credential breakers as every other GitHub call in the
+    /// process: a GitHub outage discovered by the webhook path must refuse the
+    /// pool's first lookup instead of being rediscovered with a fresh 30 s
+    /// wait. `None` (a one-shot CLI bake, tests) makes the pool keep a private
+    /// funnel — the same protection, with no engine to share it with — rather
+    /// than let a GitHub call go unobserved.
+    pub github: Option<preloop_runner_server::github_breaker::GithubFunnel>,
 }
 
 /// How many environment goldens the host can retain alongside the pool's
@@ -3513,6 +3597,10 @@ pub enum OrchestratorError {
 pub struct RunnerPool<P: VmProvider = SmolVmProvider> {
     provider: Arc<P>,
     config: RunnerPoolConfig,
+    /// The funnel every golden GitHub and registry call is admitted through:
+    /// the engine's shared one when [`RunnerPoolConfig::github`] carries it,
+    /// a private one otherwise.
+    github: GithubFunnel,
 }
 
 /// Pull `images` into a golden so every runner forked from it starts warm.
@@ -3904,6 +3992,7 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     // Adoption first: without it every engine restart repays the golden's full
     // build or unpack (tens of GB of storage writes) before the first job.
@@ -3927,7 +4016,7 @@ async fn prepare_fork_base<P: VmProvider + 'static>(
         ));
     }
     let prepared = if provider.capabilities().file_packs {
-        unpack_golden_pack(provider, config, golden, env_spec, shutdown).await
+        unpack_golden_pack(provider, config, golden, env_spec, shutdown, github).await
     } else {
         bake_golden_in_guest(provider, config, golden, env_spec).await
     };
@@ -3973,9 +4062,10 @@ async fn unpack_golden_pack<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     let payload = artifact_payload(&config.artifact_stem, &env_spec.base);
-    ensure_golden_payload(provider, config, env_spec, &payload, shutdown).await?;
+    ensure_golden_payload(provider, config, env_spec, &payload, shutdown, github).await?;
     // smolvm's `machine create --from` consumes the SMOLPACK, not the ELF
     // launcher stub written at the payload stem. A downloaded release asset
     // IS the pack at the stem; a locally built golden leaves the pack in the
@@ -4248,6 +4338,7 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
     env_spec: &EnvironmentSpec,
     payload: &Path,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     if payload.is_file() {
         return Ok(());
@@ -4258,7 +4349,7 @@ async fn ensure_golden_payload<P: VmProvider + 'static>(
     if is_official_golden(&env_spec.base) {
         abort_preparation_if_shutting_down(shutdown)?;
         info!(payload = %payload.display(), "downloading the official golden");
-        return match download_prebaked_golden(payload, &config.release_version).await {
+        return match download_prebaked_golden(payload, &config.release_version, github).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(OrchestratorError::Config(format!(
                 "the official golden could not be downloaded for {}: no OCI image at `{}` and no \
@@ -4403,7 +4494,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     /// Construct a runner pool.
     pub fn new(provider: Arc<P>, config: RunnerPoolConfig) -> Result<Self, OrchestratorError> {
         config.validate()?;
-        Ok(Self { provider, config })
+        // The engine hands the pool the same funnel its `AppState` uses, so a
+        // GitHub outage parked by the webhook path also refuses the golden
+        // lookup. A caller with no engine (a one-shot CLI bake, tests) gets a
+        // private funnel instead: every GitHub call is still admitted by a
+        // breaker, there is just nothing outside this pool to share it with.
+        let github = config.github.clone().unwrap_or_default();
+        Ok(Self {
+            provider,
+            config,
+            github,
+        })
     }
 
     /// Prepare the immutable runner image once, then supervise all slots until cancellation.
@@ -4512,6 +4613,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     &golden,
                     &environment,
                     &shutdown,
+                    &self.github,
                 ),
             )
             .await
@@ -4610,6 +4712,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let slot_shutdown = shutdown.child_token();
             let slot_registry = golden_cache.clone();
             let slot_budget = golden_budget.clone();
+            let slot_github = self.github.clone();
             let slot_handles = PoolHandles {
                 idle: idle.clone(),
                 keys: keys.clone(),
@@ -4625,6 +4728,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_registry,
                     slot_budget,
                     slot_handles,
+                    slot_github,
                 )
                 .await
             });
@@ -4809,6 +4913,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let permit_slot = Arc::new(std::sync::Mutex::new(Some(permit)));
             let slot_semaphore = semaphore.clone();
             let slot_budget = golden_budget.clone();
+            let slot_github = self.github.clone();
 
             slots.spawn(async move {
                 let result = run_on_demand_slot(
@@ -4821,6 +4926,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     slot_handles,
                     slot_semaphore,
                     permit_slot,
+                    slot_github,
                 )
                 .await;
                 if let Err(error) = &result {
@@ -4901,7 +5007,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
     ) -> Result<(), OrchestratorError> {
         let env_spec = EnvironmentSpec::for_base(self.config.base_image.clone());
         let payload = self.config.artifact_payload();
-        ensure_golden_payload(&self.provider, &self.config, &env_spec, &payload, shutdown).await
+        ensure_golden_payload(
+            &self.provider,
+            &self.config,
+            &env_spec,
+            &payload,
+            shutdown,
+            &self.github,
+        )
+        .await
     }
 
     /// Delete every machine this pool owns that the startup adoption path
@@ -5466,6 +5580,14 @@ const DEBUG_SUSPEND_IDLE: Duration = Duration::from_secs(15);
 /// probe cadence bounds it, and one exec per interval per active machine is
 /// negligible against the guest work happening anyway.
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// A closed private funnel for tests that drive the golden download path
+/// directly: every request is admitted exactly as it was before the breaker
+/// existed, and one test's breaker state never leaks into another's.
+#[cfg(test)]
+fn test_github() -> GithubFunnel {
+    GithubFunnel::default()
+}
+
 /// Watch a machine's guest pause marker and release its pool concurrency
 /// permit for the duration of a debug-session pause.
 ///
@@ -5698,6 +5820,7 @@ async fn resolve_slot_environment<P: VmProvider + 'static>(
     golden_cache: &Arc<GoldenCache>,
     golden_budget: &GoldenBudget,
     shutdown: &CancellationToken,
+    github: &GithubFunnel,
 ) -> Result<SlotEnvironment, OrchestratorError> {
     if !config.use_fork {
         // create-per-runner path: no golden, provision fresh each time.
@@ -5739,7 +5862,7 @@ async fn resolve_slot_environment<P: VmProvider + 'static>(
                     name_prefix,
                     &fp[..12.min(fp.len())]
                 ))?;
-                prepare_fork_base(&provider, &config, &name, &env_spec, shutdown).await?;
+                prepare_fork_base(&provider, &config, &name, &env_spec, shutdown, github).await?;
                 Ok(name)
             }
         })
@@ -5787,6 +5910,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     handles: PoolHandles,
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    github: GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     // Mirror `run_slot`: once the packed golden is known-unusable, on-demand
     // slots must not attempt another environment-golden bake either — fall
@@ -5807,7 +5931,14 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     // Resolve the golden for the queued job's environment.
     let Some(resolved) = unless_shutdown(
         &shutdown,
-        resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown),
+        resolve_slot_environment(
+            &provider,
+            &config,
+            &golden_cache,
+            &golden_budget,
+            &shutdown,
+            &github,
+        ),
     )
     .await
     else {
@@ -5895,6 +6026,9 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     result
 }
 
+// Mirrors `run_on_demand_slot`'s argument list: the slot needs its own copy of
+// every shared handle plus the funnel the golden lookups go through.
+#[allow(clippy::too_many_arguments)]
 async fn run_slot<P: VmProvider + 'static>(
     provider: Arc<P>,
     config: RunnerPoolConfig,
@@ -5903,6 +6037,7 @@ async fn run_slot<P: VmProvider + 'static>(
     golden_cache: Arc<GoldenCache>,
     golden_budget: GoldenBudget,
     handles: PoolHandles,
+    github: GithubFunnel,
 ) -> Result<(), OrchestratorError> {
     let PoolHandles {
         idle,
@@ -5932,7 +6067,14 @@ async fn run_slot<P: VmProvider + 'static>(
         // half-baked machine with the rest.
         let Some(resolution) = unless_shutdown(
             &shutdown,
-            resolve_slot_environment(&provider, &config, &golden_cache, &golden_budget, &shutdown),
+            resolve_slot_environment(
+                &provider,
+                &config,
+                &golden_cache,
+                &golden_budget,
+                &shutdown,
+                &github,
+            ),
         )
         .await
         else {
@@ -10746,6 +10888,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             handles,
+            test_github(),
         ));
 
         // Wait until the slot's first provision reaches configure (i.e. the
@@ -10982,6 +11125,7 @@ fi"#,
             preparing_signal: None,
             pool_status: None,
             observability: None,
+            github: None,
         }
     }
 
@@ -11899,6 +12043,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect("golden preparation succeeds");
@@ -11938,6 +12083,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect_err("start failure aborts golden preparation");
@@ -11948,6 +12094,36 @@ fi"#,
             "a failed unpack prunes the partial extraction before returning"
         );
     }
+
+    /// The engine's shared funnel must be the one the pool spends from: a
+    /// private funnel per pool would rediscover an outage the engine's other
+    /// GitHub traffic already parked. With no funnel supplied the pool still
+    /// gets one, so no golden call can go unobserved.
+    #[test]
+    fn pool_adopts_the_supplied_github_funnel_or_mints_a_private_one() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let shared = GithubFunnel::default();
+        let mut config = test_config(false);
+        config.github = Some(shared.clone());
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+
+        let pool = RunnerPool::new(provider.clone(), config).expect("pool config validates");
+        assert!(
+            Arc::ptr_eq(&pool.github.breakers, &shared.breakers),
+            "the pool must admit golden calls through the engine's registry"
+        );
+        assert!(Arc::ptr_eq(&pool.github.consumption, &shared.consumption));
+
+        let mut config = test_config(false);
+        config.github = None;
+        let pool = RunnerPool::new(provider, config).expect("pool config validates");
+        assert!(
+            !Arc::ptr_eq(&pool.github.breakers, &shared.breakers),
+            "a pool with no engine funnel must mint its own rather than borrow one"
+        );
+    }
+
     /// Startup prunes `pack/` intermediates from every surviving pool
     /// machine — a failed unpack's residue lives inside a registered data dir
     /// the orphan sweep cannot see — and leaves foreign machines alone.
@@ -12017,7 +12193,17 @@ fi"#,
             let env_spec = env_spec.clone();
             let golden = golden.clone();
             let shutdown = shutdown.clone();
-            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+            async move {
+                prepare_fork_base(
+                    &provider,
+                    &config,
+                    &golden,
+                    &env_spec,
+                    &shutdown,
+                    &test_github(),
+                )
+                .await
+            }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -12041,6 +12227,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect("unpack proceeds once the pack fits");
@@ -12074,6 +12261,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect_err("a create that never registers still fails preparation");
@@ -12139,6 +12327,7 @@ fi"#,
                     &golden,
                     &env_spec,
                     &CancellationToken::new(),
+                    &test_github(),
                 )
                 .await
             }
@@ -12152,7 +12341,17 @@ fi"#,
             let config = config.clone();
             let shutdown = shutdown_b.clone();
             let golden = golden_b.clone();
-            async move { prepare_fork_base(&provider, &config, &golden, &env_spec, &shutdown).await }
+            async move {
+                prepare_fork_base(
+                    &provider,
+                    &config,
+                    &golden,
+                    &env_spec,
+                    &shutdown,
+                    &test_github(),
+                )
+                .await
+            }
         });
 
         unpack_a
@@ -12962,6 +13161,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            test_github(),
         )
         .await
         .unwrap();
@@ -13057,6 +13257,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             pool_handles(),
+            test_github(),
         ));
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -13137,6 +13338,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             pool_handles(),
+            test_github(),
         ));
 
         // Booting: the configure step is gated, so the slot is mid-provision
@@ -13226,6 +13428,7 @@ fi"#,
             Arc::new(GoldenCache::new(config.name_prefix.clone())),
             GoldenBudget::unbounded(),
             pool_handles(),
+            test_github(),
         ));
 
         let first = format!("{}-0-1", config.name_prefix);
@@ -13299,6 +13502,7 @@ fi"#,
             // No golden slot left on this host.
             GoldenBudget::new(0),
             pool_handles(),
+            test_github(),
         ));
 
         let runner = format!("{}-0-1", config.name_prefix);
@@ -13366,6 +13570,7 @@ fi"#,
             handles,
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(std::sync::Mutex::new(None)),
+            test_github(),
         ));
 
         let booting = wait_for_pool_status("the on-demand boot", &pool_status, |snapshot| {
@@ -13476,6 +13681,7 @@ fi"#,
             &golden,
             &env_spec,
             &CancellationToken::new(),
+            &test_github(),
         )
         .await
         .expect("the in-guest golden preparation succeeds");
@@ -13509,6 +13715,9 @@ fi"#,
 #[cfg(test)]
 mod golden_download_tests {
     use super::*;
+    use preloop_runner_server::github_breaker::{
+        BreakerConfig, GithubBreakerRegistry, GithubConsumption, GithubFailureKind,
+    };
     use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
@@ -13653,9 +13862,14 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-            .await
-            .unwrap();
+        let downloaded = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(u64::MAX),
+            &test_github(),
+        )
+        .await
+        .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
@@ -13677,9 +13891,10 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let error = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(1024))
-            .await
-            .expect_err("the download must stop when the target filesystem is full");
+        let error =
+            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(1024), &test_github())
+                .await
+                .expect_err("the download must stop when the target filesystem is full");
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         match error {
@@ -13717,9 +13932,14 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-            .await
-            .unwrap();
+        let downloaded = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(u64::MAX),
+            &test_github(),
+        )
+        .await
+        .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // The caller reads `false` as "build the golden locally", so a partial
@@ -13820,6 +14040,7 @@ mod golden_download_tests {
                 .build()
                 .unwrap(),
             &api_base,
+            &test_github(),
         )
         .await;
 
@@ -13847,7 +14068,7 @@ mod golden_download_tests {
         let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
 
         let started = tokio::time::Instant::now();
-        let tag = resolve_latest_golden_tag(&client, &api_base).await;
+        let tag = resolve_latest_golden_tag(&client, &api_base, &test_github()).await;
         let waited = started.elapsed();
 
         assert_eq!(tag, None, "a lookup that never answers resolves to no tag");
@@ -13858,6 +14079,102 @@ mod golden_download_tests {
         assert!(
             waited < GOLDEN_DOWNLOAD_TIMEOUT / 10,
             "waited {waited:?}: the lookup ran on the download budget"
+        );
+    }
+
+    /// G10: an open breaker must refuse the golden release lookup before it
+    /// reaches the network — no connection to `api_base`, and none of the 30 s
+    /// metadata deadline spent — and the same lookup, once the open window
+    /// lapses, must go out again, take the answer, and close the breaker.
+    /// (The breaker's window is a `std::time::Instant`, so this test runs on
+    /// the real clock rather than a paused one.)
+    #[tokio::test]
+    async fn open_breaker_refuses_the_golden_release_lookup_before_it_spends_the_deadline() {
+        let body = serde_json::json!([
+            {"tag_name": "v9.9.9", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let funnel = GithubFunnel {
+            breakers: Arc::new(GithubBreakerRegistry::new(BreakerConfig {
+                enabled: true,
+                // One failure trips the bucket; the window is short enough to
+                // wait out and long enough that the refusal below cannot race
+                // its expiry.
+                failure_threshold: 1,
+                base_open: Duration::from_millis(250),
+                max_open: Duration::from_millis(250),
+                probe_timeout: Duration::from_secs(5),
+            })),
+            consumption: Arc::new(GithubConsumption::default()),
+        };
+        let breaker = funnel
+            .breakers
+            .breaker_for(GithubCredentialBucket::Anonymous);
+        breaker.record_failure(&GithubFailureKind::Unavailable, "503 from api.github.com");
+        assert!(breaker.is_open(), "the anonymous bucket starts open");
+
+        let client = golden_http_client(GOLDEN_METADATA_TIMEOUT).unwrap();
+        let started = std::time::Instant::now();
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+        let waited = started.elapsed();
+        assert_eq!(tag, None, "a refused lookup resolves to no tag");
+        assert!(
+            waited < GOLDEN_METADATA_TIMEOUT / 10,
+            "the refusal waited {waited:?}: it must not spend the metadata deadline"
+        );
+        // A refusal never opens a connection, so the stub's hit count is the
+        // proof — and it stays zero after a grace period in which a wrongly
+        // sent request would have been accepted.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an open breaker must not touch GitHub"
+        );
+        assert_eq!(
+            funnel
+                .consumption
+                .snapshot()
+                .iter()
+                .find(|usage| usage.subsystem == "golden")
+                .map(|usage| usage.breaker_blocked),
+            Some(1),
+            "the refusal must be accounted under `golden`"
+        );
+
+        // The refusal must not have been cached as a negative answer: once the
+        // window lapses the lookup is admitted, the stub answers, and the
+        // breaker closes on the reachability proof.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let tag = resolve_latest_golden_tag(&client, &api_base, &funnel).await;
+        assert_eq!(tag.as_deref(), Some("v9.9.9"), "the lookup must answer");
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an admitted lookup must reach the stub"
+        );
+        assert!(
+            !breaker.is_open(),
+            "a reachable answer must close the breaker"
         );
     }
 
@@ -13950,9 +14267,14 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-            .await
-            .unwrap();
+        let downloaded = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(u64::MAX),
+            &test_github(),
+        )
+        .await
+        .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
@@ -13975,9 +14297,14 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-            .await
-            .unwrap();
+        let downloaded = download_prebaked_golden_with_space(
+            &payload,
+            "9.9.9",
+            |_| Ok(u64::MAX),
+            &test_github(),
+        )
+        .await
+        .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // A corrupted artifact must never be published as the payload: the

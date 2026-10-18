@@ -484,6 +484,7 @@ impl Fixture {
             pending_registrations: None,
             preparing_signal: None,
             observability: None,
+            github: None,
         };
         Self {
             _env_guard: env_guard,

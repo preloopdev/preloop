@@ -62,6 +62,21 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **The runner pool's golden-release GitHub calls now go through the engine's
+  circuit breaker.** `resolve_latest_golden_tag` (the `/releases` listing), the
+  OCI manifest and token lookups, the `.sha256` sidecars and the golden
+  transfers were the last GitHub calls outside it: the pool had no handle on
+  the engine's `AppState` breaker registry. `RunnerPoolConfig` now carries the
+  engine's shared funnel (the registry and its per-subsystem accounting) from
+  the CLI through `bootstrap::serve` into `AppState` and the runner pool, so
+  golden traffic is admitted on the anonymous bucket and attributed to the new
+  `golden` subsystem. A one-shot CLI bake, with no engine to share a funnel
+  with, keeps a private one instead of leaving a call unobserved. Behaviour: an
+  open breaker refuses the metadata lookup before it opens a connection — none
+  of its 30-second deadline is spent, and the refusal is not cached as a
+  negative tag — while the transfers keep their one-hour budget and only their
+  admission decision changes.
+
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked

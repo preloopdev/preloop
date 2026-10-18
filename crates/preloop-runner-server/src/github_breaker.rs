@@ -470,6 +470,34 @@ pub struct GithubBucketSnapshot {
     pub breaker: BreakerSnapshot,
 }
 
+/// One process's outbound-GitHub funnel: the breaker registry every GitHub
+/// call is admitted through, together with the recorder its spend is
+/// attributed to.
+///
+/// The two travel as one value because a call admitted by one registry but
+/// accounted in another would report a budget it never spent. [`crate::state::AppState`]
+/// holds a funnel, and so does anything outside it that talks to GitHub on the
+/// engine's behalf — the runner pool downloads the packed golden over GitHub
+/// before a VM ever boots, and that traffic must resolve through the same
+/// breakers as the webhook path or a GitHub outage is discovered once per
+/// caller again. Cloning a funnel shares it; [`GithubFunnel::default`] builds a
+/// private one, which is what a caller with no engine to share with (the
+/// standalone one-shot CLI paths, tests) gets.
+#[derive(Debug, Clone)]
+pub struct GithubFunnel {
+    pub breakers: Arc<GithubBreakerRegistry>,
+    pub consumption: Arc<GithubConsumption>,
+}
+
+impl Default for GithubFunnel {
+    fn default() -> Self {
+        Self {
+            breakers: Arc::new(GithubBreakerRegistry::default()),
+            consumption: Arc::new(GithubConsumption::default()),
+        }
+    }
+}
+
 /// Classify a GitHub response status as a dependency failure.
 ///
 /// A 403 is only a rate limit when GitHub says so — `x-ratelimit-remaining: 0`
@@ -609,6 +637,10 @@ pub enum GithubSubsystem {
     /// listing, installation reads, and installation-token minting
     /// (`github_app.rs`).
     AppAuth,
+    /// Packed-golden provisioning in the orchestrator: the release listing,
+    /// the OCI manifest and token lookups, `.sha256` sidecars, and the golden
+    /// transfers themselves (`preloop-orchestrator/src/lib.rs`).
+    Golden,
 }
 
 impl GithubSubsystem {
@@ -622,10 +654,11 @@ impl GithubSubsystem {
             GithubSubsystem::Workflows => "workflows",
             GithubSubsystem::Webhooks => "webhooks",
             GithubSubsystem::AppAuth => "app-auth",
+            GithubSubsystem::Golden => "golden",
         }
     }
 
-    const ALL: [GithubSubsystem; 8] = [
+    const ALL: [GithubSubsystem; 9] = [
         GithubSubsystem::CheckRuns,
         GithubSubsystem::Actions,
         GithubSubsystem::RefResolve,
@@ -634,6 +667,7 @@ impl GithubSubsystem {
         GithubSubsystem::Workflows,
         GithubSubsystem::Webhooks,
         GithubSubsystem::AppAuth,
+        GithubSubsystem::Golden,
     ];
 }
 
@@ -1018,7 +1052,8 @@ mod tests {
                 "snapshots",
                 "workflows",
                 "webhooks",
-                "app-auth"
+                "app-auth",
+                "golden"
             ]
         );
     }

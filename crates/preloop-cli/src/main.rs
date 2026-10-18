@@ -1450,6 +1450,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         preparing_signal: None,
         pool_status: None,
         observability: None,
+        // A one-shot bake has no engine to share a funnel with; the pool
+        // builds a private one so this download still honours the breakers.
+        github: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
     // The bake follows the engine's backend: SmolVM writes a portable
@@ -2118,6 +2121,12 @@ async fn cmd_engine(
     let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
         initial_pool_snapshot(pool_enabled),
     ));
+    // One outbound-GitHub funnel for the whole engine: the server's webhook,
+    // dispatch and check-run paths and the runner pool's golden downloads all
+    // resolve through these breakers, so a GitHub outage is discovered once
+    // and the golden lookup is refused instead of spending its own 30 s
+    // metadata deadline rediscovering it.
+    let github = preloop_runner_server::github_breaker::GithubFunnel::default();
     let pool_config = local_runner_pool_config(
         &home,
         runner_url.clone(),
@@ -2130,6 +2139,7 @@ async fn cmd_engine(
         pending_registrations.clone(),
         pool_status.clone(),
         observability.clone(),
+        Some(github.clone()),
     );
     // Report the real pool configuration: the configured warm size (or zero
     // in on-demand mode) instead of the zero-sized warm default.
@@ -2169,6 +2179,7 @@ async fn cmd_engine(
             pending_registrations: pool_available.then_some(pending_registrations),
             pool_status: Some(pool_status.clone()),
             observability: Some(observability),
+            github: Some(github),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
             store_url: args.store.clone(),
@@ -2641,6 +2652,7 @@ fn local_runner_pool_config(
     >,
     pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
     observability: preloop_observability::Observability,
+    github: Option<preloop_runner_server::github_breaker::GithubFunnel>,
 ) -> anyhow::Result<RunnerPoolConfig> {
     let control_bridge = home.join("control-bridge");
     std::fs::create_dir_all(&control_bridge)?;
@@ -2823,6 +2835,7 @@ fn local_runner_pool_config(
         preparing_signal: Some(preparing_signal),
         pool_status: Some(pool_status),
         observability: Some(observability),
+        github,
     })
 }
 
@@ -6508,6 +6521,7 @@ mod tests {
                     preloop_observability::status::PoolSnapshot::default(),
                 )),
                 preloop_observability::Observability::noop(),
+                None,
             )
             .unwrap();
             unsafe {
@@ -6595,6 +6609,7 @@ mod tests {
                     preloop_observability::status::PoolSnapshot::default(),
                 )),
                 preloop_observability::Observability::noop(),
+                None,
             )
             .unwrap();
             unsafe {

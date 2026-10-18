@@ -86,7 +86,20 @@ Invariants worth keeping:
 
 ## Layer 2 — outage circuit breaker
 
-`src/github_breaker.rs`, wired through every GitHub call on the webhook path.
+`src/github_breaker.rs`, wired through every GitHub call in the engine, not
+just the webhook path: the webhook path, dispatch auth, push-back, the
+snapshot module's anonymous forge relay, the startup schedule scan, the PAT
+scope probe, the App-manifest exchange, and the runner pool's golden
+provisioning — the release listing, OCI manifest and token lookups, `.sha256`
+sidecars, and the golden transfers. Presigned cross-host LFS downloads are the
+one deliberate exception: they are not GitHub traffic and spend no GitHub API
+budget.
+
+Breaker state is keyed per credential bucket (installation id, PAT, App id,
+anonymous), because GitHub's budgets are per credential. The runner pool
+resolves its bucket through the same registry `AppState` holds, so a GitHub
+outage the webhook path already discovered refuses the pool's next golden
+lookup instead of being rediscovered with a fresh 30-second wait.
 
 Three consecutive 5xx/transport failures open it; a `429`, or a `403` with
 `x-ratelimit-remaining: 0`, opens it immediately for exactly as long as
