@@ -20,6 +20,11 @@
 //! - Expiry kills the child, then reaps it under a short grace period. The
 //!   error names the caller's `what` and the deadline so an operator can tell
 //!   which dependency hung.
+//! - On Unix the child is placed in its own process group and expiry signals
+//!   the whole group: a killed `git fetch` takes its `index-pack`, transport,
+//!   and credential helpers with it instead of leaving them running against
+//!   the repository after the caller's lock has been released. Other platforms
+//!   signal the direct child only.
 //! - Nothing here configures environment variables. Callers apply their own
 //!   non-interactive policy (`GIT_TERMINAL_PROMPT`, `GIT_ASKPASS`, …) to the
 //!   [`Command`] they pass in.
@@ -280,9 +285,59 @@ async fn read_pipe<R: AsyncRead + Unpin>(
     Ok((captured, truncated))
 }
 
+/// Put the child in its own process group so that expiry can signal the whole
+/// tree it may spawn, not just the direct child.
+#[cfg(unix)]
+fn isolate_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_cmd: &mut Command) {}
+
+/// The synchronous twin of [`isolate_process_group`].
+#[cfg(unix)]
+fn isolate_process_group_blocking(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group_blocking(_cmd: &mut std::process::Command) {}
+
+/// SIGKILL one process group.
+///
+/// `pgid` is the id of a child that was spawned through
+/// [`isolate_process_group`], i.e. the child's pid and its group id.
+/// `-pgid` therefore names exactly the group that child leads, and no other
+/// process: the engine never joins a group led by one of its children.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_process_group(pgid: u32) {
+    // SAFETY: `kill(2)` takes two integers and reads no memory this process
+    // owns. The target is a process group created for the child by
+    // `process_group(0)`, so signalling it cannot reach the engine or its
+    // siblings; `pgid` comes from a live `Child::id()`. SIGKILL is 9 on every
+    // Unix this engine targets, and the literal keeps the module free of a
+    // libc dependency.
+    const SIGKILL: i32 = 9;
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let _ = unsafe { kill(-(pgid as i32), SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
+
 /// Kill the child and reap it, but never block the caller past the grace
 /// period. A grandchild holding the pipe open does not extend the wait.
 async fn kill_and_reap(child: &mut Child) {
+    // The group signal takes the child's own workers down with it; the direct
+    // kill below keeps non-Unix platforms and a racing exit covered.
+    if let Some(pid) = child.id() {
+        kill_process_group(pid);
+    }
     // `kill_on_drop` is set by every public runner, but an explicit kill
     // returns the error to the caller instead of relying on drop timing.
     let _ = child.start_kill();
@@ -409,6 +464,7 @@ async fn run_command_with_limit(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    isolate_process_group(&mut cmd);
     let child = cmd
         .spawn()
         .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
@@ -433,6 +489,7 @@ pub async fn run_command_with_stdin(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    isolate_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
@@ -490,6 +547,7 @@ pub async fn run_command_status(
     let program = program_name(&cmd);
     cmd.kill_on_drop(true);
     cmd.stdin(Stdio::null());
+    isolate_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
@@ -559,6 +617,7 @@ fn spawn_pipe_reader<R: io::Read + Send + 'static>(
 /// Kill the child and poll for its reaping, never blocking past the grace
 /// period.
 fn kill_and_reap_blocking(child: &mut std::process::Child) {
+    kill_process_group(child.id());
     let _ = child.kill();
     let reap_deadline = Instant::now() + KILL_REAP_GRACE;
     loop {
@@ -613,6 +672,7 @@ pub fn run_command_blocking_capped(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    isolate_process_group_blocking(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
@@ -926,6 +986,56 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// Whether `pid` no longer runs. A zombie counts as gone: it holds no
+    /// memory and the OS reaps it once its parent does.
+    #[cfg(unix)]
+    fn process_is_gone(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+            // `ps` reports nothing for a pid that no longer exists.
+            _ => true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_exit(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_gone(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &std::path::Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("parsing {}: {error}", path.display()))
+    }
+
+    /// A script that records the child's and a background worker's pids, then
+    /// waits on the worker like `git fetch` waits on its transport helpers.
+    #[cfg(unix)]
+    fn pidfile_script(child: &std::path::Path, grandchild: &std::path::Path) -> String {
+        format!(
+            "echo $$ > {}; sleep 300 & echo $! > {}; wait",
+            child.display(),
+            grandchild.display()
+        )
+    }
+
     #[tokio::test]
     async fn async_command_is_killed_at_the_deadline() {
         let mut cmd = Command::new("sh");
@@ -948,6 +1058,36 @@ mod tests {
         assert!(text.contains("test sleep"), "missing what: {text}");
         assert!(text.contains("250ms"), "missing deadline: {text}");
         assert!(text.contains("sh"), "missing program: {text}");
+    }
+
+    /// Expiry must take the child's own workers with it: a killed `git fetch`
+    /// leaves `index-pack`/transport helpers behind otherwise, and they keep
+    /// writing into the repository after the caller has released its lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_expiry_kills_the_childs_process_group() {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{}", std::process::id(), line!());
+        let child_pid = dir.join(format!("deadline-child-{stamp}"));
+        let grandchild_pid = dir.join(format!("deadline-grandchild-{stamp}"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &pidfile_script(&child_pid, &grandchild_pid)]);
+        let error = run_command(cmd, Duration::from_millis(400), "group kill")
+            .await
+            .unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        let child = read_pid(&child_pid);
+        let grandchild = read_pid(&grandchild_pid);
+        assert!(
+            wait_for_pid_exit(child),
+            "the direct child {child} survived expiry"
+        );
+        assert!(
+            wait_for_pid_exit(grandchild),
+            "the grandchild {grandchild} survived expiry"
+        );
+        let _ = std::fs::remove_file(&child_pid);
+        let _ = std::fs::remove_file(&grandchild_pid);
     }
 
     #[tokio::test]
@@ -1090,6 +1230,32 @@ mod tests {
         assert_eq!(output.status.code(), Some(4));
         assert_eq!(output.stdout.len(), 524_288);
         assert_eq!(output.stderr.len(), 524_288);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_expiry_kills_the_childs_process_group() {
+        let dir = std::env::temp_dir();
+        let stamp = format!("{}-{}", std::process::id(), line!());
+        let child_pid = dir.join(format!("deadline-sync-child-{stamp}"));
+        let grandchild_pid = dir.join(format!("deadline-sync-grandchild-{stamp}"));
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &pidfile_script(&child_pid, &grandchild_pid)]);
+        let error =
+            run_command_blocking(cmd, Duration::from_millis(400), "sync group kill").unwrap_err();
+        assert!(error.timed_out(), "expected a timeout: {error}");
+        let child = read_pid(&child_pid);
+        let grandchild = read_pid(&grandchild_pid);
+        assert!(
+            wait_for_pid_exit(child),
+            "the direct child {child} survived expiry"
+        );
+        assert!(
+            wait_for_pid_exit(grandchild),
+            "the grandchild {grandchild} survived expiry"
+        );
+        let _ = std::fs::remove_file(&child_pid);
+        let _ = std::fs::remove_file(&grandchild_pid);
     }
 
     #[test]
