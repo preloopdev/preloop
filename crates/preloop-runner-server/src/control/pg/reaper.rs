@@ -431,6 +431,36 @@ impl PgBackend {
                 out.runner_idle += 1;
             }
         }
+        // Poll and lease ages, so a busy pool can be told from a wedged one.
+        // SQL returns the oldest instant; the age is computed here.
+        out.max_poll_age_seconds = client
+            .query_one(
+                concat!(
+                    "SELECT ",
+                    us!("min(last_seen_at)"),
+                    " FROM runner_sessions \
+                     WHERE runner_id IS NOT NULL AND last_seen_at IS NOT NULL"
+                ),
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .get::<_, Option<i64>>(0)
+            .map(|oldest| (now_us().saturating_sub(oldest).max(0) / 1_000_000) as u64);
+        out.max_lease_age_seconds = client
+            .query_one(
+                concat!(
+                    "SELECT ",
+                    us!("min(l.renewed_at)"),
+                    " FROM job_leases l JOIN job_requests q ON q.request_id = l.request_id \
+                     WHERE q.result IS NULL AND l.renewed_at IS NOT NULL"
+                ),
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .get::<_, Option<i64>>(0)
+            .map(|oldest| (now_us().saturating_sub(oldest).max(0) / 1_000_000) as u64);
         out.runner_assignments = runner_assignments;
         // Oldest ready job with a known enqueue instant.
         let oldest = client

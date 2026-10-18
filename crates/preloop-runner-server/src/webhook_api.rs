@@ -179,6 +179,7 @@ pub async fn webhook_health(
                 "missing_events": app.missing_events,
                 "missing_permissions": app.missing_permissions,
                 "healthy": app.healthy(),
+                "checked_at": app.checked_at_us.and_then(rfc3339),
                 "error": app.error,
             })
         })

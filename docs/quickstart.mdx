@@ -1,0 +1,50 @@
+---
+title: Quickstart
+description: Install Preloop and run your first GitHub Actions workflow locally.
+---
+
+Get from a clean machine to a workflow running locally in a few minutes. Your existing `.github/workflows` files run against your working tree, including uncommitted and untracked files.
+
+## Prerequisites
+
+- Apple Silicon macOS or Linux. Windows is supported through WSL2; see [Setup](/setup) for virtualization requirements.
+- About 80 GB of free disk for the default packed runner image and its unpacked working data.
+- To publish check runs on GitHub commits, configure a GitHub App. Local-only runs need no credential; see [GitHub tokens](/github-tokens) for workflow job token details.
+
+## Install
+
+Install the Preloop CLI with Homebrew or npm. Both install the same release binaries:
+
+```sh
+brew install preloopdev/tap/preloop
+npm install -g @preloop-dev/cli
+```
+
+## Initialize and start the engine
+
+Configure the engine without starting it, then launch it in the foreground:
+
+```sh
+preloop init --mode none
+preloop serve
+```
+
+`preloop init` configures GitHub credentials, selects the runner image, and chooses how the engine runs. It writes the resulting configuration to `~/.preloop/config.toml`. Leave `preloop serve` running in this terminal. Open a second terminal, change to your repository, and run the workflow there. For a background service, follow [Self-hosting](/self-hosting).
+
+## Run a workflow
+
+In the second terminal, from a repository with GitHub Actions workflows, run a workflow locally:
+
+```sh
+cd my-repo
+preloop run -f .github/workflows/ci.yml --event pull_request
+```
+
+The first run downloads and prepares Preloop's default packed golden VM image. It uses a GitHub-hosted Ubuntu base but bundles Preloop's Rust runner, not the official `actions/runner` binary. The image is about 9 GB compressed and can use close to 50 GB unpacked, so allow about 80 GB of free disk. Subsequent jobs can start from the prepared image in about 300 ms.
+
+## Where to go next
+
+- [Setup and credentials](/setup)
+- [Full CLI reference](/cli_reference)
+- [Self-hosting and service configuration](/self-hosting)
+- [Architecture overview](/system-architecture)

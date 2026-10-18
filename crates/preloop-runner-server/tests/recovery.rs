@@ -2976,6 +2976,36 @@ async fn log_get_run_logs_falls_back_to_uploaded_step_logs() {
 }
 
 #[tokio::test]
+async fn log_get_run_logs_prefers_larger_step_blobs_over_partial_merged_upload() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = three_step_run_for_log_filters(&app, &state).await;
+    let ids = workflow_step_ids(&state, run_id, "build").await;
+    assert_eq!(ids.len(), 3);
+
+    write_merged_job_log(&temp, &jobs[0].1, &jobs[0].2, "partial\n").await;
+    write_step_job_logs(
+        &temp,
+        &jobs[0].1,
+        &jobs[0].2,
+        &[
+            (ids[0].as_str(), "complete step one\n"),
+            (ids[1].as_str(), "complete step two\n"),
+            (ids[2].as_str(), "complete step three\n"),
+        ],
+    )
+    .await;
+
+    let (status, body) = get_logs(&app, format!("/api/v1/runs/{run_id}/logs")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        b"complete step one\ncomplete step two\ncomplete step three\n"
+    );
+}
+
+#[tokio::test]
 async fn log_get_run_logs_returns_404_for_unknown_run() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();

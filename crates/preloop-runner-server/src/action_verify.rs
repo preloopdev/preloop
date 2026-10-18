@@ -43,7 +43,18 @@
 //! Reachability is reused for [`ACTION_VERIFY_CACHE_TTL`]. A whole locked-pin
 //! verdict from [`verify_locked_pin`] is reused for [`LOCKED_PIN_CACHE_TTL`],
 //! so a moved tag or a transferred repository is noticed within that window.
-//! Each map holds at most 4096 entries. No lock is held across an await.
+//! Concurrent checks of one pin share a single verification (one gate per key),
+//! so a matrix fan-out cannot multiply the requests one lock costs.
+//!
+//! Credentials. Each request carries an App installation token when an App
+//! covers the repository, else the static PAT, else none — the same ladder the
+//! workflow fetches climb. Verification therefore bills the installation's
+//! budget rather than the anonymous one, and can read a private action
+//! repository.
+//!
+//! Each map holds at most 4096 entries. No standard lock is held across an
+//! await; the per-pin gate is an async mutex, held by design while the pin it
+//! guards is verified.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -301,6 +312,10 @@ pub struct VerifyCache {
     clock: Clock,
     reachable: TtlMap<ReachKey>,
     pinned: TtlMap<PinKey>,
+    /// One async gate per pin key, so concurrent identical verifications run
+    /// one after another instead of in parallel. An entry is dropped once
+    /// nobody holds it, which keeps the map bounded by the pins in flight.
+    pin_gates: parking_lot::Mutex<HashMap<PinKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl VerifyCache {
@@ -309,6 +324,7 @@ impl VerifyCache {
             clock,
             reachable: TtlMap::new(ACTION_VERIFY_CACHE_TTL),
             pinned: TtlMap::new(LOCKED_PIN_CACHE_TTL),
+            pin_gates: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -332,6 +348,23 @@ impl VerifyCache {
 
     fn pin_hit(&self, key: &PinKey) -> bool {
         self.pinned.contains(key, self.now())
+    }
+
+    /// The gate that serializes verification of one pin. Shared by every
+    /// caller holding the same key, so the first one verifies and the rest
+    /// find its verdict in the cache.
+    fn pin_gate(&self, key: PinKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.pin_gates.lock();
+        if gates.len() >= VERIFY_CACHE_CAPACITY && !gates.contains_key(&key) {
+            // Drop the gates no task is holding, so a long-lived server's map
+            // stays bounded by the pins in flight.
+            gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        }
+        Arc::clone(
+            gates
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     fn remember_pin(&self, key: PinKey) {
@@ -421,7 +454,9 @@ async fn reachable_uncached(
         Reply::Found(repository) => repository,
         Reply::Missing => return Err(repository_missing(owner, repo)),
     };
-    match github_get::<CommitSha>(state, &format!("repos/{owner}/{repo}/commits/{sha}")).await? {
+    match github_get::<CommitSha>(state, owner, repo, &format!("repos/{owner}/{repo}/commits/{sha}"))
+        .await?
+    {
         Reply::Found(found) if found.sha.eq_ignore_ascii_case(sha) => {}
         Reply::Found(_) => {
             return Err(VerifyError::Unavailable(format!(
@@ -573,7 +608,7 @@ async fn is_ancestor_of_head(
     head: &str,
 ) -> Result<bool, VerifyError> {
     let path = format!("repos/{owner}/{repo}/compare/{sha}...{head}?per_page=1");
-    let comparison: Comparison = match github_get(state, &path).await? {
+    let comparison: Comparison = match github_get(state, owner, repo, &path).await? {
         Reply::Found(comparison) => comparison,
         Reply::Missing => {
             return Err(VerifyError::Unavailable(format!(
@@ -623,7 +658,7 @@ async fn list_refs(
             "repos/{owner}/{repo}/{}?per_page={LISTING_PAGE_SIZE}&page={page}",
             kind.path()
         );
-        let entries: Vec<RefEntry> = match github_get(state, &path).await? {
+        let entries: Vec<RefEntry> = match github_get(state, owner, repo, &path).await? {
             Reply::Found(entries) => entries,
             Reply::Missing => {
                 return Err(VerifyError::Unavailable(format!(
@@ -734,7 +769,7 @@ async fn peel_tag(
         .map(crate::actions::percent_encode_path_segment)
         .collect();
     let path = format!("repos/{owner}/{repo}/git/ref/tags/{}", encoded.join("/"));
-    let reference: GitRef = match github_get(state, &path).await? {
+    let reference: GitRef = match github_get(state, owner, repo, &path).await? {
         Reply::Found(reference) => reference,
         Reply::Missing => {
             // A 404 is also what an invisible repository looks like, so the
@@ -763,7 +798,7 @@ async fn peel_tag(
             )));
         }
         let tag_path = format!("repos/{owner}/{repo}/git/tags/{}", object.sha);
-        object = match github_get::<GitTag>(state, &tag_path).await? {
+        object = match github_get::<GitTag>(state, owner, repo, &tag_path).await? {
             Reply::Found(annotated) => annotated.object,
             Reply::Missing => {
                 return Err(VerifyError::Unavailable(format!(
@@ -813,8 +848,14 @@ pub fn is_full_version_tag(reference: &str) -> bool {
 /// from a branch of the locked repository, then, for a full-version reference,
 /// that the tag still peels to the locked commit.
 ///
+/// The reachability step is the impostor-commit check, which an operator can
+/// turn off with `[actions_policy] verify_commit_reachability = false` — the
+/// same switch a plain SHA pin honors. Identity and moved-tag checks are never
+/// optional.
+///
 /// A positive whole-pin verdict is cached for [`LOCKED_PIN_CACHE_TTL`]. Within
-/// that window a repeated check makes no request. A failure is never cached.
+/// that window a repeated check makes no request, and concurrent checks of one
+/// pin share a single verification. A failure is never cached.
 pub async fn verify_locked_pin(
     state: &AppState,
     pin: &LockedPinCheck<'_>,
@@ -823,8 +864,20 @@ pub async fn verify_locked_pin(
     if state.action_verify_cache.pin_hit(&key) {
         return Ok(());
     }
+    // One verification per pin at a time: concurrent resolves of the same lock
+    // (a matrix fan-out) miss the positive cache together, and N identical
+    // checks would spend N times the GitHub requests of one. A waiter re-reads
+    // the cache once the first verdict lands.
+    let gate = state.action_verify_cache.pin_gate(key.clone());
+    let _gate = gate.lock().await;
+    if state.action_verify_cache.pin_hit(&key) {
+        return Ok(());
+    }
     verify_repo_identity(state, pin.owner, pin.repo, pin.owner_id, pin.repo_id).await?;
-    verify_commit_reachable(state, pin.owner, pin.repo, pin.sha, RefScope::BranchesOnly).await?;
+    if state.actions_policy().verify_commit_reachability {
+        verify_commit_reachable(state, pin.owner, pin.repo, pin.sha, RefScope::BranchesOnly)
+            .await?;
+    }
     if is_full_version_tag(pin.reference) {
         verify_tag_points_at(state, pin.owner, pin.repo, pin.reference, pin.sha).await?;
     }
@@ -839,10 +892,62 @@ enum Reply<T> {
     Missing,
 }
 
-/// `GET {api_base}/{path}` through the credential's breaker. The static PAT is
-/// attached only when the API base may carry it.
+/// The credential every verification request for `repository` carries.
+///
+/// An App installation token when an App covers the repository: it is the only
+/// credential that can read a private action repository, and its installation
+/// budget keeps verification off the anonymous 60-requests-an-hour allowance.
+/// Otherwise the static PAT, attached only when the API base may carry it, and
+/// otherwise nothing.
+async fn verification_credential(
+    state: &AppState,
+    repository: &str,
+) -> (Option<String>, GithubCredentialBucket) {
+    let api_base = api_base(state);
+    if let Some(app) = crate::github_app::select_app_for_repo_in_state(state, repository).await {
+        let permissions =
+            std::collections::BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        match crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
+            .await
+        {
+            Ok(token) => {
+                let bucket = match crate::github_app::installation_for_repo(&app, repository).await
+                {
+                    // The installation id is the rate-limit identity GitHub
+                    // bills; never invent one.
+                    Ok(installation) if installation != 0 => {
+                        GithubCredentialBucket::Installation(installation)
+                    }
+                    _ => GithubCredentialBucket::Pat,
+                };
+                return (Some(token), bucket);
+            }
+            // The mint failure policy belongs to the job-token path, not to
+            // verification: fall back to what a host without an App uses.
+            Err(error) => tracing::warn!(
+                %repository,
+                %error,
+                "GitHub App token mint failed for action verification; using the static credential"
+            ),
+        }
+    }
+    match state.static_github_pat() {
+        Some(pat) if pat_may_be_sent(&api_base) => (Some(pat), GithubCredentialBucket::Pat),
+        _ => (None, GithubCredentialBucket::Anonymous),
+    }
+}
+
+/// `GET {api_base}/{path}` through the credential's breaker.
+///
+/// The credential is picked the way the workflow fetches pick theirs: an App
+/// installation token when an App covers `owner/repo`, else the static PAT,
+/// else nothing. Verification cannot run on the anonymous budget: 60 requests
+/// an hour is one locked workflow, and a private action repository answers 404
+/// to an anonymous read, which no pin can pass.
 async fn github_get<T: serde::de::DeserializeOwned>(
     state: &AppState,
+    owner: &str,
+    repo: &str,
     path: &str,
 ) -> Result<Reply<T>, VerifyError> {
     let api_base = api_base(state);
@@ -850,13 +955,10 @@ async fn github_get<T: serde::de::DeserializeOwned>(
     let mut request = crate::shared_http::CLIENT
         .get(&url)
         .header("Accept", "application/vnd.github+json");
-    let bucket = match state.static_github_pat() {
-        Some(pat) if pat_may_be_sent(&api_base) => {
-            request = request.bearer_auth(pat);
-            GithubCredentialBucket::Pat
-        }
-        _ => GithubCredentialBucket::Anonymous,
-    };
+    let (token, bucket) = verification_credential(state, &format!("{owner}/{repo}")).await;
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
     let response = crate::github_breaker::send_observed_labeled(
         &state.github_breakers,
         bucket,
@@ -909,7 +1011,7 @@ async fn fetch_repository(
     owner: &str,
     repo: &str,
 ) -> Result<Reply<RepositoryInfo>, VerifyError> {
-    github_get(state, &format!("repos/{owner}/{repo}")).await
+    github_get(state, owner, repo, &format!("repos/{owner}/{repo}")).await
 }
 
 /// A 404 on the repository is "missing or invisible to this credential". GitHub

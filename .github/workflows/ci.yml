@@ -45,7 +45,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.99"
           components: rustfmt,clippy
@@ -85,6 +85,7 @@ jobs:
       - run: |
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
+          cargo clippy --locked -p preloop-runner-server --lib -- -D dead_code
 
   rust-test:
     # Sharded unit/integration suite. Each shard runs 1/4 of the tests (split
@@ -149,7 +150,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.99"
           components: rustfmt,clippy
@@ -221,7 +222,7 @@ jobs:
           # lose its output — including the failing test names — and the run
           # becomes undiagnosable. The summary step below re-prints just the
           # verdict, which always fits.
-          cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4 2>&1 \
+          cargo nextest run --locked --no-fail-fast --workspace --partition hash:${{ matrix.shard }}/4 2>&1 \
             | tee "$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
         env:
           RUSTFLAGS: "-A warnings"
@@ -241,6 +242,8 @@ jobs:
           else
             echo "no shard log captured at $log"
           fi
+          echo "--- guest disk (temp full? look for a small/100% tmpfs) ---"
+          df -h 2>/dev/null | head -8 || true
           echo "--- guest kernel (OOM?) ---"
           sudo dmesg 2>/dev/null | tail -15 || echo "(no dmesg)"
           echo "--- guest memory ---"
@@ -293,7 +296,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.99"
       - name: Select Rust toolchain binaries
@@ -417,7 +420,7 @@ jobs:
             /home/runner/.rustup/toolchains
             /home/runner/.rustup/settings.toml
           key: rustup-1.97-${{ runner.os }}-${{ runner.arch }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: "1.99"
       - name: Select Rust toolchain binaries

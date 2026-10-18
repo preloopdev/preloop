@@ -81,18 +81,27 @@ case "${1-}" in
     fi
     ;;
   snapshot)
+    if [ -f "$0.fail-snapshot" ]; then
+      printf 'snapshot refused\n' >&2
+      exit 1
+    fi
     printf 'Created snapshot snap-9999\n'
     ;;
   exec)
     # Guest probes and provisioning shell-outs all succeed. When the test
-    # plants `<exe>.fail-payload`, the wrapper that sources a secret file
-    # and execs the payload fails instead — the cleanup `rm -f` exec and
-    # every probe still succeed, matching a real control plane.
+    # plants `<exe>.fail-payload`, the secret wrapper's payload fails instead
+    # (its cleanup and every probe still succeed). `<exe>.fail-sudo` makes
+    # every root step refuse sudo, as a guest without passwordless sudo would.
     last=""
     for arg in "$@"; do last="$arg"; done
+    if [ -f "$0.fail-sudo" ]; then
+      case "$last" in
+        *"sudo -n sh"*) printf 'sudo: a password is required\n' >&2; exit 1 ;;
+      esac
+    fi
     if [ -f "$0.fail-payload" ]; then
       case "$last" in
-        "rm -f "*|"set -eu; . "*) exit 3 ;;
+        "set -eu; SECRETS="*) exit 3 ;;
       esac
     fi
     exit 0
@@ -130,6 +139,38 @@ fn calls_for(executable: &Path, verb: &str) -> Vec<String> {
     calls(executable)
         .into_iter()
         .filter(|line| line.split('|').next() == Some(verb))
+        .collect()
+}
+
+/// The guest scripts a root-or-sudo wrapper carries, decoded.
+///
+/// `run_as_root_or_sudo_strict` embeds each script base64-encoded so it
+/// survives both shells, so the contract is the decoded text.
+fn embedded_guest_scripts(call: &str) -> Vec<String> {
+    use base64::Engine as _;
+
+    const MARKER: &str = "printf %s '";
+    call.match_indices(MARKER)
+        .filter_map(|(start, _)| {
+            let rest = &call[start + MARKER.len()..];
+            let encoded = &rest[..rest.find('\'')?];
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        })
+        .collect()
+}
+
+/// Every recorded `exec` whose decoded guest script contains `needle`.
+fn exec_calls_with_script(executable: &Path, needle: &str) -> Vec<String> {
+    calls_for(executable, "exec")
+        .into_iter()
+        .filter(|call| {
+            embedded_guest_scripts(call)
+                .iter()
+                .any(|script| script.contains(needle))
+        })
         .collect()
 }
 
@@ -398,14 +439,22 @@ async fn host_volumes_are_streamed_in_as_a_tar_and_read_only_mounts_lose_write_b
     );
     assert!(fields[3].starts_with("/run/preloop-vm-staging/"));
 
-    let unpack = calls_for(&executable, "exec")
+    let unpack = exec_calls_with_script(&executable, "tar --no-same-owner -xf")
         .into_iter()
-        .find(|call| call.contains("tar -xf"))
+        .next()
         .expect("an exec must unpack the uploaded archive");
-    assert!(unpack.contains("'/opt/preloop/bin'"), "{unpack}");
+    let script = embedded_guest_scripts(&unpack)
+        .into_iter()
+        .find(|script| script.contains("tar --no-same-owner -xf"))
+        .expect("the unpack runs through the root-or-sudo wrapper");
+    assert!(script.contains("'/opt/preloop/bin'"), "{script}");
     assert!(
-        unpack.contains("chmod -R a-w '/opt/preloop/bin'"),
-        "a read-only mount must lose its write bits: {unpack}"
+        script.contains("chown -R \"${SUDO_UID:-0}:${SUDO_GID:-0}\" '/opt/preloop/bin'"),
+        "extracted files must belong to the invoking user: {script}"
+    );
+    assert!(
+        script.contains("chmod -R a-w '/opt/preloop/bin'"),
+        "a read-only mount must lose its write bits: {script}"
     );
 }
 
@@ -538,19 +587,34 @@ async fn secret_env_values_never_appear_in_the_guest_argv() {
         !recorded.contains("s3cr3t-token"),
         "the secret leaked into an aenv invocation:\n{recorded}"
     );
-    // It travelled as an uploaded file that the wrapper sources and unlinks.
+    // It travelled as an uploaded file. The wrapper reads and unlinks it through
+    // the root-or-sudo step, then runs the payload as the exec user.
     let wrapper = calls_for(&executable, "exec")
         .into_iter()
-        .find(|call| call.contains("preloop-runner"))
-        .expect("the payload must still run");
-    assert!(wrapper.contains(". '/run/preloop-vm-secrets/"), "{wrapper}");
-    assert!(
-        wrapper.contains("rm -f '/run/preloop-vm-secrets/"),
-        "{wrapper}"
-    );
+        .find(|call| call.contains("SECRETS=$("))
+        .expect("the payload must still run through the secret wrapper");
+    assert!(wrapper.contains("eval \"$SECRETS\""), "{wrapper}");
     assert!(
         wrapper.contains("exec '/opt/preloop/bin/preloop-runner' 'run'"),
         "{wrapper}"
+    );
+    // The privileged part is exactly the read and the unlink of that file, and
+    // the payload is not inside either of them.
+    let privileged = embedded_guest_scripts(&wrapper);
+    assert_eq!(privileged.len(), 2, "{privileged:?}");
+    assert!(
+        privileged[0].starts_with("cat '/run/preloop-vm-secrets/"),
+        "{privileged:?}"
+    );
+    assert!(
+        privileged[1].starts_with("rm -f '/run/preloop-vm-secrets/"),
+        "{privileged:?}"
+    );
+    assert!(
+        privileged
+            .iter()
+            .all(|script| !script.contains("preloop-runner")),
+        "the payload must stay with the exec user: {privileged:?}"
     );
 }
 
@@ -589,15 +653,16 @@ async fn secret_env_payload_exit_code_propagates_as_an_error() {
         matches!(result, Err(VmError::Command { exit_code: 3, .. })),
         "a failing payload must surface the guest exit code, got: {result:?}"
     );
-    // Best-effort cleanup ran: a plain `rm -f` exec of the secret file,
-    // distinct from the wrapper's inlined `rm -f`.
-    let cleanup = calls_for(&executable, "exec")
-        .into_iter()
-        .find(|call| call.contains("|rm -f '/run/preloop-vm-secrets/"))
-        .expect("the secret file must be cleaned up after a failed payload");
+    // Best-effort cleanup ran: a standalone exec of the secret file, distinct
+    // from the wrapper's own removal, which travels inside the wrapper call.
+    let standalone: Vec<String> =
+        exec_calls_with_script(&executable, "rm -f '/run/preloop-vm-secrets/")
+            .into_iter()
+            .filter(|call| !call.contains("SECRETS="))
+            .collect();
     assert!(
-        cleanup.contains("rm -f '/run/preloop-vm-secrets/"),
-        "{cleanup}"
+        !standalone.is_empty(),
+        "the secret file must be cleaned up after a failed payload"
     );
 }
 
@@ -724,4 +789,240 @@ async fn capabilities_tell_the_pool_what_agentenv_cannot_do() {
     assert!(!capabilities.live_host_volumes);
     assert!(!capabilities.socket_mounts);
     assert!(!capabilities.file_packs);
+}
+
+#[tokio::test]
+async fn guest_scratch_directories_are_prepared_through_the_root_or_sudo_wrapper() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("runner-dirs").unwrap();
+    provider
+        .create(&spec("runner-dirs", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+
+    let prepared = exec_calls_with_script(&executable, "mkdir -p /run/preloop-vm-staging");
+    assert_eq!(prepared.len(), 1, "{prepared:?}");
+    assert!(
+        prepared[0].contains("if [ \"$(id -u)\" -eq 0 ]; then"),
+        "{}",
+        prepared[0]
+    );
+    assert!(prepared[0].contains("| sudo -n sh; fi"), "{}", prepared[0]);
+    assert_eq!(
+        embedded_guest_scripts(&prepared[0]),
+        vec![
+            "mkdir -p /run/preloop-vm-staging /run/preloop-vm-secrets && chmod 700 /run/preloop-vm-secrets"
+                .to_owned()
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_guest_without_passwordless_sudo_fails_start_with_the_prerequisite_named() {
+    let (_directory, executable) = fake_aenv();
+    fs::write(executable.with_extension("fail-sudo"), "1").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("runner-nosudo").unwrap();
+    provider
+        .create(&spec("runner-nosudo", "ubuntu:24.04"))
+        .await
+        .unwrap();
+
+    let error = provider
+        .start(&name)
+        .await
+        .expect_err("a root step that sudo refuses must not report a started machine");
+    match error {
+        VmError::Command { message, .. } => assert!(
+            message.contains("passwordless sudo"),
+            "the error must name the prerequisite: {message}"
+        ),
+        other => panic!("expected a command error naming sudo, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_dns_is_refused_before_anything_runs_and_an_absent_one_starts() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+
+    let mut machine = spec("runner-dns", "ubuntu:24.04");
+    machine.dns = Some("192.168.1.1".to_owned());
+    let refused = provider.create(&machine).await;
+    assert!(
+        matches!(refused, Err(VmError::InvalidSpec(_))),
+        "AgentENV cannot honour a per-sandbox resolver: {refused:?}"
+    );
+    assert!(
+        calls(&executable).is_empty(),
+        "a refused spec must not reach aenv"
+    );
+
+    // The runner default is not sent to this backend, so an absent resolver is
+    // the normal case and the machine starts.
+    let name = MachineName::new("runner-nodns").unwrap();
+    provider
+        .create(&spec("runner-nodns", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+}
+
+#[tokio::test]
+async fn pack_resumes_a_paused_machine_before_snapshotting() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("golden-pack").unwrap();
+    provider
+        .create(&spec("golden-pack", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+    // The orchestrator stops a golden before packing it, and AgentENV's stop
+    // is a pause, which the server will not snapshot.
+    provider.stop(&name).await.unwrap();
+    set_state(&executable, "paused");
+
+    let output = home.path().join("golden.smolmachine.json");
+    provider.pack(&name, &output).await.unwrap();
+
+    let ordered: Vec<String> = calls(&executable)
+        .into_iter()
+        .filter(|call| call.starts_with("resume|") || call.starts_with("snapshot|"))
+        .collect();
+    assert_eq!(ordered.len(), 2, "{ordered:?}");
+    assert_eq!(ordered[0], "resume|sb-0001|--timeout|600", "{ordered:?}");
+    assert!(
+        ordered[1].starts_with("snapshot|create|sb-0001|--name|golden-pack-pack-"),
+        "{ordered:?}"
+    );
+}
+
+/// The lifecycle calls the fake recorded, in order: pauses, resumes, snapshots.
+fn lifecycle_calls(executable: &Path) -> Vec<String> {
+    calls(executable)
+        .into_iter()
+        .filter(|call| {
+            ["pause|", "resume|", "snapshot|"]
+                .iter()
+                .any(|verb| call.starts_with(verb))
+        })
+        .collect()
+}
+
+/// Packing a paused golden resumes it for the snapshot and parks it again
+/// afterwards, so it is paused as the orchestrator recorded it.
+#[tokio::test]
+async fn pack_pauses_the_sandbox_again_after_snapshotting_it() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("golden-repause").unwrap();
+    provider
+        .create(&spec("golden-repause", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+    provider.stop(&name).await.unwrap();
+    set_state(&executable, "paused");
+
+    let output = home.path().join("golden.smolmachine.json");
+    provider.pack(&name, &output).await.unwrap();
+
+    let ordered = lifecycle_calls(&executable);
+    let [.., resume, snapshot, pause] = ordered.as_slice() else {
+        panic!("expected resume, snapshot, pause: {ordered:?}");
+    };
+    assert_eq!(
+        resume.as_str(),
+        "resume|sb-0001|--timeout|600",
+        "{ordered:?}"
+    );
+    assert!(
+        snapshot.starts_with("snapshot|create|sb-0001|--name|golden-repause-pack-"),
+        "{ordered:?}"
+    );
+    assert_eq!(pause.as_str(), "pause|sb-0001", "{ordered:?}");
+}
+
+/// A refused snapshot still parks the sandbox it resumed: the pause runs on the
+/// error path too, and the caller sees the snapshot's refusal.
+#[tokio::test]
+async fn pack_pauses_the_sandbox_again_when_the_snapshot_fails() {
+    let (_directory, executable) = fake_aenv();
+    std::fs::write(format!("{}.fail-snapshot", executable.display()), "").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let name = MachineName::new("golden-refused").unwrap();
+    provider
+        .create(&spec("golden-refused", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&name).await.unwrap();
+    provider.stop(&name).await.unwrap();
+    set_state(&executable, "paused");
+
+    let output = home.path().join("golden.smolmachine.json");
+    assert!(
+        provider.pack(&name, &output).await.is_err(),
+        "the refused snapshot must surface as an error"
+    );
+
+    let ordered = lifecycle_calls(&executable);
+    let [.., resume, snapshot, pause] = ordered.as_slice() else {
+        panic!("expected resume, snapshot, pause: {ordered:?}");
+    };
+    assert_eq!(
+        resume.as_str(),
+        "resume|sb-0001|--timeout|600",
+        "{ordered:?}"
+    );
+    assert!(
+        snapshot.starts_with("snapshot|create|sb-0001|--name|golden-refused-pack-"),
+        "{ordered:?}"
+    );
+    assert_eq!(pause.as_str(), "pause|sb-0001", "{ordered:?}");
+}
+
+/// Forking from a paused golden resumes it to snapshot it, then parks it again.
+#[tokio::test]
+async fn fork_pauses_the_golden_again_after_snapshotting_it() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(&executable, home.path());
+    let golden = MachineName::new("golden-fork-repause").unwrap();
+    let clone = MachineName::new("clone-fork-repause").unwrap();
+    provider
+        .create(&spec("golden-fork-repause", "ubuntu:24.04"))
+        .await
+        .unwrap();
+    provider.start(&golden).await.unwrap();
+    provider.stop(&golden).await.unwrap();
+    set_state(&executable, "paused");
+
+    provider.fork(&golden, &clone).await.unwrap();
+
+    let ordered = lifecycle_calls(&executable);
+    let snapshot_at = ordered
+        .iter()
+        .position(|call| {
+            call.starts_with("snapshot|create|sb-0001|--name|golden-fork-repause-snap-")
+        })
+        .unwrap_or_else(|| panic!("no golden snapshot: {ordered:?}"));
+    assert_eq!(
+        ordered[snapshot_at - 1].as_str(),
+        "resume|sb-0001|--timeout|600",
+        "{ordered:?}"
+    );
+    assert_eq!(
+        ordered.get(snapshot_at + 1).map(String::as_str),
+        Some("pause|sb-0001"),
+        "{ordered:?}"
+    );
 }

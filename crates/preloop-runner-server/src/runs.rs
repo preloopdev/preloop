@@ -3323,10 +3323,11 @@ enum JobLogs {
 
 /// Resolve one job's logs through the tier fallback.
 ///
-/// Unfiltered requests prefer the merged upload because it is the runner's
-/// authoritative whole-job representation. A step-filtered request prefers
-/// individual step blobs when both are present; the merged upload has no
-/// recoverable boundaries and is only used to produce the explicit 409.
+/// Unfiltered requests normally prefer the merged upload. If the aggregate
+/// per-step blob size is larger, the merged scratch file may be partial, so
+/// the step blobs are used instead. A step-filtered request always prefers
+/// individual step blobs when present; the merged upload has no recoverable
+/// boundaries and is only used to produce the explicit 409.
 ///
 /// `workflow_step_ids` is the attempt's declared-step order, taken from the
 /// manifest built out of the job request message. There is deliberately no
@@ -3352,11 +3353,12 @@ async fn resolve_job_logs(
             )));
         }
     };
-    if !prefer_steps && let Some(contents) = merged {
-        return Ok(JobLogs::Merged(contents));
-    }
+    // Inspect step blobs before choosing the unfiltered source: a failed flush
+    // can leave a shorter merged upload even though per-step uploads exist.
 
     let mut step_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut step_bytes = 0u64;
+
     match tokio::fs::read_dir(results_dir).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(|error| {
@@ -3383,6 +3385,7 @@ async fn resolve_job_logs(
                 if !metadata.is_file() {
                     continue;
                 }
+                step_bytes = step_bytes.saturating_add(metadata.len());
                 step_files.push((step_id, entry.path()));
             }
         }
@@ -3408,7 +3411,15 @@ async fn resolve_job_logs(
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    if !step_files.is_empty() {
+    // Keep the merged upload as the normal whole-job source, but do not let a
+    // shorter partial scratch file hide the larger per-step representation.
+    if !step_files.is_empty()
+        && (prefer_steps
+            || merged.is_none()
+            || merged
+                .as_ref()
+                .is_some_and(|contents| step_bytes > contents.len() as u64))
+    {
         let workflow = workflow_step_ids.filter(|ids| !ids.is_empty()).map(|ids| {
             ids.iter()
                 .map(|id| {
@@ -3961,14 +3972,34 @@ pub(crate) async fn rerun_run_with_mode(
         };
     };
 
+    // The policy may have changed since this run was accepted — an operator
+    // enables `require_sha_pinning` or `require_lockfile` and restarts — so the
+    // stored workflow is judged again before the new attempt is created. An
+    // ordinary in-place rerun reuses the stored job templates verbatim, so
+    // without this an earlier accepted, lockless or tag-pinned workflow would
+    // run again under the stricter policy.
+    let workflow = parse_workflow(&submission.workflow_yaml)?;
+    let lockfiles = crate::actions::RunLockfiles::from_submission(&submission)?;
+    shared
+        .state
+        .actions_policy()
+        .evaluate(&crate::actions_policy::PolicyInputs {
+            workflow_path: &crate::actions::submission_workflow_path(&submission),
+            workflow: &workflow,
+            reusable_workflows: &submission.reusable_workflows,
+            reusable_workflow_shas: &submission.reusable_workflow_shas,
+            lock: lockfiles.root(),
+            remote_locks: lockfiles.remote(),
+        })
+        .map_err(|violations| ApiError::actions_policy(violations.to_string()))?;
+
     // Workflow-level concurrency is re-evaluated for the new attempt off
     // the stored workflow, against the stored github context — the same
     // inputs submit evaluated (`inputs`, not `dispatch_inputs`, mirroring
     // submit's own merge where dispatch inputs sit on top).
     let mut workflow_concurrency = None;
     let mut templates = Vec::new();
-    if !plan.missing_templates.is_empty() || submission.workflow_yaml.contains("concurrency") {
-        let workflow = parse_workflow(&submission.workflow_yaml)?;
+    if !plan.missing_templates.is_empty() || workflow.concurrency.is_some() {
         if let Some(raw) = &workflow.concurrency {
             let eval_ctx = concurrency::ConcurrencyContext {
                 scope: concurrency::ConcurrencyScope::Workflow,
@@ -4039,7 +4070,6 @@ pub(crate) async fn rerun_run_with_mode(
             }
             let plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan> =
                 jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
-            let lockfiles = crate::actions::RunLockfiles::from_submission(&submission)?;
             for job_id in &plan.missing_templates {
                 let Some(job) = plans.get(job_id) else {
                     return Err(ApiError::conflict(format!(

@@ -137,8 +137,20 @@ pub async fn resolve_remote_workflows(
                         )
                         .await?;
                     }
+                    // A client may state the callee's commit itself. It is used
+                    // as-is only when it is a full commit: any other value would
+                    // be interpolated into the contents API query, and a commit
+                    // the callee's repository never had would put the lockfile
+                    // read at a revision the callee never ran.
                     let sha = match submission.reusable_workflow_shas.get(&reference) {
-                        Some(sha) => sha.clone(),
+                        Some(sha) => {
+                            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
+                                return Err(ApiError::bad_request(format!(
+                                    "reusable workflow `{reference}` was submitted with {sha:?}, which is not a commit SHA. Submit the commit that reference resolved to"
+                                )));
+                            }
+                            sha.clone()
+                        }
                         None => {
                             let sha = resolve_remote_sha(
                                 shared, client, bucket, token, &api_base, &reference, owner, repo,
@@ -151,7 +163,24 @@ pub async fn resolve_remote_workflows(
                             sha
                         }
                     };
-                    let lockfile = crate::github::fetch_repository_actions_lockfile(
+                    // Whatever the commit came from, it is held to the same
+                    // impostor-commit check a `uses:` that names a commit gets:
+                    // a commit that exists only in a fork is refused.
+                    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
+                        let subject = format!("reusable workflow `{reference}`");
+                        crate::actions::verify_plain_commit(
+                            &shared.state,
+                            owner,
+                            repo,
+                            &sha,
+                            &subject,
+                        )
+                        .await?;
+                    }
+                    // GitHub is authoritative for the callee's lockfile: its
+                    // answer replaces any entry the submission carried, so a
+                    // stale or fabricated lock cannot govern the callee.
+                    let fetched = crate::github::fetch_repository_actions_lockfile(
                         shared,
                         bucket,
                         token,
@@ -159,16 +188,37 @@ pub async fn resolve_remote_workflows(
                         &sha,
                         &api_base,
                     )
-                    .await
-                    .map_err(|error| {
-                        ApiError::bad_gateway(format!(
-                            "fetch actions.lock of reusable workflow `{reference}`: {error}"
-                        ))
-                    })?;
-                    if let Some(lockfile) = lockfile {
-                        submission
-                            .reusable_workflow_lockfiles
-                            .insert(reference.clone(), lockfile);
+                    .await;
+                    match fetched {
+                        Ok(Some(lockfile)) => {
+                            submission
+                                .reusable_workflow_lockfiles
+                                .insert(reference.clone(), lockfile);
+                        }
+                        Ok(None) => {
+                            submission.reusable_workflow_lockfiles.remove(&reference);
+                        }
+                        // GitHub could not answer. A lockfile that the
+                        // submission already carries for this callee is the
+                        // client's own statement of its pins — the only place
+                        // offline pins can come from — so it is kept instead of
+                        // failing an otherwise valid submission.
+                        Err(error)
+                            if submission
+                                .reusable_workflow_lockfiles
+                                .contains_key(&reference) =>
+                        {
+                            warn!(
+                                reference = %reference,
+                                %error,
+                                "reusable workflow actions.lock unreadable; keeping the submitted lockfile"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(ApiError::bad_gateway(format!(
+                                "fetch actions.lock of reusable workflow `{reference}`: {error}"
+                            )));
+                        }
                     }
                     Some((reference.clone(), sha))
                 };
@@ -306,10 +356,18 @@ pub async fn resolve_remote_workflows(
                         "fetch actions.lock of reusable workflow `{reference}`: {error}"
                     ))
                 })?;
-                if let Some(lockfile) = lockfile {
-                    submission
-                        .reusable_workflow_lockfiles
-                        .insert(reference.clone(), lockfile);
+                // GitHub's answer is authoritative here too: an absent lockfile
+                // at the callee's commit removes any earlier entry, so a stale
+                // lock cannot keep governing the callee.
+                match lockfile {
+                    Some(lockfile) => {
+                        submission
+                            .reusable_workflow_lockfiles
+                            .insert(reference.clone(), lockfile);
+                    }
+                    None => {
+                        submission.reusable_workflow_lockfiles.remove(&reference);
+                    }
                 }
             }
             submission
