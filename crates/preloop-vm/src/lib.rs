@@ -532,6 +532,15 @@ pub trait VmProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
+    /// Start the background maintenance this backend owns, if any.
+    ///
+    /// Called once when an engine starts, before any runner needs a machine: a
+    /// backend whose maintenance is otherwise armed lazily by the work it does
+    /// (AgentENV arms its idle-volume collection on the first volume it needs)
+    /// would on an idle engine — one that only resumes machines it already has —
+    /// never run it at all. Must be cheap and must not block; a provider without
+    /// background work keeps the default no-op.
+    fn start_maintenance(&self) {}
     /// Create a persistent machine.
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError>;
     /// Start an existing machine.
@@ -653,6 +662,9 @@ pub trait VmProvider: Send + Sync {
 impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         (**self).capabilities()
+    }
+    fn start_maintenance(&self) {
+        (**self).start_maintenance()
     }
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
         (**self).create(spec).await

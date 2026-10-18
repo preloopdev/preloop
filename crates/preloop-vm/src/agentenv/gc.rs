@@ -14,7 +14,11 @@
 //! # What a pass keeps
 //!
 //! * a volume the caller is using right now ([`KeepReason::Live`]: the engine's
-//!   own published set, or the trees `--keep` names),
+//!   own published set, or the trees `--keep` names) — a volume the engine
+//!   published still has to be mountable, so a published volume AgentENV calls
+//!   `failed` or `uploading` is kept only until its grace period is up, after
+//!   which [`DeleteReason::Unusable`] reclaims it and the next start populates
+//!   again instead of failing on a volume it cannot mount,
 //! * a volume a live sandbox mounts ([`KeepReason::Mounted`]),
 //! * a volume a populate is writing, and the published volume that populate
 //!   commits ([`KeepReason::Populating`]),
@@ -383,6 +387,10 @@ impl VolumeFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepReason {
     /// The caller is using the volume right now.
+    ///
+    /// A volume AgentENV reports as something other than `ready` is only live
+    /// until its grace period is up: it cannot be mounted, so keeping it would
+    /// leave every start that resolves it stuck.
     Live,
     /// A live sandbox mounts it.
     Mounted,
@@ -688,7 +696,17 @@ pub fn plan_gc(
             continue;
         };
         let retention = kind.retention();
-        let disposition = if live.contains(&volume.name) {
+        // A volume this provider published and remembers is kept — but a memo is
+        // not a reason to keep a volume AgentENV cannot mount. Such a volume
+        // fails every start that resolves it (`volume_is_ready` refuses a status
+        // other than `ready`), and the memo revalidates the name before reuse, so
+        // reclaiming it is what lets that start populate again. A volume that is
+        // not mountable is therefore kept only inside the grace period: past it,
+        // the `unusable` rule below decides, exactly as for a volume no memo
+        // names.
+        let mountable_live = live.contains(&volume.name)
+            && (volume.status == READY_STATUS || age(volume, retention, now) != Age::Old);
+        let disposition = if mountable_live {
             Disposition::Keep(KeepReason::Live)
         } else if mounted.contains(&volume.name) {
             Disposition::Keep(KeepReason::Mounted)
@@ -809,6 +827,12 @@ fn load_staging(path: &Path) -> StagingRegistry {
     }
 }
 
+/// A counter making each temporary registry file unique within this process.
+///
+/// Two writers that share a temporary name race on the file: the second
+/// `rename` finds nothing to rename, and the registry it wrote is lost.
+static STAGING_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
 /// Write `registry` to `path` atomically, best effort.
 fn store_staging(path: &Path, registry: &StagingRegistry) {
     let Some(parent) = path.parent() else {
@@ -816,7 +840,11 @@ fn store_staging(path: &Path, registry: &StagingRegistry) {
     };
     let write = || -> io::Result<()> {
         fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(".{STAGING_FILE}.{}.tmp", std::process::id()));
+        let temporary = parent.join(format!(
+            ".{STAGING_FILE}.{}.{}.tmp",
+            std::process::id(),
+            STAGING_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
         let bytes = serde_json::to_vec_pretty(registry)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(&temporary, &bytes)?;
@@ -836,6 +864,30 @@ fn store_staging(path: &Path, registry: &StagingRegistry) {
     }
 }
 
+/// An exclusive lock on the staging registry, held across a read-modify-write.
+///
+/// The registry is shared by every engine on the host: the atomic rename makes a
+/// reader see one whole version or the other, but two writers that each read
+/// first would each write a registry without the other's record, and a lost
+/// record makes a staging volume look ageless, which keeps it forever. The lock
+/// is a sibling file so the rename itself still publishes the registry
+/// atomically. Best effort: a filesystem that cannot lock falls back to the
+/// process-local serialisation, and a lock this process cannot take is not a
+/// reason to lose a record (the write proceeds, as before).
+fn lock_staging(path: &Path) -> Option<fs::File> {
+    let lock = path.with_file_name(format!("{STAGING_FILE}.lock"));
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock).ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
 /// What one provider's processes know about collection: the knobs, the staging
 /// volumes being written here, and the scheduler's own bookkeeping.
 #[derive(Debug)]
@@ -846,6 +898,8 @@ pub struct GcState {
     writing: Mutex<BTreeMap<String, StagedVolume>>,
     /// Where those records are persisted, when there is a preloop home.
     registry: Option<PathBuf>,
+    /// Serialises registry writes in this process: see [`GcState::persist_staging`].
+    persist: Mutex<()>,
     /// When the last pass started, in Unix seconds; zero until one does.
     last_pass: AtomicU64,
     /// Whether the periodic pass was started, so it is started only once.
@@ -862,6 +916,7 @@ impl GcState {
             config,
             writing: Mutex::new(BTreeMap::new()),
             registry,
+            persist: Mutex::new(()),
             last_pass: AtomicU64::new(0),
             scheduled: AtomicBool::new(false),
             pass: AsyncMutex::new(()),
@@ -1011,10 +1066,20 @@ impl GcState {
     /// Read-modify-write so that one process's record does not drop another's:
     /// the file is shared by every engine on the host, and the worst a lost
     /// record can do is make a staging volume look ageless, which keeps it.
+    ///
+    /// The whole transaction is serialised — against this process's own tasks
+    /// with the state's mutex, and against another engine with the sibling lock
+    /// file — because two writers that overlap each write a registry holding
+    /// only their own record.
     fn persist_staging(&self, update: impl FnOnce(&mut StagingRegistry)) {
         let Some(path) = &self.registry else {
             return;
         };
+        let _serialized = self
+            .persist
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _host = lock_staging(path);
         let mut registry = load_staging(path);
         update(&mut registry);
         store_staging(path, &registry);
@@ -1111,6 +1176,12 @@ pub struct Outcome {
     pub plan: GcPlan,
     /// What the deletion did, volume by volume. Empty for a dry run.
     pub report: PruneReport,
+    /// Deletions the plan asked for and the pass did not attempt, because
+    /// something claimed the volume between the plan and the deletion: a
+    /// populate that started while the listing ran, or a volume this engine
+    /// published for a start that is about to mount it (see [`still_deletable`]).
+    /// Empty for a dry run, which deletes nothing at all.
+    pub skipped: Vec<String>,
     /// Whether the pass deleted nothing on purpose.
     pub dry_run: bool,
 }
@@ -1127,6 +1198,10 @@ impl Outcome {
     pub fn render(&self, now: u64) -> String {
         let mut out = self.plan.render(now);
         if self.dry_run {
+            out.push_str(
+                "dry run: the plan above is what a real run acts on; a volume a sandbox \
+                 mounts is reported as in use by that run\n",
+            );
             return out;
         }
         for name in &self.report.deleted {
@@ -1139,6 +1214,11 @@ impl Outcome {
         }
         for (name, error) in &self.report.failed {
             out.push_str(&format!("failed {name}: {error}\n"));
+        }
+        for name in &self.skipped {
+            out.push_str(&format!(
+                "left {name} (a populate or a start claimed it after this plan)\n"
+            ));
         }
         out
     }
@@ -1185,6 +1265,17 @@ fn facts_of(
 /// populate: a pass keeps the staging volume of a populate this process runs and
 /// the grace period covers one another process runs, and a volume deleted
 /// between a populate's create and its first mount fails that populate.
+///
+/// Both of those windows are closed as far as they can be without a lock: what a
+/// populate other than this process's own started while the listing ran, and what
+/// this engine published since, are read again in [`late_keeps`] immediately
+/// before the deletion ([`Outcome::skipped`] names what that saved). What remains
+/// is one start that resolved a volume the moment before this pass deleted it and
+/// has not mounted it yet: AgentENV refuses a deletion only once a sandbox
+/// reserves the volume, so such a start fails — and repopulates on its next start
+/// — rather than corrupting anything. Collection never takes the per-tree
+/// populate lock, because holding it for the length of a pass would serialize
+/// every start behind a ~1 minute populate.
 pub async fn run_pass(provider: &AgentEnvProvider, request: Request) -> Result<Outcome, VmError> {
     let state = provider.gc_state();
     // One pass at a time in this process.
@@ -1221,6 +1312,7 @@ pub async fn run_pass(provider: &AgentEnvProvider, request: Request) -> Result<O
         return Ok(Outcome {
             plan,
             report: PruneReport::default(),
+            skipped: Vec::new(),
             dry_run: true,
         });
     }
@@ -1228,38 +1320,118 @@ pub async fn run_pass(provider: &AgentEnvProvider, request: Request) -> Result<O
     // The plan is the only authority on what this pass may touch: another engine
     // can publish a volume between the listing and the deletion, and deleting
     // what a keep set does not name would reclaim a volume no policy classified.
-    let report = delete_planned(provider, &plan).await?;
-    log_deletions(&plan, &report);
+    // What the plan classified is re-checked against the facts that can have
+    // changed since it was built, right before it is acted on.
+    let skipped = claimed_since(provider, &plan, &staged).await;
+    let doomed: Vec<String> = plan
+        .delete_names()
+        .into_iter()
+        .filter(|name| !skipped.contains(name))
+        .collect();
+    let report = delete_planned(provider, &doomed, &plan).await?;
+    log_deletions(&plan, &report, &skipped);
     state.forget_staged(&report.deleted);
     Ok(Outcome {
         plan,
         report,
+        skipped,
         dry_run: false,
     })
 }
 
-/// Delete exactly the volumes `plan` decided to delete.
+/// The plan's deletions that something claimed after the plan was built: read
+/// the facts that can have changed since then and hand them to [`late_keeps`].
+async fn claimed_since(
+    provider: &AgentEnvProvider,
+    plan: &GcPlan,
+    sampled: &StagingRegistry,
+) -> Vec<String> {
+    let state = provider.gc_state();
+    let in_flight = state.in_flight();
+    let registry = state.staged();
+    let published = provider.published_volume_names().await;
+    late_keeps(plan, &in_flight, &published, &registry, sampled)
+}
+
+/// The plan's deletions that something claimed after the plan was built.
 ///
-/// Driven by the plan rather than by a keep set: another engine can publish a
-/// volume between the listing and the deletion, and deleting what a keep set
-/// does not name would reclaim a volume no policy classified.
+/// The plan is a pure function of snapshots taken before the listing it is based
+/// on, so a populate another task or another engine starts while that listing
+/// runs is in none of them. Its staging volume — and any published volume of its
+/// digest, which its commit is about to reuse — must not be deleted, however low
+/// the grace period is, so a record this pass did not sample protects both.
+/// `in_flight` is this process's own staging volumes whatever `sampled` says.
+///
+/// A volume `published` names is one a start has resolved and is about to
+/// mount, so it is kept back too — but only while AgentENV can mount it: a memo
+/// that names a volume the server calls `failed` is exactly what collection has
+/// to reclaim, or the start that resolves it stays stuck.
+///
+/// Skipping a deletion is always safe: the volume survives to the next pass.
+/// This narrows the window described on [`run_pass`], in which a start that
+/// resolved an existing volume can lose it, from the whole listing-to-deletion
+/// span to the moment after this read.
+fn late_keeps(
+    plan: &GcPlan,
+    in_flight: &BTreeSet<String>,
+    published: &BTreeSet<String>,
+    registry: &StagingRegistry,
+    sampled: &StagingRegistry,
+) -> Vec<String> {
+    // A staging record this pass did not sample belongs to a populate that
+    // started while the listing ran.
+    let fresh: BTreeSet<&str> = registry
+        .staging
+        .keys()
+        .filter(|name| !sampled.staging.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    let populating: BTreeSet<&str> = fresh
+        .iter()
+        .filter_map(|name| staging_digest(name))
+        .collect();
+    let mountable: BTreeSet<&str> = plan
+        .verdicts()
+        .iter()
+        .filter(|verdict| verdict.status == READY_STATUS)
+        .map(|verdict| verdict.name.as_str())
+        .collect();
+    plan.delete_names()
+        .into_iter()
+        .filter(|name| {
+            in_flight.contains(name)
+                || fresh.contains(name.as_str())
+                || digest_of(name).is_some_and(|digest| populating.contains(digest))
+                || (published.contains(name) && mountable.contains(name.as_str()))
+        })
+        .collect()
+}
+
+/// Delete exactly the volumes `doomed`.
+///
+/// `doomed` is the plan's decision narrowed by [`late_keeps`]; the plan is still
+/// what is reported, so a volume the pass left in place is named as such rather
+/// than as deleted. Driven by the plan rather than by a keep set: another engine
+/// can publish a volume between the listing and the deletion, and deleting what
+/// a keep set does not name would reclaim a volume no policy classified.
 ///
 /// The report's `kept` is the plan's keep set, since that is the decision the
 /// plan made; a mounted volume the server refuses comes back as `in use`.
 async fn delete_planned(
     provider: &AgentEnvProvider,
+    doomed: &[String],
     plan: &GcPlan,
 ) -> Result<PruneReport, VmError> {
-    let mut report = provider.delete_volumes(&plan.delete_names()).await?;
+    let mut report = provider.delete_volumes(doomed).await?;
     report.kept = plan.keep_names();
     Ok(report)
 }
 
-/// Log what a pass deleted, and what it could not.
+/// Log what a pass deleted, what it could not, and what it left alone.
 ///
 /// Always at info: a deletion is the one irreversible thing a pass does, and
 /// another engine's idle volume is a reason to be able to see exactly what went.
-fn log_deletions(plan: &GcPlan, report: &PruneReport) {
+fn log_deletions(plan: &GcPlan, report: &PruneReport, skipped: &[String]) {
     for verdict in plan.delete() {
         if report.deleted.contains(&verdict.name) {
             tracing::info!(
@@ -1272,6 +1444,12 @@ fn log_deletions(plan: &GcPlan, report: &PruneReport) {
                 "deleted a collected AgentENV volume"
             );
         }
+    }
+    for name in skipped {
+        tracing::info!(
+            volume = %name,
+            "left a planned AgentENV volume deletion in place: a populate or a start claimed it"
+        );
     }
     for name in &report.in_use {
         tracing::debug!(
@@ -1823,7 +2001,37 @@ mod tests {
     }
 
     #[test]
-    fn a_live_volume_is_kept_even_when_the_server_calls_it_unusable() {
+    fn a_live_volume_is_kept_only_while_it_can_be_mounted() {
+        let name = published(DIGEST);
+        let young = published(OTHER_DIGEST);
+        let mut ready = facts(&name, 1024, Some(9 * GRACE));
+        ready.status = READY_STATUS.to_owned();
+        let mut unready = facts(&young, 1024, Some(GRACE - 1));
+        unready.status = "failed".to_owned();
+        let live: BTreeSet<String> = [name.clone(), young.clone()].into_iter().collect();
+
+        let plan = plan_gc(
+            &[ready, unready],
+            &live,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &policy(),
+            NOW,
+        );
+        assert_eq!(
+            disposition(&plan, &name),
+            Disposition::Keep(KeepReason::Live),
+            "a mountable volume the provider published is kept"
+        );
+        assert_eq!(
+            disposition(&plan, &young),
+            Disposition::Keep(KeepReason::Live),
+            "a volume the server cannot mount stays live inside its grace period"
+        );
+    }
+
+    #[test]
+    fn a_live_volume_the_server_cannot_mount_is_reclaimed_once_it_is_old() {
         let name = published(DIGEST);
         let mut volume = facts(&name, 1024, Some(9 * GRACE));
         volume.status = "failed".to_owned();
@@ -1836,10 +2044,103 @@ mod tests {
             &policy(),
             NOW,
         );
+        // Keeping it would leave every start that resolves it stuck: the engine
+        // refuses to mount a volume that is not ready, and the memo revalidates
+        // before reuse, so collection is what lets that start populate again.
         assert_eq!(
             disposition(&plan, &name),
-            Disposition::Keep(KeepReason::Live)
+            Disposition::Delete(DeleteReason::Unusable)
         );
+    }
+
+    /// A pass deletes what its plan named, except what something claimed after
+    /// the plan was built: the staging volume of a populate that started while
+    /// the listing ran, the published volume its commit reuses, this process's
+    /// own in-flight stages, and a volume the engine published since.
+    #[test]
+    fn a_planned_deletion_is_dropped_when_something_claimed_it() {
+        let stage = staging(DIGEST, "aaaaaaaa");
+        let volume = published(DIGEST);
+        let other = published(OTHER_DIGEST);
+        let policy = Policy::runner_bundle(Duration::from_secs(0), 0);
+        let plan = plan_gc(
+            &[
+                facts(&stage, 1024, Some(9 * GRACE)),
+                facts(&volume, 1024, Some(9 * GRACE)),
+                facts(&other, 1024, Some(9 * GRACE)),
+            ],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &policy,
+            NOW,
+        );
+        let doomed = plan.delete_names();
+        assert_eq!(doomed.len(), 3, "every volume is superseded or abandoned");
+        let none = BTreeSet::new();
+        let empty = StagingRegistry::default();
+        // A pass that saw nothing new keeps nothing back: every planned
+        // deletion is still a deletion.
+        assert!(late_keeps(&plan, &none, &none, &empty, &empty).is_empty());
+
+        let in_flight: BTreeSet<String> = [stage.clone()].into_iter().collect();
+        let without = |skipped: Vec<String>| -> Vec<String> {
+            doomed
+                .iter()
+                .filter(|name| !skipped.contains(name))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            without(late_keeps(&plan, &in_flight, &none, &empty, &empty)),
+            vec![volume.clone(), other.clone()]
+        );
+
+        let published: BTreeSet<String> = [volume.clone()].into_iter().collect();
+        assert_eq!(
+            without(late_keeps(&plan, &none, &published, &empty, &empty)),
+            vec![other.clone(), stage.clone()]
+        );
+
+        // A record the pass did not sample: the populate started while the
+        // listing ran, so its stage and the volume it is about to commit to
+        // survive — however low the grace period is.
+        let mut registry = StagingRegistry::default();
+        registry.staging.insert(
+            stage.clone(),
+            StagedVolume {
+                digest: DIGEST.to_owned(),
+                host: "/opt/preloop/bundle".to_owned(),
+                created: unix_now(),
+            },
+        );
+        assert_eq!(
+            without(late_keeps(&plan, &none, &none, &registry, &empty)),
+            vec![other.clone()]
+        );
+        // A record the pass already sampled is the plan's business, not this
+        // re-check's: it is not evidence of a populate that arrived late.
+        assert!(late_keeps(&plan, &none, &none, &registry, &registry).is_empty());
+
+        // A memo is only a reason to hold a deletion back while a start could
+        // mount what it names: the unusable volume the plan reclaims is not
+        // saved by the provider still remembering it.
+        let mut unusable = facts(&volume, 1024, Some(9 * GRACE));
+        unusable.status = "failed".to_owned();
+        let unusable_plan = plan_gc(
+            &[unusable],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &policy,
+            NOW,
+        );
+        assert_eq!(
+            unusable_plan.delete_names(),
+            vec![volume.clone()],
+            "an unusable published volume is collected"
+        );
+        assert!(late_keeps(&unusable_plan, &none, &published, &empty, &empty).is_empty());
     }
 
     #[test]
@@ -2068,6 +2369,53 @@ mod tests {
         );
     }
 
+    /// Two engines on one host write the registry at the same time. Only the
+    /// lock file serialises them — each state has its own mutex — and a lost
+    /// read-modify-write leaves a staging volume with no recorded age, which
+    /// collection then keeps forever.
+    #[test]
+    fn concurrent_registry_writers_keep_every_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(STAGING_FILE);
+        let states: Vec<Arc<GcState>> = (0..2)
+            .map(|_| Arc::new(GcState::new(Config::defaults(), Some(path.clone()))))
+            .collect();
+        let writers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(writers));
+        let threads: Vec<_> = (0..writers)
+            .map(|index| {
+                let state = Arc::clone(&states[index % states.len()]);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let name = staging(DIGEST, &format!("aaaa{index:04}"));
+                    // Every writer waits for the others, so the writes overlap.
+                    barrier.wait();
+                    state.persist_staging(|registry| {
+                        registry.staging.insert(
+                            name.clone(),
+                            StagedVolume {
+                                digest: DIGEST.to_owned(),
+                                host: format!("/engine/{index}"),
+                                created: NOW + index as u64,
+                            },
+                        );
+                    });
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a registry writer thread");
+        }
+
+        let registry = load_staging(&path);
+        assert_eq!(
+            registry.staging.len(),
+            writers,
+            "every writer's record survives: {:#?}",
+            registry.staging.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_deleted_staging_volume_loses_its_record() {
         let directory = tempfile::tempdir().unwrap();
@@ -2180,12 +2528,17 @@ mod tests {
         let outcome = Outcome {
             plan,
             report: PruneReport::default(),
+            skipped: Vec::new(),
             dry_run: true,
         };
         let rendered = outcome.render(NOW);
         assert!(rendered.contains(&published(DIGEST)));
         assert!(rendered.contains("superseded"));
         assert!(!rendered.contains("deleted "));
+        assert!(
+            rendered.contains("dry run: the plan above is what a real run acts on"),
+            "{rendered}"
+        );
         assert!(outcome.deleted().is_empty());
     }
 
@@ -2206,6 +2559,7 @@ mod tests {
             &Policy::runner_bundle(Duration::from_secs(GRACE), 0),
             NOW,
         );
+        let skipped = staging(OTHER_DIGEST, "aaaaaaaa");
         let outcome = Outcome {
             plan,
             report: PruneReport {
@@ -2215,6 +2569,7 @@ mod tests {
                 candidates: Vec::new(),
                 failed: vec![(failed.to_owned(), "the server said no".to_owned())],
             },
+            skipped: vec![skipped.clone()],
             dry_run: false,
         };
         assert_eq!(outcome.deleted(), std::slice::from_ref(&deleted));
@@ -2231,6 +2586,12 @@ mod tests {
         );
         assert!(
             rendered.contains(&format!("failed {failed}: the server said no")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "left {skipped} (a populate or a start claimed it after this plan)"
+            )),
             "{rendered}"
         );
     }

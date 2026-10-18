@@ -1025,7 +1025,6 @@ impl AgentEnvProvider {
                 host = %host.display(),
                 "populated read-only runner volume"
             );
-            self.remember_volume(host, &tree).await;
             // Publishing a volume is what supersedes one, so this is where a
             // pass is worth asking for. It runs in the background.
             gc::request_pass(self);
@@ -1208,6 +1207,12 @@ impl AgentEnvProvider {
             }
         }
         self.discard_volume(&staging).await;
+        // Record the final volume before asking whether it can be mounted: a
+        // volume the server reports as `failed` or `uploading` still carries the
+        // creation time collection needs, or it would look ageless and be kept
+        // forever — and every later start would fail on it, since a volume this
+        // engine remembers is refused unless it is ready.
+        self.remember_volume(host, tree).await;
         if self.volume_is_ready(name).await? {
             Ok(())
         } else {
@@ -1603,6 +1608,17 @@ impl VmProvider for AgentEnvProvider {
             fork_inherits_guest_writes: true,
             preserves_runtime_state_on_suspend: true,
         }
+    }
+
+    /// Start the periodic collection pass with the engine, not with the first
+    /// volume it needs.
+    ///
+    /// Collection is otherwise armed where a volume is resolved (a cold start or
+    /// a bundle change), so an engine whose runners are all resumed — or which
+    /// sits idle with nothing queued — would never run a periodic pass and the
+    /// volumes nothing needs would stay on the server indefinitely.
+    fn start_maintenance(&self) {
+        gc::ensure_scheduled(self);
     }
 
     /// Record the machine. AgentENV has no unstarted sandbox to create.

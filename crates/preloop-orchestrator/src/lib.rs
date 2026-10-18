@@ -4346,6 +4346,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             // "no runner can ever match these labels".
             ps.set_labels(self.config.labels.clone());
         }
+        // Maintenance the backend owns starts with the pool rather than with the
+        // first runner: a pool that only resumes machines it already has never
+        // reaches the paths that arm it lazily, and what it collects (AgentENV's
+        // superseded runner volumes) would then never be collected.
+        self.provider.start_maintenance();
         // Any error exit below (host externals, artifact prep, stale-machine
         // cleanup, golden bake) must clear the flag again; the guard is
         // disarmed once the warm completes.

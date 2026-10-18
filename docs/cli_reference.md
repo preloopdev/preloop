@@ -561,6 +561,11 @@ younger than the grace period or with no recorded creation time, the newest
 superseded volume per kind for a rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`,
 default 1), and any staging volume a populate is writing.
 
+Remembering a volume keeps it only while it can be mounted: a volume AgentENV
+reports as `failed` or `uploading` is kept until its grace period is over and
+then reclaimed as `unusable`, because this engine refuses to mount such a volume
+— keeping it would leave every start on that tree stuck.
+
 It deletes the rest and prints one row per volume — size, kind, age and the reason
 it is kept or deleted — so `--dry-run` shows exactly what a real run does. The
 reasons are `live`, `mounted`, `populating`, `young`, `unknown-age`, `previous`
@@ -570,10 +575,19 @@ other than `ready`) for deleted ones. A volume whose age nothing recorded —
 populated by an older build, or by another host — is kept, which is what `prune`
 is for.
 
+A planned deletion that something claimed between the plan and the deletion — a
+populate that started while the listing ran, or a volume this engine published
+for a start that is about to mount it — is printed as `left` and left for the
+next pass. A deletion the server refused for any reason other than a mounted
+volume exits nonzero, as `prune` does, so a caller can tell that the cleanup it
+asked for did not happen.
+
 The engine runs the same plan in the background after it populates a volume and
 every `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600 seconds), so a bundle
-change reclaims the bundle it replaced once the grace period is over.
-`PRELOOP_VOLUMES_GC=off` stops those automatic passes and leaves this command.
+change reclaims the bundle it replaced once the grace period is over. The timer
+starts with the engine, so an engine that only resumes sandboxes it already has
+still collects. `PRELOOP_VOLUMES_GC=off` stops those automatic passes and leaves
+this command.
 
 | Flag | Description |
 |---|---|

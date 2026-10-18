@@ -111,19 +111,24 @@ orchestrator branches on it instead of assuming SmolVM's semantics.
 * **Superseded volumes are collected.** A bundle change publishes a new volume and
   leaves the old one behind, because an unmounted volume may be about to be
   mounted. The engine reclaims the leftovers itself — a pass after each populate
-  and every six hours — keeping the volumes it published, anything a sandbox
+  and every six hours, the timer starting with the engine rather than with the
+  first runner — keeping the volumes it published, anything a sandbox
   mounts (AgentENV refuses those deletes), anything younger than the grace period
   or without a recorded creation time, and the newest superseded volume for a
   rollback (`PRELOOP_VOLUMES_KEEP_PREVIOUS`). Every deletion is logged at info
   with its name, size and reason, and a volume AgentENV reports as something
-  other than `ready` is reclaimed once it is past the grace period, so a start
-  stuck on a failed volume can populate again. `preloop volumes gc [--dry-run]`
+  other than `ready` is reclaimed once it is past the grace period — including
+  one this engine published and still remembers, since it refuses to mount such a
+  volume and would otherwise stay stuck on it, so a start stuck on a failed
+  volume can populate again. `preloop volumes gc [--dry-run]`
   prints and runs the same plan; `PRELOOP_VOLUMES_GC=off` stops the automatic
   passes. Ages come from the index (`$PRELOOP_HOME/agentenv-runner-volumes.json`)
   and, for staging volumes, from `$PRELOOP_HOME/agentenv-volume-staging.json`,
   whose records a populate writes before it creates its staging volume and
   removes when it ends — so a pass can tell a populate in flight from a leftover
-  without taking the per-tree lock. With more than one engine on one server, an
+  without taking the per-tree lock. A volume that a populate or a start claims
+  after the plan was built is left for the next pass rather than deleted. With
+  more than one engine on one server, an
   idle volume another engine published can still be collected once it is past the
   grace period: that engine revalidates the name it remembers before reuse and
   repopulates (~1 minute) instead of failing.

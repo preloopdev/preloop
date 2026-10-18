@@ -146,7 +146,9 @@ fn render_list(volumes: &[AgentEnvVolume], index: &VolumeIndex) -> String {
 ///
 /// The plan is what a pass acts on: `--dry-run` prints it and stops there, and a
 /// real run deletes exactly the volumes it names (a mounted volume comes back as
-/// in use, never as deleted).
+/// in use, never as deleted). A deletion the server refused for any other reason
+/// exits nonzero, like `prune`, so a caller can tell that the cleanup it asked
+/// for did not happen.
 async fn gc(provider: AgentEnvProvider, args: GcArgs) -> anyhow::Result<()> {
     let trees = if args.keep.is_empty() {
         default_keep_trees()
@@ -173,7 +175,14 @@ async fn gc(provider: AgentEnvProvider, args: GcArgs) -> anyhow::Result<()> {
         .dry_run(args.dry_run);
     let outcome = volume_gc::run_pass(&provider, request).await?;
     print!("{}", outcome.render(volume_gc::unix_now()));
-    Ok(())
+    if outcome.report.failed.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{} runner volume(s) could not be deleted",
+            outcome.report.failed.len()
+        )
+    }
 }
 
 async fn prune(provider: AgentEnvProvider, args: PruneArgs) -> anyhow::Result<()> {

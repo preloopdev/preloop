@@ -24,12 +24,16 @@ Releases before v0.27.0 predate the changelog.
   change publishes a new content-addressed volume and leaves the old one behind;
   the engine now reclaims the ones nothing needs — unmounted by any sandbox, past
   the grace period, beyond the newest one kept for a rollback, and not a tree the
-  engine mounts — in a pass after each populate and every six hours. A pass never
-  deletes a volume a sandbox mounts (AgentENV refuses), a volume whose creation
-  time nothing recorded, or a staging volume a populate is writing, and every
-  deletion is logged with its name, size and reason. A volume AgentENV reports as
-  something other than `ready` is reclaimed once it is past the grace period,
-  which unblocks a start that would otherwise stay stuck on it.
+  engine mounts — in a pass after each populate and every six hours (the timer
+  starts with the engine, so an engine that only resumes sandboxes still
+  collects). A pass never deletes a volume a sandbox mounts (AgentENV refuses), a
+  volume whose creation time nothing recorded, or a staging volume a populate is
+  writing, and every deletion is logged with its name, size and reason. A volume
+  AgentENV reports as something other than `ready` is reclaimed once it is past
+  the grace period — including one this engine published and remembers, which it
+  refuses to mount — so a start that would otherwise stay stuck on it populates
+  again. A volume a populate or a start claims between the plan and the deletion
+  is left for the next pass.
   `PRELOOP_VOLUMES_GC=off` turns the automatic passes off;
   `PRELOOP_VOLUMES_KEEP_PREVIOUS` (default 1), `PRELOOP_VOLUMES_GC_GRACE_SECS`
   (default 3600) and `PRELOOP_VOLUMES_GC_INTERVAL_SECS` (default 21600) set the
@@ -37,8 +41,9 @@ Releases before v0.27.0 predate the changelog.
 
 - **`preloop volumes gc [--keep <DIR>]... [--dry-run]`** prints the plan a pass
   acts on — one row per volume with its size, kind, age and the reason it is kept
-  or deleted — and deletes it unless `--dry-run` is given. `prune` stays as the
-  explicit one-shot for volumes that have no recorded age.
+  or deleted — and deletes it unless `--dry-run` is given. A deletion that fails
+  exits nonzero, as `prune` does. `prune` stays as the explicit one-shot for
+  volumes that have no recorded age.
 
 - **`preloop init` workflow readiness checks.** The five-step wizard can ask for
   a stable HTTPS App webhook URL, scan local and configured repositories for

@@ -857,6 +857,105 @@ async fn a_volume_agentenv_reports_as_unusable_is_reclaimed_once_it_is_old() {
     );
 }
 
+#[tokio::test]
+async fn a_published_volume_the_server_calls_unusable_is_reclaimed_from_the_engine_that_published_it()
+ {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let gc_home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
+    let provider = provider(&executable, home.path(), gc_home.path(), 0, 0);
+    let volume = populated(&provider, &executable, "runner-0", bundle.path()).await;
+    provider
+        .delete(&MachineName::new("runner-0").unwrap())
+        .await
+        .unwrap();
+    fs::write(executable.with_extension("volume-status"), b"failed").unwrap();
+
+    // The engine that published the volume is still running, so its own memo
+    // names it. Keeping it because of that would leave every start on this tree
+    // stuck: the engine refuses to mount a volume that is not ready and never
+    // populates it again while it is there.
+    let outcome = gc::run_pass(&provider, Request::new()).await.unwrap();
+
+    assert_eq!(
+        outcome
+            .plan
+            .verdicts()
+            .iter()
+            .find(|verdict| verdict.name == volume)
+            .map(|verdict| verdict.disposition),
+        Some(gc::Disposition::Delete(gc::DeleteReason::Unusable)),
+        "a memo is not a reason to keep a volume that cannot be mounted"
+    );
+    assert_eq!(outcome.report.deleted, vec![volume.clone()]);
+
+    // With the unusable volume gone, the next start on the same tree populates
+    // again instead of failing.
+    fs::remove_file(executable.with_extension("volume-status")).unwrap();
+    provider
+        .create(&spec("runner-0", bundle.path()))
+        .await
+        .unwrap();
+    provider
+        .start(&MachineName::new("runner-0").unwrap())
+        .await
+        .unwrap();
+    assert!(volume_names(&executable).contains(&volume));
+    assert_eq!(
+        calls_for(&executable, "upload").len(),
+        2,
+        "the tree was populated again"
+    );
+}
+
+#[tokio::test]
+async fn a_final_volume_that_is_not_ready_still_records_when_it_was_created() {
+    let (_directory, executable) = fake_aenv();
+    let home = tempfile::tempdir().unwrap();
+    let gc_home = tempfile::tempdir().unwrap();
+    let bundle = tempfile::tempdir().unwrap();
+    fs::write(bundle.path().join("preloop-runner"), b"ELF").unwrap();
+    // The server keeps reporting the volume as failed, so nothing can be mounted
+    // from the tree and the populate fails after creating it.
+    fs::write(executable.with_extension("volume-status"), b"failed").unwrap();
+    let provider = provider(&executable, home.path(), gc_home.path(), 3600, 0);
+    provider
+        .create(&spec("runner-0", bundle.path()))
+        .await
+        .unwrap();
+    assert!(
+        provider
+            .start(&MachineName::new("runner-0").unwrap())
+            .await
+            .is_err(),
+        "a volume that is not ready cannot be mounted"
+    );
+    let volume = volume_names(&executable)
+        .into_iter()
+        .find(|volume| !volume.starts_with("preloop-runner-stage-"))
+        .expect("the populate created the final volume before it failed");
+
+    // The attempt is recorded, so the volume has an age. Without one it counts
+    // as `unknown-age` and is kept for ever, which is what made the unusable
+    // volume above impossible to recover from.
+    let recorded = provider
+        .volume_index()
+        .await
+        .get(&volume)
+        .cloned()
+        .expect("the failed final volume is recorded");
+    assert!(recorded.created > 0);
+
+    // An engine that did not publish it (a restart) sees it as old and reclaims
+    // it, so a later start on the tree populates again.
+    let collector = collecting_provider(&executable, home.path(), gc_home.path(), 0, 0);
+    let outcome = gc::run_pass(&collector, Request::new()).await.unwrap();
+    assert_eq!(outcome.report.deleted, vec![volume.clone()]);
+    assert!(!volume_names(&executable).contains(&volume));
+}
+
 #[test]
 fn the_fixture_reports_the_volumes_it_holds() {
     // The tests above read the volume table through `aenv`, so the fixture
