@@ -203,6 +203,7 @@ Known limitations:
 | `github.rs`             | GitHub webhook receiver, durable queue worker, check runs               |
 | `rerequest.rs`         | `check_run`/`check_suite` rerequest webhook handling: in-place run reruns |
 | `github_breaker.rs`     | Circuit breaker + rate-limit classification for GitHub calls           |
+| `github_runner_admin.rs` | Host-side self-hosted-runner administration: registration/remove tokens, JIT config, runner list/delete, version deprecations, for a repository or an organization scope |
 | `webhook_watchdog.rs`   | Delivery-history poll, phantom-ack join, redelivery                    |
 | `webhook_health.rs`     | Periodic App subscription / delivery-URL drift checks                  |
 | `webhook_status.rs`     | Live repair-layer status behind one lock                               |

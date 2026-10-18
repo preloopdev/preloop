@@ -899,6 +899,7 @@ impl Session {
             token: args.token.clone(),
             repos: Vec::new(),
             workspace: None,
+            runner_admin: false,
         };
         // In `--json` the reused flow's human output would land between our
         // one-object-per-line steps, so it is captured and attached instead.

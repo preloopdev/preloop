@@ -62,6 +62,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **GitHub runner administration is available as an explicit App opt-in**
+  (#623): the host-side client mints repository- or organization-scoped
+  registration/remove tokens, JIT configuration, runner lists/deletions, and
+  version-deprecation responses. `preloop setup github --github-runner-admin` (or
+  `PRELOOP_GITHUB_RUNNER_ADMIN=true`) adds only repository
+  `Administration: write`; existing installations must accept GitHub's
+  permission review, and organization pools require the organization
+  `Self-hosted runners: write` grant.
+
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the

@@ -33,7 +33,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::errors::ApiError;
 use super::state::SharedState;
@@ -45,7 +45,10 @@ use super::state::SharedState;
 static RUNNER_EOL_SCHEDULE: &[(&str, Option<&str>, Option<&str>)] = &[];
 
 /// GitHub-compatible deprecation lookup response.
-#[derive(Debug, Serialize, PartialEq)]
+///
+/// `Deserialize` lets [`crate::github_runner_admin`] parse the same shape when
+/// it asks github.com (or GHES) for the schedule as a client.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RunnerDeprecation {
     pub runner_version: String,
     pub runtime_deprecates_at: Option<String>,
@@ -54,7 +57,11 @@ pub struct RunnerDeprecation {
 
 /// True when `version` has the shape of a runner release (`2.336.0`,
 /// optionally with a leading `v`).
-fn is_runner_version_shape(version: &str) -> bool {
+///
+/// Also the client-side guard for
+/// [`crate::github_runner_admin::GithubRunnerAdmin`], which appends the version
+/// to a request path as one segment.
+pub(crate) fn is_runner_version_shape(version: &str) -> bool {
     let digits = version.strip_prefix('v').unwrap_or(version);
     !digits.is_empty()
         && digits

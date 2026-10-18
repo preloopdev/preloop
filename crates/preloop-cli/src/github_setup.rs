@@ -94,6 +94,15 @@ pub struct GithubSetupArgs {
     /// Workspace whose workflows should drive the permission checklist.
     #[arg(long)]
     pub workspace: Option<PathBuf>,
+
+    /// Add the repository `Administration: write` permission to the created
+    /// App (with `--via app`, browser flow). A GitHub-mode runner pool needs
+    /// it to mint runner registration tokens and delete dead runners. The
+    /// default stays narrow: the manifest is the only place this can be
+    /// granted at creation, and granting it on an existing App means every
+    /// installation must accept a permission review in the GitHub UI.
+    #[arg(long = "github-runner-admin", env = "PRELOOP_GITHUB_RUNNER_ADMIN")]
+    pub runner_admin: bool,
 }
 
 /// Manual `Debug` — `token` is a PAT, so it is never printed. Clap's derives
@@ -114,6 +123,7 @@ impl std::fmt::Debug for GithubSetupArgs {
             .field("token", &redacted(self.token.is_some()))
             .field("repos", &self.repos)
             .field("workspace", &self.workspace)
+            .field("runner_admin", &self.runner_admin)
             .finish()
     }
 }
@@ -242,6 +252,7 @@ pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()
                  and webhook secret are written to your config automatically.\n\
                  \x20 --org <NAME>       create it under an organization\n\
                  \x20 --public-url <URL> also enable webhook delivery to this engine\n\
+                 \x20 --github-runner-admin add Administration: write for runner pools\n\
                  \n\
                  Already have an App? Skip the browser:\n\
                  \x20 preloop setup github --via app --app-id <ID> --pem-file <KEY>"
@@ -302,6 +313,23 @@ pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()
     }
 }
 
+/// What `--github-runner-admin` can and cannot do to an App that already
+/// exists.
+///
+/// The flag only changes the manifest an App is *created* from. App
+/// permissions are not something a CLI flag can edit afterwards, so every path
+/// that reuses an existing App says what to do in GitHub instead of letting
+/// the flag look applied.
+fn note_runner_admin_opt_in() {
+    println!(
+        "Note: --github-runner-admin only sets permissions at App creation. For an \
+         existing App, grant `Administration: write` on repositories in the \
+         App's permission settings, then accept the pending permission review \
+         on each installation — otherwise runner-admin token mints will fail \
+         naming the missing grant."
+    );
+}
+
 async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     // Nothing supplied means "create the App for me"; either flag on its own
     // is a half-finished manual setup, and silently starting a browser flow
@@ -315,6 +343,12 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
             let has_configured_app = (existing.app_id.is_some() && existing.app_pem().is_some())
                 || !existing.apps.is_empty();
             if has_configured_app && !args.add {
+                // The flag cannot change an existing App, and this branch is
+                // where an operator who expected it to would end up: say how
+                // to grant the permission before returning.
+                if args.runner_admin {
+                    note_runner_admin_opt_in();
+                }
                 if let (Some(app_id), Some(pem)) = (existing.app_id.as_deref(), existing.app_pem())
                 {
                     return match args.public_url.as_deref() {
@@ -363,6 +397,9 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
         ),
     };
 
+    if args.runner_admin {
+        note_runner_admin_opt_in();
+    }
     let path = save_app_credentials(&app_id, &pem, webhook_secret)?;
     println!("Wrote {}", path.display());
     println!(
@@ -509,6 +546,7 @@ async fn setup_app_via_browser(args: &GithubSetupArgs) -> anyhow::Result<()> {
         args.org.as_deref(),
         args.port,
         args.public_url.as_deref(),
+        args.runner_admin,
         !args.no_browser,
         |credentials| {
             let app_id = credentials.id.to_string();
@@ -1561,6 +1599,7 @@ mod tests {
                     token: Some("github_pat_external".to_owned()),
                     repos: Vec::new(),
                     workspace: None,
+                    runner_admin: false,
                 })
                 .await?;
                 preloop_runner_server::config::load_config_from(&config_path)
