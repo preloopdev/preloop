@@ -2129,13 +2129,16 @@ mod tests {
     #[test]
     fn nesting_beyond_the_reusable_depth_bound_fails_closed() {
         let policy = sha_policy();
-        // Depth 4 is the deepest callee the expander and this check follow.
-        assert!(offenders(chained_run(4).evaluate(&policy)).is_empty());
+        // The bound is the parser's own reusable depth, so this check follows
+        // exactly the tree the expander materializes: one callee inside it is
+        // judged, one past it is refused.
+        let depth = crate::actions::DECLARED_ACTION_REUSABLE_DEPTH;
+        assert!(offenders(chained_run(depth).evaluate(&policy)).is_empty());
         assert_eq!(
-            offenders(chained_run(5).evaluate(&policy)),
+            offenders(chained_run(depth + 1).evaluate(&policy)),
             vec![(
-                ".github/workflows/c4.yml".to_owned(),
-                "./.github/workflows/c5.yml".to_owned(),
+                format!(".github/workflows/c{depth}.yml"),
+                format!("./.github/workflows/c{}.yml", depth + 1),
                 REQUIRE_SHA_PINNING
             )]
         );
