@@ -35,20 +35,17 @@ TOML specs, and replays golden wire captures for protocol conformance.
 
 ## Pluggable backends
 
-preloop is execution-agnostic. The only thing that differs between runner hosts
-is how a runner instance is created and destroyed. This is modeled as the
-`preloop_vm::VmProvider` trait (crates/preloop-vm/src/lib.rs:349); the
-`ControlBackend` trait (control/backend.rs) covers durable state. (The `RunnerProvider`/`AuthProvider`
-design in fidelity-gap §4 is aspirational.)
+The shipped extension points are `ControlBackend` for durable control-plane
+state and `VmProvider` for VM provisioning. `ControlBackend` has SQLite as the
+default and Postgres for shared deployments; `VmProvider` currently supports
+SmolVM (the default) and AgentENV. See [State Model](#state-model) and [VM
+substrates](/vm-substrates).
 
-- `**ControlBackend**` — durable control-plane state behind one trait: SQLite
-  (default) or Postgres (shared nodes). See [State Model](#state-model).
-- `**AuthProvider**` — loopback-trust (local) or OAuth plus bearer tokens
-  (system token or minted job JWTs).
-- `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
-cloud VM, k8s pod, bare BYO). Optional — preloop works with external runners.
-
-See [fidelity-gap.md §4](fidelity-gap.md) for the full design.
+The `AuthProvider` and `RunnerProvider` interfaces, plus process, container,
+Kubernetes, cloud-VM, and bare-BYO runner providers described in
+[fidelity-gap.md §4](fidelity-gap.md), are aspirational design ideas and are
+not implemented by the shipped system. This page and the architecture diagrams
+label them as such.
 
 ## State Model
 
@@ -75,17 +72,19 @@ diverge between nodes. Scheduling decisions that need Rust evaluation live in
 
 Backends are selected by `--store` / `PRELOOP_STORE_URL` (`sqlite://<path>`, a
 bare path, or `postgres://…`), defaulting to SQLite at `<state_dir>/preloop.db`.
-The control schema is greenfield **v1**: created on first use and stamped in
-`schema_meta`, with no migrations — a `control` schema at another version is
-refused.
-The in-memory state that remains (`state.rs::InnerState`) is node-local — live
-logs and log feeds, cache/artifact reservations, runner liveness, and debug
-sessions — and is never the authority for runs, jobs, runners, or sessions.
+The control schema uses embedded, forward-only refinery migrations. Fresh local
+SQLite stores are initialized by supported setup paths; existing stores are
+upgraded explicitly with `preloop store migrate`. `preloop serve` verifies the
+migration ledger and refuses an uninitialized or incompatible schema rather
+than migrating it. `schema_meta` is not the version authority; see
+[Control database migrations](control-migrations.md).
 
-Cache and artifact payloads stay in file-backed stores under `.preloop/`, and
-their reservation bookkeeping is node-local, so a multi-node deployment must
-route a job's cache/artifact requests to the node that reserved them (or run
-one node per job).
+The Postgres backend supports several engine nodes sharing one database for
+durable runs, jobs, runner state, and queue claims. Some operational state
+remains node-local (`state.rs::InnerState`): live logs and feeds, cache/artifact
+reservations, runner liveness, and debug sessions. Those file-backed payloads
+and reservations need node-aware routing; shared Postgres is not by itself a
+complete active-active deployment.
 
 Known gaps and their tradeoffs are tracked in the repository issue tracker.
 

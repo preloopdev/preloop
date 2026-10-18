@@ -608,30 +608,6 @@ pub fn job_matches_runner_group(required_group: Option<&str>, runner: &RunnerCap
     }
 }
 
-pub fn job_matches_runner_capabilities(job: &QueuedJob, runner: &RunnerCapabilities) -> bool {
-    job_matches_runner(&job.runs_on, &runner.labels)
-        && job_matches_runner_group(job.runner_group.as_deref(), runner)
-}
-
-/// Whether the runner carries every label the job asked for, verbatim.
-///
-/// The difference from [`job_matches_runner`] is the hosted-image stand-in: a
-/// 24.04 machine *may* run an `ubuntu-22.04` job, but it is not what the job
-/// asked for, and the pool is usually already building the machine that is.
-fn job_labels_covered_exactly(job_labels: &[String], runner_labels: &[String]) -> bool {
-    if job_labels.is_empty() {
-        return true;
-    }
-    if runner_labels.is_empty() {
-        return false;
-    }
-    let runner_set: std::collections::HashSet<String> =
-        runner_labels.iter().map(|l| l.to_lowercase()).collect();
-    job_labels
-        .iter()
-        .all(|required| runner_set.contains(&required.to_lowercase()))
-}
-
 /// How long an assignment or pool-pending mark stays authoritative. After
 /// expiry a job falls back to ordinary permissive scheduling so a crashed
 /// pool or dead machine can never wedge a queued job forever.

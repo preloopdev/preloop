@@ -1,28 +1,20 @@
 # Fidelity Gap &amp; Roadmap
 
-**preloop** is a faithful Rust reimplementation of the GitHub Actions control plane, a host-side service that the **official** `actions/runner`**(**`Runner.Listener`**)**  or our rust-equivalent can register against, poll for jobs, execute, and report results to, without GitHub-hosted minutes. This doc is a tracker of any fidelity gaps between preloop and the official runner/server.
+**Purpose and status:** this is an engineering tracker comparing Preloop with
+the official GitHub Actions runner/server. It contains dated campaign results
+and design notes; do not read every item below as a current support matrix.
+For current setup and host requirements, see [Self-hosting](self-hosting.md)
+and [Preloop vs. other runners](preloop_vs_others.md).
 
-**preloop is not tied to any specific runner host.** It speaks the runner protocol and accepts
+Preloop combines the control plane with a runner pool. The default product
+execution path uses SmolVM/libkrun microVMs; AgentENV is an optional Linux
+backend. The control-plane protocol is a separate component, but protocol
+compatibility does not mean every alternative runner host is a supported or
+productized deployment. Remote-runner authentication and multi-host pool
+limitations are tracked in [the roadmap](roadmap.md).
 
-incoming runner connections; the runner itself handles execution. This means preloop works
-
-equally well with:
-
-- libkrun/fircracker/CH/Qemu microVMs (preloop by default uses libkrun)
-- Docker / Podman containers
-- Virtual machines (cloud or local)
-- Bare processes on the same machine
-- Remote runners on other servers
-
-**Preloop** is the *product* that combines preloop (control plane) + a libkrun-based
-
-ephemeral runner host for local CI. preloop is its control plane. But preloop is independently
-
-usable: anyone can `cargo install preloop` and point their own runners at it.
-
-Runner *provisioning* integrations live in separate repos/crates. The Rust runner
-
-protocol client (`preloop-runner`) lives in this workspace alongside the control plane.
+The Rust runner protocol client (`preloop-runner`) lives in this workspace
+alongside the control plane.
 
 Upstream reference: `actions/runner` v2.336.0 (commit `98aabcd429c4e8402406c56ce2d26387fed3b9ce`)
 
@@ -522,7 +514,7 @@ Every item below broke a real workflow step and was fixed in preloop:
 
 | Gap | Symptom | Fix |
 | --- | --- | --- |
-| Older SmolVM releases lost UID/GID ownership while extracting packed machines | packed images containing non-root service accounts or ownership-sensitive system files could not start correctly | `preloop update --ensure-runtime` requires SmolVM >=1.8.1 and installs the latest stable release when the current runtime is older or lacks the required socket capability |
+| Older SmolVM releases lost UID/GID ownership while extracting packed machines | packed images containing non-root service accounts or ownership-sensitive system files could not start correctly | `preloop update --ensure-runtime` requires SmolVM at or above the compiled `smolvm_min_version` floor (which moves as new runtime invariants arrive) and installs the latest stable release when the current runtime is older or lacks the required socket capability |
 | SmolVM's non-streaming `machine exec` drops the connection after ~30s with no output | quiet provisioning execs such as toolchain installs were killed mid-flight | provider execs pass an explicit `--timeout 30m` |
 | Job/workflow-level `env:` never reached action processes | moby's `docker buildx bake` resolved `${DESTDIR}` to `""` because the hcl default took over — the `govulncheck` target's `output = ["${DESTDIR}"]` collapsed to an empty output list, the report was never exported, and the bake action failed on the missing path. The server put job env in the message `variables` map and left the wire `environmentVariables` (the field the official runner materializes into step environments) empty | the job message builder now populates `environmentVariables` from the job env |
 | A server restart left every queued run permanently wedged | jobs restored from the store sat "pending" forever: the on-demand pool only forks while its shared `queue_depth` atomic is non-zero, and after a restart no runner exists to refresh it from a broker poll | `serve` re-arms the atomic with the recovered ready-queue length and re-syncs `next_job_runs_on` |
@@ -1355,13 +1347,12 @@ Steps:
 4. **Crypto isolation:** all RSA/AES lives in one reviewed module (`protocol::crypto`);
 
   `unsafe` stays forbidden; use `rsa`/`aes-gcm`/`cbc` crates. Document algorithm choices.
-5. **Known FIPS gap:** upstream `actions/runner` uses RSA-OAEP-SHA1 by default but switches to
-
-  RSA-OAEP-SHA256 when `UseFipsEncryption` is enabled. preloop currently implements the default
-
-   SHA-1 OAEP path only; FIPS-mode runners require an explicit algorithm switch before they can
-
-   decrypt `TaskAgentSession.encryptionKey`.
+5. **FIPS-mode encryption (implemented):** upstream `actions/runner` uses
+   RSA-OAEP-SHA1 by default and switches to RSA-OAEP-SHA256 when
+   `UseFipsEncryption` is enabled. Current session setup selects SHA-256 for
+   FIPS mode and rejects plaintext fallback; see the implemented evidence in
+   the compatibility table above. This historical campaign note is not an
+   outstanding gap.
 
 **Validate (Phase C):**
 

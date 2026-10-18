@@ -210,7 +210,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
 /// `preserve_on_failure` is a property of the run, carried to the runner on the
 /// job message. It must be absent unless asked for, so the default wire shape
 /// stays byte-identical to what an official runner expects.
-
 pub fn selected_jobs_workflow() -> &'static str {
     r#"
 on: push

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Preloop",
+  "colors": {
+    "primary": "#0067C5",
+    "light": "#0485F7",
+    "dark": "#0485F7"
+  },
+  "logo": {
+    "light": "/images/preloop-logo-wide.jpg",
+    "dark": "/images/preloop-logo-wide.jpg",
+    "href": "https://preloop.dev"
+  },
+  "favicon": "/images/preloop-logo.png",
+  "appearance": {
+    "default": "light",
+    "strict": false
+  },
+  "fonts": {
+    "family": "Inter"
+  },
+  "background": {
+    "color": {
+      "light": "#F5F5F5",
+      "dark": "#18181B"
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/preloopdev/preloop"
+      },
+      {
+        "label": "preloop.dev",
+        "href": "https://preloop.dev"
+      }
+    ]
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting started",
+        "pages": ["introduction", "quickstart", "setup", "cli_reference"]
+      },
+      {
+        "group": "Architecture",
+        "pages": ["system-architecture", "architecture", "control-migrations", "vm-substrates", "vm-images", "build-goldens"]
+      },
+      {
+        "group": "Compatibility",
+        "pages": ["conformance", "fidelity-gap", "preloop_vs_others"]
+      },
+      {
+        "group": "Operations",
+        "pages": ["self-hosting", "push", "webhook-resilience", "github-app-webhook", "github-app-api-compat", "github-tokens", "retries-and-pool-memory"]
+      },
+      {
+        "group": "Debugging and automation",
+        "pages": ["debug-sessions", "agent-pre-push", "ci-gate-auto-pr"]
+      },
+      {
+        "group": "Project status",
+        "pages": ["roadmap"]
+      },
+      {
+        "group": "Demos",
+        "pages": ["demo/dap/omp-debugging-demo", "demo/dap/agent-prompt"]
+      }
+    ]
+  }
+}

@@ -80,28 +80,52 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
         shared
             .state
             .webhook_status
-            .set_app_config(Vec::new(), now_us());
+            .set_app_config(Vec::new(), Some(now_us()));
         return Vec::new();
     }
-    if let Some(retry_after) = shared
-        .state
-        .github_breakers
-        .retry_after_for(crate::github_breaker::GithubCredentialBucket::App)
-    {
-        tracing::debug!(
-            retry_in_secs = retry_after.as_secs(),
-            "GitHub breaker open or probe in progress; skipping App webhook health check"
-        );
-        return shared.state.webhook_status.app_config_snapshot().0;
-    }
-
+    // The verdicts published last pass. An App held back by its breaker is not
+    // re-checked and keeps its previous verdict, so the published list still
+    // covers every App.
+    let (previous, previous_checked_at_us) = shared.state.webhook_status.app_config_snapshot();
+    let app_count = apps.len();
     let api_base = crate::github::github_api_base();
     let expected_url = expected_webhook_url();
     let mut statuses = Vec::with_capacity(apps.len());
+    let mut checked = 0usize;
     for app in apps {
+        let bucket = crate::github_breaker::GithubCredentialBucket::for_app(&app.app_id);
+        if let Some(retry_after) = shared.state.github_breakers.retry_after_for(bucket) {
+            tracing::debug!(
+                app_id = %app.app_id,
+                retry_in_secs = retry_after.as_secs(),
+                "GitHub breaker open or probe in progress; skipping App webhook health check"
+            );
+            let kept: Vec<AppWebhookConfigStatus> = previous
+                .iter()
+                .filter(|status| status.app_id == app.app_id)
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                // Nothing was ever published for this App, so there is no
+                // verdict to keep — but omitting it would make a blocked App
+                // invisible exactly when its wiring matters. Publish an
+                // explicitly unchecked verdict instead, with no check time.
+                statuses.push(AppWebhookConfigStatus {
+                    app_id: app.app_id.clone(),
+                    expected_url: expected_url.clone(),
+                    error: Some("not checked: GitHub breaker open or probe in progress".to_owned()),
+                    ..Default::default()
+                });
+            } else {
+                statuses.extend(kept);
+            }
+            continue;
+        }
+        checked += 1;
         let mut status = AppWebhookConfigStatus {
             app_id: app.app_id.clone(),
             expected_url: expected_url.clone(),
+            checked_at_us: Some(now_us()),
             ..Default::default()
         };
         let mut errors: Vec<String> = Vec::new();
@@ -110,7 +134,10 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some(&shared.state.github_breakers),
+            Some((
+                &shared.state.github_breakers,
+                &shared.state.github_consumption,
+            )),
         )
         .await
         {
@@ -140,7 +167,10 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
             &api_base,
             &app.app_id,
             &app.private_key,
-            Some(&shared.state.github_breakers),
+            Some((
+                &shared.state.github_breakers,
+                &shared.state.github_consumption,
+            )),
         )
         .await
         {
@@ -154,10 +184,22 @@ pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebh
         statuses.push(status);
     }
 
+    if checked == 0 {
+        // Every App is held back by its breaker: publish nothing new.
+        return previous;
+    }
+    // The list is verified as a whole only when every configured App was
+    // actually read this pass. A partial pass keeps the previous publication
+    // time: reusing a verdict must not make it look freshly checked.
+    let checked_at_us = if checked == app_count {
+        Some(now_us())
+    } else {
+        previous_checked_at_us
+    };
     shared
         .state
         .webhook_status
-        .set_app_config(statuses.clone(), now_us());
+        .set_app_config(statuses.clone(), checked_at_us);
     statuses
 }
 
@@ -245,6 +287,51 @@ mod tests {
         )
     }
 
+    async fn shared_with_two_apps() -> (tempfile::TempDir, Arc<SharedState>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.github_apps = Some(crate::github_app::GitHubApps {
+            apps: vec![
+                crate::github_app::GitHubAppCredentials::for_tests(
+                    "424",
+                    TEST_KEY.clone(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+                crate::github_app::GitHubAppCredentials::for_tests(
+                    "525",
+                    TEST_KEY.clone(),
+                    crate::github_app::MintFailurePolicy::LocalJwt,
+                ),
+            ],
+            default_index: 0,
+        });
+        (
+            temp,
+            Arc::new(SharedState {
+                state,
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            }),
+        )
+    }
+
+    /// Trip one App's own breaker bucket the way a 429 would.
+    fn park_app(shared: &Arc<SharedState>, app_id: &str) {
+        shared
+            .state
+            .github_breakers
+            .breaker_for(crate::github_breaker::GithubCredentialBucket::for_app(
+                app_id,
+            ))
+            .record_failure(
+                &crate::github_breaker::GithubFailureKind::RateLimited {
+                    retry_after: Some(Duration::from_secs(60)),
+                },
+                "429",
+            );
+    }
+
     #[tokio::test]
     async fn reports_url_drift_against_the_public_url() {
         let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -304,5 +391,106 @@ mod tests {
         assert!(statuses[0].error.is_some(), "{statuses:?}");
         assert!(!statuses[0].healthy());
         assert!(statuses[0].hook_url.is_none());
+    }
+
+    /// Two Apps, the first behind an open breaker: only the second is checked,
+    /// and the published list still covers both — the held-back App appears
+    /// as explicitly unchecked rather than vanishing from the snapshot.
+    #[tokio::test]
+    async fn an_app_behind_an_open_breaker_is_not_checked_while_the_others_are() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
+        let (_temp, shared) = shared_with_two_apps().await;
+        park_app(&shared, "424");
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        let ids: Vec<&str> = statuses
+            .iter()
+            .map(|status| status.app_id.as_str())
+            .collect();
+        assert_eq!(ids, ["424", "525"], "{statuses:?}");
+        assert!(
+            statuses[0].error.is_some(),
+            "the held-back App must say it was not checked: {statuses:?}"
+        );
+        assert!(!statuses[0].healthy(), "{statuses:?}");
+        assert!(statuses[1].healthy(), "{statuses:?}");
+        assert!(
+            statuses[0].checked_at_us.is_none(),
+            "an App that was never checked has no check time: {statuses:?}"
+        );
+        assert!(statuses[1].checked_at_us.is_some(), "{statuses:?}");
+    }
+
+    /// An App held back by its breaker is not re-checked, so the verdict it
+    /// published last pass stays in the list.
+    #[tokio::test]
+    async fn an_app_held_back_keeps_its_last_published_verdict() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
+        let (_temp, shared) = shared_with_two_apps().await;
+        let published = check_webhook_config_once(&shared).await;
+        let first_checked_at = shared.state.webhook_status.app_config_snapshot().1;
+        park_app(&shared, "424");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        let ids: Vec<&str> = statuses
+            .iter()
+            .map(|status| status.app_id.as_str())
+            .collect();
+        assert_eq!(ids, ["424", "525"], "{statuses:?}");
+        assert_eq!(statuses[0], published[0]);
+        assert!(
+            statuses[1].checked_at_us > published[1].checked_at_us,
+            "the re-checked App's verdict must advance: {statuses:?}"
+        );
+        assert_eq!(
+            shared.state.webhook_status.app_config_snapshot().1,
+            first_checked_at,
+            "a partial pass must not make the whole list look freshly checked"
+        );
+    }
+
+    /// When every App is held back the pass checks nothing, so it publishes
+    /// nothing and the publication time does not move.
+    #[tokio::test]
+    async fn every_app_held_back_leaves_the_published_snapshot_untouched() {
+        let _lock = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let api_base = stub_github(
+            "https://here.example/api/v1/github/webhooks",
+            axum::http::StatusCode::OK,
+        )
+        .await;
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+        let _public = crate::state::TestEnvVar::set("PRELOOP_PUBLIC_URL", "https://here.example");
+        let (_temp, shared) = shared_with_two_apps().await;
+        let published = check_webhook_config_once(&shared).await;
+        let checked_at = shared.state.webhook_status.app_config_snapshot().1;
+        park_app(&shared, "424");
+        park_app(&shared, "525");
+
+        let statuses = check_webhook_config_once(&shared).await;
+
+        assert_eq!(statuses, published);
+        assert_eq!(
+            shared.state.webhook_status.app_config_snapshot().1,
+            checked_at,
+            "a pass that checked nothing must not move the publication time"
+        );
     }
 }

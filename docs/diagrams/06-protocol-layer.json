@@ -500,7 +500,7 @@
    "type": 3
   },
   "label": {
-   "text": "Rule 4: GitHub Fidelity\n\nProtocol DTOs match official v2.337.0 wire captures byte-for-byte.",
+   "text": "Rule 4: GitHub Fidelity\n\nProtocol DTOs match official v2.336.0 wire captures byte-for-byte.",
    "fontSize": 14
   }
  },

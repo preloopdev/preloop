@@ -330,7 +330,7 @@ impl GithubBreaker {
 /// authenticates with.
 ///
 /// GitHub's budgets are per credential: one installation token's 429 must
-/// not park another installation's traffic, and the static PAT, the App JWT,
+/// not park another installation's traffic, and the static PAT, each App's JWT,
 /// and anonymous calls each have their own budget. Breaker state is
 /// partitioned on this key so a throttled credential only blocks its own
 /// traffic; consumption accounting keeps its per-subsystem labels separately.
@@ -340,22 +340,47 @@ pub enum GithubCredentialBucket {
     Installation(u64),
     /// The engine's static PAT (`PRELOOP_GITHUB_TOKEN` / config `github.pat`).
     Pat,
-    /// A GitHub App JWT (webhook delivery management, app health checks).
-    App,
+    /// A GitHub App JWT, keyed by App id (webhook delivery management, app
+    /// health checks, installation lookup and token minting). Each App is its
+    /// own rate-limit identity.
+    App(u64),
     /// No credential (anonymous API, 60 req/hour/IP).
     Anonymous,
 }
 
 impl GithubCredentialBucket {
+    /// The App-JWT bucket for `app_id`.
+    ///
+    /// GitHub App ids are numeric. An id that does not parse (emulators, test
+    /// doubles) is hashed instead, so every App still gets its own budget.
+    pub fn for_app(app_id: &str) -> Self {
+        let app_id = app_id.trim();
+        let id = app_id
+            .parse::<u64>()
+            .unwrap_or_else(|_| fnv1a_64(app_id.as_bytes()));
+        Self::App(id)
+    }
+
     /// Stable label for snapshots and traces.
     pub fn label(&self) -> String {
         match self {
             GithubCredentialBucket::Installation(id) => format!("installation:{id}"),
             GithubCredentialBucket::Pat => "pat".to_owned(),
-            GithubCredentialBucket::App => "app".to_owned(),
+            GithubCredentialBucket::App(id) => format!("app:{id}"),
             GithubCredentialBucket::Anonymous => "anonymous".to_owned(),
         }
     }
+}
+
+/// FNV-1a over `bytes`. Chosen over `DefaultHasher`, whose output the standard
+/// library does not promise to keep across releases: a bucket names a budget,
+/// and that meaning must survive an upgrade.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// Registry of per-credential breakers.
@@ -580,6 +605,10 @@ pub enum GithubSubsystem {
     Workflows,
     /// Webhook delivery management (watchdog repair, health checks).
     Webhooks,
+    /// App-JWT calls that authenticate the App itself: installation lookup and
+    /// listing, installation reads, and installation-token minting
+    /// (`github_app.rs`).
+    AppAuth,
 }
 
 impl GithubSubsystem {
@@ -592,10 +621,11 @@ impl GithubSubsystem {
             GithubSubsystem::Snapshots => "snapshots",
             GithubSubsystem::Workflows => "workflows",
             GithubSubsystem::Webhooks => "webhooks",
+            GithubSubsystem::AppAuth => "app-auth",
         }
     }
 
-    const ALL: [GithubSubsystem; 7] = [
+    const ALL: [GithubSubsystem; 8] = [
         GithubSubsystem::CheckRuns,
         GithubSubsystem::Actions,
         GithubSubsystem::RefResolve,
@@ -603,6 +633,7 @@ impl GithubSubsystem {
         GithubSubsystem::Snapshots,
         GithubSubsystem::Workflows,
         GithubSubsystem::Webhooks,
+        GithubSubsystem::AppAuth,
     ];
 }
 
@@ -986,7 +1017,8 @@ mod tests {
                 "env",
                 "snapshots",
                 "workflows",
-                "webhooks"
+                "webhooks",
+                "app-auth"
             ]
         );
     }
@@ -1003,6 +1035,52 @@ mod tests {
             assert_eq!(usage.rate_limited, 0);
             assert_eq!(usage.breaker_blocked, 0);
         }
+    }
+
+    /// An App's JWT budget is its own: App 1's 429 parks App 1 and leaves
+    /// App 2 flowing.
+    #[test]
+    fn app_jwt_budget_is_partitioned_by_app_id() {
+        let registry = GithubBreakerRegistry::new(test_config());
+        registry
+            .breaker_for(GithubCredentialBucket::App(1))
+            .record_failure(
+                &GithubFailureKind::RateLimited {
+                    retry_after: Some(Duration::from_secs(60)),
+                },
+                "429",
+            );
+        assert!(
+            registry
+                .breaker_for(GithubCredentialBucket::App(1))
+                .is_open()
+        );
+        assert!(
+            !registry
+                .breaker_for(GithubCredentialBucket::App(2))
+                .is_open(),
+            "App 2 must keep flowing while App 1 is rate limited"
+        );
+    }
+
+    #[test]
+    fn numeric_app_id_names_its_bucket_directly() {
+        assert_eq!(
+            GithubCredentialBucket::for_app("123"),
+            GithubCredentialBucket::App(123)
+        );
+        assert_eq!(GithubCredentialBucket::App(123).label(), "app:123");
+    }
+
+    #[test]
+    fn non_numeric_app_id_maps_to_a_stable_distinct_bucket() {
+        let bucket = GithubCredentialBucket::for_app("emulated-app");
+        assert!(matches!(bucket, GithubCredentialBucket::App(_)));
+        assert_eq!(bucket, GithubCredentialBucket::for_app("emulated-app"));
+        assert_ne!(
+            bucket,
+            GithubCredentialBucket::for_app("other-emulated-app")
+        );
     }
 
     /// A tiny stub GitHub: serves scripted responses and counts hits, so
