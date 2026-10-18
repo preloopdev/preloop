@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Runner steps no longer inherit credential-shaped host environment
+  variables.** A step is attacker-controlled code, so a name containing
+  `token`, `secret`, `password`, `passwd`, `api_key`, `apikey`, `private_key`,
+  `access_key`, `credential`, `auth_token`, or `session_key`, or ending in
+  `_key`, is filtered out of the runner's own environment before a step,
+  action, or script starts (`TOKENIZERS_PARALLELISM` is exempt). Set
+  `PRELOOP_RUNNER_INHERIT_HOST_ENV=1` to restore full inheritance, and pass
+  secrets through the workflow's `env:`. Runner-owned image pulls keep the
+  host environment so Docker registry credential helpers, such as the ECR
+  helper, still authenticate private `container:` images.
+
 ### Added
 
 - **Engine-hosted GitHub App setup.** With a public URL (`--public-url` or

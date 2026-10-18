@@ -126,6 +126,14 @@ sudo systemctl enable --now preloop-runner
 </Step>
 </Steps>
 
+## Environment inherited by steps
+
+A step starts with the runner's own environment (`PATH`, `HOME`, `LANG`, toolchain roots) plus the `env:` block of its workflow and job. Credential-shaped host variables are dropped: names containing `token`, `secret`, `password`, `passwd`, `api_key`, `apikey`, `private_key`, `access_key`, `credential`, `auth_token`, or `session_key`, and names ending in `_key`. That keeps provider keys that live in the service environment — say `OPENAI_API_KEY` in a unit file's `Environment=` — out of a workflow that runs `env`. `TOKENIZERS_PARALLELISM` is exempt.
+
+Pass secrets through the workflow's `env:` or the control plane's secret store. To inherit the host environment in full anyway, set `PRELOOP_RUNNER_INHERIT_HOST_ENV=1` for the runner.
+
+Pulling a job's `container:` image still runs with the host environment intact. Docker registry credential helpers read their credentials from it — the ECR helper needs `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` — so private images keep authenticating on hosts configured that way. The pull runs before any step does.
+
 ## Single-job runners
 
 A runner configured with `--ephemeral` exits after its first job. `run --once` does the same for any configured runner. Use either on hosts that you provision for one job.

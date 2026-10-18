@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-use crate::process;
+use crate::process::{self, HostEnvPolicy};
 
 /// Registry credentials for pulling images from private registries.
 ///
@@ -351,6 +351,13 @@ pub async fn create_network(network: &str, label: &str, log: &mut Vec<String>) -
 /// Docker config directory (so the user's global `~/.docker/config.json` is
 /// never touched), pulls with that config, then removes the credentials on
 /// drop. Matches official runner `ContainerOperationProvider.cs:193-221`.
+///
+/// The pull goes through [`docker_cmd_trusted`], not [`docker_cmd`]: pulling
+/// without workflow-supplied credentials routes through the host's Docker
+/// credential helpers, which read their credentials from the environment
+/// (`docker-credential-ecr-login` wants `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY`). This runs before any step exists and belongs to
+/// the runner, so it keeps them.
 pub async fn pull_image(
     image: &str,
     credentials: Option<&RegistryCredentials>,
@@ -359,11 +366,11 @@ pub async fn pull_image(
     if let Some(creds) = credentials {
         let config_dir = docker_registry_login(image, creds, log).await?;
         let config_path = config_dir.path().to_string_lossy().to_string();
-        let result = docker_cmd(&["--config", &config_path, "pull", image], log).await;
+        let result = docker_cmd_trusted(&["--config", &config_path, "pull", image], log).await;
         drop(config_dir); // deletes temp credentials dir
         result?;
     } else {
-        docker_cmd(&["pull", image], log).await?;
+        docker_cmd_trusted(&["pull", image], log).await?;
     }
     Ok(())
 }
@@ -1101,6 +1108,12 @@ fn parse_registry_from_image(image: &str) -> &str {
 ///
 /// Retries up to 3 times with 5 s / 10 s exponential backoff, matching
 /// official runner `ContainerOperationProvider.cs:470-499`.
+///
+/// Spawns `docker` directly rather than through [`docker_cmd`], so it keeps
+/// the runner's whole environment (`HostEnvPolicy::Trusted` territory): the
+/// login handshake and any credential helper it consults read host
+/// configuration. This is runner-owned, runs before any step does, and never
+/// sees workflow input beyond the credentials the job itself supplied.
 async fn docker_registry_login(
     image: &str,
     creds: &RegistryCredentials,
@@ -1219,16 +1232,48 @@ pub(crate) async fn wait_for_daemon_ready(log: &mut Vec<String>) -> Result<()> {
 }
 
 /// Run a docker command, logging the command line, and return stdout lines.
+///
+/// The host environment is filtered (`HostEnvPolicy::Filtered`): a workflow
+/// `docker` step is attacker-controlled code and must not inherit the host's
+/// credentials. Only [`docker_cmd_trusted`] keeps them.
 async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
+    docker_cmd_with_host_env(args, log, HostEnvPolicy::Filtered).await
+}
+
+/// Run a docker command with the runner's credential-shaped host environment
+/// kept.
+///
+/// Registry credential helpers are external processes configured in the host's
+/// `~/.docker/config.json` (`credsStore`/`credHelpers`) that read their
+/// credentials from the environment: ECR's helper reads `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY`, GCR's wants `GOOGLE_APPLICATION_CREDENTIALS`.
+/// `docker pull` invokes them, so filtering the environment breaks every
+/// private image on a host that authenticates this way — before any step has
+/// run.
+///
+/// Deliberately narrow: runner-owned image/registry pulls only. Do not route a
+/// step's docker command through this, and do not allowlist cloud credential
+/// names globally — the point of the filter is that a step cannot read the
+/// host's environment.
+async fn docker_cmd_trusted(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
+    docker_cmd_with_host_env(args, log, HostEnvPolicy::Trusted).await
+}
+
+async fn docker_cmd_with_host_env(
+    args: &[&str],
+    log: &mut Vec<String>,
+    policy: HostEnvPolicy,
+) -> Result<Vec<String>> {
     let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
     log.push(format!("##[command]{cmd_line}"));
     debug!("docker {}", args.join(" "));
 
-    let result = process::invoke(
+    let result = process::invoke_with_host_env_policy(
         "docker",
         args,
         Path::new("."),
         &HashMap::new(),
+        policy,
         None,
         None,
         true,

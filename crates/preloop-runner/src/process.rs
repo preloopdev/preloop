@@ -122,6 +122,75 @@ pub(crate) fn is_internal_step_env(key: &str) -> bool {
         || matches!(lower.as_str(), "term" | "colorterm")
 }
 
+/// Credential-shaped names that must never be inherited by a step.
+///
+/// The runner starts from the operator's environment (shell, unit file, CI
+/// agent). Self-hosted hosts routinely carry provider/cloud credentials there,
+/// and a step is attacker-controlled code, so inheriting them turns any
+/// workflow into a credential-disclosure primitive — an audit run printed the
+/// host's `CLIPROXY_API_KEY`/`OPENROUTER_API_KEY` through a plain `env` dump.
+///
+/// This is a name-shape filter, not a value scan: it is deliberately
+/// conservative about what it keeps (`PATH`, `HOME`, `LANG`, toolchain roots
+/// are untouched) and is overridable with
+/// `PRELOOP_RUNNER_INHERIT_HOST_ENV=1` for workflows that genuinely rely on a
+/// host credential variable (which should instead be passed via `env:`).
+pub(crate) fn is_sensitive_host_env(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    // Benign toolchain knobs whose name happens to trip a marker below.
+    // `TOKENIZERS_PARALLELISM` (HuggingFace) carries a tokenizer
+    // fork-parallelism preference, not a token; dropping it silently changes
+    // tokenizer behaviour for every step that loads one. Exact names only:
+    // `MY_TOKENIZERS_PARALLELISM_API_KEY` is still credential-shaped.
+    if lower == "tokenizers_parallelism" {
+        return false;
+    }
+    const MARKERS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "private_key",
+        "access_key",
+        "credential",
+        "auth_token",
+        "session_key",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker)) || lower.ends_with("_key")
+}
+
+/// Which of the runner's own environment variables a child process inherits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostEnvPolicy {
+    /// Drop credential-shaped host names, like a step's own environment does.
+    /// Steps, scripts, actions, hooks, and every runner-owned command that
+    /// does not have to authenticate through the host environment use this.
+    Filtered,
+    /// Keep credential-shaped host names (internal bookkeeping families are
+    /// still dropped). Only runner-owned plumbing that delegates
+    /// authentication to a helper process reading the host environment —
+    /// Docker's registry credential helpers — may use this.
+    Trusted,
+}
+
+/// Whether a variable from the runner's own environment reaches a child.
+///
+/// Internal bookkeeping families never do, under either policy. Under
+/// [`HostEnvPolicy::Filtered`] credential-shaped names do not either, unless
+/// `PRELOOP_RUNNER_INHERIT_HOST_ENV` opts back in; under
+/// [`HostEnvPolicy::Trusted`] they are kept on purpose.
+fn inherits_step_env(key: &str, policy: HostEnvPolicy, inherit_host_env: bool) -> bool {
+    if is_internal_step_env(key) {
+        return false;
+    }
+    match policy {
+        HostEnvPolicy::Trusted => true,
+        HostEnvPolicy::Filtered => inherit_host_env || !is_sensitive_host_env(key),
+    }
+}
+
 /// Invoke a process with the given environment.
 ///
 /// In production mode (`keep_lines = false`), raw byte chunks are delivered
@@ -133,21 +202,73 @@ pub(crate) fn is_internal_step_env(key: &str) -> bool {
 ///
 /// If `cancel_rx` fires, the process group receives SIGINT → SIGTERM → SIGKILL
 /// with graceful timeouts, matching the official runner sequence.
+///
+/// The runner's own environment reaches the child under
+/// [`HostEnvPolicy::Filtered`]; see [`invoke_with_host_env_policy`] for the
+/// one class of caller that needs more.
 pub async fn invoke<'a>(
     program: &str,
     args: &[&str],
     cwd: &Path,
     env: &HashMap<String, String>,
+    on_chunk: Option<ChunkCallback<'a>>,
+    cancel_rx: Option<watch::Receiver<bool>>,
+    keep_lines: bool,
+) -> Result<ProcessOutput> {
+    invoke_with_host_env_policy(
+        program,
+        args,
+        cwd,
+        env,
+        HostEnvPolicy::Filtered,
+        on_chunk,
+        cancel_rx,
+        keep_lines,
+    )
+    .await
+}
+
+/// [`invoke`] with an explicit [`HostEnvPolicy`] for the runner's own
+/// environment.
+///
+/// [`HostEnvPolicy::Trusted`] exists for runner-owned invocations whose
+/// authentication is performed by a helper process that reads the host
+/// environment by design — Docker's registry credential helpers
+/// (`docker-credential-ecr-login` reads `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY`, the gcloud helper reads
+/// `GOOGLE_APPLICATION_CREDENTIALS`). A step must never use it: workflow YAML
+/// is attacker-controlled code, and an inherited provider key turns any
+/// workflow into a credential-disclosure primitive.
+#[allow(clippy::too_many_arguments)] // mirrors `invoke`'s shape plus the policy
+pub(crate) async fn invoke_with_host_env_policy<'a>(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    policy: HostEnvPolicy,
     mut on_chunk: Option<ChunkCallback<'a>>,
     mut cancel_rx: Option<watch::Receiver<bool>>,
     keep_lines: bool,
 ) -> Result<ProcessOutput> {
-    // Steps inherit the worker's machine environment (HOME, LANG, …) but must
-    // not see job-message bookkeeping families that could ride along in it:
-    // a workflow can observe any inherited key by running `env`. Explicit
-    // job/step variables are applied afterwards and take precedence.
-    let inherited = std::env::vars_os()
-        .filter(|(key, _)| key.to_str().is_none_or(|key| !is_internal_step_env(key)));
+    // Children inherit the worker's machine environment (HOME, LANG, …) but
+    // must not see job-message bookkeeping families that could ride along in
+    // it: a workflow can observe any inherited key by running `env`.
+    // Credential-shaped host variables (provider keys, cloud tokens) are
+    // dropped too — the child is attacker-controlled code.
+    // `PRELOOP_RUNNER_INHERIT_HOST_ENV` restores the old full inheritance for
+    // workflows that rely on one. Explicit job/step variables are applied
+    // afterwards and take precedence.
+    let inherit_host_env = std::env::var("PRELOOP_RUNNER_INHERIT_HOST_ENV")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false);
+    let inherited = std::env::vars_os().filter(move |(key, _)| {
+        inherits_step_env(&key.to_string_lossy(), policy, inherit_host_env)
+    });
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -1300,5 +1421,267 @@ mod tests {
         let _ = cancel_task.await;
         let err = result.unwrap_err().to_string();
         assert!(err.contains("process cancelled"));
+    }
+
+    #[test]
+    fn credential_shaped_host_env_is_sensitive() {
+        for key in [
+            "CLIPROXY_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "ACTIONS_RUNTIME_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "SSH_PRIVATE_KEY",
+            "DB_PASSWORD",
+            "DB_PASSWD",
+            "SERVICE_CREDENTIALS",
+            "MY_SESSION_KEY",
+            "GPG_KEY",
+        ] {
+            assert!(is_sensitive_host_env(key), "{key} must be filtered");
+        }
+    }
+
+    #[test]
+    fn ordinary_host_env_is_inherited() {
+        for key in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "SHELL",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "JAVA_HOME",
+            "GOPATH",
+            "GITHUB_ACTIONS",
+            "CI",
+            "TERM_PROGRAM",
+            // Exact-name exception: the substring `token` matches, but the
+            // variable is HuggingFace's tokenizer parallelism knob and carries
+            // no credential.
+            "TOKENIZERS_PARALLELISM",
+            "tokenizers_parallelism",
+        ] {
+            assert!(!is_sensitive_host_env(key), "{key} must be inherited");
+        }
+        // The exception is by exact name, not prefix: a credential variable
+        // that merely contains it stays filtered.
+        assert!(is_sensitive_host_env("TOKENIZERS_PARALLELISM_API_KEY"));
+    }
+
+    /// A workflow can observe every inherited key with `env`; a credential in
+    /// the runner's own environment must not reach the step at all.
+    #[test]
+    fn step_env_inheritance_policy() {
+        // Ordinary machine environment survives.
+        assert!(inherits_step_env("PATH", HostEnvPolicy::Filtered, false));
+        assert!(inherits_step_env("HOME", HostEnvPolicy::Filtered, false));
+        assert!(inherits_step_env("LANG", HostEnvPolicy::Filtered, false));
+        assert!(inherits_step_env(
+            "RUSTUP_HOME",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        assert!(inherits_step_env(
+            "TOKENIZERS_PARALLELISM",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        // Credential-shaped host values are dropped.
+        assert!(!inherits_step_env(
+            "CLIPROXY_API_KEY",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        assert!(!inherits_step_env(
+            "OPENROUTER_API_KEY",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        assert!(!inherits_step_env(
+            "GITHUB_TOKEN",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        assert!(!inherits_step_env(
+            "AWS_SECRET_ACCESS_KEY",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        // Internal bookkeeping families are always dropped. `ACTIONS_*`
+        // uppercase is deliberately kept: steps are entitled to see it, and
+        // the per-job values are injected explicitly afterwards.
+        assert!(inherits_step_env(
+            "ACTIONS_RUNTIME_URL",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        assert!(!inherits_step_env("TERM", HostEnvPolicy::Filtered, false));
+        assert!(!inherits_step_env(
+            "system.github",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        // A host `ACTIONS_*` token is still credential-shaped and dropped;
+        // the runner injects its own token through the job env map.
+        assert!(!inherits_step_env(
+            "ACTIONS_RUNTIME_TOKEN",
+            HostEnvPolicy::Filtered,
+            false
+        ));
+        // The documented escape hatch restores the old behaviour.
+        assert!(inherits_step_env(
+            "CLIPROXY_API_KEY",
+            HostEnvPolicy::Filtered,
+            true
+        ));
+        // The trusted policy — runner-owned pulls through a registry
+        // credential helper — keeps credential-shaped names.
+        assert!(inherits_step_env(
+            "AWS_ACCESS_KEY_ID",
+            HostEnvPolicy::Trusted,
+            false
+        ));
+        assert!(inherits_step_env(
+            "AWS_SECRET_ACCESS_KEY",
+            HostEnvPolicy::Trusted,
+            false
+        ));
+        // …but still never the job-message bookkeeping families.
+        assert!(!inherits_step_env("TERM", HostEnvPolicy::Trusted, false));
+        assert!(!inherits_step_env(
+            "system.github",
+            HostEnvPolicy::Trusted,
+            false
+        ));
+        assert!(!inherits_step_env(
+            "DistributedTask.LeakTest",
+            HostEnvPolicy::Trusted,
+            false
+        ));
+    }
+
+    /// End to end, through a real child process: a credential-shaped variable
+    /// in the runner's own environment must not reach a step. The variable is
+    /// seeded by re-execing this test binary (`std::env::set_var` is `unsafe`
+    /// and the crate denies `unsafe`), the same trick the signal tests use.
+    #[tokio::test]
+    async fn invoke_drops_credential_shaped_host_env_from_steps() {
+        const CHILD_MARKER: &str = "PRELOOP_STEP_ENV_CREDENTIAL_CHILD";
+        const SECRET: &str = "PRELOOP_TEST_CLIPROXY_API_KEY";
+        const PLAIN: &str = "PRELOOP_TEST_HOST_ENV_KEEP";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let status = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "process::tests::invoke_drops_credential_shaped_host_env_from_steps",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env(SECRET, "hunter2")
+                .env(PLAIN, "kept-value")
+                .status()
+                .expect("spawning the seeded test subprocess");
+            assert!(
+                status.success(),
+                "seeded subprocess failed ({status}); the inherited-environment check runs there"
+            );
+            return;
+        }
+
+        let result = invoke(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "printenv {SECRET} || echo SECRET-MISSING; \
+                     printenv {PLAIN} || echo PLAIN-MISSING"
+                ),
+            ],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let output = result.lines.join("\n");
+        assert!(
+            output.contains("SECRET-MISSING"),
+            "credential-shaped host env {SECRET} reached a step: {output}"
+        );
+        assert!(
+            !output.contains("hunter2"),
+            "the credential value itself reached a step: {output}"
+        );
+        assert!(
+            output.contains("kept-value"),
+            "ordinary inherited env {PLAIN} was dropped: {output}"
+        );
+    }
+
+    /// The trusted policy is what `pull_image` uses, so that a registry
+    /// credential helper (ECR's reads `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY`) still authenticates private images — while the
+    /// job-message bookkeeping families stay filtered.
+    #[tokio::test]
+    async fn trusted_host_env_policy_keeps_credential_shaped_vars() {
+        const CHILD_MARKER: &str = "PRELOOP_STEP_ENV_TRUSTED_CHILD";
+        const SECRET: &str = "PRELOOP_TEST_AWS_SECRET_ACCESS_KEY";
+        const BOOKKEEPING: &str = "system.leak.test";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let status = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "process::tests::trusted_host_env_policy_keeps_credential_shaped_vars",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env(SECRET, "hunter2")
+                .env(BOOKKEEPING, "1")
+                .status()
+                .expect("spawning the seeded test subprocess");
+            assert!(status.success(), "seeded subprocess failed ({status})");
+            return;
+        }
+
+        // `env` directly, not `sh -c env`: dash drops variable names that are
+        // not valid shell identifiers when it execs a child, which would mask
+        // a leak of the dotted bookkeeping family.
+        let result = invoke_with_host_env_policy(
+            "env",
+            &[],
+            Path::new("."),
+            &HashMap::new(),
+            HostEnvPolicy::Trusted,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let output = result.lines.join("\n");
+        assert!(
+            output.contains(&format!("{SECRET}=hunter2")),
+            "the trusted policy dropped {SECRET}, and registry credential helpers would fail: {output}"
+        );
+        assert!(
+            !output.contains(&format!("{BOOKKEEPING}=")),
+            "job bookkeeping {BOOKKEEPING} leaked under the trusted policy"
+        );
     }
 }

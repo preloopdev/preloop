@@ -101,6 +101,7 @@ Set these in the runner's environment. For a service, use `Environment=` in the 
 | `PRELOOP_GITHUB_API_URL` | `lint` | API base URL. Defaults to `https://api.github.com`. |
 | `ACTIONS_RUNNER_HOOK_JOB_STARTED` | `run` | Path to a script that runs as the first step of every job. |
 | `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` | `run` | Path to a script that runs as the last step of every job. |
+| `PRELOOP_RUNNER_INHERIT_HOST_ENV` | `run` | Set to `1`, `true`, `on`, or `yes` to let steps inherit credential-shaped host variables too. See [environment inherited by steps](/runner/install#environment-inherited-by-steps). |
 
 Hook steps run even when earlier steps failed. A failing hook does not fail the job, and each hook has a 10-minute limit.
 
