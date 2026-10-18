@@ -491,11 +491,42 @@ fn status_sqlite(path: &Path) -> anyhow::Result<StoreStatus> {
 
 // ── Postgres ────────────────────────────────────────────────────────────
 
+/// Deadline for a Postgres connection to become usable: TCP connect, startup
+/// packet, TLS, authentication, and session setup.
+///
+/// `preloop store` is an operator command, so a database that accepts the
+/// socket and then stops talking used to park the operator's terminal with no
+/// way out. `tokio-postgres`'s own `connect_timeout` bounds only the TCP
+/// connect, not the handshake after it, which is why both are set here. A
+/// healthy local or LAN database completes all of this in milliseconds, so 10 s
+/// is generous; it is the same 10 s value the serving pool uses
+/// (`store_pg::CONNECT_TIMEOUT`, owned by the Postgres slice) so the two paths
+/// stay consistent until they are unified.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn postgres_client(url: &str) -> anyhow::Result<tokio_postgres::Client> {
+    postgres_client_within(url, CONNECT_TIMEOUT).await
+}
+
+/// [`postgres_client`] with an explicit handshake deadline, so a test can prove
+/// that a stalled database fails instead of hanging.
+async fn postgres_client_within(
+    url: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<tokio_postgres::Client> {
     let connect_url = crate::store_pg::connect_url(url);
+    // Parse once so `connect_timeout` (the TCP connect) is set on the driver
+    // config too; the `timeout` below covers the handshake that follows it.
+    let mut config: tokio_postgres::Config = connect_url
+        .parse()
+        .context("parsing the Postgres connection string")?;
+    config.connect_timeout(deadline);
     let client = match crate::store_pg::tls_connector(url)? {
         Some(tls) => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tls).await?;
+            let (client, connection) = tokio::time::timeout(deadline, config.connect(tls))
+                .await
+                .map_err(|_| postgres_handshake_timeout(deadline))?
+                .context("connecting to Postgres")?;
             tokio::spawn(async move {
                 let _ = connection.await;
             });
@@ -503,7 +534,10 @@ async fn postgres_client(url: &str) -> anyhow::Result<tokio_postgres::Client> {
         }
         None => {
             let (client, connection) =
-                tokio_postgres::connect(&connect_url, tokio_postgres::NoTls).await?;
+                tokio::time::timeout(deadline, config.connect(tokio_postgres::NoTls))
+                    .await
+                    .map_err(|_| postgres_handshake_timeout(deadline))?
+                    .context("connecting to Postgres")?;
             tokio::spawn(async move {
                 let _ = connection.await;
             });
@@ -514,6 +548,18 @@ async fn postgres_client(url: &str) -> anyhow::Result<tokio_postgres::Client> {
     // baseline creates `control` first, and every admin read is qualified.
     client.batch_execute("SET search_path TO control").await?;
     Ok(client)
+}
+
+/// The error a Postgres connection reports when its handshake deadline expires.
+///
+/// It names the dependency and the deadline so an operator can tell a database
+/// that accepted the socket and stopped answering from one that refused the
+/// connection or rejected the credentials.
+fn postgres_handshake_timeout(deadline: std::time::Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Postgres did not complete the connection handshake within {deadline:?}: the database \
+         accepted the socket but is not answering, so the connection was abandoned"
+    )
 }
 
 async fn postgres_preflight(
@@ -573,14 +619,65 @@ async fn postgres_preflight(
     }
 }
 
+/// How long `preloop store migrate` waits for another administrator's migration
+/// lock before giving up.
+///
+/// The lock is held for a whole migration — DDL plus backfills — which on a
+/// large database is minutes, so the wait has to outlast real work. 10 minutes
+/// covers that while replacing the previous silent, indefinite wait with an
+/// error that names the lock and says who to look for.
+const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How often the bounded migration-lock wait retries `pg_try_advisory_lock`.
+///
+/// A poll rather than a blocking `pg_advisory_lock`: polling is what makes the
+/// wait cancellable at the deadline. Two seconds keeps the retries cheap.
+const MIGRATION_LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn migrate_postgres(url: &str, options: &MigrateOptions) -> anyhow::Result<MigrateReport> {
+    migrate_postgres_within(url, options, MIGRATION_LOCK_WAIT).await
+}
+
+/// [`migrate_postgres`] with an explicit lock-wait deadline, so a test can hold
+/// the lock elsewhere and prove the second admin fails instead of hanging.
+async fn migrate_postgres_within(
+    url: &str,
+    options: &MigrateOptions,
+    lock_wait: std::time::Duration,
+) -> anyhow::Result<MigrateReport> {
     let mut client = postgres_client(url).await?;
-    client
-        .batch_execute(&format!(
-            "SELECT pg_advisory_lock({})",
+    // `pg_advisory_lock` waits forever when another session holds the lock, so
+    // a concurrently running migration (or a stale session) parked a second
+    // `preloop store migrate` indefinitely. Trying, then giving up at a named
+    // deadline, turns that into an actionable error. The lock stays
+    // session-level, so `initialize_empty_postgres`'s own `pg_advisory_lock`
+    // for the same id re-enters instead of blocking.
+    let started = std::time::Instant::now();
+    loop {
+        let acquired: bool = client
+            .query_one(
+                &format!(
+                    "SELECT pg_try_advisory_lock({})",
+                    migrate_runner::POSTGRES_SETUP_LOCK
+                ),
+                &[],
+            )
+            .await
+            .context("taking the migration lock")?
+            .get(0);
+        if acquired {
+            break;
+        }
+        anyhow::ensure!(
+            started.elapsed() < lock_wait,
+            "another Preloop administrator is holding the migration lock (Postgres advisory \
+             lock {}): waited {lock_wait:?} for it and gave up rather than hang. Wait for the \
+             other `preloop store migrate` to finish, then retry; `SELECT * FROM pg_locks WHERE \
+             locktype = 'advisory'` shows the holder.",
             migrate_runner::POSTGRES_SETUP_LOCK
-        ))
-        .await?;
+        );
+        tokio::time::sleep(MIGRATION_LOCK_RETRY).await;
+    }
     let result = migrate_postgres_locked(&mut client, options).await;
     let _ = client
         .batch_execute(&format!(
@@ -670,5 +767,93 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
         let error = exclusive_directory(&link, uid).unwrap_err();
         assert!(error.to_string().contains("exclusively"), "{error}");
+    }
+
+    /// A database that accepts the socket and then never answers must fail the
+    /// connect at the deadline: before the bound, `preloop store` parked the
+    /// operator's terminal for as long as the stall lasted.
+    #[tokio::test]
+    async fn a_stalled_postgres_connect_ends_at_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept, then never write a byte: exactly the wedged-database
+            // symptom (a `postgres` that took the connection and stopped).
+            let Ok((_socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            std::future::pending::<()>().await
+        });
+
+        let started = std::time::Instant::now();
+        let result = postgres_client_within(
+            &format!("postgres://postgres@{address}/preloop"),
+            CONNECT_TIMEOUT,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a database that never answers must not connect"),
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("Postgres"), "{text}");
+        assert!(text.contains("handshake"), "{text}");
+        assert!(text.contains(&format!("{CONNECT_TIMEOUT:?}")), "{text}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the connect must end at the deadline, not later: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A second administrator must fail at the lock deadline, not hang, when a
+    /// concurrent migration holds the setup lock. Skipped when no Postgres is
+    /// reachable (`PRELOOP_TEST_POSTGRES_URL`), the repo's convention for
+    /// optional database coverage.
+    #[tokio::test]
+    async fn a_held_migration_lock_fails_instead_of_hanging() {
+        let Some((_database, url)) = crate::test_pg::fresh_database().await else {
+            eprintln!(
+                "skipping: set {} to a Postgres server to cover the migration lock",
+                crate::test_pg::TEST_POSTGRES_URL_ENV
+            );
+            return;
+        };
+        // Hold the lock from a separate session, as a concurrent migration does.
+        let holder = postgres_client(&url).await.unwrap();
+        holder
+            .batch_execute(&format!(
+                "SELECT pg_advisory_lock({})",
+                migrate_runner::POSTGRES_SETUP_LOCK
+            ))
+            .await
+            .unwrap();
+
+        let lock_wait = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let result = migrate_postgres_within(&url, &MigrateOptions::default(), lock_wait).await;
+        let error = match result {
+            Ok(_) => panic!("migrating under a held lock must not succeed or hang"),
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("holding the migration lock"), "{text}");
+        assert!(
+            text.contains(&format!("{}", migrate_runner::POSTGRES_SETUP_LOCK)),
+            "{text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the lock wait must end at the deadline: {:?}",
+            started.elapsed()
+        );
+
+        holder
+            .batch_execute(&format!(
+                "SELECT pg_advisory_unlock({})",
+                migrate_runner::POSTGRES_SETUP_LOCK
+            ))
+            .await
+            .unwrap();
     }
 }

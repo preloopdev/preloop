@@ -503,6 +503,91 @@ pub(crate) fn api_token() -> Option<String> {
         })
 }
 
+/// Deadline for opening a TCP connection to the engine's management port.
+///
+/// A control-op deadline, not a data one: a loopback connect completes in
+/// microseconds and an engine reached over a WAN completes in well under a
+/// second. Unbounded, a firewalled port that swallows SYNs (or an engine whose
+/// accept queue is wedged) parked an interactive CLI command forever.
+pub(crate) const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle bound on the engine client: the longest the CLI waits for *any* byte
+/// before declaring the connection dead.
+///
+/// This is the stream protection, so it must sit above the engine's own
+/// liveness bounds. The live log feed closes itself after 5 minutes of
+/// silence (`preloop-runner-server/src/live_logs.rs`, `IDLE_TIMEOUT` = 300 s),
+/// so 10 minutes only fires when the engine has genuinely stopped talking.
+/// It is deliberately *not* a total-request deadline: `preloop logs --follow`
+/// and the run event feed are legitimately silent for minutes and legitimately
+/// last for hours, and a total would cut them off mid-run.
+pub(crate) const ENGINE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Total deadline for one one-shot engine control request (status, list,
+/// submit, cancel, rerun, `push` bookkeeping).
+///
+/// A healthy engine answers these in milliseconds; 30 s leaves room for a busy
+/// control plane and for a remote engine's round trip, while a wedged one fails
+/// the command instead of hanging it. The streams (`--follow`), durable log
+/// fetches, and bundle uploads do not use it — see the constants below.
+pub(crate) const ENGINE_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total deadline for fetching one run's or job's durable logs.
+///
+/// The whole body is buffered before it is printed, so a total is the right
+/// bound here: there is no incremental progress for the user to watch. A job
+/// log is capped by the engine's per-job log limit, so 5 minutes is comfortably
+/// above a multi-megabyte fetch over loopback or a remote link, and still ends
+/// a stall inside one coffee break.
+pub(crate) const ENGINE_LOG_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Total deadline for uploading a git bundle to the engine.
+///
+/// The engine caps a bundle at 512 MiB. A loopback upload of that size takes
+/// seconds and a remote engine on a slow uplink takes minutes, so 15 minutes
+/// keeps the largest legitimate upload working while a wedged engine cannot
+/// park `preloop run`/`preloop push` forever (the upload happens before the run
+/// is even submitted).
+pub(crate) const ENGINE_BUNDLE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Total deadline for one `cosign` provenance check of a base image.
+///
+/// `cosign verify` resolves the image's signature and attestations in the
+/// registry and may consult the Rekor transparency log; with a cold cache and a
+/// multi-hundred-megabyte image that is minutes, not seconds. Ten minutes is
+/// generous for that path and still ends a registry or Rekor stall that would
+/// otherwise hang `preloop build-golden` indefinitely.
+const COSIGN_VERIFY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Build the engine client with explicit deadlines.
+///
+/// Split out so a test can prove the bounds fire with short values; production
+/// always goes through [`build_client`], which passes the constants above.
+fn build_engine_client(connect: Duration, idle: Duration) -> reqwest::Client {
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .connect_timeout(connect)
+        .read_timeout(idle)
+        .build()
+        .expect("valid HTTP client configuration")
+}
+
+/// One-shot request against the engine's native API, under `deadline`.
+///
+/// The client already carries the connect and idle-read bounds
+/// ([`ENGINE_CONNECT_TIMEOUT`], [`ENGINE_READ_TIMEOUT`]); this adds the total
+/// that fits the call: an engine that accepts TCP and never answers must fail
+/// the command, not hang it. Keeping the per-request total in one place is what
+/// lets a test exercise it against a stalled listener with a short deadline,
+/// rather than only asserting that some constant was passed somewhere.
+fn engine_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    deadline: Duration,
+) -> reqwest::RequestBuilder {
+    client.request(method, url).timeout(deadline)
+}
+
 pub(crate) fn build_client() -> reqwest::Client {
     // The CLI talks to the native management surface, which the engine
     // serves on TCP (`server_url`, default 127.0.0.1:9090). The unix socket
@@ -513,9 +598,14 @@ pub(crate) fn build_client() -> reqwest::Client {
     // `with_tls_roots` pins verification to the shared in-process root set:
     // the platform verifier would consult the OS trust daemon on every
     // handshake, and that daemon can prompt or hang.
-    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
-        .build()
-        .expect("valid HTTP client configuration")
+    //
+    // Every caller gets the connect and idle-read bounds, so no command can
+    // wait on a wedged engine forever. They bound a *stalled* connection, not
+    // total work: one-shot calls add their own total through `engine_request`
+    // (`ENGINE_CONTROL_TIMEOUT`, `ENGINE_LOG_FETCH_TIMEOUT`,
+    // `ENGINE_BUNDLE_UPLOAD_TIMEOUT`) and the streams rely on the idle bound
+    // alone, on purpose.
+    build_engine_client(ENGINE_CONNECT_TIMEOUT, ENGINE_READ_TIMEOUT)
 }
 
 pub(crate) fn preloop_home() -> PathBuf {
@@ -668,14 +758,63 @@ pub(crate) fn guest_resume_command(machine: &str) -> anyhow::Result<Option<std::
     Ok(Some(command))
 }
 
-pub(crate) fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
-    let Some(mut resume) = guest_resume_command(machine)? else {
+/// Deadline for one AgentENV control operation against the local sandbox
+/// runtime: `aenv resume`, or one `aenv exec` readiness probe.
+///
+/// Resuming a suspended Firecracker sandbox and answering `aenv exec /bin/true`
+/// inside a live guest are control ops: seconds when the runtime is healthy,
+/// and the observed worst case right after a resume is well under one second.
+/// 30 s is generous for both, and it is the value that turns "attach hangs
+/// forever because `aenv` never returns" into an error.
+pub(crate) const AENV_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `resume_guest_if_needed` waits for the guest to start answering.
+///
+/// The pre-existing loop was 20 probes 200 ms apart, which observes readiness
+/// within about 5 s. Two minutes is far above that, so the only runs that hit
+/// it are ones where the sandbox is genuinely not coming back; without it, a
+/// sandbox that never becomes ready looped over unbounded probes forever.
+pub(crate) const AENV_READY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Run an argv inside `machine`'s guest under [`AENV_CONTROL_TIMEOUT`].
+///
+/// Returns `Ok(false)` when the guest did not answer in time (or answered
+/// non-zero), so callers can treat a wedged runtime like an unreachable guest
+/// instead of blocking. The child is killed at the deadline.
+async fn guest_answers(machine: &str, argv: &[&str]) -> anyhow::Result<bool> {
+    let mut command = guest_exec_command(machine)?;
+    command.args(argv);
+    // Process policy (null stdin, kill_on_drop, kill+reap on expiry) belongs to
+    // the shared runner; the guest's own argv/cwd stay here.
+    let command = tokio::process::Command::from(command);
+    match preloop_observability::deadline::run_command_status(
+        command,
+        AENV_CONTROL_TIMEOUT,
+        &format!("`{}` inside `{machine}`", argv.join(" ")),
+    )
+    .await
+    {
+        Ok(status) => Ok(status.success()),
+        Err(error) if error.timed_out() => {
+            eprintln!(
+                "[warn] `{}` inside `{machine}` did not answer within {}s and was killed; \
+                 the sandbox runtime is unresponsive",
+                argv.join(" "),
+                AENV_CONTROL_TIMEOUT.as_secs()
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            Err(anyhow::Error::new(error)).with_context(|| format!("probing `{machine}`"))
+        }
+    }
+}
+
+pub(crate) async fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
+    let Some(resume) = guest_resume_command(machine)? else {
         return Ok(());
     };
-
-    let mut probe = guest_exec_command(machine)?;
-    probe.args(["/bin/true"]);
-    if probe.status().is_ok_and(|status| status.success()) {
+    if guest_answers(machine, &["/bin/true"]).await? {
         return Ok(());
     }
 
@@ -685,19 +824,36 @@ pub(crate) fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
     // returning does not mean `cn`'s proxy is already serving ("410 Gone:
     // sandbox is not proxyable" was observed on the first attach right
     // after a resume).
-    let _ = resume.status();
-    let mut ready = guest_exec_command(machine)?;
-    ready.args(["/bin/true"]);
-    for attempt in 0..20 {
-        if ready.status().is_ok_and(|status| status.success()) {
+    let resume = tokio::process::Command::from(resume);
+    if preloop_observability::deadline::run_command_status(
+        resume,
+        AENV_CONTROL_TIMEOUT,
+        &format!("{} resume", preloop_vm::agentenv::binary().display()),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!(
+            "[warn] `{} resume` did not finish within {}s and was killed; waiting for the \
+             sandbox to answer anyway",
+            preloop_vm::agentenv::binary().display(),
+            AENV_CONTROL_TIMEOUT.as_secs()
+        );
+    }
+    let ready_by = std::time::Instant::now() + AENV_READY_DEADLINE;
+    loop {
+        if guest_answers(machine, &["/bin/true"]).await? {
             return Ok(());
         }
-        if attempt == 19 {
-            anyhow::bail!("AgentENV sandbox `{machine}` did not become ready after resume");
+        if std::time::Instant::now() >= ready_by {
+            anyhow::bail!(
+                "AgentENV sandbox `{machine}` did not become ready within {}s of the resume \
+                 attempt; the sandbox runtime is not responding",
+                AENV_READY_DEADLINE.as_secs()
+            );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    unreachable!()
 }
 
 /// The AgentENV sandbox behind `machine`, or an explanation of why the guest
@@ -1217,7 +1373,10 @@ async fn main() -> anyhow::Result<()> {
     // pool provisioning faults). The runtime is held for the life of `main`
     // and flushed with a bounded 2s shutdown on exit.
     let obs_config = preloop_observability::ObservabilityConfig::from_env()
-        .with_service_version(env!("CARGO_PKG_VERSION"));
+        .with_service_version(env!("CARGO_PKG_VERSION"))
+        // Pin OTLP export TLS to the shared in-process roots: the platform
+        // verifier can block on a hung macOS trust daemon with no deadline.
+        .with_otel_client_builder(preloop_runner_server::shared_http::with_tls_roots_blocking);
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
@@ -1520,10 +1679,10 @@ async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
         anyhow::bail!("base image `{base_image}` is not a registry reference; nothing to verify");
     }
     require_digest_pinned_base(base_image)?;
-    verify_base_image_with(&repo, base_image)
+    verify_base_image_with(&repo, base_image).await
 }
 
-fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
+async fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
     let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
         format!(
             "^https://github.com/{repo}/.github/workflows/(dump|attest-local)\\.yml@refs/heads/"
@@ -1551,13 +1710,13 @@ fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
         verify_args.extend(["--key", key]);
     }
     verify_args.extend(identity_args.iter().copied());
-    run_verifier("cosign", &verify_args, "cosign signature")?;
+    run_verifier("cosign", &verify_args, "cosign signature").await?;
     let mut attest_args: Vec<&str> = vec!["verify-attestation", base_image, "--type", "spdx"];
     if let Some(key) = &key {
         attest_args.extend(["--key", key]);
     }
     attest_args.extend(identity_args.iter().copied());
-    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation")
+    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation").await
 }
 
 fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
@@ -1586,11 +1745,33 @@ fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
-    let status = std::process::Command::new(binary)
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to run `{binary}`; is it installed?"))?;
+/// Run one `cosign` subcommand to completion under [`COSIGN_VERIFY_TIMEOUT`].
+///
+/// `cosign verify` is a network client: it resolves the image in the registry
+/// and may query the Rekor transparency log. Run as a plain
+/// `std::process::Command::status()` it inherited the terminal and waited with
+/// no timeout at all, so a stalled registry or transparency log hung
+/// `preloop build-golden` for as long as the stall lasted. It now runs through
+/// `preloop_observability::deadline::run_command_status`, so the deadline below
+/// kills the child instead of leaving it behind.
+async fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
+    let mut command = tokio::process::Command::new(binary);
+    command.args(args);
+    let status = match preloop_observability::deadline::run_command_status(
+        command,
+        COSIGN_VERIFY_TIMEOUT,
+        what,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) if error.timed_out() => anyhow::bail!(
+            "`{binary}` {what} did not finish within {}s and was killed: the registry or the \
+             transparency log is not answering",
+            COSIGN_VERIFY_TIMEOUT.as_secs()
+        ),
+        Err(error) => return Err(anyhow::Error::new(error).context(format!("running `{binary}`"))),
+    };
     if !status.success() {
         anyhow::bail!("{what} verification failed for the base image (exit {status})");
     }
@@ -3673,9 +3854,13 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
         submission.git_bundle_id = Some(uploaded?);
     }
     // Secrets redact on plain serialization; sending them is opt-in.
-    let mut request = client
-        .post(format!("{url}/api/v1/runs"))
-        .json(&submission.to_request_json()?);
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs"),
+        ENGINE_CONTROL_TIMEOUT,
+    )
+    .json(&submission.to_request_json()?);
     // A bundled submission carries its own workspace; a workspace header would
     // point the engine at the live checkout instead of the commit under test.
     if submit_commit.is_none()
@@ -3740,6 +3925,11 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     let mut last_activity = std::time::Instant::now();
     let mut last_backpressure = std::time::Instant::now();
     loop {
+        // No total deadline: the server holds this stream open until the run is
+        // terminal, which can be hours. A stalled engine is caught by the
+        // client's connect deadline plus `ENGINE_READ_TIMEOUT` (10 idle
+        // minutes), which surfaces as a stream error and takes the reconnect
+        // path below.
         let mut events_request = client.get(format!(
             "{url}/api/v1/runs/{}/events.ndjson",
             accepted.run_id
@@ -4059,7 +4249,12 @@ async fn runner_capacity(
     url: &str,
     run_id: RunId,
 ) -> anyhow::Result<Option<(usize, usize)>> {
-    let mut request = client.get(format!("{url}/api/v1/runners?run_id={run_id}"));
+    let mut request = engine_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runners?run_id={run_id}"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -4509,10 +4704,14 @@ async fn upload_git_bundle(
     let body = tokio::fs::read(path)
         .await
         .with_context(|| format!("read git bundle {}", path.display()))?;
-    let mut request = client
-        .post(format!("{url}/api/v1/bundles"))
-        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(body);
+    let mut request = engine_request(
+        client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/bundles"),
+        ENGINE_BUNDLE_UPLOAD_TIMEOUT,
+    )
+    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+    .body(body);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -4936,7 +5135,12 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         // (success/failure/cancelled/skipped/in_progress/queued/pending) for
         // scripts like the pre-push hook. Connection failures carry the
         // engine-unreachable marker so the hook can fail open.
-        let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+        let mut request = engine_request(
+            &client,
+            reqwest::Method::GET,
+            format!("{url}/api/v1/runs/{run_id}"),
+            ENGINE_CONTROL_TIMEOUT,
+        );
         if let Some(token) = api_token() {
             request = request.bearer_auth(token);
         }
@@ -4959,7 +5163,12 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     // Native bearer required for /api/v1/status (same as other native calls)
-    let mut status_req = client.get(format!("{url}/api/v1/status"));
+    let mut status_req = engine_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/status"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         status_req = status_req.bearer_auth(token);
     }
@@ -4997,7 +5206,12 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         serde_json::from_str(&status_text).context("parse status json")?;
 
     // Fetch recent runs for table (preserve existing behavior)
-    let mut runs_req = client.get(format!("{url}/api/v1/runs?limit={}", args.limit));
+    let mut runs_req = engine_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs?limit={}", args.limit),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         runs_req = runs_req.bearer_auth(token);
     }
@@ -5528,7 +5742,12 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
         return follow_run_logs(&client, &url, &run_id, args.job.as_deref()).await;
     }
 
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs/{run_id}/logs"),
+        ENGINE_LOG_FETCH_TIMEOUT,
+    );
     let query = logs_query(args.job.as_deref(), args.step);
     if !query.is_empty() {
         request = request.query(&query);
@@ -5554,7 +5773,14 @@ async fn fetch_run_job_logs(
     run_id: &str,
     job: Option<&str>,
 ) -> anyhow::Result<String> {
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    // One shot, and the whole body is buffered before it is printed, so a total
+    // deadline is correct here (unlike `follow_run_logs`, which streams).
+    let mut request = engine_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs/{run_id}/logs"),
+        ENGINE_LOG_FETCH_TIMEOUT,
+    );
     if let Some(job) = job {
         request = request.query(&[("job", job)]);
     }
@@ -5576,6 +5802,11 @@ async fn fetch_run_job_logs(
 /// client drains every queued SSE frame before returning; if a completed job
 /// has no retained in-memory snapshot (for example after a server restart),
 /// the durable job-log endpoint supplies the missing output.
+///
+/// No total deadline here on purpose: a job legitimately streams for hours. The
+/// hang protection is the client's connect deadline plus its idle read bound
+/// ([`ENGINE_READ_TIMEOUT`]), which fires only after the engine has sent
+/// nothing at all for longer than its own 5-minute liveness window.
 async fn follow_run_logs(
     client: &reqwest::Client,
     url: &str,
@@ -5681,7 +5912,12 @@ async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no active runs found"))?,
     };
-    let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/cancel"));
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs/{run_id}/cancel"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -5711,9 +5947,13 @@ async fn cmd_rerun(args: RerunArgs) -> anyhow::Result<()> {
     } else {
         serde_json::json!({ "mode": "all" })
     };
-    let mut request = client
-        .post(format!("{url}/api/v1/runs/{run_id}/rerun"))
-        .json(&body);
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs/{run_id}/rerun"),
+        ENGINE_CONTROL_TIMEOUT,
+    )
+    .json(&body);
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -5744,7 +5984,12 @@ async fn latest_run_id(
         || "limit=1".to_owned(),
         |status| format!("status={status}&limit=1"),
     );
-    let mut request = client.get(format!("{url}/api/v1/runs?{query}"));
+    let mut request = engine_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs?{query}"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -5867,6 +6112,90 @@ mod tests {
 
     fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
         tokio::spawn(std::future::pending())
+    }
+
+    /// A listener that accepts connections and then never writes a byte: the
+    /// wedged-engine symptom from the incident (TCP accepted, no answer).
+    async fn listening_but_silent() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((_socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            std::future::pending::<()>().await
+        });
+        address
+    }
+
+    /// The client-level idle bound, not just a per-request total: a call site
+    /// that only builds the shared client still cannot be held open by an
+    /// engine that accepts the connection and never answers.
+    #[tokio::test]
+    async fn a_silent_engine_cannot_hold_a_cli_request_open() {
+        let address = listening_but_silent().await;
+        // `build_client()` uses the production values; the same constructor
+        // with short ones is what a test can wait for.
+        let idle = Duration::from_millis(200);
+        let client = build_engine_client(Duration::from_millis(200), idle);
+        let started = std::time::Instant::now();
+        let error = client
+            .get(format!("http://{address}/api/v1/runs"))
+            .send()
+            .await
+            .expect_err("an engine that never answers must not hold the request");
+        assert!(error.is_timeout(), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the idle bound must end the request: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The per-request control total is what ends a request whose headers
+    /// arrived but whose body never does, even while the client's idle bound is
+    /// still far away. Without it, `preloop status` / `preloop logs` would sit
+    /// on a wedged engine until the idle bound, or forever before that bound
+    /// existed.
+    #[tokio::test]
+    async fn a_control_request_deadline_ends_a_stalled_response_body() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            // Headers now, body never: the promise of 1024 bytes is a lie.
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n")
+                .await;
+            std::future::pending::<()>().await
+        });
+
+        // The idle bound is far above the total, so only the total can fire.
+        let client = build_engine_client(Duration::from_secs(5), Duration::from_secs(60));
+        let response = engine_request(
+            &client,
+            reqwest::Method::GET,
+            format!("http://{address}/api/v1/runs"),
+            Duration::from_millis(200),
+        )
+        .send()
+        .await
+        .expect("headers arrive, so `send` succeeds");
+        let started = std::time::Instant::now();
+        let error = response
+            .text()
+            .await
+            .expect_err("a body that never arrives must not be buffered forever");
+        assert!(error.is_timeout(), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the request total must end the body read: {:?}",
+            started.elapsed()
+        );
     }
 
     /// A pool that ends the race (a failed slot) is consumed by

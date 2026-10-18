@@ -225,6 +225,33 @@ Releases before v0.27.0 predate the changelog.
   effective public URL is resolved before the already-configured-App branch, so
   setting it in the environment (without `--public-url`) points the configured
   App's webhook at that address instead of printing only that it is configured.
+
+- **The CLI can no longer hang on a wedged engine, daemon, or registry.**
+  The engine client every command uses had no timeouts at all, so the incident's
+  exact symptom — a process that accepts the TCP connection and never answers —
+  held `preloop status`, `preloop run`, `preloop logs`, `preloop push` and the
+  rest open indefinitely. It now has a 10 s connect deadline and a 10-minute
+  idle-read bound (above the engine's own 5-minute live-log liveness window, so
+  a quiet long job is never cut), with per-command totals on top: 30 s for
+  one-shot control calls, 5 minutes for a durable log fetch, and 15 minutes for
+  a git-bundle upload. The streaming paths (`logs --follow`, the run event feed)
+  keep no total on purpose and rely on the idle bound.
+  The same pass bounds the CLI's other external waits: `cosign` verification of
+  a base image (10 minutes, killed at the deadline), the AgentENV guest probes
+  behind `preloop debug` (30 s each, 2 minutes to become ready), the AgentENV
+  egress reconciliation's `sudo`/`systemctl` calls, `launchctl` during
+  `preloop server install`, `docker`/`podman` build, save and inspect during
+  `preloop init`, the release/GitHub clients in `preloop update` and
+  `preloop setup app-manifest`, and `git push` in `preloop push`, which is also
+  now run with every interactive credential path disabled
+  (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS`/`SSH_ASKPASS` neutralised,
+  `GCM_INTERACTIVE=never`) while the developer's own keychain/ssh-agent
+  credentials keep working. `preloop store migrate` bounds its Postgres connect
+  (10 s) and replaces the indefinite `pg_advisory_lock` wait with a 10-minute
+  `pg_try_advisory_lock` retry that names the other holder instead of hanging.
+  Every deadline is a named constant, and every timeout error names the
+  dependency and the deadline, so a hang is distinguishable from a failure.
+
 - **A hung OS keychain or trust daemon no longer freezes the engine.** On
   macOS, outbound TLS verified every new connection through
   `SecTrustEvaluateWithError` inside the handshake, so when `securityd` blocked

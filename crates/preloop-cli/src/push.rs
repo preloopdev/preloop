@@ -9,12 +9,43 @@
 
 use anyhow::Context as _;
 use preloop_gha_protocol::WorkflowSubmission;
-use std::process::Command;
 use std::time::Duration;
 
 /// Retry schedule for transient failures (GitHub unreachable, 5xx). Each
 /// retry re-runs the whole sync, so a push that already landed is a no-op.
 const RETRY_DELAYS_SECS: &[u64] = &[60, 300, 900];
+
+/// One git metadata operation: `cat-file`, `merge-base`, `ls-remote`,
+/// `rev-parse`, `log`, `commit-tree`.
+///
+/// A healthy local repository answers these in milliseconds and a healthy
+/// forge's `ls-remote` in well under a second, so a minute is already generous
+/// — it absorbs a cold connection to GitHub or a forge that is briefly
+/// throttling. What it exists for is the other end: a git that is not
+/// answering at all (a credential helper waiting on a prompt nobody will see,
+/// a half-open TCP connection) must end the push, not hang it. `preloop push`
+/// runs unattended by design — from a submitter's terminal or a script — so
+/// there is nobody to notice a stalled child.
+const GIT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `git push` of the tested commit to `origin`.
+///
+/// A transfer, not a metadata read: the pack for a large repository over a
+/// slow uplink legitimately takes many minutes, so this bound is deliberately
+/// generous — 30 minutes — rather than tight; a working push must never be
+/// killed. It still ends the hang this protects against (a forge that accepts
+/// the connection and then never reads, an SSH or credential helper blocked on
+/// input) instead of leaving the run's push-back wedged forever.
+const GIT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Reproducing the tested tree in the private index when its objects are not
+/// already local (`git add -A` + `git write-tree` on a dirty-tree run).
+///
+/// Local and CPU-bound, but it hashes every modified and untracked file of the
+/// checkout, so a large repository legitimately needs minutes. Five minutes
+/// bounds a stale index lock or a filesystem that stopped answering without
+/// tripping on repository size.
+const GIT_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What the pinned push did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,20 +67,60 @@ pub(crate) struct PushOpts {
     pub(crate) draft: bool,
 }
 
+/// The environment every git child of this module gets, so that no git command
+/// can stop and wait for a human.
+///
+/// The deadline in [`preloop_observability::deadline::run_command`] bounds a
+/// wait; this removes the waits that can be removed at all:
+///
+/// - `GIT_TERMINAL_PROMPT=0` — git must never prompt on the terminal for HTTP
+///   credentials. (`preloop push` is often run from a developer's interactive
+///   terminal, where that prompt is exactly the invisible hang this prevents;
+///   a prompt that cannot be answered must fail instead.)
+/// - `GIT_ASKPASS=false` — no askpass helper may be spawned to open a dialog.
+/// - `SSH_ASKPASS=false` — same for the ssh passphrase helper.
+/// - `GCM_INTERACTIVE=never` — Git Credential Manager must answer from its
+///   stored credentials or fail, never open an interactive window.
+///
+/// `credential.helper` is deliberately NOT cleared here (unlike the engine's
+/// snapshot fetches): `preloop push` pushes to the developer's own `origin`,
+/// where the OS keychain / ssh-agent helper *is* the authentication path, so
+/// clearing it would break every properly configured checkout. The deadline in
+/// [`preloop_observability::deadline::run_command`] is what kills a helper that
+/// blocks despite these settings.
+///
+/// Kept as a table so the test that proves the child environment is the same
+/// values the production `git_command` applies.
+const NON_INTERACTIVE_GIT_ENV: [(&str, &str); 4] = [
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_ASKPASS", "false"),
+    ("SSH_ASKPASS", "false"),
+    ("GCM_INTERACTIVE", "never"),
+];
+
+/// A `git` process with every interactive prompt path neutralised
+/// ([`NON_INTERACTIVE_GIT_ENV`]).
+fn git_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command.envs(NON_INTERACTIVE_GIT_ENV);
+    command
+}
+
 /// Push the tested commit to `refs/heads/<branch>` on `origin`.
 ///
 /// The remote branch must not exist, equal the tested commit, or be an
 /// ancestor of it. Anything else (diverged history) is refused — a force
 /// push would overwrite someone else's work, and the design never clobbers.
-fn push_tested_commit(sha: &str, branch: &str) -> anyhow::Result<PushOutcome> {
+async fn push_tested_commit(sha: &str, branch: &str) -> anyhow::Result<PushOutcome> {
     push_tested_commit_in(
         &std::env::current_dir().context("current directory")?,
         sha,
         branch,
     )
+    .await
 }
 
-fn push_tested_commit_in(
+async fn push_tested_commit_in(
     cwd: &std::path::Path,
     sha: &str,
     branch: &str,
@@ -57,7 +128,10 @@ fn push_tested_commit_in(
     // The tested commit must exist in this checkout (it does when the push
     // runs where the run was submitted). Without it the push would fail with
     // a confusing "src refspec does not match any" error.
-    if git_output(cwd, ["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_err() {
+    if git_output(cwd, ["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .await
+        .is_err()
+    {
         anyhow::bail!(
             "commit {sha} is not present in this checkout — run `preloop push` from the \
              checkout the run was submitted from"
@@ -76,7 +150,8 @@ fn push_tested_commit_in(
             "HEAD",
             &format!("refs/heads/{branch}"),
         ],
-    )?;
+    )
+    .await?;
     let default_branch = remote.lines().find_map(|line| {
         line.strip_prefix("ref: refs/heads/")
             .and_then(|rest| rest.strip_suffix("\tHEAD"))
@@ -103,14 +178,26 @@ fn push_tested_commit_in(
             // confusing fatal. A missing object cannot be an ancestor, so
             // that case is divergence by construction.
             let remote_present =
-                git_output(cwd, ["cat-file", "-e", &format!("{remote}^{{commit}}")]).is_ok();
-            let is_ancestor = remote_present
-                && Command::new("git")
+                git_output(cwd, ["cat-file", "-e", &format!("{remote}^{{commit}}")])
+                    .await
+                    .is_ok();
+            let is_ancestor = if remote_present {
+                let mut command = git_command();
+                command
                     .current_dir(cwd)
-                    .args(["merge-base", "--is-ancestor", &remote, sha])
-                    .status()
-                    .context("git merge-base")?
-                    .success();
+                    .args(["merge-base", "--is-ancestor", &remote, sha]);
+                preloop_observability::deadline::run_command(
+                    command,
+                    GIT_CONTROL_TIMEOUT,
+                    "git merge-base --is-ancestor",
+                )
+                .await
+                .context("git merge-base")?
+                .status
+                .success()
+            } else {
+                false
+            };
             if !is_ancestor {
                 anyhow::bail!(
                     "branch {branch} on GitHub has commits that are not ancestors of the tested \
@@ -122,10 +209,13 @@ fn push_tested_commit_in(
         }
     };
 
-    let push = Command::new("git")
-        .current_dir(cwd)
-        .args(["push", "origin", &format!("{sha}:refs/heads/{branch}")])
-        .output()
+    // A whole-pack transfer, so the transfer deadline, not the metadata one.
+    let spec = format!("{sha}:refs/heads/{branch}");
+    let what = format!("git push origin {spec}");
+    let mut command = git_command();
+    command.current_dir(cwd).args(["push", "origin", &spec]);
+    let push = preloop_observability::deadline::run_command(command, GIT_TRANSFER_TIMEOUT, &what)
+        .await
         .context("git push")?;
     if !push.status.success() {
         let stderr = String::from_utf8_lossy(&push.stderr);
@@ -134,17 +224,18 @@ fn push_tested_commit_in(
     Ok(outcome)
 }
 
-/// `git <args>` returning trimmed stdout; fails when git fails.
-fn git_output<'a>(
+/// `git <args>` returning trimmed stdout; fails when git fails. `deadline`
+/// bounds the command; callers that read metadata want [`GIT_CONTROL_TIMEOUT`].
+async fn git_output_with<'a>(
     cwd: &std::path::Path,
     args: impl IntoIterator<Item = &'a str>,
+    deadline: Duration,
 ) -> anyhow::Result<String> {
     let args = args.into_iter().collect::<Vec<_>>();
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(&args)
-        .output()
-        .with_context(|| format!("git {} failed to run", args.join(" ")))?;
+    let what = format!("git {}", args.join(" "));
+    let mut command = git_command();
+    command.current_dir(cwd).args(&args);
+    let output = preloop_observability::deadline::run_command(command, deadline, &what).await?;
     if !output.status.success() {
         anyhow::bail!(
             "git {}: {}",
@@ -153,6 +244,15 @@ fn git_output<'a>(
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// [`git_output_with`] under [`GIT_CONTROL_TIMEOUT`] — the deadline for every
+/// metadata read in the push path.
+async fn git_output<'a>(
+    cwd: &std::path::Path,
+    args: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<String> {
+    git_output_with(cwd, args, GIT_CONTROL_TIMEOUT).await
 }
 
 /// Whether a sync failure is likely transient (GitHub unreachable, 5xx)
@@ -264,11 +364,12 @@ async fn prepare_push_sha(
     let head_tree = git_output(
         &std::env::current_dir().context("current directory")?,
         ["rev-parse", &format!("{sha}^{{tree}}")],
-    )?;
+    )
+    .await?;
     if head_tree == push_tree {
         return Ok(sha.to_owned());
     }
-    let materialized = materialize_tested_commit(push_tree, sha)?;
+    let materialized = materialize_tested_commit(push_tree, sha).await?;
     eprintln!(
         "materialized CI-verified commit {materialized} (tree {push_tree}) from \
          the tested snapshot"
@@ -320,7 +421,7 @@ async fn push_run_once(
             )
         })?;
 
-    let outcome = push_tested_commit(push_sha, branch)?;
+    let outcome = push_tested_commit(push_sha, branch).await?;
     match outcome {
         PushOutcome::Created => eprintln!("pushed {push_sha} to origin/{branch} (branch created)"),
         PushOutcome::AlreadyThere => eprintln!("origin/{branch} already at {push_sha}"),
@@ -373,15 +474,16 @@ async fn push_run_once(
 /// the run's base commit. The author/committer come from the checkout's git
 /// identity (`user.name` / `user.email`), so the materialized commit is
 /// attributed to the developer, not to a bot.
-fn materialize_tested_commit(tested_tree: &str, parent: &str) -> anyhow::Result<String> {
+async fn materialize_tested_commit(tested_tree: &str, parent: &str) -> anyhow::Result<String> {
     materialize_tested_commit_in(
         &std::env::current_dir().context("current directory")?,
         tested_tree,
         parent,
     )
+    .await
 }
 
-fn materialize_tested_commit_in(
+async fn materialize_tested_commit_in(
     cwd: &std::path::Path,
     tested_tree: &str,
     parent: &str,
@@ -395,8 +497,9 @@ fn materialize_tested_commit_in(
     // now present. A mismatch means the working tree changed since the run
     // was submitted; materializing a *different* tree would violate
     // pushed == tested, so fail with a re-submit hint.
-    ensure_tested_tree_resolvable(cwd, tested_tree)?;
+    ensure_tested_tree_resolvable(cwd, tested_tree).await?;
     let head_message = git_output(cwd, ["log", "-1", "--format=%B", parent])
+        .await
         .unwrap_or_else(|_| "CI-verified snapshot".to_owned());
     let message = format!(
         "{head_message}\n\n[preloop] CI-verified snapshot of the working tree \
@@ -405,7 +508,8 @@ fn materialize_tested_commit_in(
     let commit = git_output(
         cwd,
         ["commit-tree", tested_tree, "-p", parent, "-m", &message],
-    )?;
+    )
+    .await?;
     Ok(commit)
 }
 
@@ -415,44 +519,23 @@ fn materialize_tested_commit_in(
 /// working tree into a private index (never touching the user's index) and
 /// write the resulting tree — this materializes every blob the tree
 /// references. The private index keeps the user's staging area untouched.
-fn ensure_tested_tree_resolvable(cwd: &std::path::Path, tested_tree: &str) -> anyhow::Result<()> {
-    if git_output(cwd, ["cat-file", "-e", tested_tree]).is_ok() {
+async fn ensure_tested_tree_resolvable(
+    cwd: &std::path::Path,
+    tested_tree: &str,
+) -> anyhow::Result<()> {
+    if git_output(cwd, ["cat-file", "-e", tested_tree])
+        .await
+        .is_ok()
+    {
         return Ok(());
     }
     // A private index under the repo's git dir: unique per invocation, and
     // git cleans up nothing, so remove it afterwards.
-    let git_dir = git_output(cwd, ["rev-parse", "--git-dir"])?;
+    let git_dir = git_output(cwd, ["rev-parse", "--git-dir"]).await?;
     let index =
         std::path::Path::new(&git_dir).join(format!("preloop-index-{}", std::process::id()));
     let _ = std::fs::remove_file(&index);
-    let stage = || -> anyhow::Result<String> {
-        let add = Command::new("git")
-            .current_dir(cwd)
-            .env("GIT_INDEX_FILE", &index)
-            .args(["add", "-A"])
-            .output()
-            .context("git add -A (private index)")?;
-        if !add.status.success() {
-            anyhow::bail!(
-                "git add -A: {}",
-                String::from_utf8_lossy(&add.stderr).trim()
-            );
-        }
-        let write = Command::new("git")
-            .current_dir(cwd)
-            .env("GIT_INDEX_FILE", &index)
-            .args(["write-tree"])
-            .output()
-            .context("git write-tree (private index)")?;
-        if !write.status.success() {
-            anyhow::bail!(
-                "git write-tree: {}",
-                String::from_utf8_lossy(&write.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&write.stdout).trim().to_owned())
-    };
-    let reproduced = stage();
+    let reproduced = stage_working_tree(cwd, &index).await;
     let _ = std::fs::remove_file(&index);
     let reproduced = reproduced?;
     if reproduced != tested_tree {
@@ -465,11 +548,61 @@ fn ensure_tested_tree_resolvable(cwd: &std::path::Path, tested_tree: &str) -> an
     Ok(())
 }
 
+/// Stage the working tree into `index` (a private `GIT_INDEX_FILE`) and return
+/// the resulting tree.
+///
+/// Split out of [`ensure_tested_tree_resolvable`] so that the private index is
+/// removed on the failure path too; both calls share [`GIT_STAGE_TIMEOUT`]
+/// because they are the same local, size-dependent working-tree operation.
+async fn stage_working_tree(
+    cwd: &std::path::Path,
+    index: &std::path::Path,
+) -> anyhow::Result<String> {
+    let mut command = git_command();
+    command
+        .current_dir(cwd)
+        .env("GIT_INDEX_FILE", index)
+        .args(["add", "-A"]);
+    let add = preloop_observability::deadline::run_command(
+        command,
+        GIT_STAGE_TIMEOUT,
+        "git add -A (private index)",
+    )
+    .await?;
+    if !add.status.success() {
+        anyhow::bail!(
+            "git add -A: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+    let mut command = git_command();
+    command
+        .current_dir(cwd)
+        .env("GIT_INDEX_FILE", index)
+        .args(["write-tree"]);
+    let write = preloop_observability::deadline::run_command(
+        command,
+        GIT_STAGE_TIMEOUT,
+        "git write-tree (private index)",
+    )
+    .await?;
+    if !write.status.success() {
+        anyhow::bail!(
+            "git write-tree: {}",
+            String::from_utf8_lossy(&write.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&write.stdout).trim().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    // The fixture helper below is deliberately synchronous: it drives git the
+    // way a developer's shell does, independent of the code under test.
+    use std::process::Command;
 
     fn git(cwd: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -515,19 +648,21 @@ mod tests {
         (work, remote, head)
     }
 
-    #[test]
-    fn push_creates_missing_branch() {
+    #[tokio::test]
+    async fn push_creates_missing_branch() {
         let (work, _remote, head) = repo_with_remote();
         assert_eq!(
-            push_tested_commit_in(work.path(), &head, "feat/x").unwrap(),
+            push_tested_commit_in(work.path(), &head, "feat/x")
+                .await
+                .unwrap(),
             PushOutcome::Created
         );
         let remote_sha = git(work.path(), &["ls-remote", "origin", "refs/heads/feat/x"]);
         assert!(remote_sha.starts_with(&head), "branch created at {head}");
     }
 
-    #[test]
-    fn materialize_tested_commit_pins_the_exact_tree() {
+    #[tokio::test]
+    async fn materialize_tested_commit_pins_the_exact_tree() {
         let (work, _remote, head) = repo_with_remote();
 
         // Dirty the tree and capture the staged tree — what CI would test.
@@ -540,7 +675,9 @@ mod tests {
             "the dirty tree must differ from HEAD"
         );
 
-        let commit = materialize_tested_commit_in(work.path(), &dirty_tree, &head).unwrap();
+        let commit = materialize_tested_commit_in(work.path(), &dirty_tree, &head)
+            .await
+            .unwrap();
         // The materialized commit's tree is exactly the tested tree…
         assert_eq!(
             git(work.path(), &["rev-parse", &format!("{commit}^{{tree}}")]),
@@ -559,8 +696,8 @@ mod tests {
         assert_eq!(author, "Test <test@example.com>");
     }
 
-    #[test]
-    fn materialize_imports_tree_from_another_repository() {
+    #[tokio::test]
+    async fn materialize_imports_tree_from_another_repository() {
         // The tested tree is created in repo A (its object store holds the
         // blobs); the push runs from repo B, whose object store never saw
         // that tree. Materialization must reproduce the tree from B's
@@ -615,7 +752,9 @@ mod tests {
         // B has the same working-file content, unstaged.
         fs::write(b.path().join("f.txt"), "two\n").unwrap();
 
-        let commit = materialize_tested_commit_in(b.path(), &tested_tree, &head).unwrap();
+        let commit = materialize_tested_commit_in(b.path(), &tested_tree, &head)
+            .await
+            .unwrap();
         assert_eq!(
             git(b.path(), &["rev-parse", &format!("{commit}^{{tree}}")]),
             tested_tree,
@@ -624,25 +763,33 @@ mod tests {
         assert_eq!(git(b.path(), &["rev-parse", &format!("{commit}^")]), head);
     }
 
-    #[test]
-    fn push_skips_when_remote_already_equal() {
+    #[tokio::test]
+    async fn push_skips_when_remote_already_equal() {
         let (work, _remote, head) = repo_with_remote();
-        push_tested_commit_in(work.path(), &head, "feat/x").unwrap();
+        push_tested_commit_in(work.path(), &head, "feat/x")
+            .await
+            .unwrap();
         assert_eq!(
-            push_tested_commit_in(work.path(), &head, "feat/x").unwrap(),
+            push_tested_commit_in(work.path(), &head, "feat/x")
+                .await
+                .unwrap(),
             PushOutcome::AlreadyThere
         );
     }
 
-    #[test]
-    fn push_fast_forwards_an_ancestor() {
+    #[tokio::test]
+    async fn push_fast_forwards_an_ancestor() {
         let (work, _remote, head) = repo_with_remote();
-        push_tested_commit_in(work.path(), &head, "feat/x").unwrap();
+        push_tested_commit_in(work.path(), &head, "feat/x")
+            .await
+            .unwrap();
         fs::write(work.path().join("f.txt"), "two\n").unwrap();
         git(work.path(), &["commit", "-am", "two"]);
         let second = git(work.path(), &["rev-parse", "HEAD"]);
         assert_eq!(
-            push_tested_commit_in(work.path(), &second, "feat/x").unwrap(),
+            push_tested_commit_in(work.path(), &second, "feat/x")
+                .await
+                .unwrap(),
             PushOutcome::FastForwarded
         );
         let remote_sha = git(work.path(), &["ls-remote", "origin", "refs/heads/feat/x"]);
@@ -652,10 +799,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn push_refuses_diverged_branch() {
+    #[tokio::test]
+    async fn push_refuses_diverged_branch() {
         let (work, remote, head) = repo_with_remote();
-        push_tested_commit_in(work.path(), &head, "feat/x").unwrap();
+        push_tested_commit_in(work.path(), &head, "feat/x")
+            .await
+            .unwrap();
 
         // Someone else pushed a conflicting commit to the same branch.
         let other_clone = tempfile::tempdir().unwrap();
@@ -685,7 +834,9 @@ mod tests {
         fs::write(work.path().join("f.txt"), "mine\n").unwrap();
         git(work.path(), &["commit", "-am", "mine"]);
         let mine = git(work.path(), &["rev-parse", "HEAD"]);
-        let error = push_tested_commit_in(work.path(), &mine, "feat/x").unwrap_err();
+        let error = push_tested_commit_in(work.path(), &mine, "feat/x")
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("never force-pushes"),
             "diverged branch refused: {error:#}"
@@ -697,14 +848,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn push_refuses_unknown_commit() {
+    #[tokio::test]
+    async fn push_refuses_unknown_commit() {
         let (work, _remote, _head) = repo_with_remote();
         let error = push_tested_commit_in(
             work.path(),
             "ffffffffffffffffffffffffffffffffffffffff",
             "feat/x",
         )
+        .await
         .unwrap_err();
         assert!(format!("{error:#}").contains("not present in this checkout"));
     }
@@ -730,13 +882,86 @@ mod tests {
         }
     }
 
-    #[test]
-    fn push_refuses_default_branch() {
+    #[tokio::test]
+    async fn push_refuses_default_branch() {
         let (work, _remote, head) = repo_with_remote();
-        let error = push_tested_commit_in(work.path(), &head, "main").unwrap_err();
+        let error = push_tested_commit_in(work.path(), &head, "main")
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("default branch"),
             "default-branch push refused: {error:#}"
         );
+    }
+
+    /// The deadline, not the child, must end the call: the old synchronous
+    /// `wait()` returned only when the child exited, so a hung git hung the
+    /// whole `preloop push` with it.
+    #[tokio::test]
+    async fn run_command_kills_a_child_that_never_exits() {
+        let deadline = Duration::from_millis(300);
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = preloop_observability::deadline::run_command(command, deadline, "git push")
+            .await
+            .expect_err("a child that never exits must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the git runner must return on its own deadline, not after the child exits"
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("git push"), "error names the command: {text}");
+        assert!(
+            text.contains(&format!("{deadline:?}")),
+            "error names the deadline: {text}"
+        );
+    }
+
+    /// A credential prompt is the classic way a push hangs; the child
+    /// environment must leave no interactive path open. The probe runs a shell
+    /// under exactly the environment `git_command` applies, so a regression in
+    /// that table (or its values) fails here.
+    #[tokio::test]
+    async fn git_children_are_non_interactive() {
+        let mut probe = tokio::process::Command::new("/bin/sh");
+        probe.envs(NON_INTERACTIVE_GIT_ENV);
+        // `git_command` applies this table to git itself; the shell is only
+        // the vehicle that prints it back, because git would not.
+        probe.args([
+            "-c",
+            r#"printf "%s|%s|%s|%s" "$GIT_TERMINAL_PROMPT" "$GIT_ASKPASS" "$SSH_ASKPASS" "$GCM_INTERACTIVE""#,
+        ]);
+        let output = preloop_observability::deadline::run_command(
+            probe,
+            Duration::from_secs(10),
+            "git env probe",
+        )
+        .await
+        .expect("the probe shell runs");
+        assert!(
+            output.status.success(),
+            "probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "0|false|false|never",
+            "every interactive git path must be neutralised"
+        );
+        // The probe mirrors the table; this pins the production command to it.
+        let command = git_command();
+        for (key, value) in NON_INTERACTIVE_GIT_ENV {
+            let applied = command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .and_then(|(_, value)| value);
+            assert_eq!(
+                applied,
+                Some(std::ffi::OsStr::new(value)),
+                "{key} must be set on every git child"
+            );
+        }
     }
 }

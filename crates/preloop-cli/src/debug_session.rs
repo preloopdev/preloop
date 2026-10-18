@@ -63,7 +63,7 @@ impl DebugAttach {
         // rewriting ACTIVE for a controller that never attached: the guard
         // below is never constructed on error, and a dropped JoinHandle
         // detaches rather than cancels.
-        crate::resume_guest_if_needed(machine)?;
+        crate::resume_guest_if_needed(machine).await?;
         std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
         let heartbeat_marker = marker.clone();
         let heartbeat = tokio::spawn(async move {
