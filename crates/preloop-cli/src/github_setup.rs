@@ -660,7 +660,12 @@ fn store_webhook_secret(app_id: &str, secret: &str) -> anyhow::Result<String> {
         CredentialWriter::for_config(&config_path(), config.credential_store.as_deref())?;
     let webhook_ref =
         github_reference_with_host("webhook", config.github.server_url.as_deref(), Some(app_id))?;
-    persist_secret(&mut writer, &mut config, &webhook_ref, &SecretString::new(secret))?;
+    persist_secret(
+        &mut writer,
+        &mut config,
+        &webhook_ref,
+        &SecretString::new(secret),
+    )?;
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
         existing.legacy_webhook_secret = None;
         existing.webhook_secret_ref = Some(webhook_ref.as_str().to_owned());
