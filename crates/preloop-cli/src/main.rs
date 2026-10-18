@@ -38,6 +38,47 @@ pub(crate) fn server_url() -> String {
     std::env::var("PRELOOP_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
 }
 
+/// The engine a command talks to, resolved once at its command boundary.
+///
+/// `url` is `PRELOOP_URL` or the default local endpoint; `configured` records
+/// whether an endpoint was named at all, which decides whether a submission may
+/// carry the local-workspace header. Resolving both here keeps the submission
+/// path from rereading the process environment for either answer.
+#[derive(Debug, Clone)]
+struct EngineTarget {
+    /// Base URL of the engine, without a trailing slash.
+    url: String,
+    /// Whether the endpoint was named explicitly rather than defaulted.
+    configured: bool,
+}
+
+impl EngineTarget {
+    /// Boundary read: the environment is consulted once per command.
+    fn from_env() -> Self {
+        match std::env::var("PRELOOP_URL") {
+            Ok(url) => Self::named(url),
+            Err(_) => Self::default_local(),
+        }
+    }
+
+    /// An endpoint the caller already resolved. Treated as explicitly named, so
+    /// the transport decision matches an operator-set `PRELOOP_URL`.
+    fn named(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            configured: true,
+        }
+    }
+
+    /// The default local engine, for an unset `PRELOOP_URL`.
+    fn default_local() -> Self {
+        Self {
+            url: server_url(),
+            configured: false,
+        }
+    }
+}
+
 /// Resolve the GitHub REST API root once at each CLI command boundary.
 ///
 /// Whitespace-only values are unset, and trailing slashes are removed so
@@ -3672,12 +3713,15 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // A hook that fails to install after the user accepted is a real
     // failure: report it instead of silently running ungated.
     maybe_offer_hook()?;
-    run_workflow(args).await
+    // Resolved once at this command boundary and passed down: the submission
+    // and its transport decision never reread the environment.
+    let engine = EngineTarget::from_env();
+    run_workflow(args, engine).await
 }
 
 /// Everything `preloop run` does after the interactive hook offer: build the
 /// submission from the flags and the checkout, send it, and follow the run.
-async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
+async fn run_workflow(args: RunArgs, engine: EngineTarget) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -3720,7 +3764,7 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     // Resolved once at this command boundary and passed down: the preflight
     // asks the engine about stored secrets over the same transport and token
     // the submission itself uses.
-    let base = server_url();
+    let base = engine.url.clone();
     let token = api_token();
     preflight_secrets(
         &workflow_path,
@@ -3841,7 +3885,7 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let client = build_client();
-    let url = server_url();
+    let EngineTarget { url, configured } = engine;
     if let Some(commit) = submit_commit.as_ref() {
         // The bundle is single-use scratch: remove it whether or not the upload
         // succeeded, so a refused or failed upload (413, network error) cannot
@@ -3856,9 +3900,7 @@ async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
         .json(&submission.to_request_json()?);
     // A bundled submission carries its own workspace; a workspace header would
     // point the engine at the live checkout instead of the commit under test.
-    if submit_commit.is_none()
-        && should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err())
-    {
+    if submit_commit.is_none() && should_send_local_workspace_header(&url, !configured) {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -7649,34 +7691,33 @@ mod tests {
                 let _ = std::env::set_current_dir(&self.0);
             }
         }
-        let previous_url = std::env::var_os("PRELOOP_URL");
-        unsafe { std::env::set_var("PRELOOP_URL", &base) };
         let cwd_guard = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&repo).unwrap();
-        let result = run_workflow(RunArgs {
-            file: Some(std::path::PathBuf::from("ci.yml")),
-            job: Some("build".to_owned()),
-            event: Some("pull_request".to_owned()),
-            payload: Some(payload),
-            base: Some("main".to_owned()),
-            message: None,
-            debug: true,
-            no_debug: false,
-            preserve_on_failure: false,
-            secrets: vec!["TOKEN=s3cret".to_owned()],
-            strict_secrets: false,
-            detach: true,
-            push: false,
-            create_pr: false,
-            pr_draft: true,
-            no_merge: true,
-        })
+        let result = run_workflow(
+            RunArgs {
+                file: Some(std::path::PathBuf::from("ci.yml")),
+                job: Some("build".to_owned()),
+                event: Some("pull_request".to_owned()),
+                payload: Some(payload),
+                base: Some("main".to_owned()),
+                message: None,
+                debug: true,
+                no_debug: false,
+                preserve_on_failure: false,
+                secrets: vec!["TOKEN=s3cret".to_owned()],
+                strict_secrets: false,
+                detach: true,
+                push: false,
+                create_pr: false,
+                pr_draft: true,
+                no_merge: true,
+            },
+            // An explicitly named engine, the way `PRELOOP_URL` would name it:
+            // no process-environment mutation, and the same transport decision.
+            EngineTarget::named(&base),
+        )
         .await;
         drop(cwd_guard);
-        match previous_url {
-            Some(previous) => unsafe { std::env::set_var("PRELOOP_URL", previous) },
-            None => unsafe { std::env::remove_var("PRELOOP_URL") },
-        }
         result.expect("the run is submitted");
 
         let body = submitted.get().expect("the engine received a submission");

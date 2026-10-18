@@ -1580,7 +1580,7 @@ jobs:
     let server_url = checkout_input(checkout, "github-server-url")
         .expect("checkout server URL should be rewritten");
     assert_eq!(repository, format!("snapshots/{run_id}"));
-    assert_eq!(server_url, public_base_url());
+    assert_eq!(server_url, state.public_base_url());
     assert_eq!(commit.len(), 40);
     assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(acquired["snapshot"], Value::Null);
@@ -2028,7 +2028,7 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
         |name: &str| -> Option<String> { cached_checkout_input(checkout, name).map(str::to_owned) };
     assert_eq!(inputs("ref").as_deref(), Some(commit.as_str()));
     assert_eq!(inputs("repository"), Some(format!("snapshots/{run_id}")));
-    assert_eq!(inputs("github-server-url"), Some(public_base_url()));
+    assert_eq!(inputs("github-server-url"), Some(state.public_base_url()));
     // The forge origin is left alone: the commit exists upstream, and the cache
     // holds only that commit.
     assert_eq!(acquired["snapshotOriginRewrite"], Value::Null);

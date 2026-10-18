@@ -2557,7 +2557,7 @@ jobs:
     );
     assert_eq!(
         acquired["variables"]["system.github.launch_endpoint"]["value"],
-        public_base_url()
+        state.public_base_url()
     );
     assert!(
         wire_variable(&acquired, "system.github.token").is_none_or(str::is_empty),
@@ -2777,7 +2777,7 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
     .await;
     assert_eq!(pool_ref["messageType"], "RunnerJobRequest");
     let pool_body: Value = serde_json::from_str(pool_ref["body"].as_str().unwrap()).unwrap();
-    let expected_run_service_url = format!("{}/broker/{runner_id}/", public_base_url());
+    let expected_run_service_url = format!("{}/broker/{runner_id}/", state.public_base_url());
     assert_eq!(pool_body["run_service_url"], expected_run_service_url);
     assert!(
         !pool_body["run_service_url"]
@@ -3845,7 +3845,8 @@ async fn action_download_requires_a_ticket_for_the_action_it_serves() {
 #[tokio::test]
 async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf(), startup.clone())
+    let startup = stub_startup(None, None);
+    let state = AppState::new(temp.path().to_path_buf(), startup)
         .await
         .unwrap();
     let app = app(state.clone(), CancellationToken::new());

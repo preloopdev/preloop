@@ -4241,15 +4241,11 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
 const PARITY_MINTED_TOKEN: &str = "ghs_ParityMintedInstallationTokenAAAAAAAA";
 
 /// A broker whose GitHub App mints [`PARITY_MINTED_TOKEN`] for `owner/repo`.
-/// The guards hold the process-wide GitHub env lock and restore the env on drop.
+/// The stub's URL and App live on the state this fixture builds, so it needs no
+/// process-wide environment or env lock.
 struct MintingBroker {
     state: AppState,
     app: Router,
-    _env: (
-        tokio::sync::MutexGuard<'static, ()>,
-        crate::state::TestEnvVar,
-        crate::state::TestEnvVar,
-    ),
 }
 
 async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
@@ -4271,22 +4267,22 @@ async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
         );
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
-    let env_lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-    let api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
-    let pat = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
-    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
+        .await
+        .unwrap();
+    state.github_urls = crate::state::GitHubUrls {
+        server_url: api_base.clone(),
+        api_url: api_base.clone(),
+        graphql_url: api_base,
+    };
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
         MintFailurePolicy::LocalJwt,
     ));
     let app = app(state.clone(), CancellationToken::new());
-    MintingBroker {
-        state,
-        app,
-        _env: (env_lock, api_url, pat),
-    }
+    MintingBroker { state, app }
 }
 
 /// The value `environmentVariables` carries for `name`: the literal once the

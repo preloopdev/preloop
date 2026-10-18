@@ -1733,7 +1733,7 @@ async fn contents_read_credential(shared: &SharedState, repository: &str) -> Con
         }
     };
     // The installation is the rate-limit identity, so never invent one.
-    match crate::github_app::installation_for_repo(&app, repository).await {
+    match crate::github_app::installation_for_repo(api_base, &app, repository).await {
         Ok(installation) if installation != 0 => ContentsCredential::Token(
             token,
             crate::github_breaker::GithubCredentialBucket::Installation(installation),
@@ -3087,7 +3087,9 @@ jobs:
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let state = AppState::new_for_tests(temp.path().to_path_buf())
+            .await
+            .unwrap();
         let source = temp.path().join("source");
         for (path, body) in files {
             let file = source.join(path);
@@ -3603,24 +3605,20 @@ jobs:
 
     /// A webhook-style run's engine: no workspace snapshot, the stub App
     /// configured when `with_app`, and the GitHub API pointed at the stub. The
-    /// guards hold the process-wide env lock and restore `PRELOOP_GITHUB_API_URL`
-    /// when dropped, so one fixture at a time per test.
+    /// stub's URLs live on the state this fixture builds, so it needs no
+    /// process-wide environment or env lock.
     struct ForgeFixture {
         shared: Arc<SharedState>,
         stub: Arc<ForgeStub>,
         _temp: tempfile::TempDir,
-        _env: (
-            crate::state::TestEnvVar,
-            tokio::sync::MutexGuard<'static, ()>,
-        ),
     }
 
     async fn forge_fixture(stub: ForgeStub, with_app: bool) -> ForgeFixture {
         let (stub, base) = spawn_forge_stub(stub).await;
-        let lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        let var = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &base);
         let temp = tempfile::tempdir().unwrap();
-        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        let mut state = AppState::new_for_tests(temp.path().join("state"))
+            .await
+            .unwrap();
         state.github_urls = crate::state::GitHubUrls {
             server_url: base.clone(),
             api_url: base.clone(),
@@ -3637,7 +3635,6 @@ jobs:
             shared: state.shared(),
             stub,
             _temp: temp,
-            _env: (var, lock),
         }
     }
 

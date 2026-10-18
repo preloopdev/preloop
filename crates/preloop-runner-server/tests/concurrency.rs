@@ -1861,10 +1861,13 @@ fn server_config_debug_redacts_store_url_password() {
         systemd_socket_activation: false,
         unix_socket: None,
         state_dir: std::path::PathBuf::from(".preloop"),
-        store_url: Some(
-            "postgres://preloop:hunter2-secret@db.example:5432/preloop?sslmode=verify-full"
-                .to_owned(),
-        ),
+        startup: crate::config::StartupConfig {
+            store_url: Some(
+                "postgres://preloop:hunter2-secret@db.example:5432/preloop?sslmode=verify-full"
+                    .to_owned(),
+            ),
+            ..crate::config::StartupConfig::for_tests()
+        },
         record_flows: None,
         tls: TlsMode::None,
         queue_depth: None,

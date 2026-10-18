@@ -4097,13 +4097,12 @@ mod tests {
 
         // The real `ps` runs: no `_boot-vm` names this fixture home, so the
         // mount is provably orphaned.
-        let detached =
-            super::detach_orphaned_layer_mounts_in(
-                &paths.machine_data_roots(),
-                &mount_table,
-                Some(&bin),
-            )
-            .expect("detach");
+        let detached = super::detach_orphaned_layer_mounts_in(
+            &paths.machine_data_roots(),
+            &mount_table,
+            Some(&bin),
+        )
+        .expect("detach");
         assert_eq!(detached, 1, "the orphaned layer mount must be detached");
         assert_eq!(
             std::fs::read_to_string(&log).expect("fake hdiutil log"),
