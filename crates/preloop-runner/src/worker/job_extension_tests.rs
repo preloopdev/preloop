@@ -279,14 +279,14 @@ fn setup_workspace_derives_repo_layout_from_claim_repository() {
         let resolved = setup_workspace(&message).unwrap();
         let expected = std::env::current_dir()
             .unwrap()
-            .join("_work")
+            .join("work")
             .join(&repo)
             .join(&repo);
         assert_eq!(resolved, expected.to_string_lossy());
         assert!(resolved.contains(&repo));
-        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("_work").join(&repo));
+        let _ = std::fs::remove_dir_all(std::env::current_dir().unwrap().join("work").join(&repo));
     }
-    let work_root = std::env::current_dir().unwrap().join("_work");
+    let work_root = std::env::current_dir().unwrap().join("work");
     for sibling in ["_temp", "_actions", "_tool"] {
         let _ = std::fs::remove_dir(work_root.join(sibling));
     }
@@ -412,6 +412,13 @@ fn inject_github_env_sets_core_vars() {
     assert_eq!(job.env.get("GITHUB_ACTOR").unwrap(), "user1");
     assert!(job.env.contains_key("RUNNER_OS"));
     assert!(job.env.contains_key("RUNNER_ARCH"));
+    // Hosted parity (G3): the workspace's own directory is exported, and the
+    // temp dir sits beside it under the work folder — the parity probe
+    // measured `RUNNER_WORKSPACE` UNSET on a preloop guest while hosted
+    // exports `/home/runner/work/<repo>`.
+    assert_eq!(job.env.get("RUNNER_WORKSPACE").unwrap(), "work/repo");
+    assert_eq!(job.env.get("RUNNER_TEMP").unwrap(), "work/_temp");
+    assert_eq!(job.env.get("GITHUB_WORKSPACE").unwrap(), "work/repo/repo");
 }
 
 #[test]

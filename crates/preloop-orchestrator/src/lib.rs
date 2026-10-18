@@ -2110,8 +2110,8 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
          fi; \
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
-         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/_work; \
-         chown {uid}:{uid} /run/user/{uid} {root} {root}/_work 2>/dev/null; \
+         mkdir -p /run/user/{uid} /opt/hostedtoolcache {root}/work; \
+         chown {uid}:{uid} /run/user/{uid} {root} {root}/work 2>/dev/null; \
          [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
            chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
@@ -2272,6 +2272,177 @@ fn golden_hosts_cleanup_script_at(hosts: &str) -> String {
 /// [`golden_hosts_cleanup_script_at`] against the guest's real `/etc/hosts`.
 fn golden_hosts_cleanup_script() -> String {
     golden_hosts_cleanup_script_at("/etc/hosts")
+}
+
+/// The units a hosted runner never runs, and a preloop guest should not either.
+///
+/// Provenance: every Azure/Hyper-V/cloud-init/snap/apt-timer unit in the current
+/// golden's enabled set (`smolvm-probe.txt`, §systemd), plus
+/// `systemd-sysctl.service`, which fails on the SmolVM kernel
+/// (`kernel/pid_max: Invalid argument`, `yama/ptrace_scope` ENOENT). Masking
+/// them leaves `systemctl --failed` empty and `is-system-running` `running` on a
+/// guest that boots systemd; units an image does not ship are skipped, so the
+/// list is safe on a custom base.
+const SYSTEMD_MASKED_UNITS: &[&str] = &[
+    "walinuxagent.service",
+    "cloud-init.service",
+    "cloud-init-local.service",
+    "cloud-config.service",
+    "cloud-final.service",
+    "snapd.service",
+    "snapd.socket",
+    "snapd.seeded.service",
+    "snapd.apparmor.service",
+    "snapd.autoimport.service",
+    "snapd.core-fixup.service",
+    "snapd.recovery-chooser-trigger.service",
+    "snapd.system-shutdown.service",
+    "unattended-upgrades.service",
+    "apt-daily.service",
+    "apt-daily-upgrade.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "systemd-sysctl.service",
+    "hv-kvp-daemon.service",
+    "hv-vss-daemon.service",
+    "hv-fcopy-daemon.service",
+    "ModemManager.service",
+    "multipathd.service",
+    "multipathd.socket",
+    "apport-autoreport.path",
+    "ubuntu-advantage.service",
+    "ua-reboot-cmds.service",
+    "systemd-networkd-wait-online.service",
+    "systemd-networkd.service",
+    "networkd-dispatcher.service",
+    "getty@.service",
+    "e2scrub_reap.service",
+];
+
+/// The bake-time systemd preparation a guest that boots systemd needs, and that
+/// the per-machine init cannot do.
+///
+/// Three things the hosted image has and a guest that boots systemd does not:
+///
+/// * **resolved's upstream.** Nothing feeds systemd-resolved its DNS on a
+///   preloop guest — the interface has no DHCP or networkd provider and
+///   `resolved` runs in `foreign` mode — so it takes the upstream from
+///   `/etc/resolv.conf` alone. Naming the stub there without also giving
+///   resolved an upstream leaves it with none, which breaks external DNS for the
+///   whole guest while `/etc/hosts` names keep working (measured: `curl
+///   https://github.com` → `Could not resolve host`). `DNS=` in
+///   `resolved.conf` makes the upstream explicit and survives a rewrite of
+///   `/etc/resolv.conf`; the value is the first nameserver the image carries,
+///   and `1.1.1.1` when there is none or it is loopback (an image whose
+///   resolver is itself the stub cannot supply one). A `DNS=` the image or the
+///   operator already set is never touched.
+/// * **`/etc/resolv.conf` naming the stub**, as a regular file. This is the
+///   golden half of [`guest_resolver_stub_script`]: it runs whether or not
+///   systemd is *running* (the SmolVM builder has no systemd PID 1, and a
+///   "resolved is active" gate would skip exactly there), so the gate is the
+///   binaries existing. The runtime half re-applies after the SmolVM agent
+///   rewrites the file at every start, and keeps the upstream line.
+/// * **the unit masks** ([`SYSTEMD_MASKED_UNITS`]): Azure/Hyper-V/cloud-init/
+///   snapd/apt-timer units the hosted image does not run, plus the one that
+///   fails on the SmolVM kernel. `systemctl mask` when a running systemd answers
+///   (which also covers a guest whose `systemctl` writes the same
+///   `/dev/null` symlink), the symlink directly otherwise — the builder case,
+///   verified identical to what `systemctl mask` creates.
+///
+/// Best-effort and idempotent throughout: every failure warns on stderr (the
+/// engine logs it) instead of failing the bake, a second run appends nothing,
+/// rewrites nothing and re-masks nothing, and an image without systemd is left
+/// exactly as it is.
+pub fn golden_systemd_parity_script() -> String {
+    golden_systemd_parity_script_at(
+        &["/lib/systemd/systemd", "/usr/lib/systemd/systemd"],
+        "/etc",
+        &["/lib/systemd/system", "/usr/lib/systemd/system"],
+        SYSTEMD_MASKED_UNITS,
+    )
+}
+
+/// The scratch paths and unit list the shell test substitutes; production passes
+/// the paths above and [`SYSTEMD_MASKED_UNITS`].
+fn golden_systemd_parity_script_at(
+    systemd_bins: &[&str],
+    etc: &str,
+    unit_dirs: &[&str],
+    units: &[&str],
+) -> String {
+    let gate = systemd_bins
+        .iter()
+        .map(|path| format!("[ -x {} ]", shell_quote(path)))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let unit_dirs = unit_dirs
+        .iter()
+        .map(|dir| shell_quote(dir))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let units = units
+        .iter()
+        .map(|unit| shell_quote(unit))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let etc = shell_quote(etc);
+    format!(
+        "prsys_etc={etc}; \
+         if {gate}; then \
+           prsys_ns=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2; exit }}' \"$prsys_etc/resolv.conf\" 2>/dev/null); \
+           case \"$prsys_ns\" in ''|127.*|::1|0.0.0.0|::) prsys_ns=1.1.1.1 ;; esac; \
+           if [ -e \"$prsys_etc/systemd/resolved.conf\" ] || [ -d \"$prsys_etc/systemd\" ]; then \
+             if grep -q '^[[:space:]]*DNS=' \"$prsys_etc/systemd/resolved.conf\" 2>/dev/null; then \
+               echo \"preloop: $prsys_etc/systemd/resolved.conf already sets DNS=; leaving it alone\" >&2; \
+             else \
+               mkdir -p \"$prsys_etc/systemd\" 2>/dev/null || true; \
+               if printf 'DNS=%s\\n' \"$prsys_ns\" >> \"$prsys_etc/systemd/resolved.conf\" 2>/dev/null; then \
+                 echo \"preloop: set the systemd-resolved upstream to $prsys_ns\"; \
+               else \
+                 echo \"preloop: warning: could not set DNS= in $prsys_etc/systemd/resolved.conf\" >&2; \
+               fi; \
+             fi; \
+           fi; \
+           if [ ! -L \"$prsys_etc/resolv.conf\" ] && grep -qx 'nameserver 127.0.0.53' \"$prsys_etc/resolv.conf\" 2>/dev/null; then \
+             echo \"preloop: $prsys_etc/resolv.conf already names the 127.0.0.53 stub resolver\"; \
+           else \
+             prsys_tmp=$prsys_etc/resolv.conf.preloop.$$; \
+             if printf 'nameserver 127.0.0.53\\noptions edns0 trust-ad\\n' > \"$prsys_tmp\" 2>/dev/null; then \
+               chmod 0644 \"$prsys_tmp\" 2>/dev/null; \
+               if mv -f \"$prsys_tmp\" \"$prsys_etc/resolv.conf\" 2>/dev/null; then \
+                 echo \"preloop: pointed $prsys_etc/resolv.conf at the 127.0.0.53 stub resolver\"; \
+               else \
+                 rm -f \"$prsys_tmp\" 2>/dev/null; \
+                 echo \"preloop: warning: could not write $prsys_etc/resolv.conf\" >&2; \
+               fi; \
+             else \
+               rm -f \"$prsys_tmp\" 2>/dev/null; \
+               echo \"preloop: warning: could not stage $prsys_etc/resolv.conf\" >&2; \
+             fi; \
+           fi; \
+           prsys_masked=0; prsys_absent=0; \
+           for prsys_unit in {units}; do \
+             prsys_shipped=0; \
+             for prsys_dir in {unit_dirs}; do \
+               if [ -e \"$prsys_dir/$prsys_unit\" ]; then prsys_shipped=1; fi; \
+             done; \
+             if [ \"$prsys_shipped\" != 1 ]; then prsys_absent=$((prsys_absent + 1)); continue; fi; \
+             if command -v systemctl >/dev/null 2>&1 && systemctl mask \"$prsys_unit\" >/dev/null 2>&1; then \
+               prsys_masked=$((prsys_masked + 1)); \
+             else \
+               mkdir -p \"$prsys_etc/systemd/system\" 2>/dev/null || true; \
+               if ln -sf /dev/null \"$prsys_etc/systemd/system/$prsys_unit\" 2>/dev/null; then \
+                 prsys_masked=$((prsys_masked + 1)); \
+               else \
+                 echo \"preloop: warning: could not mask $prsys_unit\" >&2; \
+               fi; \
+             fi; \
+           done; \
+           echo \"preloop: masked $prsys_masked systemd units ($prsys_absent not shipped by this image)\"; \
+         else \
+           echo 'preloop: this image has no systemd; skipping the systemd parity preparation' >&2; \
+         fi"
+    )
 }
 
 /// Sysctls GitHub's hosted `ubuntu-24.04` image applies, with their values.
@@ -2505,6 +2676,100 @@ fn guest_hostname_script_at(hosts: &str) -> String {
     )
 }
 
+/// Point the guest's `/etc/resolv.conf` at the systemd-resolved stub.
+///
+/// A GitHub-hosted runner's container resolves a `/etc/hosts`-only name — a
+/// compose service alias such as `postgres.localhost` — because Docker reads
+/// the *host file* and gives its embedded DNS server `ExtServers:
+/// [host(127.0.0.53)]`: measured on hosted `ubuntu-24.04`, whose
+/// `/etc/resolv.conf` is the stub. A preloop guest that names its own resolver
+/// instead (`75.75.75.75` on AgentENV, `100.96.0.1` on SmolVM) hands its
+/// containers `ExtServers: [host(75.75.75.75)]` and the name comes back
+/// NXDOMAIN, while every external name still resolves (G6).
+///
+/// The *file* is what has to name the stub, never a `daemon.json` `dns` entry:
+/// a `dns` pin reaches the container as `ExtServers: [127.0.0.53]` with
+/// `Overrides: [nameservers]`, and the address is then the container's own
+/// loopback, so every lookup inside it fails. Through the host file Docker
+/// keeps the `host(...)` wrapper and queries the stub from the host namespace,
+/// which is why the hosted shape works.
+///
+/// A regular file, not a symlink: the SmolVM agent's per-start overlay refresh
+/// rejects a symlinked `/etc/resolv.conf` and the machine then refuses to start
+/// (measured), and a symlink to the stub is the upstream-less shape above on
+/// AgentENV. Replaced by rename in the same directory — `mv` swaps the link
+/// itself, so a symlinked file never clobbers the file it points at — and no
+/// reader ever sees a half-written resolver file.
+///
+/// The guest's own resolver is *kept*, as a second `nameserver` line. On
+/// AgentENV nothing feeds systemd-resolved its upstreams — the interface has no
+/// DHCP or networkd provider and `resolved` runs in `foreign` mode — so it
+/// takes them from `/etc/resolv.conf` alone: a file naming only the stub makes
+/// resolved drop that address as itself and leaves it with no upstream at all,
+/// which breaks external DNS for the whole guest (`curl https://github.com` →
+/// `Could not resolve host`) while `/etc/hosts` names keep working, so a
+/// hosts-only probe looks healthy. Measured shape that works end to end:
+/// `nameserver 127.0.0.53`, the original nameserver, `options edns0 trust-ad`
+/// — the container then reads `ExtServers: [host(127.0.0.53) host(75.75.75.75)]`
+/// and resolves both kinds of name. The upstreams are read from the file and
+/// from resolved's own `/run/systemd/resolve/resolv.conf` *before* the file is
+/// replaced, so an image that keeps them there (or in `resolved.conf.d`) is
+/// covered too.
+///
+/// Applied in the golden — an AgentENV restore keeps the baked file, so the
+/// daemon the guest's systemd starts at boot reads it — and per machine, since
+/// the SmolVM agent rewrites `/etc/resolv.conf` on every start. A guest without
+/// the resolved stub keeps the file it has, with the reason on stderr.
+pub fn guest_resolver_stub_script() -> String {
+    guest_resolver_stub_script_at(
+        "/etc/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+    )
+}
+
+/// `resolv_conf`, `stub` and `upstream_file` are the scratch paths the shell
+/// tests substitute for `/etc/resolv.conf`, the stub's own file and resolved's
+/// upstream list. No `#` comments in the text: the golden contract's statements
+/// are joined into one physical line.
+fn guest_resolver_stub_script_at(resolv_conf: &str, stub: &str, upstream_file: &str) -> String {
+    format!(
+        "prs_conf={conf}; prs_stub={stub}; prs_upstream_file={upstream_file}; \
+         if [ -e \"$prs_stub\" ] || {{ command -v resolvectl >/dev/null 2>&1 && resolvectl status >/dev/null 2>&1; }}; then \
+           prs_upstreams=$(cat \"$prs_conf\" \"$prs_upstream_file\" 2>/dev/null \
+             | awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2 }}' \
+             | grep -v '^127\\.0\\.0\\.53$' | grep -v '^::1$' | grep -v '^0\\.0\\.0\\.0$' | grep -v '^::$' \
+             | awk '!seen[$0]++'); \
+           prs_first=$(awk '/^[[:space:]]*nameserver[[:space:]]/ {{ print $2; exit }}' \"$prs_conf\" 2>/dev/null); \
+           prs_missing=0; \
+           for prs_ns in $prs_upstreams; do grep -qx \"nameserver $prs_ns\" \"$prs_conf\" 2>/dev/null || prs_missing=1; done; \
+           if [ \"$prs_first\" = 127.0.0.53 ] && [ \"$prs_missing\" = 0 ]; then \
+             echo \"preloop: $prs_conf already names the 127.0.0.53 stub resolver first\"; \
+           else \
+             prs_tmp=$prs_conf.preloop.$$; \
+             prs_ok=0; \
+             if printf 'nameserver 127.0.0.53\\n' > \"$prs_tmp\" 2>/dev/null; then \
+               prs_ok=1; \
+               for prs_ns in $prs_upstreams; do printf 'nameserver %s\\n' \"$prs_ns\" >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; done; \
+               printf 'options edns0 trust-ad\\n' >> \"$prs_tmp\" 2>/dev/null || prs_ok=0; \
+               chmod 0644 \"$prs_tmp\" 2>/dev/null; \
+             fi; \
+             if [ \"$prs_ok\" = 1 ] && mv -f \"$prs_tmp\" \"$prs_conf\" 2>/dev/null; then \
+               echo \"preloop: pointed $prs_conf at the 127.0.0.53 stub resolver\"; \
+             else \
+               rm -f \"$prs_tmp\" 2>/dev/null; \
+               echo \"preloop: warning: could not write $prs_conf; containers follow the guest resolver\" >&2; \
+             fi; \
+           fi; \
+         else \
+           echo \"preloop: no resolved stub resolver on this guest; leaving $prs_conf alone\" >&2; \
+         fi",
+        conf = shell_quote(resolv_conf),
+        stub = shell_quote(stub),
+        upstream_file = shell_quote(upstream_file),
+    )
+}
+
 /// The per-guest **hosted runtime init**: what the hosted image's own init
 /// applies to a job's environment, applied by preloop instead.
 ///
@@ -2530,18 +2795,34 @@ fn guest_hostname_script_at(hosts: &str) -> String {
 /// through passwordless sudo, and sudo resolves its hostname on every
 /// invocation: with a stale mapping it would print
 /// `sudo: unable to resolve host` into the apply's stderr before the name is
-/// fixed.
+/// fixed. The resolver half runs last: it is the only one that has to run
+/// *after* the guest agent settled the network.
 pub fn guest_hosted_runtime_init_script() -> String {
-    hosted_runtime_init_script_at("/etc/hosts", "/proc/sys")
+    hosted_runtime_init_script_at(
+        "/etc/hosts",
+        "/proc/sys",
+        "/etc/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+    )
 }
 
-/// `hosts` and `sysctl_root` are the scratch paths the shell tests substitute
-/// for `/etc/hosts` and `/proc/sys`; production passes those.
-fn hosted_runtime_init_script_at(hosts: &str, sysctl_root: &str) -> String {
+/// `hosts`, `sysctl_root`, `resolv_conf`, `stub` and `upstream_file` are the
+/// scratch paths the shell tests substitute for `/etc/hosts`, `/proc/sys`,
+/// `/etc/resolv.conf`, the stub's own file and resolved's upstream list;
+/// production passes those.
+fn hosted_runtime_init_script_at(
+    hosts: &str,
+    sysctl_root: &str,
+    resolv_conf: &str,
+    stub: &str,
+    upstream_file: &str,
+) -> String {
     format!(
-        "set -e; ( {} ); ( {} )",
+        "set -e; ( {} ); ( {} ); ( {} )",
         guest_hostname_script_at(hosts),
-        guest_sysctl_script_at(sysctl_root)
+        guest_sysctl_script_at(sysctl_root),
+        guest_resolver_stub_script_at(resolv_conf, stub, upstream_file)
     )
 }
 
@@ -2569,7 +2850,7 @@ pub fn golden_glibc_check_script() -> &'static str {
 /// exactly as it is, and this is everything Preloop adds.
 ///
 /// GitHub-runner machinery only — the account jobs run as (with its home,
-/// `_work` and passwordless sudo), the ownership of the paths they write, the
+/// `work` and passwordless sudo), the ownership of the paths they write, the
 /// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
 /// `/etc/environment`, the glibc requirement above, the image's apt package
 /// indices ([`golden_apt_lists_script`]), and the two pieces of bake-host
@@ -2608,11 +2889,17 @@ pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
     // membership step below.
     steps.push(golden_hosts_cleanup_script());
     steps.push(golden_ping_capability_script("/usr/bin/ping"));
-    // The container DNS pin is written here, not only per machine: on AgentENV
-    // the daemon is started by the guest's systemd at boot, before any
-    // per-machine exec runs, so the golden's own `daemon.json` is what the
-    // daemon that serves the job actually read.
-    steps.push(docker_dns_pin_script());
+    // The systemd preparation is bake-time only: it is gated on the systemd
+    // binaries rather than on a running systemd, because the SmolVM builder has
+    // no systemd PID 1 and would skip a "resolved is active" gate.
+    steps.push(golden_systemd_parity_script());
+    // The resolver file has to name the resolved stub before the container
+    // engine reads it: Docker hands a container the *host file's* nameservers,
+    // so a guest naming its own resolver gives a compose network NXDOMAIN for
+    // `/etc/hosts`-only aliases. Baked here as well as per machine — an AgentENV
+    // restore keeps the baked file, and the daemon the guest's systemd starts
+    // reads it.
+    steps.push(guest_resolver_stub_script());
     if user != "root" {
         // The runner's groups are written last: nothing after this step may
         // change them, so the membership it grants is the one the bake keeps.
@@ -2790,95 +3077,10 @@ fn render_docker_start_script() -> String {
         ("@@GOLDEN_STACK_PRLIMIT@@", GOLDEN_STACK_PRLIMIT),
         ("@@GOLDEN_RLIMIT_NOFILE_SOFT@@", GOLDEN_RLIMIT_NOFILE_SOFT),
         ("@@GOLDEN_NOFILE_PRLIMIT@@", GOLDEN_NOFILE_PRLIMIT),
-        ("@@DOCKER_DNS_PIN@@", DOCKER_DNS_PIN_SCRIPT),
     ] {
         script = script.replace(token, value);
     }
     script
-}
-
-/// Pin container DNS to the guest's own stub resolver, when one is answering.
-///
-/// A GitHub-hosted runner's containers resolve through systemd-resolved's stub:
-/// the daemon's embedded DNS server (the `127.0.0.11` a container on a
-/// user-defined network is given) forwards to the daemon's *configured*
-/// servers, and resolved answers `/etc/hosts` names, so a compose service alias
-/// such as `postgres.localhost` resolves inside the network. Docker never takes
-/// a loopback nameserver from the host's `/etc/resolv.conf` — it filters those
-/// and falls back to `8.8.8.8`/`8.8.4.4` — so the stub has to be named
-/// explicitly in `daemon.json`, or containers inherit whatever non-loopback
-/// resolver the guest carries (measured: AgentENV `75.75.75.75`, smolvm
-/// `100.96.0.1`) and every `/etc/hosts`-only name fails inside a compose
-/// network (G6).
-///
-/// This is only correct because the golden configures that stub resolver: on
-/// AgentENV systemd-resolved already listens on `127.0.0.53`, and the smolvm
-/// golden sets it up. When nothing answers there, `daemon.json` is left exactly
-/// as the image shipped it — today's behaviour — and the reason is reported.
-///
-/// The probe asks `127.0.0.53` itself rather than reading `/etc/resolv.conf`:
-/// AgentENV's guest carries a foreign `resolv.conf` naming `75.75.75.75` while
-/// resolved answers on the loopback stub anyway. No tool is required — `dig`,
-/// `nslookup`, or a listener on the stub's socket each prove it.
-///
-/// `daemon.json` is merged, never rewritten: the image's own keys survive, a
-/// `dns` the image or the operator already set is left alone, and the write is
-/// an atomic rename in the same directory, so a half-written file can never
-/// reach the daemon. The merge is idempotent: the second run sees its own key
-/// and does nothing.
-///
-/// Shared verbatim by the golden contract (the daemon AgentENV's systemd starts
-/// from the golden's own `daemon.json` before any per-machine exec can run) and
-/// by `scripts/docker-start.sh` (a machine that starts its own daemon), through
-/// the `@@DOCKER_DNS_PIN@@` placeholder.
-const DOCKER_DNS_PIN_SCRIPT: &str = "\
-merge_docker_daemon_json() { \
-  ddj_file=$1; ddj_member=$2; ddj_tmp=$ddj_file.preloop.$$; \
-  mkdir -p \"$(dirname \"$ddj_file\")\" 2>/dev/null; \
-  if [ ! -s \"$ddj_file\" ]; then printf '{%s}\\n' \"$ddj_member\" > \"$ddj_tmp\" || return 1; \
-  else \
-    ddj_body=$(tr -d '\\n\\r\\t' < \"$ddj_file\" 2>/dev/null); \
-    case \"$ddj_body\" in \\{*\\}) : ;; *) rm -f \"$ddj_tmp\"; return 1 ;; esac; \
-    ddj_inner=${ddj_body#?}; ddj_inner=${ddj_inner%?}; \
-    ddj_inner=$(printf '%s' \"$ddj_inner\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); \
-    if [ -n \"$ddj_inner\" ]; then printf '{%s,%s}\\n' \"$ddj_inner\" \"$ddj_member\" > \"$ddj_tmp\" || return 1; \
-    else printf '{%s}\\n' \"$ddj_member\" > \"$ddj_tmp\" || return 1; fi; \
-  fi; \
-  chmod 0644 \"$ddj_tmp\" 2>/dev/null; \
-  mv -f \"$ddj_tmp\" \"$ddj_file\"; \
-}; \
-pin_container_dns_stub() { \
-  ddp_file=$1; \
-  if grep -q '\"dns\"' \"$ddp_file\" 2>/dev/null; then \
-    echo 'the docker daemon config already names dns servers; leaving them untouched' >&2; \
-    return 0; \
-  fi; \
-  if merge_docker_daemon_json \"$ddp_file\" '\"dns\":[\"127.0.0.53\"]'; then \
-    echo 'pinned container dns to the 127.0.0.53 stub resolver'; \
-    return 0; \
-  fi; \
-  echo 'could not merge the dns pin into the docker daemon config; containers follow the guest resolver' >&2; \
-  return 0; \
-}; \
-pin_container_dns() { \
-  ddp_file=$1; ddp_stub=0; \
-  if command -v dig >/dev/null 2>&1; then \
-    dig +time=1 +tries=1 +short @127.0.0.53 localhost A 2>/dev/null | grep -q . && ddp_stub=1; \
-  elif command -v nslookup >/dev/null 2>&1; then \
-    nslookup -timeout=1 -retry=1 localhost 127.0.0.53 2>/dev/null | grep -qE '^Address:[[:space:]]*127\\.0\\.0\\.1' && ddp_stub=1; \
-  elif grep -q '3500007F:0035' /proc/net/tcp /proc/net/udp 2>/dev/null; then ddp_stub=1; fi; \
-  if [ \"$ddp_stub\" != 1 ]; then \
-    echo 'no resolver answers at 127.0.0.53; leaving the docker daemon config untouched, so containers follow the guest resolver' >&2; \
-    return 0; \
-  fi; \
-  pin_container_dns_stub \"$ddp_file\"; \
-}";
-
-/// [`DOCKER_DNS_PIN_SCRIPT`] plus the call that applies it to the guest's
-/// `daemon.json`. Used as a golden-contract step and inside
-/// `scripts/docker-start.sh`.
-fn docker_dns_pin_script() -> String {
-    format!("{DOCKER_DNS_PIN_SCRIPT}; pin_container_dns /etc/docker/daemon.json")
 }
 
 /// How long to wait for a freshly started guest to accept commands.
@@ -8596,98 +8798,6 @@ chmod +x "$dest/bin/node"
         );
     }
 
-    /// The container DNS pin merges into `daemon.json` without losing a key the
-    /// image shipped and without touching a `dns` already configured; the
-    /// daemon that starts from the result is what gives a compose network's
-    /// containers the stub resolver (G6).
-    #[test]
-    fn docker_dns_pin_merges_daemon_json_without_clobbering() {
-        let temp = tempfile::tempdir().unwrap();
-        let daemon = temp.path().join("daemon.json");
-        let pin = || {
-            std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    &format!(
-                        "{DOCKER_DNS_PIN_SCRIPT}; pin_container_dns_stub {}",
-                        shell_quote(daemon.to_str().unwrap())
-                    ),
-                ])
-                .output()
-                .expect("the pin shell must run")
-        };
-
-        // No file at all: the pin creates one.
-        let output = pin();
-        assert!(output.status.success());
-        let merged: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&daemon).unwrap()).unwrap();
-        assert_eq!(merged["dns"][0], "127.0.0.53");
-
-        // An image's own keys survive, and the result is still valid JSON.
-        std::fs::write(
-            &daemon,
-            "{\n  \"data-root\": \"/var/lib/docker\",\n  \"storage-driver\": \"vfs\"\n}\n",
-        )
-        .unwrap();
-        assert!(pin().status.success());
-        let merged: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&daemon).unwrap()).unwrap();
-        assert_eq!(merged["data-root"], "/var/lib/docker");
-        assert_eq!(merged["storage-driver"], "vfs");
-        assert_eq!(merged["dns"][0], "127.0.0.53");
-
-        // A `dns` the image (or operator) already set is never replaced.
-        std::fs::write(&daemon, "{\"dns\":[\"8.8.8.8\"]}\n").unwrap();
-        assert!(pin().status.success());
-        assert_eq!(
-            std::fs::read_to_string(&daemon).unwrap(),
-            "{\"dns\":[\"8.8.8.8\"]}\n"
-        );
-
-        // A file the merge cannot read as JSON is left exactly as it was.
-        std::fs::write(&daemon, "not json\n").unwrap();
-        assert!(pin().status.success());
-        assert_eq!(std::fs::read_to_string(&daemon).unwrap(), "not json\n");
-
-        // The merge is an atomic rename in the same directory: no temporary
-        // file is left behind for a later bake to adopt.
-        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "daemon.json")
-            .collect();
-        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
-    }
-
-    /// The per-machine engine bootstrap applies the pin before it starts the
-    /// daemon it will read from: the storage-driver write above it replaces
-    /// `daemon.json` outright, so a pin written earlier would be lost.
-    #[test]
-    fn docker_start_script_pins_dns_before_starting_the_daemon() {
-        let script = docker_start_command()[2].clone();
-        let pin = script
-            .find("pin_container_dns /etc/docker/daemon.json")
-            .unwrap_or_else(|| panic!("the engine bootstrap must pin container dns: {script}"));
-        let driver = script
-            .find("storage-driver")
-            .unwrap_or_else(|| panic!("the storage-driver write must still be there: {script}"));
-        let spawn = script
-            .find("dockerd >/var/log/dockerd.log")
-            .unwrap_or_else(|| panic!("the launch must still start dockerd: {script}"));
-        assert!(
-            driver < pin && pin < spawn,
-            "the pin must land after the storage-driver write and before the daemon: {script}"
-        );
-        // And the golden carries it too: AgentENV's daemon is started by the
-        // guest's systemd before any per-machine exec can run.
-        assert!(
-            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
-                .contains("pin_container_dns /etc/docker/daemon.json"),
-            "the golden's own daemon.json must carry the pin"
-        );
-    }
-
     #[test]
     fn tcp_upstream_sets_origin_and_upstream_without_socket() {
         let mut config = test_config(false);
@@ -8719,7 +8829,7 @@ chmod +x "$dest/bin/node"
         );
         assert!(contract.contains("NOPASSWD"), "{contract}");
         assert!(
-            contract.contains("/home/runner/_work") && contract.contains("mkdir -p"),
+            contract.contains("/home/runner/work") && contract.contains("mkdir -p"),
             "{contract}"
         );
         assert!(
@@ -9597,32 +9707,338 @@ done
         );
     }
 
-    /// The composed init run end to end against scratch roots: the fork's own
-    /// name resolves and the sysctls reach the hosted values in one exec, and
-    /// a second run changes nothing. Textual order alone would not catch a
-    /// half whose `exit 0` swallows the other — this runs both halves in one
-    /// shell, the way provisioning does.
+    /// The resolver file is what gives a container the stub: Docker hands a
+    /// container the *host file's* nameservers, so a guest naming its own
+    /// resolver makes a compose network's `/etc/hosts`-only alias NXDOMAIN
+    /// (G6). A `daemon.json` `dns` pin is the opposite — the address becomes
+    /// the container's own loopback and every lookup fails — which is why this
+    /// step writes the file. The guest's own upstream is *kept*: on AgentENV
+    /// resolved takes its upstreams from this very file, so a stub-only file
+    /// leaves it with none and breaks external DNS for the whole guest.
     #[cfg(unix)]
     #[test]
-    fn hosted_runtime_init_applies_both_halves_in_one_run() {
+    fn guest_resolver_stub_points_the_guest_at_the_stub() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
+        let upstream = temp.path().join("resolved-resolv.conf");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A PATH without `resolvectl`: on a host that runs systemd-resolved the
+        // stub would answer and the "no stub" case would write the file, so the
+        // harness pins which branch the step takes instead of trusting the
+        // machine running the test. `/bin/sh` is absolute for the same reason —
+        // a bare `sh` is looked up through the harness PATH.
+        for tool in ["printf", "chmod", "mv", "rm", "grep", "cat", "awk"] {
+            symlink_tool(&bin, tool);
+        }
+        let script = guest_resolver_stub_script_at(
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            upstream.to_str().unwrap(),
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the resolver shell must run")
+        };
+
+        // No stub resolver on this guest: the file keeps the guest's resolver.
+        std::fs::write(&resolv, "nameserver 75.75.75.75\n").unwrap();
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 75.75.75.75\n",
+            "a guest without the stub must keep its own resolver"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no resolved stub resolver"),
+            "the skip must say why: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // With the stub present the file names it first and keeps the guest's
+        // own upstream: the measured shape that resolves `/etc/hosts` names
+        // *and* external names, host-wide.
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
+        );
+
+        // An upstream resolved keeps in its own file is preserved too, and the
+        // stub's own address is never duplicated.
+        std::fs::write(
+            &resolv,
+            "nameserver 100.96.0.1\noptions rotate\nsearch internal.example\n",
+        )
+        .unwrap();
+        std::fs::write(&upstream, "nameserver 127.0.0.53\nnameserver 8.8.8.8\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\nnameserver 8.8.8.8\noptions edns0 trust-ad\n"
+        );
+
+        // Idempotent: the second run rewrites nothing.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 100.96.0.1\nnameserver 8.8.8.8\noptions edns0 trust-ad\n"
+        );
+
+        // A symlinked `/etc/resolv.conf` becomes a regular file — SmolVM's agent
+        // refuses to start the machine over a symlink — and the file the link
+        // pointed at is never written through.
+        let managed = temp.path().join("managed-resolv.conf");
+        std::fs::write(&managed, "nameserver 75.75.75.75\n").unwrap();
+        std::fs::remove_file(&resolv).unwrap();
+        std::os::unix::fs::symlink(&managed, &resolv).unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert!(
+            !std::fs::symlink_metadata(&resolv)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&managed).unwrap(),
+            "nameserver 75.75.75.75\n",
+            "the file the symlink pointed at must not be clobbered"
+        );
+
+        // No staging file is left behind for a later bake or fork to adopt.
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // And the golden carries the step: an AgentENV restore keeps the baked
+        // file, which is what the daemon the guest's systemd starts reads.
+        assert!(
+            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
+                .contains(&guest_resolver_stub_script()),
+            "the golden contract must carry the resolver step"
+        );
+    }
+
+    /// The bake-time systemd preparation: resolved's upstream, the stub in
+    /// `/etc/resolv.conf`, and the unit masks — gated on the systemd binaries,
+    /// because the SmolVM builder has no systemd PID 1 and a "resolved is
+    /// active" gate would skip exactly there.
+    #[cfg(unix)]
+    #[test]
+    fn golden_systemd_parity_prepares_the_guest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let systemd_bin = root.join("lib/systemd/systemd");
+        let unit_dir = root.join("lib/systemd/system");
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(etc.join("systemd")).unwrap();
+        std::fs::write(&systemd_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&systemd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(unit_dir.join("fake-parity.service"), "[Unit]\n").unwrap();
+        std::fs::write(etc.join("resolv.conf"), "nameserver 100.96.0.1\n").unwrap();
+
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // No `systemctl` in the harness PATH: the mask falls back to the
+        // `/dev/null` symlink, which is the builder's case and what
+        // `systemctl mask` creates.
+        for tool in ["awk", "grep", "printf", "chmod", "mv", "rm", "mkdir", "ln"] {
+            symlink_tool(&bin, tool);
+        }
+
+        let units = ["fake-parity.service", "absent-unit.service"];
+        let script = golden_systemd_parity_script_at(
+            &[systemd_bin.to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", bin.display().to_string())
+                .output()
+                .expect("the systemd preparation shell must run")
+        };
+        let resolv_conf = etc.join("resolv.conf");
+        let resolved_conf = etc.join("systemd/resolved.conf");
+        let masked = etc.join("systemd/system/fake-parity.service");
+
+        let first = run();
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        // resolved's upstream is the image's own nameserver, so naming the stub
+        // in resolv.conf cannot leave resolved without one.
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=100.96.0.1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 127.0.0.53\noptions edns0 trust-ad\n"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&resolv_conf)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the stub must be a regular file: a symlink breaks SmolVM's start"
+        );
+        assert_eq!(
+            std::fs::read_link(&masked).unwrap(),
+            std::path::Path::new("/dev/null"),
+            "a shipped unit must be masked"
+        );
+        assert!(
+            !etc.join("systemd/system/absent-unit.service").exists(),
+            "a unit the image does not ship must be skipped"
+        );
+        assert!(
+            String::from_utf8_lossy(&first.stdout).contains("masked 1 systemd units"),
+            "{}",
+            String::from_utf8_lossy(&first.stdout)
+        );
+
+        // Idempotent: nothing is appended, rewritten or re-staged.
+        let second = run();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=100.96.0.1\n",
+            "a second run must not append a second DNS= line"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 127.0.0.53\noptions edns0 trust-ad\n"
+        );
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains("already sets DNS="),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&etc)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("preloop."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // An image with systemd but a resolver it cannot name: the fallback is
+        // a public resolver, and a `DNS=` the image configured is never touched.
+        std::fs::remove_file(&resolved_conf).unwrap();
+        std::fs::write(&resolv_conf, "search only.example\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=1.1.1.1\n",
+            "a guest whose resolver is itself the stub needs a public upstream"
+        );
+        std::fs::write(&resolved_conf, "DNS=9.9.9.9\n").unwrap();
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolved_conf).unwrap(),
+            "DNS=9.9.9.9\n",
+            "a configured DNS= must survive"
+        );
+
+        // No systemd in the image: nothing is touched, and the reason is said.
+        let absent = golden_systemd_parity_script_at(
+            &[root.join("nope/systemd").to_str().unwrap()],
+            etc.to_str().unwrap(),
+            &[unit_dir.to_str().unwrap()],
+            &units,
+        );
+        std::fs::write(&resolv_conf, "nameserver 8.8.8.8\n").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &absent])
+            .env("PATH", bin.display().to_string())
+            .output()
+            .expect("the systemd preparation shell must run");
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).unwrap(),
+            "nameserver 8.8.8.8\n"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no systemd"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // And the golden contract carries the step.
+        assert!(
+            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
+                .contains(&golden_systemd_parity_script()),
+            "the golden contract must carry the systemd preparation"
+        );
+    }
+
+    /// The composed init run end to end against scratch roots: the fork's own
+    /// name resolves, the sysctls reach the hosted values and the resolver file
+    /// names the stub in one exec, and a second run changes nothing. Textual
+    /// order alone would not catch a half whose `exit 0` swallows the others —
+    /// this runs every half in one shell, the way provisioning does.
+    #[cfg(unix)]
+    #[test]
+    fn hosted_runtime_init_applies_every_half_in_one_run() {
         let temp = tempfile::tempdir().unwrap();
         let hosts = temp.path().join("hosts");
         let root = temp.path().join("sys");
+        let resolv = temp.path().join("resolv.conf");
+        let stub = temp.path().join("stub-resolv.conf");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(root.join("vm")).unwrap();
         std::fs::create_dir_all(root.join("fs/inotify")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        std::fs::write(&resolv, "nameserver 75.75.75.75\n").unwrap();
+        std::fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
         std::fs::write(root.join("vm/max_map_count"), "65530").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_watches"), "655360").unwrap();
         std::fs::write(root.join("fs/inotify/max_user_instances"), "128").unwrap();
         // The sysctl half's procps is absent here, so the apply writes the
         // scratch tree directly — the same branch a guest without procps
-        // takes. Every other tool both halves call is linked in, so the test
-        // exercises the real scripts rather than the harness PATH.
+        // takes. Every other tool all three halves call is linked in, so the
+        // test exercises the real scripts rather than the harness PATH.
         for tool in [
             "cat", "tr", "id", "base64", "sh", "awk", "sed", "sort", "cut", "grep", "mktemp",
-            "tee", "rm", "uname", "head",
+            "tee", "rm", "uname", "head", "printf", "chmod", "mv",
         ] {
             symlink_tool(&bin, tool);
         }
@@ -9643,7 +10059,16 @@ done
         );
         hostname_harness_stub(&bin.join("sudo"), SUDO_STUB);
 
-        let script = hosted_runtime_init_script_at(hosts.to_str().unwrap(), root.to_str().unwrap());
+        let script = hosted_runtime_init_script_at(
+            hosts.to_str().unwrap(),
+            root.to_str().unwrap(),
+            resolv.to_str().unwrap(),
+            stub.to_str().unwrap(),
+            temp.path()
+                .join("absent-resolved-resolv.conf")
+                .to_str()
+                .unwrap(),
+        );
         let run = || {
             std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -9671,6 +10096,11 @@ done
             std::fs::read_to_string(root.join("fs/inotify/max_user_instances")).unwrap(),
             "1280"
         );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n",
+            "the resolver half must land in the same run, keeping the guest's upstream"
+        );
         // Idempotent: the second run writes nothing at all.
         let second = run();
         assert!(
@@ -9681,6 +10111,10 @@ done
         assert_eq!(
             std::fs::read_to_string(&hosts).unwrap(),
             "127.0.0.1 localhost\n127.0.0.1 fork-7c1f\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 127.0.0.53\nnameserver 75.75.75.75\noptions edns0 trust-ad\n"
         );
     }
 

@@ -57,13 +57,6 @@ rmdir /tmp/.preloop-ovprobe 2>/dev/null || true
 if [ -n "$DRIVER" ]; then
   printf '{"data-root":"@@DOCKER_DATA_ROOT@@","storage-driver":"%s"}\n' "$DRIVER" > /etc/docker/daemon.json
 fi
-# Pin container DNS to the guest's stub resolver when one answers, before the
-# daemon that will read it starts. After the storage-driver write above, which
-# would otherwise overwrite the pin. A machine whose daemon is already running
-# (an inherited golden chain, or AgentENV's systemd-started one) returns above
-# and keeps whatever config its own start read.
-@@DOCKER_DNS_PIN@@
-pin_container_dns /etc/docker/daemon.json
 start_dockerd() {
   rm -f /var/run/docker.pid
   dockerd >/var/log/dockerd.log 2>&1 &

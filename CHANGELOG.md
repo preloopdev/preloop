@@ -78,12 +78,41 @@ Releases before v0.27.0 predate the changelog.
   image dump drops file capabilities, so every guest answered `ping: socket:
   Operation not permitted` as the runner) and drops the bake host's own mapping
   from `/etc/hosts` (`10.1.0.59 runnervm…internal.cloudapp.net`), which every
-  fork had inherited. The container engine pins `dns: ["127.0.0.53"]` in
-  `/etc/docker/daemon.json` when a stub resolver answers there — on hosted
-  runners containers resolve through systemd-resolved, and `/etc/hosts`-only
-  compose aliases such as `postgres.localhost` now resolve instead of failing
-  against the guest's own resolver (`75.75.75.75` on AgentENV, `100.96.0.1` on
-  SmolVM). `uses: docker://image` steps are no longer rejected with `action
+  fork had inherited. The container-DNS gap — a compose network's
+  `/etc/hosts`-only alias such as `postgres.localhost` failing because the
+  container's ext server was the guest's own resolver, `75.75.75.75` on AgentENV
+  and `100.96.0.1` on SmolVM — is fixed in the guest's resolver *file*: Docker
+  hands a container the host file's nameservers, so a hosted runner's container
+  gets `ExtServers: [host(127.0.0.53)]` from
+  `/etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf`, and the guest now
+  writes `nameserver 127.0.0.53` first, **keeps its own nameserver** as a second
+  line, and adds `options edns0 trust-ad` — as a regular file, since a symlink
+  makes the SmolVM agent refuse to start the machine. Keeping the guest's
+  upstream is not cosmetic: on AgentENV nothing feeds systemd-resolved its
+  upstreams, so it reads them from this very file, and a stub-only file leaves
+  it with none and breaks external DNS for the whole guest while `/etc/hosts`
+  names keep working. The step runs in the golden — an AgentENV restore keeps
+  the baked file — and per machine, since the SmolVM agent rewrites
+  `/etc/resolv.conf` on every start; a guest without the resolved stub keeps the
+  file it has and says so. A `daemon.json` `dns` pin would be a regression, not
+  a fix: that path reaches the container as `ExtServers: [127.0.0.53]` with
+  `Overrides: [nameservers]`, and the address is then the container's own
+  loopback, so every lookup inside it fails. A guest that boots systemd also
+  gets the bake-time preparation the per-machine init cannot do
+  (`golden_systemd_parity_script`, gated on the systemd binaries so the SmolVM
+  builder — which has no systemd PID 1 — is covered): `DNS=` in
+  `resolved.conf` set from the image's own first nameserver (`1.1.1.1` when it
+  has none, and never over a configured value), the stub written into
+  `/etc/resolv.conf`, and the Azure/Hyper-V/cloud-init/snapd/apt-timer units
+  plus `systemd-sysctl.service` masked — via `systemctl mask` when a running
+  systemd answers, else the same `/dev/null` symlink the builder needs. The runner
+  workspace is the hosted shape too: `<runner-root>/work/<repo>/<repo>` instead
+  of the self-hosted `_work`, with `RUNNER_WORKSPACE` exported as the
+  repository's own directory under it (`/home/runner/work/<repo>`, which the
+  probe measured UNSET while a hosted runner exports it). `RUNNER_TEMP`,
+  `GITHUB_WORKSPACE`, the container `-v <work>:/__w` mount and the tool-cache
+  fallback all derive from the workspace, so they follow it. `uses:
+  docker://image` steps are no longer rejected with `action
   reference must contain @ref`: the job-message reader rebuilt the reference as
   a remote action, dropping the image azdo carries as
   `{"type":"containerRegistry","image":…}`, and now hands it to the docker

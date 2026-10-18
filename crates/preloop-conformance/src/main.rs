@@ -669,7 +669,7 @@ async fn run_runner_e2e(
             "--name",
             "e2e-runner",
             "--work",
-            "_work",
+            "work",
             "--no-externals",
             "--unattended",
             "--replace",
@@ -694,7 +694,7 @@ async fn run_runner_e2e(
         .map(|s| s.contains("live") || s.contains("ci") || s.contains("dogfood"))
         .unwrap_or(false);
     let submit_workflow_path = if is_live_workflow {
-        copy_workspace_code(&runner_root.join("_work/default/default"))?;
+        copy_workspace_code(&runner_root.join("work/default/default"))?;
         let modified = modify_workflow_for_local_run(&workflow)?;
         let temp_wf = temp_dir.path().join("local-wf.yml");
         std::fs::write(&temp_wf, modified)?;
