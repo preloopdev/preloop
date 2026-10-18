@@ -1608,18 +1608,25 @@ async fn local_composite_declared_actions(
     let mut declared = BTreeSet::new();
     let mut visited_actions = BTreeSet::new();
     let mut references_left = MAX_LOCAL_TRAVERSAL_REFERENCES;
+    // A traversal that stopped on a limit has not read every manifest the
+    // workflow could reach, so what it found is not the run's whole answer.
+    let mut truncated = false;
     while let Some((action_path, depth)) = pending.pop_front() {
-        if depth > MAX_LOCAL_ACTION_DEPTH
-            || visited_actions.len() >= MAX_LOCAL_ACTION_MANIFESTS
-            || !visited_actions.insert(action_path.clone())
-        {
+        if depth > MAX_LOCAL_ACTION_DEPTH || visited_actions.len() >= MAX_LOCAL_ACTION_MANIFESTS {
+            truncated = true;
+            continue;
+        }
+        if !visited_actions.insert(action_path.clone()) {
             continue;
         }
         let (remote, nested_local) = match tree.manifest(&action_path).await {
             ManifestRead::Found(nested) => nested,
             ManifestRead::Absent | ManifestRead::Transient => continue,
             // Out of lookups: nothing further is read, so the rest stays denied.
-            ManifestRead::Exhausted => break,
+            ManifestRead::Exhausted => {
+                truncated = true;
+                break;
+            }
         };
         let cost = remote.len() + nested_local.len();
         if cost > references_left {
@@ -1627,6 +1634,7 @@ async fn local_composite_declared_actions(
                 run_references = cost,
                 "local composite traversal reached its reference budget; the rest of the tree stays denied"
             );
+            truncated = true;
             break;
         }
         references_left -= cost;
@@ -1645,7 +1653,7 @@ async fn local_composite_declared_actions(
     }
     LocalDeclared {
         actions: declared,
-        complete: tree.complete,
+        complete: tree.complete && !truncated,
     }
 }
 
@@ -3663,6 +3671,38 @@ jobs:
                 "{label}: an unreadable source must not be remembered as a definitive answer"
             );
         }
+    }
+
+    /// A traversal that stops on one of its budgets has not read every
+    /// manifest the workflow reaches, so what it found is a partial answer and
+    /// is never remembered for the run.
+    #[tokio::test]
+    async fn local_composite_limit_hit_is_incomplete() {
+        // One composite names more distinct remote actions than the whole
+        // traversal may spend references on, so the traversal stops at it.
+        let actions: Vec<String> = (0..=MAX_LOCAL_TRAVERSAL_REFERENCES)
+            .map(|index| format!("owner{index}/repo@v1"))
+            .collect();
+        let uses: Vec<&str> = actions.iter().map(String::as_str).collect();
+        let setup = composite_manifest(&uses);
+        let (_temp, state, snapshot) =
+            local_snapshot_fixture(&[(".github/actions/setup/action.yml", setup.as_str())]).await;
+        let declared = local_composite_declared_actions(
+            &state.shared(),
+            LocalManifests::Snapshot(&snapshot),
+            SETUP_WORKFLOW,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert!(
+            !declared.complete,
+            "a traversal that stopped on its reference budget is not a definitive answer"
+        );
+        assert!(
+            declared.actions.is_empty(),
+            "the manifest past the budget is not read: {} actions",
+            declared.actions.len()
+        );
     }
 
     /// Ticket TTL is ~20 minutes, not 6 hours: a leaked bearerless ticket URL

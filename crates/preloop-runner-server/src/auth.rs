@@ -894,6 +894,22 @@ pub fn require_canonical_results_job_id(
         .unwrap_or_else(|_| job_id.to_owned()))
 }
 
+/// The plan a Results handler must key storage by: a job token's own plan.
+///
+/// A runner may address its own job with the plan segment spelled as its
+/// `system.orchestrationId` (`{planId}.{jobId}.__default`), which
+/// `path_names_token_plan` accepts for authorization. A replay path or
+/// metadata key built from that spelling names a namespace no reader resolves
+/// (logs are read back under the plan id, `runs.rs`), so handlers that write
+/// storage use the token's own plan instead. The system identity keeps the
+/// requested segment: engine callers address opaque backend ids.
+pub fn results_storage_plan_id(identity: &ResultsIdentity, requested_plan_id: &str) -> String {
+    match identity {
+        ResultsIdentity::System => requested_plan_id.to_owned(),
+        ResultsIdentity::Job(job) => job.plan_id.clone(),
+    }
+}
+
 /// Runner identity proven by a listen token on this request.
 ///
 /// `runner_id` is `Some` only when the bearer verifies as a runner-listen JWT
