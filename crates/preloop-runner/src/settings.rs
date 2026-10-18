@@ -87,24 +87,28 @@ impl CredentialData {
 
 /// RSA key parameters persisted in `.credentials_rsaparams`.
 ///
-/// Field names match the C# `RSAParameters` struct exactly.
+/// Serialized in the C# `RSAParameters` PascalCase spelling. Deserialization
+/// also accepts the lowercase spelling (`d`, `dp`, `dq`, `exponent`,
+/// `inverseQ`, `modulus`, `p`, `q`), which is how the JIT service emits the
+/// same struct through .NET's web-default camelCase policy; the official
+/// runner's Newtonsoft reader is case-insensitive, so it accepts both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RsaParameters {
-    #[serde(rename = "D")]
+    #[serde(rename = "D", alias = "d")]
     pub d: String,
-    #[serde(rename = "DP")]
+    #[serde(rename = "DP", alias = "dp")]
     pub dp: String,
-    #[serde(rename = "DQ")]
+    #[serde(rename = "DQ", alias = "dq")]
     pub dq: String,
-    #[serde(rename = "Exponent")]
+    #[serde(rename = "Exponent", alias = "exponent")]
     pub exponent: String,
-    #[serde(rename = "InverseQ")]
+    #[serde(rename = "InverseQ", alias = "inverseQ")]
     pub inverse_q: String,
-    #[serde(rename = "Modulus")]
+    #[serde(rename = "Modulus", alias = "modulus")]
     pub modulus: String,
-    #[serde(rename = "P")]
+    #[serde(rename = "P", alias = "p")]
     pub p: String,
-    #[serde(rename = "Q")]
+    #[serde(rename = "Q", alias = "q")]
     pub q: String,
 }
 
@@ -128,9 +132,9 @@ impl preloop_gha_protocol::crypto::RsaParamsLike for RsaParameters {
 
 // ─── File I/O ────────────────────────────────────────────────────────────
 
-const RUNNER_FILE: &str = ".runner";
-const CREDENTIALS_FILE: &str = ".credentials";
-const RSA_PARAMS_FILE: &str = ".credentials_rsaparams";
+pub(crate) const RUNNER_FILE: &str = ".runner";
+pub(crate) const CREDENTIALS_FILE: &str = ".credentials";
+pub(crate) const RSA_PARAMS_FILE: &str = ".credentials_rsaparams";
 
 /// Strip UTF-8 BOM if present (official runner writes BOM).
 fn strip_bom(s: &str) -> &str {
@@ -156,7 +160,7 @@ fn save_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             .unwrap_or("runner"),
         std::process::id()
     ));
-    std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
+    write_private(&temp, json.as_bytes())?;
     let result =
         std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()));
     if result.is_err() {
@@ -165,9 +169,36 @@ fn save_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     result
 }
 
-fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+    write_private(path, json.as_bytes())
+}
+
+/// Write `bytes` to `path`, creating the file owner-only (0600) on Unix.
+///
+/// The mode is applied at open time rather than after the write: `save_json`
+/// followed by `restrict_permissions` leaves a window in which a permissive
+/// umask exposes the contents — and these files carry the runner's private
+/// RSA key. An already-existing file keeps its mode through `open`, so the
+/// chmod still runs afterwards.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    restrict_permissions(path)
 }
 
 fn decode_refresh_payload(payload: &serde_json::Value) -> Result<serde_json::Value> {
@@ -201,7 +232,7 @@ fn refresh_settings_object(
 /// `.credentials_rsaparams` to 0600 on Linux/macOS so the private RSA key
 /// is not readable by other users on a shared host.
 /// No-op on non-Unix platforms.
-fn restrict_permissions(path: &Path) -> Result<()> {
+pub(crate) fn restrict_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

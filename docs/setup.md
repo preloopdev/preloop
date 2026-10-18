@@ -127,6 +127,27 @@ preloop-runner configure --url https://github.com/OWNER/REPO --token <TOKEN> --e
 preloop-runner run --once
 ```
 
+#### Just-in-Time Runner Mode
+For a runner configuration returned by GitHub's
+`generate-jitconfig` endpoint, pass the `encoded_jit_config` value to
+`preloop-runner run`. The payload contains the runner's private RSA key, so
+prefer the environment input the official runner also reads — argv is visible
+in process listings — and keep it out of shell history:
+
+```sh
+read -r -s JIT && ACTIONS_RUNNER_INPUT_JITCONFIG="$JIT" preloop-runner run
+```
+
+`--jitconfig <encoded_jit_config>` works too (it wins over the environment).
+The payload already registers the runner and contains the runner settings,
+OAuth credentials, and RSA parameters. `preloop-runner` hydrates those files
+without issuing the normal configure or registration requests, provisions the
+Node externals that `configure` would have downloaded, connects to the
+advertised broker (or legacy distributed-task service), runs one job, and
+exits. JIT runners are single-use; GitHub may reclaim one that remains idle
+for several minutes, so this mode is intended for provision-then-run-once
+hosts rather than a warm pool.
+
 #### Running as a systemd Service (Linux)
 To run `preloop-runner` as a persistent background service on a Linux server:
 

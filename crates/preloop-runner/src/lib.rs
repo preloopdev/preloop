@@ -23,6 +23,7 @@ pub mod cli;
 pub mod client;
 pub mod configure;
 pub mod control_bridge;
+pub mod jitconfig;
 
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
