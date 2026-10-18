@@ -12,6 +12,13 @@ The durable boundary: the raw delivery is committed to `webhook_deliveries`
 payload", not "we received some bytes". Everything after that is preloop's
 problem, and everything below is how it gets fixed.
 
+Workers are woken, not only polled. A delivery that one node makes claimable (an
+enqueue, or an operator replay) wakes that node's worker at once. On Postgres the
+node also sends one `preloop_webhooks` notification after the commit, coalesced
+over 15 ms, so every other node's worker wakes too. A lost notification costs only
+latency: each worker re-reads the queue at least every five seconds. SQLite is
+single-node and wakes only its own worker.
+
 ## Failure modes and what handles them
 
 | # | Failure | Symptom | Handled by |
@@ -64,8 +71,11 @@ Invariants worth keeping:
 - Nothing is redelivered while the local store is unhealthy: replaying into a
   broken store loses the payload a second time and spends a finite
   redelivery opportunity doing it.
-- The poll is skipped while the breaker is open — during a GitHub outage the
-  poll would fail anyway.
+- Each App's poll is skipped while that App's breaker is open — during a GitHub
+  outage the poll would fail anyway. Apps have separate breakers, so one App's
+  rate limit does not stall the others. A pass that skips any App is not a
+  successful poll: the stale signal keeps aging until every App's history has
+  been read again, because the skipped App's deliveries are unwatched.
 - Per-GUID backoff (0, 5m, 15m, 1h, 6h) with a cap; a GUID that hits the cap
   stays **open** as a standing finding rather than disappearing.
 - An attempt is **claimed before the request**: the attempt count and the
@@ -103,6 +113,13 @@ misconfigured App on day one and nothing after. This re-reads `GET /app` and
 - delivery-URL drift against `PRELOOP_PUBLIC_URL`,
 - read errors — never rendered as a clean bill of health.
 
+An App whose own breaker is open is not re-read: its last verdict stays published
+until the breaker closes, while the other Apps are checked as normal. A held-back
+App never vanishes from the published list: with no earlier verdict (its breaker
+was open on the first pass) it is published as explicitly unchecked. Every verdict
+carries its own `checked_at`, and `app_config_checked_at` advances only when a
+pass checked every App — a reused verdict never looks freshly verified.
+
 GitHub exposes no API to change an App's event subscription, and no `active`
 flag on `/app/hook/config`: this layer pages a human, it cannot self-heal.
 
@@ -138,7 +155,7 @@ The operational snapshot (`GET /api/v1/status`, `/readyz`) carries:
 | `webhook_dead_letter` | Deliveries failed permanently |
 | `webhook_queue_stalled` | Oldest unprocessed delivery older than 15 minutes |
 | `github_unavailable` | Breaker open; deliveries parked, not failing |
-| `webhook_watchdog_stale` | No successful history poll in 30 minutes — lost deliveries would go unnoticed |
+| `webhook_watchdog_stale` | No poll of *every* App in 30 minutes — lost deliveries would go unnoticed |
 | `webhook_repairs_pending` | Redeliveries requested that have not arrived |
 | `webhook_config_drift` | App events, permissions or delivery URL wrong |
 

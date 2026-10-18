@@ -274,16 +274,42 @@ never prints values.
 ## `preloop init [OPTIONS]`
 
 One command for first-run setup: it configures GitHub credentials, the golden
-image every job VM forks from, and how to run. In a terminal (stdin *and*
-stdout are TTYs) it is a four-step wizard; anywhere else it takes the same
-answers as flags, never prompts, and exits instead of waiting. Re-running it
-reconfigures in place — each step shows the stored answer and only asks again
-if you change it.
+image every job VM forks from, workflow requirements, and how to run. In a
+terminal (stdin *and* stdout are TTYs) it is a five-step wizard; anywhere else
+it takes the same answers as flags, never prompts, and exits instead of
+waiting. Re-running it reconfigures in place — each step shows the stored
+answer and only asks again if you change it.
 
 Steps: **1 credentials** (the `preloop setup github` flow, verified live like
-`preloop doctor`), **2 golden**, **3 run mode**, **4 preflight** (free space on
-the SmolVM data volume, host architecture, hypervisor) — then the config is
-written to `$PRELOOP_CONFIG` and the chosen mode starts.
+`preloop doctor`; App auth asks for a stable URL before creating the App),
+**2 golden**, **3 workflows** (workflow secrets and `runs-on` labels),
+**4 run mode**, **5 preflight** (free space on the SmolVM data volume, host
+architecture, hypervisor) — then the config is written to `$PRELOOP_CONFIG`
+and the chosen mode starts. The workflow pass reads local
+`.github/workflows/*.yml|yaml` and `.github/actions/**/action.y*ml`; a
+`--repo` that is not the checkout is read through GitHub when its credential
+allows it. It never fails init because a repository cannot be read or a secret
+is missing.
+
+For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub
+can reach. Tailscale Funnel, a Cloudflare **named** Tunnel (not a quick Tunnel,
+whose URL changes on restart), or a domain/reverse proxy are suitable; expose
+only `/api/v1/github/webhooks`. Blank means local-only App webhooks: pushes and
+pull requests will not start runs and PR checks will not report. An existing
+`--public-url` or `PRELOOP_PUBLIC_URL` is used without asking.
+
+The workflow report lists every `secrets.NAME` / `secrets['NAME']` reference
+(excluding engine-minted `GITHUB_TOKEN`), its file locations, and whether the
+name is configured globally, for the repository, or for an environment. In a
+terminal, each missing UPPER_SNAKE name can be entered through a hidden prompt;
+otherwise the report prints the exact `preloop secret set NAME --repo
+OWNER/NAME` command. The `runs-on` table uses the engine's actual matching
+rules: base labels are `self-hosted`, `Linux`, and the host architecture;
+`ubuntu-latest`/`ubuntu-24.04` use the official golden, other `ubuntu-*`
+labels use the configured golden, and macOS/Windows labels require a matching
+external runner because the Linux pool cannot host them. Undeclared custom
+labels need a matching registered runner or an explicit `PRELOOP_RUNNER_LABELS`
+value.
 
 | Flag | Description |
 |---|---|
@@ -291,8 +317,11 @@ written to `$PRELOOP_CONFIG` and the chosen mode starts.
 | `--auth <app\|pat\|none>` | Credential step. `none` writes no credential (local-only engine) and leaves existing ones alone |
 | `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials (with `--auth app`); without them the browser flow creates one |
 | `--token <TOKEN>` | PAT (with `--auth pat`); falls back to `PRELOOP_GITHUB_PAT` |
-| `--org <NAME>`, `--public-url <URL>`, `--port <N>`, `--no-browser`, `--webhook-secret <SECRET>` | As in `preloop setup github` |
-| `--repo <OWNER/NAME>` | Repository to verify the credential against (repeatable) |
+| `--org <NAME>` | Create the App under this organization |
+| `--public-url <URL>` | Stable HTTPS URL GitHub can reach. Enables App webhooks and PR checks; loopback and non-HTTPS URLs are rejected, and trailing slashes are removed |
+| `--port <N>`, `--no-browser`, `--webhook-secret <SECRET>` | As in `preloop setup github` |
+| `--repo <OWNER/NAME>` | Repository to verify and scan (repeatable); without it, the current checkout's origin is used |
+| `--no-secrets-scan` | Skip the workflow secret scan; the `runs-on` label report still runs |
 | `--golden <official\|oci\|dockerfile\|file>` | Golden step. `official` (default) is the packed official GitHub runner golden: drop-in parity with GitHub-hosted runners, **~60 GB on disk** (≈9.6 GB download + the unpacked golden + per-job VM space) |
 | `--base-image <REF>` | OCI reference (with `--golden oci`). Resolved anonymously before it is written; pin `@sha256:…` for reproducibility (unpinned only warns). Private registries answer 401/403 — add their credentials with `smolvm config registries edit` and retry; they are used for the pull only and never enter the VM |
 | `--dockerfile <PATH>`, `--docker-context <DIR>` | Build a Dockerfile in this repo (with `--golden dockerfile`; defaults `./Dockerfile` and its directory). Offline-builds with `docker`/`nerdctl`, saves the result to a tar under `$PRELOOP_HOME/goldens/`, and uses that tar as the base image. The choice is only offered when a `Dockerfile` exists in the working directory and `docker`/`nerdctl` is on `PATH`; otherwise the wizard shows it disabled with the reason |

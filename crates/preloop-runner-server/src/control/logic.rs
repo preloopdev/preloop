@@ -1917,18 +1917,6 @@ pub(crate) const ASSIGNMENT_TTL: std::time::Duration = std::time::Duration::from
 /// How long a pre-claim assignment stays exclusive.
 pub(crate) const CLAIM_BINDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-fn assignment_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
-    now.duration_since(at)
-        .map(|age| age < ASSIGNMENT_TTL)
-        .unwrap_or(false)
-}
-
-fn binding_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
-    now.duration_since(at)
-        .map(|age| age < CLAIM_BINDING_TTL)
-        .unwrap_or(false)
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Stamps
 // ─────────────────────────────────────────────────────────────────────────

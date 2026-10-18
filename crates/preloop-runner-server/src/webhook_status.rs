@@ -28,6 +28,11 @@ pub struct AppWebhookConfigStatus {
     /// cannot even be subscribed to.
     pub missing_permissions: Vec<String>,
     pub error: Option<String>,
+    /// When this verdict was produced, microsecond epoch. `None` for a
+    /// verdict that was never actually checked: a held-back App published
+    /// before its first check, or a copy of one. A reused verdict keeps its
+    /// original time, so freshness is per verdict, not per publication.
+    pub checked_at_us: Option<i64>,
 }
 
 impl AppWebhookConfigStatus {
@@ -116,10 +121,17 @@ impl WebhookResilienceStatus {
         (snapshot.statuses.clone(), snapshot.checked_at_us)
     }
 
-    pub fn set_app_config(&self, statuses: Vec<AppWebhookConfigStatus>, checked_at_us: i64) {
+    /// Publish the verdict list. `checked_at_us` is when the list was
+    /// verified as a whole — `None` when the pass could not verify every
+    /// configured App, so a partial publication never claims full freshness.
+    pub fn set_app_config(
+        &self,
+        statuses: Vec<AppWebhookConfigStatus>,
+        checked_at_us: Option<i64>,
+    ) {
         *self.app_config.write() = AppConfigSnapshot {
             statuses,
-            checked_at_us: Some(checked_at_us),
+            checked_at_us,
         };
     }
 

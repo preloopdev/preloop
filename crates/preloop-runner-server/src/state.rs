@@ -758,6 +758,32 @@ pub type ActionResolvedUses =
 /// [`ActionResolvedUses`].
 pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
 
+/// Nested `uses:` of composite manifests read through the GitHub contents API
+/// for runs without a workspace snapshot: (`owner/repo` lowercased, commit,
+/// composite directory) → the manifest's nested references, or `None` when the
+/// commit has no readable manifest there. Only definitive reads are memoised;
+/// a transient failure is retried on the next adjudication.
+pub type LocalCompositeNestedUses = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String, String),
+        Option<(std::collections::BTreeSet<String>, Vec<String>)>,
+    >,
+>;
+
+/// Maximum entries in [`LocalCompositeNestedUses`]. A full memo is cleared
+/// rather than evicted entry by entry; clearing only costs re-reads.
+pub const MAX_LOCAL_COMPOSITE_MEMO: usize = 4096;
+
+/// Remote actions a run's local composites reach, per run. A run's answer is
+/// fixed by its immutable commit, so a traversal that reached a definitive
+/// answer is remembered; see `local_composite_declared_for_run`.
+pub type LocalCompositeDeclared =
+    std::sync::Mutex<std::collections::HashMap<RunId, Arc<std::collections::BTreeSet<String>>>>;
+
+/// Maximum runs in [`LocalCompositeDeclared`]. A full memo is cleared, which
+/// only costs a re-traversal.
+pub const MAX_LOCAL_COMPOSITE_DECLARED_RUNS: usize = 1024;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -869,8 +895,7 @@ pub struct AppState {
     /// Per-subsystem consumption accounting for outbound GitHub traffic
     /// (requests, bytes, rate limits, breaker-blocked attempts). Only the
     /// labeled sender ([`crate::github_breaker::send_observed_labeled`])
-    /// records here; the unlabeled [`crate::github_breaker::send_observed`]
-    /// covers only pre-`AppState` bootstrap reads and records nothing.
+    /// records here.
     pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
@@ -1042,6 +1067,12 @@ pub struct AppState {
     /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
     /// see [`ActionResolvedUses`].
     pub action_resolved_uses: Arc<ActionResolvedUses>,
+    /// Memo for composite manifests read through the GitHub contents API for
+    /// runs without a workspace snapshot; see [`LocalCompositeNestedUses`].
+    pub local_composite_nested_uses: Arc<LocalCompositeNestedUses>,
+    /// Remote actions reached through a run's local composites, per run; see
+    /// [`LocalCompositeDeclared`].
+    pub local_composite_declared: Arc<LocalCompositeDeclared>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1466,23 +1497,19 @@ impl AppState {
         let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let diag_staging_max_age_seconds =
             crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_apps = crate::github_app::load_from(&config)?;
+        let github_breakers = Arc::new(crate::github_breaker::GithubBreakerRegistry::default());
+        let github_consumption = Arc::new(crate::github_breaker::GithubConsumption::default());
+        // Attached before `github_app` is cloned from the registry, so the
+        // legacy field reports through the same breaker and accounting.
+        let github_apps = crate::github_app::load_from(&config)?
+            .map(|apps| apps.with_github_accounting(&github_breakers, &github_consumption));
         let github_app = github_apps
             .as_ref()
             .map(|registry| registry.default_app().clone());
         // Env wins over the config file, matching every other credential
         // here. An empty value in either source counts as unset: a blank
         // export must not disable signature verification silently.
-        let webhook_secret = env::var("PRELOOP_WEBHOOK_SECRET")
-            .ok()
-            .filter(|secret| !secret.is_empty())
-            .or_else(|| {
-                config
-                    .github
-                    .webhook_secret()
-                    .filter(|secret| !secret.is_empty())
-                    .map(str::to_owned)
-            });
+        let webhook_secret = crate::config::webhook_secret_from_env_or_config(&config);
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
@@ -1670,8 +1697,8 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
-            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
+            github_breakers,
+            github_consumption,
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             fresh_merge_poll: crate::github::FreshMergePoll::default(),
@@ -1739,6 +1766,12 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            local_composite_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            local_composite_declared: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),

@@ -1,29 +1,46 @@
 runner_version = "2.336.0"
 
-# SmolVM runtime floor: v1.18.1 is the first release that carries
-# `machine fork --freeze-source` (upstream PR #1376), which preloop-vm passes
-# on every fork so the golden stays frozen as a reusable branch base instead
-# of live-forking onto new CoW layers. Live forking accumulates qcow2 backing
-# layers until MAX_FORK_LINEAGE_DEPTH (32) wedges the pool, and on macOS it
-# re-checkpoints the source on every fork — the failure mode the retained
-# fork patch fixed before upstream carried the flag. The floor also
-# still covers packed-machine UID/GID metadata restoration (v1.8.1) for an
-# UNPRIVILEGED smolvm; run as root, the per-VM uid drop presents packed layers
-# through a count-1 idmapped mount and every non-zero uid surfaces as the
-# overflow uid (65534). `preloop update --ensure-runtime` accepts any stable
-# release >= this and installs the latest stable when the local runtime is
-# below the floor or lacks the required socket capability. Compiled into
-# preloop-cli and preloop-vm. Keep it at the first release that satisfies all
-# runtime invariants; the golden release pin below is Renovate-managed.
-smolvm_min_version = "1.18.1"
+# SmolVM runtime floor: v1.30.1, the release this branch was measured on. Below
+# the floor a machine preloop builds can fail to boot, fork, or restore packed
+# ownership, so the floor is the first release that satisfies every runtime
+# invariant preloop needs:
+#
+# * packed-machine ownership preservation (v1.8.1) for an UNPRIVILEGED smolvm;
+#   run as root, the per-VM uid drop presents packed layers through a count-1
+#   idmapped mount and every non-zero uid surfaces as the overflow uid (65534).
+# * `machine fork --freeze-source` (v1.18.1, upstream PR #1376), which
+#   preloop-vm passes on every fork so the golden stays frozen as a reusable
+#   branch base instead of live-forking onto new CoW layers. Live forking
+#   accumulates qcow2 backing layers until MAX_FORK_LINEAGE_DEPTH (32) wedges
+#   the pool, and on macOS it re-checkpoints the source on every fork — the
+#   failure mode the retained fork patch fixed before upstream carried the flag.
+# * the x86_64 virtio device budget (v1.23.0, smolvm PR #1521). libkrun
+#   allocates one MMIO IRQ line per virtio device, and the count of IRQ lines
+#   it can hand out on x86_64 is the device ceiling: 19 (lines 5-23) since
+#   v1.23.0, 11 before. Measured on x86_64 Linux at v1.30.1: an image machine
+#   (`--storage 1 --overlay 1`) starts with 9 devices, each extra `--disk` or
+#   `--volume` costs exactly 1, and the 20th device fails `machine start` with
+#   `krun_start_enter returned: -22 (EINVAL)` / `no more IRQs are available`.
+#   Below v1.23.0 preloop's packed golden — baseline devices plus its mounts —
+#   can exceed the budget and never boot. The arm64/macOS ceiling has not been
+#   measured; `preloop update --ensure-runtime` accepts any stable release >=
+#   this and installs the latest stable when the local runtime is below the
+#   floor or lacks the required socket capability. Compiled into preloop-vm
+#   (see `crates/preloop-vm/build.rs`), which preloop-cli reads. Keep it at the
+#   first release that satisfies all runtime invariants; the golden release pin
+#   below is Renovate-managed.
+smolvm_min_version = "1.30.1"
 
 # SmolVM release the golden-image workflow (.github/workflows/release-golden.yml)
 # builds with. Renovate opens a bump PR when upstream ships a newer stable;
 # .github/workflows/smolvm-release-verify.yml runs the real-VM E2E on
 # GitHub-hosted KVM to gate the merge. Deliberately separate from
 # smolvm_min_version: goldens track the last *verified* release, the runtime
-# floor rarely moves.
-smolvm_golden_version = "1.23.6"
+# floor rarely moves. Raising this pin does NOT rebuild the published golden:
+# the official golden is a prebuilt OCI artifact pinned by digest in
+# crates/preloop-orchestrator/src/lib.rs (`GOLDEN_OCI_REF_*`), and a new one
+# only exists after a host-driven bake and publish — see docs/build-goldens.md.
+smolvm_golden_version = "1.30.1"
 
 # Image inputs for the runner golden. The official golden is baked from the
 # per-architecture OCI references in official-image.toml (the dump of the

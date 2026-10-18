@@ -185,11 +185,12 @@ explicitly; never print or commit the fallback file.
 | `PRELOOP_GITHUB_APP_ID` | App id |
 | `PRELOOP_GITHUB_APP_PEM` / `_PEM_FILE` / `_PRIVATE_KEY` / `_PRIVATE_KEY_PATH` | Private key, inline or by path |
 | `PRELOOP_GITHUB_APP_INSTALLATION_ID` | Installation id; skips discovery |
-| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` |
+| `PRELOOP_WEBHOOK_SECRET` | Verifies `X-Hub-Signature-256` for the default App; a payload it signs is bound to that App's installation coverage. Other Apps' secrets are set per App with `preloop setup github --via app --webhook-secret` |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback; also fetches **private remote reusable workflows** |
 | `PRELOOP_GITHUB_APP_MINT_FAILURE` | Policy when installation-token minting fails |
 | `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL` | Point at GitHub Enterprise Server |
 | `PRELOOP_GITHUB_REPOSITORY` | Repository the scheduler scans for `schedule:` workflows at startup |
+| `PRELOOP_ENABLE_APP_REGISTRATION` | `1`, `true`, or `on` serves the App-manifest pages at `/api/v1/github/register` and `/api/v1/github/callback`. Off by default (both return `404`). Keep it off in production and register Apps with `preloop setup github --via app`. |
 
 ### Checkout cache
 
@@ -594,6 +595,7 @@ Also worth knowing:
 | `state/snapshots/` | Per-run immutable workspace snapshots; in-flight captures stage under `state/snapshots/.staging/` |
 | `vms/` | Golden images and per-machine state |
 | `credentials/` | Credentials in the default file store (App key, PAT, webhook secrets, engine token): `0600` files. Set `credential_store = "os"` to keep them in the OS keychain instead |
+| `secrets.key` | Legacy config-secrets key, written only while the credential store cannot be reached and migrated into it once it can. A file that disagrees with the store is renamed `secrets.key.orphan-<unix-ts>`, never deleted |
 | `engine.token` | Legacy last-resort file for the generated native API token, used only when the credential store cannot hold it |
 
 Keep the whole state directory on one filesystem. Everything the engine
@@ -635,7 +637,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | `could not compile … (signal: 9, SIGKILL)` | Out of memory — raise `PRELOOP_RUNNER_MEMORY_MIB` |
 | Jobs never resume after a restart | Expected; see *Restarts* |
 | Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
-| Webhook delivered but nothing runs | Confirm `PRELOOP_WEBHOOK_SECRET` matches the App, and that the workflow's `on:` matches the event |
+| Webhook delivered but nothing runs | Confirm the webhook secret matches the App (`PRELOOP_WEBHOOK_SECRET` for the default App; `preloop setup github --via app --webhook-secret` for any other), and that the workflow's `on:` matches the event |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
 | `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 
