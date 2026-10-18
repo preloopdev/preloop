@@ -910,6 +910,9 @@ impl Default for ConfigFile {
 
 /// Env override for the secrets-store mode; see [`ConfigFile::secrets_store`].
 pub const SECRETS_STORE_ENV: &str = "PRELOOP_SECRETS_STORE";
+/// Serves the App-manifest registration pages (`/api/v1/github/register`,
+/// `/api/v1/github/callback`); off unless `1`, `true`, or `on`.
+pub const APP_REGISTRATION_ENV: &str = "PRELOOP_ENABLE_APP_REGISTRATION";
 pub const CHECKOUT_CACHE_MODE_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MODE";
 pub const CHECKOUT_CACHE_RUN_RETENTION_ENV: &str = "PRELOOP_CHECKOUT_CACHE_RUN_RETENTION_SECONDS";
 pub const CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV: &str =
@@ -1584,6 +1587,11 @@ pub struct StartupConfig {
     /// `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` over the manifest default
     /// (`push,pull_request,check_run`).
     pub github_app_default_events: Option<String>,
+    /// `PRELOOP_ENABLE_APP_REGISTRATION` (`1`, `true`, or `on`, case
+    /// insensitive): serve the App-manifest pages at
+    /// `/api/v1/github/register` and `/api/v1/github/callback`. Off by
+    /// default — both routes answer `404`.
+    pub github_app_registration: Option<bool>,
     /// `PRELOOP_GITHUB_SKIP_WORKFLOWS`: workflow filenames the engine never
     /// runs (comma-separated).
     pub github_skip_workflows: Option<String>,
@@ -1625,6 +1633,22 @@ fn env_flag_value(name: &str) -> Option<bool> {
             "1" | "true" | "yes"
         )
     })
+}
+
+/// `1|true|on` (case-insensitive) parse: the documented spelling of the
+/// switches whose contract is "off unless on" rather than
+/// [`env_flag_value`]'s `1|true|yes`. Present-but-other counts as off.
+fn parse_switch(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    )
+}
+
+/// [`parse_switch`] against the process environment: `None` when the variable
+/// is unset, `Some(on)` when it is set.
+fn env_switch_value(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| parse_switch(&value))
 }
 
 impl StartupConfig {
@@ -1716,6 +1740,7 @@ impl StartupConfig {
             outbox_retention_seconds: env_override("PRELOOP_OUTBOX_RETENTION_SECONDS")
                 .and_then(|raw| raw.parse().ok()),
             github_app_default_events: env_override("PRELOOP_GITHUB_APP_DEFAULT_EVENTS"),
+            github_app_registration: env_switch_value(APP_REGISTRATION_ENV),
             github_skip_workflows: env_override(crate::github::GITHUB_OWNED_WORKFLOWS_ENV),
             github_pr_auto: env_override("PRELOOP_GITHUB_PR_AUTO"),
             github_pr_draft: env_override("PRELOOP_GITHUB_PR_DRAFT"),
@@ -1785,6 +1810,7 @@ impl StartupConfig {
             token_ttl_secs: None,
             outbox_retention_seconds: None,
             github_app_default_events: None,
+            github_app_registration: None,
             github_skip_workflows: None,
             github_pr_auto: None,
             github_pr_draft: None,
@@ -1900,6 +1926,7 @@ impl std::fmt::Debug for StartupConfig {
             .field("token_ttl_secs", &self.token_ttl_secs)
             .field("outbox_retention_seconds", &self.outbox_retention_seconds)
             .field("github_app_default_events", &self.github_app_default_events)
+            .field("github_app_registration", &self.github_app_registration)
             .field("github_skip_workflows", &self.github_skip_workflows)
             .field("github_pr_auto", &self.github_pr_auto)
             .field("github_pr_draft", &self.github_pr_draft)
@@ -2896,6 +2923,22 @@ pub fn pinned_test_config_path() -> PathBuf {
 mod tests {
     use super::*;
     use crate::credential_store::WriteOnlyCredentialStore;
+
+    /// The App-registration flag accepts exactly the documented on-values:
+    /// `PRELOOP_ENABLE_APP_REGISTRATION` is read once by [`StartupConfig::from_env`],
+    /// so the mapping is a pure parse and needs no process-wide variable.
+    #[test]
+    fn app_registration_switch_accepts_only_the_documented_on_values() {
+        for value in ["1", "true", "TRUE", " on ", "On"] {
+            assert!(parse_switch(value), "{value:?} should enable registration");
+        }
+        for value in ["", "0", "false", "off", "yes"] {
+            assert!(
+                !parse_switch(value),
+                "{value:?} should not enable registration"
+            );
+        }
+    }
 
     // These tests use the path-taking helpers rather than pinning
     // `PRELOOP_CONFIG`: mutating a process-wide env var raced every other test

@@ -5236,18 +5236,6 @@ const APP_MANIFEST_COOKIE_PATH: &str = "/api/v1/github";
 /// Lifetime of one registration: the cookie's `Max-Age` and the signed expiry.
 const APP_MANIFEST_STATE_TTL_SECS: u64 = 3600;
 
-/// Whether the App-manifest routes are served. Off unless
-/// `PRELOOP_ENABLE_APP_REGISTRATION` is `1`, `true`, or `on` (case-insensitive).
-fn app_registration_enabled() -> bool {
-    let Ok(value) = std::env::var("PRELOOP_ENABLE_APP_REGISTRATION") else {
-        return false;
-    };
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "on"
-    )
-}
-
 /// The `Host` the browser addressed; the manifest's URLs are built from it.
 fn manifest_host(headers: &HeaderMap) -> &str {
     headers
@@ -5410,7 +5398,7 @@ pub async fn github_register(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
-    if !app_registration_enabled() {
+    if !shared.state.app_registration_enabled {
         return Err(StatusCode::NOT_FOUND);
     }
     let host = manifest_host(&headers);
@@ -5528,7 +5516,7 @@ pub async fn github_callback(
 ) -> Result<axum::response::Response, StatusCode> {
     // The gate runs before query extraction: a request that cannot parse must
     // still see the disabled route's 404, not an extractor rejection.
-    if !app_registration_enabled() {
+    if !shared.state.app_registration_enabled {
         return Err(StatusCode::NOT_FOUND);
     }
     let params = match Query::<CallbackQuery>::try_from_uri(&uri) {
@@ -12509,5 +12497,397 @@ jobs:
                 .all(|request| !request.contains("check-runs/") && !request.contains("deployments")),
             "an unsatisfied approval touches no GitHub surface: {requests:?}"
         );
+    }
+
+    /// App-manifest registration: the feature flag, the cookie-bound `state`,
+    /// the one-time handoff page, and the conversion request sent upstream.
+    ///
+    /// The flag and the upstream api base arrive as typed startup values, so
+    /// nothing here touches the process environment.
+    mod manifest_registration {
+        use super::*;
+
+        /// GitHub's manifest-conversion response for an App owned by `owner`.
+        fn conversion_response(owner: &str, webhook_secret: &str) -> Value {
+            serde_json::json!({
+                "id": 987654,
+                "slug": "preloop-local-app",
+                "owner": { "login": owner },
+                "pem": "-----BEGIN RSA PRIVATE KEY-----\nMOCK-KEY\n-----END RSA PRIVATE KEY-----",
+                "webhook_secret": webhook_secret,
+            })
+        }
+
+        /// A stub GitHub, the production router, and the state whose startup
+        /// carries both the stub's api base and the registration flag.
+        struct Harness {
+            app: axum::Router,
+            state: AppState,
+            requests: StubRequests,
+            _temp: tempfile::TempDir,
+        }
+
+        async fn harness(response: Value, registration: bool) -> Harness {
+            harness_at(response, 201, registration).await
+        }
+
+        /// [`harness`] with control over the conversion endpoint's status.
+        async fn harness_at(response: Value, upstream_status: u16, registration: bool) -> Harness {
+            let (api, requests) =
+                start_github_stub(move |_, _, _| (upstream_status, vec![], response.clone())).await;
+            let startup = crate::config::StartupConfig {
+                github_api_url: Some(api),
+                github_app_registration: Some(registration),
+                ..crate::config::StartupConfig::for_tests()
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let state = AppState::new(temp.path().join("state"), startup)
+                .await
+                .unwrap();
+            let app = crate::routes::app(state.clone(), CancellationToken::new());
+            Harness {
+                app,
+                state,
+                requests,
+                _temp: temp,
+            }
+        }
+
+        /// One GET through the production router, with an optional `Cookie` and `Host`.
+        async fn get(
+            app: &axum::Router,
+            uri: &str,
+            cookie: Option<&str>,
+            host: Option<&str>,
+        ) -> axum::response::Response {
+            let mut request = Request::builder().method(Method::GET).uri(uri);
+            if let Some(cookie) = cookie {
+                request = request.header("cookie", cookie);
+            }
+            if let Some(host) = host {
+                request = request.header("host", host);
+            }
+            app.clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        async fn text(response: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        fn set_cookie_of(response: &axum::response::Response) -> String {
+            let value = &response.headers()["set-cookie"];
+            value.to_str().unwrap().to_owned()
+        }
+
+        /// The `Cookie` header and the `state` token of a binding this engine would
+        /// issue under `nonce`, valid for ten minutes.
+        fn binding(key: &[u8], nonce: &str) -> (String, String) {
+            let token = app_manifest_state_token(key, nonce, unix_now_secs() + 600);
+            (format!("preloop_app_manifest_state={token}"), token)
+        }
+
+        fn upstream(requests: &StubRequests) -> Vec<(String, String, Value)> {
+            requests.lock().iter().cloned().collect()
+        }
+
+        #[tokio::test]
+        async fn routes_are_not_found_while_registration_is_disabled() {
+            let h = harness(conversion_response("acme", "s"), false).await;
+
+            let register = get(&h.app, "/api/v1/github/register", None, None).await;
+            assert_eq!(register.status(), StatusCode::NOT_FOUND);
+            assert!(register.headers().get("set-cookie").is_none());
+
+            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-disabled");
+            let uri = format!("/api/v1/github/callback?code=c1&state={token}");
+            let callback = get(&h.app, &uri, Some(cookie.as_str()), None).await;
+            assert_eq!(callback.status(), StatusCode::NOT_FOUND);
+            // A query that cannot parse must still see the disabled route's
+            // 404, not an extractor rejection.
+            let malformed = get(
+                &h.app,
+                "/api/v1/github/callback?code=c1&code=c2&state=x",
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "a disabled route must not reach GitHub"
+            );
+        }
+
+        /// A failed code exchange answers with the protected page: the browser
+        /// URL still carries the one-time code, so the response is never
+        /// cacheable and never leaks through `Referer`.
+        #[tokio::test]
+        async fn exchange_failure_renders_a_protected_page() {
+            let h = harness_at(conversion_response("acme", "s"), 500, true).await;
+            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-exchange");
+            let uri = format!("/api/v1/github/callback?code=the-code&state={token}");
+            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                response.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                response.headers()["referrer-policy"].to_str().unwrap(),
+                "no-referrer"
+            );
+            let page = text(response).await;
+            assert!(page.contains("Registration could not be completed"));
+            assert_eq!(
+                upstream(&h.requests).len(),
+                1,
+                "the bound exchange is attempted exactly once"
+            );
+        }
+
+        #[tokio::test]
+        async fn round_trip_hands_off_a_cli_command_and_clears_the_binding() {
+            let response = conversion_response("acme-admin", "mock-webhook-secret-xyz");
+            let h = harness(response, true).await;
+
+            // Loopback hosts are plain HTTP, so their cookie is not `Secure`.
+            let local = get(&h.app, "/api/v1/github/register", None, None).await;
+            assert!(!set_cookie_of(&local).contains("Secure"));
+
+            // Over HTTPS the cookie is HttpOnly, Lax, scoped to the GitHub routes, and
+            // lives for an hour.
+            let register = get(
+                &h.app,
+                "/api/v1/github/register",
+                None,
+                Some("preloop.example.com"),
+            )
+            .await;
+            assert_eq!(register.status(), StatusCode::OK);
+            assert_eq!(
+                register.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            let set_cookie = set_cookie_of(&register);
+            for attribute in [
+                "HttpOnly",
+                "SameSite=Lax",
+                "Path=/api/v1/github",
+                "Max-Age=3600",
+                "Secure",
+            ] {
+                assert!(
+                    set_cookie.contains(attribute),
+                    "missing {attribute}: {set_cookie}"
+                );
+            }
+            let cookie = set_cookie.split(';').next().unwrap().to_owned();
+            let token = cookie
+                .strip_prefix("preloop_app_manifest_state=")
+                .unwrap()
+                .to_owned();
+            let page = text(register).await;
+            assert!(
+                page.contains(&format!(
+                    "https://github.com/settings/apps/new?state={token}"
+                )),
+                "the form must send the token the cookie carries"
+            );
+
+            // GitHub redirects the same browser back, echoing the state.
+            let uri = format!("/api/v1/github/callback?code=the-code&state={token}");
+            let callback = get(
+                &h.app,
+                &uri,
+                Some(cookie.as_str()),
+                Some("preloop.example.com"),
+            )
+            .await;
+            assert_eq!(callback.status(), StatusCode::OK);
+            assert_eq!(
+                callback.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                callback.headers()["referrer-policy"].to_str().unwrap(),
+                "no-referrer"
+            );
+            assert!(
+                set_cookie_of(&callback).contains("Max-Age=0"),
+                "the binding is cleared"
+            );
+            let page = text(callback).await;
+            assert!(page.contains("GitHub App Registered Successfully!"));
+            assert!(page.contains("987654"));
+            assert!(
+                page.contains("acme-admin"),
+                "the owner is shown for confirmation"
+            );
+            assert!(
+                page.contains("--webhook-secret &#39;mock-webhook-secret-xyz&#39;"),
+                "the handoff must pass the secret on the CLI"
+            );
+            assert!(!page.contains("export PRELOOP_WEBHOOK_SECRET"));
+
+            let calls = upstream(&h.requests);
+            assert_eq!(
+                calls.len(),
+                1,
+                "one registration makes one conversion request"
+            );
+            assert_eq!(calls[0].0, "POST");
+            assert_eq!(calls[0].1, "/app-manifests/the-code/conversions");
+        }
+
+        #[tokio::test]
+        async fn code_stays_one_percent_encoded_upstream() {
+            let h = harness(conversion_response("acme", "s"), true).await;
+            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-code");
+            // The code decodes to `a/b?c&d`; none of those characters may split the path.
+            let uri = format!("/api/v1/github/callback?code=a%2Fb%3Fc%26d&state={token}");
+            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let calls = upstream(&h.requests);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].1, "/app-manifests/a%2Fb%3Fc%26d/conversions");
+        }
+
+        #[tokio::test]
+        async fn handoff_page_escapes_every_value_github_supplies() {
+            let hostile = serde_json::json!({
+                "id": 42,
+                "slug": "<img src=x>",
+                "owner": { "login": "<b>acme</b>" },
+                "pem": "<script>alert(1)</script>",
+                "webhook_secret": "s3cr'et<i>",
+            });
+            let h = harness(hostile, true).await;
+            let (cookie, token) = binding(&h.state.local_jwt_key, "nonce-escape");
+            let uri = format!("/api/v1/github/callback?code=c1&state={token}");
+            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let page = text(response).await;
+            for raw in ["<script>", "<img", "<b>acme", "<i>"] {
+                assert!(!page.contains(raw), "{raw} reached the page unescaped");
+            }
+            assert!(page.contains("&lt;b&gt;acme&lt;/b&gt;"));
+            assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+            assert!(page.contains("s3cr&#39;et&lt;i&gt;"));
+            // The slug only reaches the install link percent-encoded.
+            assert!(page.contains("%3Cimg%20src%3Dx%3E"));
+        }
+
+        #[test]
+        fn state_token_is_bound_to_nonce_expiry_and_key() {
+            let key: &[u8] = b"engine-local-jwt-key";
+            let now: u64 = 1_800_000_000;
+            let token = app_manifest_state_token(key, "nonce", now + 600);
+            assert!(app_manifest_state_is_valid(key, &token, now));
+            // The nonce, the expiry, and the engine key are all covered by the signature.
+            assert!(!app_manifest_state_is_valid(
+                key,
+                &token.replacen("nonce", "other", 1),
+                now
+            ));
+            let longer = (now + 6_000).to_string();
+            let extended = token.replacen(&(now + 600).to_string(), &longer, 1);
+            assert!(!app_manifest_state_is_valid(key, &extended, now));
+            assert!(!app_manifest_state_is_valid(
+                b"another-engine-key",
+                &token,
+                now
+            ));
+            // Expired from the expiry second onward.
+            assert!(!app_manifest_state_is_valid(key, &token, now + 600));
+        }
+
+        #[tokio::test]
+        async fn callback_without_a_matching_state_never_reaches_github() {
+            let h = harness(conversion_response("acme", "s"), true).await;
+            let key = &h.state.local_jwt_key;
+            let (cookie, token) = binding(key, "nonce-good");
+            let (_, other) = binding(key, "nonce-other");
+            let expiry = unix_now_secs() + 600;
+            let forged = app_manifest_state_token(b"not-this-engine", "nonce-good", expiry);
+            let refused: [(String, Option<String>); 6] = [
+                ("/api/v1/github/callback?code=c1".to_owned(), None),
+                (
+                    format!("/api/v1/github/callback?code=c1&state={token}"),
+                    None,
+                ),
+                (
+                    "/api/v1/github/callback?code=c1".to_owned(),
+                    Some(cookie.clone()),
+                ),
+                (
+                    format!("/api/v1/github/callback?code=c1&state={other}"),
+                    Some(cookie.clone()),
+                ),
+                (
+                    format!("/api/v1/github/callback?code=c1&state={forged}"),
+                    Some(format!("preloop_app_manifest_state={forged}")),
+                ),
+                (
+                    format!("/api/v1/github/callback?code=c1&state={token}"),
+                    Some(format!("{cookie}; {cookie}")),
+                ),
+            ];
+            for (uri, cookie_header) in &refused {
+                let response = get(&h.app, uri, cookie_header.as_deref(), None).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            }
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "no refused callback may reach GitHub"
+            );
+        }
+
+        #[tokio::test]
+        async fn expired_state_is_refused_even_when_signed_and_echoed() {
+            let h = harness(conversion_response("acme", "s"), true).await;
+            let expired = app_manifest_state_token(
+                &h.state.local_jwt_key,
+                "nonce-old",
+                unix_now_secs().saturating_sub(1),
+            );
+            let cookie = format!("preloop_app_manifest_state={expired}");
+            let uri = format!("/api/v1/github/callback?code=c1&state={expired}");
+            let response = get(&h.app, &uri, Some(cookie.as_str()), None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "an expired state must not reach GitHub"
+            );
+        }
+
+        /// A malformed query gets the generic refusal — never an extractor
+        /// rejection — and never reaches GitHub.
+        #[tokio::test]
+        async fn malformed_query_gets_the_generic_refusal() {
+            let h = harness(conversion_response("acme", "s"), true).await;
+            let response = get(
+                &h.app,
+                "/api/v1/github/callback?code=c1&code=c2&state=x",
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()["cache-control"].to_str().unwrap(),
+                "no-store"
+            );
+            assert!(text(response).await.contains("Registration not accepted"));
+            assert!(
+                upstream(&h.requests).is_empty(),
+                "a malformed query must not reach GitHub"
+            );
+        }
     }
 }

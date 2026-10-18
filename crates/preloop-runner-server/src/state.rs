@@ -1103,6 +1103,9 @@ pub struct AppState {
     /// (`PRELOOP_GITHUB_APP_DEFAULT_EVENTS`, default
     /// `push,pull_request,check_run`).
     pub manifest_default_events: Vec<String>,
+    /// Whether the App-manifest registration routes are served, resolved at
+    /// startup (`PRELOOP_ENABLE_APP_REGISTRATION`, off by default).
+    pub app_registration_enabled: bool,
     /// Webhook delivery-watchdog tuning, resolved at startup.
     pub webhook_watchdog: WebhookWatchdogConfig,
     /// In-place re-run hold for the history archiver, resolved at startup
@@ -1766,6 +1769,7 @@ impl AppState {
             manifest_default_events: crate::github::manifest_default_events(
                 startup.github_app_default_events.as_deref(),
             ),
+            app_registration_enabled: startup.github_app_registration.unwrap_or(false),
             webhook_watchdog: WebhookWatchdogConfig {
                 enabled: startup.webhook_watchdog_enabled.unwrap_or(true),
                 interval_secs: startup.webhook_watchdog_interval_secs.unwrap_or(300),

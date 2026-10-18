@@ -1665,8 +1665,11 @@ async fn github_app_manifest_registration_flow() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // The manifest-conversion flow talks to the mock GitHub API above.
-    let startup = stub_startup(Some(&format!("http://127.0.0.1:{port}")), None);
+    // The manifest-conversion flow talks to the mock GitHub API above, and the
+    // registration routes are served only when the flag is on — both typed
+    // startup values (the removed test set them in the process environment).
+    let mut startup = stub_startup(Some(&format!("http://127.0.0.1:{port}")), None);
+    startup.github_app_registration = Some(true);
 
     let state = AppState::new(temp.path().to_path_buf(), startup)
         .await
@@ -4292,14 +4295,15 @@ async fn minting_broker(temp: &tempfile::TempDir) -> MintingBroker {
     tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
 
     let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
-    let mut state = AppState::new_for_tests(temp.path().to_path_buf())
-        .await
-        .unwrap();
-    state.github_urls = crate::state::GitHubUrls {
-        server_url: api_base.clone(),
-        api_url: api_base.clone(),
-        graphql_url: api_base,
-    };
+    // The stub's base rides the typed startup, the way the removed
+    // `PRELOOP_GITHUB_API_URL` override used to: the claim path mints against
+    // the startup-resolved request base, and `github_urls` follows it.
+    let mut state = AppState::new(
+        temp.path().to_path_buf(),
+        stub_startup(Some(api_base.as_str()), None),
+    )
+    .await
+    .unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
         private_key,
