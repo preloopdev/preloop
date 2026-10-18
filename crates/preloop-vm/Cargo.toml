@@ -25,3 +25,11 @@ serde_json = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+
+# Declared although the env-guard test helpers that used it are gone: dropping
+# a dependency rewrites `Cargo.lock`, and the supply-chain isolation rule keeps
+# lockfile changes in their own PR (AGENTS.md, "Supply-chain policy
+# isolation"). The removal ships separately — see the
+# `deps/drop-unused-libc-and-parking-lot` follow-up.
+[dev-dependencies]
+parking_lot.workspace = true

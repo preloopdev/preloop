@@ -4857,15 +4857,9 @@ mod tests {
     /// actionable message rather than smolvm's bare `EINVAL`.
     #[cfg(unix)]
     #[tokio::test]
-    // The PRELOOP_HOME guard must stay held across the awaits: `create` and
-    // `start` resolve the runtime environment through `effective_preloop_home`.
-    // Sync locking across awaits is the established pattern for the
-    // env-mutating suite.
-    #[allow(clippy::await_holding_lock)]
     async fn start_failure_with_the_irq_signature_becomes_the_dedicated_variant() {
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
+        let paths = scratch_paths(home.path());
         let scratch = tempfile::tempdir().expect("scratch");
         // The failure text lives in a file: it carries quotes of its own, so
         // it cannot be inlined into the fake's shell script safely.
@@ -4886,7 +4880,7 @@ mod tests {
                 failure = failure.display()
             ),
         );
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let bundle = scratch.path().join("bundle");
         let control = scratch.path().join("control");
         for dir in [&bundle, &control] {
@@ -4975,11 +4969,9 @@ mod tests {
     /// held-disk/corrupt-image diagnosis is untouched.
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn start_failure_without_the_signature_keeps_its_command_error() {
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
+        let paths = scratch_paths(home.path());
         let scratch = tempfile::tempdir().expect("scratch");
         let held_disk = scratch.path().join("held-disk.txt");
         std::fs::write(
@@ -5005,7 +4997,7 @@ mod tests {
                 held_disk = held_disk.display()
             ),
         );
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let error = provider
             .start(&MachineName::new("runner-0").unwrap())
             .await
@@ -5031,11 +5023,9 @@ mod tests {
     /// shutdown; it boots the same launcher and must classify identically.
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn start_forkable_failures_are_classified_too() {
-        let _home_guard = PRELOOP_HOME_LOCK.lock();
         let home = tempfile::tempdir().expect("home");
-        let _home = PreloopHomeGuard::set(home.path());
+        let paths = scratch_paths(home.path());
         let scratch = tempfile::tempdir().expect("scratch");
         let binary = fake_smolvm(
             scratch.path(),
@@ -5046,7 +5036,7 @@ mod tests {
              echo 'libkrun detail: build microVM: no more IRQs are available' >&2\n\
              exit 1\n",
         );
-        let provider = super::SmolVmProvider::new(&binary);
+        let provider = super::SmolVmProvider::new(&binary, paths);
         let error = provider
             .start_forkable(&MachineName::new("preloop-runner-golden").unwrap())
             .await

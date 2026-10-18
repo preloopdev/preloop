@@ -46,6 +46,12 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 tokio-tungstenite = { workspace = true }
+# Declared although the raw `libc` calls this crate used are gone: dropping a
+# dependency rewrites `Cargo.lock`, and the supply-chain isolation rule keeps
+# lockfile changes in their own PR (AGENTS.md, "Supply-chain policy
+# isolation"). The removal ships separately — see the
+# `deps/drop-unused-libc-and-parking-lot` follow-up.
+libc = "0.2"
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }
 self-replace = { workspace = true }
 semver = { workspace = true }
