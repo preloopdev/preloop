@@ -11,24 +11,26 @@ use std::path::Path;
 
 /// Which control plane the runner registered against.
 ///
-/// GitHub-operated endpoints hand the runner a real GitHub credential in the
+/// A GitHub-operated endpoint hands the runner a real GitHub credential in the
 /// job's `system.github.token` variable, so the worker may project it onto
 /// `github.token`/`GITHUB_TOKEN` exactly like the official runner
-/// (`ExecutionContext.InitializeJob`). A preloop engine puts its job-scoped
-/// runtime credential in that same slot when no GitHub App token was minted —
-/// a dead credential at api.github.com and a control-plane secret workflow
-/// code must not see — so engine registrations keep `system.github.token`
-/// out of the step surface.
+/// (`ExecutionContext.InitializeJob`). On a preloop engine that variable is the
+/// control plane's own slot: the claim writes the GitHub credential it minted
+/// there and leaves it empty when it has none, and the job-scoped runtime
+/// credential is a control-plane credential workflow code must not see. So
+/// engine registrations keep `system.github.token` off the step surface and
+/// read the `github.token` context the claim patches instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ControlPlane {
-    /// Registered against a preloop engine (or anything that is not a
-    /// GitHub-operated endpoint). Fails closed: `system.github.token` is
-    /// treated as a control-plane credential and never exported.
+    /// Registered against a preloop engine (or anything that is not a URL
+    /// `register_runner` registers against GitHub). Fails closed:
+    /// `system.github.token` is treated as a control-plane credential and
+    /// never exported.
     #[default]
     Engine,
-    /// Registered against github.com (or a `*.ghe.com` managed enterprise
-    /// endpoint): `system.github.token` is a real GitHub credential.
+    /// Registered against github.com: `system.github.token` is a real GitHub
+    /// credential.
     GitHub,
 }
 
@@ -48,16 +50,24 @@ impl<'de> Deserialize<'de> for ControlPlane {
     }
 }
 
-/// Classify the `--url` passed to `configure` into a [`ControlPlane`].
+/// Classify the URL a runner registered with into a [`ControlPlane`].
 ///
 /// `register_runner` routes `github.com` URLs to `api.github.com` and
 /// everything else to the server-relative `/api/v3/` registration path; that
-/// second branch covers both self-hosted GHES and preloop engines, which are
-/// indistinguishable by URL shape. Classification therefore fails closed:
-/// only hosts GitHub itself operates — `github.com`/`api.github.com` and
-/// managed `*.ghe.com` enterprises — map to `GitHub`; any other host,
-/// including a self-hosted GHES, maps to `Engine` and keeps the engine-JWT
-/// fence. Unparseable URLs are `Engine` for the same reason.
+/// second branch covers self-hosted GHES, managed `*.ghe.com` enterprises and
+/// preloop engines, which are indistinguishable by URL shape — and preloop
+/// implements registration routing for none of them. Classification therefore
+/// fails closed: only hosts under `github.com`, the one URL shape
+/// `register_runner` actually registers against GitHub, map to `GitHub`; every
+/// other host, including self-hosted GHES and `*.ghe.com` (whose enterprise
+/// API host preloop does not route to), maps to `Engine` and keeps the
+/// control-plane fence. Unparseable URLs are `Engine` for the same reason.
+///
+/// `register_runner` matches hosts with a `contains("github.com")` substring
+/// test, so a host like `github.com.example.invalid` is registered against
+/// GitHub's API while this classification stays `Engine`; the disagreement is
+/// deliberately resolved in the closed direction, never by exporting a
+/// variable a control plane owns.
 pub fn control_plane_for_url(url: &str) -> ControlPlane {
     let host = reqwest::Url::parse(url)
         .ok()
@@ -68,7 +78,7 @@ pub fn control_plane_for_url(url: &str) -> ControlPlane {
         // they can never be github.com.
         None => return ControlPlane::Engine,
     };
-    if host == "github.com" || host.ends_with(".github.com") || host.ends_with(".ghe.com") {
+    if host == "github.com" || host.ends_with(".github.com") {
         ControlPlane::GitHub
     } else {
         ControlPlane::Engine
@@ -119,12 +129,27 @@ pub struct RunnerSettings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub use_runner_admin_flow: bool,
     /// preloop extension (not an official `.runner` field): which control
-    /// plane this runner registered against. Recorded at configure from the
-    /// `--url` host; defaults to `engine` for `.runner` files written before
-    /// the field existed and for unknown values, so a credential the engine
-    /// minted is never mistaken for a GitHub one.
-    #[serde(default)]
-    pub control_plane: ControlPlane,
+    /// plane this runner registered against, recorded at configure from the
+    /// `--url` host. `None` in `.runner` files written before the field
+    /// existed, and for a value this build does not recognise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<ControlPlane>,
+}
+
+impl RunnerSettings {
+    /// The plane this runner registered against: the recorded value, or — for
+    /// a `.runner` file that predates the field — the class of the
+    /// registration URL the file already carries.
+    ///
+    /// The inference is the classification `configure` would have recorded for
+    /// that same URL, so an upgraded github.com runner keeps its GitHub token
+    /// surface without re-registering, while an engine (or a host preloop does
+    /// not register against GitHub) stays fenced. A recorded but unrecognised
+    /// value deserialised to `Engine` and is never widened here.
+    pub fn control_plane(&self) -> ControlPlane {
+        self.control_plane
+            .unwrap_or_else(|| control_plane_for_url(&self.git_hub_url))
+    }
 }
 
 fn default_true() -> bool {
@@ -444,7 +469,7 @@ mod tests {
             skip_session_recover: false,
             monitor_socket_address: None,
             use_runner_admin_flow: false,
-            control_plane: ControlPlane::Engine,
+            control_plane: Some(ControlPlane::Engine),
         };
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".runner");
@@ -506,7 +531,7 @@ mod tests {
                 skip_session_recover: false,
                 monitor_socket_address: None,
                 use_runner_admin_flow: false,
-                control_plane: ControlPlane::Engine,
+                control_plane: Some(ControlPlane::Engine),
             },
             credentials: CredentialData {
                 scheme: "OAuth".to_string(),
@@ -593,7 +618,7 @@ mod tests {
             skip_session_recover: true,
             monitor_socket_address: Some("/tmp/runner-monitor.sock".to_string()),
             use_runner_admin_flow: true,
-            control_plane: ControlPlane::GitHub,
+            control_plane: Some(ControlPlane::GitHub),
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let loaded: RunnerSettings = serde_json::from_str(&json).unwrap();
@@ -636,7 +661,7 @@ mod tests {
             skip_session_recover: false,
             monitor_socket_address: None,
             use_runner_admin_flow: false,
-            control_plane: ControlPlane::Engine,
+            control_plane: Some(ControlPlane::Engine),
         };
         let json = serde_json::to_string(&settings).unwrap();
         // Official.runner uses camelCase
@@ -652,7 +677,8 @@ mod tests {
 
     #[test]
     fn control_plane_classifies_configure_url() {
-        // github.com and managed `*.ghe.com` enterprises are GitHub-operated.
+        // Only hosts under github.com are GitHub's, because that is the one
+        // URL shape `register_runner` registers against GitHub.
         assert_eq!(
             control_plane_for_url("https://github.com/owner/repo"),
             ControlPlane::GitHub
@@ -661,25 +687,26 @@ mod tests {
             control_plane_for_url("https://api.github.com"),
             ControlPlane::GitHub
         );
-        assert_eq!(
-            control_plane_for_url("https://acme.ghe.com/org/repo"),
-            ControlPlane::GitHub
-        );
         // Host matching is case-insensitive and tolerates a trailing dot.
         assert_eq!(
             control_plane_for_url("https://GitHub.COM/owner/repo"),
             ControlPlane::GitHub
         );
 
-        // Everything else fails closed: engine URLs, self-hosted GHES
-        // (indistinguishable from an engine by URL alone), and hosts that
-        // merely contain "github.com" as a substring.
+        // Everything else fails closed: engine URLs, self-hosted GHES and
+        // managed `*.ghe.com` (their enterprise API host is not a
+        // registration route preloop implements), and hosts that merely
+        // contain "github.com" as a substring.
         assert_eq!(
             control_plane_for_url("https://ci.internal.example"),
             ControlPlane::Engine
         );
         assert_eq!(
             control_plane_for_url("http://127.0.0.1:9191"),
+            ControlPlane::Engine
+        );
+        assert_eq!(
+            control_plane_for_url("https://acme.ghe.com/org/repo"),
             ControlPlane::Engine
         );
         assert_eq!(
@@ -698,44 +725,80 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_defaults_to_engine_for_old_runner_files() {
-        // `.runner` written before `controlPlane` existed.
-        let json = r#"{
-            "agentId": 1,
-            "agentName": "test",
-            "poolId": 1,
-            "serverUrl": "https://example.com",
-            "gitHubUrl": "https://github.com/t/r",
-            "workFolder": "_work"
-        }"#;
-        let settings: RunnerSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.control_plane, ControlPlane::Engine);
+    fn control_plane_migrates_old_runner_files_from_their_url() {
+        // `.runner` written before `controlPlane` existed: the registration
+        // URL it already carries decides, so an upgraded github.com runner
+        // keeps its token surface without re-registering.
+        let legacy = |git_hub_url: &str| {
+            let json = format!(
+                r#"{{
+                    "agentId": 1,
+                    "agentName": "test",
+                    "poolId": 1,
+                    "serverUrl": "https://example.com",
+                    "gitHubUrl": "{git_hub_url}",
+                    "workFolder": "_work"
+                }}"#
+            );
+            serde_json::from_str::<RunnerSettings>(&json).unwrap()
+        };
+        assert_eq!(
+            legacy("https://github.com/t/r").control_plane(),
+            ControlPlane::GitHub
+        );
+        assert_eq!(
+            legacy("https://ci.internal.example").control_plane(),
+            ControlPlane::Engine
+        );
+        assert_eq!(
+            legacy("https://ghe.corp.example/owner/repo").control_plane(),
+            ControlPlane::Engine
+        );
 
-        // An unknown value fails closed too, never silently trusts.
-        let json = r#"{
-            "agentId": 1,
-            "agentName": "test",
-            "poolId": 1,
-            "serverUrl": "https://example.com",
-            "gitHubUrl": "https://github.com/t/r",
-            "workFolder": "_work",
-            "controlPlane": "surprise"
-        }"#;
-        let settings: RunnerSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.control_plane, ControlPlane::Engine);
+        // A recorded value wins over the URL, and an unrecognised one fails
+        // closed rather than being re-derived from the URL.
+        let recorded = |control_plane: &str| {
+            let json = format!(
+                r#"{{
+                    "agentId": 1,
+                    "agentName": "test",
+                    "poolId": 1,
+                    "serverUrl": "https://example.com",
+                    "gitHubUrl": "https://github.com/t/r",
+                    "workFolder": "_work",
+                    "controlPlane": "{control_plane}"
+                }}"#
+            );
+            serde_json::from_str::<RunnerSettings>(&json).unwrap()
+        };
+        assert_eq!(recorded("github").control_plane(), ControlPlane::GitHub);
+        assert_eq!(recorded("engine").control_plane(), ControlPlane::Engine);
+        assert_eq!(recorded("surprise").control_plane(), ControlPlane::Engine);
 
-        // And the explicit github value parses.
-        let json = r#"{
-            "agentId": 1,
-            "agentName": "test",
-            "poolId": 1,
-            "serverUrl": "https://example.com",
-            "gitHubUrl": "https://github.com/t/r",
-            "workFolder": "_work",
-            "controlPlane": "github"
-        }"#;
-        let settings: RunnerSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.control_plane, ControlPlane::GitHub);
+        // Configure always records the plane explicitly.
+        let settings = RunnerSettings {
+            agent_id: 1,
+            agent_name: "test".to_string(),
+            pool_id: 1,
+            pool_name: "Default".to_string(),
+            server_url: "https://example.com".to_string(),
+            git_hub_url: "https://github.com/t/r".to_string(),
+            work_folder: "_work".to_string(),
+            is_hosted: false,
+            runner_group_id: None,
+            runner_group_name: None,
+            ephemeral: false,
+            is_hosted_server: false,
+            use_v2_flow: true,
+            server_url_v2: None,
+            disable_update: false,
+            skip_session_recover: false,
+            monitor_socket_address: None,
+            use_runner_admin_flow: false,
+            control_plane: Some(ControlPlane::Engine),
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"controlPlane\":\"engine\""));
     }
 
     #[test]
@@ -845,7 +908,7 @@ mod tests {
                 skip_session_recover: false,
                 monitor_socket_address: None,
                 use_runner_admin_flow: false,
-                control_plane: ControlPlane::Engine,
+                control_plane: Some(ControlPlane::Engine),
             },
             credentials: CredentialData {
                 scheme: "OAuth".to_string(),
@@ -903,7 +966,7 @@ mod tests {
                 skip_session_recover: false,
                 monitor_socket_address: None,
                 use_runner_admin_flow: false,
-                control_plane: ControlPlane::Engine,
+                control_plane: Some(ControlPlane::Engine),
             },
             credentials: CredentialData {
                 scheme: "OAuth".to_string(),

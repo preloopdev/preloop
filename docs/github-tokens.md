@@ -32,6 +32,21 @@ service credentials. Acquire-time job `env:` values and reusable-workflow
 checkout intentionally replaces its default `token` input with the local
 engine credential; that transport credential is not the job's GitHub token.
 
+A runner can also be registered straight against github.com
+(`preloop-runner configure --url https://github.com/...`) rather than against a
+Preloop engine. There GitHub's job message carries the credential in the
+`system.github.token` variable and never patches the context, so the runner
+resolves `github.token` and `GITHUB_TOKEN` from that variable — or its
+`github_token` alias — exactly as the official runner's
+`ExecutionContext.InitializeJob` does. `configure` records the registration's
+control plane in `.runner` (`controlPlane`), and a `.runner` written before that
+field existed is classified from the `gitHubUrl` it already carries. On an
+engine registration the variable is left unread: it is the control plane's own
+slot, filled with the credential the claim minted, which the runner already
+takes from the `github.token` context. On both planes a workflow's own
+`env: GITHUB_TOKEN` reaches the step process but never replaces
+`${{ github.token }}`, which is what the official runner does too.
+
 The **local HMAC JWT** is signed with a per-instance key persisted at
 `<state-dir>/hmac-key.bin` and carries `sub: preloop-job-<job-id>` plus
 `scp: Actions.Results:<plan-id>:<job-id>`. It authenticates against *the Preloop

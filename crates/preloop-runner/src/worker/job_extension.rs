@@ -217,7 +217,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
     // job's `system.github.token` variable is a usable GitHub credential —
     // CWD is the runner root, where `.runner` lives (see `RUNNER_NAME`).
     let control_plane = crate::settings::RunnerConfig::load(Path::new("."))
-        .map(|config| config.settings.control_plane)
+        .map(|config| config.settings.control_plane())
         .unwrap_or_default();
     inject_github_env_with_plane(job, msg, control_plane);
 }
@@ -298,17 +298,17 @@ fn inject_github_env_with_plane(
             // `githubContext["token"] = Variables.Get("system.github.token")`,
             // with `contextData` overlaid on top). The variable is only a
             // usable GitHub credential when the control plane is GitHub: on a
-            // preloop engine that slot can carry the job-scoped runtime JWT,
-            // a dead credential at api.github.com ("Bad credentials") and a
-            // control-plane secret workflow code must not receive. Engine
-            // registrations keep reading `github.token` (the context slot the
-            // engine patches with a minted App token) and leave the variable
-            // alone.
+            // preloop engine the control plane owns that slot — the claim
+            // fills it with the credential it minted (and patches the same
+            // value into the `github.token` context read here) and leaves it
+            // empty when it has none, so a step must never be handed a
+            // control-plane credential in its place. Engine registrations
+            // therefore export the context token alone.
             let context_token = str_from_json(&github, "token");
             if context_token.is_empty() && control_plane == crate::settings::ControlPlane::GitHub {
-                // `github_token` mirrors the same value; it covers messages
-                // whose `system.*` spelling differs or whose producer only
-                // fills the canonical secret variable.
+                // `github_token` is the same credential under the canonical
+                // secret's name; either alias may be the populated one, so
+                // take the first non-empty value.
                 variable_value(msg, "system.github.token")
                     .or_else(|| variable_value(msg, "github_token"))
                     .unwrap_or_default()
@@ -1173,12 +1173,14 @@ pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
     }
 }
 
-/// Read the string value of one job-message `variables` entry.
+/// Read the value of one job-message `variables` entry.
 ///
 /// Case-insensitive key match, mirroring `JobContext::get_variable`: the wire
 /// is camelCase-ish (`system.github.token`) while producers differ in
-/// spelling. Returns `None` when the variable is absent or its `value` is not
-/// a string.
+/// spelling. Returns `None` when the variable is absent, its `value` is not a
+/// string, or the string is empty: the job builder writes empty `isSecret`
+/// slots for both token aliases before the claim fills them, and an empty slot
+/// must not shadow the populated alias it is paired with.
 fn variable_value(msg: &serde_json::Value, key: &str) -> Option<String> {
     let variables = msg.get("variables")?.as_object()?;
     let key_lower = key.to_lowercase();
@@ -1187,6 +1189,7 @@ fn variable_value(msg: &serde_json::Value, key: &str) -> Option<String> {
             return entry
                 .get("value")
                 .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty())
                 .map(str::to_owned);
         }
     }

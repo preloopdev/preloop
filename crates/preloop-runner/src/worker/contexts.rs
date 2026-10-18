@@ -152,11 +152,16 @@ impl JobContext {
                     masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val));
                     // actions/runner `ExecutionContext.InitializeJob` also
-                    // registers `base64("x-access-token:{token}")` for
-                    // `system.github.token`: that is the git extraheader
+                    // registers `base64("x-access-token:{token}")` for the
+                    // job's GitHub token: that is the git extraheader
                     // actions/checkout persists, and it would otherwise leak
                     // verbatim in a log that echoes remote/auth config.
-                    if k == "system.github.token" {
+                    // Resolution accepts `system.github.token` and its
+                    // `github_token` alias case-insensitively, so the derived
+                    // mask has to cover every spelling it can export.
+                    if k.eq_ignore_ascii_case("system.github.token")
+                        || k.eq_ignore_ascii_case("github_token")
+                    {
                         masks.insert(
                             base64::engine::general_purpose::STANDARD
                                 .encode(format!("x-access-token:{val}")),
@@ -257,6 +262,17 @@ impl JobContext {
             }
         }
         None
+    }
+
+    /// The first non-empty value among `keys` (case-insensitive), if any.
+    ///
+    /// "Present but empty" is not a credential: the job builder writes empty
+    /// `isSecret` slots for `github_token` and `system.github.token` before the
+    /// claim fills them, so treating such a slot as authoritative would shadow
+    /// the token a sibling alias carries in the same message.
+    pub fn first_nonempty_variable(&self, keys: &[&str]) -> Option<&str> {
+        keys.iter()
+            .find_map(|key| self.get_variable(key).filter(|value| !value.is_empty()))
     }
 
     /// Get a variable parsed as boolean. Does not throw if not found or null.
@@ -422,19 +438,24 @@ impl JobContext {
                 // `system.github.token` variable before overlaying
                 // `contextData.github` (`ExecutionContext.InitializeJob`).
                 // That variable is only a GitHub credential when the control
-                // plane is GitHub; on a preloop engine it can be the job's
-                // runtime credential, which must stay off the step surface.
+                // plane is GitHub; on a preloop engine it is the control
+                // plane's own slot, which the claim fills with the credential
+                // it minted (and patches into the context read above) or
+                // leaves empty.
+                //
+                // `job.env` is deliberately not consulted: a workflow- or
+                // job-level `env: GITHUB_TOKEN` (and a `GITHUB_ENV` write)
+                // replaces the variable the step process sees, but it is not
+                // the job's GitHub credential, and upstream never reads it
+                // back into the context.
                 let variable_token = if self.control_plane == crate::settings::ControlPlane::GitHub
                 {
-                    self.get_variable("system.github.token")
-                        .or_else(|| self.get_variable("github_token"))
+                    self.first_nonempty_variable(&["system.github.token", "github_token"])
                         .unwrap_or("")
                 } else {
                     ""
                 };
-                if let Some(token) = self.env.get("GITHUB_TOKEN") {
-                    obj.insert("token".to_string(), serde_json::json!(token));
-                } else if !variable_token.is_empty() {
+                if !variable_token.is_empty() {
                     obj.insert("token".to_string(), serde_json::json!(variable_token));
                 } else if !obj.contains_key("token") {
                     // `StringContextData(null)` in the official runner

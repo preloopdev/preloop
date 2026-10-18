@@ -1510,7 +1510,10 @@ fn test_golden_acquirejob_payloads_parsing() {
             .unwrap_or("")
             .to_owned();
 
-        // Engine registration: keep the fence.
+        // Engine registration: keep the fence. This branch is also the
+        // before/after control for #626 — the variable is exactly what the
+        // pre-fix runner never read, so `GITHUB_TOKEN` stayed unset and
+        // `github.token` resolved empty from this same golden message.
         let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
         assert_eq!(
             token, None,
@@ -1943,6 +1946,89 @@ fn unresolved_job_env_token_evaluates_to_the_minted_token_at_step_time() {
                 .expect("job env value evaluates"),
             CLAIM_MINTED_TOKEN,
             "job env `{name}` must evaluate to the claim-minted token"
+        );
+    }
+}
+
+/// A workflow- or job-level `env: GITHUB_TOKEN` reaches the step process as
+/// that override, but never becomes `${{ github.token }}`: the context comes
+/// from `system.github.token` (or the `github_token` alias) alone, exactly as
+/// `ExecutionContext.InitializeJob` builds it.
+#[test]
+fn job_env_github_token_override_does_not_replace_the_github_token_context() {
+    let mut message = golden_claimed_message("13-composite-action", CLAIM_MINTED_TOKEN);
+    message["environmentVariables"] = serde_json::json!([{
+        "type": 2,
+        "map": [{
+            "Key": {"type": 0, "lit": "GITHUB_TOKEN"},
+            "Value": {"type": 0, "lit": "ghp_job_env"}
+        }]
+    }]);
+    let mut job = claimed_job(&message);
+    job.workspace = Some("_work/repo/repo".into());
+    inject_github_env_with_plane(&mut job, &message, crate::settings::ControlPlane::GitHub);
+
+    assert_eq!(
+        job.env.get("GITHUB_TOKEN").map(String::as_str),
+        Some("ghp_job_env"),
+        "the workflow's `env:` override is what the step process reads"
+    );
+    let ctx = job.build_expression_context();
+    for expression in ["github.token", "secrets.GITHUB_TOKEN"] {
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(expression, &ctx)
+                .expect("expression evaluates")
+                .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`{expression}` must stay the job credential, not the env override"
+        );
+    }
+}
+
+/// The builder writes empty `isSecret` slots for both token aliases before the
+/// claim fills them; an empty `system.github.token` must not shadow the
+/// populated `github_token` it is paired with (nor the other way round).
+#[test]
+fn empty_system_token_slot_falls_back_to_the_github_token_alias() {
+    let token_variables = |system: &str, alias: &str| {
+        serde_json::json!({
+            "system.github.token": {"value": system, "isSecret": true},
+            "github_token": {"value": alias, "isSecret": true}
+        })
+    };
+    for (system, alias) in [("", CLAIM_MINTED_TOKEN), (CLAIM_MINTED_TOKEN, "")] {
+        // The claim patches the context token too; build the message with no
+        // context token at all so only the variable aliases can supply one.
+        let mut message = golden_claimed_message("13-composite-action", "");
+        message["variables"] = token_variables(system, alias);
+
+        let mut job = claimed_job(&message);
+        job.workspace = Some("_work/repo/repo".into());
+        inject_github_env_with_plane(&mut job, &message, crate::settings::ControlPlane::GitHub);
+        assert_eq!(
+            job.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some(CLAIM_MINTED_TOKEN),
+            "the populated alias must be exported (system={system:?})"
+        );
+        assert_eq!(
+            preloop_gha_expressions::eval_expression(
+                "github.token",
+                &job.build_expression_context()
+            )
+            .expect("expression evaluates")
+            .as_str(),
+            Some(CLAIM_MINTED_TOKEN),
+            "`github.token` must read the populated alias (system={system:?})"
+        );
+
+        // Engine registration: the same variables stay off the step surface.
+        let mut engine_job = claimed_job(&message);
+        engine_job.workspace = Some("_work/repo/repo".into());
+        inject_github_env(&mut engine_job, &message);
+        assert_eq!(
+            engine_job.env.get("GITHUB_TOKEN").map(String::as_str),
+            None,
+            "an engine registration must not export the token variable"
         );
     }
 }
