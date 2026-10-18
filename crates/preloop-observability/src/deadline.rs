@@ -13,6 +13,10 @@
 //! - Child output is drained concurrently with the wait. A child that fills a
 //!   64 KiB pipe buffer blocks on `write` and looks exactly like a hang, so a
 //!   naive wait would either time out spuriously or deadlock on the pipe.
+//!   Capture is unbounded by default; the `_capped` variants keep at most a
+//!   caller-supplied number of bytes per stream and discard the excess *while
+//!   still reading to EOF*, so a cap bounds memory without reintroducing the
+//!   deadlock.
 //! - Expiry kills the child, then reaps it under a short grace period. The
 //!   error names the caller's `what` and the deadline so an operator can tell
 //!   which dependency hung.
@@ -248,13 +252,26 @@ fn program_name(cmd: &Command) -> String {
     cmd.as_std().get_program().to_string_lossy().into_owned()
 }
 
-async fn read_pipe<R: AsyncRead + Unpin>(pipe: Option<R>) -> io::Result<Vec<u8>> {
+async fn read_pipe<R: AsyncRead + Unpin>(
+    pipe: Option<R>,
+    max_capture: usize,
+) -> io::Result<(Vec<u8>, bool)> {
     let Some(mut pipe) = pipe else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let mut captured = Vec::new();
-    pipe.read_to_end(&mut captured).await?;
-    Ok(captured)
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = pipe.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let keep = (max_capture - captured.len()).min(read);
+        captured.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok((captured, truncated))
 }
 
 /// Kill the child and reap it, but never block the caller past the grace
@@ -272,23 +289,33 @@ async fn wait_with_capture(
     started: Instant,
     what: &str,
     program: &str,
-) -> Result<Output, CommandError> {
+    max_capture: usize,
+) -> Result<(Output, bool), CommandError> {
     let remaining = deadline.saturating_sub(started.elapsed());
     let capture = async {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         // All four run concurrently: a child that fills one pipe while we wait
-        // on it can never be mistaken for a hang.
-        let (stdout, stderr, status) =
-            tokio::join!(read_pipe(stdout), read_pipe(stderr), child.wait(),);
-        let stdout = stdout.map_err(|source| CommandError::io(what, program, source))?;
-        let stderr = stderr.map_err(|source| CommandError::io(what, program, source))?;
+        // on it can never be mistaken for a hang. A capped drain still reads
+        // to EOF, discarding the excess, so the promise holds with a cap too.
+        let (stdout, stderr, status) = tokio::join!(
+            read_pipe(stdout, max_capture),
+            read_pipe(stderr, max_capture),
+            child.wait(),
+        );
+        let (stdout, stdout_truncated) =
+            stdout.map_err(|source| CommandError::io(what, program, source))?;
+        let (stderr, stderr_truncated) =
+            stderr.map_err(|source| CommandError::io(what, program, source))?;
         let status = status.map_err(|source| CommandError::io(what, program, source))?;
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
+        Ok((
+            Output {
+                status,
+                stdout,
+                stderr,
+            },
+            stdout_truncated || stderr_truncated,
+        ))
     };
     match tokio::time::timeout(remaining, capture).await {
         Ok(result) => result,
@@ -313,6 +340,10 @@ async fn wait_with_capture(
 /// output is returned even for a non-zero exit status; success is the
 /// caller's decision.
 ///
+/// Output is unbounded. Callers that must cap what a chatty child can make the
+/// engine buffer use [`run_command_capped`], which still drains the pipes to
+/// EOF and discards the excess.
+///
 /// # Example
 ///
 /// ```no_run
@@ -333,10 +364,39 @@ async fn wait_with_capture(
 /// # }
 /// ```
 pub async fn run_command(
-    mut cmd: Command,
+    cmd: Command,
     deadline: Duration,
     what: &str,
 ) -> Result<Output, CommandError> {
+    run_command_with_limit(cmd, deadline, what, usize::MAX)
+        .await
+        .map(|(output, _)| output)
+}
+
+/// As [`run_command`], with a cap on captured output.
+///
+/// At most `max_capture` bytes are kept per stream; the excess is discarded
+/// but **read**, so a child that out-writes the cap still reaches EOF instead
+/// of blocking on a full pipe. The returned flag is true when either stream
+/// was truncated, and the returned [`Output`] holds only the retained bytes.
+///
+/// The cap bounds engine memory, not the deadline: a child that writes forever
+/// is still killed when `deadline` expires.
+pub async fn run_command_capped(
+    cmd: Command,
+    deadline: Duration,
+    what: &str,
+    max_capture: usize,
+) -> Result<(Output, bool), CommandError> {
+    run_command_with_limit(cmd, deadline, what, max_capture).await
+}
+
+async fn run_command_with_limit(
+    mut cmd: Command,
+    deadline: Duration,
+    what: &str,
+    max_capture: usize,
+) -> Result<(Output, bool), CommandError> {
     let started = Instant::now();
     let program = program_name(&cmd);
     cmd.kill_on_drop(true);
@@ -346,7 +406,7 @@ pub async fn run_command(
     let child = cmd
         .spawn()
         .map_err(|source| CommandError::spawn(what, program.clone(), source))?;
-    wait_with_capture(child, deadline, started, what, &program).await
+    wait_with_capture(child, deadline, started, what, &program, max_capture).await
 }
 
 /// Run a command with bytes written to its stdin, bounded by `deadline`.
@@ -385,13 +445,13 @@ pub async fn run_command_with_stdin(
         };
         let (written, stdout, stderr, status) = tokio::join!(
             write,
-            read_pipe(child.stdout.take()),
-            read_pipe(child.stderr.take()),
+            read_pipe(child.stdout.take(), usize::MAX),
+            read_pipe(child.stderr.take(), usize::MAX),
             child.wait(),
         );
         written.map_err(|source| CommandError::io(what, &program, source))?;
-        let stdout = stdout.map_err(|source| CommandError::io(what, &program, source))?;
-        let stderr = stderr.map_err(|source| CommandError::io(what, &program, source))?;
+        let (stdout, _) = stdout.map_err(|source| CommandError::io(what, &program, source))?;
+        let (stderr, _) = stderr.map_err(|source| CommandError::io(what, &program, source))?;
         let status = status.map_err(|source| CommandError::io(what, &program, source))?;
         Ok(Output {
             status,
@@ -447,10 +507,17 @@ enum PipeKind {
     Stderr,
 }
 
+/// One captured stream: the retained bytes and whether the cap truncated it.
+type Captured = (Vec<u8>, bool);
+
+/// A finished capture from one reader thread, tagged with its stream.
+type ReaderMessage = (PipeKind, io::Result<Captured>);
+
 fn spawn_pipe_reader<R: io::Read + Send + 'static>(
     pipe: Option<R>,
     kind: PipeKind,
-    sender: std::sync::mpsc::Sender<(PipeKind, io::Result<Vec<u8>>)>,
+    sender: std::sync::mpsc::Sender<ReaderMessage>,
+    max_capture: usize,
 ) -> io::Result<()> {
     let Some(mut pipe) = pipe else {
         return Ok(());
@@ -462,7 +529,20 @@ fn spawn_pipe_reader<R: io::Read + Send + 'static>(
         })
         .spawn(move || {
             let mut captured = Vec::new();
-            let result = pipe.read_to_end(&mut captured).map(|_| captured);
+            let mut truncated = false;
+            let mut buffer = [0_u8; 8192];
+            let result = loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break Ok(()),
+                    Ok(read) => {
+                        let keep = (max_capture - captured.len()).min(read);
+                        captured.extend_from_slice(&buffer[..keep]);
+                        truncated |= keep < read;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+            .map(|()| (captured, truncated));
             // The receiver is gone only when the call already timed out; the
             // thread then exits at its next EOF and nothing is lost.
             let _ = sender.send((kind, result));
@@ -499,11 +579,29 @@ fn kill_and_reap_blocking(child: &mut std::process::Child) {
 /// the pipes and keeps them open after the direct child exits, the call fails
 /// rather than waiting on that descendant forever. Reader threads are detached
 /// on expiry and exit when the pipes finally close.
+///
+/// Output is unbounded; use [`run_command_blocking_capped`] to bound what a
+/// chatty child can make the engine buffer.
 pub fn run_command_blocking(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     deadline: Duration,
     what: &str,
 ) -> Result<Output, CommandError> {
+    run_command_blocking_capped(cmd, deadline, what, usize::MAX).map(|(output, _)| output)
+}
+
+/// As [`run_command_blocking`], with a cap on captured output.
+///
+/// At most `max_capture` bytes are kept per stream; the excess is discarded
+/// but **read**, so a child that out-writes the cap still reaches EOF instead
+/// of blocking on a full pipe. The returned flag is true when either stream
+/// was truncated, and the returned [`Output`] holds only the retained bytes.
+pub fn run_command_blocking_capped(
+    mut cmd: std::process::Command,
+    deadline: Duration,
+    what: &str,
+    max_capture: usize,
+) -> Result<(Output, bool), CommandError> {
     let started = Instant::now();
     let program = cmd.get_program().to_string_lossy().into_owned();
     cmd.stdin(Stdio::null());
@@ -515,8 +613,18 @@ pub fn run_command_blocking(
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let readers = (|| -> io::Result<()> {
-        spawn_pipe_reader(child.stdout.take(), PipeKind::Stdout, sender.clone())?;
-        spawn_pipe_reader(child.stderr.take(), PipeKind::Stderr, sender.clone())
+        spawn_pipe_reader(
+            child.stdout.take(),
+            PipeKind::Stdout,
+            sender.clone(),
+            max_capture,
+        )?;
+        spawn_pipe_reader(
+            child.stderr.take(),
+            PipeKind::Stderr,
+            sender.clone(),
+            max_capture,
+        )
     })();
     // Only the reader threads hold senders now; a disconnect means they are
     // gone, not that more output is coming.
@@ -582,17 +690,20 @@ pub fn run_command_blocking(
             }
         }
     }
-    let stdout = stdout
+    let (stdout, stdout_truncated) = stdout
         .expect("stdout is collected before the loop exits")
         .map_err(|source| CommandError::io(what, &program, source))?;
-    let stderr = stderr
+    let (stderr, stderr_truncated) = stderr
         .expect("stderr is collected before the loop exits")
         .map_err(|source| CommandError::io(what, &program, source))?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok((
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        stdout_truncated || stderr_truncated,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -861,6 +972,37 @@ mod tests {
         assert_eq!(output.stderr.len(), 524_288);
     }
 
+    /// A capped capture discards the excess but keeps reading, so the child
+    /// reaches EOF and exits instead of blocking on a full pipe.
+    #[tokio::test]
+    async fn capped_command_discards_the_excess_and_reports_truncation() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "head -c 524288 /dev/zero; head -c 524288 /dev/zero >&2",
+        ]);
+        let (output, truncated) =
+            run_command_capped(cmd, Duration::from_secs(10), "capped child", 1024)
+                .await
+                .unwrap();
+        assert!(output.status.success(), "the child must reach EOF");
+        assert!(truncated);
+        assert_eq!(output.stdout.len(), 1024);
+        assert_eq!(output.stderr.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn capped_command_keeps_small_output_and_clears_the_flag() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf small"]);
+        let (output, truncated) =
+            run_command_capped(cmd, Duration::from_secs(10), "small child", 1024)
+                .await
+                .unwrap();
+        assert!(!truncated);
+        assert_eq!(output.stdout, b"small");
+    }
+
     #[tokio::test]
     async fn command_with_stdin_writes_input_and_captures_output() {
         let mut cmd = Command::new("cat");
@@ -942,6 +1084,21 @@ mod tests {
         assert_eq!(output.status.code(), Some(4));
         assert_eq!(output.stdout.len(), 524_288);
         assert_eq!(output.stderr.len(), 524_288);
+    }
+
+    #[test]
+    fn blocking_capped_command_discards_the_excess() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "head -c 524288 /dev/zero; head -c 524288 /dev/zero >&2",
+        ]);
+        let (output, truncated) =
+            run_command_blocking_capped(cmd, Duration::from_secs(10), "sync capped", 1024).unwrap();
+        assert!(output.status.success(), "the child must reach EOF");
+        assert!(truncated);
+        assert_eq!(output.stdout.len(), 1024);
+        assert_eq!(output.stderr.len(), 1024);
     }
 
     #[tokio::test]
