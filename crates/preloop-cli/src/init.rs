@@ -1129,8 +1129,9 @@ impl Session {
 
     /// The stable-URL answer for an App flow: `--public-url`, else a usable
     /// `PRELOOP_PUBLIC_URL`, else one prompt on a terminal. The prompt takes a
-    /// URL directly, a detected tailnet name on Enter, or `-` to skip — and an
-    /// App created without a webhook never triggers on pushes or pull requests.
+    /// URL directly, a Funnel-published tailnet name on Enter, or `-` to skip
+    /// — and an App created without a webhook never triggers on pushes or pull
+    /// requests.
     fn public_url_answer(
         &mut self,
         flag: Option<&str>,
@@ -1166,36 +1167,19 @@ impl Session {
                 source: "skipped",
             });
         }
-        // A Tailscale host already has a stable HTTPS name (Funnel/Serve
-        // publish under it), so offer it instead of making the operator look
-        // one up. Detection is best effort: no tailscale, no suggestion — and
-        // whether Funnel is publishing it is asked separately, because a name
-        // GitHub cannot reach must not be offered as if it worked.
+        // A Tailscale host already has a stable HTTPS name, so offer it when
+        // Funnel publishes the webhook path there instead of making the
+        // operator look one up. Detection is best effort: no tailscale, no
+        // suggestion, and a tailnet-only name is shown as a hint Enter does not
+        // accept.
         let suggestion = detected_public_url();
         for line in public_url_help(suggestion.as_ref()) {
             self.note(&line);
         }
         loop {
             let answer = self.read_line(&public_url_prompt(suggestion.as_ref()))?;
-            match read_public_url(
-                &answer,
-                suggestion.as_ref().map(|detected| detected.url.as_str()),
-            ) {
+            match read_public_url(&answer, suggestion.as_ref()) {
                 UrlInput::Use { url, source } => {
-                    if source == "suggested"
-                        && suggestion
-                            .as_ref()
-                            .is_some_and(|detected| !detected.funnel_confirmed())
-                    {
-                        // Accepting the name is allowed — the operator may be
-                        // about to publish it — but the webhook is not live
-                        // until they do, and the wizard says so where the
-                        // acceptance happened.
-                        self.note(
-                            "the webhook stays silent until Tailscale Funnel publishes this URL \
-                             (the setup above)",
-                        );
-                    }
                     return Ok(PublicUrlAnswer {
                         url: Some(url),
                         source,
@@ -2363,17 +2347,55 @@ fn configure_only_hint(config_path: &Path, public_url: Option<&str>) -> Vec<Stri
 /// Why the stable-URL question is asked, and how to get one, in the wizard's
 /// own words. Whatever fronts the engine must publish *only*
 /// `/api/v1/github/webhooks`: the port also serves runner registration, which
-/// no tunnel should expose (docs/self-hosting.md, "Exposure options").
-const PUBLIC_URL_HELP: [&str; 8] = [
+/// no tunnel should expose (docs/self-hosting.md, "Exposure options"). The
+/// Funnel wording must not promise that mounting one path keeps the rest
+/// private — Funnel access applies to the whole host and port, so an earlier
+/// root mount would become public with it (tailscale/tailscale#10234).
+const PUBLIC_URL_HELP: [&str; 10] = [
     "PR status checks and push-triggered runs need GitHub to reach this engine at a stable",
     "HTTPS URL — only /api/v1/github/webhooks may be public, never the whole port (it also",
-    "serves runner registration). Tailscale Funnel, mounted at just that path:",
+    "serves runner registration). Funnel access applies to the whole host and port, not just",
+    "the mounted path, so use a dedicated hostname (or remove every other mount there) before",
+    "enabling it, then mount the webhook path:",
     "  tailscale funnel --set-path=/api/v1/github/webhooks --bg http://127.0.0.1:9090/api/v1/github/webhooks",
-    "(use your PRELOOP_LISTEN port in place of 9090)",
+    "(use your PRELOOP_LISTEN port in place of 9090; verify with `tailscale funnel status`)",
     "Alternatives: a Cloudflare *named* Tunnel (quick tunnels change on restart and break the",
     "App's webhook) behind a path-filtering proxy, or your own domain + reverse proxy — see",
     "docs/self-hosting.md, \"Exposure options\".",
 ];
+
+/// A stable HTTPS address detected on this host, and what Tailscale Funnel
+/// publishes at it. Only a host:port whose *only* public mount is the webhook
+/// path may be accepted: Funnel access applies to the whole host and port, so
+/// a name that is not Funnel-published is tailnet-only (GitHub cannot reach
+/// it), and a name that also publishes other paths would expose them with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlSuggestion {
+    url: String,
+    funnel: FunnelPublication,
+}
+
+/// What `tailscale funnel status --json` shows for this machine's HTTPS name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FunnelPublication {
+    /// The webhook path is published there and nothing else: reachable from
+    /// GitHub, and nothing beside it became public.
+    WebhookPathOnly,
+    /// The webhook path is published *and* so is everything else mounted on
+    /// that host:port — the paths, named, that the operator would be exposing.
+    WebhookPathAndOthers(Vec<String>),
+    /// Nothing is Funnel-published there: plain Serve only serves the tailnet,
+    /// which GitHub cannot reach.
+    NotPublished,
+}
+
+impl FunnelPublication {
+    /// Whether Enter may accept the name: GitHub can reach it, and the Funnel
+    /// turned no other mount on that host:port public with it.
+    fn accepts(&self) -> bool {
+        matches!(self, Self::WebhookPathOnly)
+    }
+}
 
 /// What one line at the URL prompt means.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2387,16 +2409,20 @@ enum UrlInput {
     Retry(String),
 }
 
-/// Read one answer to the URL question. Blank is the suggestion when there is
-/// one, and `-` skips in either case (webhooks off, said plainly).
-fn read_public_url(input: &str, suggestion: Option<&str>) -> UrlInput {
+/// Read one answer to the URL question. Blank accepts a suggestion only when
+/// Enter on it is safe (`FunnelPublication::accepts`): a tailnet-only name, or
+/// one whose Funnel publishes other mounts too, would otherwise point the
+/// App's webhook at an address GitHub cannot reach, and the pre-existing
+/// semantics (blank = skip) still hold for it. `-` skips either way (webhooks
+/// off, said plainly).
+fn read_public_url(input: &str, suggestion: Option<&UrlSuggestion>) -> UrlInput {
     if input.is_empty() {
         return match suggestion {
-            Some(url) => UrlInput::Use {
-                url: url.to_owned(),
+            Some(suggestion) if suggestion.funnel.accepts() => UrlInput::Use {
+                url: suggestion.url.clone(),
                 source: "suggested",
             },
-            None => UrlInput::Skip,
+            _ => UrlInput::Skip,
         };
     }
     if input == "-" {
@@ -2409,169 +2435,190 @@ fn read_public_url(input: &str, suggestion: Option<&str>) -> UrlInput {
         },
         Err(reason) => {
             let way_out = match suggestion {
-                Some(_) => "type \"-\" to leave webhooks off",
-                None => "leave it blank to skip",
+                Some(suggestion) if suggestion.funnel.accepts() => {
+                    "type \"-\" to leave webhooks off"
+                }
+                _ => "leave it blank to skip",
             };
             UrlInput::Retry(format!("{reason}; enter an https:// address, or {way_out}"))
         }
     }
 }
 
-/// The prompt for the URL question. A detected URL is one keystroke away;
-/// without one the only safe default is to skip, so the wizard asks for a URL
-/// rather than suggesting an address GitHub could not reach. The suggestion
-/// carries Tailscale's own verdict on it: one Enter must never be sold as
-/// giving GitHub a working webhook without Funnel actually publishing the name.
-fn public_url_prompt(suggestion: Option<&DetectedPublicUrl>) -> String {
+/// The prompt for the URL question. Only a name Enter may safely accept is
+/// shown as a suggestion; a detected-but-unusable one is a hint, so the prompt
+/// keeps the safe default (blank = skip) and the help above says what is
+/// missing.
+fn public_url_prompt(suggestion: Option<&UrlSuggestion>) -> String {
     match suggestion {
-        Some(detected) => format!(
-            "    public URL [{}] ({}; \"-\" skips, webhooks off): ",
-            detected.url,
-            detected.label()
-        ),
+        Some(UrlSuggestion {
+            url,
+            funnel: FunnelPublication::WebhookPathOnly,
+        }) => format!("    public URL [{url}] (Enter accepts; \"-\" skips, webhooks off): "),
+        Some(UrlSuggestion { url, .. }) => {
+            format!("    public URL (blank = skip; {url} is not published by Funnel for GitHub): ")
+        }
         None => "    public URL (blank = skip, local only): ".to_owned(),
     }
 }
 
-/// The explanation shown before the prompt, with the detected URL called out:
-/// an accepted suggestion must never look like something `init` invented, and
-/// a name Tailscale's own status does not show as published is labeled as
-/// needing the Funnel setup instead of being presented as already working.
-fn public_url_help(suggestion: Option<&DetectedPublicUrl>) -> Vec<String> {
+/// The explanation shown before the prompt. A detected name is only ever
+/// claimed as detected, and an accepted suggestion must never look like
+/// something `init` invented; a name Enter may not accept says why.
+fn public_url_help(suggestion: Option<&UrlSuggestion>) -> Vec<String> {
     let mut lines: Vec<String> = PUBLIC_URL_HELP
         .iter()
         .map(|line| (*line).to_owned())
         .collect();
-    lines.push(match suggestion {
-        Some(detected) if detected.funnel_confirmed() => format!(
-            "detected on this host: {label} — Enter accepts it: {url}",
-            label = detected.label(),
-            url = detected.url
-        ),
-        Some(detected) => format!(
-            "detected on this host with tailscale: {url} — Enter accepts it, but this name \
-             {label}; until it is published GitHub cannot deliver and the webhook stays silent",
-            url = detected.url,
-            label = detected.label()
-        ),
-        None => {
-            "no stable URL detected here — type the one your tunnel or proxy publishes".to_owned()
+    match suggestion {
+        Some(UrlSuggestion {
+            url,
+            funnel: FunnelPublication::WebhookPathOnly,
+        }) => {
+            lines.push(format!(
+                "detected on this host: tailscale funnel publishes {WEBHOOK_PATH} and nothing \
+                 else at {url} — Enter accepts it"
+            ));
         }
-    });
+        Some(UrlSuggestion {
+            url,
+            funnel: FunnelPublication::WebhookPathAndOthers(others),
+        }) => {
+            lines.push(format!(
+                "this machine is on the tailnet as {url}, and its funnel also publishes {} on \
+                 the same host and port:",
+                others.join(", ")
+            ));
+            lines.push(
+                "Tailscale applies Funnel to the whole host and port, so the webhook path cannot \
+                 be public there alone (tailscale/tailscale#10234) — give it a dedicated \
+                 hostname, check with `tailscale funnel status`, then re-run this step"
+                    .to_owned(),
+            );
+        }
+        Some(UrlSuggestion { url, .. }) => {
+            lines.push(format!(
+                "this machine is on the tailnet as {url}, but no tailscale funnel publishes \
+                 {WEBHOOK_PATH} there:"
+            ));
+            lines.push(
+                "GitHub cannot reach a tailnet-only name, so it is a hint only — run the funnel \
+                 command above, or type the URL your own proxy publishes"
+                    .to_owned(),
+            );
+        }
+        None => lines.push(
+            "no stable URL detected here — type the one your tunnel or proxy publishes".to_owned(),
+        ),
+    }
     lines
 }
 
-/// A stable HTTPS URL detected on this host — the tailnet's own name for this
-/// machine, which Tailscale Funnel and Serve publish under — and what
-/// Tailscale's own status said about Funnel publishing it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DetectedPublicUrl {
-    url: String,
-    /// `Some(true)` when `tailscale funnel status` shows Funnel publishing
-    /// this name; `Some(false)` when the daemon answered without a funnel for
-    /// it; `None` when that could not be told. Anything but `Some(true)` is
-    /// presented as needing the Funnel setup: an unverified name must not be
-    /// offered as if GitHub could already reach it.
-    funnel: Option<bool>,
+/// The one path GitHub delivers webhooks to, and so the only path a tunnel in
+/// front of the engine may publish.
+const WEBHOOK_PATH: &str = "/api/v1/github/webhooks";
+
+/// How long a `tailscale` query may take before the child is killed and the
+/// query read as "no answer". The daemon is local, so anything slower is
+/// unresponsive — and `status` must never hang the wizard.
+const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the child is re-checked while waiting for that deadline.
+const TAILSCALE_POLL: Duration = Duration::from_millis(50);
+
+/// A stable HTTPS URL this host probably already has — the tailnet's own name
+/// for this machine — with what Funnel publishes there. Best effort and never
+/// fatal: no tailscale, a stopped daemon, an unreadable answer, a daemon that
+/// does not answer within [`TAILSCALE_TIMEOUT`], or an unexpected shape all
+/// mean "nothing detected" rather than a wizard failure.
+fn detected_public_url() -> Option<UrlSuggestion> {
+    let status = tailscale_json(&["status", "--json"])?;
+    // A second query: without an answer the name is still shown, as a hint
+    // only — never accepted. `funnel status --json` is the daemon's own
+    // answer; `serve status --json` marshals the same config, so it stands in
+    // when the daemon is too old for the funnel subcommand.
+    let funnel = tailscale_json(&["funnel", "status", "--json"])
+        .or_else(|| tailscale_json(&["serve", "status", "--json"]));
+    tailnet_suggestion(&status, funnel.as_ref())
 }
 
-impl DetectedPublicUrl {
-    /// Whether Tailscale's own status showed Funnel publishing this name.
-    fn funnel_confirmed(&self) -> bool {
-        self.funnel == Some(true)
-    }
-
-    /// The suggestion's one-line verdict, shown at the prompt and in the help.
-    fn label(&self) -> &'static str {
-        if self.funnel_confirmed() {
-            "Funnel publishes this"
-        } else {
-            "requires the Funnel setup above"
-        }
-    }
-}
-
-/// A stable HTTPS URL this host probably already has, and whether the daemon
-/// says Funnel is publishing it. Best effort and never fatal — no tailscale, a
-/// stopped daemon, or an unreadable answer all mean "no suggestion" rather than
-/// a wizard failure, and `tailscale funnel status` answering nothing usable
-/// means the Funnel verdict is unknown (said as "not verified", not as
-/// "published").
-fn detected_public_url() -> Option<DetectedPublicUrl> {
-    let tailscale = find_on_path("tailscale")?;
-    let output = std::process::Command::new(&tailscale)
-        .args(["status", "--json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = tailnet_public_url(&String::from_utf8_lossy(&output.stdout))?;
-    // The name and its Funnel verdict come from two different answers of the
-    // same daemon: what the machine is called, and whether GitHub can reach it.
+/// The suggestion the two daemon answers support, or `None` when this host has
+/// no tailnet name to offer.
+fn tailnet_suggestion(status: &Value, funnel: Option<&Value>) -> Option<UrlSuggestion> {
+    let url = tailnet_public_url(status)?;
     let host = reqwest::Url::parse(&url).ok()?.host_str()?.to_owned();
-    let funnel = funnel_publishing(&tailscale, &host);
-    Some(DetectedPublicUrl { url, funnel })
-}
-
-/// Whether Tailscale says Funnel is publishing `host`'s name. `funnel status
-/// --json` is the daemon's own answer; `serve status --json` marshals the same
-/// config, so it stands in when the daemon is too old for the funnel
-/// subcommand. Never fatal, and unparseable output stays "cannot tell".
-fn funnel_publishing(tailscale: &Path, host: &str) -> Option<bool> {
-    for command in [
-        ["funnel", "status", "--json"],
-        ["serve", "status", "--json"],
-    ] {
-        let Ok(output) = std::process::Command::new(tailscale).args(command).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        if let Some(publishing) =
-            funnel_state_from_status(&String::from_utf8_lossy(&output.stdout), host)
-        {
-            return Some(publishing);
-        }
-    }
-    None
-}
-
-/// Read Funnel's verdict for `host` out of `tailscale funnel status --json`
-/// (the daemon's marshalled `ipn.ServeConfig`): `AllowFunnel` maps this node's
-/// `host:port` names to whether Funnel publishes them, and the key is absent —
-/// `omitempty` — when it publishes none. `None` for anything unrecognizable: a
-/// stranger's output must not be read as "not published" any more confidently
-/// than "cannot tell".
-fn funnel_state_from_status(status_json: &str, host: &str) -> Option<bool> {
-    let status: Value = serde_json::from_str(status_json).ok()?;
-    if status.is_null() {
-        // A daemon with no serve config at all: nothing is funnelled.
-        return Some(false);
-    }
-    let allow = match status.as_object()?.get("AllowFunnel") {
-        Some(Value::Object(allow)) => allow,
-        Some(_) => return None,
-        None => return Some(false),
+    let funnel = match funnel {
+        Some(funnel) => funnel_publication(funnel, &host),
+        None => FunnelPublication::NotPublished,
     };
-    let host = host.trim_end_matches('.');
-    Some(allow.iter().any(|(hostport, enabled)| {
-        enabled.as_bool() == Some(true)
-            && hostport
-                .rsplit_once(':')
-                .map_or(hostport.as_str(), |(name, _)| name)
-                .trim_end_matches('.')
-                .eq_ignore_ascii_case(host)
-    }))
+    Some(UrlSuggestion { url, funnel })
+}
+
+/// One `tailscale` query's JSON answer: `None` when tailscale is not
+/// installed, exits non-zero, does not answer within [`TAILSCALE_TIMEOUT`]
+/// (the child is killed), or answers with something that is not JSON.
+fn tailscale_json(args: &[&str]) -> Option<Value> {
+    let tailscale = find_on_path("tailscale")?;
+    let mut command = std::process::Command::new(tailscale);
+    command.args(args);
+    parse_tailscale_json(&bounded_stdout(&mut command, TAILSCALE_TIMEOUT)?)
+}
+
+/// The JSON a tailscale answer carries; `None` when the answer is not JSON at
+/// all (a daemon's error text on stdout, a version whose flag differs).
+fn parse_tailscale_json(stdout: &str) -> Option<Value> {
+    serde_json::from_str(stdout).ok()
+}
+
+/// Run `command` and read its stdout, killing it after `timeout`: `tailscale
+/// status` talks to a daemon, and an unresponsive one must not hang the
+/// wizard. `None` when the program cannot be run, exits non-zero, or does not
+/// finish in time — all of which read as "no answer".
+fn bounded_stdout(command: &mut std::process::Command, timeout: Duration) -> Option<String> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Drained on its own thread: a chatty answer fills the pipe buffer while
+    // this thread watches the clock, and a full buffer would otherwise block
+    // the child until the deadline killed it.
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut succeeded = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                succeeded = status.success();
+                break;
+            }
+            // An unresponsive daemon is not worth waiting for: kill it and
+            // treat the query as unanswered.
+            Ok(None) if std::time::Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(TAILSCALE_POLL),
+            Err(_) => break,
+        }
+    }
+    if !succeeded {
+        let _ = child.kill();
+        // Reaped either way, so the reader thread sees EOF.
+        let _ = child.wait();
+    }
+    let bytes = reader.join().ok()?;
+    succeeded.then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `tailscale status --json`'s name for this machine as a URL
 /// (`https://<machine>.<tailnet>.ts.net`). Tailscale writes it as an FQDN with
 /// a trailing dot, and a node that is not up has a name GitHub could not reach
 /// either, so anything that does not validate is not offered.
-fn tailnet_public_url(status_json: &str) -> Option<String> {
-    let status: Value = serde_json::from_str(status_json).ok()?;
+fn tailnet_public_url(status: &Value) -> Option<String> {
     // The daemon's own verdict on the tailnet link: "Stopped", "NeedsLogin",
     // and friends still report a DNS name.
     if status.get("BackendState")?.as_str()? != "Running" {
@@ -2583,6 +2630,66 @@ fn tailnet_public_url(status_json: &str) -> Option<String> {
         .as_str()?
         .trim_end_matches('.');
     validate_public_url(&format!("https://{dns_name}")).ok()
+}
+
+/// What `tailscale funnel status --json` publishes at `host`'s HTTPS port.
+///
+/// `AllowFunnel` is the daemon's own "Funnel, not just Serve, is enabled for
+/// this host:port" flag and `Web` carries the mounted paths: without the first
+/// nothing there is public, and any shape this does not understand (an older
+/// or newer daemon) degrades to "not published" rather than a false claim.
+fn funnel_publication(funnel_status: &Value, host: &str) -> FunnelPublication {
+    let allowed = funnel_status
+        .get("AllowFunnel")
+        .and_then(Value::as_object)
+        .and_then(|map| host_entry(map, host))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !allowed {
+        return FunnelPublication::NotPublished;
+    }
+    let handlers = funnel_status
+        .get("Web")
+        .and_then(Value::as_object)
+        .and_then(|map| host_entry(map, host))
+        .and_then(|entry| entry.get("Handlers"))
+        .and_then(Value::as_object);
+    let Some(handlers) = handlers else {
+        return FunnelPublication::NotPublished;
+    };
+    if !handlers.keys().any(|path| path == WEBHOOK_PATH) {
+        return FunnelPublication::NotPublished;
+    }
+    // Funnel is enabled for the host and port, so every other mount on it is
+    // public too: the name is only usable once the webhook path stands alone.
+    let mut others: Vec<String> = handlers
+        .keys()
+        .filter(|path| path.as_str() != WEBHOOK_PATH)
+        .cloned()
+        .collect();
+    if others.is_empty() {
+        return FunnelPublication::WebhookPathOnly;
+    }
+    others.sort();
+    FunnelPublication::WebhookPathAndOthers(others)
+}
+
+/// The `AllowFunnel` / `Web` entry naming `host`, whatever port suffix this
+/// daemon's version writes (`builder.tail1234.ts.net:443`, or a bare host,
+/// which is the same 443): another port is a different address and does not
+/// make this URL public. Tailscale reports names as FQDNs, so a key carrying
+/// the trailing dot is the same name.
+fn host_entry<'a>(map: &'a serde_json::Map<String, Value>, host: &str) -> Option<&'a Value> {
+    let names_this_host_on_443 = |key: &str| {
+        let (name, port) = match key.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (key, None),
+        };
+        name.trim_end_matches('.').eq_ignore_ascii_case(host) && matches!(port, None | Some("443"))
+    };
+    map.iter()
+        .find(|(key, _)| names_this_host_on_443(key))
+        .map(|(_, value)| value)
 }
 
 /// Check the URL GitHub will deliver webhooks to, and return it without a
@@ -3622,7 +3729,8 @@ mod tests {
 
     /// A suggestion is offered from evidence, never guessed:
     /// `tailscale status --json`'s own name for this machine while the tailnet
-    /// is up.
+    /// is up — and, for the Enter default, `tailscale funnel status --json`
+    /// publishing the webhook path there and nothing else.
     #[test]
     fn a_running_tailnet_supplies_the_suggested_url() {
         let status = json!({
@@ -3636,11 +3744,179 @@ mod tests {
                 "OS": "linux",
             },
             "Peer": {},
-        })
-        .to_string();
+        });
         assert_eq!(
             tailnet_public_url(&status).as_deref(),
             Some("https://builder.tail1234.ts.net")
+        );
+        let published = json!({
+            "TCP": {"443": true},
+            "Web": {
+                "builder.tail1234.ts.net:443": {
+                    "Handlers": {
+                        "/api/v1/github/webhooks": {
+                            "Proxy": "http://127.0.0.1:9090/api/v1/github/webhooks"
+                        }
+                    }
+                }
+            },
+            "AllowFunnel": {"builder.tail1234.ts.net:443": true},
+        });
+        let suggestion = tailnet_suggestion(&status, Some(&published))
+            .expect("a running tailnet supplies a suggestion");
+        assert_eq!(suggestion.url, "https://builder.tail1234.ts.net");
+        assert_eq!(
+            suggestion.funnel,
+            FunnelPublication::WebhookPathOnly,
+            "Funnel publishes only the webhook path, so GitHub can reach it"
+        );
+        assert_eq!(
+            read_public_url("", Some(&suggestion)),
+            UrlInput::Use {
+                url: "https://builder.tail1234.ts.net".to_owned(),
+                source: "suggested"
+            },
+            "Enter accepts a published Funnel name"
+        );
+    }
+
+    /// `{"<key>": value}` with a computed key: the Funnel status maps are keyed
+    /// by `<host>:443`, which `json!` cannot write as a literal.
+    fn one_key(key: String, value: Value) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(key, value);
+        Value::Object(map)
+    }
+
+    /// Anything short of "Funnel publishes the webhook path, and nothing else
+    /// on that host:port" is a hint only: Enter must not point the App's
+    /// webhook at an address GitHub cannot reach, and Funnel makes *every*
+    /// mount on its host and port public, so a shared one is not safe either.
+    #[test]
+    fn only_a_path_scoped_funnel_lets_enter_accept_the_tailnet_name() {
+        let status = json!({
+            "BackendState": "Running",
+            "Self": {"DNSName": "builder.tail1234.ts.net."},
+        });
+        let host = "builder.tail1234.ts.net";
+        let handlers = json!({
+            "/api/v1/github/webhooks": {"Proxy": "http://127.0.0.1:9090/api/v1/github/webhooks"}
+        });
+        // The shape a working `tailscale funnel --set-path=… --bg …` writes:
+        // Funnel allowed for this host:port, and the webhook path mounted.
+        let published = json!({
+            "TCP": {"443": true},
+            "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+            "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+        });
+        assert_eq!(
+            funnel_publication(&published, host),
+            FunnelPublication::WebhookPathOnly
+        );
+        for (what, funnel, expected) in [
+            (
+                "plain Serve: the handlers exist but Funnel is not allowed for the host:port",
+                json!({
+                    "Web": one_key(format!("{host}:443"), json!({"Handlers": handlers.clone()})),
+                }),
+                FunnelPublication::NotPublished,
+            ),
+            (
+                "a Funnel for another path only",
+                json!({
+                    "Web": one_key(format!("{host}:443"), json!({"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}})),
+                    "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+                }),
+                FunnelPublication::NotPublished,
+            ),
+            (
+                "a Funnel for another host:port",
+                json!({
+                    "Web": one_key("other.tail1234.ts.net:443".to_owned(), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key("other.tail1234.ts.net:443".to_owned(), json!(true)),
+                }),
+                FunnelPublication::NotPublished,
+            ),
+            (
+                "a port-less key, which is the same 443",
+                json!({
+                    "Web": one_key(host.to_owned(), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(host.to_owned(), json!(true)),
+                }),
+                FunnelPublication::WebhookPathOnly,
+            ),
+            (
+                "the FQDN form of the same name and port",
+                json!({
+                    "Web": one_key(format!("{host}.:443"), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(format!("{host}.:443"), json!(true)),
+                }),
+                FunnelPublication::WebhookPathOnly,
+            ),
+            (
+                "another port is a different address",
+                json!({
+                    "Web": one_key(format!("{host}:8443"), json!({"Handlers": handlers.clone()})),
+                    "AllowFunnel": one_key(format!("{host}:8443"), json!(true)),
+                }),
+                FunnelPublication::NotPublished,
+            ),
+            (
+                "a shape this version does not write",
+                json!({"AllowFunnel": ["builder.tail1234.ts.net:443"]}),
+                FunnelPublication::NotPublished,
+            ),
+            ("nothing at all", json!({}), FunnelPublication::NotPublished),
+            (
+                "no JSON object at all",
+                json!("denied"),
+                FunnelPublication::NotPublished,
+            ),
+        ] {
+            assert_eq!(funnel_publication(&funnel, host), expected, "{what}");
+        }
+
+        // Without a Funnel answer (absent, a version without the flag, or a
+        // timeout) the name is still a hint, and Enter must not accept it.
+        for funnel in [None, Some(json!("denied"))] {
+            let suggestion = tailnet_suggestion(&status, funnel.as_ref())
+                .expect("the tailnet name is still worth showing");
+            assert_eq!(suggestion.funnel, FunnelPublication::NotPublished);
+            assert_eq!(
+                read_public_url("", Some(&suggestion)),
+                UrlInput::Skip,
+                "Enter must not accept a name GitHub cannot reach"
+            );
+            assert!(
+                !public_url_prompt(Some(&suggestion)).contains('['),
+                "an unusable name must not look like a suggestion"
+            );
+        }
+
+        // The webhook path *is* published, but something else shares the
+        // host:port — Funnel makes that public too, so the operator is told
+        // which paths would be exposed instead of being offered the name.
+        let shared = json!({
+            "Web": one_key(format!("{host}:443"), json!({"Handlers": {
+                "/api/v1/github/webhooks": {"Proxy": "http://127.0.0.1:9090/api/v1/github/webhooks"},
+                "/": {"Proxy": "http://127.0.0.1:3000"},
+            }})),
+            "AllowFunnel": one_key(format!("{host}:443"), json!(true)),
+        });
+        let suggestion = tailnet_suggestion(&status, Some(&shared)).expect("still a hint");
+        assert_eq!(
+            suggestion.funnel,
+            FunnelPublication::WebhookPathAndOthers(vec!["/".to_owned()])
+        );
+        assert_eq!(read_public_url("", Some(&suggestion)), UrlInput::Skip);
+        let help = public_url_help(Some(&suggestion)).join("\n");
+        assert!(help.contains("builder.tail1234.ts.net"), "{help}");
+        assert!(help.contains("whole host and port"), "{help}");
+        assert!(help.contains("dedicated hostname"), "{help}");
+        assert!(help.contains("tailscale funnel status"), "{help}");
+        assert!(
+            !help.contains("Enter accepts"),
+            "an unsafe name must never be announced as accepted: {help}"
         );
     }
 
@@ -3648,43 +3924,100 @@ mod tests {
     fn no_usable_tailscale_answer_means_no_suggestion() {
         for (what, status) in [
             (
-                "tailscale absent or failed, so not JSON at all",
-                "command not found",
-            ),
-            ("an empty answer", ""),
-            (
                 "a stopped daemon still names a node",
-                "{\"BackendState\":\"Stopped\",\"Self\":{\"DNSName\":\"builder.tail1234.ts.net.\"}}",
+                json!({
+                    "BackendState": "Stopped",
+                    "Self": {"DNSName": "builder.tail1234.ts.net."},
+                }),
             ),
             (
                 "a logged-out node",
-                "{\"BackendState\":\"NeedsLogin\",\"Self\":{\"DNSName\":\"builder.tail1234.ts.net.\"}}",
+                json!({
+                    "BackendState": "NeedsLogin",
+                    "Self": {"DNSName": "builder.tail1234.ts.net."},
+                }),
             ),
-            ("no Self block", "{\"BackendState\":\"Running\"}"),
+            ("no Self block", json!({"BackendState": "Running"})),
             (
                 "a Self without a DNS name",
-                "{\"BackendState\":\"Running\",\"Self\":{\"HostName\":\"builder\"}}",
+                json!({"BackendState": "Running", "Self": {"HostName": "builder"}}),
             ),
             (
                 "a name GitHub cannot reach",
-                "{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\"localhost.\"}}",
+                json!({"BackendState": "Running", "Self": {"DNSName": "localhost."}}),
             ),
             (
                 "an empty name",
-                "{\"BackendState\":\"Running\",\"Self\":{\"DNSName\":\".\"}}",
+                json!({"BackendState": "Running", "Self": {"DNSName": "."}}),
             ),
+            ("an empty answer", Value::Null),
         ] {
-            assert_eq!(tailnet_public_url(status), None, "{what}: {status}");
+            assert_eq!(tailnet_public_url(&status), None, "{what}: {status}");
+            assert_eq!(tailnet_suggestion(&status, None), None, "{what}: {status}");
         }
     }
 
+    /// A daemon that does not answer is "no answer", never a failure: both the
+    /// parse and the deadline have to collapse to `None`.
+    #[test]
+    fn a_tailscale_query_that_does_not_answer_is_no_suggestion() {
+        for (what, answer) in [
+            ("an error message where JSON should be", "Exit status 1"),
+            ("an empty answer", ""),
+            ("truncated JSON", "{\"BackendState\":"),
+        ] {
+            assert_eq!(parse_tailscale_json(answer), None, "{what}: {answer}");
+        }
+        // The deadline: a child that outlives it is killed, not awaited, and
+        // the query reads as unanswered.
+        let mut slow = std::process::Command::new("sh");
+        slow.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        assert_eq!(bounded_stdout(&mut slow, Duration::from_millis(200)), None);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "the deadline must be waited out, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "an unresponsive daemon must not hang the wizard, took {elapsed:?}"
+        );
+    }
+
+    /// A bounded query still returns a healthy answer, and a program that
+    /// cannot answer is `None` rather than a wizard failure.
+    #[test]
+    fn a_bounded_query_returns_the_answer_it_can() {
+        let run = |program: &str, args: &[&str]| {
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            bounded_stdout(&mut command, Duration::from_secs(10))
+        };
+        assert_eq!(run("sh", &["-c", "echo hello"]).as_deref(), Some("hello\n"));
+        assert_eq!(
+            run("sh", &["-c", "exit 3"]),
+            None,
+            "a non-zero exit is not an answer"
+        );
+        assert_eq!(
+            run("preloop-no-such-binary", &[]),
+            None,
+            "a program that cannot be run is not an answer"
+        );
+    }
+
     /// The question takes a typed URL, the suggestion through Enter, or `-` to
-    /// skip; with no suggestion the older contract (blank = skip) still holds.
+    /// skip; with no suggestion — or one Enter may not accept — the older
+    /// contract (blank = skip) still holds.
     #[test]
     fn the_url_answer_takes_a_typed_url_the_suggestion_or_a_skip() {
-        let suggestion = Some("https://builder.tail1234.ts.net");
+        let suggestion = UrlSuggestion {
+            url: "https://builder.tail1234.ts.net".to_owned(),
+            funnel: FunnelPublication::WebhookPathOnly,
+        };
         assert_eq!(
-            read_public_url("", suggestion),
+            read_public_url("", Some(&suggestion)),
             UrlInput::Use {
                 url: "https://builder.tail1234.ts.net".to_owned(),
                 source: "suggested"
@@ -3692,22 +4025,34 @@ mod tests {
             "Enter accepts the suggestion"
         );
         assert_eq!(
-            read_public_url("https://ci.example.com/", suggestion),
+            read_public_url("https://ci.example.com/", Some(&suggestion)),
             UrlInput::Use {
                 url: "https://ci.example.com".to_owned(),
                 source: "prompt"
             }
         );
-        assert_eq!(read_public_url("-", suggestion), UrlInput::Skip);
+        assert_eq!(read_public_url("-", Some(&suggestion)), UrlInput::Skip);
         assert_eq!(read_public_url("", None), UrlInput::Skip);
         assert_eq!(read_public_url("-", None), UrlInput::Skip);
-        // A refused answer is asked again, and the retry names the way out.
-        match read_public_url("http://ci.example.com", suggestion) {
+        // A superset of the accepted case: a hint must never be taken by Enter.
+        let hint = UrlSuggestion {
+            url: "https://builder.tail1234.ts.net".to_owned(),
+            funnel: FunnelPublication::NotPublished,
+        };
+        assert_eq!(read_public_url("", Some(&hint)), UrlInput::Skip);
+        assert_eq!(read_public_url("-", Some(&hint)), UrlInput::Skip);
+        // A refused answer is asked again, and the retry names the way out:
+        // `-` when Enter had a way to accept, blank otherwise.
+        match read_public_url("http://ci.example.com", Some(&suggestion)) {
             UrlInput::Retry(reason) => {
                 assert!(reason.contains("https://"), "{reason}");
                 assert!(reason.contains("webhooks off"), "{reason}");
             }
             other => panic!("a non-https URL must be refused, got {other:?}"),
+        }
+        match read_public_url("nonsense", Some(&hint)) {
+            UrlInput::Retry(reason) => assert!(reason.contains("blank"), "{reason}"),
+            other => panic!("garbage must be refused, got {other:?}"),
         }
         match read_public_url("nonsense", None) {
             UrlInput::Retry(reason) => assert!(reason.contains("blank"), "{reason}"),
@@ -3717,14 +4062,16 @@ mod tests {
 
     /// The how-to shown at the prompt: the exact path-scoped Funnel command,
     /// where the full guide is, and — when one was detected — the URL itself,
-    /// so an accepted suggestion is never mistaken for a guess.
+    /// so an accepted suggestion is never mistaken for a guess. The Funnel
+    /// wording must not promise that mounting one path keeps the rest private
+    /// (Funnel publishes the whole host and port, tailscale/tailscale#10234).
     #[test]
     fn the_url_prompt_shows_the_funnel_command_and_the_suggestion() {
-        let detected = DetectedPublicUrl {
+        let published = UrlSuggestion {
             url: "https://builder.tail1234.ts.net".to_owned(),
-            funnel: Some(true),
+            funnel: FunnelPublication::WebhookPathOnly,
         };
-        let text = public_url_help(Some(&detected)).join("\n");
+        let text = public_url_help(Some(&published)).join("\n");
         assert!(
             text.contains(
                 "tailscale funnel --set-path=/api/v1/github/webhooks --bg http://127.0.0.1:9090/api/v1/github/webhooks"
@@ -3734,8 +4081,16 @@ mod tests {
         assert!(text.contains("docs/self-hosting.md"), "{text}");
         assert!(text.contains("builder.tail1234.ts.net"), "{text}");
         assert!(text.to_lowercase().contains("cloudflare"), "{text}");
+        // F7: the path mount does not keep the other mounts private.
+        assert!(!text.contains("mounted at just that path"), "{text}");
+        assert!(text.contains("dedicated hostname"), "{text}");
+        assert!(text.contains("tailscale funnel status"), "{text}");
         assert!(
-            public_url_prompt(Some(&detected)).contains("https://builder.tail1234.ts.net"),
+            text.contains("only /api/v1/github/webhooks"),
+            "the one-path rule is still stated: {text}"
+        );
+        assert!(
+            public_url_prompt(Some(&published)).contains("https://builder.tail1234.ts.net"),
             "the suggestion must be visible at the prompt"
         );
         assert!(
@@ -3746,114 +4101,24 @@ mod tests {
         let plain = public_url_help(None).join("\n");
         assert!(!plain.contains("Enter accepts"), "{plain}");
         assert!(!plain.contains("https://builder"), "{plain}");
-    }
-
-    /// The tailnet name stays the Enter-accepted suggestion, but it is only
-    /// presented as working when the daemon's own funnel status says Funnel
-    /// publishes it: without that, the suggestion requires the Funnel setup and
-    /// the acceptance note says the webhook stays silent until it is
-    /// published. The two labelings are pinned here.
-    #[test]
-    fn the_suggestion_says_whether_funnel_publishes_it() {
-        let detected = |funnel: Option<bool>| DetectedPublicUrl {
+        // Detected but not Funnel-published: the name is a hint, and the
+        // wording never claims Enter accepts it.
+        let hint = UrlSuggestion {
             url: "https://builder.tail1234.ts.net".to_owned(),
-            funnel,
+            funnel: FunnelPublication::NotPublished,
         };
-        let confirmed = detected(Some(true));
-        let text = public_url_help(Some(&confirmed)).join("\n");
-        assert!(text.contains("Funnel publishes this"), "{text}");
-        assert!(text.contains("https://builder.tail1234.ts.net"), "{text}");
+        let hinted = public_url_help(Some(&hint)).join("\n");
+        assert!(hinted.contains("builder.tail1234.ts.net"), "{hinted}");
+        assert!(hinted.contains("tailnet"), "{hinted}");
         assert!(
-            !text.contains("stays silent"),
-            "a published name has nothing to warn about: {text}"
+            hinted.contains("GitHub cannot reach a tailnet-only name"),
+            "{hinted}"
         );
+        assert!(!hinted.contains("Enter accepts"), "{hinted}");
         assert!(
-            public_url_prompt(Some(&confirmed)).contains("Funnel publishes this"),
-            "the prompt carries the verdict too"
+            public_url_prompt(Some(&hint)).contains("blank = skip"),
+            "{hint:?}"
         );
-
-        // Not confirmed: the daemon answered no, or could not be asked at all.
-        for funnel in [Some(false), None] {
-            let suggestion = detected(funnel);
-            let text = public_url_help(Some(&suggestion)).join("\n");
-            assert!(text.contains("requires the Funnel setup above"), "{text}");
-            assert!(text.contains("stays silent"), "{text}");
-            assert!(
-                !text.contains("Funnel publishes this"),
-                "an unverified name must not be presented as published: {text}"
-            );
-            let prompt = public_url_prompt(Some(&suggestion));
-            assert!(
-                prompt.contains("requires the Funnel setup above"),
-                "{prompt}"
-            );
-            assert!(
-                prompt.contains("https://builder.tail1234.ts.net"),
-                "{prompt}"
-            );
-        }
-    }
-
-    /// The Funnel verdict is read from the daemon's own serve config, never
-    /// guessed: only an `AllowFunnel` entry for *this* host's name counts, a
-    /// name published for another node is not this machine's, and output that
-    /// cannot be read stays unknown instead of "not published".
-    #[test]
-    fn the_funnel_verdict_comes_from_the_daemons_own_status() {
-        let host = "builder.tail1234.ts.net";
-        assert_eq!(
-            funnel_state_from_status(
-                r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"builder.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9090/"}}}},"AllowFunnel":{"builder.tail1234.ts.net:443":true}}"#,
-                host
-            ),
-            Some(true),
-            "the daemon's own funnel record for this name"
-        );
-        assert_eq!(
-            funnel_state_from_status(
-                r#"{"AllowFunnel":{"builder.tail1234.ts.net.:443":true}}"#,
-                host
-            ),
-            Some(true),
-            "Tailscale reports names as FQDNs, trailing dot included"
-        );
-        for (what, status) in [
-            (
-                "a funnel recorded for another node's name",
-                r#"{"AllowFunnel":{"other.tail1234.ts.net:443":true}}"#,
-            ),
-            (
-                "the name's record says it is not funnelled",
-                r#"{"AllowFunnel":{"builder.tail1234.ts.net:443":false}}"#,
-            ),
-            (
-                "serve config without any funnel",
-                r#"{"Web":{"builder.tail1234.ts.net:443":{"Handlers":{}}}}"#,
-            ),
-            ("a daemon with no serve config", "null"),
-        ] {
-            assert_eq!(
-                funnel_state_from_status(status, host),
-                Some(false),
-                "{what}: {status}"
-            );
-        }
-        for (what, status) in [
-            ("no tailscale answer at all", "command not found"),
-            ("an empty answer", ""),
-            ("truncated JSON", "{\"AllowFunnel\":"),
-            ("not an object", "[1, 2]"),
-            (
-                "an AllowFunnel that is not a map",
-                r#"{"AllowFunnel":"yes"}"#,
-            ),
-        ] {
-            assert_eq!(
-                funnel_state_from_status(status, host),
-                None,
-                "{what}: {status}"
-            );
-        }
     }
 
     /// From `serve` the wizard runs inside the process that *is* the engine:

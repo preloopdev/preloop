@@ -461,7 +461,9 @@ pub(super) struct SecretRead {
 
 /// Every `secrets.NAME` the raw text spells inside a `${{ … }}` span, or on
 /// an `if:` line, except the tokens the engine mints itself (`GITHUB_TOKEN`
-/// and friends are never stored, so never missing).
+/// and friends are never stored, so never missing) and the names spelled
+/// inside an expression's single-quoted string literal, which the engine
+/// passes through as text.
 ///
 /// The raw text alone cannot tell a YAML comment from a `run:` block line:
 /// the engine substitutes a `${{ … }}` span inside a `run:` block wherever it
@@ -473,17 +475,20 @@ pub(super) struct SecretRead {
 /// unparsed.
 pub(super) fn secret_reads(path: &str, text: &str) -> Vec<SecretRead> {
     let bodies = expression_bodies(text);
+    // A name spelled inside an expression's string literal is text the engine
+    // passes through, so it is not a read even where the scan finds it.
+    let quoted = quoted_spans(text, &bodies);
     let mut reads = Vec::new();
     let mut line_start = 0;
     let mut condition_block = None;
     for (index, line) in text.split_inclusive('\n').enumerate() {
         let condition = is_condition_line(line, &mut condition_block);
         for (offset, name) in names_read_on(line) {
-            if !condition
-                && !bodies
-                    .iter()
-                    .any(|body| body.contains(&(line_start + offset)))
-            {
+            let start = line_start + offset;
+            if quoted.iter().any(|span| span.contains(&start)) {
+                continue;
+            }
+            if !condition && !bodies.iter().any(|body| body.contains(&start)) {
                 continue;
             }
             if is_engine_provided(name) {
@@ -514,6 +519,37 @@ fn expression_bodies(text: &str) -> Vec<Range<usize>> {
         from = body_start + end + 2;
     }
     bodies
+}
+
+/// The byte ranges of the single-quoted string literals inside every expression
+/// body of `text`: a `secrets.NAME` spelled there is text, not a read. `''` is
+/// one escaped quote, as the shared expression scanner reads it.
+fn quoted_spans(text: &str, bodies: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    for body in bodies {
+        let mut opened: Option<usize> = None;
+        let mut characters = text[body.clone()].char_indices().peekable();
+        while let Some((offset, character)) = characters.next() {
+            if character != '\'' {
+                continue;
+            }
+            match opened {
+                None => opened = Some(body.start + offset),
+                Some(start) => {
+                    if characters.peek().map(|&(_, next)| next) == Some('\'') {
+                        characters.next();
+                    } else {
+                        spans.push(start..body.start + offset + 1);
+                        opened = None;
+                    }
+                }
+            }
+        }
+        if let Some(start) = opened {
+            spans.push(start..body.end);
+        }
+    }
+    spans
 }
 
 /// Whether `line` holds or continues an `if:` value, which the engine reads
@@ -594,19 +630,32 @@ fn is_engine_provided(name: &str) -> bool {
 }
 
 /// The names one field's text reads: its `${{ … }}` expressions, or the whole
-/// text when it is an `if:` value.
+/// text when it is an `if:` value. A name spelled inside a single-quoted string
+/// literal of an expression is not a read — the engine evaluates the literal as
+/// text — so it is skipped.
 fn names_read_in(text: &str, whole: bool) -> Vec<&str> {
-    if whole {
-        return names_read_on(text)
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect();
-    }
     let mut names = Vec::new();
+    if whole {
+        collect_expression_names(text, 0..text.len(), &mut names);
+        return names;
+    }
     for body in expression_bodies(text) {
-        names.extend(names_read_on(&text[body]).into_iter().map(|(_, name)| name));
+        collect_expression_names(text, body, &mut names);
     }
     names
+}
+
+/// Add the names read in one expression range of `text`: `secrets.NAME` and
+/// `secrets['NAME']`, minus the ones spelled inside a string literal.
+fn collect_expression_names<'a>(text: &'a str, body: Range<usize>, names: &mut Vec<&'a str>) {
+    let body_text = &text[body];
+    let quoted = quoted_spans(body_text, std::slice::from_ref(&(0..body_text.len())));
+    for (offset, name) in names_read_on(body_text) {
+        if quoted.iter().any(|span| span.contains(&offset)) {
+            continue;
+        }
+        names.push(name);
+    }
 }
 
 /// A secret name at the start of `text`: letters, digits, underscores, not
@@ -1692,6 +1741,65 @@ mod tests {
     }
 
     #[test]
+    fn secret_reads_ignore_expression_string_literals() {
+        // A `secrets.NAME` spelled inside an expression's string literal is
+        // text the engine passes through, not a read.
+        let text = "a: ${{ 'secrets.FROM_LITERAL' }}\n\
+                    b: ${{ secrets.REAL }}\n\
+                    c: ${{ format('secrets.{0}', 'ALSO_LITERAL') }}\n\
+                    d: ${{ secrets['BRACKETED'] }}\n";
+        assert_eq!(
+            names(text),
+            vec![("REAL".to_owned(), 2), ("BRACKETED".to_owned(), 4)]
+        );
+    }
+
+    /// A workflow reads what the parser evaluates, not what it spells: a YAML
+    /// comment is not a value, so its example is inert; a `#` line inside a
+    /// `run:` block is content the engine substitutes, so it is a read; and an
+    /// expression's string literal is spelling, not a lookup.
+    #[test]
+    fn a_workflow_reads_what_the_parser_evaluates_not_what_it_spells() {
+        let text = r#"# example: ${{ secrets.FROM_COMMENT }}
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ 'secrets.FROM_LITERAL' }}
+      - run: |
+          # echo ${{ secrets.IN_RUN_BLOCK }}
+"#;
+        let scan = scan_with(Some("o/r"), &[(".github/workflows/ci.yml", text)]);
+        let rows = secret_rows(&scan, &Stored::default());
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["IN_RUN_BLOCK"]
+        );
+        assert_eq!(rows[0].reads, vec![".github/workflows/ci.yml:9"]);
+    }
+
+    /// A composite action is read from its raw text (the parser walk covers
+    /// workflows), and its step conditions are read the same whether the value
+    /// sits on the `if:` line or on the lines below it: a name folded onto its
+    /// own line is a read, and the `run:` after the block is not mistaken for
+    /// part of the condition.
+    #[test]
+    fn a_folded_condition_inside_an_action_is_read_like_a_single_line_one() {
+        let reads = secret_reads(
+            ".github/actions/deploy/action.yml",
+            "runs:\n  using: composite\n  steps:\n    - if: >-\n        secrets.DEPLOY_KEY != ''\n      run: echo ${{ secrets.IN_RUN }}\n",
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .map(|read| (read.name.as_str(), read.line))
+                .collect::<Vec<_>>(),
+            vec![("DEPLOY_KEY", 5), ("IN_RUN", 6)]
+        );
+    }
+
+    #[test]
     fn composite_action_references_are_found() {
         let reads = secret_reads(
             ".github/actions/deploy/action.yml",
@@ -2412,6 +2520,119 @@ runs:
         assert_eq!(
             encode_path(".github/workflows/a b.yml"),
             ".github/workflows/a%20b.yml"
+        );
+    }
+
+    /// The remote scan end to end against a stub GitHub: the tree listing names
+    /// the files, the contents endpoint hands over their bytes, and the rows
+    /// come from what the repository actually contains. This is the path the
+    /// repository-name preflight and the credential load sit on.
+    #[tokio::test]
+    async fn a_remote_target_is_scanned_through_the_github_api() {
+        let ci = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                  - run: deploy --key ${{ secrets.DEPLOY_KEY }}\n";
+        let action =
+            "runs:\n  using: composite\n  steps:\n    - run: echo ${{ secrets.NPM_TOKEN }}\n";
+        let tree = json!({
+            "truncated": false,
+            "tree": [
+                {"type": "blob", "path": ".github/workflows/ci.yml"},
+                {"type": "blob", "path": ".github/actions/deploy/action.yml"},
+                {"type": "blob", "path": "src/main.rs"},
+            ],
+        });
+        let router = {
+            let (ci, action, tree) = (ci.to_owned(), action.to_owned(), tree.clone());
+            axum::Router::new()
+                .route(
+                    "/repos/o/r",
+                    axum::routing::get(|| async { axum::Json(json!({"default_branch": "main"})) }),
+                )
+                .route(
+                    "/repos/o/r/git/trees/main",
+                    axum::routing::get(move || {
+                        let tree = tree.clone();
+                        async move { axum::Json(tree) }
+                    }),
+                )
+                .route(
+                    "/repos/o/r/contents/.github/workflows/ci.yml",
+                    axum::routing::get(move || {
+                        let ci = ci.clone();
+                        async move { ci }
+                    }),
+                )
+                .route(
+                    "/repos/o/r/contents/.github/actions/deploy/action.yml",
+                    axum::routing::get(move || {
+                        let action = action.clone();
+                        async move { action }
+                    }),
+                )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut config = ConfigFile::default();
+        config.github.legacy_pat = Some("stub-token".to_owned());
+
+        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
+        let previous = std::env::var_os("PRELOOP_GITHUB_API_URL");
+        // SAFETY: TEST_ENV_LOCK serializes this process-global env access, and
+        // the scan reaches GitHub through this variable alone.
+        unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", &base) };
+        let scan = read_target(
+            Target {
+                repo: Some("o/r".to_owned()),
+                checkout: None,
+            },
+            &config,
+        )
+        .await;
+        let refused = read_target(
+            Target {
+                repo: Some("o/r/../../users/x?y".to_owned()),
+                checkout: None,
+            },
+            &config,
+        )
+        .await;
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", value) },
+            None => unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") },
+        }
+        drop(_env_lock);
+
+        assert_eq!(scan.source, "github");
+        assert_eq!(
+            scan.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                ".github/actions/deploy/action.yml",
+                ".github/workflows/ci.yml"
+            ],
+            "only workflow files and composite actions are read"
+        );
+        let rows = secret_rows(&scan, &Stored::default());
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["DEPLOY_KEY", "NPM_TOKEN"]
+        );
+        assert!(rows.iter().all(|row| row.scope.is_none()));
+
+        // A name that is not a plain `owner/repo` is refused before a token is
+        // loaded, so nothing is sent to a host the caller never chose.
+        assert_eq!(refused.source, "none");
+        assert!(
+            refused
+                .skipped
+                .as_deref()
+                .unwrap_or_default()
+                .contains("is not a GitHub"),
+            "{:?}",
+            refused.skipped
         );
     }
 

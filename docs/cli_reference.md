@@ -294,17 +294,20 @@ is missing.
 For `--auth app`, the stable URL must be an HTTPS, non-loopback URL that GitHub
 can reach. Answer the prompt with the URL directly; when `tailscale` is on the
 host and reports a running tailnet, its own name for the machine
-(`https://<machine>.<tailnet>.ts.net`) is suggested and Enter accepts it; type
-`-` to skip. Without a suggestion, an empty answer still skips. The prompt also
-prints the way there — a path-scoped Tailscale Funnel
-(`tailscale funnel --set-path=/api/v1/github/webhooks --bg
-http://127.0.0.1:9090/api/v1/github/webhooks`, exposing only that path), a
-Cloudflare **named** Tunnel (not a quick Tunnel, whose URL changes on restart)
-behind a path-filtering proxy, or a domain/reverse proxy; the full guide is in
-`docs/self-hosting.md` ("Exposure options"). Skipping means the App is created
-with webhooks off: pushes and pull requests will not start runs and PR checks
-will not report. An existing `--public-url` or `PRELOOP_PUBLIC_URL` is used
-without asking.
+(`https://<machine>.<tailnet>.ts.net`) is offered: Enter accepts it when
+`tailscale funnel status --json` shows the webhook path as the only route this
+node publishes, and it is shown as a hint (blank still skips) when it is not
+Funnel-published or the Funnel also has other mounts. Type `-` to skip. The
+prompt also prints the way there — a Tailscale Funnel on a hostname nothing else
+serves (`tailscale funnel --set-path=/api/v1/github/webhooks --bg
+http://127.0.0.1:9090/api/v1/github/webhooks`; Funnel applies to the host and
+port, so a root mount beside it would publish the runner-registration surface
+too — check with `tailscale funnel status`), a Cloudflare **named** Tunnel (not
+a quick Tunnel, whose URL changes on restart) behind a path-filtering proxy, or
+a domain/reverse proxy; the full guide is in `docs/self-hosting.md` ("Exposure
+options"). Skipping means the App is created with webhooks off: pushes and pull
+requests will not start runs and PR checks will not report. An existing
+`--public-url` or `PRELOOP_PUBLIC_URL` is used without asking.
 
 The URL resolved here is not written to the config file: it is handed to
 whatever run mode init starts — the foreground `serve` args, or a

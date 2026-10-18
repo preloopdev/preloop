@@ -1516,10 +1516,12 @@ fn webhook_hint(public_url: Option<&str>) -> String {
              \x20 webhooks:  no --public-url set — GitHub can't reach the engine yet.\n\
              \x20          Re-run with --public-url once the webhook path is published:\n\
              \x20          `tailscale funnel --set-path=/api/v1/github/webhooks --bg\n\
-             \x20          http://127.0.0.1:9090/api/v1/github/webhooks` (only that path\n\
-             \x20          goes public), a *named* Cloudflare Tunnel (a quick tunnel's\n\
-             \x20          URL changes on restart and breaks the App's webhook), or your\n\
-             \x20          own domain + reverse proxy.\n\
+             \x20          http://127.0.0.1:9090/api/v1/github/webhooks` on a hostname\n\
+             \x20          dedicated to it — Funnel publishes the whole host and port, not\n\
+             \x20          the path, so check `tailscale funnel status` for what else it\n\
+             \x20          exposes — a *named* Cloudflare Tunnel (a quick tunnel's URL\n\
+             \x20          changes on restart and breaks the App's webhook), or your own\n\
+             \x20          domain + reverse proxy.\n\
              \x20          See docs/setup.md \"Exposing the engine to GitHub\"."
             .to_owned(),
     }

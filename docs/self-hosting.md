@@ -425,8 +425,9 @@ PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
 ```
 
 This URL is reachable only by tailnet members permitted by the Tailscale ACL.
-It is not a GitHub webhook endpoint; use a separate public, path-filtering
-ingress if GitHub must deliver webhooks.
+It is not a GitHub webhook endpoint: enabling Funnel on this hostname can make
+this whole route public too (§B), so give the webhook a hostname of its own or
+remove this mount first.
 
 ### B. Tailscale Funnel
 
@@ -434,30 +435,30 @@ Tailscale Funnel provides public HTTPS without opening a port or running a
 proxy. Do **not** publish the whole engine port: Funnel would then expose the
 unauthenticated runner-registration surface described in §6.
 
-Funnel's path mount is enough for a webhook-only setup — mount that one path
-and every other path answers 404 — but only while that mount is the *only*
-route on the host and port. Funnel is applied per host:port, not per path:
-enabling it publishes every route already configured for that port, so a root
-`tailscale serve` mount left over from §A (or any other route on the port
-Funnel uses) would become public with it. Check what is configured first, and
-remove anything you did not mean to publish:
+Funnel's access covers the **host and port**, not just the path you mount:
+adding a mount to a hostname that already serves something else — §A's
+`tailscale serve` root route, for instance — can make that whole route public
+as well ([tailscale#10234](https://github.com/tailscale/tailscale/issues/10234)).
+Give the webhook a hostname of its own (its own node), or remove every other
+mount from this one first:
 
 ```sh
-tailscale serve status     # tailnet-only routes, per port
-tailscale funnel status    # routes Funnel already publishes
-```
-
-Do not mix a root `serve` mount with Funnel on the same port. With no other
-route on the port, the path mount is the only thing exposed:
-
-```sh
+tailscale funnel reset          # clears this node's Funnel mounts
+tailscale serve reset           # …and the tailnet-only ones
 tailscale funnel --set-path=/api/v1/github/webhooks --bg \
     http://127.0.0.1:9090/api/v1/github/webhooks
+tailscale funnel status         # verify: the webhook path must be the only route listed
 PRELOOP_PUBLIC_URL=https://<host>.<tailnet>.ts.net
 ```
 
-`preloop init` offers that URL (read from `tailscale status --json`) as the
-suggested answer when the host is on a running tailnet.
+`tailscale funnel status` is the check that matters: it lists every route that
+is actually public on this node, so anything else it names is open to the
+internet. `preloop init` makes the same check before it offers that URL as the
+suggested answer: it reads the name from `tailscale status --json` and accepts
+Enter on it only when `tailscale funnel status --json` shows the webhook path as
+the sole public route here. A name that is not Funnel-published (or one whose
+Funnel also publishes other mounts) is still shown, but only as a hint — blank
+keeps webhooks off.
 
 If you also need other authenticated paths (run pages, for example), put a
 path-filtering proxy in front and publish only its port. Keep Preloop on
@@ -477,7 +478,8 @@ the webhook path to Preloop:
 }
 ```
 
-Expose only that proxy port through Funnel, not the engine listener:
+Expose only that proxy port through Funnel, not the engine listener — and, as
+above, only on a hostname with nothing else mounted on the same port:
 
 ```sh
 tailscale funnel --bg 8080
@@ -563,7 +565,9 @@ internet. `PRELOOP_REGISTRATION_POLICY=permissive` is rejected on non-loopback
 listeners.
 
 **Never publish the whole API surface.** Restrict your proxy or tunnel to
-`/api/v1/github/webhooks`, as every example above does.
+`/api/v1/github/webhooks`: a path-filtering proxy or a Cloudflare ingress rule
+does that by path, and Funnel by giving the webhook a hostname with nothing
+else mounted on it (§5 B).
 
 The reason is `POST /api/v3/actions/runner-registration`. The official GitHub
 runner authenticates there with a registration token **GitHub** issued, but a
@@ -664,6 +668,7 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | Jobs never resume after a restart | Expected; see *Restarts* |
 | Guest cannot resolve DNS | Set `PRELOOP_RUNNER_DNS` |
 | Webhook delivered but nothing runs | Confirm the webhook secret matches the App (`PRELOOP_WEBHOOK_SECRET` for the default App; `preloop setup github --via app --webhook-secret` for any other), and that the workflow's `on:` matches the event |
+| Webhook never fires at all | Check the App's webhook is **Active** under the App's Webhook settings. GitHub's API cannot set that flag, so `preloop setup github` points the hook at the engine and leaves the checkbox to you |
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
 | `failed to publish workspace snapshot repository` with `EXDEV` | The state directory spans more than one filesystem (a bind mount inside it) — put `$PRELOOP_HOME` on a single device |
 

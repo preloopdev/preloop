@@ -21,14 +21,15 @@ Releases before v0.27.0 predate the changelog.
   cargo-zigbuild match `release-runner.yml`.
 
 - **`preloop init` workflow readiness checks.** The five-step wizard can ask for
-  a stable HTTPS App webhook URL — typed directly, or accepted from the tailnet
-  name it detects on the host, with the path-scoped Tailscale Funnel / named
-  Cloudflare Tunnel setup shown — and carries that URL into the run mode it
-  starts, so Check Run links and the webhook health check use it. It scans
-  local and configured repositories for missing workflow secrets, and reports
-  every `runs-on` label against the engine's actual pool rules. Use
-  `--no-secrets-scan` to skip secret checks; `--json` includes the URL, secret,
-  and runner-label decisions.
+  a stable HTTPS App webhook URL, scan local and configured repositories for
+  missing workflow secrets, and report every `runs-on` label against the
+  engine's actual pool rules. Use `--no-secrets-scan` to skip secret checks;
+  `--json` includes the URL, secret, and runner-label decisions.
+  It accepts the tailnet name it detects on the host when a Funnel publishes
+  only the webhook path there (showing the Tailscale Funnel / named Cloudflare
+  Tunnel setup, and checking `tailscale funnel status`), and carries the URL
+  into the run mode it starts — foreground `serve`, or the installed service's
+  environment — so Check Run links and the webhook health check use it.
 
 ### Changed
 
@@ -81,7 +82,9 @@ Releases before v0.27.0 predate the changelog.
   with `--public-url` kept a webhook that delivered nowhere: pushes and pull
   requests never started runs. It now points the hook at the engine (reusing
   the stored webhook secret), and a GitHub refusal is fatal and says plainly
-  that the credentials were saved but the hook still delivers nowhere.
+  that the credentials were saved but the hook still delivers nowhere. Setup
+  also says the App's webhook must be **Active** for pushes and pull requests
+  to arrive, and where to tick it: GitHub's API cannot set that flag.
 
 - **A file-store fallback keeps the config-secrets key.** When the keychain locked during `preloop setup` and a credential fell back to the file store, the config write that recorded the switch failed, which stranded the new GitHub App key. The write now carries the sealing key this process already resolved into the file store, then persists the switch. Sealed-value checks also read only the secret tables, so a commented-out old secret can no longer make a key conflict look ambiguous.
 - **Job `env:` and reusable-call `secrets:` maps read the claim-minted `GITHUB_TOKEN`.**
