@@ -609,6 +609,8 @@ uses the configured image, baked locally as-is.
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | Guest runner account (default `runner`/1001); `root` restores root; empty disables switching |
+| `PRELOOP_SMOLVM_WORKLOAD_INIT` | Command a *pack-based* SmolVM machine runs as its workload, overriding the pack's recorded entrypoint/cmd (default `/sbin/init`, which is what gives the guest systemd as PID 1 — `systemctl`, `journald`, `systemd-resolved`, and docker's `systemd` cgroup driver). Set it to an empty value to boot the pack's own entrypoint instead, e.g. for a golden that predates the systemd contract. Image machines, including the golden builder, are unaffected |
+| `PRELOOP_SMOLVM_GUEST_VOLUMES` | Comma-separated guest paths a *pack-based* SmolVM machine keeps on its own disk instead of its overlay root (default `/var/lib/docker,/var/lib/containerd`, which is what lets dockerd use `overlay2` instead of falling back to `fuse-overlayfs`). An empty value disables them. They persist across stop/start and are inherited by forks |
 | `PRELOOP_URL` | Server URL for the client commands (default `http://127.0.0.1:9090`) |
 | `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |

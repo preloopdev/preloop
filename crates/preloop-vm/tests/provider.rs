@@ -27,8 +27,8 @@ fn machine_names_accept_dns_like_names_and_reject_invalid_boundaries() {
 mod unix {
     use super::*;
     use preloop_vm::{
-        ExecOutput, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider, SocketMount,
-        VmProvider, VolumeMount,
+        ExecOutput, GuestVolume, MachineSpec, MachineState, NetworkPolicy, SmolVmProvider,
+        SocketMount, VmProvider, VolumeMount,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -183,6 +183,8 @@ esac
             sockets: Vec::new(),
             dns: None,
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         }
     }
 
@@ -250,6 +252,8 @@ exit 0
                 guest: PathBuf::from("/run/preloop-engine.sock"),
             }],
             rosetta: false,
+            guest_volumes: Vec::new(),
+            workload_init: None,
         };
 
         SmolVmProvider::new(&executable)
@@ -707,6 +711,76 @@ for arg in "$@"; do printf '%s\n' "$arg" >> "$0.args"; done
         assert!(
             args.windows(2).any(|pair| pair == ["--net-backend", "tsi"]),
             "the override must reach create's command line: {args:?}"
+        );
+    }
+
+    /// A pack-based machine (the golden, and a direct create from its payload)
+    /// is created with the guest-local runtime state directories and the
+    /// systemd workload; both are what the guest's docker needs to run
+    /// overlay2 under the systemd cgroup driver.
+    #[tokio::test]
+    async fn pack_machines_get_guest_volumes_and_the_systemd_workload() {
+        let (directory, executable) = fake_smolvm();
+        let pack = directory
+            .path()
+            .join("preloop-ubuntu-24.04-x86_64.smolmachine");
+        fs::write(&pack, b"pack").unwrap();
+        let mut spec = valid_spec(MachineName::new("runner-0").unwrap());
+        spec.image = pack.display().to_string();
+        spec.network = NetworkPolicy::PublicOnly;
+        spec.guest_volumes = vec![
+            GuestVolume::new("/var/lib/docker").unwrap(),
+            GuestVolume::new("/var/lib/containerd").unwrap(),
+        ];
+        spec.workload_init = Some(vec!["/sbin/init".to_owned()]);
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--from", spec.image.as_str()])
+                && args
+                    .windows(2)
+                    .any(|pair| pair == ["--volume", "/var/lib/docker"])
+                && args
+                    .windows(2)
+                    .any(|pair| pair == ["--volume", "/var/lib/containerd"]),
+            "{args:?}"
+        );
+        // The workload block is last: everything after `--` is the workload.
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("a workload block");
+        assert_eq!(&args[separator + 1..], ["/sbin/init"], "{args:?}");
+    }
+
+    /// The pack workload override is pack-only: an image machine still boots
+    /// its own entrypoint/keep-alive and never gains a trailing `--` block.
+    #[tokio::test]
+    async fn image_machines_ignore_the_pack_workload_override() {
+        let (_directory, executable) = fake_smolvm();
+        let mut spec = valid_spec(MachineName::new("builder-0").unwrap());
+        spec.workload_init = Some(vec!["/sbin/init".to_owned()]);
+        // An explicit guest volume is honoured wherever it is asked for, but
+        // the built-in default set is what `is_pack` gates.
+        spec.guest_volumes = vec![GuestVolume::new("/var/lib/docker").unwrap()];
+
+        SmolVmProvider::new(&executable)
+            .create(&spec)
+            .await
+            .unwrap();
+
+        let args = captured_args(&executable);
+        assert!(!args.iter().any(|arg| arg == "--"), "{args:?}");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--volume", "/var/lib/docker"]),
+            "{args:?}"
         );
     }
 
