@@ -220,16 +220,14 @@ fn is_object_id(sha: &str) -> bool {
 
 /// A Git command with the engine's child policy applied.
 ///
-/// The policy ([`crate::snapshots::apply_git_child_policy`]) kills the child
-/// when a bounded wait expires and disables every interactive credential path:
-/// the helper list is cleared, so an osxkeychain or GCM helper cannot block a
+/// The policy ([`crate::snapshots::git_command_for`]) resets Git's credential
+/// helper list on the command line and disables every interactive credential
+/// path in the environment, so an osxkeychain or GCM helper cannot block a
 /// merge build on a keychain dialog. Merge fetches authenticate with an
 /// `http.<url>.extraheader` token ([`auth_header_for_remote`]) or URL userinfo,
 /// neither of which involves a helper.
 fn git_command() -> Command {
-    let mut command = Command::new(GIT_PROGRAM);
-    crate::snapshots::apply_git_child_policy(&mut command);
-    command
+    crate::snapshots::git_command_for(GIT_PROGRAM)
 }
 
 /// Run `command` under `deadline` and return its output whatever the exit
@@ -237,12 +235,15 @@ fn git_command() -> Command {
 /// ([`preloop_observability::deadline::run_command`]): the child is killed and
 /// reaped when the deadline expires, and it cannot look hung merely because it
 /// filled a pipe.
+///
+/// `command` must come from [`git_command`]; the policy is applied there, not
+/// here, so a call site that staged `GIT_CONFIG_*` after building it keeps what
+/// it staged.
 async fn git_output_within(
-    mut command: Command,
+    command: Command,
     operation: &str,
     deadline: std::time::Duration,
 ) -> Result<std::process::Output, MergeError> {
-    crate::snapshots::apply_git_child_policy(&mut command);
     // Boxed so the spawn/drain/timeout machinery is not inlined into every
     // handler future that can reach a merge build.
     Box::pin(preloop_observability::deadline::run_command(
@@ -445,17 +446,15 @@ async fn fetch_into_mirror_within(
     refspec: &str,
     resolve_ref: &str,
 ) -> Result<String, MergeError> {
-    let mut command = Command::new(program);
+    let mut command = crate::snapshots::git_command_for(program);
     if let Some((key, value)) = source
         .token
         .as_deref()
         .and_then(|token| auth_header_for_remote(url, token, source.forge_host.as_deref()))
     {
-        // `-c` is a global option and must precede the subcommand. It cannot
-        // ride on `GIT_CONFIG_*`: the child policy owns that environment to
-        // clear the credential helper list, and a second writer would clobber
-        // it.
-        command.arg("-c").arg(format!("{key}={value}"));
+        // Staged in the environment: the value is a live token, and command
+        // lines are world-readable through process listings.
+        crate::snapshots::stage_git_auth_header(&mut command, &key, &value);
     }
     command
         .arg("--git-dir")
@@ -463,7 +462,6 @@ async fn fetch_into_mirror_within(
         .args(["fetch", "--quiet", "--no-tags"])
         .arg(url)
         .arg(refspec);
-    crate::snapshots::apply_git_child_policy(&mut command);
     // `what` carries the program name here because the message is the one an
     // operator sees for a stalled forge: "git fetch timed out after 30m:
     // killed the hung git process".

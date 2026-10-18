@@ -991,9 +991,9 @@ async fn fetch_checkout_cache_commit(
     commit_sha: &str,
     auth_header: Option<(&str, &str)>,
 ) -> Result<(), ApiError> {
-    let mut fetch = Command::new(program);
+    let mut fetch = git_command_for(program);
     if let Some((key, value)) = auth_header {
-        fetch.arg("-c").arg(format!("{key}={value}"));
+        stage_git_auth_header(&mut fetch, key, value);
     }
     fetch
         .arg("--git-dir")
@@ -1229,24 +1229,35 @@ async fn snapshot_repo_timing(
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let object_count = count.stdout.iter().filter(|byte| **byte == b'\n').count() as u64;
     // `du` is an external process too, and the caller is on the request path.
-    // It measures stats, so a timeout costs a number, not the snapshot.
+    // It goes through the shared bounded runner rather than a bare timeout:
+    // dropping a `du.output()` future leaves the walk running, so repeated
+    // snapshots would accumulate walkers. The shared runner kills and reaps
+    // the child at the deadline. It measures stats, so a deadline expiry
+    // costs a number, not the snapshot.
     let mut du = Command::new("du");
     du.arg("-sk").arg(repository);
-    let size_kib = match tokio::time::timeout(DIRECTORY_WALK_TIMEOUT, du.output()).await {
-        Ok(Ok(output)) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+    let size_kib = match preloop_observability::deadline::run_command(
+        du,
+        DIRECTORY_WALK_TIMEOUT,
+        "measure the snapshot repository size",
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
             .next()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0),
-        Ok(Ok(_)) => 0,
-        Ok(Err(error)) => return Err(anyhow::anyhow!("failed to run du: {error}")),
-        Err(_) => {
+        Ok(_) => 0,
+        Err(error) if error.timed_out() => {
             warn!(
                 path = %repository.display(),
+                %error,
                 "du timed out measuring the snapshot repository; reporting zero stored bytes"
             );
             0
         }
+        Err(error) => return Err(anyhow::anyhow!("failed to run du: {error}")),
     };
     Ok(crate::models::SnapshotTiming {
         duration_ms: 0, // filled by the caller
@@ -2737,40 +2748,79 @@ async fn run_snapshot_git<const N: usize>(
 /// with a helper configured, a fetch that needs credentials executes it even
 /// with `GIT_TERMINAL_PROMPT=0` and even with stdin on `/dev/null`. Engine Git
 /// never needs a helper: fetches authenticate with an
-/// `http.<url>.extraheader` token (see the fetch call sites) or with URL
-/// userinfo, both of which bypass the credential subsystem. So the helper list
-/// is reset to empty and both askpass programs are pointed at `false`, which
-/// exits non-zero at once whether Git runs it through a shell (it does for
-/// askpass) or execs it directly. `GCM_INTERACTIVE=never` closes GCM's own
-/// interactive path.
+/// `http.<url>.extraheader` token (see [`stage_git_auth_header`]) or with URL
+/// userinfo, both of which bypass the credential subsystem. So the askpass
+/// programs are pointed at `false` (which exits non-zero at once whether Git
+/// runs it through a shell — it does for askpass — or execs it directly) and
+/// `GCM_INTERACTIVE=never` closes GCM's own interactive path. The helper list
+/// itself is reset by [`git_command_for`], which is where the empty
+/// `credential.helper=` entry goes.
 ///
 /// An operator who deliberately configures a helper for engine Git does not
 /// need one here: nothing in the snapshot or merge paths reads credentials
 /// from a store.
+///
+/// Deliberately silent on `GIT_CONFIG_*`: that environment is the only
+/// channel a call site may stage a *secret* through
+/// ([`stage_git_auth_header`]), so this function must not claim it.
 pub(crate) fn apply_git_child_policy(command: &mut Command) {
     command
         .kill_on_drop(true)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "false")
         .env("SSH_ASKPASS", "false")
-        .env("GCM_INTERACTIVE", "never")
-        // An empty helper value *resets* Git's credential helper list, so a
-        // helper from the operator's global or system config can never run
-        // for an engine command.
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "credential.helper")
-        .env("GIT_CONFIG_VALUE_0", "");
+        .env("GCM_INTERACTIVE", "never");
 }
 
-/// A Git command with [`apply_git_child_policy`] applied.
+/// A Git command with the engine's child policy applied.
+///
+/// Two placements, chosen by whether the value is a secret:
+///
+/// * the credential-helper reset rides on the command line (`-c
+///   credential.helper=`), whose empty value costs nothing if a process
+///   listing shows it. A command-line `-c` entry is appended after every
+///   config file, so the empty value resets the helper list whatever the
+///   operator's global or system config defines — and Git requires global
+///   options before the subcommand, so it has to be appended here, before the
+///   caller adds anything;
+/// * everything else is environment ([`apply_git_child_policy`]).
+///
+/// Every engine Git child is created here or by [`git_command`], its
+/// [`GIT_PROGRAM`] twin. The runners deliberately do *not* re-apply the
+/// policy: that is what lets a call site stage its own `GIT_CONFIG_*` after
+/// this returns ([`stage_git_auth_header`]) without it being clobbered.
+pub(crate) fn git_command_for(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.arg("-c").arg("credential.helper=");
+    apply_git_child_policy(&mut command);
+    command
+}
+
+/// A Git command for [`GIT_PROGRAM`].
 ///
 /// Sites that must `spawn()` by hand (the snapshot Git HTTP backend) use this
 /// rather than `Command::new("git")`, so they inherit the killed-on-drop and
 /// no-prompting policy too.
 fn git_command() -> Command {
-    let mut command = Command::new(GIT_PROGRAM);
-    apply_git_child_policy(&mut command);
+    git_command_for(GIT_PROGRAM)
+}
+
+/// Stage an origin-scoped credential header for a fetch.
+///
+/// The child *environment*, never the command line: `GIT_CONFIG_*` is readable
+/// only by the process owner, while argv is world-readable through process
+/// listings on the platforms the engine runs on — and the value staged here is
+/// a live GitHub bearer token. Git reads `GIT_CONFIG_*` as `-c`, so it carries
+/// the same precedence, and [`apply_git_child_policy`]/[`git_command_for`]
+/// deliberately leave these variables alone for exactly this.
+///
+/// Call it on a command built by [`git_command_for`]; it uses the index-0
+/// slot.
+pub(crate) fn stage_git_auth_header(command: &mut Command, key: &str, value: &str) {
     command
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", key)
+        .env("GIT_CONFIG_VALUE_0", value);
 }
 
 /// Run `command` under `deadline` and return its output whatever the exit
@@ -2783,12 +2833,15 @@ fn git_command() -> Command {
 /// not slow. `operation` names what it was doing, so the error names the
 /// dependency, the operation, and the deadline — an operator reading the log
 /// can tell a hang from a failure.
+///
+/// `command` must come from [`git_command_for`]; the policy is applied there,
+/// not here, so a call site that staged `GIT_CONFIG_*` after building it keeps
+/// what it staged.
 async fn git_output_within(
-    mut command: Command,
+    command: Command,
     operation: &str,
     deadline: std::time::Duration,
 ) -> Result<std::process::Output, ApiError> {
-    apply_git_child_policy(&mut command);
     // Boxed on purpose: this future is awaited deep inside the snapshot and
     // submit handlers, and inlining the spawn/drain/timeout machinery into
     // every one of those state machines is what tips a debug-build handler
@@ -2867,12 +2920,11 @@ fn output_path_text(value: &str, workspace: &FsPath) -> Result<PathBuf, ApiError
 /// wait — because any of the three can be the one that hangs. On expiry the
 /// child is killed and reaped.
 async fn run_git_with_stdin(
-    mut command: Command,
+    command: Command,
     input: &[u8],
     operation: &str,
     deadline: std::time::Duration,
 ) -> Result<std::process::Output, ApiError> {
-    apply_git_child_policy(&mut command);
     // Boxed for the same reason as [`git_output_within`]: keep the process
     // machinery out of every enclosing handler future.
     let output = Box::pin(preloop_observability::deadline::run_command_with_stdin(
@@ -3172,10 +3224,9 @@ async fn deepen_object_cache_from_remote(
         // Scoped by `github_auth_header_for_remote` so the PAT is never sent
         // to a host the operator did not configure it for.
         //
-        // `-c` is a global option: it has to precede the subcommand, and it
-        // cannot ride on `GIT_CONFIG_*` because the child policy owns that
-        // environment to clear the credential helper list.
-        fetch.arg("-c").arg(format!("{key}={value}"));
+        // Staged in the environment: the value is a live token, and command
+        // lines are world-readable.
+        stage_git_auth_header(&mut fetch, key, &value);
     }
     fetch.args(["fetch", "--quiet", "--force", "--no-tags"]);
     if shallow_marker.is_file() {
@@ -8371,6 +8422,85 @@ pub(crate) mod bounded_git_tests {
         init.args(["init", "--bare", "--quiet", "--template="])
             .arg(path);
         run_git(init, operation).await.unwrap();
+    }
+
+    /// A fake `git` that records its argv and the credential environment, then
+    /// fails. Proves where each value is staged.
+    fn dumping_git(dir: &FsPath) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let argv_file = dir.join("argv");
+        let env_file = dir.join("env");
+        let program = dir.join("dumping-git");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > '{argv}'\n\
+                 {{ printf 'GIT_CONFIG_COUNT=%s\\n' \"$GIT_CONFIG_COUNT\"; \
+                 printf 'GIT_CONFIG_KEY_0=%s\\n' \"$GIT_CONFIG_KEY_0\"; \
+                 printf 'GIT_CONFIG_VALUE_0=%s\\n' \"$GIT_CONFIG_VALUE_0\"; \
+                 printf 'GIT_ASKPASS=%s\\n' \"$GIT_ASKPASS\"; \
+                 printf 'GIT_TERMINAL_PROMPT=%s\\n' \"$GIT_TERMINAL_PROMPT\"; }} > '{env}'\n\
+                 exit 1\n",
+                argv = argv_file.display(),
+                env = env_file.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, argv_file, env_file)
+    }
+
+    /// The forge token must travel in the child *environment*, never on the
+    /// command line: argv is world-readable through process listings, and the
+    /// value is a live GitHub bearer token. The credential-helper reset is the
+    /// opposite case — an empty, non-secret value — so it stays on argv, where
+    /// it cannot collide with the environment slot the token needs.
+    #[tokio::test]
+    async fn a_forge_token_never_reaches_the_git_command_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, argv_file, env_file) = dumping_git(temp.path());
+        let repository = temp.path().join("mirror.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        let header = "Authorization: basic c2VjcmV0LXRva2Vu";
+        let error = fetch_checkout_cache_commit(
+            program,
+            std::time::Duration::from_secs(30),
+            &repository,
+            "https://github.com/owner/repo.git",
+            "0123456789012345678901234567890123456789",
+            Some(("http.https://github.com/.extraheader", header)),
+        )
+        .await
+        .expect_err("the dumping git exits non-zero");
+        assert!(
+            format!("{error:?}").contains("fetch remote checkout snapshot"),
+            "unexpected error: {error:?}"
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            !argv.contains("c2VjcmV0LXRva2Vu") && !argv.contains("Authorization"),
+            "the forge token must never be an argument: {argv}"
+        );
+        assert!(
+            argv.contains("credential.helper="),
+            "the helper reset is argv-safe and belongs on the command line: {argv}"
+        );
+
+        let env = std::fs::read_to_string(&env_file).unwrap();
+        assert!(
+            env.contains(&format!("GIT_CONFIG_VALUE_0={header}")),
+            "the token must be staged in the child environment: {env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_KEY_0=http.https://github.com/.extraheader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_ASKPASS=false") && env.contains("GIT_TERMINAL_PROMPT=0"),
+            "prompting must stay disabled: {env}"
+        );
     }
 
     /// A hung Git child must be killed at the deadline, not waited on forever.
