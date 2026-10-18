@@ -21,6 +21,15 @@ on:
         type: choice
         options:
           - x86_64
+      guest_gib:
+        description: Guest disk GiB for the bake. The headroom gate below needs this plus ~2x the base image on the host.
+        required: false
+        default: "200"
+      publish_ghcr:
+        description: Publish the baked pack to ghcr.io/<owner>/preloop-x86_64-smolvm-golden (dated tag + latest)
+        required: false
+        type: boolean
+        default: false
   pull_request:
     paths:
       - official-image.toml
@@ -145,12 +154,12 @@ jobs:
       CARGO_BUILD_JOBS: "1"
       # Guest disk for the bake VM; the headroom gate below and
       # PRELOOP_RUNNER_STORAGE_GB both read it.
-      GOLDEN_GUEST_GIB: "200"
+      GOLDEN_GUEST_GIB: ${{ inputs.guest_gib || '200' }}
     permissions:
       contents: read
       id-token: write
       attestations: write
-      packages: read
+      packages: write
     steps:
       # The bake needs nested KVM to boot the image it packs. Self-hosted
       # runners (preloop smolvm guests) have no /dev/kvm, so every step is
@@ -400,6 +409,22 @@ jobs:
             --base-sbom "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
             --output "dist/$GOLDEN_NAME.provenance.json"
 
+      - name: Publish pack to GHCR
+        # Opt-in: the default path keeps GHCR publication as the host-side
+        # runbook step (docs/build-goldens.md). `pack push` writes `<tag>`
+        # (index) and `<tag>-linux-amd64` (the platform manifest to pin).
+        if: runner.environment == 'github-hosted' && inputs.publish_ghcr
+        env:
+          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
+        run: |
+          set -euo pipefail
+          test -s "dist/$GOLDEN_NAME"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          REPOSITORY="ghcr.io/${{ github.repository_owner }}/preloop-x86_64-smolvm-golden"
+          DATED_TAG="$(date -u +%Y%m%d)-$GOLDEN_ARCH"
+          smolvm pack push --file "dist/$GOLDEN_NAME" "$REPOSITORY:$DATED_TAG"
+          smolvm pack push --file "dist/$GOLDEN_NAME" "$REPOSITORY:latest"
+          echo "pushed $REPOSITORY:$DATED_TAG and :latest"
       - name: Install cosign
         if: runner.environment == 'github-hosted'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
