@@ -2189,6 +2189,91 @@ pub fn golden_ownership_script(uid: u32) -> String {
     )
 }
 
+/// Restore the file capability a container-image dump loses: `ping`.
+///
+/// A hosted runner's `/usr/bin/ping` is capability-based (`cap_net_raw+ep`),
+/// not setuid, and the OCI layer the golden is built from carries no extended
+/// attributes, so every preloop guest answers `ping: socket: Operation not
+/// permitted` as `runner` while the same command works on GitHub (G7). The
+/// other way to allow it is the `net.ipv4.ping_group_range` sysctl, but the
+/// image deliberately leaves that at `1 0` (no group) exactly as hosted does,
+/// so the capability is the hosted-parity fix.
+///
+/// `setcap` is preferred and `getcap` re-reads what landed; a guest without
+/// `setcap` (a custom base) falls back to the setuid bit the `iputils-ping`
+/// package itself installs. Best-effort throughout: a bake is not worth
+/// failing over a diagnostic tool, and a step that cannot land says so on
+/// stderr, which the engine logs. Idempotent — `setcap`/`chmod` set the same
+/// state on every run. No `#` comments in the text: the contract's statements
+/// are joined into one physical line.
+pub fn golden_ping_capability_script(ping: &str) -> String {
+    let ping = shell_quote(ping);
+    format!(
+        "if [ -e {ping} ]; then \
+           ok=0; \
+           if command -v setcap >/dev/null 2>&1; then \
+             setcap cap_net_raw+ep {ping} 2>/dev/null; \
+             if command -v getcap >/dev/null 2>&1; then \
+               [ -n \"$(getcap {ping} 2>/dev/null)\" ] && ok=1; \
+             else ok=1; fi; \
+           fi; \
+           if [ \"$ok\" != 1 ]; then chmod u+s {ping} 2>/dev/null && ok=1; fi; \
+           if [ \"$ok\" = 1 ]; then echo 'preloop: restored cap_net_raw+ep on {ping}'; \
+           else echo 'preloop: warning: could not make {ping} usable by the runner account' >&2; fi; \
+         fi"
+    )
+}
+
+/// Strip the bake host's own mapping out of `/etc/hosts`.
+///
+/// The runner image is dumped from a machine that was itself a runner, so its
+/// `/etc/hosts` carries that host's mapping — measured on both bakes as
+/// `10.1.0.59 runnervm…internal.cloudapp.net` — and every fork inherits it: a
+/// name that resolves to an address which is not this machine's, the same
+/// stale-mapping class [`guest_hostname_script`] repairs at run time. Cleaning
+/// it in the bake means no fork ever carries it.
+///
+/// The rule is conservative, and deliberately so: a line survives when its
+/// address is loopback, link-local, multicast or unspecified — the standard
+/// `localhost`/`ip6-localhost`/`ip6-allnodes` block must never be touched — and
+/// when any of its names is this machine's own hostname. Only a routable
+/// address naming something else (the bake host's own mapping) is dropped.
+/// Idempotent: a cleaned file has nothing left to drop, and best-effort — a
+/// bake is not worth failing over it, and a guest whose `/etc/hosts` cannot be
+/// written fails provisioning later, loudly, in [`guest_hostname_script`].
+/// `hosts` is the file the shell test substitutes for `/etc/hosts`.
+fn golden_hosts_cleanup_script_at(hosts: &str) -> String {
+    let hosts = shell_quote(hosts);
+    format!(
+        "host=$(hostname 2>/dev/null || uname -n); \
+         tmp=$(mktemp 2>/dev/null) || tmp=/tmp/.preloop-hosts-clean.$$; \
+         if awk -v host=\"$host\" ' \
+           /^[[:space:]]*$/ {{ print; next }} \
+           /^[[:space:]]*#/ {{ print; next }} \
+           {{ \
+             addr = $1; keep = 0; \
+             if (addr ~ /^127\\./) keep = 1; \
+             else if (addr == \"::1\" || addr == \"::\" || addr == \"0.0.0.0\") keep = 1; \
+             else if (addr ~ /^169\\.254\\./) keep = 1; \
+             else if (addr ~ /^22[4-9]\\./ || addr ~ /^23[0-9]\\./) keep = 1; \
+             else if (addr ~ /^[fF][eE]/ || addr ~ /^[fF][fF]/) keep = 1; \
+             if (!keep) for (i = 2; i <= NF; i++) if ($i == host) {{ keep = 1; break }}; \
+             if (keep) print; \
+           }}' {hosts} > \"$tmp\" 2>/dev/null; then \
+           if [ -s \"$tmp\" ]; then \
+             cat \"$tmp\" > {hosts} || \
+               echo 'preloop: warning: could not drop the bake host mapping from {hosts}' >&2; \
+           fi; \
+         else echo 'preloop: warning: could not read {hosts} for cleaning' >&2; fi; \
+         rm -f \"$tmp\""
+    )
+}
+
+/// [`golden_hosts_cleanup_script_at`] against the guest's real `/etc/hosts`.
+fn golden_hosts_cleanup_script() -> String {
+    golden_hosts_cleanup_script_at("/etc/hosts")
+}
+
 /// Sysctls GitHub's hosted `ubuntu-24.04` image applies, with their values.
 ///
 /// Provenance: `actions/runner-images` appends these to `/etc/sysctl.conf`
@@ -2486,8 +2571,11 @@ pub fn golden_glibc_check_script() -> &'static str {
 /// GitHub-runner machinery only — the account jobs run as (with its home,
 /// `_work` and passwordless sudo), the ownership of the paths they write, the
 /// writable tool cache with `RUNNER_TOOL_CACHE`/`AGENT_TOOLSDIRECTORY` in
-/// `/etc/environment`, the glibc requirement above, and the image's apt package
-/// indices ([`golden_apt_lists_script`]). No packages, no
+/// `/etc/environment`, the glibc requirement above, the image's apt package
+/// indices ([`golden_apt_lists_script`]), and the two pieces of bake-host
+/// residue a container-image dump carries — `ping`'s file capability
+/// ([`golden_ping_capability_script`]) and the bake host's own `/etc/hosts`
+/// mapping ([`golden_hosts_cleanup_script`]). No packages, no
 /// toolchains, no PATH or environment overrides: on a hosted runner a missing
 /// `bash`, `git` or `docker` fails the step that needs it, and the same is true
 /// here.
@@ -2513,6 +2601,18 @@ pub fn golden_contract_steps(user: &str, uid: u32) -> Vec<String> {
         steps.push(golden_ownership_script(uid));
     }
     steps.push(golden_apt_lists_script());
+    // The bake host's own `/etc/hosts` mapping is dropped here, and `ping`'s
+    // capability restored: both are image residue that every fork would
+    // otherwise inherit, and both are cheaper to fix once per golden than per
+    // machine. Neither touches the runner's groups, so they stay ahead of the
+    // membership step below.
+    steps.push(golden_hosts_cleanup_script());
+    steps.push(golden_ping_capability_script("/usr/bin/ping"));
+    // The container DNS pin is written here, not only per machine: on AgentENV
+    // the daemon is started by the guest's systemd at boot, before any
+    // per-machine exec runs, so the golden's own `daemon.json` is what the
+    // daemon that serves the job actually read.
+    steps.push(docker_dns_pin_script());
     if user != "root" {
         // The runner's groups are written last: nothing after this step may
         // change them, so the membership it grants is the one the bake keeps.
@@ -2690,10 +2790,95 @@ fn render_docker_start_script() -> String {
         ("@@GOLDEN_STACK_PRLIMIT@@", GOLDEN_STACK_PRLIMIT),
         ("@@GOLDEN_RLIMIT_NOFILE_SOFT@@", GOLDEN_RLIMIT_NOFILE_SOFT),
         ("@@GOLDEN_NOFILE_PRLIMIT@@", GOLDEN_NOFILE_PRLIMIT),
+        ("@@DOCKER_DNS_PIN@@", DOCKER_DNS_PIN_SCRIPT),
     ] {
         script = script.replace(token, value);
     }
     script
+}
+
+/// Pin container DNS to the guest's own stub resolver, when one is answering.
+///
+/// A GitHub-hosted runner's containers resolve through systemd-resolved's stub:
+/// the daemon's embedded DNS server (the `127.0.0.11` a container on a
+/// user-defined network is given) forwards to the daemon's *configured*
+/// servers, and resolved answers `/etc/hosts` names, so a compose service alias
+/// such as `postgres.localhost` resolves inside the network. Docker never takes
+/// a loopback nameserver from the host's `/etc/resolv.conf` — it filters those
+/// and falls back to `8.8.8.8`/`8.8.4.4` — so the stub has to be named
+/// explicitly in `daemon.json`, or containers inherit whatever non-loopback
+/// resolver the guest carries (measured: AgentENV `75.75.75.75`, smolvm
+/// `100.96.0.1`) and every `/etc/hosts`-only name fails inside a compose
+/// network (G6).
+///
+/// This is only correct because the golden configures that stub resolver: on
+/// AgentENV systemd-resolved already listens on `127.0.0.53`, and the smolvm
+/// golden sets it up. When nothing answers there, `daemon.json` is left exactly
+/// as the image shipped it — today's behaviour — and the reason is reported.
+///
+/// The probe asks `127.0.0.53` itself rather than reading `/etc/resolv.conf`:
+/// AgentENV's guest carries a foreign `resolv.conf` naming `75.75.75.75` while
+/// resolved answers on the loopback stub anyway. No tool is required — `dig`,
+/// `nslookup`, or a listener on the stub's socket each prove it.
+///
+/// `daemon.json` is merged, never rewritten: the image's own keys survive, a
+/// `dns` the image or the operator already set is left alone, and the write is
+/// an atomic rename in the same directory, so a half-written file can never
+/// reach the daemon. The merge is idempotent: the second run sees its own key
+/// and does nothing.
+///
+/// Shared verbatim by the golden contract (the daemon AgentENV's systemd starts
+/// from the golden's own `daemon.json` before any per-machine exec can run) and
+/// by `scripts/docker-start.sh` (a machine that starts its own daemon), through
+/// the `@@DOCKER_DNS_PIN@@` placeholder.
+const DOCKER_DNS_PIN_SCRIPT: &str = "\
+merge_docker_daemon_json() { \
+  ddj_file=$1; ddj_member=$2; ddj_tmp=$ddj_file.preloop.$$; \
+  mkdir -p \"$(dirname \"$ddj_file\")\" 2>/dev/null; \
+  if [ ! -s \"$ddj_file\" ]; then printf '{%s}\\n' \"$ddj_member\" > \"$ddj_tmp\" || return 1; \
+  else \
+    ddj_body=$(tr -d '\\n\\r\\t' < \"$ddj_file\" 2>/dev/null); \
+    case \"$ddj_body\" in \\{*\\}) : ;; *) rm -f \"$ddj_tmp\"; return 1 ;; esac; \
+    ddj_inner=${ddj_body#?}; ddj_inner=${ddj_inner%?}; \
+    ddj_inner=$(printf '%s' \"$ddj_inner\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); \
+    if [ -n \"$ddj_inner\" ]; then printf '{%s,%s}\\n' \"$ddj_inner\" \"$ddj_member\" > \"$ddj_tmp\" || return 1; \
+    else printf '{%s}\\n' \"$ddj_member\" > \"$ddj_tmp\" || return 1; fi; \
+  fi; \
+  chmod 0644 \"$ddj_tmp\" 2>/dev/null; \
+  mv -f \"$ddj_tmp\" \"$ddj_file\"; \
+}; \
+pin_container_dns_stub() { \
+  ddp_file=$1; \
+  if grep -q '\"dns\"' \"$ddp_file\" 2>/dev/null; then \
+    echo 'the docker daemon config already names dns servers; leaving them untouched' >&2; \
+    return 0; \
+  fi; \
+  if merge_docker_daemon_json \"$ddp_file\" '\"dns\":[\"127.0.0.53\"]'; then \
+    echo 'pinned container dns to the 127.0.0.53 stub resolver'; \
+    return 0; \
+  fi; \
+  echo 'could not merge the dns pin into the docker daemon config; containers follow the guest resolver' >&2; \
+  return 0; \
+}; \
+pin_container_dns() { \
+  ddp_file=$1; ddp_stub=0; \
+  if command -v dig >/dev/null 2>&1; then \
+    dig +time=1 +tries=1 +short @127.0.0.53 localhost A 2>/dev/null | grep -q . && ddp_stub=1; \
+  elif command -v nslookup >/dev/null 2>&1; then \
+    nslookup -timeout=1 -retry=1 localhost 127.0.0.53 2>/dev/null | grep -qE '^Address:[[:space:]]*127\\.0\\.0\\.1' && ddp_stub=1; \
+  elif grep -q '3500007F:0035' /proc/net/tcp /proc/net/udp 2>/dev/null; then ddp_stub=1; fi; \
+  if [ \"$ddp_stub\" != 1 ]; then \
+    echo 'no resolver answers at 127.0.0.53; leaving the docker daemon config untouched, so containers follow the guest resolver' >&2; \
+    return 0; \
+  fi; \
+  pin_container_dns_stub \"$ddp_file\"; \
+}";
+
+/// [`DOCKER_DNS_PIN_SCRIPT`] plus the call that applies it to the guest's
+/// `daemon.json`. Used as a golden-contract step and inside
+/// `scripts/docker-start.sh`.
+fn docker_dns_pin_script() -> String {
+    format!("{DOCKER_DNS_PIN_SCRIPT}; pin_container_dns /etc/docker/daemon.json")
 }
 
 /// How long to wait for a freshly started guest to accept commands.
@@ -2855,14 +3040,16 @@ pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
 /// sets, with no launcher shell. [`guest_env_prefix`] adds the shell that
 /// sources the image's `/etc/environment` on top of these.
 ///
+/// No `PATH` here: the image's own PATH is the one a hosted step shell gets,
+/// and only the launcher — which has sourced `/etc/environment` by then — can
+/// tell whether the image declared one. [`guest_runner_path`] is the launcher's
+/// fallback, not an entry `env` re-asserts over the image's value.
+///
 /// Control-socket routing and failure-marker debugging are independent
 /// features: a pool can debug failed jobs without a mounted control socket and
 /// vice versa, so neither may gate the other.
 fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
-    let mut env = vec![
-        format!("PATH={}", guest_runner_path(config)),
-        format!("PRELOOP_MACHINE_NAME={}", name.as_str()),
-    ];
+    let mut env = vec![format!("PRELOOP_MACHINE_NAME={}", name.as_str())];
     if config.control_socket.is_some() {
         env.push(format!(
             "PRELOOP_CONTROL_ORIGIN={}",
@@ -2895,26 +3082,54 @@ fn guest_env_entries(config: &RunnerPoolConfig, name: &MachineName) -> Vec<Strin
 /// `sh -c` so the image's `/etc/environment` is sourced first.
 ///
 /// `/etc/environment` is where a Linux image declares the PATH its toolchains
-/// live on, and `smolvm machine exec` starts the process without a login shell
-/// that would read it; a step calling a preinstalled tool would fail command
-/// lookup. Sourcing it *is* the hosted-runner parity fix, and an image without
-/// the file keeps [`guest_runner_path`]'s system default. The pool's own
-/// variables are re-asserted by `env` after the source, so a malformed
-/// `/etc/environment` cannot unset `HOME` or the control routing.
+/// live on *and* the environment its steps expect (`ImageOS`/`ImageVersion`,
+/// `JAVA_HOME*`, `LANG`, `DEBIAN_FRONTEND`, …), and `smolvm machine exec`
+/// starts the process without a login shell that would read it. Sourcing it
+/// with `set -a` is what exports those entries to the child: sourced without
+/// `-a` they stay shell variables and the `exec env` that follows drops them,
+/// which is how a smolvm job saw ~60 fewer variables than the same job on
+/// GitHub-hosted and every `setup-*` action failed to find its tool cache.
+///
+/// PATH is the launcher's, not an entry `env` re-asserts: the image's PATH is
+/// the one a hosted step shell gets, and a step that cannot find
+/// `/opt/pipx_bin`/`~/.local/bin`/`/usr/local/.ghcup/bin` fails while the tool
+/// is installed. [`guest_runner_path`] therefore applies only when the image
+/// declares no PATH at all. The pool's own variables are still re-asserted by
+/// `env` *after* the source, so a malformed `/etc/environment` cannot unset
+/// the control routing or the machine name.
 fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String> {
+    guest_env_prefix_at(config, name, "/etc/environment")
+}
+
+/// [`guest_env_prefix`] against a chosen environment file.
+///
+/// Production passes `/etc/environment`; the shell test below passes a scratch
+/// file, so the generated launcher runs end to end without touching the host's
+/// environment, the way [`guest_hostname_script_at`] stands in for `/etc/hosts`.
+fn guest_env_prefix_at(
+    config: &RunnerPoolConfig,
+    name: &MachineName,
+    environment_file: &str,
+) -> Vec<String> {
     let env = guest_env_entries(config, name);
-    // `env` re-asserts every variable above *after* the image's environment is
-    // sourced, so a malformed `/etc/environment` cannot unset `HOME` or the
-    // control routing. It also resolves the program through the PATH the
-    // source may have replaced (a running process keeps the PATH it started
-    // with), which is exactly the heap the image declares.
+    // `env` re-asserts every pool variable *after* the image's environment is
+    // sourced, so a malformed `/etc/environment` cannot unset the control
+    // routing or the machine name. PATH is exported by the launcher instead:
+    // the image's value survives, and the pool's list is only the fallback for
+    // an image that declares none. `PATH=` first, so an environment file
+    // without a PATH falls back instead of inheriting whatever the exec
+    // channel happened to hand the shell.
     let pairs = env
         .iter()
         .map(|entry| shell_quote(entry))
         .collect::<Vec<_>>()
         .join(" ");
+    let environment_file = shell_quote(environment_file);
+    let fallback = shell_quote(&guest_runner_path(config));
     let launcher = format!(
-        "if [ -r /etc/environment ]; then . /etc/environment; fi; \
+        "PATH=; if [ -r {environment_file} ]; then set -a; . {environment_file}; set +a; fi; \
+         [ -n \"$PATH\" ] || PATH={fallback}; \
+         export PATH; \
          exec /usr/bin/env {pairs} \"$0\" \"$@\""
     );
     let mut argv = vec!["sh".to_owned(), "-c".to_owned(), launcher];
@@ -8132,8 +8347,8 @@ chmod +x "$dest/bin/node"
     /// launcher sources `/etc/environment` before handing over, so the PATH a
     /// hosted step shell would get is the PATH a step here gets. The curated
     /// Rust/Go bakes that used to justify host-side toolchain entries are
-    /// gone, so the pool's own list stays a system default and nothing
-    /// exports a Rust home.
+    /// gone, so the pool's own list stays a fallback and nothing exports a
+    /// Rust home.
     #[test]
     fn runner_env_comes_from_the_image_environment_file() {
         let config = test_config(false);
@@ -8144,30 +8359,40 @@ chmod +x "$dest/bin/node"
         assert_eq!(argv[1], "-c");
         let launcher = &argv[2];
         assert!(
-            launcher.contains(". /etc/environment"),
+            launcher.contains(". '/etc/environment'"),
             "the image's environment must be sourced: {launcher}"
+        );
+        assert!(
+            launcher.contains("set -a; . '/etc/environment'; set +a"),
+            "the image's entries must be *exported*, not left shell-local: {launcher}"
         );
         assert!(
             launcher.contains("exec /usr/bin/env"),
             "the pool's variables must survive the source: {launcher}"
         );
+        // PATH is not an entry `env` re-asserts over the image's value: the
+        // launcher decides it after the source, so an image PATH survives and
+        // the pool's list is only the fallback for an image without one.
+        assert!(
+            !launcher.contains(&format!("PATH={}", guest_runner_path(&config))),
+            "the fallback PATH must not be handed to `env` as an assignment: {launcher}"
+        );
+        assert!(
+            launcher.contains(&format!(
+                "[ -n \"$PATH\" ] || PATH='{}'",
+                guest_runner_path(&config)
+            )),
+            "the fallback PATH must be the empty-PATH branch: {launcher}"
+        );
         // The `KEY=value` words after the launcher are the runner's
         // environment, so the entries the assertions below read are exactly
         // what `env` applies.
-        assert_eq!(
-            &argv[3],
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        );
-        assert_eq!(argv[4], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
+        assert_eq!(argv[3], format!("PRELOOP_MACHINE_NAME={}", name.as_str()));
 
         let env = guest_env_entries(&config, &name);
-        let path = env
-            .iter()
-            .find_map(|entry| entry.strip_prefix("PATH="))
-            .expect("the runner is launched with a PATH");
-        assert_eq!(
-            path,
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("PATH=")),
+            "PATH belongs to the launcher, not to the pool's entries: {env:?}"
         );
         for absent in [
             "/usr/local/cargo/bin",
@@ -8176,10 +8401,291 @@ chmod +x "$dest/bin/node"
             "CARGO_HOME=",
         ] {
             assert!(
-                !path.contains(absent) && !env.iter().any(|entry| entry.starts_with(absent)),
+                !env.iter().any(|entry| entry.starts_with(absent)),
                 "the curated toolchain contract is deleted; {absent} must not be exported: {env:?}"
             );
         }
+    }
+
+    /// Run the generated launcher for real, against a scratch environment file
+    /// standing in for `/etc/environment`, with an empty inherited environment
+    /// (`env -i`): the child is `/usr/bin/env`, so its stdout *is* the
+    /// environment a guest runner would start with.
+    ///
+    /// This is the measured parity gap, not a text assertion: sourcing without
+    /// `set -a` left the image's `ImageOS`/`LANG`/… unexported (G2), and
+    /// `exec /usr/bin/env PATH=<fallback>` replaced the image PATH, making
+    /// installed tools unreachable (G1).
+    #[test]
+    fn runner_launcher_exports_the_image_environment_and_keeps_its_path() {
+        let config = test_config(false);
+        let name = MachineName::new("runner").unwrap();
+
+        let child_env = |contents: &str| -> std::collections::HashMap<String, String> {
+            let temp = tempfile::tempdir().unwrap();
+            let environment_file = temp.path().join("environment");
+            std::fs::write(&environment_file, contents).unwrap();
+
+            let mut argv = guest_env_prefix_at(&config, &name, environment_file.to_str().unwrap());
+            // The program `env` execs: it prints the environment it received.
+            argv.push("/usr/bin/env".to_owned());
+            let output = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .env_clear()
+                .output()
+                .expect("the launcher shell must run");
+            assert!(
+                output.status.success(),
+                "the launcher failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect()
+        };
+
+        // (a) The image's PATH survives, pipx-bin-like entry and all.
+        let image_path = "/snap/bin:/home/runner/.local/bin:/opt/pipx_bin:/usr/bin";
+        let env = child_env(&format!("PATH={image_path}\n"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(image_path),
+            "the image's PATH must reach the runner: {env:?}"
+        );
+
+        // (b) An image with no PATH falls back to the pool's system default.
+        let env = child_env("LANG=C.UTF-8\n");
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(guest_runner_path(&config).as_str()),
+            "an image without a PATH keeps the fallback: {env:?}"
+        );
+
+        // (c) Every entry the image declares is exported, and the pool's own
+        // variables still win over the image's.
+        let env = child_env(
+            "foo=bar\nImageOS=ubuntu24\nPATH=/opt/pipx_bin:/usr/bin\nPRELOOP_MACHINE_NAME=clobbered\n",
+        );
+        assert_eq!(env.get("foo").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("ImageOS").map(String::as_str), Some("ubuntu24"));
+        assert_eq!(
+            env.get("PRELOOP_MACHINE_NAME").map(String::as_str),
+            Some(name.as_str()),
+            "a malformed environment file must not unset the pool's variables: {env:?}"
+        );
+    }
+
+    /// The bake host's own `/etc/hosts` mapping is the measured residue
+    /// (`10.1.0.59 runnervm…internal.cloudapp.net`), and it must not survive
+    /// into a golden: a name that resolves to an address which is not this
+    /// machine's is what every later `sudo` prints `unable to resolve host`
+    /// over. The standard local block — and a routable address that *does* name
+    /// this machine — has to survive untouched, and a second run must change
+    /// nothing.
+    #[test]
+    fn golden_hosts_cleanup_drops_the_bake_host_and_keeps_local_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let hosts = temp.path().join("hosts");
+        let host = String::from_utf8_lossy(
+            &std::process::Command::new("hostname")
+                .output()
+                .expect("hostname must run")
+                .stdout,
+        )
+        .trim()
+        .to_owned();
+        assert!(!host.is_empty(), "the fixture needs this machine's name");
+        let fixture = format!(
+            "127.0.0.1 localhost\n\
+             # The following lines are desirable for IPv6 capable hosts\n\
+             ::1     localhost ip6-localhost ip6-loopback\n\
+             fe00::0 ip6-localnet\n\
+             ff00::0 ip6-mcastprefix\n\
+             ff02::1 ip6-allnodes\n\
+             ff02::2 ip6-allrouters\n\
+             ff02::3 ip6-allhosts\n\
+             10.1.0.59 runnervmvrwv9.oibkqik1sgtutjdscjavv13dxh.gx.internal.cloudapp.net runnervmvrwv9\n\
+             127.0.1.1\tcpane-runner-golden\n\
+             10.9.9.9\t{host}\n"
+        );
+        std::fs::write(&hosts, &fixture).unwrap();
+        let script = golden_hosts_cleanup_script_at(hosts.to_str().unwrap());
+
+        let run = || {
+            std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .expect("the cleanup shell must run")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "the cleanup must not fail: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cleaned = std::fs::read_to_string(&hosts).unwrap();
+        assert!(
+            !cleaned.contains("runnervmvrwv9"),
+            "the bake host's mapping must be dropped: {cleaned}"
+        );
+        for kept in [
+            "127.0.0.1 localhost",
+            "::1     localhost ip6-localhost ip6-loopback",
+            "fe00::0 ip6-localnet",
+            "ff00::0 ip6-mcastprefix",
+            "ff02::1 ip6-allnodes",
+            "127.0.1.1\tcpane-runner-golden",
+        ] {
+            assert!(cleaned.contains(kept), "{kept} must survive: {cleaned}");
+        }
+        assert!(
+            cleaned.contains(&format!("10.9.9.9\t{host}")),
+            "a routable address naming this machine must survive: {cleaned}"
+        );
+
+        // Idempotent: the second run rewrites the same bytes.
+        let output = run();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&hosts).unwrap(),
+            cleaned,
+            "a re-run must not change the file"
+        );
+    }
+
+    /// `ping` reaches the runner account with `cap_net_raw` (or, where
+    /// `setcap` is missing, the setuid bit): without it every guest answers
+    /// `ping: socket: Operation not permitted` while the same step works on a
+    /// hosted runner.
+    #[test]
+    fn golden_ping_capability_makes_ping_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let ping = temp.path().join("ping");
+        std::fs::write(&ping, "#!/bin/sh\nexit 0\n").unwrap();
+        let script = golden_ping_capability_script(ping.to_str().unwrap());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("the capability shell must run");
+        assert!(
+            output.status.success(),
+            "restoring the capability must not fail the bake: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let setuid = std::fs::metadata(&ping).unwrap().permissions().mode() & 0o4000 != 0;
+        let has_capability = std::process::Command::new("getcap")
+            .arg(&ping)
+            .output()
+            .map(|output| !output.stdout.is_empty())
+            .unwrap_or(false);
+        assert!(
+            setuid || has_capability,
+            "ping must end up either capability- or setuid-based: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A binary the image does not carry is a no-op, not a failure.
+        let missing = golden_ping_capability_script("/nonexistent/preloop-ping");
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", &missing])
+                .status()
+                .expect("the capability shell must run")
+                .success()
+        );
+    }
+
+    /// The container DNS pin merges into `daemon.json` without losing a key the
+    /// image shipped and without touching a `dns` already configured; the
+    /// daemon that starts from the result is what gives a compose network's
+    /// containers the stub resolver (G6).
+    #[test]
+    fn docker_dns_pin_merges_daemon_json_without_clobbering() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = temp.path().join("daemon.json");
+        let pin = || {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "{DOCKER_DNS_PIN_SCRIPT}; pin_container_dns_stub {}",
+                        shell_quote(daemon.to_str().unwrap())
+                    ),
+                ])
+                .output()
+                .expect("the pin shell must run")
+        };
+
+        // No file at all: the pin creates one.
+        let output = pin();
+        assert!(output.status.success());
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&daemon).unwrap()).unwrap();
+        assert_eq!(merged["dns"][0], "127.0.0.53");
+
+        // An image's own keys survive, and the result is still valid JSON.
+        std::fs::write(
+            &daemon,
+            "{\n  \"data-root\": \"/var/lib/docker\",\n  \"storage-driver\": \"vfs\"\n}\n",
+        )
+        .unwrap();
+        assert!(pin().status.success());
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&daemon).unwrap()).unwrap();
+        assert_eq!(merged["data-root"], "/var/lib/docker");
+        assert_eq!(merged["storage-driver"], "vfs");
+        assert_eq!(merged["dns"][0], "127.0.0.53");
+
+        // A `dns` the image (or operator) already set is never replaced.
+        std::fs::write(&daemon, "{\"dns\":[\"8.8.8.8\"]}\n").unwrap();
+        assert!(pin().status.success());
+        assert_eq!(
+            std::fs::read_to_string(&daemon).unwrap(),
+            "{\"dns\":[\"8.8.8.8\"]}\n"
+        );
+
+        // A file the merge cannot read as JSON is left exactly as it was.
+        std::fs::write(&daemon, "not json\n").unwrap();
+        assert!(pin().status.success());
+        assert_eq!(std::fs::read_to_string(&daemon).unwrap(), "not json\n");
+
+        // The merge is an atomic rename in the same directory: no temporary
+        // file is left behind for a later bake to adopt.
+        let leftovers: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "daemon.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    }
+
+    /// The per-machine engine bootstrap applies the pin before it starts the
+    /// daemon it will read from: the storage-driver write above it replaces
+    /// `daemon.json` outright, so a pin written earlier would be lost.
+    #[test]
+    fn docker_start_script_pins_dns_before_starting_the_daemon() {
+        let script = docker_start_command()[2].clone();
+        let pin = script
+            .find("pin_container_dns /etc/docker/daemon.json")
+            .unwrap_or_else(|| panic!("the engine bootstrap must pin container dns: {script}"));
+        let driver = script
+            .find("storage-driver")
+            .unwrap_or_else(|| panic!("the storage-driver write must still be there: {script}"));
+        let spawn = script
+            .find("dockerd >/var/log/dockerd.log")
+            .unwrap_or_else(|| panic!("the launch must still start dockerd: {script}"));
+        assert!(
+            driver < pin && pin < spawn,
+            "the pin must land after the storage-driver write and before the daemon: {script}"
+        );
+        // And the golden carries it too: AgentENV's daemon is started by the
+        // guest's systemd before any per-machine exec can run.
+        assert!(
+            golden_contract_script(DEFAULT_RUNNER_USER, DEFAULT_RUNNER_UID)
+                .contains("pin_container_dns /etc/docker/daemon.json"),
+            "the golden's own daemon.json must carry the pin"
+        );
     }
 
     #[test]

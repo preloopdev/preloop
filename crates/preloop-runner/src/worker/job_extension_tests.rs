@@ -496,6 +496,36 @@ fn build_step_list_parses_action_reference() {
     );
 }
 
+/// `uses: docker://image` reaches the runner as azdo's `containerRegistry`
+/// reference — the image and no `name`/`ref`. Rebuilding it as a remote action
+/// produced an empty `uses`, so every `docker://` step failed with "action
+/// reference must contain @ref" (G8); it has to come back out as the
+/// `docker://` reference the docker action handler dispatches on.
+#[test]
+fn build_step_list_parses_container_registry_reference() {
+    let steps = vec![serde_json::json!({
+        "id": "docker",
+        "displayName": "Run docker://alpine:3.20",
+        "reference": {
+            "type": "containerRegistry",
+            "image": "alpine:3.20"
+        },
+        "inputs": {
+            "args": "echo hello"
+        }
+    })];
+
+    let msg = serde_json::json!({});
+    let result = build_step_list(&steps, &msg);
+
+    assert_eq!(result.len(), 1);
+    assert!(
+        matches!(&result[0].step_type, StepType::Action { uses, .. } if uses == "docker://alpine:3.20"),
+        "the image must come back as a docker:// action: {:?}",
+        result[0].step_type
+    );
+}
+
 #[test]
 fn build_step_list_parses_github_template_token_maps() {
     let steps = vec![serde_json::json!({

@@ -787,6 +787,17 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if ref_type.eq_ignore_ascii_case("containerRegistry") {
+                        // `uses: docker://image` — the server carries it as
+                        // azdo's `containerRegistry` reference
+                        // (`{"type":"containerRegistry","image":"alpine:3.20"}`,
+                        // no `name`/`ref`), which the official runner runs
+                        // through its docker action handler. Rebuilding it as
+                        // a remote action here produced an empty `uses`, so
+                        // every `docker://` step failed with "action reference
+                        // must contain @ref" (G8).
+                        let image = ref_val.get("image").and_then(|v| v.as_str()).unwrap_or("");
+                        format!("docker://{image}")
                     } else if repo_type.eq_ignore_ascii_case("selfRepository") {
                         // v2.336.0 $/ self-repository action reference
                         // (PipelineConstants.SelfRepositoryAlias).

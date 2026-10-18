@@ -62,6 +62,33 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Guest parity with GitHub-hosted runners: job environment, `ping`,
+  `/etc/hosts`, container DNS, and `uses: docker://`.** A probe run as a real
+  job on hosted `ubuntu-24.04` and on both preloop goldens found differences
+  that break real workflows, each fixed at its cause. The runner launcher now
+  sources `/etc/environment` with `set -a`, so the image's
+  `ImageOS`/`ImageVersion`/`JAVA_HOME*`/`ANDROID_*`/`LANG`/`DEBIAN_FRONTEND`/…
+  reach the step (a SmolVM job saw ~60 fewer variables than the same job on
+  GitHub, and `setup-*` actions could not find the hosted tool cache), and it no
+  longer replaces the image's `PATH` with the engine's fallback — `/opt/pipx_bin`,
+  `~/.local/bin`, `~/.config/composer/vendor/bin`, `/usr/local/.ghcup/bin`,
+  `~/.dotnet/tools`, `/usr/games` and `/snap/bin` are reachable again, so
+  `ansible`, `yamllint`, `ghc` and `cabal` no longer report as missing. The
+  golden contract restores `cap_net_raw+ep` on `/usr/bin/ping` (the container
+  image dump drops file capabilities, so every guest answered `ping: socket:
+  Operation not permitted` as the runner) and drops the bake host's own mapping
+  from `/etc/hosts` (`10.1.0.59 runnervm…internal.cloudapp.net`), which every
+  fork had inherited. The container engine pins `dns: ["127.0.0.53"]` in
+  `/etc/docker/daemon.json` when a stub resolver answers there — on hosted
+  runners containers resolve through systemd-resolved, and `/etc/hosts`-only
+  compose aliases such as `postgres.localhost` now resolve instead of failing
+  against the guest's own resolver (`75.75.75.75` on AgentENV, `100.96.0.1` on
+  SmolVM). `uses: docker://image` steps are no longer rejected with `action
+  reference must contain @ref`: the job-message reader rebuilt the reference as
+  a remote action, dropping the image azdo carries as
+  `{"type":"containerRegistry","image":…}`, and now hands it to the docker
+  action handler the runner already had.
+
 - **A microVM that runs out of IRQ lines says so.** When `machine start` fails
   with libkrun's `no more IRQs are available` (the device budget x86_64
   libkrun draws 19 MMIO IRQ lines from since SmolVM 1.23.0, 11 before), the
