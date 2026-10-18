@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use anyhow::{Context, anyhow, bail};
+use preloop_gha_protocol::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -32,9 +33,15 @@ use crate::github_app::{
     GitHubAppCredentials, MintRejected, api_base, installation_grants, installation_id_for,
     installation_permissions, sign_app_jwt, ungranted_scopes,
 };
+use crate::runner_deprecations::is_runner_version_shape;
 use crate::shared_http::CLIENT;
 
-const MAX_RUNNER_PAGES: u32 = 10;
+/// Runaway guard for [`RunnerAdmin::list_runners`], not a GitHub limit: the
+/// loop stops when a page comes back short or the reported `total_count` is
+/// reached, so this only bounds a server that answers full pages forever. An
+/// inventory that outgrows it is reported as an error — a partial list would
+/// be indistinguishable from a complete one.
+const MAX_RUNNER_PAGES: u32 = 100;
 const RUNNERS_PER_PAGE: u32 = 100;
 
 /// The account surface served by a runner-admin client.
@@ -103,19 +110,14 @@ impl RunnerAdminScope {
 }
 
 /// A one-hour registration or remove credential returned by GitHub.
-#[derive(Clone)]
+///
+/// The credential is a [`SecretString`], so formatting, logging, or
+/// serializing the struct cannot disclose it; callers call `expose()` only
+/// where they hand the token to the runner.
+#[derive(Clone, Debug)]
 pub struct RunnerAdminToken {
-    pub token: String,
+    pub token: SecretString,
     pub expires_at: SystemTime,
-}
-
-impl std::fmt::Debug for RunnerAdminToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RunnerAdminToken")
-            .field("token", &"<redacted>")
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
 }
 
 /// A runner returned by GitHub's list or JIT endpoints.
@@ -166,18 +168,14 @@ impl Default for JitConfigRequest {
 }
 
 /// The encoded, single-use runner configuration returned by JIT generation.
+///
+/// The encoded blob is a credential of the same class as a registration
+/// token, so it is a [`SecretString`]: callers `expose()` it only where they
+/// pass it to the runner that is being configured.
+#[derive(Debug)]
 pub struct JitConfig {
-    pub encoded_jit_config: String,
+    pub encoded_jit_config: SecretString,
     pub runner: GithubRunner,
-}
-
-impl std::fmt::Debug for JitConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JitConfig")
-            .field("encoded_jit_config", &"<redacted>")
-            .field("runner", &self.runner)
-            .finish()
-    }
 }
 
 /// The version deprecation response shared with the server's mirror route.
@@ -186,14 +184,27 @@ pub use crate::runner_deprecations::RunnerDeprecation;
 /// A runner-admin failure with a typed missing-grant case.
 #[derive(Debug)]
 pub enum RunnerAdminError {
-    /// GitHub rejected an operation with a status that is used for a missing
-    /// grant. A 404 can also mean that the runner/version is gone; GitHub does
-    /// not distinguish that from an installation lacking the permission.
+    /// GitHub rejected the installation token with `403 Resource not
+    /// accessible by integration`. The installation grant is read before
+    /// every operation, so this is normally the grant being revoked between
+    /// that read and the call. A 404 is *not* reported as this: GitHub uses
+    /// it for a runner, version, or endpoint that does not exist, and cleanup
+    /// deleting an already-deleted runner must not be told to change App
+    /// permissions.
     MissingGrant {
         status: Option<reqwest::StatusCode>,
         scope: RunnerAdminScope,
         permission: String,
         operation: String,
+    },
+    /// GitHub refused the call because the App is rate-limited. Distinct from
+    /// [`Self::MissingGrant`] because GitHub answers a throttled App with the
+    /// same 403 it uses for a missing grant, and "wait for the window" is the
+    /// opposite instruction from "change the App's permissions".
+    RateLimited {
+        status: reqwest::StatusCode,
+        operation: String,
+        message: String,
     },
     /// A non-permission GitHub API response.
     Api {
@@ -224,6 +235,14 @@ impl std::fmt::Display for RunnerAdminError {
                     scope.permission_label(),
                 )
             }
+            Self::RateLimited {
+                status,
+                operation,
+                message,
+            } => write!(
+                f,
+                "{operation} failed with {status}: GitHub is rate-limiting this App ({message}); retry after the limit's reset, the App's permissions are not the problem"
+            ),
             Self::Api {
                 status,
                 operation,
@@ -268,7 +287,9 @@ pub trait RunnerAdmin: Send + Sync {
         &self,
         request: &JitConfigRequest,
     ) -> Result<JitConfig, RunnerAdminError>;
-    /// List all runners at this scope.
+    /// List every runner at this scope, following `total_count` and short
+    /// pages. A scope that outgrows the client's pagination guard is an error,
+    /// never a silently partial list.
     async fn list_runners(&self) -> Result<Vec<GithubRunner>, RunnerAdminError>;
     /// Delete one runner by its GitHub id.
     async fn delete_runner(&self, runner_id: u64) -> Result<(), RunnerAdminError>;
@@ -345,12 +366,23 @@ impl GithubRunnerAdmin {
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
+        let rate_limited = is_rate_limited(response.headers());
         let payload = response
             .text()
             .await
             .with_context(|| format!("POST {url} response body"))?;
         if !status.is_success() {
-            let message: String = payload.chars().take(1024).collect();
+            let message = github_error_message(&payload);
+            let operation = format!("POST {url}");
+            // The grant preflight above already passed, so a 403 here is a
+            // throttle, not the permission this message would name.
+            if rate_limited {
+                return Err(RunnerAdminError::RateLimited {
+                    status,
+                    operation,
+                    message,
+                });
+            }
             if matches!(
                 status,
                 reqwest::StatusCode::FORBIDDEN
@@ -361,7 +393,7 @@ impl GithubRunnerAdmin {
                     status: Some(status),
                     scope: self.scope.clone(),
                     permission: format!("{}: write", self.scope.permission_key()),
-                    operation: format!("POST {url}"),
+                    operation,
                 });
             }
             return Err(RunnerAdminError::Other(
@@ -397,23 +429,38 @@ impl GithubRunnerAdmin {
         }
         let response = request.send().await.with_context(|| operation.clone())?;
         let status = response.status();
+        // GitHub also publishes `x-ratelimit-remaining: 0` on the last
+        // successful call, so the headers only mean a refusal once the status
+        // says the call failed.
+        let rate_limited = is_rate_limited(response.headers());
         let payload = response.text().await.with_context(|| operation.clone())?;
-        if matches!(
-            status,
-            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND
-        ) {
-            return Err(RunnerAdminError::MissingGrant {
-                status: Some(status),
-                scope: self.scope.clone(),
-                permission: format!("{}: write", self.scope.permission_key()),
-                operation,
-            });
-        }
         if !status.is_success() {
+            // A throttled App gets the same 403 as one that lacks the grant,
+            // and "retry after the window" is the opposite of "change the
+            // App's permissions".
+            if rate_limited {
+                return Err(RunnerAdminError::RateLimited {
+                    status,
+                    operation,
+                    message: github_error_message(&payload),
+                });
+            }
+            // Only 403 is a grant failure. A 404 means the runner, version,
+            // or endpoint is not there — cleanup racing a runner that GitHub
+            // already removed gets that answer, and it is not a permission
+            // problem.
+            if status == reqwest::StatusCode::FORBIDDEN {
+                return Err(RunnerAdminError::MissingGrant {
+                    status: Some(status),
+                    scope: self.scope.clone(),
+                    permission: format!("{}: write", self.scope.permission_key()),
+                    operation,
+                });
+            }
             return Err(RunnerAdminError::Api {
                 status,
                 operation,
-                message: payload.chars().take(1024).collect(),
+                message: github_error_message(&payload),
             });
         }
         if payload.trim().is_empty() {
@@ -423,6 +470,49 @@ impl GithubRunnerAdmin {
             .with_context(|| format!("{operation} returned a non-JSON body"))
             .map_err(RunnerAdminError::Other)
     }
+}
+
+/// True when GitHub refused a call because the App is throttled rather than
+/// because it lacks a grant.
+///
+/// Both arrive as `403`, and GitHub's prose is not stable enough to match on
+/// (the sibling token mint downcasts the same way for the same reason), so the
+/// headers decide: a primary limit leaves `x-ratelimit-remaining` at `0`, and a
+/// secondary limit carries `retry-after`.
+fn is_rate_limited(headers: &reqwest::header::HeaderMap) -> bool {
+    if headers.contains_key(reqwest::header::RETRY_AFTER) {
+        return true;
+    }
+    headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|remaining| remaining.trim() == "0")
+}
+
+/// The prose of a failed GitHub response, for an error message.
+///
+/// GitHub's documented error body is `{"message": …, "documentation_url": …}`,
+/// so only `message` is surfaced: the raw body is echoed straight into a
+/// displayed error, and a response that carries a credential in an unexpected
+/// field must not reach a log line through it.
+fn github_error_message(payload: &str) -> String {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .map_or_else(
+            || {
+                format!(
+                    "GitHub returned a non-JSON error body ({} bytes, omitted)",
+                    payload.len()
+                )
+            },
+            |message| message.chars().take(1024).collect(),
+        )
 }
 
 fn parse_token(payload: &Value, url: &str) -> anyhow::Result<RunnerAdminToken> {
@@ -438,7 +528,7 @@ fn parse_token(payload: &Value, url: &str) -> anyhow::Result<RunnerAdminToken> {
     let expires_at = chrono::DateTime::parse_from_rfc3339(expiry)
         .with_context(|| format!("unparsable token expiry {expiry:?}"))?;
     Ok(RunnerAdminToken {
-        token,
+        token: SecretString::new(token),
         expires_at: SystemTime::from(expires_at),
     })
 }
@@ -492,14 +582,15 @@ impl RunnerAdmin for GithubRunnerAdmin {
         )
         .context("decoding the generated runner")?;
         Ok(JitConfig {
-            encoded_jit_config: encoded,
+            encoded_jit_config: SecretString::new(encoded),
             runner,
         })
     }
 
     async fn list_runners(&self) -> Result<Vec<GithubRunner>, RunnerAdminError> {
         let mut all = Vec::new();
-        for page in 1..=MAX_RUNNER_PAGES {
+        let mut page = 1;
+        loop {
             let payload = self
                 .request(
                     reqwest::Method::GET,
@@ -518,13 +609,24 @@ impl RunnerAdmin for GithubRunnerAdmin {
             .context("decoding the runner list")?;
             let count = runners.len();
             all.extend(runners);
+            // A short page ends the inventory, and `total_count` ends it
+            // exactly — a full page is not the signal that more remain.
             if count < RUNNERS_PER_PAGE as usize
                 || total.is_some_and(|total| all.len() as u64 >= total)
             {
-                break;
+                return Ok(all);
             }
+            if page >= MAX_RUNNER_PAGES {
+                bail!(
+                    "listing runners for {} stopped after {MAX_RUNNER_PAGES} pages \
+                     ({MAX_RUNNER_PAGES} × {RUNNERS_PER_PAGE} runners) with {} reported: \
+                     refusing to report a partial inventory as a complete one",
+                    self.scope.describe(),
+                    total.map_or_else(|| "more".to_owned(), |total| total.to_string()),
+                );
+            }
+            page += 1;
         }
-        Ok(all)
     }
 
     async fn delete_runner(&self, runner_id: u64) -> Result<(), RunnerAdminError> {
@@ -539,6 +641,15 @@ impl RunnerAdmin for GithubRunnerAdmin {
     }
 
     async fn deprecation(&self, version: &str) -> Result<RunnerDeprecation, RunnerAdminError> {
+        // `version` becomes one path segment: a value carrying `/`, `?`, or
+        // `..` would rewrite the endpoint or its query instead of naming a
+        // version, so it is checked against the shape the server's own route
+        // accepts before the URL is built.
+        if !is_runner_version_shape(version) {
+            return Err(RunnerAdminError::Other(anyhow!(
+                "{version:?} is not a runner version; expected `<major>.<minor>.<patch>`"
+            )));
+        }
         let suffix = format!("/deprecations/{version}");
         let payload = self
             .request(reqwest::Method::GET, &suffix, None, None)
@@ -565,6 +676,16 @@ mod tests {
     struct StubState {
         grants: Value,
         admin_status: Option<StatusCode>,
+        /// Status the access-token mint answers with, so a throttle or a
+        /// revoked grant can be exercised without touching the admin routes.
+        mint_status: Option<StatusCode>,
+        /// Whether the mint's response carries GitHub's primary-limit header.
+        mint_rate_limited: bool,
+        /// When set, the repo runner list pages out this many runners.
+        list_total: Option<u64>,
+        /// Whether admin responses advertise an exhausted rate-limit budget
+        /// while still answering 200.
+        admin_rate_limited: bool,
         access_bodies: Mutex<Vec<Value>>,
         admin_requests: Mutex<Vec<(String, String, String)>>,
     }
@@ -579,9 +700,19 @@ mod tests {
     async fn access_token(
         State(state): State<Arc<StubState>>,
         body: String,
-    ) -> (StatusCode, Json<Value>) {
+    ) -> axum::response::Response {
         let body: Value = serde_json::from_str(&body).expect("JSON access-token body");
         state.access_bodies.lock().push(body);
+        if let Some(status) = state.mint_status {
+            let mut response = status.into_response();
+            if state.mint_rate_limited {
+                response.headers_mut().insert(
+                    "x-ratelimit-remaining",
+                    axum::http::HeaderValue::from_static("0"),
+                );
+            }
+            return response;
+        }
         (
             StatusCode::OK,
             Json(json!({
@@ -589,6 +720,7 @@ mod tests {
                 "expires_at": "2099-01-01T00:00:00Z",
             })),
         )
+            .into_response()
     }
 
     async fn admin_response(
@@ -612,7 +744,16 @@ mod tests {
             return status.into_response();
         }
         let _ = body;
-        (StatusCode::OK, Json(response)).into_response()
+        let mut response = (StatusCode::OK, Json(response)).into_response();
+        if state.admin_rate_limited {
+            // GitHub publishes an exhausted budget on the last successful
+            // call too, so this must not turn a 200 into a failure.
+            response.headers_mut().insert(
+                "x-ratelimit-remaining",
+                axum::http::HeaderValue::from_static("0"),
+            );
+        }
+        response
     }
 
     async fn repo_registration(
@@ -793,6 +934,32 @@ mod tests {
                 .map(String::as_str)
                 .unwrap_or_default(),
         );
+        if let Some(total) = state.list_total {
+            // GitHub's paging shape: full pages then a short one, with the
+            // whole inventory announced in `total_count` from page one.
+            let page: u64 = query
+                .get("page")
+                .and_then(|page| page.parse().ok())
+                .unwrap_or(1);
+            let per_page: u64 = query
+                .get("per_page")
+                .and_then(|per_page| per_page.parse().ok())
+                .unwrap_or(100);
+            let first = (page - 1) * per_page + 1;
+            let last = (first + per_page - 1).min(total);
+            let runners: Vec<Value> = (first..=last)
+                .map(|id| json!({ "id": id, "name": format!("vm-{id}"), "labels": [] }))
+                .collect();
+            return admin_response(
+                State(state),
+                headers,
+                String::new(),
+                path,
+                "GET",
+                json!({ "total_count": total, "runners": runners }),
+            )
+            .await;
+        }
         admin_response(
             State(state),
             headers,
@@ -852,6 +1019,47 @@ mod tests {
             admin_status,
             ..Default::default()
         });
+        serve_stub(state).await
+    }
+
+    /// A stub whose token mint answers `mint_status`, carrying GitHub's
+    /// primary-limit header when `mint_rate_limited`.
+    async fn start_stub_with_mint(
+        grants: Value,
+        mint_status: StatusCode,
+        mint_rate_limited: bool,
+    ) -> (String, Arc<StubState>) {
+        let state = Arc::new(StubState {
+            grants,
+            mint_status: Some(mint_status),
+            mint_rate_limited,
+            ..Default::default()
+        });
+        serve_stub(state).await
+    }
+
+    /// A stub whose repo runner list pages out `total` runners.
+    async fn start_stub_listing(grants: Value, total: u64) -> (String, Arc<StubState>) {
+        let state = Arc::new(StubState {
+            grants,
+            list_total: Some(total),
+            ..Default::default()
+        });
+        serve_stub(state).await
+    }
+
+    /// A stub that advertises an exhausted rate-limit budget on every admin
+    /// response while still answering 200.
+    async fn start_stub_with_exhausted_budget(grants: Value) -> (String, Arc<StubState>) {
+        let state = Arc::new(StubState {
+            grants,
+            admin_rate_limited: true,
+            ..Default::default()
+        });
+        serve_stub(state).await
+    }
+
+    async fn serve_stub(state: Arc<StubState>) -> (String, Arc<StubState>) {
         let app = Router::new()
             .route("/app/installations/{id}", get(installation))
             .route("/app/installations/{id}/access_tokens", post(access_token))
@@ -928,11 +1136,12 @@ mod tests {
                 .registration_token()
                 .await
                 .expect("registration")
-                .token,
+                .token
+                .expose(),
             "registration-token"
         );
         assert_eq!(
-            admin.remove_token().await.expect("remove").token,
+            admin.remove_token().await.expect("remove").token.expose(),
             "remove-token"
         );
         let jit = admin
@@ -944,7 +1153,7 @@ mod tests {
             })
             .await
             .expect("jit config");
-        assert_eq!(jit.encoded_jit_config, "encoded-jit");
+        assert_eq!(jit.encoded_jit_config.expose(), "encoded-jit");
         assert_eq!(admin.list_runners().await.expect("list")[0].id, 42);
         admin.delete_runner(42).await.expect("delete");
         assert_eq!(
@@ -1008,7 +1217,12 @@ mod tests {
             },
         );
         assert_eq!(
-            admin.registration_token().await.expect("org token").token,
+            admin
+                .registration_token()
+                .await
+                .expect("org token")
+                .token
+                .expose(),
             "org-registration-token"
         );
         let bodies = state.access_bodies.lock();
@@ -1038,11 +1252,12 @@ mod tests {
                 .registration_token()
                 .await
                 .expect("registration")
-                .token,
+                .token
+                .expose(),
             "org-registration-token"
         );
         assert_eq!(
-            admin.remove_token().await.expect("remove").token,
+            admin.remove_token().await.expect("remove").token.expose(),
             "org-remove-token"
         );
         let jit = admin
@@ -1054,7 +1269,7 @@ mod tests {
             })
             .await
             .expect("jit config");
-        assert_eq!(jit.encoded_jit_config, "org-encoded-jit");
+        assert_eq!(jit.encoded_jit_config.expose(), "org-encoded-jit");
         assert_eq!(admin.list_runners().await.expect("list")[0].id, 43);
         admin.delete_runner(43).await.expect("delete");
         assert_eq!(
@@ -1145,5 +1360,153 @@ mod tests {
                 .contains("organization_self_hosted_runners: write")
         );
         assert!(error.to_string().contains("Self-hosted runners"));
+    }
+
+    fn repo_client(base: &str) -> GithubRunnerAdmin {
+        client(
+            base,
+            RunnerAdminScope::Repo {
+                owner: "acme".to_owned(),
+                repo: "repo".to_owned(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn runner_list_follows_pagination_past_a_full_tenth_page() {
+        let (base, state) = start_stub_listing(json!({ "administration": "write" }), 1_001).await;
+        let runners = repo_client(&base).list_runners().await.expect("list");
+        assert_eq!(runners.len(), 1_001, "the last runner is not dropped");
+        assert_eq!(runners.last().expect("a runner").id, 1_001);
+        let listed = state
+            .admin_requests
+            .lock()
+            .iter()
+            .filter(|(method, path, _)| method == "GET" && path.contains("/actions/runners?"))
+            .count();
+        assert_eq!(listed, 11, "a full page does not end the inventory");
+    }
+
+    #[tokio::test]
+    async fn runner_list_refuses_to_report_a_partial_inventory() {
+        let (base, _state) = start_stub_listing(json!({ "administration": "write" }), 10_001).await;
+        let error = repo_client(&base)
+            .list_runners()
+            .await
+            .expect_err("truncated list");
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing to report a partial inventory"),
+            "{message}"
+        );
+        assert!(
+            message.contains("10001"),
+            "the reported total is named: {message}"
+        );
+        assert!(!error.is_missing_grant());
+    }
+
+    #[tokio::test]
+    async fn missing_runner_is_not_reported_as_a_missing_grant() {
+        let (base, _state) = start_stub(
+            json!({ "administration": "write" }),
+            Some(StatusCode::NOT_FOUND),
+        )
+        .await;
+        let error = repo_client(&base)
+            .delete_runner(42)
+            .await
+            .expect_err("already deleted");
+        assert!(
+            !error.is_missing_grant(),
+            "a missing runner is not a permission problem: {error}"
+        );
+        assert!(error.to_string().contains("404"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_mint_is_reported_as_a_rate_limit() {
+        let (base, state) = start_stub_with_mint(
+            json!({ "administration": "write" }),
+            StatusCode::FORBIDDEN,
+            true,
+        )
+        .await;
+        let error = repo_client(&base)
+            .registration_token()
+            .await
+            .expect_err("throttled mint");
+        assert!(
+            !error.is_missing_grant(),
+            "a throttle is not a grant: {error}"
+        );
+        assert!(error.to_string().contains("rate-limiting"), "{error}");
+        assert_eq!(state.access_bodies.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbidden_mint_without_a_limit_header_still_names_the_grant() {
+        let (base, _state) = start_stub_with_mint(
+            json!({ "administration": "write" }),
+            StatusCode::FORBIDDEN,
+            false,
+        )
+        .await;
+        let error = repo_client(&base)
+            .registration_token()
+            .await
+            .expect_err("forbidden mint");
+        assert!(error.is_missing_grant());
+        assert!(
+            error.to_string().contains("administration: write"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deprecation_rejects_a_version_that_is_not_one_path_segment() {
+        let (base, state) = start_stub(json!({ "administration": "write" }), None).await;
+        for version in ["../../repos/acme/repo", "2.336.0?x=1", "2.336.0/extra", ""] {
+            let error = repo_client(&base)
+                .deprecation(version)
+                .await
+                .expect_err("not a runner version");
+            assert!(
+                error.to_string().contains("is not a runner version"),
+                "{version:?} -> {error}"
+            );
+        }
+        assert!(
+            state.admin_requests.lock().is_empty(),
+            "an invalid version never reaches GitHub"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_on_a_successful_call_is_not_a_failure() {
+        let (base, _state) =
+            start_stub_with_exhausted_budget(json!({ "administration": "write" })).await;
+        let admin = repo_client(&base);
+        assert_eq!(
+            admin.list_runners().await.expect("list")[0].id,
+            42,
+            "a 200 carrying `x-ratelimit-remaining: 0` is still a success"
+        );
+        admin.delete_runner(42).await.expect("delete");
+    }
+
+    #[tokio::test]
+    async fn runner_credentials_redact_in_formatting() {
+        let (base, _state) = start_stub(json!({ "administration": "write" }), None).await;
+        let admin = repo_client(&base);
+        let token = admin.registration_token().await.expect("registration");
+        assert_eq!(token.token.to_string(), "<redacted>");
+        assert!(!format!("{token:?}").contains("registration-token"));
+        let jit = admin
+            .generate_jitconfig(&JitConfigRequest::default())
+            .await
+            .expect("jit config");
+        assert_eq!(jit.encoded_jit_config.to_string(), "<redacted>");
+        assert!(!format!("{jit:?}").contains("encoded-jit"));
     }
 }

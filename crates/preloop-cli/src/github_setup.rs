@@ -313,6 +313,23 @@ pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()
     }
 }
 
+/// What `--github-runner-admin` can and cannot do to an App that already
+/// exists.
+///
+/// The flag only changes the manifest an App is *created* from. App
+/// permissions are not something a CLI flag can edit afterwards, so every path
+/// that reuses an existing App says what to do in GitHub instead of letting
+/// the flag look applied.
+fn note_runner_admin_opt_in() {
+    println!(
+        "Note: --github-runner-admin only sets permissions at App creation. For an \
+         existing App, grant `Administration: write` on repositories in the \
+         App's permission settings, then accept the pending permission review \
+         on each installation — otherwise runner-admin token mints will fail \
+         naming the missing grant."
+    );
+}
+
 async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     // Nothing supplied means "create the App for me"; either flag on its own
     // is a half-finished manual setup, and silently starting a browser flow
@@ -326,6 +343,12 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
             let has_configured_app = (existing.app_id.is_some() && existing.app_pem().is_some())
                 || !existing.apps.is_empty();
             if has_configured_app && !args.add {
+                // The flag cannot change an existing App, and this branch is
+                // where an operator who expected it to would end up: say how
+                // to grant the permission before returning.
+                if args.runner_admin {
+                    note_runner_admin_opt_in();
+                }
                 if let (Some(app_id), Some(pem)) = (existing.app_id.as_deref(), existing.app_pem())
                 {
                     return match args.public_url.as_deref() {
@@ -375,18 +398,7 @@ async fn setup_app(args: &GithubSetupArgs) -> anyhow::Result<()> {
     };
 
     if args.runner_admin {
-        // `--github-runner-admin` only changes the manifest an App is *created*
-        // from; App permissions are not something a CLI flag can edit after
-        // the fact. The operator grants `Administration: write` in the App's
-        // settings, and every existing installation must accept the pending
-        // permission review before admin tokens carry it.
-        println!(
-            "Note: --github-runner-admin only sets permissions at App creation. For an \
-             existing App, grant `Administration: write` on repositories in the \
-             App's permission settings, then accept the pending permission review \
-             on each installation — otherwise runner-admin token mints will fail \
-             naming the missing grant."
-        );
+        note_runner_admin_opt_in();
     }
     let path = save_app_credentials(&app_id, &pem, webhook_secret)?;
     println!("Wrote {}", path.display());

@@ -57,7 +57,11 @@ pub struct RunnerDeprecation {
 
 /// True when `version` has the shape of a runner release (`2.336.0`,
 /// optionally with a leading `v`).
-fn is_runner_version_shape(version: &str) -> bool {
+///
+/// Also the client-side guard for
+/// [`crate::github_runner_admin::GithubRunnerAdmin`], which appends the version
+/// to a request path as one segment.
+pub(crate) fn is_runner_version_shape(version: &str) -> bool {
     let digits = version.strip_prefix('v').unwrap_or(version);
     !digits.is_empty()
         && digits
