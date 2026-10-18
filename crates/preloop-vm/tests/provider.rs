@@ -865,18 +865,6 @@ printf 'exit %s\n' "$6" >> "$0.forklog"
         two.await.unwrap().unwrap();
     }
 
-    /// Every deadline tier shrunk to `deadline`, so a fake runtime that never
-    /// exits is proved to be cut off in milliseconds.
-    fn short_deadlines(deadline: std::time::Duration) -> WaitDeadlines {
-        WaitDeadlines {
-            probe: deadline,
-            control: deadline,
-            boot: deadline,
-            pack: deadline,
-            exec: deadline,
-        }
-    }
-
     /// A smolvm whose first `machine create` records its pid and never exits;
     /// later ones succeed, so a second create can prove it was not blocked.
     fn fake_wedged_create_smolvm() -> (TempDir, PathBuf) {
@@ -964,12 +952,15 @@ exit 0
     #[tokio::test]
     async fn timed_out_create_kills_smolvm_and_releases_the_lifecycle_lock() {
         let (_directory, executable) = fake_wedged_create_smolvm();
-        // One second, not the smallest possible value: the fake has to reach
-        // `exec sleep` inside a loaded test binary before the deadline can be
-        // evidence that the *wait* is what ended. Production deadlines are
-        // three orders of magnitude larger.
-        let deadline = std::time::Duration::from_secs(1);
-        let provider = SmolVmProvider::new(&executable).with_deadlines(short_deadlines(deadline));
+        // Only the tier under test is shrunk. `create` runs on the boot tier,
+        // and a test-wide shrink would make unrelated steps flaky under a
+        // loaded `cargo test` (a 1 s deadline can expire before the fake's own
+        // `exec` completes).
+        let deadline = std::time::Duration::from_secs(2);
+        let provider = SmolVmProvider::new(&executable).with_deadlines(WaitDeadlines {
+            boot: deadline,
+            ..WaitDeadlines::default()
+        });
         let wedged = valid_spec(MachineName::new("runner-wedged").unwrap());
         let next = valid_spec(MachineName::new("runner-next").unwrap());
 
@@ -1005,10 +996,13 @@ exit 0
         let (directory, executable) = fake_slow_help_smolvm();
         let host_socket = directory.path().join("engine.sock");
         let _socket = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
-        // See `timed_out_create_...`: the deadline must outlast the fake's own
-        // startup to be evidence about the wait.
-        let deadline = std::time::Duration::from_secs(1);
-        let provider = SmolVmProvider::new(&executable).with_deadlines(short_deadlines(deadline));
+        // Only the probe tier is shrunk; the `create` that follows the probe
+        // keeps its production deadline and the fake answers it at once.
+        let deadline = std::time::Duration::from_secs(2);
+        let provider = SmolVmProvider::new(&executable).with_deadlines(WaitDeadlines {
+            probe: deadline,
+            ..WaitDeadlines::default()
+        });
         let mut spec = valid_spec(MachineName::new("ci-01").unwrap());
         spec.sockets.push(SocketMount {
             host: host_socket,

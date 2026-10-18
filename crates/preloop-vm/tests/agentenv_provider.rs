@@ -1730,15 +1730,13 @@ fn process_gone(pid: i32, budget: std::time::Duration) -> bool {
 async fn timed_out_pause_is_killed_at_its_deadline() {
     let (_directory, executable) = fake_wedged_pause_aenv();
     let home = tempfile::tempdir().unwrap();
-    // One second, not the smallest possible value: the fake `aenv` has to
-    // finish its own startup before the deadline is evidence about the wait.
-    let deadline = std::time::Duration::from_secs(1);
+    // Only the tier under test is shrunk: `stop` pauses on the control tier,
+    // while `create`/`start` (the setup) keep their production deadlines so a
+    // loaded `cargo test` cannot time them out.
+    let deadline = std::time::Duration::from_secs(2);
     let provider = provider(&executable, home.path()).with_deadlines(WaitDeadlines {
-        probe: deadline,
         control: deadline,
-        boot: deadline,
-        pack: deadline,
-        exec: deadline,
+        ..WaitDeadlines::default()
     });
     let name = MachineName::new("runner-wedged").unwrap();
     provider
