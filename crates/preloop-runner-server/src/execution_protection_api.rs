@@ -109,8 +109,13 @@ fn policy_view(policy: &ExecutionProtectionConfig) -> serde_json::Value {
 
 /// Load the operator's current `[execution_protection]` table from the
 /// config file — the same file the engine read at startup.
-fn load_policy(shared: &Arc<SharedState>) -> Result<ExecutionProtectionConfig, ApiError> {
-    let config = crate::config::load_config_from(&shared.state.config_path)
+///
+/// The load may reach the OS credential store for the `[secrets]` sealing key,
+/// bounded by `credential_store`'s 10 s guard; `config_blocking` keeps that
+/// bound off the async workers.
+async fn load_policy(shared: &Arc<SharedState>) -> Result<ExecutionProtectionConfig, ApiError> {
+    let config = crate::config_blocking::load_config(&shared.state.config_path)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     Ok(config.execution_protection)
 }
@@ -131,7 +136,11 @@ async fn mutate_policy(
     mutate: impl FnOnce(&mut ExecutionProtectionConfig) -> Result<serde_json::Value, ApiError>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _guard = shared.state.policy_mutation.lock().await;
-    let mut config = crate::config::load_config_from(&shared.state.config_path)
+    // Both the load and the write can reach the OS credential store (sealing
+    // key) — bounded at 10 s by `credential_store`'s guard, but never worth an
+    // async worker while this lock is held.
+    let mut config = crate::config_blocking::load_config(&shared.state.config_path)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     // `secrets_store = "memory"` only governs where secret values are kept;
     // execution-protection rules are operator policy, not secrets, so they
@@ -139,7 +148,8 @@ async fn mutate_policy(
     let response = mutate(&mut config.execution_protection)?;
     crate::config::validate_execution_protection_rules(&config.execution_protection)
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
-    crate::config::write_config_to(&shared.state.config_path, &config)
+    crate::config_blocking::write_config(&shared.state.config_path, config)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     Ok(Json(response))
 }
@@ -148,7 +158,7 @@ async fn mutate_policy(
 pub async fn get_execution_protection_policy(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(policy_view(&load_policy(&shared)?)))
+    Ok(Json(policy_view(&load_policy(&shared).await?)))
 }
 
 #[derive(Deserialize)]
@@ -182,7 +192,7 @@ pub async fn set_execution_protection_mode(
 pub async fn list_execution_protection_rules(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let policy = load_policy(&shared)?;
+    let policy = load_policy(&shared).await?;
     let rules: Vec<RuleView> = policy
         .event_rules
         .iter()
@@ -309,7 +319,7 @@ pub async fn get_execution_protection_rule(
     State(shared): State<Arc<SharedState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let policy = load_policy(&shared)?;
+    let policy = load_policy(&shared).await?;
     let (kind, index) = parse_rule_id(&id)
         .ok_or_else(|| ApiError::not_found(format!("no execution protection rule {id:?}")))?;
     let view = match kind {

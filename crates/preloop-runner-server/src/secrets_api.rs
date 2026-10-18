@@ -221,8 +221,13 @@ pub async fn set_secret(
     // while both landed in the in-memory store. Lock order is
     // `secret_mutation` → `secrets` write guard; the global `inner` mutex is
     // never taken here.
+    // The load reaches the OS credential store for the `[secrets]` sealing key
+    // and is bounded by `credential_store`'s 10 s guard; it runs on the
+    // blocking pool so that bound cannot park an async worker while the
+    // mutation lock is held.
     let _mutation = shared.state.secret_mutation.lock().await;
-    let mut config = crate::config::load_config_from(&shared.state.config_path)
+    let mut config = crate::config_blocking::load_config(&shared.state.config_path)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     match (&body.repo, &body.env) {
         (Some(repo), Some(env)) => {
@@ -252,7 +257,10 @@ pub async fn set_secret(
     if !crate::config::store_memory(&config)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?
     {
-        crate::config::write_config_to(&shared.state.config_path, &config)
+        // Sealing the config may reach the same OS store; same reason as the
+        // load above.
+        crate::config_blocking::write_config(&shared.state.config_path, config)
+            .await
             .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     }
 
@@ -325,7 +333,8 @@ pub async fn delete_secret(
     // is one critical section, so a concurrent set cannot resurrect the
     // deleted name in the file. Lock order: `secret_mutation` → `secrets`.
     let _mutation = shared.state.secret_mutation.lock().await;
-    let config = crate::config::load_config_from(&shared.state.config_path)
+    let config = crate::config_blocking::load_config(&shared.state.config_path)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
     let memory = crate::config::store_memory(&config)
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
@@ -389,7 +398,8 @@ pub async fn delete_secret(
     if !removed {
         return Err(not_found_error(&name, &query));
     }
-    crate::config::write_config_to(&shared.state.config_path, &config)
+    crate::config_blocking::write_config(&shared.state.config_path, config)
+        .await
         .map_err(|error| ApiError::internal(format!("{error:#}")))?;
 
     let mut store = shared.state.secrets.write();
