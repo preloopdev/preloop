@@ -94,6 +94,13 @@ Releases before v0.27.0 predate the changelog.
     loopback: the one-time link and GitHub's redirect carry the App's token and
     code.
 
+- **Refused setup guesses no longer end a live App setup.** The browser-facing
+  `/setup/github` route is unauthenticated, and five wrong tokens used to fail
+  the session outright — which made an onlooker's guesses a way to cancel a
+  setup that was in progress. A mismatch is now refused and logged without
+  touching the session; the one-time token is still burned the moment it is
+  used, and the shared request budget still caps how fast anyone can guess.
+
 - **`PRELOOP_PUBLIC_URL` alone now updates an existing App's webhook.** The
   effective public URL is resolved before the already-configured-App branch, so
   setting it in the environment (without `--public-url`) points the configured

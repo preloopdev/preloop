@@ -50,9 +50,6 @@ pub const SETUP_LINK_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long the operator has to approve the App once the form is served.
 pub const APPROVAL_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// Invalid tokens or states a live session tolerates before it is burned.
-const MAX_BAD_ATTEMPTS: u32 = 5;
-
 /// Repository checks one setup session may ask the engine to run. Each check
 /// mints an installation token and probes GitHub, so the list is bounded like
 /// any other operator-supplied input.
@@ -118,7 +115,6 @@ struct Session {
     /// Link expiry while awaiting the link; approval expiry afterwards.
     deadline: Instant,
     phase: Phase,
-    bad_attempts: u32,
     /// Whether a poller has read a terminal phase. An unread result is what
     /// stops a second setup from taking this session's place.
     result_read: bool,
@@ -266,7 +262,6 @@ impl SetupSessions {
             repos,
             deadline: now + SETUP_LINK_TTL,
             phase: Phase::AwaitingLink,
-            bad_attempts: 0,
             result_read: false,
         };
         let mut table = self.inner.lock();
@@ -283,8 +278,13 @@ impl SetupSessions {
     }
 
     /// Redeem the setup link for `token`. A live link with the right token is
-    /// burned and returns what the form needs; anything else returns `None`,
-    /// and a wrong token counts against the session.
+    /// burned and returns what the form needs; anything else returns `None`.
+    ///
+    /// A wrong token does not touch the session. The route that reaches here is
+    /// unauthenticated, so anything a guess could change is something an
+    /// onlooker could use to end a setup that is in progress — with a 256-bit
+    /// token compared in constant time, a guess cannot succeed, and the shared
+    /// rate limit is what caps how fast anyone can try.
     pub fn redeem_link(&self, now: Instant, token: &str) -> Option<FormGrant> {
         let mut table = self.inner.lock();
         let session = table.current.as_mut()?;
@@ -293,7 +293,10 @@ impl SetupSessions {
         }
         let stored = session.token_digest?;
         if !constant_time_eq(&stored, &digest(token)) {
-            session.count_bad_attempt();
+            warn!(
+                session = %session.id,
+                "refused a setup link whose token did not match the live session"
+            );
             return None;
         }
         let state = random_nonce();
@@ -331,7 +334,12 @@ impl SetupSessions {
         };
         let code = code.filter(|code| !code.is_empty());
         let Some(code) = code.filter(|_| state_matches) else {
-            session.count_bad_attempt();
+            // Like a wrong token, a forged callback is refused without
+            // touching the session the operator is still waiting on.
+            warn!(
+                session = %session.id,
+                "refused a setup callback whose state did not match the live session"
+            );
             return Err(Refusal::Rejected);
         };
         session.state = None;
@@ -388,22 +396,6 @@ impl SetupSessions {
             session.result_read = true;
         }
         Some(status)
-    }
-}
-
-impl Session {
-    /// Count one bad token or state. The fifth burns the session, so a live
-    /// link cannot be guessed at indefinitely.
-    fn count_bad_attempt(&mut self) {
-        self.bad_attempts += 1;
-        if self.bad_attempts >= MAX_BAD_ATTEMPTS {
-            self.token_digest = None;
-            self.state = None;
-            self.phase = Phase::Failed(
-                "too many invalid setup requests; start again with `preloop setup github --via app`"
-                    .to_owned(),
-            );
-        }
     }
 }
 
@@ -1209,21 +1201,48 @@ mod tests {
     }
 
     #[test]
-    fn five_bad_tokens_burn_the_session() {
+    fn repeated_guesses_do_not_end_the_live_setup() {
         let sessions = SetupSessions::new();
         let now = Instant::now();
         let opened = open(&sessions, now);
-        for _ in 0..MAX_BAD_ATTEMPTS {
+        // The route that serves the link is unauthenticated: whoever can reach
+        // it must not be able to end a setup that is in progress by guessing.
+        for _ in 0..50 {
             assert!(sessions.redeem_link(now, "guess").is_none());
         }
-        assert!(
-            sessions.redeem_link(now, &opened.token).is_none(),
-            "the right token is useless once the session is burned"
-        );
-        assert!(matches!(
+        assert_eq!(
             sessions.status(now, &opened.id),
-            Some(Status::Failed(_))
-        ));
+            Some(Status::AwaitingLink),
+            "the session is untouched by refused guesses"
+        );
+        assert!(
+            sessions.redeem_link(now, &opened.token).is_some(),
+            "the operator's own link still works"
+        );
+    }
+
+    #[test]
+    fn repeated_forged_callbacks_do_not_end_the_live_setup() {
+        let sessions = SetupSessions::new();
+        let now = Instant::now();
+        let opened = open(&sessions, now);
+        let grant = sessions.redeem_link(now, &opened.token).unwrap();
+        for _ in 0..50 {
+            assert_eq!(
+                sessions
+                    .begin_conversion(now, Some("forged"), Some("code"))
+                    .err(),
+                Some(Refusal::Rejected)
+            );
+        }
+        assert_eq!(
+            sessions.status(now, &opened.id),
+            Some(Status::AwaitingApproval)
+        );
+        let conversion = sessions
+            .begin_conversion(now, Some(&grant.state), Some("the-code"))
+            .expect("the real callback still converts");
+        assert_eq!(conversion.id, opened.id);
     }
 
     #[test]
